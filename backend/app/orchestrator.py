@@ -408,6 +408,7 @@ def _resolve_ci_fix_branch(
         branch = ((pr_data or {}).get("head", {}) or {}).get("ref", "")
     return branch or ""
 
+
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
 # starving new provisions and creating a cascading failure where no VM can
@@ -3644,7 +3645,13 @@ async def orchestrator_worker():
                                     ci_task.status = TaskStatus.FAILED
                                     if ci_task.vm_provisioned_at:
                                         ci_task.vm_stopped_at = _utcnow()
-                                    ci_task.requires_approval = True
+                                    # Gate only the approval flag — FAILED is the
+                                    # terminalization and stays. Gates off → task FAILs
+                                    # without approval-gating (no 2h timeout strand).
+                                    if _runtime_config.get(
+                                        "require_approval_gates", True
+                                    ):
+                                        ci_task.requires_approval = True
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} reopen failed {_reopen_attempts} times — "
                                         f"manual intervention required"
@@ -3776,7 +3783,14 @@ async def orchestrator_worker():
                                 )
                                 if _reopen_tries >= _reopen_cap:
                                     if not ci_task.requires_approval:
-                                        ci_task.requires_approval = True
+                                        # Discretionary gate: keep the status message +
+                                        # alert (visibility) but only approval-gate when
+                                        # require_approval_gates is on, so a non-terminal
+                                        # ci_task isn't stranded on the 2h timeout.
+                                        if _runtime_config.get(
+                                            "require_approval_gates", True
+                                        ):
+                                            ci_task.requires_approval = True
                                         ci_task.latest_status_message = (
                                             f"PR #{ci_pr_number} mergeability stuck after {_reopen_tries} "
                                             f"close/reopen attempts — manual intervention required"
@@ -4307,7 +4321,12 @@ async def orchestrator_worker():
                                     ci_task.status = TaskStatus.FAILED
                                     if ci_task.vm_provisioned_at:
                                         ci_task.vm_stopped_at = _utcnow()
-                                    ci_task.requires_approval = True
+                                    # Gate only the approval flag — FAILED is the
+                                    # terminalization and stays. Gates off → no strand.
+                                    if _runtime_config.get(
+                                        "require_approval_gates", True
+                                    ):
+                                        ci_task.requires_approval = True
                                     ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                                     logger.warning(
                                         f"[CI] PR #{ci_pr_number} merge conflicts, fix not spawned — marking FAILED (requires_approval)"
@@ -4429,9 +4448,7 @@ async def orchestrator_worker():
                                     "ref", ""
                                 )
                                 _ci_proj = (
-                                    await session.get(
-                                        Project, ci_task.project_id
-                                    )
+                                    await session.get(Project, ci_task.project_id)
                                     if ci_task.project_id
                                     else None
                                 )

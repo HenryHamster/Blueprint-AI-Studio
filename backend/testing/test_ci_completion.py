@@ -756,6 +756,56 @@ async def test_rule_block_keywords_trigger_escalation(db_session, mocker, rule_m
     assert "manual intervention" in (task.latest_status_message or "")
 
 
+@pytest.mark.asyncio
+async def test_rule_block_does_not_escalate_when_gates_off(db_session, mocker):
+    """With require_approval_gates OFF, a rule-blocked merge must NOT set
+    requires_approval — otherwise services.py's 2h approval-gate timeout would
+    FAIL the CI task and, via the orig escalation, strand the parent. The block
+    is still recorded (merge_rule_blocked) and surfaced (status message + alert),
+    so visibility is preserved; only the approval gate is skipped.
+
+    Companion to test_rule_block_keywords_trigger_escalation (gates on)."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "not allowed to merge"},
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+
+    project = Project(name="Rule block gates off", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    # The fix: gates off → no approval gate on the CI task.
+    assert task.requires_approval is not True, (
+        "rule block must NOT approval-gate when require_approval_gates is off"
+    )
+    # Block still recorded + surfaced (visibility preserved).
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_rule_blocked") is True
+    assert "manual intervention" in (task.latest_status_message or "")
+
+
 # ---------------------------------------------------------------------------
 # 4. Merge failure counter and escalation at 10 failures
 # ---------------------------------------------------------------------------
@@ -2159,9 +2209,7 @@ async def test_merge_conflict_uses_pr_head_ref_on_drift(db_session, mocker, capl
         f"Drift correction must use PR.head.ref='blueprint/test-branch', "
         f"not the stale derived branch — got {spawn_branch_arg!r}"
     )
-    drift_warnings = [
-        r for r in caplog.records if "branch drift" in r.getMessage()
-    ]
+    drift_warnings = [r for r in caplog.records if "branch drift" in r.getMessage()]
     assert drift_warnings, "Expected a 'branch drift' WARNING to be logged"
 
 

@@ -2590,8 +2590,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                     "_merge_time_alerted": True,
                                 }
                             # Approval gate: any of per-state, total, or time thresholds can fire it.
-                            # Only one approval dispatch — the first condition wins.
-                            if not parent.requires_approval:
+                            # Only one approval dispatch — the first condition wins. Discretionary:
+                            # only gate when require_approval_gates is on. With gates off the
+                            # per-state/total/time *alerts* above still fire (visibility preserved),
+                            # but we do NOT approval-gate the parent — otherwise services.py's 2h
+                            # approval-gate timeout would FAIL a healthy EVALUATING parent whose
+                            # rollup PR is merely deferred. The evaluating_fail_hours backstop
+                            # handles a genuinely stuck rollup. (Mirrors the review-cap/respawn-cap
+                            # gating elsewhere in this file.)
+                            if (
+                                _runtime_config.get("require_approval_gates", True)
+                                and not parent.requires_approval
+                            ):
                                 if deferred_count >= approval_threshold:
                                     parent.requires_approval = True
                                     try:

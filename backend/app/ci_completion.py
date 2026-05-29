@@ -936,15 +936,25 @@ async def _attempt_merge_with_retry_and_escalation(
             return False
 
         if _is_rule_block:
+            from app.shared_state import runtime_config as _rt_cfg
+
+            # Discretionary gate: only approval-gate when require_approval_gates is on.
+            # With gates off the status message + alert below still surface the block
+            # (visibility preserved), but we do NOT set requires_approval — otherwise
+            # services.py's 2h approval-gate timeout FAILs the CI task and, via the
+            # orig escalation, strands the parent. The merge stays rule-blocked; the
+            # normal backstop applies. (Mirrors the rollup review-cap/respawn-cap gating.)
+            _gates_on = _rt_cfg.get("require_approval_gates", True)
             task.latest_status_message = (
                 f"CI passed but merge blocked on PR #{ci_pr_number}: "
                 f"{merge_msg[:200]} — requires manual intervention"
             )
-            task.requires_approval = True
+            if _gates_on:
+                task.requires_approval = True
             ci_loop["merge_rule_blocked"] = True
             task.context = {**(task.context or {}), "review_loop": ci_loop}
             session.add(task)
-            if ci_orig_id:
+            if ci_orig_id and _gates_on:
                 try:
                     orig = await session.get(Task, uuid.UUID(ci_orig_id))
                     if orig:
@@ -1165,8 +1175,16 @@ async def _attempt_merge_with_retry_and_escalation(
                     f"hard cap imminent ({_hard_cap - _merge_failures} retries remaining)",
                 )
             if _merge_failures >= _hard_cap or _repeated_identical or _deterministic:
+                from app.shared_state import runtime_config as _rt_cfg
+
+                # Gate only the approval flag — FAILED is the terminalization and stays.
+                # With gates off the task still FAILs (with its status message + alert),
+                # but does not approval-gate the orig/parent (which services.py would
+                # otherwise 2h-timeout-FAIL). Mirrors the rollup review-cap gating.
+                _gates_on = _rt_cfg.get("require_approval_gates", True)
                 task.status = TaskStatus.FAILED
-                task.requires_approval = True
+                if _gates_on:
+                    task.requires_approval = True
                 _early_exit = (
                     _repeated_identical or _deterministic
                 ) and _merge_failures < _hard_cap
@@ -1194,7 +1212,7 @@ async def _attempt_merge_with_retry_and_escalation(
                         f"PR #{ci_pr_number} merge failed {_merge_failures} times "
                         f"(>= {_hard_cap}) — giving up, needs manual intervention"
                     )
-                if ci_orig_id:
+                if ci_orig_id and _gates_on:
                     try:
                         orig = await session.get(Task, uuid.UUID(ci_orig_id))
                         if orig:
