@@ -107,6 +107,23 @@ def get_confirmed_down_critical_deps() -> list:
     return [d for d in _CRITICAL_EXTERNAL_DEPS if consec.get(d, 0) >= 2]
 
 
+def _same_base_branch(a: Task, b: Task) -> bool:
+    """True when two tasks share a base branch.
+
+    A dependency only propagates a *result* when the dep's PR merges into the
+    *dependent's* base branch. Same-rollup / same-default tasks share a base, so
+    the merge lands where the dependent will see it. Tasks in different rollups
+    carry different ``base_branch`` values (the plan/rollup branch); a
+    ``depends_on`` across that boundary is timing-only — the dep merges into its
+    own rollup branch while the dependent cuts from a different one, so waiting
+    buys no propagation, only serialization. None/"" both normalize to the
+    project integration branch, so two default-base tasks count as same-base.
+    """
+    a_base = (a.first_payload or {}).get("base_branch") or None
+    b_base = (b.first_payload or {}).get("base_branch") or None
+    return a_base == b_base
+
+
 async def _check_candidate_task_deps(
     task: Task,
     dep_tasks: list,
@@ -171,13 +188,30 @@ async def _check_candidate_task_deps(
                 continue
             any_failed = True
             break
+        # Cross-rollup deps are timing-only: the dependent's base branch never
+        # inherits this dep's result (the dep merges into its own rollup branch
+        # while the dependent cuts from a different one), so waiting on an
+        # unfinished cross-base dep buys no propagation — only serialization.
+        # Scope the *wait* to same-base deps, where the dep's merge actually
+        # lands in the dependent's base. A FAILED dep still cascade-cancels above
+        # regardless of base; only the wait is loosened here. File-overlap
+        # conflict avoidance is handled separately by the dispatch filters
+        # (filter_file_conflicts / filter_rollup_conflicts), so dropping the
+        # cross-base wait does not remove conflict protection.
+        same_base = _same_base_branch(task, effective_dt)
+
         if effective_dt.status != TaskStatus.COMPLETED:
-            all_met = False
+            if same_base:
+                all_met = False
             continue
-        # For create tasks, also require PR to be merged
+        # For create tasks, also require PR to be merged — but only when the dep
+        # shares this task's base (else the merge lands where the dependent can't
+        # see it, so the merge requirement is meaningless).
         dt_type = (effective_dt.first_payload).get("type", "create")
-        if dt_type in ("create", "") and not await verify_pr_merged(
-            effective_dt, session
+        if (
+            dt_type in ("create", "")
+            and same_base
+            and not await verify_pr_merged(effective_dt, session)
         ):
             all_met = False
 

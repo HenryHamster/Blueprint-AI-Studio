@@ -2582,6 +2582,142 @@ async def test_check_deps_failed_dep_triggers_cascade(requeue_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_check_deps_cross_base_unmerged_does_not_block(requeue_db, mocker):
+    """A completed-but-unmerged dep in a DIFFERENT rollup (different base branch)
+    must NOT block dispatch. Its PR merges into its own rollup branch, which the
+    dependent (cut from a different base) never sees — so waiting buys no result
+    propagation, only serialization. Loosened 2026-05-28 for cross-rollup
+    parallelism (file-overlap conflicts are still guarded by the dispatch
+    filters)."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    async def _verify_not_merged(task, session):
+        return False  # PR still open / unmerged
+
+    project = Project(name="CrossBase Dep Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "dep", "base_branch": "rollup/Y"}],
+        status=TaskStatus.COMPLETED,
+    )
+    requeue_db.add(dep)
+    await requeue_db.commit()
+    await requeue_db.refresh(dep)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "external", "base_branch": "rollup/X"}
+        ],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(dep.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    result, _ = await _check_candidate_task_deps(
+        external, [dep], [uuid.UUID(str(dep.id))], requeue_db, _verify_not_merged
+    )
+    assert result == "eligible", (
+        f"cross-base unmerged dep should not block (timing-only), got {result!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_deps_same_base_unmerged_still_waits(requeue_db, mocker):
+    """A completed-but-unmerged dep that SHARES the dependent's base branch still
+    blocks — the dep's merge lands in the dependent's base, so the wait actually
+    propagates the result. (Guards against the cross-base loosening leaking into
+    same-base deps.)"""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    async def _verify_not_merged(task, session):
+        return False
+
+    project = Project(name="SameBase Dep Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    dep = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "dep", "base_branch": "rollup/X"}],
+        status=TaskStatus.COMPLETED,
+    )
+    requeue_db.add(dep)
+    await requeue_db.commit()
+    await requeue_db.refresh(dep)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "external", "base_branch": "rollup/X"}
+        ],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(dep.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    result, _ = await _check_candidate_task_deps(
+        external, [dep], [uuid.UUID(str(dep.id))], requeue_db, _verify_not_merged
+    )
+    assert result == "waiting", (
+        f"same-base unmerged dep must still block (propagation), got {result!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_deps_cross_base_failed_still_cascades(requeue_db, mocker):
+    """Loosening the cross-base *wait* must not drop failure safety: a genuinely
+    FAILED dep cascade-cancels the dependent regardless of base branch."""
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+
+    project = Project(name="CrossBase Failed Dep Test", user_id="u1")
+    requeue_db.add(project)
+    await requeue_db.commit()
+    await requeue_db.refresh(project)
+
+    dep = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "failed dep", "base_branch": "rollup/Y"}
+        ],
+        status=TaskStatus.FAILED,
+        latest_status_message="CODE_ERROR",
+        context={},
+    )
+    requeue_db.add(dep)
+    await requeue_db.commit()
+    await requeue_db.refresh(dep)
+
+    external = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "external", "base_branch": "rollup/X"}
+        ],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(dep.id)],
+    )
+    requeue_db.add(external)
+    await requeue_db.commit()
+    await requeue_db.refresh(external)
+
+    result, _ = await _check_candidate_task_deps(
+        external, [dep], [uuid.UUID(str(dep.id))], requeue_db, _noop_verify_pr_merged
+    )
+    assert result == "cascade_cancel", (
+        f"cross-base FAILED dep must still cascade-cancel, got {result!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_check_deps_scope_empty_dep_not_cascade(requeue_db, mocker):
     """A dep that ended CANCELLED with failure_category SCOPE_EMPTY is a
     clean 'scope already covered' exit — it must NOT cascade-cancel dependents.
