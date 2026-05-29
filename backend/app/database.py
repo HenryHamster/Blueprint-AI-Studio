@@ -13,6 +13,67 @@ from sqlalchemy.ext.asyncio import (
 DATABASE_URL = os.getenv("DATABASE_URL")
 logger = logging.getLogger(__name__)
 
+
+def _asyncpg_ssl_arg(value: str | None) -> object | None:
+    """Map a SQLAlchemy/libpq SSL hint to an asyncpg ``ssl=`` connect kwarg.
+
+    SQLAlchemy's asyncpg URL uses ``ssl=true``; libpq/asyncpg use ``sslmode``
+    values. asyncpg accepts the libpq sslmode strings ('disable'..'verify-full')
+    for its ``ssl`` kwarg, so we normalise to those. Returns ``None`` (asyncpg
+    default) when there is no hint.
+    """
+    if value is None:
+        return None
+    v = value.strip().lower()
+    if v in ("true", "1", "yes", "on", "require"):
+        return "require"
+    if v in ("false", "0", "no", "off", "disable"):
+        return "disable"
+    # libpq sslmode passthrough: allow / prefer / verify-ca / verify-full
+    return v
+
+
+def split_listen_dsn(database_url: str | None) -> tuple[str | None, object | None]:
+    """Derive ``(dsn, ssl)`` for a raw ``asyncpg.connect`` from a SQLAlchemy URL.
+
+    The LISTEN/NOTIFY connectors (``event_fanout``, ``jwt_revocation``) open
+    dedicated raw asyncpg connections rather than borrowing from the pooled
+    engine. They must NOT hand SQLAlchemy's URL straight to ``asyncpg.connect``:
+
+    * the ``+asyncpg`` driver tag must be stripped, and
+    * SQLAlchemy's ``?ssl=...`` query parameter must be pulled OUT of the DSN and
+      translated into asyncpg's ``ssl=`` kwarg. Left in the DSN, asyncpg does not
+      recognise ``ssl`` as a connection option and forwards it as a Postgres
+      *startup parameter*; the server then rejects every connect with
+      ``FATAL: parameter "ssl" cannot be changed now``, silently disabling all
+      cross-instance fanout/revocation (incident 2026-05-29).
+
+    Only the query string is rewritten — the ``user:pass@host`` netloc is left
+    byte-for-byte intact. Returns ``(None, None)`` when ``database_url`` is
+    absent or non-Postgres.
+    """
+    url = database_url or ""
+    if "postgresql" not in url:
+        return None, None
+    # Strip the SQLAlchemy driver tag: postgresql+asyncpg -> postgresql.
+    if "://" in url and "+" in url.split("://", 1)[0]:
+        scheme, rest = url.split("://", 1)
+        url = f"{scheme.split('+')[0]}://{rest}"
+    base, _sep, query = url.partition("?")
+    ssl_value: str | None = None
+    kept: list[str] = []
+    for pair in query.split("&"):
+        if not pair:
+            continue
+        key, _eq, val = pair.partition("=")
+        if key.lower() in ("ssl", "sslmode"):
+            ssl_value = val
+        else:
+            kept.append(pair)
+    dsn = base + (("?" + "&".join(kept)) if kept else "")
+    return dsn, _asyncpg_ssl_arg(ssl_value)
+
+
 # Counter of consecutive invalidate() failures. Once this hits the escalation
 # threshold we call `engine.sync_engine.pool.dispose()` to nuke the entire
 # pool — necessary backstop if individual connection.invalidate() calls keep

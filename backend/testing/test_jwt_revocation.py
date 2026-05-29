@@ -141,6 +141,35 @@ class TestGetRawDsn:
         dsn = jr._get_raw_dsn()
         assert dsn == "postgresql://user:pass@host/db"
 
+    def test_strips_ssl_query_param_and_surfaces_as_kwarg(self, monkeypatch):
+        # Regression (incident 2026-05-29): SQLAlchemy's `ssl=` query param must
+        # NOT remain in the DSN handed to asyncpg.connect — asyncpg forwards it
+        # as a Postgres startup parameter and the server rejects every connect
+        # with FATAL "parameter ssl cannot be changed now", silently breaking
+        # cross-instance revocation. It must surface as asyncpg's ssl= kwarg.
+        monkeypatch.setenv(
+            "DATABASE_URL", "postgresql+asyncpg://u:p@host:5432/db?ssl=require"
+        )
+        import app.jwt_revocation as jr
+
+        dsn = jr._get_raw_dsn()
+        assert dsn == "postgresql://u:p@host:5432/db"
+        assert "ssl" not in dsn
+        assert jr._get_ssl_arg() == "require"
+
+    def test_ssl_true_maps_to_require_kwarg(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@host/db?ssl=true")
+        import app.jwt_revocation as jr
+
+        assert jr._get_raw_dsn() == "postgresql://u:p@host/db"
+        assert jr._get_ssl_arg() == "require"
+
+    def test_no_ssl_param_yields_none_kwarg(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@host/db")
+        import app.jwt_revocation as jr
+
+        assert jr._get_ssl_arg() is None
+
 
 # ---------------------------------------------------------------------------
 # jwt_revocation_service — listener callback
@@ -330,7 +359,7 @@ class TestJwtRevocationServiceCallback:
             "app.jwt_revocation._get_raw_dsn", lambda: "postgresql://host/db"
         )
 
-        async def _make_conn(dsn):  # must accept dsn arg passed by the service
+        async def _make_conn(dsn, ssl=None):  # accept dsn + ssl kwarg from the service
             connect_calls.append(True)
             fake_conn = MagicMock()
             # Immediately invoke _on_terminate so terminated_event.wait() returns fast.
@@ -368,7 +397,7 @@ class TestJwtRevocationServiceCallback:
         )
         connect_calls = []
 
-        async def _failing_connect(dsn):
+        async def _failing_connect(dsn, ssl=None):
             connect_calls.append(dsn)
             if len(connect_calls) < 2:
                 raise ConnectionRefusedError("connection refused")

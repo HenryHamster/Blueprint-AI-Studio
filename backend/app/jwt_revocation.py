@@ -18,6 +18,8 @@ except ImportError:  # pragma: no cover — asyncpg absent in standalone test en
 
 from sqlalchemy import text
 
+from app.database import split_listen_dsn
+
 logger = logging.getLogger(__name__)
 
 _NOTIFY_CHANNEL = "task_terminated"
@@ -26,20 +28,20 @@ _IS_POSTGRES = "postgresql" in (os.getenv("DATABASE_URL") or "")
 
 
 def _get_raw_dsn() -> str | None:
-    """Return asyncpg-compatible DSN derived from DATABASE_URL.
+    """Return the asyncpg-compatible DSN derived from DATABASE_URL.
 
-    Strips the SQLAlchemy driver tag (e.g., '+asyncpg') so asyncpg can
-    parse it directly.  Returns None if DATABASE_URL is absent or does not
-    refer to Postgres.
+    Strips the SQLAlchemy driver tag (``+asyncpg``) AND the SQLAlchemy-style
+    ``ssl`` query parameter (see ``app.database.split_listen_dsn`` — left in the
+    DSN it makes asyncpg send ``ssl`` as a Postgres startup parameter, which the
+    server rejects with FATAL, breaking revocation). Returns None for
+    non-Postgres / absent DATABASE_URL.
     """
-    url = os.getenv("DATABASE_URL") or ""
-    if "postgresql" not in url:
-        return None
-    if "+" in url.split("://")[0]:
-        scheme, rest = url.split("://", 1)
-        base_scheme = scheme.split("+")[0]
-        url = f"{base_scheme}://{rest}"
-    return url
+    return split_listen_dsn(os.getenv("DATABASE_URL"))[0]
+
+
+def _get_ssl_arg() -> object | None:
+    """asyncpg ``ssl=`` kwarg derived from DATABASE_URL's ssl/sslmode hint."""
+    return split_listen_dsn(os.getenv("DATABASE_URL"))[1]
 
 
 async def _seed_deny_list(conn, terminated_task_ids: dict) -> None:
@@ -99,6 +101,7 @@ async def jwt_revocation_service() -> None:
     from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
 
     dsn = _get_raw_dsn()
+    _ssl_arg = _get_ssl_arg()
     if not dsn or _asyncpg is None:
         logger.info(
             "[JWT_REVOCATION] Non-Postgres dialect or asyncpg absent; listener inactive"
@@ -113,7 +116,7 @@ async def jwt_revocation_service() -> None:
     attempt = 0
     while True:
         try:
-            conn = await _asyncpg.connect(dsn)
+            conn = await _asyncpg.connect(dsn, ssl=_ssl_arg)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

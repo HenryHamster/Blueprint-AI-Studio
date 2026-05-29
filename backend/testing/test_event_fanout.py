@@ -38,6 +38,74 @@ class TestGetRawDsn:
         monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@host/db")
         assert ef._get_raw_dsn() == "postgresql://user:pass@host/db"
 
+    def test_strips_ssl_query_param_and_surfaces_as_kwarg(self, monkeypatch):
+        # Regression (incident 2026-05-29): SQLAlchemy's `ssl=` query param must
+        # NOT remain in the DSN handed to asyncpg.connect — asyncpg forwards it
+        # as a Postgres startup parameter and the server rejects every connect
+        # with FATAL "parameter ssl cannot be changed now", silently breaking
+        # cross-instance fanout. It must be surfaced as asyncpg's ssl= kwarg.
+        monkeypatch.setenv(
+            "DATABASE_URL", "postgresql+asyncpg://u:p@host:5432/db?ssl=require"
+        )
+        dsn = ef._get_raw_dsn()
+        assert dsn == "postgresql://u:p@host:5432/db"
+        assert "ssl" not in dsn
+        assert ef._get_ssl_arg() == "require"
+
+    def test_ssl_true_maps_to_require_kwarg(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@host/db?ssl=true")
+        assert ef._get_raw_dsn() == "postgresql://u:p@host/db"
+        assert ef._get_ssl_arg() == "require"
+
+    def test_no_ssl_param_yields_none_kwarg(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@host/db")
+        assert ef._get_ssl_arg() is None
+
+
+class TestSplitListenDsn:
+    """Direct unit tests for the shared DSN/ssl splitter (app.database)."""
+
+    def test_non_postgres_returns_none_none(self):
+        from app.database import split_listen_dsn
+
+        assert split_listen_dsn("sqlite:///x.db") == (None, None)
+        assert split_listen_dsn(None) == (None, None)
+
+    def test_strips_driver_tag_and_ssl(self):
+        from app.database import split_listen_dsn
+
+        dsn, ssl = split_listen_dsn("postgresql+asyncpg://u:p@h:5432/db?ssl=require")
+        assert dsn == "postgresql://u:p@h:5432/db"
+        assert ssl == "require"
+
+    def test_keeps_other_query_params(self):
+        from app.database import split_listen_dsn
+
+        dsn, ssl = split_listen_dsn(
+            "postgresql+asyncpg://u:p@h/db?ssl=true&application_name=fanout"
+        )
+        assert dsn == "postgresql://u:p@h/db?application_name=fanout"
+        assert ssl == "require"
+
+    def test_sslmode_passthrough_and_disable(self):
+        from app.database import split_listen_dsn
+
+        assert split_listen_dsn("postgresql://u@h/db?sslmode=verify-full") == (
+            "postgresql://u@h/db",
+            "verify-full",
+        )
+        assert split_listen_dsn("postgresql://u@h/db?ssl=disable") == (
+            "postgresql://u@h/db",
+            "disable",
+        )
+
+    def test_netloc_special_chars_preserved(self):
+        # Only the query is rewritten; the user:pass@host netloc is left intact.
+        from app.database import split_listen_dsn
+
+        dsn, _ = split_listen_dsn("postgresql+asyncpg://u:p%40ss@h/db?ssl=require")
+        assert dsn == "postgresql://u:p%40ss@h/db"
+
 
 # ---------------------------------------------------------------------------
 # _encode_payload / _decode_payload
