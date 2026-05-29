@@ -19664,3 +19664,67 @@ async def test_release_qualifier_infra_metrics_qualifier_runs_total(db_session):
     )
     assert result["qualifier_runs_total"] == 2
     assert result["release_infra_failure_total"] == 1
+
+
+class TestDigestMetricsModuleSeams:
+    """Seam guards for the digest_metrics decomposition.
+
+    ``compute_remediation_funnel`` and ``compute_direction_progress`` were the
+    two largest analytics in ``app.digest_metrics``. They now live in cohesive
+    sibling modules (``app.digest_remediation`` and
+    ``app.digest_direction_progress`` respectively) and are re-exported from
+    ``app.digest_metrics`` so existing import paths (and ``mock.patch``
+    targets) keep working. These tests fail loudly if either the canonical
+    home moves or the re-export is dropped.
+    """
+
+    def test_remediation_funnel_canonical_home_and_reexport(self):
+        import app.digest_metrics as digest_metrics
+        import app.digest_remediation as digest_remediation
+
+        # Canonical home defines it as a real function.
+        assert hasattr(digest_remediation, "compute_remediation_funnel")
+        # digest_metrics re-export resolves to the same object.
+        assert (
+            digest_metrics.compute_remediation_funnel
+            is digest_remediation.compute_remediation_funnel
+        )
+
+    def test_remediation_and_patterns_still_in_remediation_module(self):
+        import app.digest_metrics as digest_metrics
+        import app.digest_remediation as digest_remediation
+
+        assert (
+            digest_metrics.compute_remediation_and_patterns
+            is digest_remediation.compute_remediation_and_patterns
+        )
+
+    def test_direction_progress_canonical_home_and_reexport(self):
+        import app.digest_metrics as digest_metrics
+        import app.digest_direction_progress as digest_direction_progress
+
+        assert hasattr(digest_direction_progress, "compute_direction_progress")
+        assert (
+            digest_metrics.compute_direction_progress
+            is digest_direction_progress.compute_direction_progress
+        )
+
+    def test_extracted_modules_do_not_import_digest_metrics_at_load_time(self):
+        """The new sibling modules must not import ``digest_metrics`` at module
+        load time — that would create a circular import (digest_metrics imports
+        them). Cross-module needs are satisfied via function-local imports."""
+        import ast
+        import os
+
+        app_dir = os.path.join(os.path.dirname(__file__), "..", "app")
+        for module_file in ("digest_remediation.py", "digest_direction_progress.py"):
+            path = os.path.normpath(os.path.join(app_dir, module_file))
+            with open(path, encoding="utf-8") as fh:
+                tree = ast.parse(fh.read())
+            for node in tree.body:  # top-level statements only
+                if isinstance(node, ast.ImportFrom):
+                    assert node.module != "app.digest_metrics", (
+                        f"{module_file} imports app.digest_metrics at module "
+                        "load time — this risks a circular import. Use a "
+                        "function-local import instead."
+                    )

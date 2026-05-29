@@ -1159,113 +1159,13 @@ class TestBackendModuleSizeGuardrails:
             relative_path, count, max_lines, "backend"
         )
 
-    def test_main_py(self):
-        self._check_module("main.py")
-
-    def test_task_completion(self):
-        self._check_module("task_completion.py")
-
-    def test_task_lifecycle(self):
-        self._check_module("task_lifecycle.py")
-
-    def test_orchestrator(self):
-        self._check_module("orchestrator.py")
-
-    def test_admin(self):
-        self._check_module("admin.py")
-
-    def test_compute(self):
-        self._check_module("compute.py")
-
-    def test_github(self):
-        self._check_module("github.py")
-
-    def test_admin_settings(self):
-        self._check_module("routers/admin_settings.py")
-
-    def test_admin_analytics(self):
-        self._check_module("routers/admin_analytics.py")
-
-    def test_admin_digest(self):
-        self._check_module("routers/admin_digest.py")
-
-    def test_admin_pool_accounts(self):
-        self._check_module("routers/admin_pool_accounts.py")
-
-    def test_max_plan_pool(self):
-        self._check_module("max_plan_pool.py")
-
-    def test_anomaly_detection(self):
-        self._check_module("anomaly_detection.py")
-
-    def test_agent_router(self):
-        self._check_module("routers/agent.py")
-
-    def test_services(self):
-        self._check_module("services.py")
-
-    def test_agent_status(self):
-        self._check_module("routers/agent_status.py")
-
-    def test_autonomous_research(self):
-        self._check_module("autonomous_research.py")
-
-    def test_research_completion(self):
-        self._check_module("research_completion.py")
-
-    def test_strategic_completion(self):
-        self._check_module("strategic_completion.py")
-
-    def test_rollup_management(self):
-        self._check_module("rollup_management.py")
-
-    def test_reaper(self):
-        self._check_module("reaper.py")
-
-    def test_review_pipeline(self):
-        self._check_module("review_pipeline.py")
-
-    def test_deploy_health(self):
-        self._check_module("deploy_health.py")
-
-    def test_pipeline_regression_dispatcher(self):
-        self._check_module("pipeline_regression_dispatcher.py")
-
-    def test_review_learning(self):
-        self._check_module("review_learning.py")
-
-    def test_playbook_lifecycle(self):
-        self._check_module("playbook_lifecycle.py")
-
-    def test_playbook_storage(self):
-        self._check_module("playbook_storage.py")
-
-    def test_playbook_auto(self):
-        self._check_module("playbook_auto.py")
-
-    def test_models(self):
-        self._check_module("models.py")
-
-    def test_shared_state(self):
-        self._check_module("shared_state.py")
-
-    def test_strategic_spawning(self):
-        self._check_module("strategic_spawning.py")
-
-    def test_failure_classification(self):
-        self._check_module("failure_classification.py")
-
-    def test_notification_dispatch(self):
-        self._check_module("notification_dispatch.py")
-
-    def test_regression_signal_evaluators(self):
-        self._check_module("regression_signal_evaluators.py")
-
-    def test_digest_metrics(self):
-        self._check_module("digest_metrics.py")
-
-    def test_ci_completion(self):
-        self._check_module("ci_completion.py")
+    @pytest.mark.parametrize("relative_path", sorted(MODULE_SIZE_LIMITS))
+    def test_module_within_limit(self, relative_path):
+        """Every key in the ``backend`` section of module_size_limits.json is
+        enforced automatically — adding a key to the JSON is sufficient to
+        enforce its cap, with no per-file test method to maintain. The backend
+        section has no environment skip, so it always enforces."""
+        self._check_module(relative_path)
 
 
 _AGENT_SRC_ROOT = os.path.normpath(
@@ -1293,30 +1193,13 @@ class TestAgentModuleSizeGuardrails:
             relative_path, count, max_lines, "agent"
         )
 
-    def test_agent_modules(self):
-        for relative_path in (
-            "index.ts",
-            "prompt.ts",
-            "handlers/research-plan.ts",
-            "handlers/standard.ts",
-            "handlers/review-fix.ts",
-            "handlers/specialized.ts",
-            "handlers/memo.ts",
-            "handlers/code-change.ts",
-            "prompts/discovery.ts",
-            "prompts/project-context.ts",
-            "prompts/self-review.ts",
-            "prompts/analysis.ts",
-            "fix-loop-events.ts",
-            "constants.ts",
-            "json-extract.ts",
-            "workspacePrep.ts",
-            "reset.ts",
-            "providers/runners.ts",
-            "prompts/context-prefix.ts",
-            "handlers/fresh-reviewer.ts",
-        ):
-            self._check_agent(relative_path)
+    @pytest.mark.parametrize("relative_path", sorted(AGENT_SIZE_LIMITS))
+    def test_agent_module_within_limit(self, relative_path):
+        """Every key in the ``agent`` section of module_size_limits.json is
+        enforced automatically. Skips (via ``_check_agent`` →
+        ``_require_agent_src``) when ``agent/src`` is absent — e.g. CI's
+        backend-only Docker build context."""
+        self._check_agent(relative_path)
 
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
@@ -1409,107 +1292,14 @@ class TestFrontendSizeGuardrails:
             relative_path, count, max_lines, "frontend"
         )
 
-    def test_useappstate(self):
-        self._check_frontend("useAppState.ts")
-
-    def test_directions_panel(self):
-        self._check_frontend("components/DirectionsPanel.tsx")
-
-    def test_catchup_panel(self):
-        self._check_frontend("components/CatchUpPanel.tsx")
-
-    def test_task_detail_drawer(self):
-        self._check_frontend("components/TaskDetailDrawer.tsx")
-
-    def test_settings_dropdown(self):
-        self._check_frontend("components/SettingsDropdown.tsx")
-
-    def test_kanban_board(self):
-        self._check_frontend("components/KanbanBoard.tsx")
-
-    def test_kanban_column(self):
-        self._check_frontend("components/KanbanColumn.tsx")
-
-    def test_app_tsx(self):
-        self._check_frontend("App.tsx")
-
-    def test_task_card(self):
-        self._check_frontend("components/TaskCard.tsx")
-
-    def test_direction_card(self):
-        self._check_frontend("components/DirectionCard.tsx")
-
-    def test_pipeline_view(self):
-        self._check_frontend("components/PipelineView.tsx")
-
-    def test_dashboard_home(self):
-        self._check_frontend("components/DashboardHome.tsx")
-
-    def test_messages_panel(self):
-        self._check_frontend("components/MessagesPanel.tsx")
-
-    def test_metrics_dashboard(self):
-        self._check_frontend("components/MetricsDashboard.tsx")
-
-    def test_project_dashboard(self):
-        self._check_frontend("components/ProjectDashboard.tsx")
-
-    def test_autonomous_status(self):
-        self._check_frontend("components/AutonomousStatus.tsx")
-
-    def test_direction_progress_section(self):
-        self._check_frontend("components/DirectionProgressSection.tsx")
-
-    def test_remediation_funnel_section(self):
-        self._check_frontend("components/RemediationFunnelSection.tsx")
-
-    def test_orchestrator_health_bar(self):
-        self._check_frontend("components/OrchestratorHealthBar.tsx")
-
-    def test_recent_errors_widget(self):
-        self._check_frontend("components/RecentErrorsWidget.tsx")
-
-    def test_medium_scope_widget(self):
-        self._check_frontend("components/MediumScopeWidget.tsx")
-
-    def test_settings_notifications_section(self):
-        self._check_frontend("components/SettingsNotificationsSection.tsx")
-
-    def test_failure_stage_widget(self):
-        self._check_frontend("components/FailureStageWidget.tsx")
-
-    def test_pr_monitor_section(self):
-        self._check_frontend("components/PRMonitorSection.tsx")
-
-    def test_direction_auto_pause_widget(self):
-        self._check_frontend("components/DirectionAutoPauseWidget.tsx")
-
-    def test_scope_conversion_rates_section(self):
-        self._check_frontend("components/ScopeConversionRatesSection.tsx")
-
-    def test_scope_trends_section(self):
-        self._check_frontend("components/ScopeTrendsSection.tsx")
-
-    def test_provider_cost_panel(self):
-        self._check_frontend("components/ProviderCostPanel.tsx")
-
-    def test_drift_signals_card(self):
-        self._check_frontend("components/DriftSignalsCard.tsx")
-
-    def test_pool_account_health_panel(self):
-        self._check_frontend("components/PoolAccountHealthPanel.tsx")
-
-    def test_system_maturity_card(self):
-        self._check_frontend("components/SystemMaturityCard.tsx")
-
-    def test_provider_model_breakdown_panel(self):
-        self._check_frontend("components/ProviderModelBreakdownPanel.tsx")
-
-    def test_task_duration_widget(self):
-        self._check_frontend("components/TaskDurationWidget.tsx")
-
-    def test_pipeline_regressions_panel(self):
-        self._check_frontend("components/PipelineRegressionsPanel.tsx")
+    @pytest.mark.parametrize("relative_path", sorted(FRONTEND_SIZE_LIMITS))
+    def test_frontend_within_limit(self, relative_path):
+        """Every key in the ``frontend`` section of module_size_limits.json is
+        enforced automatically. Skips (via ``_check_frontend`` →
+        ``_require_admin_ui_src``) when ``admin-ui/src`` is absent (CI's
+        backend-only Docker context) or when ``SKIP_FRONTEND_SIZE_GUARDRAILS=1``
+        is set — these skips are preserved exactly."""
+        self._check_frontend(relative_path)
 
     def test_task_detail_drawer_meta(self):
         self._check_frontend("components/TaskDetailDrawerMeta.tsx")

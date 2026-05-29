@@ -5,8 +5,10 @@ import {
   SrTrendBreakdown,
   SrCatchRateFreshnessPill,
   SrMissedRetrospective,
+  SrUnhandledEdgesRetrospective,
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
+  FreshReviewerTrendBreakdown,
   SrScopeDriftVsExpansionCard,
   SrReviewerDisagreementsPanel,
   MissRateSparkline,
@@ -14,8 +16,10 @@ import {
   type SrTrendData,
   type DirectionSrEntry,
   type EdgesTrend,
+  type FreshReviewerTrend,
   type SrScopeDriftVsExpansion,
   type SrReviewerDisagreementsData,
+  type SrUnhandledEdgesTask,
 } from './SrTrendBreakdown';
 
 function makeTrends(): SrTrendData {
@@ -345,6 +349,94 @@ describe('SrMissedRetrospective drilldown', () => {
   });
 });
 
+describe('SrUnhandledEdgesRetrospective', () => {
+  function makeUnhandledTasks(): SrUnhandledEdgesTask[] {
+    return [
+      {
+        task_id: 'u1',
+        title: 'Recent create task',
+        task_type: 'create',
+        scope: 'small',
+        created_at: new Date().toISOString(),
+        unhandled_edges: [
+          { case: 'missing auth branch', handled: false, blind_spot: 'did not inspect role branch', origin: 'author' },
+        ],
+        pr_url: 'https://example.com/pr/9',
+      },
+      {
+        task_id: 'u2',
+        title: 'Recent fix task',
+        task_type: 'fix',
+        created_at: new Date().toISOString(),
+        unhandled_edges: [
+          { case: 'legacy rollback path', handled: false },
+        ],
+      },
+    ];
+  }
+
+  it('filters by task type and expands edge details', async () => {
+    const user = userEvent.setup();
+    render(<SrUnhandledEdgesRetrospective tasks={makeUnhandledTasks()} />);
+
+    expect(screen.getByText('Recent create task')).toBeInTheDocument();
+    expect(screen.getByText('Recent fix task')).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByDisplayValue('All types'), 'create');
+    expect(screen.getByText('Recent create task')).toBeInTheDocument();
+    expect(screen.queryByText('Recent fix task')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /expand recent create task/i }));
+    expect(screen.getByText('missing auth branch')).toBeInTheDocument();
+    expect(screen.getByText('did not inspect role branch')).toBeInTheDocument();
+    expect(screen.getByText('source: author')).toBeInTheDocument();
+  });
+
+  it('applies the rolling time window when the selected window changes', async () => {
+    const user = userEvent.setup();
+    const oldDate = new Date(Date.now() - 10 * 86400_000).toISOString();
+    const tasks: SrUnhandledEdgesTask[] = [
+      {
+        task_id: 'recent',
+        title: 'Recent task',
+        task_type: 'create',
+        created_at: new Date().toISOString(),
+        unhandled_edges: [{ case: 'recent edge', handled: false }],
+      },
+      {
+        task_id: 'old',
+        title: 'Old task',
+        task_type: 'create',
+        created_at: oldDate,
+        unhandled_edges: [{ case: 'old edge', handled: false }],
+      },
+    ];
+
+    const onWindowDaysChange = vi.fn();
+    const { rerender } = render(
+      <SrUnhandledEdgesRetrospective
+        tasks={tasks}
+        windowDays={14}
+        onWindowDaysChange={onWindowDaysChange}
+      />,
+    );
+    expect(screen.getByText('Recent task')).toBeInTheDocument();
+    expect(screen.getByText('Old task')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '7d' }));
+    expect(onWindowDaysChange).toHaveBeenCalledWith(7);
+    rerender(
+      <SrUnhandledEdgesRetrospective
+        tasks={tasks}
+        windowDays={7}
+        onWindowDaysChange={onWindowDaysChange}
+      />,
+    );
+    expect(screen.getByText('Recent task')).toBeInTheDocument();
+    expect(screen.queryByText('Old task')).not.toBeInTheDocument();
+  });
+});
+
 describe('SrTrendBreakdown skip rate line', () => {
   it('renders skip rate line when sr_skip_rate is present', () => {
     const trends: SrTrendData = {
@@ -520,6 +612,40 @@ describe('DirectionSrBreakdownPanel', () => {
     const panel = screen.getByTestId('direction-sr-breakdown-panel');
     expect(within(panel).queryByTestId('sr-trend-stale-badge')).toBeNull();
     expect(within(panel).queryByTestId('sr-trend-insufficient-badge')).toBeNull();
+  });
+});
+
+describe('FreshReviewerTrendBreakdown', () => {
+  function makeFreshReviewerTrend(overrides: Partial<FreshReviewerTrend> = {}): FreshReviewerTrend {
+    return {
+      bucket_mode: 'cycle',
+      current_cycle_id: 'abcdef123456',
+      previous_cycle_id: 'fedcba654321',
+      current_sample_size: 12,
+      per_category_hit_rate: {
+        correctness: { current: 0.75, previous: 0.6, delta: 0.15, trend: 'improving' },
+      },
+      approval_rate_lift: { current: 0.1, previous: 0.02, delta: 0.08, trend: 'improving' },
+      ...overrides,
+    };
+  }
+
+  it('renders category hit rates and approval lift when either seam is present', () => {
+    render(<FreshReviewerTrendBreakdown trend={makeFreshReviewerTrend()} />);
+    expect(screen.getByTestId('fr-trend-breakdown')).toBeInTheDocument();
+    expect(screen.getByText('Fresh-Reviewer Trend')).toBeInTheDocument();
+    expect(screen.getByText('correctness')).toBeInTheDocument();
+    expect(screen.getByText('75%')).toBeInTheDocument();
+    expect(screen.getByText('+10pp')).toBeInTheDocument();
+  });
+
+  it('returns null when the payload has neither per-category data nor approval lift', () => {
+    const { container } = render(
+      <FreshReviewerTrendBreakdown
+        trend={makeFreshReviewerTrend({ per_category_hit_rate: null, approval_rate_lift: null })}
+      />,
+    );
+    expect(container.firstChild).toBeNull();
   });
 });
 

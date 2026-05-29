@@ -3,7 +3,7 @@
   "backend": {
     "main.py": 3900,
     "task_completion.py": 4200,
-    "task_completion_investigation.py": 1350,
+    "task_completion_investigation.py": 2800,
     "task_completion_self_audit.py": 500,
     "task_lifecycle.py": 5750,
     "task_lifecycle_requeue.py": 750,
@@ -29,14 +29,17 @@
     "rollup_management.py": 3250,
     "reaper.py": 4200,
     "reaper_sweeps.py": 550,
-    "reaper_infra_recovery.py": 600,
+    "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 900,
     "review_pipeline.py": 2475,
     "deploy_health.py": 1250,
+    "digest_metrics.py": 3000,
+    "digest_remediation.py": 900,
+    "digest_direction_progress.py": 800,
     "regression_layer_classifier.py": 520,
     "regression_dispatcher_metrics.py": 800,
-    "regression_recovery_evaluators.py": 1000,
+    "regression_recovery_evaluators.py": 1450,
     "pipeline_regression_dispatcher.py": 9200,
     "release_qualifier.py": 2700,
     "release_qualifier_ci.py": 350,
@@ -66,7 +69,6 @@
     "failure_classification.py": 2400,
     "notification_dispatch.py": 2250,
     "regression_signal_evaluators.py": 2000,
-    "digest_metrics.py": 3800,
     "ci_completion.py": 1700
   },
   "agent": {
@@ -142,9 +144,15 @@
     "components/SystemMaturityCard.tsx": 200,
     "components/ProviderModelBreakdownPanel.tsx": 350,
     "components/TaskDurationWidget.tsx": 200,
+    "components/SrTrendBreakdown.tsx": 1350,
+    "components/srTrendBreakdown/panels.tsx": 600,
+    "components/srTrendBreakdown/primitives.tsx": 350,
+    "components/srTrendBreakdown/retrospectives.tsx": 400,
+    "components/srTrendBreakdown/types.ts": 350,
+    "components/SrMissedRetrospectivesPanel.tsx": 900,
+    "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/PipelineRegressionsPanel.tsx": 1800,
     "components/TaskDetailDrawerMeta.tsx": 1650,
-    "components/SrTrendBreakdown.tsx": 2400,
     "api.ts": 1300
   }
 }
