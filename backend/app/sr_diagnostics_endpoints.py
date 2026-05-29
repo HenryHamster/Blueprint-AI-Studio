@@ -33,7 +33,7 @@ from app.models import (
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.shared_state import get_project_integration_branch
-from app.digest_metrics import (
+from app.sr_review_quality_metrics import (
     _SR_CODE_CHANGE_TYPES,
     _author_sr_failed_categories,
     _sr_miss_drilldown,
@@ -210,8 +210,10 @@ async def list_sr_missed_retrospectives(
         if not missed:
             continue
         t_type = (t.first_payload or {}).get("type")
-        if category and category not in missed:
-            continue
+        # The `scope` filter narrows the full population (items, total, AND
+        # category_counts) — unlike `category`, which narrows only items /
+        # total / pagination below. Applying it before the category_counts
+        # accumulation keeps the chip counts honest to the scope-filtered subset.
         if scope and ctx.get("scope") != scope:
             continue
         # Severity filter: keep only tasks with a reviewer finding for a MISSED
@@ -228,10 +230,21 @@ async def list_sr_missed_retrospectives(
         if task_type and t_type != task_type:
             continue
 
-        current_index = total_matched
-        total_matched += 1
+        # Accumulate category_counts for the full missed-retrospective
+        # population within the (project, days, task_type) window — independent
+        # of the `category` filter. This keeps the chip counts for other
+        # categories honest when a category chip is active, so they show the
+        # same numbers an operator would see with the filter cleared.
         for cat in missed:
             category_counts[cat] += 1
+
+        # The `category` filter narrows only items / total / pagination, not
+        # the chip counts accumulated above.
+        if category and category not in missed:
+            continue
+
+        current_index = total_matched
+        total_matched += 1
         if current_index < page_start or current_index >= page_end:
             continue
 

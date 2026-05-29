@@ -1,8 +1,10 @@
 """
-Tests for three admin routers:
+Tests for admin routers:
 1. admin_users.py  — user management + project member management
 2. admin_projects.py — project CRUD + autonomous mode
 3. admin_notifications.py — alerts, messages, playbook
+4. admin_operator_triggers.py — manual operator triggers (self-audit, qualify,
+   clear-wave-deps, rollup, findings)
 """
 
 import json
@@ -5554,3 +5556,70 @@ class TestModifyTaskApplySeam:
         assert result["project_id"] == str(task.project_id)
         assert result["status"] == task.status
         assert "requires_approval" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_operator_triggers.py — Manual Operator Triggers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestClearWaveDeps:
+    @pytest.mark.asyncio
+    async def test_clears_depends_on_for_queued_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        """Queued tasks with depends_on are unblocked; returns cleared count."""
+        project = await _make_project(db_session)
+        dep_id = uuid.uuid4()
+        blocked = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep_id)],
+        )
+        db_session.add(blocked)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["cleared"] == 1
+        assert data["total_queued"] == 1
+
+        await db_session.refresh(blocked)
+        assert blocked.depends_on == []
+
+    @pytest.mark.asyncio
+    async def test_returns_zero_when_no_queued_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.post(f"/api/admin/projects/{project.id}/clear-wave-deps")
+        assert resp.status_code == 200
+        assert resp.json()["cleared"] == 0
+        assert resp.json()["total_queued"] == 0
+
+
+class TestGetProjectFindings:
+    @pytest.mark.asyncio
+    async def test_returns_empty_list_when_no_findings(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /findings returns an empty findings list when no data exists."""
+        project = await _make_project(db_session)
+        resp = await client.get(f"/api/admin/projects/{project.id}/findings")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["findings"] == []
+        assert data["count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_rejects_nonmember_project(self, client: AsyncClient, db_session):
+        """Non-member project returns 404."""
+        other_project = Project(name="Other", user_id="other-uid")
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+
+        resp = await client.get(f"/api/admin/projects/{other_project.id}/findings")
+        assert resp.status_code == 404

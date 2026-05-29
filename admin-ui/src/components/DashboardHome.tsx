@@ -881,6 +881,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [lastFetchError, setLastFetchError] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
+  const [srDrillThroughError, setSrDrillThroughError] = useState<{ taskId: string; message: string } | null>(null);
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
   const reviewQualitySectionRef = useRef<HTMLElement>(null);
@@ -967,12 +968,16 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const handleViewTaskById = useCallback((taskId: string) => {
     const task = tasks.find(t => t.id === taskId);
     if (task) {
+      setSrDrillThroughError(null);
       onViewTask(task);
-    } else {
-      fetchTask(taskId).then(onViewTask).catch(() => {
-        // Silently fail; user can retry or navigate manually
-      });
+      return;
     }
+    fetchTask(taskId).then(t => {
+      setSrDrillThroughError(null);
+      onViewTask(t);
+    }).catch(() => {
+      setSrDrillThroughError({ taskId, message: `Could not load task ${taskId}. It may be outside the current window.` });
+    });
   }, [tasks, onViewTask]);
 
   // Fetch data
@@ -1425,6 +1430,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           />
 
           {/* SR diagnostics stack */}
+          {srDrillThroughError && (
+            <div
+              role="alert"
+              data-testid="sr-drill-through-error"
+              className="flex items-start gap-2 rounded border border-red-500/40 bg-red-500/10 px-2.5 py-1.5 text-[11px] text-red-300"
+            >
+              <span className="flex-1">{srDrillThroughError.message}</span>
+              <button
+                type="button"
+                onClick={() => setSrDrillThroughError(null)}
+                aria-label="Dismiss task load error"
+                className="shrink-0 text-red-400 hover:text-red-200 font-bold leading-none"
+              >
+                ×
+              </button>
+            </div>
+          )}
           <SrDiagnosticsStack
             loading={loading}
             selectedProjectId={selectedProjectId}

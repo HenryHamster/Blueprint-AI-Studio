@@ -55,6 +55,12 @@ export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
   // CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx
   // which exercises it inline.
   'CatchUpNeedsAttentionSection',
+  // Remediation-pipeline funnel sub-section rendered exclusively inside
+  // CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
+  'CatchUpRemediationPipelineSection',
+  // Per-category trend row rendered exclusively inside SrTrendBreakdown (card and
+  // inline variants); viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.
+  'CategoryRow',
 ]);
 
 /**

@@ -22,7 +22,6 @@ from app.routers.admin_analytics import _derive_completed_at
 from app.digest_metrics import (
     _compute_layer_coverage_by_class,
     _compute_symptom_layers_by_class,
-    _stash_projected_task_fields,
     _summarize_symptoms_by_layer,
     compute_digest_cost_economics,
     compute_digest_trend_history,
@@ -33,8 +32,11 @@ from app.digest_metrics import (
     compute_remediation_and_patterns,
     compute_remediation_funnel,
     compute_retry_analytics,
-    compute_review_quality_metrics,
     compute_scope_mismatch_summary,
+)
+from app.sr_review_quality_metrics import (
+    _stash_projected_task_fields,
+    compute_review_quality_metrics,
     compute_sr_prediction_accuracy,
 )
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
@@ -11895,6 +11897,123 @@ async def test_sr_missed_retrospectives_category_counts_stable_across_pages(
     body_create = r_create.json()
     assert body_create["category_counts"]["correctness"] == 17
     assert body_create["category_counts"]["architecture"] == 5
+
+
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_category_counts_invariant_to_category_filter(
+    client: AsyncClient, db_session
+):
+    """category_counts reflects the full population regardless of the `category` filter.
+
+    When a category chip is active, `items`/`total` must narrow to that
+    category, but `category_counts` must stay byte-identical to the unfiltered
+    response so the other chips keep showing their independent counts.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 12 correctness-only, 8 architecture-only, 5 both.
+    for i in range(12):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Correctness-only task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    for i in range(8):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Architecture-only task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_first_attempt_rejection_categories": {"architecture": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"architecture": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    for i in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Both-category task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {
+                        "correctness": 1,
+                        "architecture": 1,
+                    },
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {
+                            "correctness": {"passed": True},
+                            "architecture": {"passed": True},
+                        },
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    # Unfiltered: full population. correctness 12+5=17, architecture 8+5=13.
+    r_all = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?page_size=200"
+    )
+    assert r_all.status_code == 200
+    body_all = r_all.json()
+    assert body_all["category_counts"]["correctness"] == 17
+    assert body_all["category_counts"]["architecture"] == 13
+    # total = 12 + 8 + 5 distinct tasks = 25
+    assert body_all["total"] == 25
+
+    # Filtered to correctness: chip counts must be IDENTICAL to unfiltered.
+    r_corr = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?category=correctness&page_size=200"
+    )
+    assert r_corr.status_code == 200
+    body_corr = r_corr.json()
+    assert body_corr["category_counts"] == body_all["category_counts"]
+    # ...but total / items narrow to only tasks that missed correctness (17).
+    assert body_corr["total"] == 17
+    assert len(body_corr["items"]) == 17
+    assert all(
+        "correctness" in item["missed_categories"] for item in body_corr["items"]
+    )
+
+    # Filtered to architecture: chip counts still identical to unfiltered.
+    r_arch = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?category=architecture&page_size=200"
+    )
+    assert r_arch.status_code == 200
+    body_arch = r_arch.json()
+    assert body_arch["category_counts"] == body_all["category_counts"]
+    assert body_arch["total"] == 13
+    assert len(body_arch["items"]) == 13
+    assert all(
+        "architecture" in item["missed_categories"] for item in body_arch["items"]
+    )
 
 
 @pytest.mark.asyncio

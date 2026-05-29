@@ -924,6 +924,34 @@ describe('DashboardHome', () => {
       (ueProps.onSelectTask as (id: string) => void)('task-unhandled');
       expect(onViewTask).toHaveBeenCalledWith(task);
     });
+
+    it('drill-through shows dismissable error banner when fetchTask rejects', async () => {
+      fetchTaskMock.mockRejectedValue(new Error('boom'));
+
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(baseDigest));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      const onViewTask = vi.fn();
+      const user = userEvent.setup();
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      await screen.findByText('All systems healthy');
+
+      const ueProps = capturedProps.srUnhandledEdges ?? {};
+      (ueProps.onSelectTask as (id: string) => void)('missing-task');
+
+      const banner = await screen.findByTestId('sr-drill-through-error');
+      expect(banner).toHaveTextContent('missing-task');
+      expect(onViewTask).not.toHaveBeenCalled();
+
+      // Dismiss the banner
+      const dismiss = screen.getByRole('button', { name: /dismiss task load error/i });
+      await user.click(dismiss);
+      expect(screen.queryByTestId('sr-drill-through-error')).not.toBeInTheDocument();
+    });
   });
 
   describe('SR drill-throughs resolve tasks by id (off-slice fetch fallback)', () => {

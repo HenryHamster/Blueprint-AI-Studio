@@ -59,6 +59,12 @@ _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
         # Needs-attention worklist sub-component rendered exclusively inside
         # CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
         "CatchUpNeedsAttentionSection",
+        # Remediation-pipeline funnel sub-section rendered exclusively inside
+        # CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
+        "CatchUpRemediationPipelineSection",
+        # Per-category trend row rendered exclusively inside SrTrendBreakdown;
+        # viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.
+        "CategoryRow",
     ]
 )
 

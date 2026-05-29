@@ -1,0 +1,236 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'fs';
+
+vi.mock('../index.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../index.js')>();
+  return {
+    ...actual,
+    WORKSPACE: '/tmp/workspace',
+    sendLog: vi.fn(),
+    getAgentToken: vi.fn().mockReturnValue(''),
+    git: vi.fn().mockReturnValue(''),
+  };
+});
+
+vi.mock('fs', () => ({
+  default: {
+    existsSync: vi.fn().mockReturnValue(false),
+    readFileSync: vi.fn().mockReturnValue(''),
+    writeFileSync: vi.fn(),
+    appendFileSync: vi.fn(),
+    mkdirSync: vi.fn(),
+    readdirSync: vi.fn().mockReturnValue([]),
+    unlinkSync: vi.fn(),
+  },
+}));
+
+import { writePrHelper } from './pr-helper.js';
+
+describe('writePrHelper', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  const writeScript = (cfg: Parameters<typeof writePrHelper>[0]): string => {
+    writePrHelper(cfg);
+    const script = capturedScripts['/tmp/workspace/pr'];
+    expect(script).toBeDefined();
+    return script;
+  };
+
+  const runScript = async (
+    script: string,
+    args: string[],
+    setup: (dir: string, realFs: typeof import('node:fs')) => void,
+  ): Promise<{ status: number; stdout: string }> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'pr-helper-'));
+    try {
+      setup(dir, realFs);
+      const scriptPath = realPath.join(dir, 'pr');
+      realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+      try {
+        const stdout = realCp.execFileSync('bash', [scriptPath, ...args], {
+          cwd: dir,
+          env: {
+            ...process.env,
+            WORKSPACE: dir,
+            PATH: `${realPath.join(dir, 'bin')}:${process.env.PATH ?? ''}`,
+            ORCHESTRATOR_URL: 'https://orchestrator.example',
+            AGENT_API_TOKEN: 'token-123',
+          },
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        return { status: 0, stdout };
+      } catch (err: unknown) {
+        const e = err as { status?: number; stdout?: string };
+        return { status: e.status ?? -1, stdout: e.stdout ?? '' };
+      }
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it('closes the PR with --superseded-by and writes the canonical PR URL', async () => {
+    const script = writeScript({
+      taskId: 'task-close-1',
+      workBranch: 'blueprint/task-close-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['close', '--pr-number', '42', '--superseded-by', '99'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-close-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"-X PATCH"*"pulls/42"*) [ -n "$OUT" ] && : > "$OUT"; printf '200'; exit 0 ;;
+  *"/issues/42/comments"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/jq`, `#!/bin/sh
+case "$*" in
+  *".data.token"*) printf 'token-abc\n' ;;
+  *) printf '{}\n' ;;
+esac
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(0);
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    expect(realFs.readFileSync('/tmp/pr_url_task-close-1', 'utf8').trim()).toBe('https://github.com/acme/repo/pull/42');
+  });
+
+  it('forces ./check test on LTS branches when backend paths changed', async () => {
+    const script = writeScript({
+      taskId: 'task-lts-1',
+      workBranch: 'blueprint/task-lts-1',
+      baseBranch: 'production',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+      promotionTarget: 'production',
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\necho "$*" > /tmp/workspace/check.args\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/production"*) exit 0 ;;
+  *"diff --name-only origin/production...HEAD"*) printf '%s\n' 'backend/app/main.py'; exit 0 ;;
+  *"diff --name-only HEAD"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/production..HEAD"*) printf '1\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-lts-1"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-lts-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/7\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(0);
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const checkArgs = realFs.readFileSync('/tmp/workspace/check.args', 'utf8').trim();
+    expect(checkArgs).toBe('test');
+  });
+
+  it('exits 4 when the created PR is mergeable=false with state dirty', async () => {
+    const script = writeScript({
+      taskId: 'task-dirty-1',
+      workBranch: 'blueprint/task-dirty-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, realFs) => {
+      const bin = `${dir}/bin`;
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-dirty-1"*) exit 0 ;;
+  *"rev-parse --verify origin/main"*) exit 1 ;;
+  *"rev-parse --verify main"*) exit 1 ;;
+  *"add -A"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-dirty-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":false,"mergeable_state":"dirty"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      realFs.writeFileSync(`${bin}/jq`, `#!/bin/sh
+case "$*" in
+  *".data.token"*) printf 'token-abc\n' ;;
+  *".data.html_url"*) printf 'https://github.com/acme/repo/pull/7\n' ;;
+  *".mergeable_state"*) printf 'dirty\n' ;;
+  *".mergeable // \\"null\\""*) printf 'false\n' ;;
+  *) printf '{}\n' ;;
+esac
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(4);
+    expect(result.stdout).toContain('mergeable=false, mergeable_state=dirty');
+  });
+});

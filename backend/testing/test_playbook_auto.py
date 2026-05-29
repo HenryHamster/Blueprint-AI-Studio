@@ -8090,7 +8090,7 @@ def test_compute_sr_prediction_accuracy_uses_cached_categories():
             call_count["n"] += 1
         return original(review_history, cached=cached)
 
-    with patch("app.digest_metrics._categorize_review_issues", side_effect=spy):
+    with patch("app.sr_review_quality_metrics._categorize_review_issues", side_effect=spy):
         result = compute_sr_prediction_accuracy(tasks)
 
     assert result is not None

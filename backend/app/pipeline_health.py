@@ -31,7 +31,7 @@ from app.models import (
 )
 from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
-from app.digest_metrics import (
+from app.sr_review_quality_metrics import (
     _compute_edges_considered_metrics,
     _serialize_sr_catch_rate_trends,
     compute_sr_prediction_accuracy,
