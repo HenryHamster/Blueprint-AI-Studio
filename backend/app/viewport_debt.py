@@ -65,6 +65,9 @@ _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
         # Per-category trend row rendered exclusively inside SrTrendBreakdown;
         # viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.
         "CategoryRow",
+        # SR diagnostics stack rendered exclusively inside DashboardHome;
+        # viewport coverage is provided by DashboardHome.viewport.test.tsx.
+        "SrDiagnosticsStack",
     ]
 )
 

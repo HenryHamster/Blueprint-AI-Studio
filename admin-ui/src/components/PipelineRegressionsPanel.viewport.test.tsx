@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, EscalationOutcomePanel, FirstAttemptComplianceTrendPanel, ClassKpisPanel, MttaTimelinePanel } from './PipelineRegressionsPanel';
+import { DispatcherHealthPanel, LayerCoverageHistogramPanel, ManualInterventionPanel, RegressionRateTrendPanel, LayerDefenseDensityPanel, ClassKpisPanel } from './PipelineRegressionsPanel';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('recharts', () => ({
@@ -466,103 +466,6 @@ describe('LayerDefenseDensityPanel — viewport regression', () => {
   });
 });
 
-describe('EscalationOutcomePanel — viewport regression', () => {
-  let root: Root | null = null;
-  let host: HTMLDivElement | null = null;
-  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
-  test('renders populated state without overflow at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      root = createRoot(host);
-      await act(async () => { root?.render(<EscalationOutcomePanel projectId="project-123" />); });
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    });
-  });
-  test('mobile cards render all buckets without text truncation at 375px', async () => {
-    await expectNoTextTruncationAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      root = createRoot(host);
-      await act(async () => { root?.render(<EscalationOutcomePanel projectId="project-123" />); });
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    }, { waitMs: 50 });
-  });
-  test('does not render when all merged_count are zero', async () => {
-    const { apiFetch } = await import('../api');
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({
-        by_reason: {
-          escalated_cross_layer: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 0 },
-          all_other: { merged_count: 0, retripped_within_30d_count: 0, durable_resolution_rate: null, median_hold_days: null, in_flight_excluded_count: 0 },
-        },
-        lookback_days: 30,
-        generated_at: new Date().toISOString(),
-      }), { status: 200 })
-    );
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    root = createRoot(host);
-    await act(async () => { root?.render(<EscalationOutcomePanel projectId="project-123" />); });
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    const panel = host.querySelector('[data-testid="escalation-outcome-panel"]');
-    if (panel) throw new Error('panel should not render when all merged_count are zero');
-  });
-});
-
-describe('FirstAttemptComplianceTrendPanel — viewport regression', () => {
-  let root: Root | null = null;
-  let host: HTMLDivElement | null = null;
-  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
-  test('renders populated trend without overflow at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      root = createRoot(host);
-      await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    });
-  });
-  test('mobile cards render window labels without text truncation at 375px', async () => {
-    await expectNoTextTruncationAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      root = createRoot(host);
-      await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    }, { waitMs: 50 });
-  });
-  test('does not render when all windows are empty', async () => {
-    const { apiFetch } = await import('../api');
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({
-        windows: Array.from({ length: 6 }, (_, i) => ({
-          window_start: new Date(Date.now() - (6 - i) * 7 * 86400_000).toISOString(),
-          window_end: new Date(Date.now() - (5 - i) * 7 * 86400_000).toISOString(),
-          first_attempt_compliant: 0,
-          followup_rescued: 0,
-          awaiting_backfill: 0,
-          rate: null,
-        })),
-        num_windows: 6,
-        window_days: 7,
-        generated_at: new Date().toISOString(),
-      }), { status: 200 })
-    );
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    root = createRoot(host);
-    await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    const panel = host.querySelector('[data-testid="first-attempt-compliance-trend-panel"]');
-    if (panel) throw new Error('panel should not render when all windows are empty');
-  });
-});
-
 describe('ManualInterventionPanel — viewport_regression baseline disclosure', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -592,57 +495,5 @@ describe('ManualInterventionPanel — viewport_regression baseline disclosure', 
       await act(async () => { root?.render(<ManualInterventionPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     });
-  });
-});
-
-describe('MttaTimelinePanel — viewport regression with per-stage elapsed/ETA', () => {
-  let root: Root | null = null;
-  let host: HTMLDivElement | null = null;
-  afterEach(() => { if (root) act(() => root?.unmount()); root = null; host?.remove(); host = null; });
-
-  test('renders populated state without overflow at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      root = createRoot(host);
-      await act(async () => { root?.render(<MttaTimelinePanel projectId="project-123" />); });
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    });
-  });
-
-  test('expands to show active cases with per-stage breakdown without overflow', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      root = createRoot(host);
-      await act(async () => { root?.render(<MttaTimelinePanel projectId="project-123" />); });
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-      // Find and click the expand button
-      const button = host?.querySelector('[data-testid="mtta-timeline-panel"] button');
-      if (button) button.dispatchEvent(new Event('click', { bubbles: true }));
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    });
-  });
-
-  test('does not render when no active cases exist', async () => {
-    const { apiFetch } = await import('../api');
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({
-        project_id: 'project-123',
-        window_days: 30,
-        class_count: 0,
-        recovery_cooldown_sec: 900,
-        classes: [],
-      }), { status: 200 })
-    );
-    host = document.createElement('div');
-    document.body.appendChild(host);
-    root = createRoot(host);
-    await act(async () => { root?.render(<MttaTimelinePanel projectId="project-123" />); });
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
-    const panel = host.querySelector('[data-testid="mtta-timeline-panel"]');
-    if (panel) throw new Error('panel should not render when no classes exist');
   });
 });

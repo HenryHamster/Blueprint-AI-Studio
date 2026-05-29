@@ -10,7 +10,7 @@ from sqlmodel import SQLModel, select
 from app.models import Project, Task, TaskStatus, Alert
 from app.reaper import reaper_service, _reaper_skip_counts
 from app.broadcast import broadcast_to_project, manager
-from app.services import _run_stale_branch_cleanup
+from app.branch_cleanup import _run_stale_branch_cleanup
 from app.task_lifecycle import _requeue_parent_task
 from app.orchestrator import _check_candidate_task_deps
 
@@ -437,7 +437,7 @@ async def cleanup_db(mocker):
         autoflush=False,
         expire_on_commit=False,
     )
-    mocker.patch("app.services.AsyncSessionLocal", Session)
+    mocker.patch("app.branch_cleanup.AsyncSessionLocal", Session)
 
     async with Session() as session:
         yield session
@@ -472,7 +472,7 @@ async def test_stale_branch_cleanup_preserves_active_task_branch(cleanup_db, moc
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -506,7 +506,7 @@ async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -535,7 +535,7 @@ async def test_stale_branch_cleanup_spares_protected_branches(cleanup_db, mocker
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -580,7 +580,7 @@ async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -607,7 +607,7 @@ async def test_stale_branch_cleanup_skips_branch_with_no_matching_task(
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -651,7 +651,7 @@ async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -700,7 +700,7 @@ async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
@@ -738,7 +738,7 @@ async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocke
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    mocker.patch("app.services._get_project_github_token", return_value="tok")
+    mocker.patch("app.branch_cleanup._get_project_github_token", return_value="tok")
     mocker.patch(
         "app.github.list_branches",
         return_value=[
