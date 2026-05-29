@@ -834,6 +834,47 @@ export async function fetchEfficiencyAxes(projectId: string): Promise<Efficiency
   return res.json();
 }
 
+export interface LlmCostModelRow {
+  provider: string;
+  model: string;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_usd: number;
+  mean_cost_per_task: number;
+  share_of_total_cost: number | null;
+  task_count: number;
+  llm_call_count: number;
+  priced: boolean;
+}
+
+export interface LlmCostBreakdownResponse {
+  window_days: number;
+  generated_at: string;
+  by_provider: Array<Omit<LlmCostModelRow, 'model' | 'priced'>>;
+  by_model: LlmCostModelRow[];
+  totals: {
+    total_input_tokens: number;
+    total_output_tokens: number;
+    total_cost_usd: number;
+    task_count: number;
+    priced_task_count: number;
+    unpriced_task_count: number;
+    unpriced_coverage_fraction: number | null;
+  };
+  unpriced_combos: string[];
+}
+
+export async function fetchLlmCostBreakdown(
+  projectId: string,
+  windowDays = 7,
+): Promise<LlmCostBreakdownResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/llm-cost-breakdown?window_days=${windowDays}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch LLM cost breakdown: ${res.status}`);
+  return res.json();
+}
+
 export interface CiResolution {
   state: 'green' | 'red' | 'pending' | 'no_checks';
   resolved_sha: string | null;

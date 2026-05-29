@@ -59,6 +59,18 @@ export interface HeaderBarProps {
   onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
   maxRetries: number;
   maxAutonomousTasksPerHour: number;
+  maxGlobalAutonomousTasksPerHour: number;
+  onUpdateMaxGlobalAutonomousRate: (value: number) => void;
+  maxPipelineSlots: number;
+  onUpdateMaxPipelineSlots: (value: number) => void;
+  reservedSlotsForTypes: Record<string, number>;
+  onUpdateReservedSlotsForTypes: (value: Record<string, number>) => void;
+  evaluatingPipelineTimeoutMinutes: number;
+  onUpdateEvaluatingPipelineTimeout: (value: number) => void;
+  evaluatingFailHours: number;
+  onUpdateEvaluatingFailHours: (value: number) => void;
+  ciBackstopTimeoutMinutes: number;
+  onUpdateCiBackstopTimeout: (value: number) => void;
   requireApprovalGates: boolean;
   autoArchiveEnabled: boolean;
   autoArchiveTerminalAfterDays: number;
@@ -220,6 +232,18 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateNotifyOnHighSignalMessage,
     maxRetries,
     maxAutonomousTasksPerHour,
+    maxGlobalAutonomousTasksPerHour,
+    onUpdateMaxGlobalAutonomousRate,
+    maxPipelineSlots,
+    onUpdateMaxPipelineSlots,
+    reservedSlotsForTypes,
+    onUpdateReservedSlotsForTypes,
+    evaluatingPipelineTimeoutMinutes,
+    onUpdateEvaluatingPipelineTimeout,
+    evaluatingFailHours,
+    onUpdateEvaluatingFailHours,
+    ciBackstopTimeoutMinutes,
+    onUpdateCiBackstopTimeout,
     requireApprovalGates,
     autoArchiveEnabled,
     autoArchiveTerminalAfterDays,
@@ -460,6 +484,18 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateAutoArchiveIntervalMinutes={onUpdateAutoArchiveIntervalMinutes}
           maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
           onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
+          maxGlobalAutonomousTasksPerHour={maxGlobalAutonomousTasksPerHour}
+          onUpdateMaxGlobalAutonomousRate={onUpdateMaxGlobalAutonomousRate}
+          maxPipelineSlots={maxPipelineSlots}
+          onUpdateMaxPipelineSlots={onUpdateMaxPipelineSlots}
+          reservedSlotsForTypes={reservedSlotsForTypes}
+          onUpdateReservedSlotsForTypes={onUpdateReservedSlotsForTypes}
+          evaluatingPipelineTimeoutMinutes={evaluatingPipelineTimeoutMinutes}
+          onUpdateEvaluatingPipelineTimeout={onUpdateEvaluatingPipelineTimeout}
+          evaluatingFailHours={evaluatingFailHours}
+          onUpdateEvaluatingFailHours={onUpdateEvaluatingFailHours}
+          ciBackstopTimeoutMinutes={ciBackstopTimeoutMinutes}
+          onUpdateCiBackstopTimeout={onUpdateCiBackstopTimeout}
           autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
           onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
           directionCooldownMinutes={directionCooldownMinutes}

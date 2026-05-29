@@ -4,6 +4,8 @@ import { Check, ChevronDown, ChevronRight, Settings } from 'lucide-react';
 export interface AutonomousConfigSectionProps {
   configCooldownHours: number;
   setConfigCooldownHours: (v: number) => void;
+  configProductiveCooldownMinutes: number;
+  setConfigProductiveCooldownMinutes: (v: number) => void;
   configIntervalMinutes: number;
   setConfigIntervalMinutes: (v: number) => void;
   configMaxParallel: number;
@@ -16,6 +18,8 @@ export interface AutonomousConfigSectionProps {
   setConfigMaxConcurrentAutoRemediations: (v: number) => void;
   configResidualRemediationCooldownHours: number;
   setConfigResidualRemediationCooldownHours: (v: number) => void;
+  configResidualAuditDeferEscalationThreshold: number;
+  setConfigResidualAuditDeferEscalationThreshold: (v: number) => void;
   configMaxActiveDirections: number;
   setConfigMaxActiveDirections: (v: number) => void;
   configArchitectureReviewFrequency: number;
@@ -41,12 +45,14 @@ export interface AutonomousConfigSectionProps {
 
 export function AutonomousConfigSection({
   configCooldownHours, setConfigCooldownHours,
+  configProductiveCooldownMinutes, setConfigProductiveCooldownMinutes,
   configIntervalMinutes, setConfigIntervalMinutes,
   configMaxParallel, setConfigMaxParallel,
   configMaxTotalResearch, setConfigMaxTotalResearch,
   configMaxTasksPerHour, setConfigMaxTasksPerHour,
   configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
   configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
+  configResidualAuditDeferEscalationThreshold, setConfigResidualAuditDeferEscalationThreshold,
   configMaxActiveDirections, setConfigMaxActiveDirections,
   configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
   configStrategicMaxIntervalMinutes, setConfigStrategicMaxIntervalMinutes,
@@ -95,6 +101,27 @@ export function AutonomousConfigSection({
               disabled={savingConfigField === 'autonomous_direction_cooldown_hours'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Productive direction cooldown (min) */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Shorter cooldown applied to directions whose previous cycle was productive (spawned merged work), controlling how quickly successful directions get re-fed. Stored in minutes (default 45).">Productive cooldown (min)</label>
+            <input
+              type="number"
+              min={1}
+              max={525600}
+              value={configProductiveCooldownMinutes}
+              onChange={e => setConfigProductiveCooldownMinutes(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('productive_direction_cooldown_minutes', configProductiveCooldownMinutes)}
+              disabled={savingConfigField === 'productive_direction_cooldown_minutes'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save (default: 45)"
             >
               <Check className="w-3.5 h-3.5" />
             </button>
@@ -221,6 +248,27 @@ export function AutonomousConfigSection({
               disabled={savingConfigField === 'residual_remediation_cooldown_hours'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Residual audit-defer escalation threshold */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Number of times a residual auto-remediation case may be deferred by an in-progress audit before the system escalates to operators via the 'Audit Deferred' notification (default 5).">Audit defer limit</label>
+            <input
+              type="number"
+              min={1}
+              max={50}
+              value={configResidualAuditDeferEscalationThreshold}
+              onChange={e => setConfigResidualAuditDeferEscalationThreshold(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('residual_audit_defer_escalation_threshold', configResidualAuditDeferEscalationThreshold)}
+              disabled={savingConfigField === 'residual_audit_defer_escalation_threshold'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save (default: 5)"
             >
               <Check className="w-3.5 h-3.5" />
             </button>

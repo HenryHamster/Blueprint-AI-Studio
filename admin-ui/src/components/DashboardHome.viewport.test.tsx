@@ -249,6 +249,22 @@ vi.mock('../api', () => ({
   })),
   CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
   fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
+  fetchLlmCostBreakdown: vi.fn(async () => ({
+    window_days: 7,
+    generated_at: '2026-05-20T12:00:00Z',
+    by_provider: [],
+    by_model: [],
+    totals: {
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      total_cost_usd: 0,
+      task_count: 0,
+      priced_task_count: 0,
+      unpriced_task_count: 0,
+      unpriced_coverage_fraction: null,
+    },
+    unpriced_combos: [],
+  })),
 }));
 
 describe('DashboardHome — viewport regression', () => {

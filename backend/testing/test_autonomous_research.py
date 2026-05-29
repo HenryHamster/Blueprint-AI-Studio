@@ -10624,6 +10624,46 @@ async def test_payload_too_large_writes_vision_bloat_marker(db_session, mocker):
     assert contributors[0]["size"] == 250000
 
 
+@pytest.mark.asyncio
+async def test_successful_strategic_spawn_clears_bloat_marker(db_session, mocker):
+    """A stale _strategic_payload_bloat_skip marker is cleared once a strategic
+    spawn succeeds again (payload shrank back under the cap), so the strategic-health
+    panel and stall investigation stop flagging a recovered bloat condition."""
+    project = Project(
+        name="Bloat Recovery Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "_strategic_payload_bloat_skip": {
+                "skipped_at": "2026-05-29T00:00:00",
+                "size": 310000,
+                "top_contributors": [{"key": "design_doc", "size": 250000}],
+            }
+        },  # no "purpose" key → force_strategic=True
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Both strategic spawner paths now succeed (payload fits under the cap).
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    assert "_strategic_payload_bloat_skip" not in (project.vision or {}), (
+        "Expected the stale bloat marker to be cleared after a successful strategic spawn"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Wall-clock strategic backstop
 # ─────────────────────────────────────────────────────────────────────────────

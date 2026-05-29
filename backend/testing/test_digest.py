@@ -20,6 +20,7 @@ from app.models import (
 )
 from app.routers.admin_analytics import _derive_completed_at
 from app.digest_metrics import (
+    _FAILURE_CLASS_LABELS,
     _compute_layer_coverage_by_class,
     _compute_symptom_layers_by_class,
     _summarize_symptoms_by_layer,
@@ -34,6 +35,7 @@ from app.digest_metrics import (
     compute_retry_analytics,
     compute_scope_mismatch_summary,
 )
+from app.failure_classification import ALL_FAILURE_CLASSES
 from app.sr_review_quality_metrics import (
     _stash_projected_task_fields,
     compute_review_quality_metrics,
@@ -18783,6 +18785,12 @@ def test_compute_failure_grouping_task_entry_fields():
     assert "taxonomy" in entry
     assert "timeout_subtype" in entry
     assert entry["timeout_subtype"] is None  # not AGENT_TIMEOUT
+
+
+def test_failure_grouping_labels_cover_all_canonical_failure_classes():
+    """Digest failure-group labels stay aligned with the canonical taxonomy."""
+    assert set(ALL_FAILURE_CLASSES) <= set(_FAILURE_CLASS_LABELS)
+    assert all(_FAILURE_CLASS_LABELS[cls] != cls for cls in ALL_FAILURE_CLASSES)
 
 
 # ---------------------------------------------------------------------------

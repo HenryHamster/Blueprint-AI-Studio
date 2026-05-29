@@ -54,6 +54,12 @@ export function useSettings(addToast: AddToast) {
   const [taskTypeProviderOverrides, setTaskTypeProviderOverrides] = useState<TaskTypeProviderOverrides>({});
   const [buildConfig, setBuildConfig] = useState<BuildConfig | null>(null);
   const [dailyCostCeilingUsd, setDailyCostCeilingUsd] = useState<number>(0);
+  const [maxGlobalAutonomousTasksPerHour, setMaxGlobalAutonomousTasksPerHour] = useState(50);
+  const [maxPipelineSlots, setMaxPipelineSlots] = useState(4);
+  const [reservedSlotsForTypes, setReservedSlotsForTypes] = useState<Record<string, number>>({ create: 1, research: 1 });
+  const [evaluatingPipelineTimeoutMinutes, setEvaluatingPipelineTimeoutMinutes] = useState(120);
+  const [evaluatingFailHours, setEvaluatingFailHours] = useState(48);
+  const [ciBackstopTimeoutMinutes, setCiBackstopTimeoutMinutes] = useState(60);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -95,6 +101,12 @@ export function useSettings(addToast: AddToast) {
         setAutoArchiveMaxTerminalTasksPerProject(data.auto_archive_max_terminal_tasks_per_project ?? 200);
         setAutoArchiveIntervalMinutes(data.auto_archive_interval_minutes ?? 60);
         setDailyCostCeilingUsd(data.daily_cost_ceiling_usd ?? 0);
+        setMaxGlobalAutonomousTasksPerHour(data.max_global_autonomous_tasks_per_hour ?? 50);
+        setMaxPipelineSlots(data.max_pipeline_slots ?? 4);
+        setReservedSlotsForTypes(data.reserved_slots_for_types ?? { create: 1, research: 1 });
+        setEvaluatingPipelineTimeoutMinutes(data.evaluating_pipeline_timeout_minutes ?? 120);
+        setEvaluatingFailHours(data.evaluating_fail_hours ?? 48);
+        setCiBackstopTimeoutMinutes(data.ci_backstop_timeout_minutes ?? 60);
         if (data.notification_config) {
           setNotificationConfig({
             webhook_url: data.notification_config.webhook_url ?? '',
@@ -629,6 +641,82 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateMaxGlobalAutonomousRate = async (value: number) => {
+    const v = Math.max(1, Math.min(500, value));
+    const prev = maxGlobalAutonomousTasksPerHour;
+    setMaxGlobalAutonomousTasksPerHour(v);
+    try {
+      await patchSettings({ max_global_autonomous_tasks_per_hour: v });
+    } catch {
+      setMaxGlobalAutonomousTasksPerHour(prev);
+      addToast('Failed to update global autonomous rate', 'error');
+    }
+  };
+
+  const updateMaxPipelineSlots = async (value: number) => {
+    const v = Math.max(0, Math.min(100, value));
+    const prev = maxPipelineSlots;
+    setMaxPipelineSlots(v);
+    try {
+      await patchSettings({ max_pipeline_slots: v });
+    } catch {
+      setMaxPipelineSlots(prev);
+      addToast('Failed to update pipeline slots', 'error');
+    }
+  };
+
+  const updateReservedSlotsForTypes = async (value: Record<string, number>) => {
+    const sanitized: Record<string, number> = {};
+    for (const key of ['create', 'research', 'plan'] as const) {
+      const n = value[key];
+      if (typeof n === 'number' && n > 0) sanitized[key] = Math.max(0, Math.min(10, Math.floor(n)));
+    }
+    const prev = reservedSlotsForTypes;
+    setReservedSlotsForTypes(sanitized);
+    try {
+      await patchSettings({ reserved_slots_for_types: sanitized });
+    } catch {
+      setReservedSlotsForTypes(prev);
+      addToast('Failed to update reserved slots', 'error');
+    }
+  };
+
+  const updateEvaluatingPipelineTimeout = async (value: number) => {
+    const v = Math.max(1, Math.min(1440, value));
+    const prev = evaluatingPipelineTimeoutMinutes;
+    setEvaluatingPipelineTimeoutMinutes(v);
+    try {
+      await patchSettings({ evaluating_pipeline_timeout_minutes: v });
+    } catch {
+      setEvaluatingPipelineTimeoutMinutes(prev);
+      addToast('Failed to update pipeline timeout', 'error');
+    }
+  };
+
+  const updateEvaluatingFailHours = async (value: number) => {
+    const v = Math.max(1, Math.min(168, value));
+    const prev = evaluatingFailHours;
+    setEvaluatingFailHours(v);
+    try {
+      await patchSettings({ evaluating_fail_hours: v });
+    } catch {
+      setEvaluatingFailHours(prev);
+      addToast('Failed to update evaluating fail hours', 'error');
+    }
+  };
+
+  const updateCiBackstopTimeout = async (value: number) => {
+    const v = Math.max(1, Math.min(1440, value));
+    const prev = ciBackstopTimeoutMinutes;
+    setCiBackstopTimeoutMinutes(v);
+    try {
+      await patchSettings({ ci_backstop_timeout_minutes: v });
+    } catch {
+      setCiBackstopTimeoutMinutes(prev);
+      addToast('Failed to update CI backstop timeout', 'error');
+    }
+  };
+
   const updateNotificationConfig = async (config: Partial<NotificationConfig>) => {
     const prev = notificationConfig;
     const next = { ...notificationConfig, ...config };
@@ -661,6 +749,8 @@ export function useSettings(addToast: AddToast) {
     autoArchiveEnabled, autoArchiveTerminalAfterDays,
     autoArchiveMaxTerminalTasksPerProject, autoArchiveIntervalMinutes,
     notificationConfig, dailyCostCeilingUsd,
+    maxGlobalAutonomousTasksPerHour, maxPipelineSlots, reservedSlotsForTypes,
+    evaluatingPipelineTimeoutMinutes, evaluatingFailHours, ciBackstopTimeoutMinutes,
     providerTierModelMap, taskTypeModelPreferences,
     taskTypeCategories, categoryRouting, taskTypeRouting,
     providerSettingsByEffort,
@@ -689,6 +779,8 @@ export function useSettings(addToast: AddToast) {
     updateAutoArchiveEnabled, updateAutoArchiveTerminalAfterDays,
     updateAutoArchiveMaxTerminalTasksPerProject, updateAutoArchiveIntervalMinutes,
     updateNotificationConfig, updateDailyCostCeiling,
+    updateMaxGlobalAutonomousRate, updateMaxPipelineSlots, updateReservedSlotsForTypes,
+    updateEvaluatingPipelineTimeout, updateEvaluatingFailHours, updateCiBackstopTimeout,
     updateBuildConfig,
   };
 }

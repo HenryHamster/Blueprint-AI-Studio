@@ -849,11 +849,17 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
         if spawned:
             research_spawn_count += 1
-            project.vision = {
+            new_vision = {
                 **(project.vision or {}),
                 "_research_spawn_count": research_spawn_count,
                 "_strategic_cycle_count": strategic_cycle_count,
             }
+            # Clear any stale payload-bloat skip marker now that a strategic spawn
+            # succeeded (payload shrank back under the cap). Otherwise the marker
+            # persists in vision and the strategic-health panel + stall investigation
+            # keep flagging a bloat condition that has already recovered.
+            new_vision.pop("_strategic_payload_bloat_skip", None)
+            project.vision = new_vision
             flag_modified(project, "vision")
             session.add(project)
             # 2026-05-03: commit BEFORE the tactical-research early-returns

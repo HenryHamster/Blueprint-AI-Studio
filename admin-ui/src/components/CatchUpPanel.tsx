@@ -131,6 +131,30 @@ interface DigestData {
     failed_again: number;
     success_rate: number | null;
   } | null;
+  migration_health?: {
+    current_schema_revision: string | null;
+    migration_tasks_in_window: number;
+    migration_tasks_succeeded: number;
+    migration_tasks_failed: number;
+    migration_errors_in_window: number;
+    auto_generated_migrations: number;
+  } | null;
+  prevention_efficacy?: {
+    preventive_tasks_created: number;
+    preventive_tasks_merged: number;
+    preventive_tasks_failed: number;
+    preventive_merge_rate: number | null;
+    overall_merge_rate: number | null;
+    assessment: 'positive' | 'negative' | 'neutral' | 'no_data';
+  } | null;
+  release_qualifier_infra_metrics?: {
+    qualifier_runs_total: number;
+    release_infra_failure_total: number;
+    audit_report_missing_count: number;
+    audit_report_parseable_but_unscoreable_count: number;
+    smoketest_report_missing_count: number;
+    release_infra_failure_streak_max: number;
+  } | null;
   total_merge_retries_saved?: number | null;
   merge_early_exit_count?: number | null;
   total_estimated_cost_usd?: number | null;
@@ -1474,6 +1498,75 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   )}
                 </div>
               )}
+
+              {/* Migration health */}
+              {digest.migration_health && (() => {
+                const mh = digest.migration_health;
+                const highlight = mh.migration_tasks_failed > 0 || mh.migration_errors_in_window > 0 || mh.auto_generated_migrations > 0;
+                return (
+                  <div className={`flex flex-wrap items-center gap-1.5 ${highlight ? 'rounded px-1.5 py-1 ring-1 ring-amber-500/40 bg-amber-500/5' : ''}`}>
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Migration health</span>
+                    {mh.current_schema_revision && (
+                      <span className="text-[10px] text-neutral-400 font-mono">rev {mh.current_schema_revision}</span>
+                    )}
+                    <span className="text-[10px] text-neutral-400">· {mh.migration_tasks_in_window} task{mh.migration_tasks_in_window === 1 ? '' : 's'}</span>
+                    <span className="text-[10px] text-emerald-400">· {mh.migration_tasks_succeeded} ok</span>
+                    <span className={`text-[10px] ${mh.migration_tasks_failed > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_tasks_failed} failed</span>
+                    <span className={`text-[10px] ${mh.migration_errors_in_window > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_errors_in_window} errors</span>
+                    {mh.auto_generated_migrations > 0 && (
+                      <span className="text-[10px] text-amber-400 font-semibold">· ⚠ {mh.auto_generated_migrations} auto-generated</span>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* Prevention efficacy */}
+              {digest.prevention_efficacy && (() => {
+                const pe = digest.prevention_efficacy;
+                const badge = pe.assessment === 'positive' ? 'text-emerald-400'
+                  : pe.assessment === 'negative' ? 'text-red-400'
+                  : pe.assessment === 'neutral' ? 'text-neutral-400' : 'text-neutral-500';
+                return (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prevention efficacy</span>
+                    <span className={`text-[10px] font-semibold uppercase ${badge}`}>{pe.assessment.replace('_', ' ')}</span>
+                    {pe.assessment === 'no_data' ? (
+                      <span className="text-[10px] text-neutral-500">· no preventive-context data in window</span>
+                    ) : (
+                      <>
+                        <span className="text-[10px] text-neutral-400">· preventive {pe.preventive_merge_rate != null ? `${Math.round(pe.preventive_merge_rate * 100)}%` : '—'}</span>
+                        <span className="text-[10px] text-neutral-500">vs overall {pe.overall_merge_rate != null ? `${Math.round(pe.overall_merge_rate * 100)}%` : '—'}</span>
+                        <span className="text-[10px] text-neutral-500">· {pe.preventive_tasks_merged}/{pe.preventive_tasks_created} merged</span>
+                      </>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {/* Release-qualifier infra failures */}
+              {digest.release_qualifier_infra_metrics && (() => {
+                const rq = digest.release_qualifier_infra_metrics;
+                const alert = rq.release_infra_failure_total > 0 || rq.release_infra_failure_streak_max > 0;
+                if (!alert) return null;
+                return (
+                  <div className="flex flex-wrap items-center gap-1.5 rounded px-1.5 py-1 ring-1 ring-red-500/40 bg-red-500/5">
+                    <span className="text-[10px] font-bold text-red-400 uppercase tracking-widest">Release infra failures</span>
+                    <span className="text-[10px] text-red-400">{rq.release_infra_failure_total} of {rq.qualifier_runs_total} runs</span>
+                    {rq.release_infra_failure_streak_max > 0 && (
+                      <span className="text-[10px] text-amber-400">· streak ×{rq.release_infra_failure_streak_max}</span>
+                    )}
+                    {rq.audit_report_missing_count > 0 && (
+                      <span className="text-[10px] text-neutral-400">· {rq.audit_report_missing_count} audit missing</span>
+                    )}
+                    {rq.audit_report_parseable_but_unscoreable_count > 0 && (
+                      <span className="text-[10px] text-neutral-400">· {rq.audit_report_parseable_but_unscoreable_count} unscoreable</span>
+                    )}
+                    {rq.smoketest_report_missing_count > 0 && (
+                      <span className="text-[10px] text-neutral-400">· {rq.smoketest_report_missing_count} smoketest missing</span>
+                    )}
+                  </div>
+                );
+              })()}
 
               {/* Retry pattern summary */}
               {digest.retry_pattern_summary && digest.retry_pattern_summary.total_multi_attempt_failures > 0 && (

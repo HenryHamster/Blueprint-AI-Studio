@@ -39,6 +39,7 @@ import { CatchUpPanel } from './components/CatchUpPanel';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
+import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 // StatusBar removed — redundant connection info
@@ -95,6 +96,43 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
+
+  // Snapshot of the full task-board filter combination + sort, fed to the saved-views
+  // switcher so it can detect "modified" state and capture new views.
+  const boardFilterSnapshot: BoardFilterSnapshot = {
+    query: s.searchQuery,
+    taskTypeFilter: s.taskTypeFilter,
+    statusFilter: s.statusFilter,
+    dateRange: s.dateRange,
+    blocked: s.blockedFilter,
+    requiresApproval: s.requiresApproval,
+    stuck: s.stuckFilter,
+    stuckMinSeconds: s.stuckMinSeconds,
+    failureClassFilter: s.failureClassFilter,
+    sortBy,
+  };
+
+  // Apply a saved view's snapshot through the live filter/sort setters so the
+  // active-filter persistence layer keeps working exactly as before. Destructure
+  // the (stable) setters so exhaustive-deps can track them without depending on
+  // the whole per-render state object `s`.
+  const {
+    setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange,
+    setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds,
+    setFailureClassFilter,
+  } = s;
+  const applyBoardView = useCallback((snap: BoardFilterSnapshot) => {
+    setSearchQuery(snap.query);
+    setTaskTypeFilter(snap.taskTypeFilter);
+    setStatusFilter(snap.statusFilter);
+    setDateRange(snap.dateRange);
+    setBlockedFilter(snap.blocked);
+    setRequiresApproval(snap.requiresApproval);
+    setStuckFilter(snap.stuck);
+    setStuckMinSeconds(snap.stuckMinSeconds);
+    setFailureClassFilter(snap.failureClassFilter);
+    setSortBy(snap.sortBy);
+  }, [setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange, setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds, setFailureClassFilter]);
 
   // Update browser tab title with unread message count
   useEffect(() => {
@@ -541,6 +579,18 @@ export default function App() {
         settingsInitialSection={settingsInitialSection}
         maxRetries={s.maxRetries}
         maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
+        maxGlobalAutonomousTasksPerHour={s.maxGlobalAutonomousTasksPerHour}
+        onUpdateMaxGlobalAutonomousRate={s.updateMaxGlobalAutonomousRate}
+        maxPipelineSlots={s.maxPipelineSlots}
+        onUpdateMaxPipelineSlots={s.updateMaxPipelineSlots}
+        reservedSlotsForTypes={s.reservedSlotsForTypes}
+        onUpdateReservedSlotsForTypes={s.updateReservedSlotsForTypes}
+        evaluatingPipelineTimeoutMinutes={s.evaluatingPipelineTimeoutMinutes}
+        onUpdateEvaluatingPipelineTimeout={s.updateEvaluatingPipelineTimeout}
+        evaluatingFailHours={s.evaluatingFailHours}
+        onUpdateEvaluatingFailHours={s.updateEvaluatingFailHours}
+        ciBackstopTimeoutMinutes={s.ciBackstopTimeoutMinutes}
+        onUpdateCiBackstopTimeout={s.updateCiBackstopTimeout}
         requireApprovalGates={s.requireApprovalGates}
         autoArchiveEnabled={s.autoArchiveEnabled}
         autoArchiveTerminalAfterDays={s.autoArchiveTerminalAfterDays}
@@ -881,6 +931,17 @@ export default function App() {
             <div className="flex-1" />
             <span className="text-xs text-neutral-500">{filteredTasks.length} of {s.tasks.length}</span>
           </div>}
+
+          {/* Named saved filter views */}
+          {s.viewMode !== 'home' && (
+            <BoardSavedViewsBar
+              key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
+              userId={s.user?.email}
+              projectId={s.selectedProjectId}
+              current={boardFilterSnapshot}
+              onApply={applyBoardView}
+            />
+          )}
 
           {/* Quick-filter preset buttons */}
           <QuickFilterPresets

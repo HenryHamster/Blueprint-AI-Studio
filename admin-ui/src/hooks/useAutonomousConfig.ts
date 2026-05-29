@@ -8,12 +8,14 @@ interface UseAutonomousConfigDeps {
 
 export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigDeps) {
   const [configCooldownHours, setConfigCooldownHours] = useState<number>(24);
+  const [configProductiveCooldownMinutes, setConfigProductiveCooldownMinutes] = useState<number>(45);
   const [configIntervalMinutes, setConfigIntervalMinutes] = useState<number>(60);
   const [configMaxParallel, setConfigMaxParallel] = useState<number>(3);
   const [configMaxTotalResearch, setConfigMaxTotalResearch] = useState<number>(5);
   const [configMaxTasksPerHour, setConfigMaxTasksPerHour] = useState<number>(10);
   const [configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations] = useState<number>(2);
   const [configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours] = useState<number>(24);
+  const [configResidualAuditDeferEscalationThreshold, setConfigResidualAuditDeferEscalationThreshold] = useState<number>(5);
   const [configMaxActiveDirections, setConfigMaxActiveDirections] = useState<number>(10);
   const [configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency] = useState<number>(3);
   const [configStrategicMaxIntervalMinutes, setConfigStrategicMaxIntervalMinutes] = useState<number>(180);
@@ -47,12 +49,14 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       if (!res.ok) return;
       const data = await res.json();
       if (data.autonomous_direction_cooldown_minutes != null) setConfigCooldownHours(data.autonomous_direction_cooldown_minutes / 60);
+      if (data.productive_direction_cooldown_minutes != null) setConfigProductiveCooldownMinutes(data.productive_direction_cooldown_minutes);
       if (data.autonomous_research_interval_minutes != null) setConfigIntervalMinutes(data.autonomous_research_interval_minutes);
       if (data.max_parallel_research_per_project != null) setConfigMaxParallel(data.max_parallel_research_per_project);
       if (data.max_total_research_per_project != null) setConfigMaxTotalResearch(data.max_total_research_per_project);
       if (data.max_autonomous_tasks_per_hour != null) setConfigMaxTasksPerHour(data.max_autonomous_tasks_per_hour);
       if (data.max_concurrent_auto_remediations != null) setConfigMaxConcurrentAutoRemediations(data.max_concurrent_auto_remediations);
       if (data.residual_remediation_cooldown_hours != null) setConfigResidualRemediationCooldownHours(data.residual_remediation_cooldown_hours);
+      if (data.residual_audit_defer_escalation_threshold != null) setConfigResidualAuditDeferEscalationThreshold(data.residual_audit_defer_escalation_threshold);
       if (data.max_active_directions != null) setConfigMaxActiveDirections(data.max_active_directions);
       if (data.architecture_review_frequency != null) setConfigArchitectureReviewFrequency(data.architecture_review_frequency);
       if (data.strategic_max_interval_minutes != null) setConfigStrategicMaxIntervalMinutes(data.strategic_max_interval_minutes);
@@ -102,12 +106,14 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
 
   return {
     configCooldownHours, setConfigCooldownHours,
+    configProductiveCooldownMinutes, setConfigProductiveCooldownMinutes,
     configIntervalMinutes, setConfigIntervalMinutes,
     configMaxParallel, setConfigMaxParallel,
     configMaxTotalResearch, setConfigMaxTotalResearch,
     configMaxTasksPerHour, setConfigMaxTasksPerHour,
     configMaxConcurrentAutoRemediations, setConfigMaxConcurrentAutoRemediations,
     configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
+    configResidualAuditDeferEscalationThreshold, setConfigResidualAuditDeferEscalationThreshold,
     configMaxActiveDirections, setConfigMaxActiveDirections,
     configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
     configStrategicMaxIntervalMinutes, setConfigStrategicMaxIntervalMinutes,

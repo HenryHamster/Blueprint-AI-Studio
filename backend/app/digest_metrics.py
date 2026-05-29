@@ -58,12 +58,39 @@ from app.sr_review_quality_metrics import (  # noqa: F401
     _compute_parallel_review_effectiveness,
     compute_review_quality_metrics,
 )
+from app.failure_classification import (
+    AGENT_STALLED,
+    AGENT_TIMEOUT,
+    BLOCKED_PRECONDITION,
+    CODE_ERROR,
+    EXTERNAL_API,
+    MIGRATION_ERROR,
+    PROVISION_FAILURE,
+    RATE_LIMIT,
+    SCOPE_EMPTY,
+    SCOPE_OVERFLOW,
+    VIEWPORT_REGRESSION,
+)
 
 logger = logging.getLogger(__name__)
 
 _CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
 
 _LAYER_SUMMARY_WINDOW = timedelta(hours=48)
+
+_FAILURE_CLASS_LABELS = {
+    CODE_ERROR: "Code Error",
+    PROVISION_FAILURE: "Provision Failure",
+    AGENT_TIMEOUT: "Agent Timeout",
+    EXTERNAL_API: "External API",
+    RATE_LIMIT: "Rate Limit",
+    SCOPE_OVERFLOW: "Scope Overflow",
+    MIGRATION_ERROR: "Migration Error",
+    VIEWPORT_REGRESSION: "Viewport Regression",
+    AGENT_STALLED: "Agent Stalled",
+    BLOCKED_PRECONDITION: "Blocked — precondition",
+    SCOPE_EMPTY: "Scope Empty",
+}
 
 
 def _compute_first_attempt_breakdowns(
@@ -721,7 +748,6 @@ def compute_failure_grouping(
         classify_failure,
         classify_failure_taxonomy,
         classify_timeout_subtype,
-        AGENT_TIMEOUT,
     )
     from app.failure_stage import _derive_failure_stage
     from app.routers.admin_analytics import (
@@ -730,14 +756,6 @@ def compute_failure_grouping(
         _derive_completed_at,
     )
 
-    _failure_class_labels = {
-        "CODE_ERROR": "Code Error",
-        "PROVISION_FAILURE": "Provision Failure",
-        "AGENT_TIMEOUT": "Agent Timeout",
-        "EXTERNAL_API": "External API",
-        "RATE_LIMIT": "Rate Limit",
-        "SCOPE_OVERFLOW": "Scope Overflow",
-    }
     _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
     _failure_stage_counts: Dict[str, int] = {}
     _cost_by_failure_class: Dict[str, float] = {}
@@ -808,7 +826,7 @@ def compute_failure_grouping(
         [
             {
                 "failure_class": cls,
-                "label": _failure_class_labels.get(cls, cls),
+                "label": _FAILURE_CLASS_LABELS.get(cls, cls),
                 "count": len(tasks),
                 "tasks": tasks,
             }

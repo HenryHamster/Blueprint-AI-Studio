@@ -1072,6 +1072,81 @@ def _check_anomaly_restoration() -> bool:
     return True
 
 
+def manual_restore_anomaly_adjustments() -> dict:
+    """Operator-initiated early restore of the active anomaly throttle.
+
+    Unlike _check_anomaly_restoration, this does NOT require the triggering
+    anomalies to have cleared — the operator asserts the root cause is
+    resolved and wants full capacity back now rather than waiting on the
+    automatic safeguard. It still respects the same deploy_health edge cases
+    the automatic path guards (capacity independently paused/ramped) rather
+    than blindly overwriting the live max_concurrent_vms.
+
+    Returns a dict describing the outcome (``restored`` is False when there is
+    no active adjustment to clear).
+    """
+    adjustments = _shared_state.anomaly_adjustments
+    rc = _shared_state.runtime_config
+
+    if not adjustments["active"]:
+        return {"restored": False, "reason": "no_active_adjustment"}
+
+    pre_max_vms = adjustments["pre_adjustment_max_vms"]
+    pre_gate = adjustments["pre_adjustment_failure_gate"]
+    cleared_triggers = list(adjustments.get("trigger_anomalies") or [])
+
+    if pre_max_vms is not None:
+        current_max_vms = rc["max_concurrent_vms"]
+        expected_adjusted_vms = adjustments.get("adjusted_max_vms")
+        if expected_adjusted_vms is None:
+            expected_adjusted_vms = max(2, pre_max_vms // 2)
+        if current_max_vms < expected_adjusted_vms:
+            # deploy_health has paused (=0) or is ramping (1-2) below our floor —
+            # it now owns max_concurrent_vms. Leave rc alone and only clear the
+            # stash; deploy_health's pre_pause_max_vms already captured our
+            # pre_adjustment capacity, so its resume path ramps cleanly.
+            logger.info(
+                "[ANOMALY_ACTION] Manual restore: current_max_vms=%d below "
+                "anomaly-adjusted floor (%d) — deploy_health owns capacity; "
+                "clearing stash without overwriting live value",
+                current_max_vms,
+                expected_adjusted_vms,
+            )
+        elif current_max_vms >= pre_max_vms:
+            # Already at or above pre-adjustment capacity; nothing to restore.
+            pass
+        else:
+            # Restore the operator's stashed pre-adjustment capacity. This is an
+            # explicit command, so we restore fully even if the live value
+            # diverged from our adjusted floor (the divergence the automatic
+            # path would treat as an admin override to preserve).
+            rc["max_concurrent_vms"] = pre_max_vms
+
+    if pre_gate is not None:
+        adjustments["failure_gate_threshold"] = pre_gate
+
+    adjustments["active"] = False
+    adjustments["adjusted_at"] = None
+    adjustments["trigger_anomalies"] = []
+    adjustments["pre_adjustment_max_vms"] = None
+    adjustments["pre_adjustment_failure_gate"] = None
+    adjustments["adjusted_max_vms"] = None
+
+    logger.info(
+        "[ANOMALY_ACTION] Manual restore by operator: max_vms=%s, "
+        "failure_gate=%s, cleared_triggers=%s",
+        rc["max_concurrent_vms"],
+        adjustments["failure_gate_threshold"],
+        cleared_triggers,
+    )
+    return {
+        "restored": True,
+        "max_concurrent_vms": rc["max_concurrent_vms"],
+        "failure_gate_threshold": adjustments["failure_gate_threshold"],
+        "cleared_trigger_anomalies": cleared_triggers,
+    }
+
+
 def _check_fast_recovery() -> bool:
     """Return True if recent task outcomes indicate the triggering issues have resolved.
 

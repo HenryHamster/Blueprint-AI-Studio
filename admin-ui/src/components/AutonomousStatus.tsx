@@ -76,6 +76,15 @@ interface StrategicBlockingGuard {
   reason: string;
   failures?: number;
   decay_at?: string;
+  size?: number;
+  skipped_at?: string;
+  top_contributors?: { key: string; size: number }[];
+}
+
+interface PayloadBloatSkip {
+  skipped_at?: string;
+  size?: number;
+  top_contributors?: { key: string; size: number }[];
 }
 
 interface StrategicCycleEntry {
@@ -93,6 +102,7 @@ interface StrategicCycleEntry {
 interface StrategicDebug {
   phase: number;
   blocking_guards: StrategicBlockingGuard[];
+  payload_bloat_skip?: PayloadBloatSkip | null;
   has_purpose: boolean;
   research_spawn_count: number;
   strategic_cycle_count: number;
@@ -426,9 +436,39 @@ function formatTimeAgoShort(iso: string | null): string {
   return `${Math.floor(hrs / 24)}d ago`;
 }
 
+function PayloadBloatIndicator({ skip }: { skip: PayloadBloatSkip }) {
+  const sizeKb = skip.size != null ? Math.round(skip.size / 1024) : null;
+  const contributors = (skip.top_contributors || []).slice(0, 3);
+  return (
+    <div className="rounded-md bg-amber-500/10 border border-amber-500/40 px-2.5 py-2">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider flex items-center gap-1">
+          <AlertTriangle className="w-3 h-3 shrink-0" />Strategic paused — payload too large
+        </span>
+        {skip.skipped_at && (
+          <span className="font-mono text-[10px] text-amber-400/70">{formatTimeAgoShort(skip.skipped_at)}</span>
+        )}
+      </div>
+      <p className="text-[11px] leading-tight text-amber-300 mt-1">
+        Assembled payload{sizeKb != null ? ` (${sizeKb} KB)` : ''} exceeds the 256 KB cap, so strategic refresh is frozen.
+        Compact{' '}
+        {contributors.length > 0
+          ? contributors.map((c) => c.key).join(', ')
+          : 'design_doc / problem_model'}
+        {' '}rather than hunting for a stuck task.
+      </p>
+    </div>
+  );
+}
+
 function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
+  const bloat = strategic.payload_bloat_skip;
+  const otherGuards = strategic.blocking_guards.filter((g) => g.guard !== 'payload_bloat_skip');
   return (
     <div className="mt-3 pt-3 border-t border-neutral-800 space-y-1.5">
+      {/* Payload-bloat stall takes precedence over the green countdown */}
+      {bloat && <PayloadBloatIndicator skip={bloat} />}
+
       {/* Active task or next countdown */}
       {strategic.active_task ? (
         <div className="flex items-center justify-between text-[11px]">
@@ -437,7 +477,7 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
           </span>
           <span className="text-cyan-400 font-mono text-[10px]">{strategic.active_task.status}</span>
         </div>
-      ) : strategic.next_strategic_in != null && (
+      ) : bloat ? null : strategic.next_strategic_in != null && (
         <div className="flex items-center justify-between text-[11px] text-neutral-500">
           <span>Next strategic cycle</span>
           <span className="font-mono">
@@ -475,11 +515,11 @@ function StrategicSection({ strategic }: { strategic: StrategicDebug }) {
         </div>
       )}
 
-      {strategic.blocking_guards.length > 0 && (
+      {otherGuards.length > 0 && (
         <div className="rounded-md bg-red-500/5 border border-red-500/20 px-2.5 py-2">
           <p className="text-[10px] font-semibold text-red-400 uppercase tracking-wider mb-1.5">Why strategic is blocked</p>
           <ul className="space-y-1">
-            {strategic.blocking_guards.map((g) => (
+            {otherGuards.map((g) => (
               <li key={g.guard} className="flex items-start gap-1.5">
                 <AlertTriangle className="w-3 h-3 shrink-0 text-red-400 mt-px" />
                 <span className="text-[11px] leading-tight text-red-300">{StrategicGuardLabel(g)}</span>

@@ -662,6 +662,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               <AutonomousConfigSection
                 configCooldownHours={config.configCooldownHours}
                 setConfigCooldownHours={config.setConfigCooldownHours}
+                configProductiveCooldownMinutes={config.configProductiveCooldownMinutes}
+                setConfigProductiveCooldownMinutes={config.setConfigProductiveCooldownMinutes}
                 configIntervalMinutes={config.configIntervalMinutes}
                 setConfigIntervalMinutes={config.setConfigIntervalMinutes}
                 configMaxParallel={config.configMaxParallel}
@@ -674,6 +676,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 setConfigMaxConcurrentAutoRemediations={config.setConfigMaxConcurrentAutoRemediations}
                 configResidualRemediationCooldownHours={config.configResidualRemediationCooldownHours}
                 setConfigResidualRemediationCooldownHours={config.setConfigResidualRemediationCooldownHours}
+                configResidualAuditDeferEscalationThreshold={config.configResidualAuditDeferEscalationThreshold}
+                setConfigResidualAuditDeferEscalationThreshold={config.setConfigResidualAuditDeferEscalationThreshold}
                 configMaxActiveDirections={config.configMaxActiveDirections}
                 setConfigMaxActiveDirections={config.setConfigMaxActiveDirections}
                 configArchitectureReviewFrequency={config.configArchitectureReviewFrequency}

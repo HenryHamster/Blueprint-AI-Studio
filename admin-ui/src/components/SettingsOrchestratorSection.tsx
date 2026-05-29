@@ -18,6 +18,18 @@ interface SettingsOrchestratorSectionProps {
   onUpdateAutoArchiveIntervalMinutes: (value: number) => void;
   maxAutonomousTasksPerHour: number;
   onUpdateMaxAutonomousRate: (value: number) => void;
+  maxGlobalAutonomousTasksPerHour: number;
+  onUpdateMaxGlobalAutonomousRate: (value: number) => void;
+  maxPipelineSlots: number;
+  onUpdateMaxPipelineSlots: (value: number) => void;
+  reservedSlotsForTypes: Record<string, number>;
+  onUpdateReservedSlotsForTypes: (value: Record<string, number>) => void;
+  evaluatingPipelineTimeoutMinutes: number;
+  onUpdateEvaluatingPipelineTimeout: (value: number) => void;
+  evaluatingFailHours: number;
+  onUpdateEvaluatingFailHours: (value: number) => void;
+  ciBackstopTimeoutMinutes: number;
+  onUpdateCiBackstopTimeout: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
   directionCooldownMinutes: number;
@@ -28,6 +40,8 @@ interface SettingsOrchestratorSectionProps {
   onPauseAllAutonomous: () => Promise<void>;
   onRestartOrchestrator: () => Promise<void>;
 }
+
+const RESERVED_SLOT_TYPES = ['create', 'research', 'plan'] as const;
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
   return (
@@ -58,6 +72,18 @@ export function SettingsOrchestratorSection({
   onUpdateAutoArchiveIntervalMinutes,
   maxAutonomousTasksPerHour,
   onUpdateMaxAutonomousRate,
+  maxGlobalAutonomousTasksPerHour,
+  onUpdateMaxGlobalAutonomousRate,
+  maxPipelineSlots,
+  onUpdateMaxPipelineSlots,
+  reservedSlotsForTypes,
+  onUpdateReservedSlotsForTypes,
+  evaluatingPipelineTimeoutMinutes,
+  onUpdateEvaluatingPipelineTimeout,
+  evaluatingFailHours,
+  onUpdateEvaluatingFailHours,
+  ciBackstopTimeoutMinutes,
+  onUpdateCiBackstopTimeout,
   autonomousResearchIntervalMinutes,
   onUpdateAutonomousResearchInterval,
   directionCooldownMinutes,
@@ -71,12 +97,37 @@ export function SettingsOrchestratorSection({
   const [vmInputVal, setVmInputVal] = useState(String(maxConcurrentVMs));
   const [retriesInputVal, setRetriesInputVal] = useState(String(maxRetries));
   const [autonomousRateInputVal, setAutonomousRateInputVal] = useState(String(maxAutonomousTasksPerHour));
+  const [globalRateInputVal, setGlobalRateInputVal] = useState(String(maxGlobalAutonomousTasksPerHour));
+  const [pipelineSlotsInputVal, setPipelineSlotsInputVal] = useState(String(maxPipelineSlots));
+  const [reservedInputVals, setReservedInputVals] = useState<Record<string, string>>(() =>
+    Object.fromEntries(RESERVED_SLOT_TYPES.map(t => [t, String(reservedSlotsForTypes[t] ?? 0)])),
+  );
+  const [evalTimeoutInputVal, setEvalTimeoutInputVal] = useState(String(evaluatingPipelineTimeoutMinutes));
+  const [evalFailHoursInputVal, setEvalFailHoursInputVal] = useState(String(evaluatingFailHours));
+  const [ciBackstopInputVal, setCiBackstopInputVal] = useState(String(ciBackstopTimeoutMinutes));
   const [restarting, setRestarting] = useState(false);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
 
   useEffect(() => { setVmInputVal(String(maxConcurrentVMs)); }, [maxConcurrentVMs]);
   useEffect(() => { setRetriesInputVal(String(maxRetries)); }, [maxRetries]);
   useEffect(() => { setAutonomousRateInputVal(String(maxAutonomousTasksPerHour)); }, [maxAutonomousTasksPerHour]);
+  useEffect(() => { setGlobalRateInputVal(String(maxGlobalAutonomousTasksPerHour)); }, [maxGlobalAutonomousTasksPerHour]);
+  useEffect(() => { setPipelineSlotsInputVal(String(maxPipelineSlots)); }, [maxPipelineSlots]);
+  useEffect(() => {
+    setReservedInputVals(Object.fromEntries(RESERVED_SLOT_TYPES.map(t => [t, String(reservedSlotsForTypes[t] ?? 0)])));
+  }, [reservedSlotsForTypes]);
+  useEffect(() => { setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); }, [evaluatingPipelineTimeoutMinutes]);
+  useEffect(() => { setEvalFailHoursInputVal(String(evaluatingFailHours)); }, [evaluatingFailHours]);
+  useEffect(() => { setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); }, [ciBackstopTimeoutMinutes]);
+
+  const reserved = (t: string) => reservedSlotsForTypes[t] ?? 0;
+  const setReserved = (t: string, value: number) =>
+    onUpdateReservedSlotsForTypes({ ...reservedSlotsForTypes, [t]: Math.max(0, Math.min(10, value)) });
+  const commitReserved = (t: string) => {
+    const n = parseInt(reservedInputVals[t]);
+    if (!isNaN(n) && n >= 0 && n <= 10) setReserved(t, n);
+    else setReservedInputVals(v => ({ ...v, [t]: String(reserved(t)) }));
+  };
 
   return (
     <div className="space-y-6">
@@ -125,6 +176,20 @@ export function SettingsOrchestratorSection({
               className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
             />
           </div>
+          <div>
+            <label htmlFor="orch-max-global-autonomous-rate" className="block text-xs font-medium text-neutral-400 mb-1.5">Global Autonomous Tasks/Hour (1-500)</label>
+            <input
+              id="orch-max-global-autonomous-rate"
+              type="number"
+              min={1}
+              max={500}
+              value={globalRateInputVal}
+              onChange={e => setGlobalRateInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(globalRateInputVal); if (n >= 1 && n <= 500) onUpdateMaxGlobalAutonomousRate(n); else setGlobalRateInputVal(String(maxGlobalAutonomousTasksPerHour)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(globalRateInputVal); if (n >= 1 && n <= 500) onUpdateMaxGlobalAutonomousRate(n); else setGlobalRateInputVal(String(maxGlobalAutonomousTasksPerHour)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
           <div className="flex items-end">
             <div className="w-full">
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Require Approval Gates</label>
@@ -133,6 +198,95 @@ export function SettingsOrchestratorSection({
                 <span className="text-xs text-neutral-400">{requireApprovalGates ? 'Enabled' : 'Disabled'}</span>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Pipeline Slots */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pipeline Slots</h3>
+        <p className="text-xs text-neutral-500 mb-3">
+          Budget review/fix tasks (0 = disabled) and reserve slots for specific task types (0-10 each).
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+          <div>
+            <label htmlFor="orch-max-pipeline-slots" className="block text-xs font-medium text-neutral-400 mb-1.5">Max Pipeline Slots (0-100)</label>
+            <input
+              id="orch-max-pipeline-slots"
+              type="number"
+              min={0}
+              max={100}
+              value={pipelineSlotsInputVal}
+              onChange={e => setPipelineSlotsInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(pipelineSlotsInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateMaxPipelineSlots(n); else setPipelineSlotsInputVal(String(maxPipelineSlots)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(pipelineSlotsInputVal); if (!isNaN(n) && n >= 0 && n <= 100) onUpdateMaxPipelineSlots(n); else setPipelineSlotsInputVal(String(maxPipelineSlots)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          {RESERVED_SLOT_TYPES.map(t => (
+            <div key={t}>
+              <label htmlFor={`orch-reserved-${t}`} className="block text-xs font-medium text-neutral-400 mb-1.5">Reserved: {t} (0-10)</label>
+              <input
+                id={`orch-reserved-${t}`}
+                type="number"
+                min={0}
+                max={10}
+                value={reservedInputVals[t] ?? '0'}
+                onChange={e => setReservedInputVals(v => ({ ...v, [t]: e.target.value }))}
+                onBlur={() => commitReserved(t)}
+                onKeyDown={e => { if (e.key === 'Enter') commitReserved(t); }}
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Pipeline Timeouts */}
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pipeline Timeouts</h3>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label htmlFor="orch-evaluating-pipeline-timeout" className="block text-xs font-medium text-neutral-400 mb-1.5">Evaluating Pipeline Timeout (1-1440 min)</label>
+            <input
+              id="orch-evaluating-pipeline-timeout"
+              type="number"
+              min={1}
+              max={1440}
+              value={evalTimeoutInputVal}
+              onChange={e => setEvalTimeoutInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(evalTimeoutInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateEvaluatingPipelineTimeout(n); else setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(evalTimeoutInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateEvaluatingPipelineTimeout(n); else setEvalTimeoutInputVal(String(evaluatingPipelineTimeoutMinutes)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="orch-evaluating-fail-hours" className="block text-xs font-medium text-neutral-400 mb-1.5">Evaluating Fail Hours (1-168)</label>
+            <input
+              id="orch-evaluating-fail-hours"
+              type="number"
+              min={1}
+              max={168}
+              value={evalFailHoursInputVal}
+              onChange={e => setEvalFailHoursInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(evalFailHoursInputVal); if (!isNaN(n) && n >= 1 && n <= 168) onUpdateEvaluatingFailHours(n); else setEvalFailHoursInputVal(String(evaluatingFailHours)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(evalFailHoursInputVal); if (!isNaN(n) && n >= 1 && n <= 168) onUpdateEvaluatingFailHours(n); else setEvalFailHoursInputVal(String(evaluatingFailHours)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label htmlFor="orch-ci-backstop-timeout" className="block text-xs font-medium text-neutral-400 mb-1.5">CI Backstop Timeout (1-1440 min)</label>
+            <input
+              id="orch-ci-backstop-timeout"
+              type="number"
+              min={1}
+              max={1440}
+              value={ciBackstopInputVal}
+              onChange={e => setCiBackstopInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(ciBackstopInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateCiBackstopTimeout(n); else setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(ciBackstopInputVal); if (!isNaN(n) && n >= 1 && n <= 1440) onUpdateCiBackstopTimeout(n); else setCiBackstopInputVal(String(ciBackstopTimeoutMinutes)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
           </div>
         </div>
       </div>

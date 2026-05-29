@@ -153,6 +153,62 @@ describe('TaskDetailDrawer', () => {
     expect(screen.getByText('Retry')).toBeInTheDocument();
   });
 
+  it('shows the timeout subtype badge for a FAILED AGENT_TIMEOUT task', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'FAILED', failure_class: 'AGENT_TIMEOUT', context: { timeout_subtype: 'oom' } })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('Subtype:')).toBeInTheDocument();
+    expect(screen.getByText('OOM')).toBeInTheDocument();
+  });
+
+  it('shows the external-API subtype badge for a FAILED EXTERNAL_API task', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'FAILED', failure_class: 'EXTERNAL_API', context: { external_api_subtype: 'provider_auth' } })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('provider auth')).toBeInTheDocument();
+  });
+
+  it('shows the rate-limit kind badge for a FAILED RATE_LIMIT task', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'FAILED', failure_class: 'RATE_LIMIT', context: { rate_limit_kind: 'quota_exhausted' } })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('quota exhausted')).toBeInTheDocument();
+  });
+
+  it('falls back to the raw subtype value when there is no friendly label', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'FAILED', failure_class: 'AGENT_TIMEOUT', context: { timeout_subtype: 'brand_new_subtype' } })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('brand_new_subtype')).toBeInTheDocument();
+  });
+
+  it('renders no subtype badge when the context field is absent', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'FAILED', failure_class: 'AGENT_TIMEOUT', context: {} })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.queryByText('Subtype:')).not.toBeInTheDocument();
+  });
+
   it('clicking the close button fires onClose', async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();

@@ -780,6 +780,32 @@ async def get_strategic_debug(
         except (ValueError, TypeError):
             pass
 
+    # Payload-bloat skip — autonomous_research.py skips the strategic spawn when the
+    # assembled payload (design_doc + problem_model + conversation_thread) exceeds the
+    # 256 KB cap, writing this marker. The skip does NOT increment _strategic_failures,
+    # so without surfacing it here the panel would compute a healthy Idle/Checking phase
+    # while strategic refresh is actually frozen. Treat it as a blocking guard.
+    payload_bloat_skip = vision.get("_strategic_payload_bloat_skip") or None
+    if payload_bloat_skip:
+        contributors = payload_bloat_skip.get("top_contributors") or []
+        top_names = ", ".join(
+            str(c.get("key")) for c in contributors[:3] if c.get("key")
+        )
+        size_kb = round((payload_bloat_skip.get("size") or 0) / 1024)
+        blocking_guards.append(
+            {
+                "guard": "payload_bloat_skip",
+                "reason": (
+                    f"Strategic paused: assembled payload ({size_kb} KB) exceeds the "
+                    "256 KB cap"
+                    + (f" — compact {top_names}" if top_names else "")
+                ),
+                "size": payload_bloat_skip.get("size"),
+                "skipped_at": payload_bloat_skip.get("skipped_at"),
+                "top_contributors": contributors,
+            }
+        )
+
     # Vision bootstrapping — without purpose, strategic can only attempt once
     # and won't auto-advance if it fails (strategic_failures gates the retry loop).
     has_purpose = bool(vision.get("purpose"))
@@ -835,6 +861,7 @@ async def get_strategic_debug(
     return {
         "phase": phase,
         "blocking_guards": blocking_guards,
+        "payload_bloat_skip": payload_bloat_skip,
         "has_purpose": has_purpose,
         "research_spawn_count": research_spawn_count,
         "strategic_cycle_count": strategic_cycle_count,
@@ -922,6 +949,36 @@ async def reset_circuit_breaker(
         "opened_at": None,
         "half_open_task_id": None,
     }
+
+
+@router.post("/anomaly-throttle/restore")
+async def restore_anomaly_throttle(
+    current_user: dict = Depends(require_admin),
+):
+    """Manually clear the active anomaly auto-throttle and restore the stashed
+    pre-adjustment max_concurrent_vms and failure-gate values.
+
+    This is an operator early-restore: the throttle otherwise auto-restores
+    once the triggering anomalies clear (or after the 6h forced-restoration
+    safeguard). The restore path honours the same deploy_health edge cases the
+    automatic restoration guards rather than blindly overwriting live capacity.
+    """
+    from app.anomaly_detection import manual_restore_anomaly_adjustments
+
+    result = manual_restore_anomaly_adjustments()
+    if not result.get("restored"):
+        raise HTTPException(
+            status_code=404, detail="No active anomaly throttle to restore"
+        )
+
+    user_email = current_user.get("email", current_user.get("sub", "unknown"))
+    logger.info(
+        f"[ADMIN] Anomaly auto-throttle manually restored by {user_email}: "
+        f"max_concurrent_vms={result.get('max_concurrent_vms')}, "
+        f"failure_gate={result.get('failure_gate_threshold')}, "
+        f"cleared_triggers={result.get('cleared_trigger_anomalies')}"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------

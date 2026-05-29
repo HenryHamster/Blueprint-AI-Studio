@@ -29,6 +29,7 @@ from app.anomaly_detection import (
     check_anomaly_actions,
     count_matching_fingerprints,
     find_directions_sharing_fingerprint,
+    manual_restore_anomaly_adjustments,
     _ACTIONABLE_FAILURE_CLASSES,
     _ANOMALY_ACTION_THRESHOLD,
     _CODE_ERROR_ACTION_THRESHOLD,
@@ -244,6 +245,69 @@ def test_apply_already_active_no_double_adjust():
 # ─────────────────────────────────────────────────────────────────────────────
 # _check_anomaly_restoration
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_manual_restore_while_anomaly_still_active():
+    """Operator can restore early even though the triggering anomaly persists."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "PROVISION_FAILURE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+
+    _apply_anomaly_adjustments()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+    # Automatic restoration would refuse: the anomaly is still active.
+    assert _check_anomaly_restoration() is False
+
+    result = manual_restore_anomaly_adjustments()
+    assert result["restored"] is True
+    assert result["max_concurrent_vms"] == 8
+    assert result["cleared_trigger_anomalies"] == ["PROVISION_FAILURE"]
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 8
+    assert _shared_state.anomaly_adjustments["failure_gate_threshold"] == 0.8
+    assert _shared_state.anomaly_adjustments["active"] is False
+
+
+def test_manual_restore_no_active_adjustment():
+    """Restore is a no-op (restored=False) when nothing is throttled."""
+    result = manual_restore_anomaly_adjustments()
+    assert result["restored"] is False
+    assert result["reason"] == "no_active_adjustment"
+
+
+def test_manual_restore_respects_deploy_health_below_floor():
+    """When deploy_health holds live capacity below the adjusted floor, the
+    manual restore clears the stash without overwriting the live value."""
+    proj_id = str(uuid.uuid4())
+    _shared_state.persistent_anomalies[proj_id] = {
+        "PROVISION_FAILURE": {
+            "severity": "high",
+            "occurrence_count": 3,
+            "first_seen": "2026-04-16T00:00:00",
+            "last_seen": "2026-04-16T01:00:00",
+            "latest_details": "test",
+        }
+    }
+    _shared_state.runtime_config["max_concurrent_vms"] = 8
+    _apply_anomaly_adjustments()
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 4
+
+    # deploy_health independently pauses/ramps below our adjusted floor (4).
+    _shared_state.runtime_config["max_concurrent_vms"] = 1
+
+    result = manual_restore_anomaly_adjustments()
+    assert result["restored"] is True
+    # Live value is NOT overwritten — deploy_health owns it now.
+    assert _shared_state.runtime_config["max_concurrent_vms"] == 1
+    assert _shared_state.anomaly_adjustments["active"] is False
+    assert _shared_state.anomaly_adjustments["pre_adjustment_max_vms"] is None
 
 
 def test_restoration_when_anomalies_clear():

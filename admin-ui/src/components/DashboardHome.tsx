@@ -23,6 +23,7 @@ import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
+import { LlmCostBreakdownPanel } from './LlmCostBreakdownPanel';
 import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
@@ -945,6 +946,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     return () => clearInterval(id);
   }, [fetchData, resetProjectScopedState]);
 
+  const refetchDashboard = useCallback(() => {
+    void fetchData(++dashboardRequestIdRef.current);
+  }, [fetchData]);
+
   const { activeCount, queuedCount } = useMemo(() => ({
     activeCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
     queuedCount: tasks.filter(t => t.status === 'QUEUED').length,
@@ -1024,7 +1029,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       </div>
 
       {/* Anomaly Throttle Banner */}
-      <AnomalyThrottleBanner digest={digest} />
+      <AnomalyThrottleBanner digest={digest} onRestored={refetchDashboard} />
 
       {/* System Health — actionable issues with remediation hints */}
       <SystemHealthCard data={healthOverview} loading={loading} tasks={tasks} onViewTask={onViewTask} />
@@ -1443,6 +1448,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Section 2f: Provider Cost & Success */}
           <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
 
+          {/* Section 2g: LLM Cost by Model */}
+          <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
+
           {/* Drift Signals */}
           {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
 
@@ -1518,7 +1526,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
 // ---------- anomaly throttle banner ----------
 
-function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
+function AnomalyThrottleBanner({ digest, onRestored }: { digest: DigestData | null; onRestored?: () => void }) {
+  const [restoring, setRestoring] = useState(false);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
   const adj = digest?.anomaly_adjustment;
   if (!adj || !adj.active) return null;
   const triggers = adj.trigger_anomalies ?? [];
@@ -1526,6 +1536,22 @@ function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
   const post = adj.adjusted_max_vms;
   const gatePre = adj.pre_adjustment_failure_gate;
   const gateNow = adj.failure_gate_threshold;
+  const handleRestore = async () => {
+    setRestoring(true);
+    setRestoreError(null);
+    try {
+      const res = await apiFetch('/api/admin/anomaly-throttle/restore', { method: 'POST' });
+      if (!res.ok) {
+        setRestoreError(`Restore failed (${res.status})`);
+        return;
+      }
+      onRestored?.();
+    } catch {
+      setRestoreError('Restore failed');
+    } finally {
+      setRestoring(false);
+    }
+  };
   return (
     <section>
       <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 flex items-start gap-2">
@@ -1564,6 +1590,23 @@ function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
                 {adj.forced_restored_at && ` (last ${timeAgo(adj.forced_restored_at)})`}
               </div>
             )}
+          </div>
+          <div className="mt-2 flex items-center gap-2 flex-wrap">
+            {/* eslint-disable-next-line viewport/min-touch-target -- dense banner control, mirrors Reset Circuit Breaker affordance */}
+            <button
+              type="button"
+              onClick={handleRestore}
+              disabled={restoring}
+              className="text-[11px] font-medium px-2 py-1 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {restoring ? 'Restoring…' : 'Clear throttle / Restore now'}
+            </button>
+            {restoreError && (
+              <span className="text-[11px] text-red-400">{restoreError}</span>
+            )}
+          </div>
+          <div className="text-[10px] text-amber-400/60 mt-1">
+            Otherwise auto-restores once the triggering anomalies clear — this is an early restore, not the only path.
           </div>
         </div>
       </div>

@@ -62,6 +62,18 @@ interface SettingsDropdownProps {
   onUpdateAutoArchiveIntervalMinutes: (value: number) => void;
   maxAutonomousTasksPerHour: number;
   onUpdateMaxAutonomousRate: (value: number) => void;
+  maxGlobalAutonomousTasksPerHour: number;
+  onUpdateMaxGlobalAutonomousRate: (value: number) => void;
+  maxPipelineSlots: number;
+  onUpdateMaxPipelineSlots: (value: number) => void;
+  reservedSlotsForTypes: Record<string, number>;
+  onUpdateReservedSlotsForTypes: (value: Record<string, number>) => void;
+  evaluatingPipelineTimeoutMinutes: number;
+  onUpdateEvaluatingPipelineTimeout: (value: number) => void;
+  evaluatingFailHours: number;
+  onUpdateEvaluatingFailHours: (value: number) => void;
+  ciBackstopTimeoutMinutes: number;
+  onUpdateCiBackstopTimeout: (value: number) => void;
   autonomousResearchIntervalMinutes: number;
   onUpdateAutonomousResearchInterval: (value: number) => void;
   directionCooldownMinutes: number;
@@ -234,6 +246,18 @@ export function SettingsDropdown({
   onUpdateAutoArchiveIntervalMinutes,
   maxAutonomousTasksPerHour,
   onUpdateMaxAutonomousRate,
+  maxGlobalAutonomousTasksPerHour,
+  onUpdateMaxGlobalAutonomousRate,
+  maxPipelineSlots,
+  onUpdateMaxPipelineSlots,
+  reservedSlotsForTypes,
+  onUpdateReservedSlotsForTypes,
+  evaluatingPipelineTimeoutMinutes,
+  onUpdateEvaluatingPipelineTimeout,
+  evaluatingFailHours,
+  onUpdateEvaluatingFailHours,
+  ciBackstopTimeoutMinutes,
+  onUpdateCiBackstopTimeout,
   autonomousResearchIntervalMinutes,
   onUpdateAutonomousResearchInterval,
   directionCooldownMinutes,
@@ -422,6 +446,18 @@ export function SettingsDropdown({
         onUpdateAutoArchiveIntervalMinutes={onUpdateAutoArchiveIntervalMinutes}
         maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
         onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
+        maxGlobalAutonomousTasksPerHour={maxGlobalAutonomousTasksPerHour}
+        onUpdateMaxGlobalAutonomousRate={onUpdateMaxGlobalAutonomousRate}
+        maxPipelineSlots={maxPipelineSlots}
+        onUpdateMaxPipelineSlots={onUpdateMaxPipelineSlots}
+        reservedSlotsForTypes={reservedSlotsForTypes}
+        onUpdateReservedSlotsForTypes={onUpdateReservedSlotsForTypes}
+        evaluatingPipelineTimeoutMinutes={evaluatingPipelineTimeoutMinutes}
+        onUpdateEvaluatingPipelineTimeout={onUpdateEvaluatingPipelineTimeout}
+        evaluatingFailHours={evaluatingFailHours}
+        onUpdateEvaluatingFailHours={onUpdateEvaluatingFailHours}
+        ciBackstopTimeoutMinutes={ciBackstopTimeoutMinutes}
+        onUpdateCiBackstopTimeout={onUpdateCiBackstopTimeout}
         autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
         onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
         directionCooldownMinutes={directionCooldownMinutes}

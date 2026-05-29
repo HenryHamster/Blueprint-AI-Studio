@@ -55,6 +55,18 @@ describe('SettingsDropdown — viewport regression', () => {
             onUpdateAutoArchiveIntervalMinutes={() => {}}
             maxAutonomousTasksPerHour={10}
             onUpdateMaxAutonomousRate={() => {}}
+            maxGlobalAutonomousTasksPerHour={50}
+            onUpdateMaxGlobalAutonomousRate={() => {}}
+            maxPipelineSlots={4}
+            onUpdateMaxPipelineSlots={() => {}}
+            reservedSlotsForTypes={{ create: 1, research: 1 }}
+            onUpdateReservedSlotsForTypes={() => {}}
+            evaluatingPipelineTimeoutMinutes={120}
+            onUpdateEvaluatingPipelineTimeout={() => {}}
+            evaluatingFailHours={48}
+            onUpdateEvaluatingFailHours={() => {}}
+            ciBackstopTimeoutMinutes={60}
+            onUpdateCiBackstopTimeout={() => {}}
             autonomousResearchIntervalMinutes={30}
             onUpdateAutonomousResearchInterval={() => {}}
             directionCooldownMinutes={240}
@@ -200,6 +212,18 @@ describe('SettingsDropdown — viewport regression', () => {
             onUpdateAutoArchiveIntervalMinutes={() => {}}
             maxAutonomousTasksPerHour={10}
             onUpdateMaxAutonomousRate={() => {}}
+            maxGlobalAutonomousTasksPerHour={50}
+            onUpdateMaxGlobalAutonomousRate={() => {}}
+            maxPipelineSlots={4}
+            onUpdateMaxPipelineSlots={() => {}}
+            reservedSlotsForTypes={{ create: 1, research: 1 }}
+            onUpdateReservedSlotsForTypes={() => {}}
+            evaluatingPipelineTimeoutMinutes={120}
+            onUpdateEvaluatingPipelineTimeout={() => {}}
+            evaluatingFailHours={48}
+            onUpdateEvaluatingFailHours={() => {}}
+            ciBackstopTimeoutMinutes={60}
+            onUpdateCiBackstopTimeout={() => {}}
             autonomousResearchIntervalMinutes={30}
             onUpdateAutonomousResearchInterval={() => {}}
             directionCooldownMinutes={240}
@@ -345,6 +369,18 @@ describe('SettingsDropdown — viewport regression', () => {
             onUpdateAutoArchiveIntervalMinutes={() => {}}
             maxAutonomousTasksPerHour={10}
             onUpdateMaxAutonomousRate={() => {}}
+            maxGlobalAutonomousTasksPerHour={50}
+            onUpdateMaxGlobalAutonomousRate={() => {}}
+            maxPipelineSlots={4}
+            onUpdateMaxPipelineSlots={() => {}}
+            reservedSlotsForTypes={{ create: 1, research: 1 }}
+            onUpdateReservedSlotsForTypes={() => {}}
+            evaluatingPipelineTimeoutMinutes={120}
+            onUpdateEvaluatingPipelineTimeout={() => {}}
+            evaluatingFailHours={48}
+            onUpdateEvaluatingFailHours={() => {}}
+            ciBackstopTimeoutMinutes={60}
+            onUpdateCiBackstopTimeout={() => {}}
             autonomousResearchIntervalMinutes={30}
             onUpdateAutonomousResearchInterval={() => {}}
             directionCooldownMinutes={240}

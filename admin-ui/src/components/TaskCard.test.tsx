@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { TaskCard } from './TaskCard';
+import { TaskCard, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { Task } from '../types/task';
 
 vi.mock('../api', () => ({
@@ -531,5 +531,94 @@ describe('TaskCard error logs copy', () => {
     // Verify the button was clickable and clipboard was called
     await user.click(copyButton);
     expect(navigator.clipboard.writeText).toHaveBeenCalled();
+  });
+});
+
+describe('TaskCard low-confidence spawn badge', () => {
+  it('renders the low-confidence badge with percentage tooltip on a queued task', () => {
+    const task = makeTask({
+      status: 'QUEUED',
+      context: { low_confidence_spawn: true, low_confidence_spawn_rate: 0.18 },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('18%')).toBeInTheDocument();
+    expect(screen.getByTitle('Spawned at 18% predicted merge probability')).toBeInTheDocument();
+  });
+
+  it('renders the badge on an in-progress task (not gated to terminal states)', () => {
+    const task = makeTask({
+      status: 'IN_PROGRESS',
+      context: { low_confidence_spawn: true, low_confidence_spawn_rate: 0.42 },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByTitle('Spawned at 42% predicted merge probability')).toBeInTheDocument();
+  });
+
+  it('does not render the badge when low_confidence_spawn is absent', () => {
+    const task = makeTask({ status: 'QUEUED', context: {} });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/predicted merge probability/)).toBeNull();
+  });
+
+  it('renders auto-split and explore sibling tags from context', () => {
+    const task = makeTask({
+      status: 'QUEUED',
+      context: { auto_decomposed: true, medium_exploration: true },
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('auto-split')).toBeInTheDocument();
+    expect(screen.getByText('explore')).toBeInTheDocument();
+  });
+});
+
+describe('FAILURE_CLASS_CONFIG', () => {
+  // Mirror of backend ALL_FAILURE_CLASSES (backend/app/failure_classification.py).
+  // NOTE: AGENT_STALLED is persisted as the lowercase literal "agent_stalled".
+  const CANONICAL_FAILURE_CLASSES = [
+    'CODE_ERROR',
+    'PROVISION_FAILURE',
+    'AGENT_TIMEOUT',
+    'EXTERNAL_API',
+    'RATE_LIMIT',
+    'SCOPE_OVERFLOW',
+    'MIGRATION_ERROR',
+    'VIEWPORT_REGRESSION',
+    'agent_stalled',
+    'BLOCKED_PRECONDITION',
+    'SCOPE_EMPTY',
+  ];
+
+  it('covers exactly the 11 canonical failure classes (incl. lowercase agent_stalled)', () => {
+    expect(Object.keys(FAILURE_CLASS_CONFIG).sort()).toEqual([...CANONICAL_FAILURE_CLASSES].sort());
+  });
+
+  it('does not key the stalled class as uppercase AGENT_STALLED', () => {
+    expect(FAILURE_CLASS_CONFIG).toHaveProperty('agent_stalled');
+    expect(FAILURE_CLASS_CONFIG).not.toHaveProperty('AGENT_STALLED');
+  });
+
+  it('gives every class a non-empty label, hint, suggestion, and retryLabel', () => {
+    for (const [key, cfg] of Object.entries(FAILURE_CLASS_CONFIG)) {
+      expect(cfg.label, key).toBeTruthy();
+      expect(cfg.color, key).toBeTruthy();
+      expect(cfg.hint, key).toBeTruthy();
+      expect(cfg.suggestion, key).toBeTruthy();
+      expect(cfg.retryLabel, key).toBeTruthy();
+    }
+  });
+
+  it('uses the exact cross-surface label strings for the newly added classes', () => {
+    expect(FAILURE_CLASS_CONFIG.MIGRATION_ERROR.label).toBe('Migration Error');
+    expect(FAILURE_CLASS_CONFIG.VIEWPORT_REGRESSION.label).toBe('Viewport Regression');
+    expect(FAILURE_CLASS_CONFIG.agent_stalled.label).toBe('Agent Stalled');
+    expect(FAILURE_CLASS_CONFIG.BLOCKED_PRECONDITION.label).toBe('Blocked — precondition');
+    expect(FAILURE_CLASS_CONFIG.SCOPE_EMPTY.label).toBe('Scope Empty');
+  });
+
+  it('renders the badge and suggestion for a task that failed with agent_stalled', () => {
+    const task = makeTask({ status: 'FAILED', failure_class: 'agent_stalled' });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Agent Stalled')).toBeInTheDocument();
+    expect(screen.getByText('Wedged agent — retries with a fresh agent')).toBeInTheDocument();
   });
 });

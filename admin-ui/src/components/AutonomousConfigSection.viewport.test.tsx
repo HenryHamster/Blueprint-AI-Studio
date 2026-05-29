@@ -25,6 +25,8 @@ describe('AutonomousConfigSection — viewport regression', () => {
           <AutonomousConfigSection
             configCooldownHours={24}
             setConfigCooldownHours={vi.fn()}
+            configProductiveCooldownMinutes={45}
+            setConfigProductiveCooldownMinutes={vi.fn()}
             configIntervalMinutes={60}
             setConfigIntervalMinutes={vi.fn()}
             configMaxParallel={5}
@@ -37,6 +39,8 @@ describe('AutonomousConfigSection — viewport regression', () => {
             setConfigMaxConcurrentAutoRemediations={vi.fn()}
             configResidualRemediationCooldownHours={48}
             setConfigResidualRemediationCooldownHours={vi.fn()}
+            configResidualAuditDeferEscalationThreshold={5}
+            setConfigResidualAuditDeferEscalationThreshold={vi.fn()}
             configMaxActiveDirections={12}
             setConfigMaxActiveDirections={vi.fn()}
             configArchitectureReviewFrequency={5}

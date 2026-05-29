@@ -7,6 +7,9 @@ import {
   windowToHours,
   resolveLastCatchUpViewed,
   computeClassTrend,
+  TIMEOUT_SUBTYPE_LABELS,
+  EXTERNAL_API_SUBTYPE_LABELS,
+  RATE_LIMIT_KIND_LABELS,
 } from './catchupHelpers';
 import type { TrendPeriod } from './catchupHelpers';
 
@@ -216,5 +219,28 @@ describe('computeClassTrend', () => {
     ];
     // Last 4: [1,1,3,3] → prior=[1,1]=2, recent=[3,3]=6 → up
     expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '↑', color: 'text-red-400' });
+  });
+});
+
+describe('failure subtype label maps', () => {
+  it('EXTERNAL_API_SUBTYPE_LABELS covers the backend EXTERNAL_API_SUBTYPE_* values', () => {
+    expect(EXTERNAL_API_SUBTYPE_LABELS.provider_auth).toBe('provider auth');
+    expect(EXTERNAL_API_SUBTYPE_LABELS.provider_quota).toBe('provider quota');
+    expect(EXTERNAL_API_SUBTYPE_LABELS.provider_model_config).toBe('model config');
+    expect(EXTERNAL_API_SUBTYPE_LABELS.github_pr_create).toBe('GitHub PR');
+    expect(EXTERNAL_API_SUBTYPE_LABELS.db_connectivity).toBe('DB connectivity');
+    expect(EXTERNAL_API_SUBTYPE_LABELS.network_transient).toBe('network blip');
+    expect(EXTERNAL_API_SUBTYPE_LABELS.other).toBe('other');
+  });
+
+  it('RATE_LIMIT_KIND_LABELS covers the persisted rate_limit_kind values', () => {
+    expect(RATE_LIMIT_KIND_LABELS.rate_limit).toBe('rate limit');
+    expect(RATE_LIMIT_KIND_LABELS.quota_exhausted).toBe('quota exhausted');
+    expect(RATE_LIMIT_KIND_LABELS.unknown).toBe('unknown');
+  });
+
+  it('TIMEOUT_SUBTYPE_LABELS still exposes the OOM and cascade keys consumed by the dashboard', () => {
+    expect(TIMEOUT_SUBTYPE_LABELS.oom).toBe('OOM');
+    expect(TIMEOUT_SUBTYPE_LABELS.cascade_cancellation).toBe('cascade');
   });
 });

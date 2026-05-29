@@ -8,6 +8,26 @@ export const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
   unknown: 'unknown',
 };
 
+/** Friendly labels for EXTERNAL_API failure sub-types persisted as `external_api_subtype`
+ *  (see backend/app/failure_classification.py EXTERNAL_API_SUBTYPE_* constants). */
+export const EXTERNAL_API_SUBTYPE_LABELS: Record<string, string> = {
+  provider_auth: 'provider auth',
+  provider_quota: 'provider quota',
+  provider_model_config: 'model config',
+  github_pr_create: 'GitHub PR',
+  db_connectivity: 'DB connectivity',
+  network_transient: 'network blip',
+  other: 'other',
+};
+
+/** Friendly labels for RATE_LIMIT kinds persisted as `rate_limit_kind`
+ *  (see backend/app/failure_classification.py rate-limit signal persistence). */
+export const RATE_LIMIT_KIND_LABELS: Record<string, string> = {
+  rate_limit: 'rate limit',
+  quota_exhausted: 'quota exhausted',
+  unknown: 'unknown',
+};
+
 export interface RecentCompletion {
   task_id: string;
   title: string;

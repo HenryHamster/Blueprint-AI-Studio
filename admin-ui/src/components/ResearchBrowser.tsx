@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
 import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2 } from 'lucide-react';
 import type { Task, ResearchFinding } from './TaskCard';
-import { TaskTypeBadge, isSafeUrl } from './TaskCard';
+import { TaskTypeBadge, isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
 
@@ -39,15 +39,6 @@ interface ResearchBrowserProps {
   /** Project-wide task feed. Used for research findings and implementation child outcomes when provided. */
   researchFeed?: Task[];
 }
-
-const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string }> = {
-  CODE_ERROR: { label: 'Code Error', color: 'bg-red-500/20 text-red-400' },
-  PROVISION_FAILURE: { label: 'Infra', color: 'bg-orange-500/20 text-orange-400' },
-  AGENT_TIMEOUT: { label: 'Timeout', color: 'bg-yellow-500/20 text-yellow-400' },
-  EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400' },
-  RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400' },
-  SCOPE_OVERFLOW: { label: 'Scope Overflow', color: 'bg-teal-500/20 text-teal-400' },
-};
 
 const OUTCOME_STYLES: Record<string, { icon: typeof CheckCircle; color: string; label: string }> = {
   COMPLETED: { icon: CheckCircle, color: 'text-emerald-500', label: 'Merged' },

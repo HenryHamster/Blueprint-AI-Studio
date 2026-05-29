@@ -22,6 +22,51 @@ import type { ResearchFinding } from '../types/task';
 import { SrBadge, SrDisallowedBadge, SrDivergenceBadge } from './SrBadges';
 export { SrBadge, SrDisallowedBadge, SrDivergenceBadge } from './SrBadges';
 
+function SpawnSignalBadges({ task }: { task: Task }) {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  const lowConfidence = ctx?.low_confidence_spawn === true;
+  const autoDecomposed = ctx?.auto_decomposed === true;
+  const mediumExploration = ctx?.medium_exploration === true;
+
+  if (!lowConfidence && !autoDecomposed && !mediumExploration) return null;
+
+  const rate = ctx?.low_confidence_spawn_rate;
+  const ratePct = typeof rate === 'number' ? Math.round(rate * 100) : null;
+  const lowConfLabel = ratePct !== null ? `${ratePct}%` : 'low-conf';
+  const lowConfTooltip = ratePct !== null
+    ? `Spawned at ${ratePct}% predicted merge probability`
+    : 'Spawned below the configured merge-probability threshold';
+
+  return (
+    <>
+      {lowConfidence && (
+        <span
+          title={lowConfTooltip}
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-orange-500/10 border-orange-500/20 text-orange-400"
+        >
+          {lowConfLabel}
+        </span>
+      )}
+      {autoDecomposed && (
+        <span
+          title="Finding was auto-decomposed by co-change clustering"
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
+        >
+          auto-split
+        </span>
+      )}
+      {mediumExploration && (
+        <span
+          title="Medium-scope task kept despite low confidence as an exploration bypass"
+          className="inline-flex items-center text-[10px] font-medium border px-1.5 py-0.5 rounded bg-neutral-700/30 border-neutral-600/30 text-neutral-400"
+        >
+          explore
+        </span>
+      )}
+    </>
+  );
+}
+
 function FixLoopBadge({ summary }: { summary: FixLoopSummary[] }) {
   // Show up to 2 badges: non_success first, then high-iteration-count
   const sorted = [...summary].sort((a, b) => {
@@ -147,6 +192,11 @@ const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string; hint:
   EXTERNAL_API: { label: 'API Error', color: 'bg-blue-500/20 text-blue-400', hint: 'External service failure — typically transient, auto-retries', suggestion: 'Transient service error — typically auto-retries', retryLabel: 'Retry' },
   RATE_LIMIT: { label: 'Rate Limit', color: 'bg-purple-500/20 text-purple-400', hint: 'API quota exhausted — auto-retries with different account', suggestion: 'API quota exhausted — auto-retries with different account', retryLabel: 'Retry' },
   SCOPE_OVERFLOW: { label: 'Scope Overflow', color: 'bg-teal-500/20 text-teal-400', hint: 'Task exceeded its scope budget — consider decomposition or scope escalation', suggestion: 'Decompose into smaller tasks or escalate scope before retrying', retryLabel: 'Retry' },
+  MIGRATION_ERROR: { label: 'Migration Error', color: 'bg-rose-500/20 text-rose-400', hint: 'Broken Alembic chain or EXPECTED_SCHEMA_REVISION mismatch — a real schema defect', suggestion: 'Fix the migration chain / schema revision before retrying', retryLabel: 'Retry' },
+  VIEWPORT_REGRESSION: { label: 'Viewport Regression', color: 'bg-fuchsia-500/20 text-fuchsia-400', hint: 'Real mobile/viewport rendering regression — overflow, truncation, or touch-target', suggestion: 'Fix the viewport regression before retrying', retryLabel: 'Retry' },
+  agent_stalled: { label: 'Agent Stalled', color: 'bg-amber-500/20 text-amber-400', hint: 'Agent was alive but made no progress — wedged execution', suggestion: 'Wedged agent — retries with a fresh agent', retryLabel: 'Retry fresh' },
+  BLOCKED_PRECONDITION: { label: 'Blocked — precondition', color: 'bg-sky-500/20 text-sky-400', hint: 'Agent correctly refused on an unmet precondition (e.g. upstream PR/file not yet on main) — not a code defect', suggestion: 'Resolve the upstream precondition, then retry', retryLabel: 'Retry' },
+  SCOPE_EMPTY: { label: 'Scope Empty', color: 'bg-slate-500/20 text-slate-400', hint: 'Declared files were already covered by a sibling PR — agent exited cleanly, not a code defect', suggestion: 'No action needed — work was already covered elsewhere', retryLabel: 'Retry' },
 };
 
 export { FAILURE_CLASS_CONFIG };
@@ -664,6 +714,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             </span>
           )
         )}
+        <SpawnSignalBadges task={task} />
         {(isTerminal || task.status === 'EVALUATING') && (
           <SrBadge task={task} onClick={onOpenSelfReview} />
         )}
