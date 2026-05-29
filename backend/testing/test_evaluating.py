@@ -191,6 +191,110 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired(
+    eval_db, mocker
+):
+    """Regression: the hard-timeout path must broadcast terminal status LITERALS
+    (parent FAILED, child CANCELLED), never a post-commit task.status/child.status
+    ORM read. _maybe_create_failure_alert + commit can roll back and expire those
+    instances (rollback expires even with expire_on_commit=False), so a post-commit
+    read would sync lazy-load in async ctx → MissingGreenlet (same family as the
+    ci_completion #6853 fix).
+
+    Simulates the expiry by having the alert helper expire the parent + children
+    on the working session — that discards their pending FAILED/CANCELLED writes,
+    so a post-commit ORM read would surface the stale pre-timeout status. The
+    broadcast must still carry FAILED/CANCELLED from the literals. Verified to
+    fail against the pre-fix (task.status / child.status) code.
+    """
+    # services.py binds broadcast_to_project at module import (line 26), so the
+    # capturing mock must target app.services, not app.broadcast.
+    bcast = mocker.patch("app.services.broadcast_to_project", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    async def _expire_alert(task, session, *args, **kwargs):
+        # Mimic the prod poison/rollback: rewrite the persisted parent + children
+        # status to a non-terminal sentinel and expire the instances, so a
+        # post-commit ORM status read would lazy-load the WRONG value (an
+        # autoflush would otherwise persist the in-memory terminal status and
+        # mask the bug). The literal-based broadcast must be immune.
+        from sqlalchemy import update
+
+        kids = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await session.execute(
+            update(Task)
+            .where((Task.id == task.id) | (Task.parent_task_id == task.id))
+            .values(status=TaskStatus.QUEUED)
+        )
+        for k in kids:
+            session.expire(k)
+        session.expire(task)
+
+    mocker.patch("app.main._maybe_create_failure_alert", side_effect=_expire_alert)
+
+    project = Project(name="Hard Timeout Expired Bcast", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "long-running task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(hours=7).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "stuck subtask"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+    await eval_db.refresh(child)
+
+    await _check_evaluating_timeouts()
+
+    by_id = {}
+    for c in bcast.call_args_list:
+        if len(c.args) >= 3 and c.args[1] == "task_updated":
+            payload = c.args[2]
+            by_id[str(payload.get("task_id"))] = payload.get("status")
+
+    assert by_id.get(str(parent.id)) == TaskStatus.FAILED, (
+        "parent must broadcast the FAILED literal even when the instance is "
+        f"expired, got {by_id.get(str(parent.id))!r}"
+    )
+    assert by_id.get(str(child.id)) == TaskStatus.CANCELLED, (
+        "cascade-cancelled child must broadcast the CANCELLED literal even when "
+        f"the instance is expired, got {by_id.get(str(child.id))!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_evaluating_ci_waiting_skipped(eval_db, mocker):
     """Tasks with context['ci_waiting'] = True must be skipped by the timeout
     sweep while under the 30-minute CI backstop threshold — the normal 20-min

@@ -1091,10 +1091,15 @@ async def _check_evaluating_timeouts():
                         flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
+                        # Status is unchanged on this recovery path (task stays
+                        # EVALUATING). The _spawn_pipeline_task above can roll back
+                        # internally and expire `task` (even with expire_on_commit=
+                        # False), so a post-commit task.status read would sync
+                        # lazy-load in async ctx → MissingGreenlet. Use the literal.
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(task.id), "status": task.status},
+                            {"task_id": str(task.id), "status": TaskStatus.EVALUATING},
                         )
                         continue
 
@@ -1152,10 +1157,13 @@ async def _check_evaluating_timeouts():
                             f"without manual resolution",
                         )
                         await session.commit()
+                        # task.status was set to FAILED above; _maybe_create_failure_alert
+                        # can poison/roll back the session (expiring `task`), so use the
+                        # literal rather than a post-commit lazy-load (MissingGreenlet).
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(task.id), "status": task.status},
+                            {"task_id": str(task.id), "status": TaskStatus.FAILED},
                         )
                         continue
 
@@ -1306,10 +1314,14 @@ async def _check_evaluating_timeouts():
                             )
                             session.add(task)
                             await session.commit()
+                            # Recovery path keeps the task EVALUATING (reset CI-wait
+                            # clock). _attempt_ci_backstop_recovery above can poison/
+                            # roll back the session and expire `task`, so use the
+                            # literal rather than a post-commit lazy-load.
                             await broadcast_to_project(
                                 str(task.project_id),
                                 "task_updated",
-                                {"task_id": str(task.id), "status": task.status},
+                                {"task_id": str(task.id), "status": TaskStatus.EVALUATING},
                             )
                             logger.warning(
                                 f"[EVAL TIMEOUT] Backstop recovery for task "
@@ -1376,16 +1388,20 @@ async def _check_evaluating_timeouts():
                         f"CI wait backstop timeout after {hours}h — {reason}",
                     )
                     await session.commit()
+                    # task.status=FAILED / children=CANCELLED were set above; the
+                    # alert + commit can poison/expire these instances, so broadcast
+                    # the known literals rather than post-commit lazy-loads. child.id
+                    # (PK) is always safe to read.
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",
-                        {"task_id": str(task.id), "status": task.status},
+                        {"task_id": str(task.id), "status": TaskStatus.FAILED},
                     )
                     for child in non_terminal_children:
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(child.id), "status": child.status},
+                            {"task_id": str(child.id), "status": TaskStatus.CANCELLED},
                         )
                     for child_vm in vms_to_delete:
                         await _ensure_vm_deleted(child_vm, reason="ci_backstop_timeout")
@@ -1606,16 +1622,20 @@ async def _check_evaluating_timeouts():
                         f"Evaluation timeout after {hours}h — children did not complete",
                     )
                     await session.commit()
+                    # task.status=FAILED / children=CANCELLED were set above; the
+                    # PR-close calls + alert + commit can poison/expire these
+                    # instances, so broadcast the known literals rather than
+                    # post-commit lazy-loads. child.id (PK) is always safe to read.
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",
-                        {"task_id": str(task.id), "status": task.status},
+                        {"task_id": str(task.id), "status": TaskStatus.FAILED},
                     )
                     for child in non_terminal_children:
                         await broadcast_to_project(
                             str(task.project_id),
                             "task_updated",
-                            {"task_id": str(child.id), "status": child.status},
+                            {"task_id": str(child.id), "status": TaskStatus.CANCELLED},
                         )
                     for child_vm in vms_to_delete:
                         await _ensure_vm_deleted(child_vm, reason="parent_eval_timeout")

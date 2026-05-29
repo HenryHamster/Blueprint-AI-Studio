@@ -1740,6 +1740,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         "rollup_pr_number": rollup_pr_number,
                     }
                     session.add(parent)
+                    # Snapshot status before the alert dispatch: _dispatch_rollup_
+                    # approval_alert can poison/roll back the session and expire
+                    # `parent` (rollback expires even with expire_on_commit=False),
+                    # so a post-commit parent.status read would sync lazy-load in
+                    # async ctx → MissingGreenlet.
+                    _bcast_status = parent.status
                     await _dispatch_rollup_approval_alert(
                         parent,
                         session,
@@ -1750,7 +1756,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     await broadcast_to_project(
                         str(parent.project_id),
                         "task_updated",
-                        {"task_id": str(parent.id), "status": parent.status},
+                        {"task_id": str(parent.id), "status": _bcast_status},
                     )
                     logger.info(
                         f"[ROLLUP] PR #{rollup_pr_number} has high-risk children — requires approval before merge to {target_branch}"

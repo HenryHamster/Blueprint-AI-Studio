@@ -1770,10 +1770,14 @@ async def reaper_service():
                                     f"{type(_spawn_exc).__name__}: {_spawn_exc}",
                                     exc_info=True,
                                 )
+                            # Status was set to EVALUATING above; _spawn_pipeline_task
+                            # can roll back internally and expire `task` (even with
+                            # expire_on_commit=False), so a task.status read here would
+                            # sync lazy-load in async ctx → MissingGreenlet. Use literal.
                             await broadcast_to_project(
                                 str(task.project_id),
                                 "task_updated",
-                                {"task_id": str(task.id), "status": task.status},
+                                {"task_id": str(task.id), "status": TaskStatus.EVALUATING},
                             )
                         elif can_retry:
                             # Check if this is a research/plan parent with work children —
