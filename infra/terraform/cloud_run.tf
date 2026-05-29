@@ -36,23 +36,25 @@ resource "google_cloud_run_v2_service" "orchestrator" {
       # Placeholder image. CI/CD will overwrite this with the actual application image.
       image = "us-docker.pkg.dev/cloudrun/container/hello"
 
-      # Cost-optimization 2026-05-02: 4Gi/2vCPU → 2Gi/1vCPU.
+      # Reverted 2026-05-29: the 2026-05-02 cost-cut to 2Gi/1vCPU triggered its
+      # own watchpoint. The singleton-leader orchestrator (orchestrator_worker,
+      # reaper, sweeps, SR-trend compute, 14-day-window analytics endpoints)
+      # exceeded 2Gi and was OOM-killed (~14×/day on 2026-05-29). Each OOM drops
+      # the leader's DB connection → releases the pg_advisory_lock → a standby
+      # watchdog respawns it ("prior leader died" hard-exit), i.e. the OOM drives
+      # a leader-respawn restart loop, and requests killed mid-flight (e.g.
+      # /api/admin/health-overview) surface as 500s. Back to the 2026-04-16
+      # sizing (4Gi/2vCPU). Cost: ~+$75/mo vs the 2Gi/1vCPU cut.
       #
-      # CPU is the dominant always-on cost on no-cpu-throttling Cloud Run
-      # (~$62/mo per vCPU; memory is ~$6.50/mo per GiB). Halving CPU saves
-      # ~$62/mo, halving memory saves ~$13/mo. Total ~$75/mo savings.
-      #
-      # The 4Gi/2vCPU bump on 2026-04-16 was for analytics endpoints that
-      # load 14-day task windows with full JSONB. Those endpoints will be
-      # slower at 2Gi/1vCPU — bump back if Cloud Run logs show OOMKilled
-      # or sustained CPU saturation under analytics load.
-      #
-      # Watchpoint: `OOMKilled` events in Cloud Run logs, /health 503s
-      # under analytics load, GC pressure on long-running endpoints.
+      # Watchpoint: OOM/day was *rising* before this revert (2→3→15 over the
+      # week), so if `OOMKilled` returns at 4Gi it is scale growth, not undersize
+      # — pursue the long-term fix (move heavy/analytics compute off the
+      # singleton leader, stream/paginate the 14-day JSONB windows) rather than
+      # bumping memory again.
       resources {
         limits = {
-          memory = "2Gi"
-          cpu    = "1000m"
+          memory = "4Gi"
+          cpu    = "2000m"
         }
       }
 
