@@ -1810,15 +1810,25 @@ async def _expire_stale_proposals(session) -> int:
     # lock (see task_locking.project_lock) so this cron's read-modify-write of
     # project.directions can't lose an update racing a concurrent same-project
     # completion: each row is read fresh under the lock and held until this
-    # transaction ends. skip_locked=False mirrors with_directions_locked — a
-    # background sweep waits for the lock rather than silently dropping the
-    # expiry. The loop does no external I/O, so the hold is brief.
+    # transaction ends.
+    #
+    # skip_locked=True (was False): a project row currently held by a concurrent
+    # same-project completion is SKIPPED this run rather than waited on. Waiting
+    # (skip_locked=False) made this background sweep bulk-lock every autonomous
+    # project at once and block on the 5s lock_timeout whenever any row was held
+    # by the per-task hot path — flooding LockNotAvailableError ("canceling
+    # statement due to lock timeout") under load (incident 2026-05-29; the sweep
+    # was the dominant lock-timeout victim). A skipped project's 30-day-stale
+    # proposals simply expire on the next idle-research cycle (~5 min) — a
+    # stale-proposal cleanup tolerates the deferral, so we never silently drop
+    # the expiry, just defer it. The loop does no external I/O, so the hold on
+    # the rows it does acquire is brief.
     projects = (
         (
             await session.execute(
                 select(Project)
                 .where(Project.autonomous_enabled.is_(True))
-                .with_for_update(skip_locked=False, key_share=True)
+                .with_for_update(skip_locked=True, key_share=True)
             )
         )
         .scalars()

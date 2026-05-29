@@ -863,11 +863,16 @@ async def test_with_directions_locked_serializes_concurrent_appends(db_session):
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
 @pytest.mark.asyncio
 async def test_expire_stale_proposals_serializes_with_concurrent_append(db_session):
-    """The _expire_stale_proposals cron now reads project.directions under the
-    canonical project row lock. An interleaved direction append via
-    with_directions_locked must survive AND the stale proposal must still expire
-    — before the lock, the cron's whole-array write-back could clobber the
-    concurrent append (lost update)."""
+    """The _expire_stale_proposals cron reads project.directions under the
+    canonical project row lock with skip_locked=True (PR #6727 — a background
+    sweep must not block on lock_timeout). Two guarantees under a concurrent
+    with_directions_locked append:
+      1. the append is NEVER lost — the cron either serializes behind it (reads
+         fresh under the lock) or skips the contended project entirely, so it
+         can't clobber the append;
+      2. the stale-proposal expiry is deferred-not-dropped — if the cron loses
+         the lock race it skips this run, and a subsequent uncontended run
+         applies the expiry."""
     from datetime import timedelta
 
     from app.anomaly_detection import _expire_stale_proposals
@@ -898,15 +903,32 @@ async def test_expire_stale_proposals_serializes_with_concurrent_append(db_sessi
 
     await asyncio.gather(expire(), append())
 
-    async with Session() as verify:
-        result = await verify.execute(select(Project).where(Project.id == project.id))
-        dirs = result.scalar_one().directions
-    by_id = {d["id"]: d for d in dirs}
+    async def _load_dirs():
+        async with Session() as verify:
+            result = await verify.execute(
+                select(Project).where(Project.id == project.id)
+            )
+            return {d["id"]: d for d in result.scalar_one().directions}
+
+    # Invariant 1: the concurrent append is never lost, regardless of which side
+    # won the lock race — the cron skips a contended project rather than
+    # clobbering it (and reads fresh under the lock when it does acquire).
+    by_id = await _load_dirs()
     assert by_id.get("d-new", {}).get("status") == "active", (
-        f"lost concurrent append: {dirs}"
+        f"lost concurrent append: {by_id}"
     )
+
+    # Invariant 2: the expiry is deferred-not-dropped. If the cron lost the race
+    # it skipped d-old this run (skip_locked=True); a follow-up uncontended run
+    # must apply it. (If the cron won the first race, d-old is already expired
+    # and this run is a no-op.)
+    await expire()
+    by_id = await _load_dirs()
     assert by_id.get("d-old", {}).get("status") == "expired", (
-        f"stale-proposal expiry not applied: {dirs}"
+        f"stale-proposal expiry not applied even after an uncontended run: {by_id}"
+    )
+    assert by_id.get("d-new", {}).get("status") == "active", (
+        f"concurrent append lost after follow-up expiry run: {by_id}"
     )
 
 
