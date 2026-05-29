@@ -14,6 +14,7 @@ from app.shared_state import limiter
 from app.models import Project, ProjectMember, ProjectStatus
 from app.auth import get_current_user, require_admin
 from app.schemas import OnboardPayload
+from app.task_locking import with_design_doc_locked
 
 logger = logging.getLogger(__name__)
 
@@ -298,28 +299,40 @@ async def onboard_project(
         branch_whitelist.append(project.integration_branch)
     if project.promotion_target and project.promotion_target not in branch_whitelist:
         branch_whitelist.append(project.promotion_target)
-    design_doc = dict(project.design_doc or {})
-    design_doc["_auto_remediation"] = {
-        "enabled": False,
-        "branch_whitelist": branch_whitelist,
-        "max_per_hour": 2,
-        "max_concurrent": 2,
-        "require_review": True,
-    }
-    design_doc["_issue_implementation"] = {
-        "enabled": False,
-        "trigger_label": "auto:implement",
-        "max_per_hour": 3,
-        "max_concurrent": 3,
-        "default_effort": "high",
-    }
-    design_doc["_auto_review"] = {
-        "enabled": False,
-        "max_per_hour": 5,
-        "max_concurrent": 3,
-    }
-    project.design_doc = design_doc
-    flag_modified(project, "design_doc")
+    # Route the one-time onboarding design_doc seed through the canonical
+    # lock helper so this file satisfies the design_doc lock invariant without
+    # a special-case exemption. There are no concurrent writers at onboard time
+    # (the project was just created in this handler), but the helper's
+    # SELECT FOR UPDATE re-load (populate_existing=True) would clobber the
+    # build_config / integration_branch / promotion_target changes set above if
+    # they were still dirty in the session. Flush them explicitly first so the
+    # re-SELECT reloads the persisted values rather than overwriting the dirty
+    # attributes with a stale row — this is independent of the session's
+    # autoflush setting (production AsyncSessionLocal is autoflush=True; the
+    # SQLite test session is autoflush=False).
+    def _seed_remediation_config(doc: dict) -> None:
+        doc["_auto_remediation"] = {
+            "enabled": False,
+            "branch_whitelist": branch_whitelist,
+            "max_per_hour": 2,
+            "max_concurrent": 2,
+            "require_review": True,
+        }
+        doc["_issue_implementation"] = {
+            "enabled": False,
+            "trigger_label": "auto:implement",
+            "max_per_hour": 3,
+            "max_concurrent": 3,
+            "default_effort": "high",
+        }
+        doc["_auto_review"] = {
+            "enabled": False,
+            "max_per_hour": 5,
+            "max_concurrent": 3,
+        }
+
+    await session.flush()
+    await with_design_doc_locked(session, project.id, _seed_remediation_config)
 
     await session.commit()
     await session.refresh(project)

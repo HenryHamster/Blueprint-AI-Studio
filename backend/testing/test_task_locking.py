@@ -1238,6 +1238,69 @@ async def test_post_auto_fix_result_message_serializes_concurrent_writers(db_ses
     assert counts.get("feat/x") == 1, f"feat/x branch count missing from {doc}"
 
 
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_auto_remediation_recovery_serializes_concurrent_writers(db_session):
+    """Two concurrent auto-remediation suspension recoveries for disjoint branches
+    must both persist — the migrated _try_auto_recover_suspension write goes through
+    with_design_doc_locked, so neither recovery may clobber the other (no lost update)."""
+    from datetime import timedelta
+
+    from app.auto_remediation import _try_auto_recover_suspension
+    from app.time_utils import _utcnow
+
+    # Both branches suspended long enough ago that their cooldown has elapsed,
+    # so each call will recover its branch and bump its recovery-attempt count.
+    long_ago = (_utcnow() - timedelta(days=30)).isoformat()
+    ar_config = {
+        "suspended_branches": ["feat/a", "feat/b"],
+        "branch_failure_counts": {"feat/a": 5, "feat/b": 5},
+        "suspension_metadata": {
+            "feat/a": {"suspended_at": long_ago, "recovery_attempts": 0},
+            "feat/b": {"suspended_at": long_ago, "recovery_attempts": 0},
+        },
+    }
+    project = Project(name="auto-remediation-concurrent", user_id="user")
+    project.design_doc = {"_auto_remediation": ar_config}
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def recover(branch: str) -> bool:
+        async with Session() as s:
+            recovered = await _try_auto_recover_suspension(
+                project_id=project.id,
+                branch=branch,
+                config=ar_config,
+                session=s,
+            )
+            await s.commit()
+            return recovered
+
+    results = await asyncio.gather(recover("feat/a"), recover("feat/b"))
+    assert all(results), f"both branches should report recovery, got {results}"
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        doc = result.scalar_one().design_doc
+    ar = doc.get("_auto_remediation", {})
+    # Both branches must be cleared from the suspended list — if one writer
+    # clobbered the other, one branch would survive in suspended_branches.
+    assert ar.get("suspended_branches") == [], (
+        f"both branches should be recovered, got {ar.get('suspended_branches')}"
+    )
+    meta = ar.get("suspension_metadata", {})
+    assert meta.get("feat/a", {}).get("recovery_attempts") == 1, (
+        f"feat/a recovery attempt lost from {doc}"
+    )
+    assert meta.get("feat/b", {}).get("recovery_attempts") == 1, (
+        f"feat/b recovery attempt lost from {doc}"
+    )
+
+
 # ── _check_anomaly_proposals concurrent appends ──────────────────────────────
 
 

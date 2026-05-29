@@ -13,7 +13,6 @@ from typing import Any
 
 from sqlalchemy import func as _func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -27,7 +26,7 @@ from app.github import (
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
 from app.task_completion import _stamp_remediation_spawn_on_direction
-from app.task_locking import with_directions_locked
+from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -68,62 +67,64 @@ async def _try_auto_recover_suspension(
     Returns True if the branch was recovered (caller should proceed with
     remediation), False if still in cooldown or permanently suspended.
     Persists changes to the project's _auto_remediation config.
+
+    The read-modify-write of design_doc["_auto_remediation"] runs through
+    ``with_design_doc_locked`` (skip_locked=False, blocking) so that two
+    webhook-driven CI-failure handlers for the same project cannot interleave
+    and silently overwrite each other's suspension/recovery-attempt state — a
+    lost-update race on the per-branch config that gates fix-task spawning.
+    The recovery decision is read off the freshly-locked doc (not the stale
+    ``config`` argument) and surfaced via a closure flag.
     """
-    meta = (config.get("suspension_metadata") or {}).get(branch) or {}
     now = _utcnow()
+    recovered = False
 
-    if not _suspension_cooldown_elapsed(meta, now):
-        # Backfill missing timestamp so the first auto-recovery can happen
-        # after a full cooldown from this point.
-        if (
-            not meta.get("suspended_at")
-            and int(meta.get("recovery_attempts", 0) or 0) < MAX_AUTO_RECOVERY_ATTEMPTS
-        ):
-            project = await session.get(Project, project_id)
-            if project is not None:
-                design_doc = dict(project.design_doc or {})
-                ar_config = dict(design_doc.get("_auto_remediation", {}))
-                suspension_meta = dict(ar_config.get("suspension_metadata", {}))
-                entry = dict(suspension_meta.get(branch) or {})
-                entry["suspended_at"] = now.isoformat()
-                entry.setdefault("recovery_attempts", 0)
-                suspension_meta[branch] = entry
+    def _mutate(doc: dict) -> None:
+        nonlocal recovered
+        ar_config = dict(doc.get("_auto_remediation", {}))
+        suspension_meta = dict(ar_config.get("suspension_metadata", {}))
+        meta = dict(suspension_meta.get(branch) or {})
+
+        if not _suspension_cooldown_elapsed(meta, now):
+            # Backfill missing timestamp so the first auto-recovery can happen
+            # after a full cooldown from this point.
+            if (
+                not meta.get("suspended_at")
+                and int(meta.get("recovery_attempts", 0) or 0)
+                < MAX_AUTO_RECOVERY_ATTEMPTS
+            ):
+                meta["suspended_at"] = now.isoformat()
+                meta.setdefault("recovery_attempts", 0)
+                suspension_meta[branch] = meta
                 ar_config["suspension_metadata"] = suspension_meta
-                design_doc["_auto_remediation"] = ar_config
-                project.design_doc = design_doc
-                flag_modified(project, "design_doc")
-                session.add(project)
-        return False
+                doc["_auto_remediation"] = ar_config
+            return
 
-    project = await session.get(Project, project_id)
-    if project is None:
-        return False
-    design_doc = dict(project.design_doc or {})
-    ar_config = dict(design_doc.get("_auto_remediation", {}))
-    suspended = [b for b in ar_config.get("suspended_branches", []) if b != branch]
-    failure_counts = dict(ar_config.get("branch_failure_counts", {}))
-    failure_counts.pop(branch, None)
-    suspension_meta = dict(ar_config.get("suspension_metadata", {}))
-    attempts = int(meta.get("recovery_attempts", 0) or 0)
-    suspension_meta[branch] = {
-        "suspended_at": meta.get("suspended_at"),
-        "recovery_attempts": attempts + 1,
-    }
-    ar_config["suspended_branches"] = suspended
-    ar_config["branch_failure_counts"] = failure_counts
-    ar_config["suspension_metadata"] = suspension_meta
-    design_doc["_auto_remediation"] = ar_config
-    project.design_doc = design_doc
-    flag_modified(project, "design_doc")
-    session.add(project)
-    await session.flush()
-    logger.info(
-        "[AUTO-REMEDIATION] Auto-recovering suspended branch %s (attempt %d/%d)",
-        branch,
-        attempts + 1,
-        MAX_AUTO_RECOVERY_ATTEMPTS,
-    )
-    return True
+        # Cooldown elapsed — recover the branch: clear it from the suspended
+        # list / failure counts and bump the recovery-attempt count for the
+        # next exponential-backoff window.
+        suspended = [b for b in ar_config.get("suspended_branches", []) if b != branch]
+        failure_counts = dict(ar_config.get("branch_failure_counts", {}))
+        failure_counts.pop(branch, None)
+        attempts = int(meta.get("recovery_attempts", 0) or 0)
+        suspension_meta[branch] = {
+            "suspended_at": meta.get("suspended_at"),
+            "recovery_attempts": attempts + 1,
+        }
+        ar_config["suspended_branches"] = suspended
+        ar_config["branch_failure_counts"] = failure_counts
+        ar_config["suspension_metadata"] = suspension_meta
+        doc["_auto_remediation"] = ar_config
+        recovered = True
+        logger.info(
+            "[AUTO-REMEDIATION] Auto-recovering suspended branch %s (attempt %d/%d)",
+            branch,
+            attempts + 1,
+            MAX_AUTO_RECOVERY_ATTEMPTS,
+        )
+
+    await with_design_doc_locked(session, project_id, _mutate, skip_locked=False)
+    return recovered
 
 
 async def _handle_main_branch_ci_failure(
@@ -210,6 +211,17 @@ async def _handle_main_branch_ci_failure_inner(
                         exc,
                     )
             return
+
+        # Recovery succeeded. Commit the suspension-lifted write now so the
+        # project-row FOR UPDATE lock taken by with_design_doc_locked is
+        # released before the network-heavy section below (branch-SHA /
+        # check-run lookups, CI-context extraction, PR/ancestry checks).
+        # Holding that lock across external GitHub round-trips would block
+        # concurrent same-project design_doc/directions/vision writers
+        # (skip_locked=False) for up to the 30s lock_timeout. The recovery is
+        # an independent, idempotent state change, so persisting it regardless
+        # of whether a fix task is ultimately spawned below is correct.
+        await session.commit()
 
     # ── Guard: rate limit ──
     # Audit W1 (B4/B14): auto_remediation is now an indexed column, so this

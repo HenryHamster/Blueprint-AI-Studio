@@ -1,8 +1,10 @@
 """Tests for CI auto-remediation (auto_remediation.py + webhook extension in github.py)."""
 
+import asyncio
 import hashlib
 import hmac
 import json
+import os
 import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, patch
@@ -24,6 +26,11 @@ from app.auto_remediation import (
     _find_recent_merged_remediation,
     _utcnow,
 )
+
+
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1103,6 +1110,124 @@ async def test_suspended_branch_auto_recovers_after_cooldown(db_session: AsyncSe
     assert (
         ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_write_uses_design_doc_lock(db_session: AsyncSession):
+    """The auto-recovery RMW of design_doc["_auto_remediation"] must go through
+    with_design_doc_locked (project-row lock), not a bare session.get + write-back.
+
+    Mirrors test_spawn_direction_stamp_uses_directions_lock: spy the lock helper
+    and assert the recovery path invokes it, and that the suspension was actually
+    lifted via the locked write.
+    """
+    from app import auto_remediation as ar_mod
+    from app.auto_remediation import _try_auto_recover_suspension
+
+    suspended_at = (_utcnow() - timedelta(hours=25)).isoformat()
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 3},
+                "suspended_branches": ["main"],
+                "suspension_metadata": {
+                    "main": {"suspended_at": suspended_at, "recovery_attempts": 0},
+                },
+            }
+        },
+    )
+
+    # Spy that delegates to the real helper so the write still happens.
+    spy = AsyncMock(side_effect=ar_mod.with_design_doc_locked)
+    with patch.object(ar_mod, "with_design_doc_locked", spy):
+        recovered = await _try_auto_recover_suspension(
+            project_id=project.id,
+            branch="main",
+            config=(project.design_doc or {}).get("_auto_remediation", {}),
+            session=db_session,
+        )
+
+    assert recovered is True
+    spy.assert_awaited_once()
+    ar = (project.design_doc or {}).get("_auto_remediation", {})
+    assert "main" not in ar.get("suspended_branches", [])
+    assert (
+        ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    )
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL"
+)
+@pytest.mark.asyncio
+async def test_concurrent_recovery_no_lost_update(db_session: AsyncSession):
+    """Interleaved auto-recovery + escalation writes to the same project's
+    design_doc must both persist.
+
+    The recovery's _auto_remediation update and a concurrent escalation write to
+    a disjoint key are both serialized under with_design_doc_locked, so neither
+    clobbers the other (the lost-update race this migration fixes).
+    """
+    from sqlalchemy.orm import sessionmaker
+
+    from app.auto_remediation import _try_auto_recover_suspension
+    from app.task_locking import with_design_doc_locked
+
+    suspended_at = (_utcnow() - timedelta(hours=25)).isoformat()
+    project = await _create_project(
+        db_session,
+        design_doc={
+            "_auto_remediation": {
+                "enabled": True,
+                "branch_failure_counts": {"main": 3},
+                "suspended_branches": ["main"],
+                "suspension_metadata": {
+                    "main": {"suspended_at": suspended_at, "recovery_attempts": 0},
+                },
+            }
+        },
+    )
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def recover() -> None:
+        async with Session() as s:
+            await _try_auto_recover_suspension(
+                project_id=project.id,
+                branch="main",
+                config={},  # decision is read off the freshly-locked doc, not this
+                session=s,
+            )
+            await s.commit()
+
+    async def escalate() -> None:
+        async with Session() as s:
+            await with_design_doc_locked(
+                s,
+                project.id,
+                lambda doc: doc.update({"_escalation_marker": {"branch": "other"}}),
+            )
+            await s.commit()
+
+    await asyncio.gather(recover(), escalate())
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        doc = result.scalar_one().design_doc
+
+    # The escalation key written concurrently must survive.
+    assert doc.get("_escalation_marker", {}).get("branch") == "other", doc
+    # The recovery write must also survive: branch lifted, attempts bumped.
+    ar = doc.get("_auto_remediation", {})
+    assert "main" not in ar.get("suspended_branches", []), ar
+    assert (
+        ar.get("suspension_metadata", {}).get("main", {}).get("recovery_attempts") == 1
+    ), ar
 
 
 @pytest.mark.asyncio

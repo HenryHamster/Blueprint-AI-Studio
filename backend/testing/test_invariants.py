@@ -2381,14 +2381,13 @@ _LOCK_BASELINE = _load_lock_baseline()
 # write from raising the per-file count above its baseline. Remove a file from this set
 # the moment its writes are migrated under a lock — that re-arms the positive guard.
 _LOCK_GUARD_EXEMPT: dict[str, set[str]] = {
-    "design_doc": {
-        # Concurrent auto-recovery RMW of design_doc["_auto_remediation"]; hot
-        # best-effort path — pending migration to with_design_doc_locked(skip_locked=True).
-        "auto_remediation.py",
-        # One-time onboarding write while configuring a freshly created project
-        # (no concurrent writers at onboard time).
-        "routers/admin_onboard.py",
-    },
+    # design_doc: empty — all design_doc writes are now migrated under
+    # with_design_doc_locked(). auto_remediation.py (concurrent auto-recovery
+    # RMW of design_doc["_auto_remediation"]) and routers/admin_onboard.py
+    # (one-time onboarding seed) were the last two exempt sites; both now route
+    # through the canonical helper, so the positive guard is fully re-armed for
+    # design_doc and their baseline entries have been removed.
+    "design_doc": set(),
     "vision": {
         # Research vision RMW from the autonomous loop — pending migration to
         # with_vision_locked(); counter serialization already hardened separately.
