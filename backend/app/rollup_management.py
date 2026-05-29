@@ -1016,20 +1016,52 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # fast — e.g. dispatch pre-emption — respawning every cycle.
                 respawn_count = _review_respawn_count(c)
                 if respawn_count >= MAX_REVIEW_RESPAWNS:
-                    if not parent.requires_approval:
+                    # Discretionary escalation: only approval-gate the parent when
+                    # require_approval_gates is enabled. With gates off the operator
+                    # opted out of manual gating, so escalating here would only let
+                    # services.py's 2h approval-gate timeout FAIL the otherwise-healthy
+                    # parent — discarding its already-merged siblings. Instead skip the
+                    # wedged child (force pr_merged, the same drop-from-unmerged
+                    # mechanism used for malformed pr_url above) so the parent converges
+                    # via partial rollup, and alert so the dropped subtask is visible.
+                    # (Sibling of the cap-exhaustion fix below at ~:1090; mirrors the
+                    # review_pipeline repeat-fingerprint/stuck-cycle gating, whose
+                    # un-skipped children fall through to this terminalization.)
+                    gates_on = _runtime_config.get("require_approval_gates", True)
+                    if gates_on and not parent.requires_approval:
                         parent.requires_approval = True
                         logger.warning(
                             f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} — review "
                             f"respawned {respawn_count}x without merging; escalating: "
                             f"marked parent {parent.id} requires_approval"
                         )
+                        alert_msg = (
+                            f"Rollup blocked: PR #{pr_number} review respawned "
+                            f"{respawn_count}x without merging — manual intervention required"
+                        )
+                    elif not gates_on:
+                        c.context = {
+                            **(c.context or {}),
+                            "pr_merged": True,
+                            "_rollup_skipped_reason": "review_respawn_cap",
+                        }
+                        session.add(c)
+                        logger.warning(
+                            f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} — review "
+                            f"respawned {respawn_count}x without merging and gates are "
+                            f"off; skipping (force pr_merged) so parent {parent.id} "
+                            f"converges via partial rollup"
+                        )
+                        alert_msg = (
+                            f"Subtask PR #{pr_number} dropped from rollup: review "
+                            f"respawned {respawn_count}x without merging "
+                            f"(require_approval_gates off — converging via partial rollup)"
+                        )
+                    else:
+                        alert_msg = None
+                    if alert_msg:
                         try:
-                            await _maybe_create_failure_alert(
-                                parent,
-                                session,
-                                f"Rollup blocked: PR #{pr_number} review respawned "
-                                f"{respawn_count}x without merging — manual intervention required",
-                            )
+                            await _maybe_create_failure_alert(parent, session, alert_msg)
                         except Exception as _alert_err:
                             logger.warning(
                                 f"[ROLLUP] Failed to create respawn-cap alert "

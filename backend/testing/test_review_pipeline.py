@@ -1789,6 +1789,102 @@ async def test_stuck_cycle_detected_at_50pct_blocks_spawn(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_stuck_cycle_with_gates_off_blocks_spawn_without_approval_gate(
+    db_session, mocker
+):
+    """With require_approval_gates OFF, a detected stuck cycle must still halt
+    the spawn (and set the informational status message) but must NOT set
+    requires_approval on the chain original — otherwise services.py's 2h
+    approval-gate timeout would FAIL an EVALUATING parent the operator never
+    asked to gate. The rollup respawn-cap terminalization converges instead.
+
+    Companion to test_stuck_cycle_detected_at_50pct_blocks_spawn (gates on)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+
+    project = await _make_db_project(db_session)
+
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    prior_issues = [_issue("null pointer dereference", "CRITICAL")]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 302,
+                "branch": "b1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 302,
+                "branch": "b1",
+                "base_branch": "main",
+                "review_history": [
+                    {
+                        "iteration": 0,
+                        "feedback": "prev feedback",
+                        "issues": prior_issues,
+                    },
+                ],
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [_issue("null pointer dereference", "CRITICAL")]
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=302,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still the same issue",
+        current_feedback="Still the same issue",
+        current_issues=current_issues,
+    )
+
+    assert result is None, "Stuck cycle should still block the fix spawn"
+
+    await db_session.refresh(original_task)
+    # The fix: gates off → NO approval gate on the chain original.
+    assert original_task.requires_approval is not True, (
+        "With require_approval_gates off, a stuck cycle must NOT set "
+        "requires_approval on the chain original"
+    )
+    # The informational status message is still set regardless of gating.
+    assert "stuck" in (original_task.latest_status_message or "").lower(), (
+        f"Status message should still mention stuck cycle: "
+        f"{original_task.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stuck_cycle_distinct_issues_do_not_match(db_session, mocker):
     """Genuinely-different issues must NOT trigger stuck-cycle detection even
     when prior and current iterations both contain CRITICAL/MAJOR feedback.

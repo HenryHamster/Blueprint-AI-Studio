@@ -1522,7 +1522,16 @@ async def _spawn_pipeline_task(
                                 Task, uuid.UUID(resolved_original_id)
                             )
                             if _orig:
-                                _orig.requires_approval = True
+                                # Discretionary gate: only approval-gate the chain
+                                # original when require_approval_gates is on. With
+                                # gates off, leaving the child unflagged lets the
+                                # rollup respawn-cap terminalization (rollup_management
+                                # ~:1019) skip it so the parent converges, instead of
+                                # the 2h approval-gate timeout FAILing an EVALUATING
+                                # parent. The BLOCKER status message is informational
+                                # and set regardless.
+                                if _runtime_config.get("require_approval_gates", True):
+                                    _orig.requires_approval = True
                                 _orig.latest_status_message = (
                                     f"Repeat-fingerprint halt on PR #{pr_number}: last "
                                     f"two {src_payload_type} attempts failed identically "
@@ -1888,7 +1897,11 @@ async def _spawn_pipeline_task(
             try:
                 stuck_orig = await session.get(Task, uuid.UUID(resolved_original_id))
                 if stuck_orig:
-                    stuck_orig.requires_approval = True
+                    # Discretionary gate (see repeat-fingerprint path above): only
+                    # approval-gate when require_approval_gates is on; with gates off
+                    # the rollup respawn-cap terminalization converges the parent.
+                    if _runtime_config.get("require_approval_gates", True):
+                        stuck_orig.requires_approval = True
                     stuck_orig.latest_status_message = (
                         f"Review-fix cycle appears stuck — same issues repeated across "
                         f"{iteration} iterations. Manual review required."

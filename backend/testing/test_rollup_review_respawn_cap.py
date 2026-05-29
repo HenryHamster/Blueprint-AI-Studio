@@ -205,6 +205,65 @@ async def test_at_cap_escalates_parent_and_does_not_respawn(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_at_cap_with_gates_off_skips_child_instead_of_escalating(
+    rollup_db, mocker
+):
+    """With ``require_approval_gates`` OFF, a child at the respawn cap must NOT
+    approval-gate the parent.
+
+    Regression — 2026-05-29, parent e3ca4f10: the unconditional escalation here
+    set ``parent.requires_approval=True`` even with gates off, and services.py's
+    2h approval-gate timeout then FAILed the otherwise-healthy EVALUATING parent,
+    discarding its already-merged siblings. With gates off the wedged child must
+    instead be skipped (force ``pr_merged`` — the same drop-from-unmerged
+    mechanism used for malformed pr_url) so the parent converges via partial
+    rollup, and an operator alert is still raised so the drop is visible.
+
+    Sibling of the cap-exhaustion fix in PR #6726 (which gated the parallel path
+    at ~:1090); this gates the review-respawn path at ~:1019.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+    # Operator opted out of manual gating.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    parent, child = await _make_respawn_scenario(
+        rollup_db, child_respawn_count=MAX_REVIEW_RESPAWNS
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    # No further review spawned for the wedged PR.
+    mock_spawn.assert_not_called()
+    # Parent NOT approval-gated — gates are off, so it must converge, not be
+    # parked on the 2h approval-gate FAIL clock.
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is False
+    assert parent.status == TaskStatus.EVALUATING
+    # Wedged child skipped so it drops from the unmerged set next cycle.
+    await rollup_db.refresh(child)
+    assert (child.context or {}).get("pr_merged") is True
+    assert (child.context or {}).get("_rollup_skipped_reason") == "review_respawn_cap"
+    # Alert still raised so the dropped subtask is visible (not silent).
+    mock_alert.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_below_cap_increments_counter_by_one_on_real_spawn(rollup_db, mocker):
     """Below the cap, a real respawn (was_spawned=True) increments the child's
     _review_respawn_count by exactly 1 and leaves the parent un-escalated."""
