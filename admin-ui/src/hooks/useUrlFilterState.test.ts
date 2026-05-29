@@ -95,6 +95,23 @@ describe('useUrlFilterState', () => {
     expect(new URLSearchParams(window.location.search).get('sru_blind_spot')).toBe('null-deref');
   });
 
+  it('tracks an optional tertiaryParam for additional drill-through filters', () => {
+    window.history.replaceState({}, '', '/?sru_case_pattern=retry-loop');
+    const { result } = renderHook(() =>
+      useUrlFilterState('sru_', 'proj-1', {
+        secondaryParam: 'blind_spot',
+        tertiaryParam: 'case_pattern',
+      }),
+    );
+    expect(result.current.tertiaryFilter).toBe('retry-loop');
+
+    act(() => { result.current.setTertiaryFilter('race-condition'); });
+    expect(new URLSearchParams(window.location.search).get('sru_case_pattern')).toBe('race-condition');
+
+    act(() => { result.current.setTertiaryFilter(''); });
+    expect(new URLSearchParams(window.location.search).get('sru_case_pattern')).toBeNull();
+  });
+
   it('tracks scope filter when withScope is enabled', () => {
     window.history.replaceState({}, '', '/?srm_scope=large');
     const { result } = renderHook(() =>
@@ -113,5 +130,20 @@ describe('useUrlFilterState', () => {
     window.history.replaceState({}, '', '/?sru_scope=large');
     const { result } = renderHook(() => useUrlFilterState('sru_', 'proj-1'));
     expect(result.current.scopeFilter).toBe('');
+  });
+
+  it('clears tertiary filter state when projectId changes', () => {
+    window.history.replaceState({}, '', '/?sru_days=30&sru_case_pattern=retry&sru_page=3');
+    const { result, rerender } = renderHook(
+      ({ pid }: { pid: string }) => useUrlFilterState('sru_', pid, { tertiaryParam: 'case_pattern' }),
+      { initialProps: { pid: 'proj-1' } },
+    );
+    expect(result.current.tertiaryFilter).toBe('retry');
+
+    act(() => { rerender({ pid: 'proj-2' }); });
+
+    expect(result.current.days).toBe(14);
+    expect(result.current.tertiaryFilter).toBe('');
+    expect(result.current.page).toBe(1);
   });
 });

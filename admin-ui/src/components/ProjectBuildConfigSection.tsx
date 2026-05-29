@@ -8,7 +8,7 @@ function isRecognizedLintCmd(cmd: string): boolean {
 }
 import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 import { apiFetch } from '../api';
-import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
+import { SR_CANONICAL_CATEGORIES } from './SrRetrospectiveShared';
 
 interface ProjectBuildConfigSectionProps {
   githubOwner: string | null;

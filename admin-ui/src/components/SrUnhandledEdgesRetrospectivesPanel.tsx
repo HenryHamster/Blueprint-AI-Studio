@@ -1,12 +1,17 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
 import { fetchSrUnhandledEdgesRetrospectives, fetchSrCatchRateHealth, type SrUnhandledEdgesTask, type SrUnhandledEdge, type SrCatchRateHealth } from '../api';
+import {
+  RetrospectiveDayWindowButtons,
+  RetrospectivePagination,
+  RetrospectiveRefreshButton,
+  SrCatchRateHealthBanner,
+} from './SrRetrospectiveShared';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { useUrlFilterState } from '../hooks/useUrlFilterState';
 
 const PAGE_SIZE = 20;
-const DAY_OPTIONS = [7, 14, 30, 90];
 const BLIND_SPOT_PILL_MIN_COUNT = 2;
 const BLIND_SPOT_PILL_MIN_THEMES = 2;
 const BLIND_SPOT_PILL_CAP = 8;
@@ -24,54 +29,25 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
   const {
     days,
     secondaryFilter: blindSpotFilter,
+    tertiaryFilter: casePatternFilter,
     taskTypeFilter,
     page,
     setDays,
     setSecondaryFilter: setBlindSpotFilter,
+    setTertiaryFilter: setCasePatternFilter,
     setTaskTypeFilter,
     setPage,
-  } = useUrlFilterState('sru_', selectedProjectId, { secondaryParam: 'blind_spot' });
+  } = useUrlFilterState('sru_', selectedProjectId, { secondaryParam: 'blind_spot', tertiaryParam: 'case_pattern' });
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
   const [blindSpotCounts, setBlindSpotCounts] = useState<Record<string, number>>({});
   const [edgeCaseCounts, setEdgeCaseCounts] = useState<Record<string, number>>({});
   const [health, setHealth] = useState<SrCatchRateHealth | null>(null);
   const [healthDismissed, setHealthDismissed] = useState(false);
-  const [casePatternState, setCasePatternState] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    return {
-      projectId: selectedProjectId,
-      value: params.get('sru_case_pattern') ?? '',
-    };
-  });
   const taskTypesAccRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
   const panelMountTimeRef = useRef<number>(Date.now());
   const abortControllerRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
-
-  if (casePatternState.projectId !== selectedProjectId) {
-    setCasePatternState({ projectId: selectedProjectId, value: '' });
-  }
-  const casePatternFilter = casePatternState.value;
-  const setCasePatternFilter = useCallback(
-    (value: string) => setCasePatternState((state) => ({ ...state, value })),
-    [],
-  );
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    if (casePatternFilter) {
-      params.set('sru_case_pattern', casePatternFilter);
-    } else {
-      params.delete('sru_case_pattern');
-    }
-    const search = params.toString();
-    window.history.replaceState(
-      null,
-      '',
-      search ? `${window.location.pathname}?${search}` : window.location.pathname,
-    );
-  }, [casePatternFilter]);
 
   const fetchData = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -182,15 +158,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Unhandled Edge Cases</h2>
 
       <div className="flex flex-wrap items-center gap-2 mb-2 text-[10px]">
-        {DAY_OPTIONS.map(d => (
-          // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
-          <button
-            key={d}
-            type="button"
-            onClick={() => setDays(d)}
-            className={`px-1.5 py-0.5 rounded border ${days === d ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
-          >{d}d</button>
-        ))}
+        <RetrospectiveDayWindowButtons days={days} onChange={setDays} />
         {stableTaskTypes.length > 0 && (
           <select
             value={taskTypeFilter}
@@ -244,7 +212,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
       )}
 
       {health && health.status !== 'healthy' && !healthDismissed && (
-        <SrHealthBanner health={health} onDismiss={() => setHealthDismissed(true)} />
+        <SrCatchRateHealthBanner health={health} onDismiss={() => setHealthDismissed(true)} />
       )}
 
       {loading ? (
@@ -297,99 +265,11 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
               <SrUnhandledEdgesRow key={t.task_id} task={t} onClick={() => onSelectTask(t.task_id)} />
             ))}
           </div>
-          {totalPages > 1 && (
-            <div className="flex flex-wrap items-center gap-2 mt-2 text-[10px] text-neutral-400">
-              {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
-              <button
-                type="button"
-                disabled={page === 1}
-                onClick={() => setPage(p => Math.max(1, p - 1))}
-                className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
-                aria-label="Previous page"
-              >←</button>
-              <span>
-                Page {page} of {totalPages} · {total} total
-                {total > 0 && ` · showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, total)}`}
-              </span>
-              {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
-              <button
-                type="button"
-                disabled={page >= totalPages}
-                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
-                aria-label="Next page"
-              >→</button>
-            </div>
-          )}
-          {isStale && (
-            // eslint-disable-next-line viewport/min-touch-target -- dense control
-            <button
-              type="button"
-              onClick={handleRefresh}
-              disabled={loading}
-              className="mt-1 p-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
-              title="Refresh data (window may have moved)"
-              aria-label="Refresh pagination data"
-            >
-              <RefreshCw className="w-3 h-3" />
-            </button>
-          )}
+          <RetrospectivePagination page={page} total={total} totalPages={totalPages} pageSize={PAGE_SIZE} setPage={setPage} />
+          <RetrospectiveRefreshButton isStale={isStale} loading={loading} onRefresh={handleRefresh} />
         </>
       )}
     </section>
-  );
-}
-
-const HEALTH_TOOLTIP: Record<string, string> = {
-  stale: 'The SR catch-rate snapshot has not been refreshed recently. Displayed metrics may lag reality.',
-  frozen: 'The signal clock has stopped: catch-rate was not recomputed even though the signal timestamp advanced. Metrics are likely incorrect.',
-  low_data: 'Not enough tasks have been reviewed to compute a reliable catch rate. Treat metrics as preliminary.',
-  never_sufficient: 'The signal has been computed but never reached sufficient data to report a catch rate.',
-  missing: 'No SR catch-rate snapshot has been computed yet for this project.',
-};
-
-function SrHealthBanner({ health, onDismiss }: { health: SrCatchRateHealth; onDismiss: () => void }) {
-  const isRed = health.status === 'frozen' || health.status === 'never_sufficient' || health.status === 'missing';
-  const isAmber = health.status === 'stale';
-  const colorClass = isRed
-    ? 'border-red-800/40 bg-red-950/20 text-red-300'
-    : isAmber
-      ? 'border-amber-800/40 bg-amber-950/20 text-amber-300'
-      : 'border-neutral-700 bg-neutral-900/50 text-neutral-400';
-  const iconColor = isRed ? 'text-red-400' : isAmber ? 'text-amber-400' : 'text-neutral-500';
-
-  let ageText = '';
-  if (health.status === 'stale' || health.status === 'frozen') {
-    if (health.last_sufficient_age_hours !== null) {
-      ageText = ` · last sufficient ${Math.round(health.last_sufficient_age_hours)}h ago`;
-    }
-  } else if (health.status === 'never_sufficient') {
-    if (health.signal_age_hours !== null) {
-      ageText = ` · signal ${Math.round(health.signal_age_hours)}h ago`;
-    }
-  }
-
-  const tooltip = HEALTH_TOOLTIP[health.status] ?? '';
-
-  return (
-    <div
-      className={`flex items-center gap-1.5 mb-2 px-2 py-1 rounded border text-[10px] ${colorClass}`}
-      role="status"
-      data-testid="sr-health-banner"
-      title={tooltip}
-    >
-      <AlertTriangle className={`w-3 h-3 shrink-0 ${iconColor}`} aria-hidden="true" />
-      <span className="flex-1">{health.status}{ageText}</span>
-      {/* eslint-disable-next-line viewport/min-touch-target -- dense dismiss control */}
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="shrink-0 hover:opacity-70"
-        aria-label="Dismiss health banner"
-      >
-        <X className="w-3 h-3" />
-      </button>
-    </div>
   );
 }
 

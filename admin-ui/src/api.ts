@@ -1,4 +1,5 @@
 import { getIdToken } from './firebase';
+import type { SrMissedTask } from './components/SrRetrospectiveShared';
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -192,7 +193,7 @@ export async function fetchResearchActionability(
 }
 
 export interface SrMissedRetrospectivesResponse {
-  items: import('./components/SrTrendBreakdown').SrMissedTask[];
+  items: SrMissedTask[];
   total: number;
   /** Full list of task_type values present in the matched result set, when returned by the server. */
   task_types?: string[];
