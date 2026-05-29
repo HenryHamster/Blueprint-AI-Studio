@@ -1082,8 +1082,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # timeout never fires on it — the parent would otherwise wait the full
                     # evaluating_fail_hours (default 48h) hard timeout. Escalate: set
                     # requires_approval on the parent so the 2-hour approval gate fires,
-                    # and raise a failure alert.
-                    if not parent.requires_approval:
+                    # and raise a failure alert. Gated on require_approval_gates: with gates
+                    # off the operator opted out of manual gating, so the parent must converge
+                    # via partial rollup rather than be approval-gated and timed out. (This
+                    # also guards against the stuck-cycle / repeat-fingerprint paths, which set
+                    # requires_approval on the child too, leaking into a parent escalation.)
+                    if _runtime_config.get("require_approval_gates", True) and not parent.requires_approval:
                         parent.requires_approval = True
                         logger.warning(
                             f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} hit review-fix cap — "

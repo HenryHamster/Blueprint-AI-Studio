@@ -844,6 +844,112 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_cap_exhaustion_skips_approval_when_gates_disabled(db_session, mocker):
+    """With require_approval_gates off, hitting the review-fix cap must still
+    FAIL the child (terminal -> partial rollup) and close the PR, but must NOT
+    set requires_approval. Otherwise rollup_management escalates the flag onto
+    the parent and services.py's 2h approval-gate timeout FAILs the otherwise-
+    healthy parent, discarding its already-merged siblings. Regression for the
+    c255c4cb / rollup PR #6722 incident (2026-05-28)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    # Operator has opted out of manual approval gating.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 903,
+                "branch": "feat/gates-off",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    # 10 COMPLETED reviews on the same PR trip the small-scope global cap (10).
+    for _ in range(10):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[
+                    {
+                        "type": "review",
+                        "pr_number": 903,
+                        "branch": "feat/gates-off",
+                        "base_branch": "main",
+                    }
+                ],
+            )
+        )
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=903,
+        branch="feat/gates-off",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still broken",
+    )
+    assert result is None, "Global cap must still block the spawn"
+
+    await db_session.refresh(original_task)
+    # Terminal outcome is preserved — the cap still fails the child and closes the PR.
+    assert original_task.status == TaskStatus.FAILED, (
+        f"Cap must still FAIL the child even with gates off, got {original_task.status}"
+    )
+    assert (original_task.context or {}).get("failure_detail") == "review_cap_exhausted"
+    close_mock.assert_awaited_once()
+    # The fix: NO approval gate is raised when require_approval_gates is off.
+    assert not original_task.requires_approval, (
+        "With require_approval_gates off, cap exhaustion must NOT set "
+        "requires_approval — the capped child is FAILED (terminal) and converges "
+        "via partial rollup without gating the parent."
+    )
+
+
+@pytest.mark.asyncio
 async def test_infra_failed_tasks_dont_count_toward_global_cap(db_session, mocker):
     """FAILED tasks with infra failure_category (PROVISION_FAILURE, RATE_LIMIT,
     AGENT_TIMEOUT, EXTERNAL_API) never ran a real review, so they must not
@@ -7464,9 +7570,7 @@ async def test_spawn_pin_funnel_records_skip_breaker_tripped(db_session, mocker)
     import app.warm_backlog_reuse as wbr
 
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.review_pipeline.is_warm_continuity_suppressed", return_value=True
-    )
+    mocker.patch("app.review_pipeline.is_warm_continuity_suppressed", return_value=True)
     _clear_spawn_pin_events()
     try:
         source, original = await _make_pin_source_task(

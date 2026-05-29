@@ -690,7 +690,15 @@ async def _handle_cap_exhaustion(
         return
 
     orig.status = TaskStatus.FAILED
-    orig.requires_approval = True
+    # The approval gate is discretionary: only raise it when require_approval_gates
+    # is enabled. With gates off the operator has opted out of manual gating, so the
+    # capped child still FAILs (terminal → routes through the normal partial-rollup
+    # path) but we must NOT set requires_approval. Otherwise rollup_management
+    # escalates this child's flag onto the parent (rollup_management.py ~1086) and
+    # services.py's 2h approval-gate timeout then FAILs the otherwise-healthy parent,
+    # discarding its already-merged siblings.
+    if _runtime_config.get("require_approval_gates", True):
+        orig.requires_approval = True
     orig.latest_status_message = (
         f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
         f"PR #{pr_number} auto-closed, manual review required"
