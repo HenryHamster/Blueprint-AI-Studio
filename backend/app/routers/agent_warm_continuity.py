@@ -1,0 +1,474 @@
+"""Agent-facing warm-VM continuity endpoints (/vm-heartbeat + /next-role).
+
+Extracted from app.routers.agent to give the warm-VM continuity surface its
+own seam, so warm-handoff work (chain continuity, backlog reuse, VM-scoped
+liveness) can evolve independently of the agent lifecycle (claim/heartbeat/
+GitHub) flow and stop colliding in the main agent router.
+
+Behavior is byte-identical to the prior in-router implementation:
+  - POST /api/agent/vm-heartbeat — VM-scoped liveness for warm VMs polling
+    /next-role; also records VM image identity + runtime fingerprint.
+  - POST /api/agent/next-role — look up a warm-pinned QUEUED task for this VM
+    (chain continuity), fall back to backlog reuse, then chain-fork exit / 204.
+
+Auth is shared with the main agent router via ``verify_agent_token``; the
+router is registered under the same ``/api/agent`` prefix in app.main so the
+route paths stay byte-identical and the agent-side warm-poll script needs no
+change.
+"""
+
+import logging
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
+
+from app.auth import (
+    create_agent_token,
+    AGENT_TOKEN_TTL_HOURS,
+    AGENT_BOOTSTRAP_TOKEN_TTL_HOURS,
+)
+from app.broadcast import broadcast_to_project
+from app.database import get_session
+from app.models import Task, TaskStatus, _utcnow
+from app.routers.agent import verify_agent_token
+from app.shared_state import limiter
+import app.shared_state as _shared_state
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 (warm-VM continuity): /next-role + /vm-heartbeat
+# ---------------------------------------------------------------------------
+
+
+class NextRoleRequest(BaseModel):
+    """Body for POST /api/agent/next-role.
+
+    The agent on a warm VM polls this endpoint after a role completes to
+    discover whether another QUEUED task has been pinned to the same VM.
+    The JWT proves the agent owns the prior task; the body re-asserts the
+    VM identity (defence in depth — JWT + body cross-check) and the prior
+    PR number so the orchestrator can scope the lookup.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    vm_instance_id: str = Field(..., min_length=1)
+    prior_task_id: uuid.UUID
+    prior_pr_number: int | None = None
+
+
+class VmHeartbeatRequest(BaseModel):
+    """Body for POST /api/agent/vm-heartbeat — VM-scoped liveness."""
+
+    model_config = ConfigDict(extra="ignore")
+    vm_instance_id: str = Field(..., min_length=1)
+    # Same field names as HeartbeatRequest (schemas.py) so agent can use
+    # one payload shape for both endpoints. Recorded into compute._vm_images
+    # so the orchestrator can detect stale Packer images on warm VMs that
+    # never run a task heartbeat.
+    vm_image_name: str | None = Field(None, max_length=200)
+    vm_image_build_ts: int | None = None
+    agent_runtime_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{64}$")
+
+
+@router.post("/vm-heartbeat", status_code=204)
+@limiter.limit("600/minute")
+async def vm_heartbeat(
+    request: Request,
+    req: VmHeartbeatRequest,
+    token: dict = Depends(verify_agent_token),
+):
+    """VM-scoped heartbeat used by warm VMs while polling /next-role.
+
+    The reaper kills VMs whose task hasn't heartbeated, but during the
+    next-role poll the prior task is already terminal, so the agent
+    needs a separate liveness signal that targets the VM identity, not
+    the task identity. The orchestrator's provisioning loop consults
+    `_shared_state.vm_last_heartbeat` to decide whether to skip
+    cold-provisioning a fresh VM.
+    """
+    if req.vm_instance_id != token.get("vm_instance_id"):
+        raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+    _shared_state.record_vm_heartbeat(req.vm_instance_id)
+    if req.vm_image_name is not None or req.vm_image_build_ts is not None:
+        from app.compute import record_vm_image
+
+        record_vm_image(req.vm_instance_id, req.vm_image_name, req.vm_image_build_ts)
+    if req.agent_runtime_fingerprint is not None:
+        from app.compute import record_vm_runtime_fingerprint
+
+        record_vm_runtime_fingerprint(req.vm_instance_id, req.agent_runtime_fingerprint)
+    return Response(status_code=204)
+
+
+async def _vm_is_refresh_capable(
+    session: AsyncSession, vm_instance_id: str | None
+) -> bool:
+    """Return True if any task previously assigned to this VM proved it can
+    refresh (i.e. recorded ``last_token_refresh_at``).
+
+    The warm-handoff path mints a token for a brand-new QUEUED task that has
+    never refreshed, so capability cannot be read off the task being claimed.
+    Instead we look across the VM's whole role chain: a single successful
+    /api/agent/refresh-token on ANY prior role on this VM proves the
+    long-lived agent process can refresh. Reusing the existing
+    ``last_token_refresh_at`` signal (set in ``agent_refresh_token``) keeps
+    this VM-level check from inventing a parallel capability marker. An old
+    image that cannot refresh never stamps the column, so it correctly keeps
+    receiving the long bootstrap window across handoffs.
+    """
+    if not vm_instance_id:
+        return False
+    stmt = (
+        select(Task.id)
+        .where(
+            Task.vm_instance_id == vm_instance_id,
+            Task.last_token_refresh_at.is_not(None),
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).first() is not None
+
+
+async def _finalize_warm_claim(
+    session: AsyncSession,
+    task: Task,
+    vm_instance_id: str,
+    *,
+    origin: str,
+    refresh_capable: bool,
+) -> dict:
+    """Flip a locked QUEUED task to IN_PROGRESS for a warm VM and build the
+    /next-role claim response.
+
+    Shared by the chain-continuity (``origin="next_role_endpoint"``) and the
+    backlog-reuse (``origin="backlog_reuse"``) paths so both stamp warm
+    telemetry identically. Sets ``context._timing.warm_start`` and resets
+    ``vm_provisioned_at`` to now so the task is counted as warm (and pays ~0
+    cold-start) by the efficiency snapshot, mints a fresh task-scoped JWT,
+    commits, and broadcasts the status change. On JWT-mint failure it rolls
+    back (restoring QUEUED) and raises 500.
+
+    ``refresh_capable`` gates the minted token's TTL: a VM already proven
+    refresh-capable gets the short security-bounded TTL (no fresh bootstrap
+    window), while an unconfirmed VM keeps the long bootstrap window so a
+    deploy/rebake cutover can't 401 it mid-task.
+    """
+    from app.compute import VM_PROVISIONING_MODEL
+
+    task.vm_instance_id = vm_instance_id
+    task.status = TaskStatus.IN_PROGRESS
+    task.last_heartbeat = _utcnow()
+    # vm_provisioned_at marks when the VM was made available to the task. For
+    # warm-start we set it to "now" so claim_latency / reaper logic operates on
+    # a fresh window — and so the subsequent idempotent /claim never stamps a
+    # cold-start sample (the warm task stays vm_cold_start_ms=NULL).
+    task.vm_provisioned_at = _utcnow()
+    task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
+    task.vm_warm_start = True
+    if task.started_at is None:
+        task.started_at = _utcnow()
+    # Carry warm-start signal forward into context._timing. setdefault keeps
+    # this server-side write idempotent; the agent's status update remains the
+    # authoritative source and may overwrite warm_start. warm_claim_origin
+    # distinguishes chain continuity from backlog reuse for post-mortem and
+    # telemetry (efficiency direction d-91d8dede).
+    ctx = dict(task.context or {})
+    existing_timing = dict(ctx.get("_timing") or {})
+    existing_timing.setdefault("warm_start", True)
+    existing_timing["warm_claim_origin"] = origin
+    existing_timing["prior_role_vm_id"] = vm_instance_id
+    ctx["_timing"] = existing_timing
+    task.context = ctx
+    flag_modified(task, "context")
+    # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If mint
+    # raises, the rollback restores QUEUED so a retry can succeed instead of
+    # leaving the task stuck IN_PROGRESS with no live agent.
+    task_type = ""
+    try:
+        payloads = task.payloads or []
+        if payloads and isinstance(payloads[0], dict):
+            task_type = str(payloads[0].get("type") or "")
+    except Exception:  # noqa: BLE001 — task_type is best-effort metadata
+        task_type = ""
+    ttl_hours = (
+        AGENT_TOKEN_TTL_HOURS if refresh_capable else AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
+    )
+    try:
+        agent_token = create_agent_token(
+            task_id=str(task.id),
+            vm_instance_id=vm_instance_id,
+            task_type=task_type,
+            project_id=str(task.project_id) if task.project_id else "",
+            ttl_hours=ttl_hours,
+        )
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
+        raise HTTPException(status_code=500, detail="token_mint_failed") from exc
+
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    # Broadcast AFTER the commit so a rollback path doesn't fire a spurious
+    # event.
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+    )
+    return {
+        "action": "claim",
+        "task_id": str(task.id),
+        "warm_start": True,
+        "agent_token": agent_token,
+    }
+
+
+@router.post("/next-role")
+@limiter.limit("600/minute")
+async def next_role(
+    request: Request,
+    req: NextRoleRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Look up a warm-pinned QUEUED task for this VM and claim it.
+
+    Phase 2b. Returns one of:
+      - 200 ``{"action": "claim", "task_id": ..., "warm_start": True}`` —
+        a QUEUED task whose context.warm_target_vm_id matches this VM
+        was found and atomically transitioned to IN_PROGRESS.
+      - 200 ``{"action": "exit", "reason": "another_vm_owns_this_pr"}`` —
+        an IN_PROGRESS task for the same PR is pinned to a different
+        VM; the agent should exit cleanly.
+      - 204 — no warm-pinned task for this VM right now; the agent
+        should keep polling until ``next_role_poll_timeout_secs``.
+
+    JWT cross-check: the body's ``vm_instance_id`` MUST equal the JWT's
+    ``vm_instance_id`` claim. Any mismatch is rejected 403.
+    """
+    if req.vm_instance_id != token.get("vm_instance_id"):
+        raise HTTPException(status_code=403, detail="vm_instance_mismatch")
+
+    # Liveness signal: receiving the request itself proves the VM is alive.
+    _shared_state.record_vm_heartbeat(req.vm_instance_id)
+
+    from app.warm_backlog_reuse import record_chain_poll as _record_chain_poll
+
+    _record_chain_poll()
+
+    # Race guard: refuse warm-claim on a VM that was just scheduled for
+    # orchestrator-initiated deletion. With fire_and_forget_vm_delete
+    # (main.py — released the agent_completion lock window), there is now
+    # a ~30-60s window where the VM is still alive in GCP but the delete
+    # is in flight. Without this check, the warm-start claim races into
+    # that window, gets the VM, and the pending delete kills the agent
+    # mid-task with [FATAL:SIGTERM] (production 2026-05-05 task cfd73cec
+    # on VM agent-vm-c44258...). The marker is recorded synchronously
+    # before scheduling so it is always observable here.
+    from app.main import is_orchestrator_initiated_delete
+
+    _is_doomed, _delete_reason = is_orchestrator_initiated_delete(req.vm_instance_id)
+    if _is_doomed:
+        logger.info(
+            f"[NEXT-ROLE] Refusing warm-claim on doomed VM {req.vm_instance_id} "
+            f"(delete reason={_delete_reason})"
+        )
+        from app.warm_backlog_reuse import record_chain_doomed as _record_chain_doomed
+
+        _record_chain_doomed()
+        return Response(status_code=204)
+
+    # Postgres can use the JSONB ``?`` operator (``has_key``) against
+    # ``ix_task_context_gin``; SQLite test runs fall back to the portable
+    # JSON-extract form. Computed once here because both the chain-continuity
+    # lookup and the chain-fork exit below need it.
+    use_jsonb_has_key = session.get_bind().dialect.name == "postgresql"
+
+    # Determine once whether this VM has proven it can refresh, so every warm
+    # claim below (chain-continuity and backlog-reuse) mints the short TTL for
+    # a confirmed VM and only falls back to the long bootstrap window for a VM
+    # that has never refreshed (e.g. an old image). See _vm_is_refresh_capable.
+    vm_refresh_capable = await _vm_is_refresh_capable(session, req.vm_instance_id)
+
+    # Circuit-breaker / feature-flag gate: if warm continuity is disabled or
+    # auto-suppressed (pin-clear rate exceeded the threshold), skip the warm-
+    # chain-continuity lookup so no new warm chains start. The orchestrator's
+    # provisioning loop clears outstanding warm pins when the breaker is active;
+    # skipping the lookup here closes the brief race window between the breaker
+    # tripping and the next orchestrator cycle. This gate governs ONLY
+    # chain-continuity claims — backlog-reuse (its own ``warm_backlog_reuse_enabled``
+    # flag) and the chain-fork exit below still run.
+    warm_continuity_active = (
+        _shared_state.runtime_config.get("warm_continuity_enabled", True)
+        and not _shared_state.is_warm_continuity_suppressed()
+    )
+    if warm_continuity_active:
+        # Look up a QUEUED task pinned to this VM. Optional prior_pr_number
+        # filter narrows further so a stray pin from an unrelated chain
+        # doesn't get claimed.
+        warm_vm_filters = [Task.status == TaskStatus.QUEUED]
+        if use_jsonb_has_key:
+            warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
+        warm_vm_filters.append(
+            Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
+        )
+        stmt = select(Task).where(*warm_vm_filters)
+        if req.prior_pr_number is not None:
+            prior_pr_filters = []
+            if use_jsonb_has_key:
+                prior_pr_filters.append(Task.context.has_key("warm_target_pr"))
+            prior_pr_filters.append(
+                Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
+            )
+            stmt = stmt.where(*prior_pr_filters)
+        stmt = stmt.with_for_update(skip_locked=True)
+
+        task = (await session.execute(stmt)).scalars().first()
+
+        if task is not None:
+            result = await _finalize_warm_claim(
+                session,
+                task,
+                req.vm_instance_id,
+                origin="next_role_endpoint",
+                refresh_capable=vm_refresh_capable,
+            )
+            from app.warm_backlog_reuse import (
+                record_chain_claimed as _record_chain_claimed,
+            )
+
+            _record_chain_claimed()
+            logger.info(
+                f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
+                f"vm={req.vm_instance_id} prior_task={req.prior_task_id} "
+                f"prior_pr={req.prior_pr_number}"
+            )
+            return result
+    else:
+        logger.info(
+            "[NEXT-ROLE] Warm continuity disabled/suppressed (circuit breaker) — "
+            "skipping chain-continuity claim for VM %s",
+            req.vm_instance_id,
+        )
+        from app.warm_backlog_reuse import (
+            record_chain_skipped as _record_chain_skipped,
+        )
+
+        if not _shared_state.runtime_config.get("warm_continuity_enabled", True):
+            _record_chain_skipped("disabled")
+        else:
+            _record_chain_skipped("breaker_tripped")
+
+    # Backlog-reuse branch (efficiency direction d-91d8dede). When the flag is
+    # enabled an idle VM with no chain-pinned follow-on may claim the next
+    # eligible QUEUED task from its project's general backlog and run it warm.
+    # Attempted BEFORE the chain-fork exit below so a forked chain doesn't
+    # strand an otherwise reusable VM. When the flag is OFF this whole block is
+    # skipped and behavior is byte-for-byte the pre-existing chain-only path —
+    # including, on no claim, the chain-fork exit / 204 so no idle VM is kept
+    # alive when there is no genuine pending work to reuse it for.
+    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+        if _shared_state.is_warm_backlog_reuse_suppressed():
+            from app.warm_backlog_reuse import (
+                record_claim_skipped as _record_claim_skipped,
+            )
+
+            _record_claim_skipped("circuit_breaker_tripped")
+        else:
+            _project_claim = token.get("project_id")
+            _project_uuid = None
+            if _project_claim:
+                try:
+                    _project_uuid = uuid.UUID(str(_project_claim))
+                except (ValueError, TypeError):
+                    _project_uuid = None
+            if _project_uuid is not None:
+                from app.warm_backlog_reuse import (
+                    record_next_role_poll_during_defer as _record_next_role_poll,
+                    record_warm_claim_succeeded as _record_warm_claim_succeeded,
+                    select_backlog_reuse_candidate,
+                )
+
+                # Record poll if we're inside a teardown-defer window the
+                # agent_status completion handler already registered. Check
+                # BEFORE refreshing so only pre-existing windows count.
+                if _shared_state.is_backlog_first_refusal_active(str(_project_uuid)):
+                    _record_next_role_poll()
+
+                # Refresh the project's first-refusal window so the orchestrator
+                # holds off cold-provisioning eligible backlog tasks while this VM
+                # polls — biasing the race toward reuse. The SKIP-LOCKED claim
+                # below still guarantees no double-provision if both race.
+                _shared_state.register_backlog_first_refusal(str(_project_uuid))
+
+                backlog_task = await select_backlog_reuse_candidate(
+                    session, _project_uuid, req.vm_instance_id
+                )
+                if backlog_task is not None:
+                    try:
+                        result = await _finalize_warm_claim(
+                            session,
+                            backlog_task,
+                            req.vm_instance_id,
+                            origin="backlog_reuse",
+                            refresh_capable=vm_refresh_capable,
+                        )
+                    except Exception:
+                        _shared_state.record_backlog_reuse_failure("finalize_error")
+                        raise
+                    _record_warm_claim_succeeded()
+                    logger.info(
+                        f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
+                        f"task={result['task_id']} vm={req.vm_instance_id} "
+                        f"project={_project_uuid}"
+                    )
+                    return result
+                # select_backlog_reuse_candidate records the skip reason
+                # (no_eligible vs lost_claim_race) itself — it is the only
+                # caller that can tell the two None cases apart.
+
+    # No matching warm-pinned task. Check whether another VM owns an
+    # IN_PROGRESS task for this PR — if so, the warm chain has already
+    # forked and this VM should exit cleanly.
+    if req.prior_pr_number is not None:
+        other_pr_filters = [
+            Task.status == TaskStatus.IN_PROGRESS,
+            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number),
+            Task.vm_instance_id.is_not(None),
+            Task.vm_instance_id != req.vm_instance_id,
+        ]
+        if use_jsonb_has_key:
+            other_pr_filters.insert(1, Task.context.has_key("warm_target_pr"))
+        other_stmt = select(Task).where(*other_pr_filters)
+        other = (await session.execute(other_stmt)).scalars().first()
+        if other is not None:
+            if warm_continuity_active:
+                from app.warm_backlog_reuse import (
+                    record_chain_other_vm_pr as _record_chain_other_vm_pr,
+                )
+
+                _record_chain_other_vm_pr()
+            return {
+                "action": "exit",
+                "reason": "another_vm_owns_this_pr",
+            }
+
+    # Nothing to claim. Tell the agent to keep polling.
+    if warm_continuity_active:
+        from app.warm_backlog_reuse import (
+            record_chain_no_pinned as _record_chain_no_pinned,
+        )
+
+        _record_chain_no_pinned()
+    return Response(status_code=204)
