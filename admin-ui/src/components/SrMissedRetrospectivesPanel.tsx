@@ -1,39 +1,60 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw, Search, X } from 'lucide-react';
 import { fetchSrCatchRateHealth, fetchSrMissedRetrospectives, type SrCatchRateHealthResponse } from '../api';
 import type { SrMissedTask } from './SrTrendBreakdown';
 import { SR_CANONICAL_CATEGORIES, SrCatchRateFreshnessPill } from './SrTrendBreakdown';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
+import { useUrlFilterState } from '../hooks/useUrlFilterState';
 
 const PAGE_SIZE = 20;
 const DAY_OPTIONS = [7, 14, 30, 90];
+const SCOPE_OPTIONS = ['small', 'medium', 'large'] as const;
 
 export interface SrMissedRetrospectivesPanelProps {
   selectedProjectId: string | null;
   onSelectTask: (taskId: string) => void;
   activeCategory?: string;
+  activeScope?: string;
+  activeInvestigationTaskIds?: Record<string, string> | null;
 }
 
-export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, activeCategory }: SrMissedRetrospectivesPanelProps) {
+export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, activeCategory, activeScope, activeInvestigationTaskIds }: SrMissedRetrospectivesPanelProps) {
   const [items, setItems] = useState<SrMissedTask[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [days, setDays] = useState(14);
-  const [categoryFilter, setCategoryFilter] = useState('');
-  const [taskTypeFilter, setTaskTypeFilter] = useState('');
-  const [page, setPage] = useState(1);
+  const {
+    days,
+    secondaryFilter: categoryFilter,
+    taskTypeFilter,
+    scopeFilter,
+    page,
+    setDays,
+    setSecondaryFilter: setCategoryFilter,
+    setTaskTypeFilter,
+    setScopeFilter,
+    setPage,
+  } = useUrlFilterState('srm_', selectedProjectId, { withScope: true });
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
   const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
   const [catchRateHealth, setCatchRateHealth] = useState<SrCatchRateHealthResponse | null>(null);
+  const [healthDismissed, setHealthDismissed] = useState(false);
   const taskTypesAccRef = useRef<Set<string>>(new Set());
   const catchRateHealthCacheRef = useRef(new Map<string, Promise<SrCatchRateHealthResponse>>());
   const mountedRef = useRef(true);
   const panelMountTimeRef = useRef<number>(Date.now());
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
 
   const fetchData = useCallback(async () => {
     if (!selectedProjectId) return;
+    // Cancel any in-flight request from a previous filter state
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    const currentId = ++requestIdRef.current;
+
     setLoading(true);
     setFetchError(null);
     try {
@@ -41,10 +62,12 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
         days,
         category: categoryFilter || undefined,
         task_type: taskTypeFilter || undefined,
+        scope: scopeFilter || undefined,
         page: page - 1,  // backend is 0-indexed; UI is 1-indexed
         page_size: PAGE_SIZE,
-      });
-      if (!mountedRef.current) return;
+      }, controller.signal);
+      // Discard stale responses: mountedRef guards unmount, requestIdRef guards filter-change races
+      if (!mountedRef.current || currentId !== requestIdRef.current) return;
       setItems(result.items);
       setTotal(result.total);
       const serverTypes = (result as { task_types?: string[] }).task_types;
@@ -58,12 +81,14 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
         setCategoryCounts(result.category_counts);
       }
     } catch (e) {
-      if (!mountedRef.current) return;
+      // Silently discard aborted requests — the panel already issued a newer fetch
+      if (e instanceof Error && e.name === 'AbortError') return;
+      if (!mountedRef.current || currentId !== requestIdRef.current) return;
       setFetchError(e instanceof Error ? e.message : 'network error');
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (mountedRef.current && currentId === requestIdRef.current) setLoading(false);
     }
-  }, [selectedProjectId, days, categoryFilter, taskTypeFilter, page]);
+  }, [selectedProjectId, days, categoryFilter, taskTypeFilter, scopeFilter, page]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -71,6 +96,8 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
       return;
     }
 
+    // Re-show the dismissable health banner whenever the project or day window changes
+    setHealthDismissed(false);
     const cacheKey = `${selectedProjectId}:${days}`;
     const cached = catchRateHealthCacheRef.current.get(cacheKey);
     let active = true;
@@ -92,26 +119,34 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
   useEffect(() => {
     mountedRef.current = true;
     fetchData();
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      abortControllerRef.current?.abort();
+    };
   }, [fetchData]);
 
   // Sync external activeCategory prop into internal categoryFilter
   useEffect(() => {
     if (activeCategory !== undefined) setCategoryFilter(activeCategory);
-  }, [activeCategory]);
+  }, [activeCategory, setCategoryFilter]);
+
+  // Sync external activeScope prop into internal scopeFilter
+  useEffect(() => {
+    if (activeScope !== undefined) setScopeFilter(activeScope);
+  }, [activeScope, setScopeFilter]);
 
   // Reset page when filters change
-  const prevFiltersRef = useRef({ days, categoryFilter, taskTypeFilter, selectedProjectId });
+  const prevFiltersRef = useRef({ days, categoryFilter, taskTypeFilter, scopeFilter, selectedProjectId });
   useEffect(() => {
     const prev = prevFiltersRef.current;
-    if (prev.days !== days || prev.categoryFilter !== categoryFilter || prev.taskTypeFilter !== taskTypeFilter || prev.selectedProjectId !== selectedProjectId) {
+    if (prev.days !== days || prev.categoryFilter !== categoryFilter || prev.taskTypeFilter !== taskTypeFilter || prev.scopeFilter !== scopeFilter || prev.selectedProjectId !== selectedProjectId) {
       setPage(1);
       taskTypesAccRef.current = new Set();
       setStableTaskTypes([]);
       setCategoryCounts({});
-      prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, selectedProjectId };
+      prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, scopeFilter, selectedProjectId };
     }
-  }, [days, categoryFilter, taskTypeFilter, selectedProjectId]);
+  }, [days, categoryFilter, taskTypeFilter, scopeFilter, selectedProjectId, setPage]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const isStale = Date.now() - panelMountTimeRef.current > 300_000; // 5 minutes
@@ -161,8 +196,21 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
             {stableTaskTypes.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         )}
+        <select
+          value={scopeFilter}
+          onChange={e => setScopeFilter(e.target.value)}
+          className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-[10px]"
+          aria-label="Filter by scope"
+        >
+          <option value="">All scopes</option>
+          {SCOPE_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
         <SrCatchRateFreshnessPill health={catchRateHealth} />
       </div>
+
+      {catchRateHealth && catchRateHealth.status !== 'healthy' && !healthDismissed && (
+        <SrHealthBanner health={catchRateHealth} onDismiss={() => setHealthDismissed(true)} />
+      )}
 
       {loading ? (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
@@ -176,7 +224,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
           <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
         </div>
       ) : items.length === 0 ? (
-        categoryFilter || taskTypeFilter ? (
+        categoryFilter || taskTypeFilter || scopeFilter ? (
           <div
             className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
             role="status"
@@ -184,9 +232,9 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
           >
             <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
             <span>
-              No misses for{categoryFilter ? ` category "${categoryFilter}"` : ''}{taskTypeFilter ? ` type "${taskTypeFilter}"` : ''}.{' '}
+              No misses for{categoryFilter ? ` category "${categoryFilter}"` : ''}{taskTypeFilter ? ` type "${taskTypeFilter}"` : ''}{scopeFilter ? ` scope "${scopeFilter}"` : ''}.{' '}
               {/* eslint-disable-next-line viewport/min-touch-target -- inline text link, dense context */}
-              <button type="button" className="underline hover:text-neutral-300" onClick={() => { setCategoryFilter(''); setTaskTypeFilter(''); }}>Clear filters</button>
+              <button type="button" className="underline hover:text-neutral-300" onClick={() => { setCategoryFilter(''); setTaskTypeFilter(''); setScopeFilter(''); }}>Clear filters</button>
             </span>
           </div>
         ) : (
@@ -203,24 +251,41 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
         <>
           {catFreq.length > 0 && (
             <div className="flex flex-wrap gap-1.5 mb-2">
-              {catFreq.map(([cat, count]) => (
-                // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
-                <button
-                  key={cat}
-                  type="button"
-                  onClick={() => setCategoryFilter(cat === categoryFilter ? '' : cat)}
-                  className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${cat === categoryFilter ? 'border-red-500/60 bg-red-950/30 text-red-300' : 'border-neutral-700 text-neutral-400 hover:border-red-500/40'}`}
-                  title={`Filter by ${cat}`}
-                >
-                  {cat} <span className="text-neutral-500">{count}</span>
-                </button>
-              ))}
+              {catFreq.map(([cat, count]) => {
+                const investigationTaskId = activeInvestigationTaskIds?.[cat];
+                return (
+                  <span key={cat} className="inline-flex items-center gap-0.5">
+                    {/* eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels */}
+                    <button
+                      type="button"
+                      onClick={() => setCategoryFilter(cat === categoryFilter ? '' : cat)}
+                      className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${cat === categoryFilter ? 'border-red-500/60 bg-red-950/30 text-red-300' : 'border-neutral-700 text-neutral-400 hover:border-red-500/40'}`}
+                      title={`Filter by ${cat}`}
+                    >
+                      {cat} <span className="text-neutral-500">{count}</span>
+                    </button>
+                    {investigationTaskId && (
+                      // eslint-disable-next-line viewport/min-touch-target -- dense inline indicator
+                      <button
+                        type="button"
+                        onClick={() => onSelectTask(investigationTaskId)}
+                        title={`Open SR investigation: ${investigationTaskId}`}
+                        aria-label={`Open SR investigation for ${cat}: ${investigationTaskId}`}
+                        data-testid={`investigation-badge-${cat}`}
+                        className="text-cyan-600 hover:text-cyan-400 shrink-0"
+                      >
+                        <Search className="w-2.5 h-2.5" />
+                      </button>
+                    )}
+                  </span>
+                );
+              })}
               <span className="text-[9px] text-neutral-600 self-center ml-1">{total} total</span>
             </div>
           )}
           <div className="flex flex-col gap-1">
             {items.map(t => (
-              <SrMissRow key={t.task_id} task={t} onClick={() => onSelectTask(t.task_id)} />
+              <SrMissRow key={t.task_id} task={t} onClick={() => onSelectTask(t.task_id)} investigationTaskIds={activeInvestigationTaskIds} onOpenInvestigation={onSelectTask} />
             ))}
           </div>
           {totalPages > 1 && (
@@ -266,7 +331,60 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
   );
 }
 
-function SrMissRow({ task, onClick }: { task: SrMissedTask; onClick: () => void }) {
+const HEALTH_TOOLTIP: Record<string, string> = {
+  stale: 'The SR catch-rate snapshot has not been refreshed recently. Displayed metrics may lag reality.',
+  frozen: 'The signal clock has stopped: catch-rate was not recomputed even though the signal timestamp advanced. Metrics are likely incorrect.',
+  low_data: 'Not enough tasks have been reviewed to compute a reliable catch rate. Treat metrics as preliminary.',
+  never_sufficient: 'The signal has been computed but never reached sufficient data to report a catch rate.',
+  missing: 'No SR catch-rate snapshot has been computed yet for this project.',
+};
+
+function SrHealthBanner({ health, onDismiss }: { health: SrCatchRateHealthResponse; onDismiss: () => void }) {
+  const isRed = health.status === 'frozen' || health.status === 'never_sufficient' || health.status === 'missing';
+  const isAmber = health.status === 'stale';
+  const colorClass = isRed
+    ? 'border-red-800/40 bg-red-950/20 text-red-300'
+    : isAmber
+      ? 'border-amber-800/40 bg-amber-950/20 text-amber-300'
+      : 'border-neutral-700 bg-neutral-900/50 text-neutral-400';
+  const iconColor = isRed ? 'text-red-400' : isAmber ? 'text-amber-400' : 'text-neutral-500';
+
+  let ageText = '';
+  if (health.status === 'stale' || health.status === 'frozen') {
+    if (health.last_sufficient_age_hours !== null) {
+      ageText = ` · last sufficient ${Math.round(health.last_sufficient_age_hours)}h ago`;
+    }
+  } else if (health.status === 'never_sufficient') {
+    if (health.signal_age_hours !== null) {
+      ageText = ` · signal ${Math.round(health.signal_age_hours)}h ago`;
+    }
+  }
+
+  const tooltip = HEALTH_TOOLTIP[health.status] ?? '';
+
+  return (
+    <div
+      className={`flex items-center gap-1.5 mb-2 px-2 py-1 rounded border text-[10px] ${colorClass}`}
+      role="status"
+      data-testid="sr-health-banner"
+      title={tooltip}
+    >
+      <AlertTriangle className={`w-3 h-3 shrink-0 ${iconColor}`} aria-hidden="true" />
+      <span className="flex-1">{health.status}{ageText}</span>
+      {/* eslint-disable-next-line viewport/min-touch-target -- dense dismiss control */}
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="shrink-0 hover:opacity-70"
+        aria-label="Dismiss health banner"
+      >
+        <X className="w-3 h-3" />
+      </button>
+    </div>
+  );
+}
+
+function SrMissRow({ task, onClick, investigationTaskIds, onOpenInvestigation }: { task: SrMissedTask; onClick: () => void; investigationTaskIds?: Record<string, string> | null; onOpenInvestigation?: (taskId: string) => void }) {
   const [expanded, setExpanded] = useState(false);
   return (
     // eslint-disable-next-line viewport/min-touch-target -- dense row, consistent with SrMissedRetrospective
@@ -312,9 +430,25 @@ function SrMissRow({ task, onClick }: { task: SrMissedTask; onClick: () => void 
           {task.missed_categories.map(cat => {
             const sr = task.sr_check_results?.[cat];
             const reviewer = task.reviewer_findings?.find(f => f.category === cat);
+            const investigationTaskId = investigationTaskIds?.[cat];
             return (
               <div key={cat} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
-                <div className="mb-1 text-neutral-400 font-medium">{cat}</div>
+                <div className="mb-1 flex items-center gap-1">
+                  <span className="text-neutral-400 font-medium">{cat}</span>
+                  {investigationTaskId && onOpenInvestigation && (
+                    // eslint-disable-next-line viewport/min-touch-target -- dense inline indicator
+                    <button
+                      type="button"
+                      onClick={e => { e.stopPropagation(); onOpenInvestigation(investigationTaskId); }}
+                      title={`Open SR investigation: ${investigationTaskId}`}
+                      aria-label={`Open SR investigation for ${cat}: ${investigationTaskId}`}
+                      data-testid={`investigation-drawer-${cat}`}
+                      className="text-cyan-600 hover:text-cyan-400 shrink-0"
+                    >
+                      <Search className="w-2.5 h-2.5" />
+                    </button>
+                  )}
+                </div>
                 <div className="flex flex-wrap gap-x-3 text-[9px] mb-0.5">
                   <span>
                     <span className="text-neutral-500">SR: </span>

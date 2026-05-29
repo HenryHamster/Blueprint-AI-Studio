@@ -460,6 +460,70 @@ def test_disagreement_directions_defaults_severity_to_low():
     assert counts[("correctness", "create")]["examples"][0]["severity"] == "LOW"
 
 
+def test_disagreement_directions_examples_include_task_id():
+    """Examples must carry task_id and preserve existing severity/description fields."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {
+                "category": "correctness",
+                "severity": "HIGH",
+                "description": "Missing null check",
+            }
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    ex = counts[("correctness", "create")]["examples"][0]
+    assert ex["severity"] == "HIGH"
+    assert ex["description"] == "Missing null check"
+    assert "task_id" in ex
+    assert ex["task_id"] == str(task.id)
+
+
+def test_disagreement_directions_examples_include_pr_url_when_present():
+    """Examples carry pr_url from task context._pr_url when available."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    pr = "https://github.com/Owner/Repo/pull/42"
+    task = make_task(
+        project_id=pid,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        context={
+            "_pr_url": pr,
+            "_self_review_outcome": {
+                "check_results": {},
+                "reviewer_findings": [
+                    {"category": "correctness", "severity": "HIGH", "description": "Issue"}
+                ],
+            },
+        },
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    ex = counts[("correctness", "create")]["examples"][0]
+    assert ex.get("pr_url") == pr
+
+
+def test_disagreement_directions_examples_omit_pr_url_when_absent():
+    """Examples do not carry pr_url key when task context has no _pr_url."""
+    from app.sr_blind_spots import _count_reviewer_disagreement_directions
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": "Issue"}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    ex = counts[("correctness", "create")]["examples"][0]
+    assert "pr_url" not in ex
+
+
 # ---------------------------------------------------------------------------
 # Unit: aggregate_sr_co_failure_pairs
 # ---------------------------------------------------------------------------

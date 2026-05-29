@@ -626,7 +626,7 @@ function ByFixIterationSection({ byFixIteration }: { byFixIteration: Record<stri
 
 const SCOPE_ORDER: readonly string[] = ['small', 'medium', 'large'];
 
-function ByScopeSection({ byScope }: { byScope: Record<string, Record<string, SrTaskTypeCategoryStats>> }) {
+function ByScopeSection({ byScope, onScopeClick }: { byScope: Record<string, Record<string, SrTaskTypeCategoryStats>>; onScopeClick?: (scope: string) => void }) {
   const known = SCOPE_ORDER.filter(s => byScope[s] && Object.keys(byScope[s]).length > 0);
   const extras = Object.keys(byScope)
     .filter(s => !SCOPE_ORDER.includes(s) && Object.keys(byScope[s]).length > 0)
@@ -637,7 +637,22 @@ function ByScopeSection({ byScope }: { byScope: Record<string, Record<string, Sr
     <div data-testid="sr-trend-by-scope" className="mt-1.5 pt-1.5 border-t border-neutral-800/60">
       <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-1">By Scope</p>
       {scopes.map(scope => (
-        <ByTaskTypeRow key={scope} ttype={scope} cats={byScope[scope]} />
+        onScopeClick ? (
+          <div
+            key={scope}
+            role="button"
+            tabIndex={0}
+            data-testid={`sr-trend-by-scope-row-${scope}`}
+            onClick={() => onScopeClick(scope)}
+            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onScopeClick(scope); } }}
+            className="cursor-pointer rounded hover:bg-neutral-800/40 focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500/60"
+            aria-label={`Filter SR misses by scope ${scope}`}
+          >
+            <ByTaskTypeRow ttype={scope} cats={byScope[scope]} />
+          </div>
+        ) : (
+          <ByTaskTypeRow key={scope} ttype={scope} cats={byScope[scope]} />
+        )
       ))}
     </div>
   );
@@ -1185,6 +1200,8 @@ interface SrTrendBreakdownProps {
   trends: SrTrendData | null | undefined;
   variant: 'card' | 'inline';
   onCategoryClick?: (category: string) => void;
+  /** Called when a row in the By Scope breakdown is clicked. Used to drill from a scope bucket into the SR-missed panel filtered to that scope. */
+  onScopeClick?: (scope: string) => void;
   /** Per-category minimum hit-rate targets configured by the operator. When unset, falls back to the default 50% floor. */
   srCatchRateTargets?: Record<string, number> | null;
   /** Callback invoked when the user clicks the "configure targets" CTA. Parent is responsible for routing to the settings destination. */
@@ -1596,7 +1613,7 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds, srCatchRateHealth }: SrTrendBreakdownProps) {
+export function SrTrendBreakdown({ trends, variant, onCategoryClick, onScopeClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds, srCatchRateHealth }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -1727,7 +1744,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
           );
         })()}
         {trends?.by_scope && Object.keys(trends.by_scope).length > 0 && (
-          <ByScopeSection byScope={trends.by_scope} />
+          <ByScopeSection byScope={trends.by_scope} onScopeClick={onScopeClick} />
         )}
         {trends?.by_task_type && Object.keys(trends.by_task_type).length > 0 && (
           <ByTaskTypeSection byTaskType={trends.by_task_type} />

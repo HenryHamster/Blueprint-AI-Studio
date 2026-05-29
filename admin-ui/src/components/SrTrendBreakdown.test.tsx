@@ -1659,6 +1659,22 @@ describe('SrTrendBreakdown by_scope section', () => {
     expect(section).not.toHaveTextContent('medium');
   });
 
+  it('invokes onScopeClick with the row scope when a scope row is activated', async () => {
+    const user = userEvent.setup();
+    const onScopeClick = vi.fn();
+    const trends: SrTrendData = {
+      categories: { correctness: { miss_rate: 0.3, trend: 'stable' } },
+      by_scope: {
+        small: { correctness: { miss_rate: 0.1, sample_count: 8 } },
+        large: { correctness: { miss_rate: 0.6, sample_count: 6 } },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" onScopeClick={onScopeClick} />);
+    const largeRow = screen.getByTestId('sr-trend-by-scope-row-large');
+    await user.click(largeRow);
+    expect(onScopeClick).toHaveBeenCalledWith('large');
+  });
+
   it('reveals examples when a category cell with examples is clicked', async () => {
     const user = userEvent.setup();
     const trends: SrTrendData = {

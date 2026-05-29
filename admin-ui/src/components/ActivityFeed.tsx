@@ -87,10 +87,11 @@ function SkeletonRow() {
   );
 }
 
-type FilterOption = ActivityEventType | 'ALL';
+type FilterOption = ActivityEventType | 'ALL' | 'NEEDS_REVIEW';
 
 const FILTER_PILLS: { label: string; value: FilterOption; activeClass: string }[] = [
   { label: 'All', value: 'ALL', activeClass: 'bg-neutral-600 text-neutral-100 border-neutral-500' },
+  { label: 'Pending Approval', value: 'NEEDS_REVIEW', activeClass: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
   { label: 'Completed', value: 'TASK_COMPLETED', activeClass: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' },
   { label: 'Failed', value: 'TASK_FAILED', activeClass: 'bg-red-500/20 text-red-400 border-red-500/40' },
   { label: 'Research', value: 'RESEARCH_FINDINGS', activeClass: 'bg-blue-500/20 text-blue-400 border-blue-500/40' },
@@ -387,8 +388,15 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   }, [fetchEvents, refreshInterval]);
 
   const filteredEvents = events.filter(e => {
-    const typeMatches = activeFilter === 'ALL' || e.type === activeFilter;
-    if (!typeMatches) return false;
+    let statusMatches: boolean;
+    if (activeFilter === 'ALL') {
+      statusMatches = true;
+    } else if (activeFilter === 'NEEDS_REVIEW') {
+      statusMatches = e.status === 'NEEDS_REVIEW';
+    } else {
+      statusMatches = e.type === activeFilter;
+    }
+    if (!statusMatches) return false;
 
     if (!searchQuery) return true;
 
@@ -603,14 +611,18 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
               ? 'No events match your search'
               : activeFilter === 'ALL'
                 ? 'No recent activity'
-                : 'No matching events'}
+                : activeFilter === 'NEEDS_REVIEW'
+                  ? 'No events pending approval'
+                  : 'No matching events'}
           </p>
           <p className="text-xs mt-1 opacity-70">
             {searchQuery
               ? 'Try different keywords'
               : activeFilter === 'ALL'
                 ? 'Events will appear here as tasks run'
-                : 'Try a different filter'}
+                : activeFilter === 'NEEDS_REVIEW'
+                  ? 'Tasks waiting for review will appear here'
+                  : 'Try a different filter'}
           </p>
         </div>
       ) : (

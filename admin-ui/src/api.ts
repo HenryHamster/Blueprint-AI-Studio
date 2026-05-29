@@ -34,7 +34,8 @@ export async function apiFetch(
   url: string,
   options?: RequestInit,
   retries = 2,
-  timeout = 30000
+  timeout = 30000,
+  signal?: AbortSignal
 ): Promise<Response> {
   const headers = await authHeaders();
   const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
@@ -60,13 +61,24 @@ export async function apiFetch(
   const attemptFetch = async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
+    // Forward external abort to the internal timeout controller so both
+    // sources can cancel the underlying fetch.
+    const onExternalAbort = () => controller.abort();
+    signal?.addEventListener('abort', onExternalAbort, { once: true });
     try {
       const res = await fetch(fullUrl, { ...mergedOptions, signal: controller.signal });
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onExternalAbort);
       return res;
     } catch (e) {
       clearTimeout(timer);
-      if (e instanceof Error && e.name === 'AbortError') throw new Error('Request timed out');
+      signal?.removeEventListener('abort', onExternalAbort);
+      if (e instanceof Error && e.name === 'AbortError') {
+        // Distinguish external caller abort (should propagate as AbortError)
+        // from internal timeout (should surface as a timeout message).
+        if (signal?.aborted) throw e;
+        throw new Error('Request timed out');
+      }
       throw e;
     }
   };
@@ -77,7 +89,8 @@ export async function apiFetch(
         const res = await attemptFetch();
         if (res.ok || res.status < 500) return res;
       } catch (e) {
-        if (i === maxAttempts) throw e;
+        // Never retry on external abort — the caller already moved on.
+        if (i === maxAttempts || (e instanceof Error && e.name === 'AbortError')) throw e;
       }
       await new Promise(r => setTimeout(r, 1000 * (i + 1)));
     }
@@ -214,20 +227,23 @@ export async function fetchSrMissedRetrospectives(
   params?: {
     category?: string;
     task_type?: string;
+    scope?: string;
     days?: number;
     page?: number;
     page_size?: number;
-  }
+  },
+  signal?: AbortSignal,
 ): Promise<SrMissedRetrospectivesResponse> {
   const searchParams = new URLSearchParams();
   if (params?.category) searchParams.set('category', params.category);
   if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.scope) searchParams.set('scope', params.scope);
   if (params?.days !== undefined) searchParams.set('days', String(params.days));
   if (params?.page !== undefined) searchParams.set('page', String(params.page));
   if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
   const query = searchParams.toString();
   const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-missed-retrospectives${query ? `?${query}` : ''}`;
-  const res = await apiFetch(url);
+  const res = await apiFetch(url, undefined, 2, 30000, signal);
   if (!res.ok) throw new Error(`Failed to fetch SR missed retrospectives: ${res.status}`);
   return res.json();
 }
@@ -292,22 +308,34 @@ export interface SrUnhandledEdgesRetrospectiveResponse {
   items: SrUnhandledEdgesTask[];
   total: number;
   task_types?: string[];
+  blind_spot_counts?: Record<string, number>;
 }
 
 export async function fetchSrUnhandledEdgesRetrospectives(
   projectId: string,
-  params?: { task_type?: string; days?: number; page?: number; page_size?: number },
+  params?: { task_type?: string; blind_spot?: string; days?: number; page?: number; page_size?: number },
+  signal?: AbortSignal,
 ): Promise<SrUnhandledEdgesRetrospectiveResponse> {
   const searchParams = new URLSearchParams();
   if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.blind_spot) searchParams.set('blind_spot', params.blind_spot);
   if (params?.days !== undefined) searchParams.set('days', String(params.days));
   if (params?.page !== undefined) searchParams.set('page', String(params.page));
   if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
   const query = searchParams.toString();
   const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-unhandled-edges-retrospectives${query ? `?${query}` : ''}`;
-  const res = await apiFetch(url);
+  const res = await apiFetch(url, undefined, 2, 30000, signal);
   if (!res.ok) throw new Error(`Failed to fetch SR unhandled edges: ${res.status}`);
   return res.json();
+}
+
+export interface SrCatchRateHealth {
+  status: 'healthy' | 'stale' | 'frozen' | 'low_data' | 'never_sufficient' | 'missing';
+  last_sufficient_computed_at: string | null;
+  last_sufficient_age_hours: number | null;
+  signal_last_computed_at: string | null;
+  signal_age_hours: number | null;
+  data_sufficient: boolean;
 }
 
 export interface DirectionSrCatStat {

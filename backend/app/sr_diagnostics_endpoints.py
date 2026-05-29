@@ -47,6 +47,7 @@ from app.sr_analytics import (
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_envelope,
     aggregate_sr_reviewer_disagreements,
+    is_disallowed_blind_spot,
     is_skipped_sr_outcome as _is_skipped_sr_outcome,
 )
 from app.research_completion import lookup_findings_by_source_ref
@@ -81,6 +82,7 @@ async def list_sr_missed_retrospectives(
     days: int = Query(14, ge=1, le=90),
     category: Optional[str] = Query(None),
     task_type: Optional[str] = Query(None),
+    scope: Optional[str] = Query(None, max_length=64),
     page: int = Query(0, ge=0),
     page_size: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
@@ -135,6 +137,8 @@ async def list_sr_missed_retrospectives(
             continue
         t_type = (t.first_payload or {}).get("type")
         if category and category not in missed:
+            continue
+        if scope and ctx.get("scope") != scope:
             continue
         # Accumulate task types before the task_type filter so the full type
         # list is available in the response regardless of which filter is active.
@@ -205,6 +209,7 @@ async def list_sr_unhandled_edges_retrospectives(
     project_id: uuid.UUID,
     days: int = Query(14, ge=1, le=90),
     task_type: Optional[str] = Query(None),
+    blind_spot: Optional[str] = Query(None),
     page: int = Query(0, ge=0),
     page_size: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
@@ -215,6 +220,12 @@ async def list_sr_unhandled_edges_retrospectives(
     Surfaces which specific recent tasks shipped with unhandled-edge admissions
     (handled: false in edges_considered), enabling audit of whether these
     correlate with later reviewer rejections and spot patterns.
+
+    ``blind_spot_counts`` aggregates recurring blind-spot themes across the
+    (days + task_type) filtered universe — counted once per unique theme per
+    task, ignoring the ``blind_spot`` filter so the pills remain swap-able.
+    Themes use the same first-6-token-lowercase normalisation as
+    ``sr_blind_spots._scan_blind_spot_counts``.
     """
     cutoff = datetime.utcnow() - timedelta(days=days)
     page_start = page * page_size
@@ -243,6 +254,7 @@ async def list_sr_unhandled_edges_retrospectives(
     page_items = []
     total_matched = 0
     all_task_types: set[str] = set()
+    blind_spot_counts: Dict[str, int] = defaultdict(int)
     task_stream = await session.stream(stmt)
     async for t in task_stream.scalars():
         ctx = t.context or {}
@@ -264,6 +276,29 @@ async def list_sr_unhandled_edges_retrospectives(
         if t_type:
             all_task_types.add(t_type)
         if task_type and t_type != task_type:
+            continue
+
+        # Tokenize each unhandled edge's blind_spot into a 6-token theme.
+        # Dedupe themes within a single task so one task contributes at most
+        # one bump per theme to blind_spot_counts.
+        task_themes: set[str] = set()
+        for edge in unhandled_edges:
+            entry = edge.get("blind_spot")
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            if is_disallowed_blind_spot(entry):
+                continue
+            theme = " ".join(entry.lower().split()[:6])
+            if theme:
+                task_themes.add(theme)
+
+        # Aggregate blind_spot_counts over the days+task_type universe BEFORE
+        # applying the theme filter so operators can swap pills meaningfully.
+        for theme in task_themes:
+            blind_spot_counts[theme] += 1
+
+        # Apply theme filter to row inclusion / total / pagination.
+        if blind_spot and blind_spot not in task_themes:
             continue
 
         current_index = total_matched
@@ -310,7 +345,12 @@ async def list_sr_unhandled_edges_retrospectives(
             }
         )
 
-    return {"items": items, "total": total_matched, "task_types": sorted(all_task_types)}
+    return {
+        "items": items,
+        "total": total_matched,
+        "task_types": sorted(all_task_types),
+        "blind_spot_counts": dict(blind_spot_counts),
+    }
 
 
 @router.get("/projects/{project_id}/sr-alert-drilldown")

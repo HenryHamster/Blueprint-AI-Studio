@@ -11870,6 +11870,87 @@ async def test_sr_missed_retrospectives_drilldown_fields_present(
     ]
 
 
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_scope_filter(
+    client: AsyncClient, db_session
+):
+    """?scope=<value> filters items and rolls up total/category_counts honestly."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _ctx(scope: str, missed_cat: str = "correctness"):
+        return {
+            "scope": scope,
+            "_first_attempt_rejection_categories": {missed_cat: 1},
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {missed_cat: {"passed": True}},
+                "blind_spots": [],
+            },
+        }
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title="Small task A",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=_ctx("small", "correctness"),
+            ),
+            make_task(
+                project_id=project.id,
+                title="Small task B",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=_ctx("small", "performance"),
+            ),
+            make_task(
+                project_id=project.id,
+                title="Large task A",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=_ctx("large", "correctness"),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    # Unfiltered baseline
+    r_all = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives"
+    )
+    assert r_all.status_code == 200
+    body_all = r_all.json()
+    assert body_all["total"] == 3
+    assert body_all["category_counts"] == {"correctness": 2, "performance": 1}
+
+    # Filter to scope=large — only the single large-scope task should match
+    r_large = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?scope=large"
+    )
+    assert r_large.status_code == 200
+    body_large = r_large.json()
+    assert body_large["total"] == 1
+    scopes = {item["scope"] for item in body_large["items"]}
+    assert scopes == {"large"}
+    # category_counts must reflect ONLY the scope-filtered subset
+    assert body_large["category_counts"] == {"correctness": 1}
+    assert "performance" not in body_large["category_counts"]
+
+    # Filter to scope=small — both small-scope tasks, both categories
+    r_small = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?scope=small"
+    )
+    assert r_small.status_code == 200
+    body_small = r_small.json()
+    assert body_small["total"] == 2
+    assert body_small["category_counts"] == {"correctness": 1, "performance": 1}
+
+
 # ---------------------------------------------------------------------------
 # SR unhandled edges endpoint — task_types and pagination parity tests
 # ---------------------------------------------------------------------------
@@ -11964,6 +12045,138 @@ async def test_sr_unhandled_edges_total_not_capped_at_page_size(
     body = response.json()
     assert body["total"] == 205
     assert len(body["items"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_sr_unhandled_edges_blind_spot_counts(
+    client: AsyncClient, db_session
+):
+    """blind_spot_counts aggregates themes with first-6-token normalisation,
+    dedupes per task, drops disallowed themes, and remains anchored to the
+    days+task_type universe when the blind_spot filter narrows rows."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Task A: two unhandled edges, both blind-spots tokenize to the SAME
+    # 6-token theme "no lock around state mutation that" — dedupe must count
+    # this task as a single bump for that theme.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="task A",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "edges_considered": [
+                        {
+                            "case": "race",
+                            "handled": False,
+                            "blind_spot": "No lock around state mutation that touches DB",
+                        },
+                        {
+                            "case": "race-2",
+                            "handled": False,
+                            "blind_spot": "no LOCK around state mutation that runs concurrently",
+                        },
+                    ],
+                },
+            },
+        )
+    )
+    # Task B: one unhandled edge with the SAME theme — second task bump.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="task B",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "edges_considered": [
+                        {
+                            "case": "race",
+                            "handled": False,
+                            "blind_spot": "no lock around state mutation that breaks",
+                        },
+                    ],
+                },
+            },
+        )
+    )
+    # Task C: distinct theme + a disallowed blind-spot that must be skipped +
+    # an empty/whitespace blind-spot that must be skipped.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="task C",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_self_review_outcome": {
+                    "edges_considered": [
+                        {
+                            "case": "timeout",
+                            "handled": False,
+                            "blind_spot": "Partial retry on network timeout boundary",
+                        },
+                        {
+                            "case": "skip",
+                            "handled": False,
+                            "blind_spot": "did not run the full backend test suite",
+                        },
+                        {
+                            "case": "blank",
+                            "handled": False,
+                            "blind_spot": "   ",
+                        },
+                    ],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    counts = body["blind_spot_counts"]
+    # Dedupe: A contributes 1, B contributes 1 → 2 for the shared theme.
+    assert counts["no lock around state mutation that"] == 2
+    # Distinct theme from task C.
+    assert counts["partial retry on network timeout boundary"] == 1
+    # Disallowed and empty entries excluded — only the two themes above.
+    assert set(counts.keys()) == {
+        "no lock around state mutation that",
+        "partial retry on network timeout boundary",
+    }
+
+    # Filtering by blind_spot narrows items + total but counts stay anchored
+    # to the (days + task_type) universe so pills remain swap-able.
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?blind_spot=no+lock+around+state+mutation+that"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    titles = sorted(item["title"] for item in body["items"])
+    assert titles == ["task A", "task B"]
+    assert body["blind_spot_counts"] == counts
+
+    # task_type filter narrows the counts universe.
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives?task_type=fix"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["blind_spot_counts"] == {
+        "partial retry on network timeout boundary": 1,
+    }
 
 
 # ---------------------------------------------------------------------------

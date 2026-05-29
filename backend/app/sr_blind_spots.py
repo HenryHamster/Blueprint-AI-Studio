@@ -760,14 +760,16 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
                     :_REVIEWER_EXAMPLE_CHAR_CAP
                 ]
                 if desc:
-                    bucket_examples.append(
-                        {
-                            "severity": sev,
-                            "description": desc,
-                            "task_id": str(t.id),
-                            "task_type": task_type,
-                        }
-                    )
+                    example: Dict[str, Any] = {
+                        "severity": sev,
+                        "description": desc,
+                        "task_id": str(t.id),
+                        "task_type": task_type,
+                    }
+                    pr_url = ctx.get("_pr_url")
+                    if pr_url:
+                        example["pr_url"] = pr_url
+                    bucket_examples.append(example)
         for cat in sr_failed:
             bucket = counts[(cat, task_type)]
             if cat in reviewer_cats:

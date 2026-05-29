@@ -207,6 +207,14 @@ vi.mock('../api', () => ({
   fetchSrMissedRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
   fetchSrRecentMisses: vi.fn(async () => ({ items: [] })),
   fetchSrUnhandledEdgesRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
+  fetchSrCatchRateHealth: vi.fn(async () => ({
+    status: 'healthy',
+    last_sufficient_computed_at: null,
+    last_sufficient_age_hours: null,
+    signal_last_computed_at: null,
+    signal_age_hours: null,
+    data_sufficient: true,
+  })),
   fetchEvictedFindings: vi.fn(async () => ({
     direction_id: '',
     total: 0,

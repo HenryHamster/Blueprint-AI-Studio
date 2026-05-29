@@ -633,6 +633,7 @@ export interface DashboardHomeProps {
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
+  onScopeClick?: (scope: string) => void;
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
 }
@@ -868,7 +869,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets, onSpawnOrphanFix }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
@@ -955,6 +956,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     setSelectedSrCategory(category);
     onCategoryClick?.(category);
   }, [onCategoryClick]);
+
+  const handleScopeClick = useCallback((scope: string) => {
+    onScopeClick?.(scope);
+  }, [onScopeClick]);
 
   const handleScrollToReviewQuality = useCallback(() => {
     reviewQualitySectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1430,6 +1435,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             onViewTask={onViewTask}
             srCatchRateTargets={srCatchRateTargets}
             onCategoryClick={handleCategoryClick}
+            onScopeClick={handleScopeClick}
             onConfigureTargets={handleConfigureTargets}
             sectionRef={reviewQualitySectionRef}
           />

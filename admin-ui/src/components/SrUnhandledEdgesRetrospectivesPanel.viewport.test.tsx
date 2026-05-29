@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { screen, fireEvent } from '@testing-library/react';
@@ -46,6 +46,14 @@ vi.mock('../api', () => ({
     total: 2,
     task_types: ['create', 'fix'],
   })),
+  fetchSrCatchRateHealth: vi.fn(async () => ({
+    status: 'healthy',
+    last_sufficient_computed_at: null,
+    last_sufficient_age_hours: null,
+    signal_last_computed_at: null,
+    signal_age_hours: null,
+    data_sufficient: true,
+  })),
   API_BASE_URL: 'http://localhost:8000',
   authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
 }));
@@ -54,10 +62,15 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/');
+  });
+
   afterEach(() => {
     const r = root;
     if (r) { act(() => { r.unmount(); }); root = null; }
     if (host) { host.remove(); host = null; }
+    window.history.replaceState({}, '', '/');
   });
 
   test('renders without horizontal overflow at 375px', async () => {
@@ -205,6 +218,107 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     nowSpy.mockRestore();
   });
 
+  test('aborted prior request does not surface as error state on rapid filter change', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+
+    // First call: never resolves naturally — rejects with AbortError when signal fires
+    spy.mockImplementationOnce((_projectId: string, _params: unknown, signal?: AbortSignal) =>
+      new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => {
+          reject(new DOMException('The operation was aborted.', 'AbortError'));
+        });
+      }),
+    );
+    // Second call (after filter change): resolves immediately with fresh data
+    spy.mockResolvedValueOnce({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel selectedProjectId="proj-1" onSelectTask={() => {}} />,
+      );
+    });
+
+    // Change filter — this aborts the in-flight first request and issues the second
+    await act(async () => {
+      const btn30d = screen.getByRole('button', { name: '30d' });
+      btn30d.click();
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // The error state must NOT be visible — AbortError is silenced
+    expect(screen.queryByText('Error fetching SR data')).toBeNull();
+    // Fresh data from the second fetch must be rendered
+    expect(screen.getByText('feat: add retry-on-conflict logic for concurrent task scheduling')).toBeTruthy();
+  });
+
+  test('stale response from prior filter does not overwrite fresh data', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+
+    const FRESH_ITEMS = [{
+      task_id: 'fresh-edge-1',
+      title: 'fresh: only this edge result should be visible',
+      task_type: 'fix',
+      scope: 'small',
+      created_at: new Date(Date.now() - 86400_000).toISOString(),
+      unhandled_edges: [{ case: 'fresh edge case', handled: false, blind_spot: null, origin: 'reviewer' }],
+      pr_url: null,
+    }];
+
+    let resolveStale!: (v: unknown) => void;
+    const stalePromise = new Promise(r => { resolveStale = r; });
+
+    // First call returns stale promise (controllable)
+    spy.mockReturnValueOnce(stalePromise);
+    // Second call (after filter change) resolves immediately with fresh data
+    spy.mockResolvedValueOnce({ items: FRESH_ITEMS, total: 1, task_types: ['fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel selectedProjectId="proj-1" onSelectTask={() => {}} />,
+      );
+    });
+
+    // Change filter — triggers second fetch while first is still in-flight
+    await act(async () => {
+      const btn30d = screen.getByRole('button', { name: '30d' });
+      btn30d.click();
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Fresh data must be visible
+    expect(screen.getByText('fresh: only this edge result should be visible')).toBeTruthy();
+
+    // Now resolve the stale promise — it must be discarded
+    await act(async () => {
+      resolveStale({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Stale data must NOT have overwritten the fresh data
+    expect(screen.queryByText('feat: add retry-on-conflict logic for concurrent task scheduling')).toBeNull();
+    expect(screen.getByText('fresh: only this edge result should be visible')).toBeTruthy();
+  });
+
   test('initial fetch passes page=0 to the API matching 0-indexed backend contract', async () => {
     const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
     const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
@@ -228,7 +342,7 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }));
+    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }), expect.any(AbortSignal));
   });
 
   test('resets pagination to page 0 when a filter changes (days selector)', async () => {
@@ -268,7 +382,122 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     });
 
     // After filter change, panel must re-fetch with page: 0 (pagination reset)
-    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }));
+    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }), expect.any(AbortSignal));
+  });
+
+  test('blind-spot pill bar renders sorted by count, click filters fetch and toggles', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({
+      items: MOCK_ITEMS,
+      total: 2,
+      task_types: ['create', 'fix'],
+      blind_spot_counts: {
+        'partial retry on network timeout boundary': 2,
+        'no lock around state mutation that': 5,
+        'hook fires unconditionally without checks': 3,
+      },
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const pillsBar = screen.getByTestId('sr-unhandled-edges-blind-spot-pills');
+    const pillButtons = pillsBar.querySelectorAll('button');
+    // 3 themes (all meet count >= 2)
+    expect(pillButtons.length).toBe(3);
+    // Sorted by count desc
+    expect(pillButtons[0].textContent).toContain('no lock around state mutation that');
+    expect(pillButtons[0].textContent).toContain('5');
+    expect(pillButtons[1].textContent).toContain('hook fires unconditionally without checks');
+    expect(pillButtons[2].textContent).toContain('partial retry on network timeout boundary');
+
+    spy.mockClear();
+    await act(async () => {
+      fireEvent.click(pillButtons[0]);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(spy).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({
+        blind_spot: 'no lock around state mutation that',
+        page: 0,
+      }),
+      expect.any(AbortSignal),
+    );
+
+    // Active pill should be marked selected
+    const refreshedPills = screen.getByTestId('sr-unhandled-edges-blind-spot-pills').querySelectorAll('button');
+    expect(refreshedPills[0].getAttribute('aria-pressed')).toBe('true');
+
+    // Click again to clear the filter
+    spy.mockClear();
+    await act(async () => {
+      fireEvent.click(refreshedPills[0]);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(spy).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({ blind_spot: undefined, page: 0 }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  test('blind-spot pill bar is hidden when fewer than 2 themes meet the minimum count', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({
+      items: MOCK_ITEMS,
+      total: 2,
+      task_types: ['create', 'fix'],
+      // Only one theme meets the minimum count of 2 → pill bar should hide.
+      blind_spot_counts: {
+        'no lock around state mutation that': 5,
+        'one off blind spot': 1,
+      },
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(screen.queryByTestId('sr-unhandled-edges-blind-spot-pills')).toBeNull();
   });
 
   test('filtered-empty state shows filter-aware message, not all-clear', async () => {
@@ -307,5 +536,237 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     expect(emptyEl).toBeTruthy();
     expect(emptyEl.textContent).not.toContain('No unhandled edges in the last');
     expect(emptyEl.textContent).toContain('No unhandled edges for type');
+  });
+
+  test('shows amber banner when health status is stale', async () => {
+    const api = await import('../api');
+    (api.fetchSrCatchRateHealth as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      status: 'stale',
+      last_sufficient_computed_at: '2026-05-27T10:00:00Z',
+      last_sufficient_age_hours: 26,
+      signal_last_computed_at: '2026-05-28T10:00:00Z',
+      signal_age_hours: 2,
+      data_sufficient: true,
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const banner = screen.getByTestId('sr-health-banner');
+    expect(banner).toBeTruthy();
+    expect(banner.textContent).toContain('stale');
+  });
+
+  test('initial render reads sru_ URL params and passes them to fetchSrUnhandledEdgesRetrospectives', async () => {
+    window.history.replaceState({}, '', '/?sru_days=30&sru_blind_spot=race&sru_task_type=create&sru_page=2');
+
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 40, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // URL page 2 → API page 1 (backend is 0-indexed); URL days=30 honored; blind_spot/task_type honored
+    expect(spy).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({ days: 30, blind_spot: 'race', task_type: 'create', page: 1 }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  test('changing days filter writes sru_days to window.location.search', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const btn30d = screen.getByRole('button', { name: '30d' });
+    await act(async () => {
+      fireEvent.click(btn30d);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(new URLSearchParams(window.location.search).get('sru_days')).toBe('30');
+  });
+
+  test('switching projects clears sru_ filter state (no leakage across projects)', async () => {
+    window.history.replaceState({}, '', '/?sru_days=30&sru_blind_spot=race&sru_page=3');
+
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 40, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    spy.mockClear();
+
+    // Switch to a different project — filters must reset to defaults
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-2"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // After project switch: days back to 14, no blind_spot filter, page 0 (UI page 1)
+    expect(spy).toHaveBeenCalledWith(
+      'proj-2',
+      expect.objectContaining({ days: 14, blind_spot: undefined, page: 0 }),
+      expect.any(AbortSignal),
+    );
+
+    // URL params for the previous project's filters should be cleared
+    const params = new URLSearchParams(window.location.search);
+    expect(params.get('sru_days')).toBeNull();
+    expect(params.get('sru_blind_spot')).toBeNull();
+    expect(params.get('sru_page')).toBeNull();
+  });
+
+  test('malformed sru_ URL params fall back to defaults without throwing', async () => {
+    window.history.replaceState({}, '', '/?sru_days=999&sru_page=abc');
+
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Malformed days=999 (not in {7,14,30,90}) → defaults to 14; page=abc → defaults to UI page 1 (API page 0)
+    expect(spy).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({ days: 14, page: 0 }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  test('banner dismissed on dismiss click and does not reappear', async () => {
+    const api = await import('../api');
+    (api.fetchSrCatchRateHealth as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      status: 'missing',
+      last_sufficient_computed_at: null,
+      last_sufficient_age_hours: null,
+      signal_last_computed_at: null,
+      signal_age_hours: null,
+      data_sufficient: false,
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const banner = screen.getByTestId('sr-health-banner');
+    expect(banner).toBeTruthy();
+
+    const dismissBtn = screen.getByRole('button', { name: /dismiss health banner/i });
+    await act(async () => {
+      fireEvent.click(dismissBtn);
+    });
+
+    expect(screen.queryByTestId('sr-health-banner')).toBeNull();
   });
 });

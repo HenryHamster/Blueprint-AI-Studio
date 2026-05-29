@@ -1,11 +1,15 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
-import { fetchSrUnhandledEdgesRetrospectives, type SrUnhandledEdgesTask, type SrUnhandledEdge } from '../api';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw, X } from 'lucide-react';
+import { fetchSrUnhandledEdgesRetrospectives, fetchSrCatchRateHealth, type SrUnhandledEdgesTask, type SrUnhandledEdge, type SrCatchRateHealth } from '../api';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
+import { useUrlFilterState } from '../hooks/useUrlFilterState';
 
 const PAGE_SIZE = 20;
 const DAY_OPTIONS = [7, 14, 30, 90];
+const BLIND_SPOT_PILL_MIN_COUNT = 2;
+const BLIND_SPOT_PILL_MIN_THEMES = 2;
+const BLIND_SPOT_PILL_CAP = 8;
 
 export interface SrUnhandledEdgesRetrospectivesPanelProps {
   selectedProjectId: string | null;
@@ -17,26 +21,46 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [days, setDays] = useState(14);
-  const [taskTypeFilter, setTaskTypeFilter] = useState('');
-  const [page, setPage] = useState(1);
+  const {
+    days,
+    secondaryFilter: blindSpotFilter,
+    taskTypeFilter,
+    page,
+    setDays,
+    setSecondaryFilter: setBlindSpotFilter,
+    setTaskTypeFilter,
+    setPage,
+  } = useUrlFilterState('sru_', selectedProjectId, { secondaryParam: 'blind_spot' });
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
+  const [blindSpotCounts, setBlindSpotCounts] = useState<Record<string, number>>({});
+  const [health, setHealth] = useState<SrCatchRateHealth | null>(null);
+  const [healthDismissed, setHealthDismissed] = useState(false);
   const taskTypesAccRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
   const panelMountTimeRef = useRef<number>(Date.now());
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const requestIdRef = useRef(0);
 
   const fetchData = useCallback(async () => {
     if (!selectedProjectId) return;
+    // Cancel any in-flight request from a previous filter state
+    abortControllerRef.current?.abort();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    const currentId = ++requestIdRef.current;
+
     setLoading(true);
     setFetchError(null);
     try {
       const result = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId, {
         days,
         task_type: taskTypeFilter || undefined,
+        blind_spot: blindSpotFilter || undefined,
         page: page - 1,  // backend is 0-indexed; UI is 1-indexed
         page_size: PAGE_SIZE,
-      });
-      if (!mountedRef.current) return;
+      }, controller.signal);
+      // Discard stale responses: mountedRef guards unmount, requestIdRef guards filter-change races
+      if (!mountedRef.current || currentId !== requestIdRef.current) return;
       setItems(result.items);
       setTotal(result.total);
       if (result.task_types) {
@@ -45,31 +69,72 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         result.items.forEach(t => { if (t.task_type) taskTypesAccRef.current.add(t.task_type); });
         setStableTaskTypes(Array.from(taskTypesAccRef.current).sort());
       }
+      if (result.blind_spot_counts) {
+        setBlindSpotCounts(result.blind_spot_counts);
+      }
     } catch (e) {
-      if (!mountedRef.current) return;
+      // Silently discard aborted requests — the panel already issued a newer fetch
+      if (e instanceof Error && e.name === 'AbortError') return;
+      if (!mountedRef.current || currentId !== requestIdRef.current) return;
       setFetchError(e instanceof Error ? e.message : 'network error');
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (mountedRef.current && currentId === requestIdRef.current) setLoading(false);
     }
-  }, [selectedProjectId, days, taskTypeFilter, page]);
+  }, [selectedProjectId, days, taskTypeFilter, blindSpotFilter, page]);
 
   useEffect(() => {
     mountedRef.current = true;
     fetchData();
-    return () => { mountedRef.current = false; };
+    return () => {
+      mountedRef.current = false;
+      abortControllerRef.current?.abort();
+    };
   }, [fetchData]);
 
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    setHealth(null);
+    setHealthDismissed(false);
+    let cancelled = false;
+    fetchSrCatchRateHealth(selectedProjectId).then(h => {
+      if (!cancelled) setHealth(h);
+    }).catch(() => { /* non-critical, silently ignore */ });
+    return () => { cancelled = true; };
+  }, [selectedProjectId]);
+
   // Reset page when filters change
-  const prevFiltersRef = useRef({ days, taskTypeFilter, selectedProjectId });
+  const prevFiltersRef = useRef({ days, taskTypeFilter, blindSpotFilter, selectedProjectId });
   useEffect(() => {
     const prev = prevFiltersRef.current;
-    if (prev.days !== days || prev.taskTypeFilter !== taskTypeFilter || prev.selectedProjectId !== selectedProjectId) {
+    if (
+      prev.days !== days ||
+      prev.taskTypeFilter !== taskTypeFilter ||
+      prev.blindSpotFilter !== blindSpotFilter ||
+      prev.selectedProjectId !== selectedProjectId
+    ) {
       setPage(1);
-      taskTypesAccRef.current = new Set();
-      setStableTaskTypes([]);
-      prevFiltersRef.current = { days, taskTypeFilter, selectedProjectId };
+      // Day/task-type/project changes invalidate the accumulated task-type
+      // list; blind-spot pill toggles do not (the universe is unchanged).
+      if (
+        prev.days !== days ||
+        prev.taskTypeFilter !== taskTypeFilter ||
+        prev.selectedProjectId !== selectedProjectId
+      ) {
+        taskTypesAccRef.current = new Set();
+        setStableTaskTypes([]);
+      }
+      prevFiltersRef.current = { days, taskTypeFilter, blindSpotFilter, selectedProjectId };
     }
-  }, [days, taskTypeFilter, selectedProjectId]);
+  }, [days, taskTypeFilter, blindSpotFilter, selectedProjectId, setPage]);
+
+  const blindSpotFreq = useMemo(() => {
+    return Object.entries(blindSpotCounts)
+      .filter(([, count]) => count >= BLIND_SPOT_PILL_MIN_COUNT)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  }, [blindSpotCounts]);
+  const showBlindSpotPills = blindSpotFreq.length >= BLIND_SPOT_PILL_MIN_THEMES;
+  const blindSpotPillsVisible = showBlindSpotPills ? blindSpotFreq.slice(0, BLIND_SPOT_PILL_CAP) : [];
+  const blindSpotPillsHidden = showBlindSpotPills ? blindSpotFreq.length - blindSpotPillsVisible.length : 0;
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const isStale = Date.now() - panelMountTimeRef.current > 300_000; // 5 minutes
@@ -107,6 +172,31 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         )}
       </div>
 
+      {showBlindSpotPills && (
+        <div className="flex flex-wrap gap-1.5 mb-2" data-testid="sr-unhandled-edges-blind-spot-pills">
+          {blindSpotPillsVisible.map(([theme, count]) => (
+            // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
+            <button
+              key={theme}
+              type="button"
+              onClick={() => setBlindSpotFilter(theme === blindSpotFilter ? '' : theme)}
+              className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${theme === blindSpotFilter ? 'border-amber-500/60 bg-amber-950/30 text-amber-300' : 'border-neutral-700 text-neutral-400 hover:border-amber-500/40'}`}
+              aria-pressed={theme === blindSpotFilter}
+              title={`Filter by blind-spot theme: ${theme}`}
+            >
+              {theme} <span className="text-neutral-500">{count}</span>
+            </button>
+          ))}
+          {blindSpotPillsHidden > 0 && (
+            <span className="text-[9px] text-neutral-600 self-center ml-1">+{blindSpotPillsHidden} more</span>
+          )}
+        </div>
+      )}
+
+      {health && health.status !== 'healthy' && !healthDismissed && (
+        <SrHealthBanner health={health} onDismiss={() => setHealthDismissed(true)} />
+      )}
+
       {loading ? (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
       ) : fetchError ? (
@@ -119,7 +209,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
           <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
         </div>
       ) : items.length === 0 ? (
-        taskTypeFilter ? (
+        (taskTypeFilter || blindSpotFilter) ? (
           <div
             className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
             role="status"
@@ -127,9 +217,16 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
           >
             <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
             <span>
-              No unhandled edges for type &quot;{taskTypeFilter}&quot;.{' '}
+              No unhandled edges
+              {taskTypeFilter && <> for type &quot;{taskTypeFilter}&quot;</>}
+              {blindSpotFilter && <> for theme &quot;{blindSpotFilter}&quot;</>}
+              .{' '}
               {/* eslint-disable-next-line viewport/min-touch-target -- inline text link, dense context */}
-              <button type="button" className="underline hover:text-neutral-300" onClick={() => setTaskTypeFilter('')}>Clear filter</button>
+              <button
+                type="button"
+                className="underline hover:text-neutral-300"
+                onClick={() => { setTaskTypeFilter(''); setBlindSpotFilter(''); }}
+              >Clear filter</button>
             </span>
           </div>
         ) : (
@@ -189,6 +286,59 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         </>
       )}
     </section>
+  );
+}
+
+const HEALTH_TOOLTIP: Record<string, string> = {
+  stale: 'The SR catch-rate snapshot has not been refreshed recently. Displayed metrics may lag reality.',
+  frozen: 'The signal clock has stopped: catch-rate was not recomputed even though the signal timestamp advanced. Metrics are likely incorrect.',
+  low_data: 'Not enough tasks have been reviewed to compute a reliable catch rate. Treat metrics as preliminary.',
+  never_sufficient: 'The signal has been computed but never reached sufficient data to report a catch rate.',
+  missing: 'No SR catch-rate snapshot has been computed yet for this project.',
+};
+
+function SrHealthBanner({ health, onDismiss }: { health: SrCatchRateHealth; onDismiss: () => void }) {
+  const isRed = health.status === 'frozen' || health.status === 'never_sufficient' || health.status === 'missing';
+  const isAmber = health.status === 'stale';
+  const colorClass = isRed
+    ? 'border-red-800/40 bg-red-950/20 text-red-300'
+    : isAmber
+      ? 'border-amber-800/40 bg-amber-950/20 text-amber-300'
+      : 'border-neutral-700 bg-neutral-900/50 text-neutral-400';
+  const iconColor = isRed ? 'text-red-400' : isAmber ? 'text-amber-400' : 'text-neutral-500';
+
+  let ageText = '';
+  if (health.status === 'stale' || health.status === 'frozen') {
+    if (health.last_sufficient_age_hours !== null) {
+      ageText = ` · last sufficient ${Math.round(health.last_sufficient_age_hours)}h ago`;
+    }
+  } else if (health.status === 'never_sufficient') {
+    if (health.signal_age_hours !== null) {
+      ageText = ` · signal ${Math.round(health.signal_age_hours)}h ago`;
+    }
+  }
+
+  const tooltip = HEALTH_TOOLTIP[health.status] ?? '';
+
+  return (
+    <div
+      className={`flex items-center gap-1.5 mb-2 px-2 py-1 rounded border text-[10px] ${colorClass}`}
+      role="status"
+      data-testid="sr-health-banner"
+      title={tooltip}
+    >
+      <AlertTriangle className={`w-3 h-3 shrink-0 ${iconColor}`} aria-hidden="true" />
+      <span className="flex-1">{health.status}{ageText}</span>
+      {/* eslint-disable-next-line viewport/min-touch-target -- dense dismiss control */}
+      <button
+        type="button"
+        onClick={onDismiss}
+        className="shrink-0 hover:opacity-70"
+        aria-label="Dismiss health banner"
+      >
+        <X className="w-3 h-3" />
+      </button>
+    </div>
   );
 }
 

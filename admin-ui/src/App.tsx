@@ -248,6 +248,7 @@ export default function App() {
   const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
   const [srMissedLoading, setSrMissedLoading] = useState(false);
   const [srMissedCategory, setSrMissedCategory] = useState('');
+  const [srMissedScope, setSrMissedScope] = useState('');
   const [srMissedWindowDays, setSrMissedWindowDays] = useState<7 | 14 | 30>(14);
   const [srMissedTruncated, setSrMissedTruncated] = useState(false);
   const srMissedRef = useRef<HTMLDivElement>(null);
@@ -906,17 +907,17 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onScopeClick={(scope) => { setSrMissedScope(scope); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} /></ErrorBoundary>
               {s.userRole === 'admin' && s.selectedProjectId && (
                 <ErrorBoundary level="panel">
-                  <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} activeCategory={srMissedCategory} />
+                  <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} activeCategory={srMissedCategory} activeScope={srMissedScope} activeInvestigationTaskIds={srInvestigationTaskIds} />
                 </ErrorBoundary>
               )}
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
                   <button
-                    onClick={() => { setShowSrMissed(v => { if (v) setSrMissedCategory(''); return !v; }); }}
+                    onClick={() => { setShowSrMissed(v => { if (v) { setSrMissedCategory(''); setSrMissedScope(''); } return !v; }); }}
                     className="text-xs font-medium text-neutral-400 hover:text-neutral-200"
                   >
                     Self-Review Missed Retrospectives {showSrMissed ? '▲' : '▼'}

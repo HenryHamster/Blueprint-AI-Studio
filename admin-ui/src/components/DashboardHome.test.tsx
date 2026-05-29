@@ -24,6 +24,14 @@ vi.mock('../api', () => ({
   fetchQualificationVerdicts: (projectId: string, limit?: number) => fetchQualificationVerdictsMock(projectId, limit),
   fetchTask: (taskId: string) => fetchTaskMock(taskId),
   fetchSrUnhandledEdgesRetrospectives: vi.fn().mockResolvedValue({ tasks: [] }),
+  fetchSrCatchRateHealth: vi.fn().mockResolvedValue({
+    status: 'healthy',
+    last_sufficient_computed_at: null,
+    last_sufficient_age_hours: null,
+    signal_last_computed_at: null,
+    signal_age_hours: null,
+    data_sufficient: true,
+  }),
   setVersionPhase: vi.fn(),
   triggerQualify: vi.fn(),
 }));

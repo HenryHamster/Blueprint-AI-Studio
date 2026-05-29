@@ -159,6 +159,7 @@ interface ReviewQualitySectionProps {
   onViewTask: (task: Task) => void;
   srCatchRateTargets: Record<string, number> | null | undefined;
   onCategoryClick: (category: string) => void;
+  onScopeClick?: (scope: string) => void;
   onConfigureTargets: () => void;
   sectionRef: React.RefObject<HTMLElement | null>;
 }
@@ -171,6 +172,7 @@ export function ReviewQualitySection({
   onViewTask,
   srCatchRateTargets,
   onCategoryClick,
+  onScopeClick,
   onConfigureTargets,
   sectionRef,
 }: ReviewQualitySectionProps) {
@@ -543,6 +545,7 @@ export function ReviewQualitySection({
           trends={digest?.self_review_prediction_accuracy_trends}
           variant="card"
           onCategoryClick={onCategoryClick}
+          onScopeClick={onScopeClick}
           srCatchRateTargets={srCatchRateTargets}
           onConfigureTargets={onConfigureTargets}
           onSpawnSrInvestigation={selectedProjectId ? handleSpawnSrInvestigation : undefined}
