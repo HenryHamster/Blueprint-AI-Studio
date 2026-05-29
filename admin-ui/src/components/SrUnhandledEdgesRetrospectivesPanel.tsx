@@ -33,13 +33,45 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
   } = useUrlFilterState('sru_', selectedProjectId, { secondaryParam: 'blind_spot' });
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
   const [blindSpotCounts, setBlindSpotCounts] = useState<Record<string, number>>({});
+  const [edgeCaseCounts, setEdgeCaseCounts] = useState<Record<string, number>>({});
   const [health, setHealth] = useState<SrCatchRateHealth | null>(null);
   const [healthDismissed, setHealthDismissed] = useState(false);
+  const [casePatternState, setCasePatternState] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      projectId: selectedProjectId,
+      value: params.get('sru_case_pattern') ?? '',
+    };
+  });
   const taskTypesAccRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
   const panelMountTimeRef = useRef<number>(Date.now());
   const abortControllerRef = useRef<AbortController | null>(null);
   const requestIdRef = useRef(0);
+
+  if (casePatternState.projectId !== selectedProjectId) {
+    setCasePatternState({ projectId: selectedProjectId, value: '' });
+  }
+  const casePatternFilter = casePatternState.value;
+  const setCasePatternFilter = useCallback(
+    (value: string) => setCasePatternState((state) => ({ ...state, value })),
+    [],
+  );
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (casePatternFilter) {
+      params.set('sru_case_pattern', casePatternFilter);
+    } else {
+      params.delete('sru_case_pattern');
+    }
+    const search = params.toString();
+    window.history.replaceState(
+      null,
+      '',
+      search ? `${window.location.pathname}?${search}` : window.location.pathname,
+    );
+  }, [casePatternFilter]);
 
   const fetchData = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -56,6 +88,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         days,
         task_type: taskTypeFilter || undefined,
         blind_spot: blindSpotFilter || undefined,
+        case_pattern: casePatternFilter || undefined,
         page: page - 1,  // backend is 0-indexed; UI is 1-indexed
         page_size: PAGE_SIZE,
       }, controller.signal);
@@ -69,9 +102,8 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         result.items.forEach(t => { if (t.task_type) taskTypesAccRef.current.add(t.task_type); });
         setStableTaskTypes(Array.from(taskTypesAccRef.current).sort());
       }
-      if (result.blind_spot_counts) {
-        setBlindSpotCounts(result.blind_spot_counts);
-      }
+      setBlindSpotCounts(result.blind_spot_counts ?? {});
+      setEdgeCaseCounts(result.edge_case_counts ?? {});
     } catch (e) {
       // Silently discard aborted requests — the panel already issued a newer fetch
       if (e instanceof Error && e.name === 'AbortError') return;
@@ -80,7 +112,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
     } finally {
       if (mountedRef.current && currentId === requestIdRef.current) setLoading(false);
     }
-  }, [selectedProjectId, days, taskTypeFilter, blindSpotFilter, page]);
+  }, [selectedProjectId, days, taskTypeFilter, blindSpotFilter, casePatternFilter, page]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -103,29 +135,22 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
   }, [selectedProjectId]);
 
   // Reset page when filters change
-  const prevFiltersRef = useRef({ days, taskTypeFilter, blindSpotFilter, selectedProjectId });
+  const prevFiltersRef = useRef({ days, taskTypeFilter, blindSpotFilter, casePatternFilter, selectedProjectId });
   useEffect(() => {
     const prev = prevFiltersRef.current;
     if (
       prev.days !== days ||
       prev.taskTypeFilter !== taskTypeFilter ||
       prev.blindSpotFilter !== blindSpotFilter ||
+      prev.casePatternFilter !== casePatternFilter ||
       prev.selectedProjectId !== selectedProjectId
     ) {
       setPage(1);
-      // Day/task-type/project changes invalidate the accumulated task-type
-      // list; blind-spot pill toggles do not (the universe is unchanged).
-      if (
-        prev.days !== days ||
-        prev.taskTypeFilter !== taskTypeFilter ||
-        prev.selectedProjectId !== selectedProjectId
-      ) {
-        taskTypesAccRef.current = new Set();
-        setStableTaskTypes([]);
-      }
-      prevFiltersRef.current = { days, taskTypeFilter, blindSpotFilter, selectedProjectId };
+      taskTypesAccRef.current = new Set();
+      setStableTaskTypes([]);
+      prevFiltersRef.current = { days, taskTypeFilter, blindSpotFilter, casePatternFilter, selectedProjectId };
     }
-  }, [days, taskTypeFilter, blindSpotFilter, selectedProjectId, setPage]);
+  }, [days, taskTypeFilter, blindSpotFilter, casePatternFilter, selectedProjectId, setPage]);
 
   const blindSpotFreq = useMemo(() => {
     return Object.entries(blindSpotCounts)
@@ -135,6 +160,13 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
   const showBlindSpotPills = blindSpotFreq.length >= BLIND_SPOT_PILL_MIN_THEMES;
   const blindSpotPillsVisible = showBlindSpotPills ? blindSpotFreq.slice(0, BLIND_SPOT_PILL_CAP) : [];
   const blindSpotPillsHidden = showBlindSpotPills ? blindSpotFreq.length - blindSpotPillsVisible.length : 0;
+
+  // edge_case_counts arrives pre-sorted from the backend; re-sort defensively
+  // (count desc, then label asc) so badge order is stable regardless of source.
+  const caseFreq = useMemo(
+    () => Object.entries(edgeCaseCounts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
+    [edgeCaseCounts]
+  );
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const isStale = Date.now() - panelMountTimeRef.current > 300_000; // 5 minutes
@@ -193,6 +225,24 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
         </div>
       )}
 
+      {caseFreq.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 mb-2" data-testid="sr-unhandled-edges-case-pattern-badges">
+          {caseFreq.map(([pattern, count]) => (
+            // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
+            <button
+              key={pattern}
+              type="button"
+              onClick={() => setCasePatternFilter(pattern === casePatternFilter ? '' : pattern)}
+              className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${pattern === casePatternFilter ? 'border-amber-500/60 bg-amber-950/30 text-amber-300' : 'border-neutral-700 text-neutral-400 hover:border-amber-500/40'}`}
+              aria-pressed={pattern === casePatternFilter}
+              title={`Filter by edge-case pattern: ${pattern}`}
+            >
+              {pattern} <span className="text-neutral-500">{count}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       {health && health.status !== 'healthy' && !healthDismissed && (
         <SrHealthBanner health={health} onDismiss={() => setHealthDismissed(true)} />
       )}
@@ -209,7 +259,7 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
           <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
         </div>
       ) : items.length === 0 ? (
-        (taskTypeFilter || blindSpotFilter) ? (
+        (taskTypeFilter || blindSpotFilter || casePatternFilter) ? (
           <div
             className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
             role="status"
@@ -220,12 +270,13 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
               No unhandled edges
               {taskTypeFilter && <> for type &quot;{taskTypeFilter}&quot;</>}
               {blindSpotFilter && <> for theme &quot;{blindSpotFilter}&quot;</>}
+              {casePatternFilter && <> matching &quot;{casePatternFilter}&quot;</>}
               .{' '}
               {/* eslint-disable-next-line viewport/min-touch-target -- inline text link, dense context */}
               <button
                 type="button"
                 className="underline hover:text-neutral-300"
-                onClick={() => { setTaskTypeFilter(''); setBlindSpotFilter(''); }}
+                onClick={() => { setTaskTypeFilter(''); setBlindSpotFilter(''); setCasePatternFilter(''); }}
               >Clear filter</button>
             </span>
           </div>

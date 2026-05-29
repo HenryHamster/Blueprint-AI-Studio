@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
@@ -16,6 +16,9 @@ const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, capturedPro
     scopeTrends: null as Record<string, unknown> | null,
     directionAutoPause: null as Record<string, unknown> | null,
     srUnhandledEdges: null as Record<string, unknown> | null,
+    srMissed: null as Record<string, unknown> | null,
+    srDisagreements: null as Record<string, unknown> | null,
+    fixLoop: null as Record<string, unknown> | null,
   },
 }));
 
@@ -105,6 +108,31 @@ vi.mock('./SrUnhandledEdgesRetrospectivesPanel', () => ({
   SrUnhandledEdgesRetrospectivesPanel: (props: Record<string, unknown>) => {
     capturedProps.srUnhandledEdges = props;
     return <div data-testid="sr-unhandled-edges-panel">SrUnhandledEdgesRetrospectivesPanel</div>;
+  },
+}));
+
+// Override only the two drill-through panels so we can capture their callbacks;
+// keep every other export (SrTrendBreakdown, EdgesTrendBreakdown,
+// DirectionSrBreakdownPanel) real so the "SR Catch Rate" card tests still render.
+vi.mock('./SrTrendBreakdown', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./SrTrendBreakdown')>();
+  return {
+    ...actual,
+    SrMissedRetrospective: (props: Record<string, unknown>) => {
+      capturedProps.srMissed = props;
+      return <div data-testid="sr-missed-retrospective">SrMissedRetrospective</div>;
+    },
+    SrReviewerDisagreementsPanel: (props: Record<string, unknown>) => {
+      capturedProps.srDisagreements = props;
+      return <div data-testid="sr-reviewer-disagreements">SrReviewerDisagreementsPanel</div>;
+    },
+  };
+});
+
+vi.mock('./FixLoopConvergenceWidget', () => ({
+  FixLoopConvergenceWidget: (props: Record<string, unknown>) => {
+    capturedProps.fixLoop = props;
+    return <div data-testid="fix-loop-convergence-widget">FixLoopConvergenceWidget</div>;
   },
 }));
 
@@ -898,6 +926,217 @@ describe('DashboardHome', () => {
     });
   });
 
+  describe('SR drill-throughs resolve tasks by id (off-slice fetch fallback)', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      direction_progress: [],
+      recent_completions: [],
+    };
+
+    beforeEach(() => {
+      capturedProps.srUnhandledEdges = null;
+      capturedProps.srMissed = null;
+      capturedProps.srDisagreements = null;
+      capturedProps.fixLoop = null;
+    });
+
+    // Populate the SR diagnostics endpoints so the Recent Misses and
+    // Reviewer-Disagreements sections render (and our mocked panels capture
+    // their drill-through callbacks).
+    function setupSrApiMocks(
+      disagreementResponse: {
+        disagreements: Array<{ category: string; count: number; max_severity: string; examples: unknown[] }>;
+        window_days: number;
+        total_entries: number;
+        total_distinct_categories?: number;
+        returned_entries?: number;
+      } = {
+        disagreements: [{ category: 'correctness', count: 3, max_severity: 'HIGH', examples: [] }],
+        window_days: 14,
+        total_entries: 1,
+      },
+    ) {
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/sr-recent-misses')) {
+          return Promise.resolve(jsonResponse({
+            misses: [{ task_id: 'off-slice-miss', title: 'Off-slice miss', task_type: 'create', missed_categories: ['correctness'] }],
+            total: 1,
+          }));
+        }
+        if (url.includes('/sr-reviewer-disagreements')) {
+          return Promise.resolve(jsonResponse(disagreementResponse));
+        }
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse(baseDigest));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+    }
+
+    it('shows the true disagreement category total when the backend returns a truncated page slice', async () => {
+      setupSrApiMocks({
+        disagreements: [{ category: 'correctness', count: 3, max_severity: 'HIGH', examples: [] }],
+        window_days: 14,
+        total_entries: 20,
+        total_distinct_categories: 23,
+        returned_entries: 20,
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      const sectionHeading = await screen.findByText('SR ↔ Reviewer Disagreements');
+      const header = sectionHeading.closest('p');
+      expect(header).not.toBeNull();
+      expect(header).toHaveTextContent('top 20 of 23 categories');
+    });
+
+    it('falls back to the legacy disagreement category count when older backend fields are absent', async () => {
+      setupSrApiMocks({
+        disagreements: [{ category: 'correctness', count: 3, max_severity: 'HIGH', examples: [] }],
+        window_days: 14,
+        total_entries: 1,
+      });
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      const sectionHeading = await screen.findByText('SR ↔ Reviewer Disagreements');
+      const header = sectionHeading.closest('p');
+      expect(header).not.toBeNull();
+      expect(header).toHaveTextContent('1 category');
+    });
+
+    it('Recent SR Misses drill-through fetches an off-slice task by id and navigates', async () => {
+      setupSrApiMocks();
+      const onViewTask = vi.fn();
+      const offSliceTask = makeTask({ id: 'off-slice-miss', title: 'Off-slice miss task' });
+      fetchTaskMock.mockResolvedValue(offSliceTask);
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      await waitFor(() => expect(capturedProps.srMissed).not.toBeNull());
+      const props = capturedProps.srMissed ?? {};
+      expect(typeof props.onTaskClick).toBe('function');
+
+      (props.onTaskClick as (id: string) => void)('off-slice-miss');
+
+      await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-miss'));
+      await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
+    });
+
+    it('SR Unhandled Edges drill-through fetches an off-slice task by id and navigates', async () => {
+      setupSrApiMocks();
+      const onViewTask = vi.fn();
+      const offSliceTask = makeTask({ id: 'off-slice-edge', title: 'Off-slice edge task' });
+      fetchTaskMock.mockResolvedValue(offSliceTask);
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      await waitFor(() => expect(capturedProps.srUnhandledEdges).not.toBeNull());
+      const props = capturedProps.srUnhandledEdges ?? {};
+      expect(typeof props.onSelectTask).toBe('function');
+
+      (props.onSelectTask as (id: string) => void)('off-slice-edge');
+
+      await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-edge'));
+      await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
+    });
+
+    it('SR ↔ Reviewer Disagreements drill-through fetches an off-slice task by id and navigates', async () => {
+      setupSrApiMocks();
+      const onViewTask = vi.fn();
+      const offSliceTask = makeTask({ id: 'off-slice-disagree', title: 'Off-slice disagreement task' });
+      fetchTaskMock.mockResolvedValue(offSliceTask);
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      await waitFor(() => expect(capturedProps.srDisagreements).not.toBeNull());
+      const props = capturedProps.srDisagreements ?? {};
+      expect(typeof props.onSelectTask).toBe('function');
+
+      (props.onSelectTask as (id: string) => void)('off-slice-disagree');
+
+      await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-disagree'));
+      await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
+    });
+
+    it('fix-loop convergence widget fetches an off-slice task by id and navigates', async () => {
+      setupSrApiMocks();
+      const onViewTask = vi.fn();
+      const offSliceTask = makeTask({ id: 'off-slice-fix', title: 'Off-slice fix task' });
+      fetchTaskMock.mockResolvedValue(offSliceTask);
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      await waitFor(() => expect(capturedProps.fixLoop).not.toBeNull());
+      const props = capturedProps.fixLoop ?? {};
+      expect(typeof props.onViewTask).toBe('function');
+
+      (props.onViewTask as (id: string) => void)('off-slice-fix');
+
+      await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-fix'));
+      await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
+    });
+
+    it('review-quality catch-rate regression drilldown fetches an off-slice task by id and navigates', async () => {
+      const onViewTask = vi.fn();
+      const offSliceTask = makeTask({ id: 'off-slice-rq', title: 'Off-slice review-quality task' });
+      fetchTaskMock.mockResolvedValue(offSliceTask);
+
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/sr-alert-drilldown')) {
+          return Promise.resolve(jsonResponse({
+            items: [{ task_id: 'off-slice-rq', title: 'Off-slice review-quality task', missed_categories: ['correctness'], sr_verdict: 'pass' }],
+          }));
+        }
+        if (url.includes('/sr-investigation-task-ids')) return Promise.resolve(jsonResponse({ task_ids: {} }));
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({
+          ...baseDigest,
+          self_review_prediction_accuracy_trends: {
+            overall_hit_rate: 0.5,
+            computed_at: '2026-05-20T00:00:00Z',
+            categories: {
+              correctness: { current_hit_rate: 0.4, previous_hit_rate: 0.7, current_human_count: 10, previous_human_count: 8, trend: 'decreasing' },
+            },
+          },
+        }));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs')) return Promise.resolve(jsonResponse({ open_prs: [] }));
+        if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      const user = userEvent.setup();
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      const investigateBtn = await screen.findByText(/Investigate regression/);
+      await user.click(investigateBtn);
+
+      const viewBtn = await screen.findByTitle('View task SR panel');
+      await user.click(viewBtn);
+
+      await waitFor(() => expect(fetchTaskMock).toHaveBeenCalledWith('off-slice-rq'));
+      await waitFor(() => expect(onViewTask).toHaveBeenCalledWith(offSliceTask));
+    });
+
+    it('uses the in-memory task without fetching when it is in the loaded slice (sanity)', async () => {
+      setupSrApiMocks();
+      const onViewTask = vi.fn();
+      const inSliceTask = makeTask({ id: 'in-slice-1', title: 'In-slice task' });
+
+      render(<DashboardHome tasks={[inSliceTask]} selectedProjectId="proj1" onViewTask={onViewTask} />);
+
+      await waitFor(() => expect(capturedProps.srMissed).not.toBeNull());
+      (capturedProps.srMissed?.onTaskClick as (id: string) => void)('in-slice-1');
+
+      expect(onViewTask).toHaveBeenCalledWith(inSliceTask);
+      expect(fetchTaskMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe('self-sufficient directions roll-up', () => {
     const baseDigest = {
       failed_count: 0,
@@ -1486,6 +1725,60 @@ describe('DashboardHome', () => {
       const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
       expect(card).toHaveTextContent('frozen');
       expect(card).not.toHaveTextContent('stale');
+    });
+  });
+
+  describe('DirectionSrBreakdownPanel freshness pass-through', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      direction_progress: [],
+      recent_completions: [],
+      self_review_prediction_accuracy: { prediction_hit_rate: 0.75 },
+    };
+    const directionSrBreakdown = {
+      min_sample: 3,
+      directions: [
+        { direction_id: 'd1', direction_text: 'Dir A', sample_size: 10, overall_catch_rate: 0.5, worst_category: null, categories: {} },
+      ],
+    };
+
+    it('renders the stale badge inside the direction breakdown section when the snapshot is stale', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { overall_hit_rate: 0.75, computed_at: '2026-05-20T00:00:00Z', is_stale: true, categories: {} } },
+        diagnostics: makeDiagnostics(),
+        directionSrBreakdown,
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const section = await screen.findByTestId('direction-sr-breakdown');
+      expect(within(section).getByTestId('sr-trend-stale-badge')).toBeInTheDocument();
+      expect(within(section).queryByTestId('sr-trend-insufficient-badge')).toBeNull();
+    });
+
+    it('renders the frozen badge inside the direction breakdown section when data is insufficient', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { overall_hit_rate: 0.75, computed_at: '2026-05-20T00:00:00Z', is_stale: false, data_sufficient: false, last_sufficient_computed_at: '2026-04-15T00:00:00Z', categories: {} } },
+        diagnostics: makeDiagnostics(),
+        directionSrBreakdown,
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const section = await screen.findByTestId('direction-sr-breakdown');
+      const badge = within(section).getByTestId('sr-trend-insufficient-badge');
+      expect(badge).toHaveTextContent(`frozen · last real data ${new Date('2026-04-15T00:00:00Z').toLocaleDateString()}`);
+    });
+
+    it('renders no freshness badge in the direction breakdown section when the snapshot is fresh and sufficient', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { overall_hit_rate: 0.75, computed_at: '2026-05-20T00:00:00Z', is_stale: false, data_sufficient: true, categories: {} } },
+        diagnostics: makeDiagnostics(),
+        directionSrBreakdown,
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const section = await screen.findByTestId('direction-sr-breakdown');
+      expect(within(section).queryByTestId('sr-trend-stale-badge')).toBeNull();
+      expect(within(section).queryByTestId('sr-trend-insufficient-badge')).toBeNull();
     });
   });
 

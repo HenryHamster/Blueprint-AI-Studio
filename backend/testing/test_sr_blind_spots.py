@@ -525,6 +525,73 @@ def test_disagreement_directions_examples_omit_pr_url_when_absent():
 
 
 # ---------------------------------------------------------------------------
+# Unit: reviewer-disagreement envelope — honest total vs truncation
+# ---------------------------------------------------------------------------
+
+
+def test_reviewer_disagreement_envelope_total_exceeds_returned_when_truncated():
+    """The envelope reports the true number of distinct disagreement categories,
+    which exceeds the returned slice when more categories exist than ``limit``."""
+    from app.sr_blind_spots import (
+        _count_reviewer_disagreement_directions,
+        _shape_reviewer_disagreement_envelope,
+    )
+
+    pid = uuid.uuid4()
+    # Five distinct disagreement categories, each a fresh-reviewer finding the
+    # SR pass omitted — so five distinct (category, "create") buckets.
+    categories = [
+        "correctness",
+        "security",
+        "performance",
+        "error-handling",
+        "type-safety",
+    ]
+    tasks = [
+        _make_disagreement_task(
+            pid,
+            reviewer_findings=[
+                {"category": cat, "severity": "HIGH", "description": f"{cat} issue"}
+            ],
+        )
+        for cat in categories
+    ]
+    counts = _count_reviewer_disagreement_directions(tasks)
+
+    limit = 2
+    envelope = _shape_reviewer_disagreement_envelope(counts, days=30, limit=limit)
+
+    assert len(envelope["disagreements"]) == limit
+    assert envelope["returned_entries"] == limit
+    # True total reflects ALL distinct categories, not the truncated page.
+    assert envelope["total_distinct_categories"] == len(categories)
+    assert envelope["total_distinct_categories"] > len(envelope["disagreements"])
+    assert envelope["window_days"] == 30
+
+
+def test_reviewer_disagreement_envelope_total_matches_returned_when_not_truncated():
+    """When fewer categories exist than ``limit``, total equals returned count."""
+    from app.sr_blind_spots import (
+        _count_reviewer_disagreement_directions,
+        _shape_reviewer_disagreement_envelope,
+    )
+
+    pid = uuid.uuid4()
+    task = _make_disagreement_task(
+        pid,
+        reviewer_findings=[
+            {"category": "correctness", "severity": "HIGH", "description": "Issue"}
+        ],
+    )
+    counts = _count_reviewer_disagreement_directions([task])
+    envelope = _shape_reviewer_disagreement_envelope(counts, days=14, limit=20)
+
+    assert envelope["total_distinct_categories"] == 1
+    assert envelope["returned_entries"] == 1
+    assert len(envelope["disagreements"]) == 1
+
+
+# ---------------------------------------------------------------------------
 # Unit: aggregate_sr_co_failure_pairs
 # ---------------------------------------------------------------------------
 

@@ -10,6 +10,9 @@ import { useUrlFilterState } from '../hooks/useUrlFilterState';
 const PAGE_SIZE = 20;
 const DAY_OPTIONS = [7, 14, 30, 90];
 const SCOPE_OPTIONS = ['small', 'medium', 'large'] as const;
+// Reviewer-finding severity scale (highest → lowest), mirroring the backend
+// _SEVERITY_RANK in sr_diagnostics_endpoints.py.
+const SEVERITY_OPTIONS = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
 
 export interface SrMissedRetrospectivesPanelProps {
   selectedProjectId: string | null;
@@ -29,13 +32,15 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
     secondaryFilter: categoryFilter,
     taskTypeFilter,
     scopeFilter,
+    severityFilter,
     page,
     setDays,
     setSecondaryFilter: setCategoryFilter,
     setTaskTypeFilter,
     setScopeFilter,
+    setSeverityFilter,
     setPage,
-  } = useUrlFilterState('srm_', selectedProjectId, { withScope: true });
+  } = useUrlFilterState('srm_', selectedProjectId, { withScope: true, withSeverity: true });
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
   const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
   const [catchRateHealth, setCatchRateHealth] = useState<SrCatchRateHealthResponse | null>(null);
@@ -63,6 +68,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
         category: categoryFilter || undefined,
         task_type: taskTypeFilter || undefined,
         scope: scopeFilter || undefined,
+        min_severity: severityFilter || undefined,
         page: page - 1,  // backend is 0-indexed; UI is 1-indexed
         page_size: PAGE_SIZE,
       }, controller.signal);
@@ -88,7 +94,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
     } finally {
       if (mountedRef.current && currentId === requestIdRef.current) setLoading(false);
     }
-  }, [selectedProjectId, days, categoryFilter, taskTypeFilter, scopeFilter, page]);
+  }, [selectedProjectId, days, categoryFilter, taskTypeFilter, scopeFilter, severityFilter, page]);
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -136,17 +142,17 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
   }, [activeScope, setScopeFilter]);
 
   // Reset page when filters change
-  const prevFiltersRef = useRef({ days, categoryFilter, taskTypeFilter, scopeFilter, selectedProjectId });
+  const prevFiltersRef = useRef({ days, categoryFilter, taskTypeFilter, scopeFilter, severityFilter, selectedProjectId });
   useEffect(() => {
     const prev = prevFiltersRef.current;
-    if (prev.days !== days || prev.categoryFilter !== categoryFilter || prev.taskTypeFilter !== taskTypeFilter || prev.scopeFilter !== scopeFilter || prev.selectedProjectId !== selectedProjectId) {
+    if (prev.days !== days || prev.categoryFilter !== categoryFilter || prev.taskTypeFilter !== taskTypeFilter || prev.scopeFilter !== scopeFilter || prev.severityFilter !== severityFilter || prev.selectedProjectId !== selectedProjectId) {
       setPage(1);
       taskTypesAccRef.current = new Set();
       setStableTaskTypes([]);
       setCategoryCounts({});
-      prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, scopeFilter, selectedProjectId };
+      prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, scopeFilter, severityFilter, selectedProjectId };
     }
-  }, [days, categoryFilter, taskTypeFilter, scopeFilter, selectedProjectId, setPage]);
+  }, [days, categoryFilter, taskTypeFilter, scopeFilter, severityFilter, selectedProjectId, setPage]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const isStale = Date.now() - panelMountTimeRef.current > 300_000; // 5 minutes
@@ -205,6 +211,15 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
           <option value="">All scopes</option>
           {SCOPE_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
+        <select
+          value={severityFilter}
+          onChange={e => setSeverityFilter(e.target.value)}
+          className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-[10px]"
+          aria-label="Filter by minimum severity"
+        >
+          <option value="">Any severity</option>
+          {SEVERITY_OPTIONS.map(s => <option key={s} value={s}>{s}+</option>)}
+        </select>
         <SrCatchRateFreshnessPill health={catchRateHealth} />
       </div>
 
@@ -224,7 +239,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
           <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
         </div>
       ) : items.length === 0 ? (
-        categoryFilter || taskTypeFilter || scopeFilter ? (
+        categoryFilter || taskTypeFilter || scopeFilter || severityFilter ? (
           <div
             className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
             role="status"
@@ -232,9 +247,9 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
           >
             <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
             <span>
-              No misses for{categoryFilter ? ` category "${categoryFilter}"` : ''}{taskTypeFilter ? ` type "${taskTypeFilter}"` : ''}{scopeFilter ? ` scope "${scopeFilter}"` : ''}.{' '}
+              No misses for{categoryFilter ? ` category "${categoryFilter}"` : ''}{taskTypeFilter ? ` type "${taskTypeFilter}"` : ''}{scopeFilter ? ` scope "${scopeFilter}"` : ''}{severityFilter ? ` severity "${severityFilter}+"` : ''}.{' '}
               {/* eslint-disable-next-line viewport/min-touch-target -- inline text link, dense context */}
-              <button type="button" className="underline hover:text-neutral-300" onClick={() => { setCategoryFilter(''); setTaskTypeFilter(''); setScopeFilter(''); }}>Clear filters</button>
+              <button type="button" className="underline hover:text-neutral-300" onClick={() => { setCategoryFilter(''); setTaskTypeFilter(''); setScopeFilter(''); setSeverityFilter(''); }}>Clear filters</button>
             </span>
           </div>
         ) : (
@@ -250,8 +265,12 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
       ) : (
         <>
           {catFreq.length > 0 && (
-            <div className="flex flex-wrap gap-1.5 mb-2">
-              {catFreq.map(([cat, count]) => {
+            <>
+              {categoryFilter && (
+                <div className="text-[9px] text-neutral-500 mb-1">missed alongside {categoryFilter}</div>
+              )}
+              <div className="flex flex-wrap gap-1.5 mb-2">
+                {catFreq.map(([cat, count]) => {
                 const investigationTaskId = activeInvestigationTaskIds?.[cat];
                 return (
                   <span key={cat} className="inline-flex items-center gap-0.5">
@@ -281,8 +300,9 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
                 );
               })}
               <span className="text-[9px] text-neutral-600 self-center ml-1">{total} total</span>
-            </div>
-          )}
+              </div>
+              </>
+            )}
           <div className="flex flex-col gap-1">
             {items.map(t => (
               <SrMissRow key={t.task_id} task={t} onClick={() => onSelectTask(t.task_id)} investigationTaskIds={activeInvestigationTaskIds} onOpenInvestigation={onSelectTask} />

@@ -20,6 +20,7 @@ type FilterInternal = {
   secondaryFilter: string;
   taskTypeFilter: string;
   scopeFilter: string;
+  severityFilter: string;
   page: number;
 };
 
@@ -28,11 +29,13 @@ export interface UrlFilterState {
   secondaryFilter: string;
   taskTypeFilter: string;
   scopeFilter: string;
+  severityFilter: string;
   page: number;
   setDays: (d: number) => void;
   setSecondaryFilter: (c: string) => void;
   setTaskTypeFilter: (t: string) => void;
   setScopeFilter: (s: string) => void;
+  setSeverityFilter: (s: string) => void;
   setPage: (p: number | ((prev: number) => number)) => void;
 }
 
@@ -42,6 +45,8 @@ export interface UrlFilterStateOptions {
   secondaryParam?: string;
   /** When true, the hook also tracks a 'scope' filter under `<prefix>scope`. */
   withScope?: boolean;
+  /** When true, the hook also tracks a 'min_severity' filter under `<prefix>min_severity`. */
+  withSeverity?: boolean;
 }
 
 /**
@@ -56,7 +61,7 @@ export function useUrlFilterState(
   projectId: string | null,
   options: UrlFilterStateOptions = {},
 ): UrlFilterState {
-  const { defaultDays = 14, secondaryParam = 'category', withScope = false } = options;
+  const { defaultDays = 14, secondaryParam = 'category', withScope = false, withSeverity = false } = options;
 
   const [state, setState] = useState<FilterInternal>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -66,6 +71,7 @@ export function useUrlFilterState(
       secondaryFilter: params.get(`${prefix}${secondaryParam}`) ?? '',
       taskTypeFilter: params.get(`${prefix}task_type`) ?? '',
       scopeFilter: withScope ? (params.get(`${prefix}scope`) ?? '') : '',
+      severityFilter: withSeverity ? (params.get(`${prefix}min_severity`) ?? '') : '',
       page: parsePage(params.get(`${prefix}page`)),
     };
   });
@@ -80,6 +86,7 @@ export function useUrlFilterState(
       secondaryFilter: '',
       taskTypeFilter: '',
       scopeFilter: '',
+      severityFilter: '',
       page: 1,
     });
   }
@@ -114,6 +121,14 @@ export function useUrlFilterState(
       }
     }
 
+    if (withSeverity) {
+      if (state.severityFilter) {
+        params.set(`${prefix}min_severity`, state.severityFilter);
+      } else {
+        params.delete(`${prefix}min_severity`);
+      }
+    }
+
     if (state.page !== 1) {
       params.set(`${prefix}page`, String(state.page));
     } else {
@@ -126,13 +141,14 @@ export function useUrlFilterState(
       '',
       search ? `${window.location.pathname}?${search}` : window.location.pathname,
     );
-  }, [prefix, secondaryParam, withScope, state, defaultDays]);
+  }, [prefix, secondaryParam, withScope, withSeverity, state, defaultDays]);
 
   // Stable setter references (setState from useState is always stable)
   const setDays = useCallback((d: number) => setState(s => ({ ...s, days: d })), []);
   const setSecondaryFilter = useCallback((c: string) => setState(s => ({ ...s, secondaryFilter: c })), []);
   const setTaskTypeFilter = useCallback((t: string) => setState(s => ({ ...s, taskTypeFilter: t })), []);
   const setScopeFilter = useCallback((s: string) => setState(prev => ({ ...prev, scopeFilter: s })), []);
+  const setSeverityFilter = useCallback((s: string) => setState(prev => ({ ...prev, severityFilter: s })), []);
   const setPage = useCallback(
     (p: number | ((prev: number) => number)) =>
       setState(s => ({ ...s, page: typeof p === 'function' ? p(s.page) : p })),
@@ -144,11 +160,13 @@ export function useUrlFilterState(
     secondaryFilter: state.secondaryFilter,
     taskTypeFilter: state.taskTypeFilter,
     scopeFilter: state.scopeFilter,
+    severityFilter: state.severityFilter,
     page: state.page,
     setDays,
     setSecondaryFilter,
     setTaskTypeFilter,
     setScopeFilter,
+    setSeverityFilter,
     setPage,
   };
 }

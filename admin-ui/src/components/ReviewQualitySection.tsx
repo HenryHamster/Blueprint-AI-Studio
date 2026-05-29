@@ -157,6 +157,13 @@ interface ReviewQualitySectionProps {
   selectedProjectId: string | null;
   tasks: Task[];
   onViewTask: (task: Task) => void;
+  /**
+   * Resolve and navigate to a task by id. Falls back to fetching the task when
+   * it is not in the in-memory `tasks` slice (e.g. an out-of-window SR miss).
+   * Preferred over `onViewTask` for drill-throughs that may reference tasks
+   * outside the dashboard's loaded list.
+   */
+  onViewTaskById?: (taskId: string) => void;
   srCatchRateTargets: Record<string, number> | null | undefined;
   onCategoryClick: (category: string) => void;
   onScopeClick?: (scope: string) => void;
@@ -170,6 +177,7 @@ export function ReviewQualitySection({
   selectedProjectId,
   tasks,
   onViewTask,
+  onViewTaskById,
   srCatchRateTargets,
   onCategoryClick,
   onScopeClick,
@@ -610,7 +618,7 @@ export function ReviewQualitySection({
                       <span className="text-neutral-200 truncate block">{row.title}</span>
                       <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
                     </div>
-                    <button onClick={() => { const t = tasks.find(t => t.id === row.task_id); if (t) onViewTask(t); }} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
+                    <button onClick={() => { if (onViewTaskById) { onViewTaskById(row.task_id); } else { const t = tasks.find(t => t.id === row.task_id); if (t) onViewTask(t); } }} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
                       <ExternalLink className="w-3 h-3" />
                     </button>
                   </div>

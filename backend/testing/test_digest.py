@@ -10629,10 +10629,107 @@ async def test_sr_reviewer_disagreements_endpoint(client: AsyncClient, db_sessio
     assert response.status_code == 200
     body = response.json()
     assert body["window_days"] == 30
+    # Legacy field preserved (= returned slice size).
     assert body["total_entries"] == 1
+    # Additive true-total / returned-count fields.
+    assert body["total_distinct_categories"] == 1
+    assert body["returned_entries"] == 1
     assert body["disagreements"][0]["category"] == "correctness"
     assert body["disagreements"][0]["task_type"] == "create"
     assert body["disagreements"][0]["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_endpoint_not_truncated(
+    client: AsyncClient, db_session
+):
+    """Single distinct category: true total equals returned-entry count (no truncation)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "x",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_distinct_categories"] == 1
+    assert body["returned_entries"] == 1
+    assert body["total_entries"] == 1
+    assert len(body["disagreements"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreements_endpoint_truncated(
+    client: AsyncClient, db_session
+):
+    """With >=2 distinct categories and limit=1, true total exceeds returned slice."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two distinct (category, task_type) disagreements.
+    for category in ("correctness", "security"):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "check_results": {category: {"passed": True}},
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": category,
+                                "severity": "HIGH",
+                                "description": "x",
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements?days=30&limit=1"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_distinct_categories"] == 2
+    assert body["returned_entries"] == 1
+    # Truncated list reflects returned_entries, not the true total.
+    assert len(body["disagreements"]) == 1
+    # Legacy field tracks the returned slice (back-compat), NOT the true total.
+    assert body["total_entries"] == 1
+    assert body["total_distinct_categories"] > body["returned_entries"]
 
 
 @pytest.mark.asyncio
@@ -11951,6 +12048,89 @@ async def test_sr_missed_retrospectives_scope_filter(
     assert body_small["category_counts"] == {"correctness": 1, "performance": 1}
 
 
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_min_severity_filter(
+    client: AsyncClient, db_session
+):
+    """?min_severity filters out tasks whose reviewer findings are all below the threshold.
+
+    total and category_counts must reflect the severity-filtered subset.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _ctx(severity: str, missed_cat: str = "correctness"):
+        return {
+            "_first_attempt_rejection_categories": {missed_cat: 1},
+            "_self_review_outcome": {
+                "verdict": "pass",
+                "fixes_applied": False,
+                "check_results": {missed_cat: {"passed": True}},
+                "reviewer_findings": [
+                    {"category": missed_cat, "severity": severity, "description": "x"}
+                ],
+                "blind_spots": [],
+            },
+        }
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title="Critical miss",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=_ctx("CRITICAL", "correctness"),
+            ),
+            make_task(
+                project_id=project.id,
+                title="High miss",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=_ctx("HIGH", "performance"),
+            ),
+            make_task(
+                project_id=project.id,
+                title="Low miss",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context=_ctx("LOW", "correctness"),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    # Unfiltered baseline: all three tasks
+    r_all = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives"
+    )
+    assert r_all.status_code == 200
+    assert r_all.json()["total"] == 3
+
+    # min_severity=HIGH keeps CRITICAL + HIGH, drops the LOW-only task
+    r_high = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?min_severity=HIGH"
+    )
+    assert r_high.status_code == 200
+    body_high = r_high.json()
+    assert body_high["total"] == 2
+    titles = {item["title"] for item in body_high["items"]}
+    assert titles == {"Critical miss", "High miss"}
+    # category_counts must reflect ONLY the severity-filtered subset
+    assert body_high["category_counts"] == {"correctness": 1, "performance": 1}
+
+    # min_severity=CRITICAL keeps only the CRITICAL task
+    r_crit = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?min_severity=CRITICAL"
+    )
+    assert r_crit.status_code == 200
+    body_crit = r_crit.json()
+    assert body_crit["total"] == 1
+    assert body_crit["category_counts"] == {"correctness": 1}
+
+
 # ---------------------------------------------------------------------------
 # SR unhandled edges endpoint — task_types and pagination parity tests
 # ---------------------------------------------------------------------------
@@ -12177,6 +12357,364 @@ async def test_sr_unhandled_edges_blind_spot_counts(
     assert body["blind_spot_counts"] == {
         "partial retry on network timeout boundary": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_sr_unhandled_edges_case_pattern_matches_exact_edge_case_label(
+    client: AsyncClient, db_session
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title="case match",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "Retry path null pointer",
+                                "handled": False,
+                                "blind_spot": "missed null guard on cache write",
+                            },
+                        ],
+                    },
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                title="case prefix match",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "network guard timeout fallback",
+                                "handled": False,
+                                "blind_spot": "Missing RETRY guard around network timeout fallback",
+                            },
+                        ],
+                    },
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                title="non match",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "different issue",
+                                "handled": False,
+                                "blind_spot": "unrelated serialization gap",
+                            },
+                        ],
+                    },
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=retry+path+null+pointer"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert [item["title"] for item in body["items"]] == ["case match"]
+    assert body["edge_case_counts"] == {
+        "different issue": 1,
+        "network guard timeout fallback": 1,
+        "retry path null pointer": 1,
+    }
+    assert "blind_spot_counts" in body
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=network+guard+timeout+fallback"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert [item["title"] for item in body["items"]] == ["case prefix match"]
+    assert body["edge_case_counts"] == {
+        "different issue": 1,
+        "network guard timeout fallback": 1,
+        "retry path null pointer": 1,
+    }
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=network+guard"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 0
+    assert body["items"] == []
+    assert body["edge_case_counts"] == {
+        "different issue": 1,
+        "network guard timeout fallback": 1,
+        "retry path null pointer": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_sr_unhandled_edges_case_pattern_counts_stable_across_pages(
+    client: AsyncClient, db_session
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title="create retry task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "Retry path null pointer",
+                                "handled": False,
+                                "blind_spot": "Retry guard missing on write path cache",
+                            },
+                            {
+                                "case": "timeout boundary",
+                                "handled": False,
+                                "blind_spot": "partial retry on timeout boundary",
+                            },
+                            {
+                                "case": "serialization gap",
+                                "handled": False,
+                                "blind_spot": "missing JSON shape validation",
+                            },
+                        ],
+                    },
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                title="fix retry task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "Retry path null pointer",
+                                "handled": False,
+                                "blind_spot": "retry guard missing on write path db",
+                            },
+                        ],
+                    },
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                title="non retry task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "serialization gap",
+                                "handled": False,
+                                "blind_spot": "missing JSON shape validation",
+                            },
+                        ],
+                    },
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                title="blind-spot sibling task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "queue fallback",
+                                "handled": False,
+                                "blind_spot": "retry guard missing on write path queue",
+                            },
+                        ],
+                    },
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response_full = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=retry+path+null+pointer&page_size=2&page=0"
+    )
+    assert response_full.status_code == 200
+    body_full = response_full.json()
+    create_item = next(
+        item for item in body_full["items"] if item["title"] == "create retry task"
+    )
+    assert create_item["unhandled_edges"] == [
+        {
+            "case": "Retry path null pointer",
+            "handled": False,
+            "blind_spot": "Retry guard missing on write path cache",
+        },
+        {
+            "case": "timeout boundary",
+            "handled": False,
+            "blind_spot": "partial retry on timeout boundary",
+        },
+        {
+            "case": "serialization gap",
+            "handled": False,
+            "blind_spot": "missing JSON shape validation",
+        },
+    ]
+
+    response_page_1 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=retry+path+null+pointer&page_size=1&page=0"
+    )
+    assert response_page_1.status_code == 200
+    body_page_1 = response_page_1.json()
+    assert body_page_1["total"] == 2
+    assert len(body_page_1["items"]) == 1
+    assert sorted(body_page_1["task_types"]) == ["create", "fix"]
+    assert body_page_1["blind_spot_counts"] == {
+        "retry guard missing on write path": 2,
+    }
+    assert body_page_1["edge_case_counts"] == {
+        "retry path null pointer": 2,
+        "serialization gap": 2,
+        "queue fallback": 1,
+        "timeout boundary": 1,
+    }
+
+    response_page_2 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=retry+path+null+pointer&page_size=1&page=1"
+    )
+    assert response_page_2.status_code == 200
+    body_page_2 = response_page_2.json()
+    assert body_page_2["total"] == 2
+    assert len(body_page_2["items"]) == 1
+    assert body_page_2["edge_case_counts"] == body_page_1["edge_case_counts"]
+    assert body_page_2["blind_spot_counts"] == body_page_1["blind_spot_counts"]
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=retry+path+null+pointer&blind_spot=retry+guard+missing+on+write+path"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["edge_case_counts"] == {
+        "retry path null pointer": 2,
+        "queue fallback": 1,
+    }
+    assert body["blind_spot_counts"] == body_page_1["blind_spot_counts"]
+    create_item = next(
+        item for item in body["items"] if item["title"] == "create retry task"
+    )
+    assert create_item["unhandled_edges"] == [
+        {
+            "case": "Retry path null pointer",
+            "handled": False,
+            "blind_spot": "Retry guard missing on write path cache",
+        },
+        {
+            "case": "timeout boundary",
+            "handled": False,
+            "blind_spot": "partial retry on timeout boundary",
+        },
+        {
+            "case": "serialization gap",
+            "handled": False,
+            "blind_spot": "missing JSON shape validation",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sr_unhandled_edges_case_pattern_dedupes_duplicate_labels_per_task(
+    client: AsyncClient, db_session
+):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title="duplicate label task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "Retry path null pointer",
+                                "handled": False,
+                                "blind_spot": "retry guard missing on cache write",
+                            },
+                            {
+                                "case": "Retry path null pointer",
+                                "handled": False,
+                                "blind_spot": "retry guard missing on db write",
+                            },
+                        ],
+                    },
+                },
+            ),
+            make_task(
+                project_id=project.id,
+                title="single label task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_self_review_outcome": {
+                        "edges_considered": [
+                            {
+                                "case": "Retry path null pointer",
+                                "handled": False,
+                                "blind_spot": "retry guard missing on queue write",
+                            },
+                        ],
+                    },
+                },
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+        "?case_pattern=retry+path+null+pointer"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["edge_case_counts"] == {"retry path null pointer": 2}
 
 
 # ---------------------------------------------------------------------------

@@ -228,6 +228,7 @@ export async function fetchSrMissedRetrospectives(
     category?: string;
     task_type?: string;
     scope?: string;
+    min_severity?: string;
     days?: number;
     page?: number;
     page_size?: number;
@@ -238,6 +239,7 @@ export async function fetchSrMissedRetrospectives(
   if (params?.category) searchParams.set('category', params.category);
   if (params?.task_type) searchParams.set('task_type', params.task_type);
   if (params?.scope) searchParams.set('scope', params.scope);
+  if (params?.min_severity) searchParams.set('min_severity', params.min_severity);
   if (params?.days !== undefined) searchParams.set('days', String(params.days));
   if (params?.page !== undefined) searchParams.set('page', String(params.page));
   if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
@@ -308,16 +310,20 @@ export interface SrUnhandledEdgesRetrospectiveResponse {
   items: SrUnhandledEdgesTask[];
   total: number;
   task_types?: string[];
+  // edge_case_counts is the current contract: edge `case` labels ranked by
+  // frequency. blind_spot_counts is retained for backend-rollout compatibility.
+  edge_case_counts?: Record<string, number>;
   blind_spot_counts?: Record<string, number>;
 }
 
 export async function fetchSrUnhandledEdgesRetrospectives(
   projectId: string,
-  params?: { task_type?: string; blind_spot?: string; days?: number; page?: number; page_size?: number },
+  params?: { task_type?: string; case_pattern?: string; blind_spot?: string; days?: number; page?: number; page_size?: number },
   signal?: AbortSignal,
 ): Promise<SrUnhandledEdgesRetrospectiveResponse> {
   const searchParams = new URLSearchParams();
   if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.case_pattern) searchParams.set('case_pattern', params.case_pattern);
   if (params?.blind_spot) searchParams.set('blind_spot', params.blind_spot);
   if (params?.days !== undefined) searchParams.set('days', String(params.days));
   if (params?.page !== undefined) searchParams.set('page', String(params.page));
@@ -544,6 +550,24 @@ export interface SrReviewerDisagreementCategory {
   sample_size: number;
   reviewer_overrode_sr_count: number;
   sr_overrode_reviewer_count: number;
+}
+
+/**
+ * Response envelope for the `sr-reviewer-disagreements` endpoint.
+ *
+ * `total_entries` is the legacy field (= number of returned entries, i.e. the
+ * truncated page slice) and is always emitted for backward compatibility. The
+ * additive `total_distinct_categories` / `returned_entries` fields report the
+ * true distinct-category total for the window independently from the truncated
+ * `disagreements` list; they are optional so a frontend can still render
+ * sensibly against an older backend during a mixed deploy.
+ */
+export interface SrReviewerDisagreementsEnvelope {
+  window_days: number;
+  total_entries: number;
+  total_distinct_categories?: number;
+  returned_entries?: number;
+  disagreements: import('./components/SrTrendBreakdown').SrReviewerDisagreement[];
 }
 
 export interface PromptFingerprintEntry {

@@ -46,7 +46,7 @@ from app.sr_analytics import (
 )
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_envelope,
-    aggregate_sr_reviewer_disagreements,
+    aggregate_sr_reviewer_disagreements_envelope,
     is_disallowed_blind_spot,
     is_skipped_sr_outcome as _is_skipped_sr_outcome,
 )
@@ -60,12 +60,81 @@ from app.research_actionability import (
 
 router = APIRouter()
 
+# Reviewer-finding severity scale (CRITICAL > HIGH > MEDIUM > LOW), mirroring
+# sr_blind_spots._SEVERITY_LEVELS. MAJOR/MINOR are normalized to MEDIUM/LOW,
+# consistent with the frontend `reviewerSeverityColor` synonym mapping.
+_SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+
+def _normalize_severity(raw: Optional[str]) -> str:
+    s = (raw or "").strip().upper()
+    if s == "MAJOR":
+        return "MEDIUM"
+    if s == "MINOR":
+        return "LOW"
+    return s
+
+
+def _missed_finding_meets_severity(
+    reviewer_findings: Any, missed: set, threshold_rank: int
+) -> bool:
+    """True if any reviewer finding for a MISSED category is at/above threshold."""
+    if not isinstance(reviewer_findings, list):
+        return False
+    for f in reviewer_findings:
+        if not isinstance(f, dict) or f.get("category") not in missed:
+            continue
+        if _SEVERITY_RANK.get(_normalize_severity(f.get("severity")), 0) >= threshold_rank:
+            return True
+    return False
+
+
 _SR_INVESTIGATION_ACTIVE_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
 )
 _SR_INVESTIGATION_SPAWNED_BY = "operator_sr_investigation"
+
+
+def _normalize_blind_spot_theme(entry: str) -> str:
+    return " ".join(entry.lower().split()[:6])
+
+
+def _normalize_case_pattern_text(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def _edge_matches_case_pattern(edge: Dict[str, Any], case_pattern: str | None) -> bool:
+    if not case_pattern:
+        return True
+    normalized_pattern = _normalize_case_pattern_text(case_pattern)
+    if not normalized_pattern:
+        return True
+    label = _edge_case_label(edge)
+    return label == normalized_pattern
+
+
+def _edge_case_label(edge: Dict[str, Any]) -> str | None:
+    case_value = edge.get("case")
+    if isinstance(case_value, str) and case_value.strip():
+        return " ".join(case_value.lower().split()[:6])
+
+    blind_spot = edge.get("blind_spot")
+    if isinstance(blind_spot, str) and blind_spot.strip():
+        if is_disallowed_blind_spot(blind_spot):
+            return None
+        return _normalize_blind_spot_theme(blind_spot)
+    return None
+
+
+def _edge_blind_spot_theme(edge: Dict[str, Any]) -> str | None:
+    blind_spot = edge.get("blind_spot")
+    if not isinstance(blind_spot, str) or not blind_spot.strip():
+        return None
+    if is_disallowed_blind_spot(blind_spot):
+        return None
+    return _normalize_blind_spot_theme(blind_spot)
 
 
 class SpawnSrInvestigationRequest(BaseModel):
@@ -83,6 +152,7 @@ async def list_sr_missed_retrospectives(
     category: Optional[str] = Query(None),
     task_type: Optional[str] = Query(None),
     scope: Optional[str] = Query(None, max_length=64),
+    min_severity: Optional[str] = Query(None),
     page: int = Query(0, ge=0),
     page_size: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
@@ -96,6 +166,10 @@ async def list_sr_missed_retrospectives(
     cutoff = datetime.utcnow() - timedelta(days=days)
     page_start = page * page_size
     page_end = page_start + page_size
+    # 0 disables the severity filter (absent param or unrecognized value).
+    min_severity_rank = (
+        _SEVERITY_RANK.get(_normalize_severity(min_severity), 0) if min_severity else 0
+    )
 
     stmt = (
         select(Task)
@@ -139,6 +213,13 @@ async def list_sr_missed_retrospectives(
         if category and category not in missed:
             continue
         if scope and ctx.get("scope") != scope:
+            continue
+        # Severity filter: keep only tasks with a reviewer finding for a MISSED
+        # category at or above the chosen severity. Applied here — alongside
+        # category/scope — so total/category_counts/pagination stay honest.
+        if min_severity_rank and not _missed_finding_meets_severity(
+            sr_outcome.get("reviewer_findings"), missed, min_severity_rank
+        ):
             continue
         # Accumulate task types before the task_type filter so the full type
         # list is available in the response regardless of which filter is active.
@@ -210,6 +291,7 @@ async def list_sr_unhandled_edges_retrospectives(
     days: int = Query(14, ge=1, le=90),
     task_type: Optional[str] = Query(None),
     blind_spot: Optional[str] = Query(None),
+    case_pattern: Optional[str] = Query(None),
     page: int = Query(0, ge=0),
     page_size: int = Query(50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
@@ -222,10 +304,15 @@ async def list_sr_unhandled_edges_retrospectives(
     correlate with later reviewer rejections and spot patterns.
 
     ``blind_spot_counts`` aggregates recurring blind-spot themes across the
-    (days + task_type) filtered universe — counted once per unique theme per
-    task, ignoring the ``blind_spot`` filter so the pills remain swap-able.
-    Themes use the same first-6-token-lowercase normalisation as
-    ``sr_blind_spots._scan_blind_spot_counts``.
+    (days + task_type + case_pattern) filtered universe — counted once per
+    unique theme per task, ignoring the ``blind_spot`` filter so the pills
+    remain swap-able. Themes use the same first-6-token-lowercase
+    normalisation as ``sr_blind_spots._scan_blind_spot_counts``.
+
+    ``edge_case_counts`` frequency-ranks the edge ``case`` labels across the
+    (days + task_type + blind_spot) filtered universe — counted once per
+    unique label per task, ignoring the ``case_pattern`` filter so the badges
+    remain swap-able while staying stable across pagination.
     """
     cutoff = datetime.utcnow() - timedelta(days=days)
     page_start = page * page_size
@@ -255,6 +342,7 @@ async def list_sr_unhandled_edges_retrospectives(
     total_matched = 0
     all_task_types: set[str] = set()
     blind_spot_counts: Dict[str, int] = defaultdict(int)
+    edge_case_counts: Dict[str, int] = defaultdict(int)
     task_stream = await session.stream(stmt)
     async for t in task_stream.scalars():
         ctx = t.context or {}
@@ -270,10 +358,23 @@ async def list_sr_unhandled_edges_retrospectives(
         if not unhandled_edges:
             continue
 
+        matched_case_pattern_edges = [
+            edge
+            for edge in unhandled_edges
+            if _edge_matches_case_pattern(edge, case_pattern)
+        ]
+        matched_blind_spot_edges = unhandled_edges
+        if blind_spot:
+            matched_blind_spot_edges = [
+                edge
+                for edge in unhandled_edges
+                if _edge_blind_spot_theme(edge) == blind_spot
+            ]
+
         t_type = (t.first_payload or {}).get("type")
-        # Accumulate task types before the task_type filter so the full type
-        # list is available in the response regardless of which filter is active.
-        if t_type:
+        # Accumulate task types after case-pattern matching so the response can
+        # still expose the full type menu even when task_type narrows rows.
+        if matched_case_pattern_edges and t_type:
             all_task_types.add(t_type)
         if task_type and t_type != task_type:
             continue
@@ -282,23 +383,34 @@ async def list_sr_unhandled_edges_retrospectives(
         # Dedupe themes within a single task so one task contributes at most
         # one bump per theme to blind_spot_counts.
         task_themes: set[str] = set()
-        for edge in unhandled_edges:
-            entry = edge.get("blind_spot")
-            if not isinstance(entry, str) or not entry.strip():
-                continue
-            if is_disallowed_blind_spot(entry):
-                continue
-            theme = " ".join(entry.lower().split()[:6])
+        for edge in matched_case_pattern_edges:
+            theme = _edge_blind_spot_theme(edge)
             if theme:
                 task_themes.add(theme)
 
-        # Aggregate blind_spot_counts over the days+task_type universe BEFORE
-        # applying the theme filter so operators can swap pills meaningfully.
+        # Aggregate blind_spot_counts over the days+task_type+case_pattern
+        # universe BEFORE applying the theme filter so operators can swap
+        # pills meaningfully.
         for theme in task_themes:
             blind_spot_counts[theme] += 1
 
-        # Apply theme filter to row inclusion / total / pagination.
-        if blind_spot and blind_spot not in task_themes:
+        task_edge_case_labels = {
+            label for edge in matched_blind_spot_edges if (label := _edge_case_label(edge))
+        }
+        for label in task_edge_case_labels:
+            edge_case_counts[label] += 1
+
+        if not matched_case_pattern_edges:
+            continue
+
+        matched_edges = matched_case_pattern_edges
+        if blind_spot:
+            matched_edges = [
+                edge
+                for edge in matched_case_pattern_edges
+                if _edge_blind_spot_theme(edge) == blind_spot
+            ]
+        if not matched_edges:
             continue
 
         current_index = total_matched
@@ -313,6 +425,9 @@ async def list_sr_unhandled_edges_retrospectives(
                 "task_type": t_type,
                 "scope": ctx.get("scope"),
                 "created_at": t.created_at.isoformat() if t.created_at else None,
+                # Filters decide which tasks qualify for the page, but the
+                # drill-down payload still returns each task's full raw
+                # unhandled-edge evidence.
                 "unhandled_edges": unhandled_edges,
             }
         )
@@ -350,6 +465,9 @@ async def list_sr_unhandled_edges_retrospectives(
         "total": total_matched,
         "task_types": sorted(all_task_types),
         "blind_spot_counts": dict(blind_spot_counts),
+        "edge_case_counts": dict(
+            sorted(edge_case_counts.items(), key=lambda item: (-item[1], item[0]))
+        ),
     }
 
 
@@ -660,16 +778,19 @@ async def list_sr_reviewer_disagreements(
     Only code-change tasks (create/fix/refactor/migrate) with both
     ``check_results`` and ``reviewer_findings`` are included.
     """
-    entries = await aggregate_sr_reviewer_disagreements(
+    envelope = await aggregate_sr_reviewer_disagreements_envelope(
         session,
         project_id,
         days=days,
         limit=limit,
     )
+    # Spread the envelope (window_days, total_distinct_categories,
+    # returned_entries, disagreements) and preserve the legacy ``total_entries``
+    # field (= returned slice size) for sibling-owned consumers that have not
+    # yet migrated to the additive true-total fields.
     return {
-        "window_days": days,
-        "total_entries": len(entries),
-        "disagreements": entries,
+        **envelope,
+        "total_entries": envelope["returned_entries"],
     }
 
 

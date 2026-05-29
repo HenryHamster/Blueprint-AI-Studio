@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {
   SrTrendBreakdown,
@@ -460,6 +460,66 @@ describe('DirectionSrBreakdownPanel', () => {
     render(<DirectionSrBreakdownPanel entries={entries} onDirectionClick={onDirectionClick} />);
     await user.click(screen.getByText('Clickable Direction'));
     expect(onDirectionClick).toHaveBeenCalledWith('d1');
+  });
+
+  const freshnessEntries: DirectionSrEntry[] = [
+    { direction_id: 'd1', direction_text: 'Dir A', sample_size: 10, overall_catch_rate: 0.5, worst_category: null, categories: {} },
+  ];
+
+  it('renders the stale badge inside the panel when trends.is_stale is true', () => {
+    render(
+      <DirectionSrBreakdownPanel
+        entries={freshnessEntries}
+        trends={{ is_stale: true, computed_at: '2026-05-01T00:00:00' }}
+      />,
+    );
+    const panel = screen.getByTestId('direction-sr-breakdown-panel');
+    const badge = within(panel).getByTestId('sr-trend-stale-badge');
+    expect(badge.textContent).toBe(`stale · as of ${new Date('2026-05-01T00:00:00').toLocaleDateString()}`);
+    expect(within(panel).queryByTestId('sr-trend-insufficient-badge')).toBeNull();
+  });
+
+  it('renders the frozen badge with last-real-data date when data_sufficient is false', () => {
+    render(
+      <DirectionSrBreakdownPanel
+        entries={freshnessEntries}
+        trends={{ data_sufficient: false, last_sufficient_computed_at: '2026-04-15T00:00:00', computed_at: '2026-05-01T00:00:00' }}
+      />,
+    );
+    const panel = screen.getByTestId('direction-sr-breakdown-panel');
+    const badge = within(panel).getByTestId('sr-trend-insufficient-badge');
+    expect(badge.textContent).toBe(`frozen · last real data ${new Date('2026-04-15T00:00:00').toLocaleDateString()}`);
+  });
+
+  it('falls back to computed_at for the frozen badge when last_sufficient_computed_at is absent', () => {
+    render(
+      <DirectionSrBreakdownPanel
+        entries={freshnessEntries}
+        trends={{ data_sufficient: false, computed_at: '2026-05-01T00:00:00' }}
+      />,
+    );
+    const panel = screen.getByTestId('direction-sr-breakdown-panel');
+    const badge = within(panel).getByTestId('sr-trend-insufficient-badge');
+    expect(badge.textContent).toBe(`frozen · last real data ${new Date('2026-05-01T00:00:00').toLocaleDateString()}`);
+  });
+
+  it('renders no freshness badge when trends prop is absent (backward compat)', () => {
+    render(<DirectionSrBreakdownPanel entries={freshnessEntries} />);
+    const panel = screen.getByTestId('direction-sr-breakdown-panel');
+    expect(within(panel).queryByTestId('sr-trend-stale-badge')).toBeNull();
+    expect(within(panel).queryByTestId('sr-trend-insufficient-badge')).toBeNull();
+  });
+
+  it('renders no freshness badge when snapshot is fresh and sufficient', () => {
+    render(
+      <DirectionSrBreakdownPanel
+        entries={freshnessEntries}
+        trends={{ is_stale: false, data_sufficient: true, computed_at: '2026-05-01T00:00:00' }}
+      />,
+    );
+    const panel = screen.getByTestId('direction-sr-breakdown-panel');
+    expect(within(panel).queryByTestId('sr-trend-stale-badge')).toBeNull();
+    expect(within(panel).queryByTestId('sr-trend-insufficient-badge')).toBeNull();
   });
 });
 

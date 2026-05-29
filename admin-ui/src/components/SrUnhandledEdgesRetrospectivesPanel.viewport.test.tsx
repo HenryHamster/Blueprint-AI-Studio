@@ -420,9 +420,7 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
 
     const pillsBar = screen.getByTestId('sr-unhandled-edges-blind-spot-pills');
     const pillButtons = pillsBar.querySelectorAll('button');
-    // 3 themes (all meet count >= 2)
     expect(pillButtons.length).toBe(3);
-    // Sorted by count desc
     expect(pillButtons[0].textContent).toContain('no lock around state mutation that');
     expect(pillButtons[0].textContent).toContain('5');
     expect(pillButtons[1].textContent).toContain('hook fires unconditionally without checks');
@@ -445,11 +443,9 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
       expect.any(AbortSignal),
     );
 
-    // Active pill should be marked selected
     const refreshedPills = screen.getByTestId('sr-unhandled-edges-blind-spot-pills').querySelectorAll('button');
     expect(refreshedPills[0].getAttribute('aria-pressed')).toBe('true');
 
-    // Click again to clear the filter
     spy.mockClear();
     await act(async () => {
       fireEvent.click(refreshedPills[0]);
@@ -472,7 +468,6 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
       items: MOCK_ITEMS,
       total: 2,
       task_types: ['create', 'fix'],
-      // Only one theme meets the minimum count of 2 → pill bar should hide.
       blind_spot_counts: {
         'no lock around state mutation that': 5,
         'one off blind spot': 1,
@@ -498,6 +493,117 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     });
 
     expect(screen.queryByTestId('sr-unhandled-edges-blind-spot-pills')).toBeNull();
+  });
+
+  test('case-pattern badge bar renders sorted by count, click filters fetch and toggles', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({
+      items: MOCK_ITEMS,
+      total: 2,
+      task_types: ['create', 'fix'],
+      edge_case_counts: {
+        'partial retry on network timeout': 2,
+        'concurrent writes race': 5,
+        'empty list still triggers hook': 3,
+      },
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const badgeBar = screen.getByTestId('sr-unhandled-edges-case-pattern-badges');
+    const badgeButtons = badgeBar.querySelectorAll('button');
+    expect(badgeButtons.length).toBe(3);
+    // Sorted by count desc
+    expect(badgeButtons[0].textContent).toContain('concurrent writes race');
+    expect(badgeButtons[0].textContent).toContain('5');
+    expect(badgeButtons[1].textContent).toContain('empty list still triggers hook');
+    expect(badgeButtons[2].textContent).toContain('partial retry on network timeout');
+
+    spy.mockClear();
+    await act(async () => {
+      fireEvent.click(badgeButtons[0]);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Clicking a badge sets the case_pattern filter and resets to page 0
+    expect(spy).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({
+        case_pattern: 'concurrent writes race',
+        page: 0,
+      }),
+      expect.any(AbortSignal),
+    );
+
+    // Active badge should be marked selected
+    const refreshedBadges = screen.getByTestId('sr-unhandled-edges-case-pattern-badges').querySelectorAll('button');
+    expect(refreshedBadges[0].getAttribute('aria-pressed')).toBe('true');
+
+    // Click again to clear the filter
+    spy.mockClear();
+    await act(async () => {
+      fireEvent.click(refreshedBadges[0]);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(spy).toHaveBeenCalledWith(
+      'proj-1',
+      expect.objectContaining({ case_pattern: undefined, page: 0 }),
+      expect.any(AbortSignal),
+    );
+  });
+
+  test('case-pattern badge bar is hidden when no edge_case_counts present', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    // No edge_case_counts in the response → badge bar should not render.
+    spy.mockResolvedValue({
+      items: MOCK_ITEMS,
+      total: 2,
+      task_types: ['create', 'fix'],
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(screen.queryByTestId('sr-unhandled-edges-case-pattern-badges')).toBeNull();
   });
 
   test('filtered-empty state shows filter-aware message, not all-clear', async () => {
@@ -538,6 +644,52 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     expect(emptyEl.textContent).toContain('No unhandled edges for type');
   });
 
+  test('filtered-empty state shows "matching <pattern>" when a case-pattern badge is active', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    // First load surfaces a badge; clicking it returns an empty filtered result.
+    spy
+      .mockResolvedValueOnce({
+        items: MOCK_ITEMS,
+        total: 2,
+        task_types: ['create', 'fix'],
+        edge_case_counts: { 'concurrent writes race': 3, 'empty list hook': 2 },
+      })
+      .mockResolvedValue({ items: [], total: 0, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const badgeBar = screen.getByTestId('sr-unhandled-edges-case-pattern-badges');
+    const firstBadge = badgeBar.querySelectorAll('button')[0];
+    await act(async () => {
+      fireEvent.click(firstBadge);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const emptyEl = screen.getByTestId('sr-unhandled-edges-empty');
+    expect(emptyEl).toBeTruthy();
+    expect(emptyEl.textContent).toContain('No unhandled edges matching "concurrent writes race"');
+  });
+
   test('shows amber banner when health status is stale', async () => {
     const api = await import('../api');
     (api.fetchSrCatchRateHealth as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -573,7 +725,7 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
   });
 
   test('initial render reads sru_ URL params and passes them to fetchSrUnhandledEdgesRetrospectives', async () => {
-    window.history.replaceState({}, '', '/?sru_days=30&sru_blind_spot=race&sru_task_type=create&sru_page=2');
+    window.history.replaceState({}, '', '/?sru_days=30&sru_blind_spot=race&sru_case_pattern=retry&sru_task_type=create&sru_page=2');
 
     const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
     const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
@@ -598,10 +750,10 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    // URL page 2 → API page 1 (backend is 0-indexed); URL days=30 honored; blind_spot/task_type honored
+    // URL page 2 → API page 1 (backend is 0-indexed); URL days=30 honored; blind_spot/case_pattern/task_type honored
     expect(spy).toHaveBeenCalledWith(
       'proj-1',
-      expect.objectContaining({ days: 30, blind_spot: 'race', task_type: 'create', page: 1 }),
+      expect.objectContaining({ days: 30, blind_spot: 'race', case_pattern: 'retry', task_type: 'create', page: 1 }),
       expect.any(AbortSignal),
     );
   });
@@ -642,7 +794,7 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
   });
 
   test('switching projects clears sru_ filter state (no leakage across projects)', async () => {
-    window.history.replaceState({}, '', '/?sru_days=30&sru_blind_spot=race&sru_page=3');
+    window.history.replaceState({}, '', '/?sru_days=30&sru_blind_spot=race&sru_case_pattern=retry&sru_page=3');
 
     const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
     const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
@@ -682,10 +834,10 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    // After project switch: days back to 14, no blind_spot filter, page 0 (UI page 1)
+    // After project switch: days back to 14, no blind_spot/case_pattern filters, page 0 (UI page 1)
     expect(spy).toHaveBeenCalledWith(
       'proj-2',
-      expect.objectContaining({ days: 14, blind_spot: undefined, page: 0 }),
+      expect.objectContaining({ days: 14, blind_spot: undefined, case_pattern: undefined, page: 0 }),
       expect.any(AbortSignal),
     );
 
@@ -693,6 +845,7 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     const params = new URLSearchParams(window.location.search);
     expect(params.get('sru_days')).toBeNull();
     expect(params.get('sru_blind_spot')).toBeNull();
+    expect(params.get('sru_case_pattern')).toBeNull();
     expect(params.get('sru_page')).toBeNull();
   });
 

@@ -9,7 +9,7 @@ import {
   Minus,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchTask, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse } from '../api';
+import { apiFetch, fetchTask, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec } from '../utils/time';
@@ -30,7 +30,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrMissedRetrospective, SrReviewerDisagreementsPanel, DirectionSrBreakdownPanel, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrMissedRetrospective, SrReviewerDisagreementsPanel, DirectionSrBreakdownPanel, type SrMissedTask, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { SrUnhandledEdgesRetrospectivesPanel } from './SrUnhandledEdgesRetrospectivesPanel';
 import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
 import { RecurringPatternsSection } from './RecurringPatternsSection';
@@ -420,8 +420,12 @@ function PipelineEfficiencyPanel({ projectId }: { projectId: string | null }) {
 interface SrDiagnosticsStackProps {
   loading: boolean;
   selectedProjectId: string | null;
-  tasks: Task[];
-  onViewTask: (task: Task) => void;
+  /**
+   * Resolve and navigate to a task by id, fetching it when absent from the
+   * dashboard's in-memory task slice. Used by SR drill-throughs that may
+   * reference tasks outside the currently-loaded list.
+   */
+  onViewTaskById: (taskId: string) => void;
   onDirectionClick?: (directionId: string) => void;
   srRecentMisses: SrMissedTask[] | null;
   srRecentMissesTotal: number;
@@ -429,16 +433,16 @@ interface SrDiagnosticsStackProps {
   blindSpots: BlindSpotsData | null;
   expandedBlindSpotThemes: Set<string>;
   onToggleBlindSpotTheme: (theme: string) => void;
-  srReviewerDisagreements: SrReviewerDisagreementsData | null;
+  srReviewerDisagreements: SrReviewerDisagreementsEnvelope | null;
   directionSrBreakdown: DirectionSrBreakdownData | null;
+  srTrends?: SrTrendWithFixIterations | null;
   fingerprintAnalytics: PromptFingerprintAnalyticsResponse | null;
 }
 
 function SrDiagnosticsStack({
   loading,
   selectedProjectId,
-  tasks,
-  onViewTask,
+  onViewTaskById,
   onDirectionClick,
   srRecentMisses,
   srRecentMissesTotal,
@@ -448,6 +452,7 @@ function SrDiagnosticsStack({
   onToggleBlindSpotTheme,
   srReviewerDisagreements,
   directionSrBreakdown,
+  srTrends,
   fingerprintAnalytics,
 }: SrDiagnosticsStackProps) {
   return (
@@ -462,10 +467,7 @@ function SrDiagnosticsStack({
           <SrMissedRetrospective
             tasks={srRecentMisses}
             selectedCategory={selectedSrCategory}
-            onTaskClick={(taskId) => {
-              const task = tasks.find(t => t.id === taskId);
-              if (task) onViewTask(task);
-            }}
+            onTaskClick={onViewTaskById}
           />
         </section>
       )}
@@ -473,10 +475,7 @@ function SrDiagnosticsStack({
       {/* SR Unhandled Edges */}
       <SrUnhandledEdgesRetrospectivesPanel
         selectedProjectId={selectedProjectId}
-        onSelectTask={(taskId) => {
-          const task = tasks.find(t => t.id === taskId);
-          if (task) onViewTask(task);
-        }}
+        onSelectTask={onViewTaskById}
       />
 
       {/* SR Blind Spots aggregation */}
@@ -489,16 +488,6 @@ function SrDiagnosticsStack({
           <div className="flex flex-wrap gap-2">
             {blindSpots.themes.slice(0, 8).map((t, i) => {
               const isExpanded = expandedBlindSpotThemes.has(t.theme);
-              const handleViewExample = (taskId: string) => {
-                const task = tasks.find(tk => tk.id === taskId);
-                if (task) {
-                  onViewTask(task);
-                } else {
-                  fetchTask(taskId).then(onViewTask).catch(() => {
-                    console.error(`Failed to fetch task ${taskId}`);
-                  });
-                }
-              };
               return (
                 <div key={i} className="flex flex-col gap-0.5 min-w-0">
                   <button
@@ -515,7 +504,7 @@ function SrDiagnosticsStack({
                         <div key={exIdx} className="text-[9px] text-neutral-300">
                           <span className="text-neutral-500 block mb-0.5">{ex.text}</span>
                           <button
-                            onClick={() => handleViewExample(ex.task_id)}
+                            onClick={() => onViewTaskById(ex.task_id)}
                             className="text-violet-400 hover:text-violet-300 cursor-pointer underline"
                           >
                             View task
@@ -551,14 +540,15 @@ function SrDiagnosticsStack({
         <section>
           <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
             SR ↔ Reviewer Disagreements
-            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {srReviewerDisagreements.total_entries} categor{srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}</span>
+            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {
+              srReviewerDisagreements.total_distinct_categories !== undefined
+                ? `top ${srReviewerDisagreements.returned_entries ?? srReviewerDisagreements.disagreements.length} of ${srReviewerDisagreements.total_distinct_categories} categor${srReviewerDisagreements.total_distinct_categories !== 1 ? 'ies' : 'y'}`
+                : `${srReviewerDisagreements.total_entries} categor${srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}`
+            }</span>
           </p>
           <SrReviewerDisagreementsPanel
             data={srReviewerDisagreements}
-            onSelectTask={(taskId) => {
-              const task = tasks.find(t => t.id === taskId);
-              if (task) onViewTask(task);
-            }}
+            onSelectTask={onViewTaskById}
           />
         </section>
       )}
@@ -575,6 +565,7 @@ function SrDiagnosticsStack({
           <DirectionSrBreakdownPanel
             entries={directionSrBreakdown.directions}
             onDirectionClick={onDirectionClick}
+            trends={srTrends ?? undefined}
           />
         </section>
       )}
@@ -885,7 +876,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [expandedBlindSpotThemes, setExpandedBlindSpotThemes] = useState<Set<string>>(new Set());
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
-  const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
+  const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsEnvelope | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1391,10 +1382,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               <FixLoopConvergenceWidget
                 trendDays={fixLoopTrendDays}
                 projectId={selectedProjectId ?? undefined}
-                onViewTask={(taskId: string) => {
-                  const task = tasks.find(t => t.id === taskId);
-                  if (task) onViewTask(task);
-                }}
+                onViewTask={handleViewTaskById}
               />
             </div>
           )}
@@ -1433,6 +1421,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             selectedProjectId={selectedProjectId}
             tasks={tasks}
             onViewTask={onViewTask}
+            onViewTaskById={handleViewTaskById}
             srCatchRateTargets={srCatchRateTargets}
             onCategoryClick={handleCategoryClick}
             onScopeClick={handleScopeClick}
@@ -1444,8 +1433,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           <SrDiagnosticsStack
             loading={loading}
             selectedProjectId={selectedProjectId}
-            tasks={tasks}
-            onViewTask={onViewTask}
+            onViewTaskById={handleViewTaskById}
             onDirectionClick={onDirectionClick}
             srRecentMisses={srRecentMisses}
             srRecentMissesTotal={srRecentMissesTotal}
@@ -1455,6 +1443,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             onToggleBlindSpotTheme={handleToggleBlindSpotTheme}
             srReviewerDisagreements={srReviewerDisagreements}
             directionSrBreakdown={directionSrBreakdown}
+            srTrends={digest?.self_review_prediction_accuracy_trends}
             fingerprintAnalytics={fingerprintAnalytics}
           />
 

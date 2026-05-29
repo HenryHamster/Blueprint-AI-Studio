@@ -993,9 +993,17 @@ export interface DirectionSrEntry {
 export function DirectionSrBreakdownPanel({
   entries,
   onDirectionClick,
+  trends,
 }: {
   entries: DirectionSrEntry[];
   onDirectionClick?: (directionId: string) => void;
+  /**
+   * Snapshot-level freshness signals from the parent SR trend snapshot. The
+   * freshness applies to the whole snapshot (not per-direction), so it is
+   * passed through from DashboardHome. When absent, no badge renders — keeping
+   * existing two-argument call sites and tests unchanged.
+   */
+  trends?: Pick<SrTrendData, 'is_stale' | 'data_sufficient' | 'last_sufficient_computed_at' | 'computed_at'>;
 }) {
   const sorted = [...entries].sort(
     (a, b) => (a.overall_catch_rate ?? 1) - (b.overall_catch_rate ?? 1),
@@ -1003,6 +1011,32 @@ export function DirectionSrBreakdownPanel({
   if (sorted.length === 0) return null;
   return (
     <div data-testid="direction-sr-breakdown-panel" className="flex flex-col gap-1.5">
+      {(trends?.is_stale || trends?.data_sufficient === false) && (
+        <div className="flex flex-wrap items-center gap-2">
+          {trends?.is_stale && (
+            <span
+              data-testid="sr-trend-stale-badge"
+              className="text-[9px] text-amber-400 font-mono"
+              title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}. Numbers may not reflect current production.`}
+            >
+              stale · as of {trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : '?'}
+            </span>
+          )}
+          {trends?.data_sufficient === false && (() => {
+            const lastRealAt = trends.last_sufficient_computed_at ?? trends.computed_at;
+            const lastRealDate = lastRealAt ? new Date(lastRealAt).toLocaleDateString() : '?';
+            return (
+              <span
+                data-testid="sr-trend-insufficient-badge"
+                className="text-[9px] text-amber-500 font-mono"
+                title="Most recent measurement windows had insufficient reviewer-finding data — displayed numbers are frozen and may not reflect current production."
+              >
+                frozen · last real data {lastRealDate}
+              </span>
+            );
+          })()}
+        </div>
+      )}
       {sorted.map(d => {
         const rate = d.overall_catch_rate;
         const rateColor =

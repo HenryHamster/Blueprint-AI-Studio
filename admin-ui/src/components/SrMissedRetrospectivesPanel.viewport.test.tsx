@@ -841,4 +841,105 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
 
     expect(screen.queryByTestId('sr-health-banner')).toBeNull();
   });
+
+  test('selecting a minimum severity issues min_severity param and excludes lower-severity tasks', async () => {
+    const { fetchSrMissedRetrospectives } = await import('../api');
+    const spy = fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    // First fetch: both tasks (HIGH correctness + CRITICAL performance).
+    // Second fetch (after selecting CRITICAL): server returns only the CRITICAL task.
+    spy
+      .mockResolvedValueOnce({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] })
+      .mockResolvedValueOnce({ items: [MOCK_ITEMS[1]], total: 1, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel selectedProjectId="proj-1" onSelectTask={() => {}} />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Both tasks visible initially
+    expect(screen.getByText('feat: add OAuth2 PKCE flow with refresh token rotation and session expiry')).toBeTruthy();
+    expect(screen.getByText('fix: resolve connection pool exhaustion under high concurrent load scenarios')).toBeTruthy();
+
+    const severitySelect = screen.getByRole('combobox', { name: /filter by minimum severity/i });
+    await act(async () => {
+      fireEvent.change(severitySelect, { target: { value: 'CRITICAL' } });
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Request must carry the min_severity param
+    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ min_severity: 'CRITICAL' }), expect.any(AbortSignal));
+    // The HIGH-only task must no longer render; only the CRITICAL task remains
+    expect(screen.queryByText('feat: add OAuth2 PKCE flow with refresh token rotation and session expiry')).toBeNull();
+    expect(screen.getByText('fix: resolve connection pool exhaustion under high concurrent load scenarios')).toBeTruthy();
+  });
+
+  test('shows co-occurrence clarification "missed alongside" when category filter is active', async () => {
+    const { fetchSrMissedRetrospectives } = await import('../api');
+    const spy = fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    spy.mockResolvedValue({
+      items: MOCK_ITEMS,
+      total: 2,
+      task_types: ['create', 'fix'],
+      category_counts: { correctness: 3, 'error-handling': 1, performance: 2 },
+    });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    // Initially render with no filter
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Clarification should NOT appear when no filter is active
+    expect(screen.queryByText(/missed alongside/)).toBeNull();
+
+    // Apply a category filter
+    const categorySelect = screen.getByRole('combobox', { name: /filter by category/i });
+    await act(async () => {
+      fireEvent.change(categorySelect, { target: { value: 'correctness' } });
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Clarification should appear when filter is active
+    expect(screen.getByText('missed alongside correctness')).toBeTruthy();
+
+    // Clear the filter
+    await act(async () => {
+      fireEvent.change(categorySelect, { target: { value: '' } });
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Clarification should disappear when filter is cleared
+    expect(screen.queryByText(/missed alongside/)).toBeNull();
+  });
 });

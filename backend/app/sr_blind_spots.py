@@ -1152,6 +1152,58 @@ def count_reviewer_disagreements_in_tasks(tasks) -> Dict[tuple, int]:
     return {key: bucket["miss"] for key, bucket in counts.items() if bucket["miss"] > 0}
 
 
+def _format_reviewer_disagreement_entry(
+    cat: str, ttype: str, bucket: dict
+) -> Dict[str, Any]:
+    """Shape a single (category, task_type) disagreement bucket into the
+    response entry used by both the bare-list and envelope aggregators."""
+    return {
+        "category": cat,
+        "task_type": ttype,
+        "count": bucket["miss"],
+        "severity_breakdown": dict(bucket["severity"]),
+        "max_severity": _max_severity(bucket["severity"]),
+        "false_positive_count": bucket["fp"],
+        "true_positive_count": bucket["tp"],
+        "false_positive_rate": round(bucket["fp"] / (bucket["fp"] + bucket["tp"]), 3)
+        if (bucket["fp"] + bucket["tp"]) > 0
+        else None,
+        "examples": bucket["examples"],
+    }
+
+
+def _shape_reviewer_disagreement_envelope(
+    direction_counts: Dict[tuple, dict],
+    *,
+    days: int,
+    limit: int,
+) -> Dict[str, Any]:
+    """Build the reviewer-disagreement envelope from pre-counted directions.
+
+    ``total_distinct_categories`` is the number of distinct (category,
+    task_type) disagreements in the window with at least one miss — computed
+    over the FULL matched set, independent of the ``limit`` truncation applied
+    to the returned ``disagreements`` list. This mirrors
+    ``aggregate_sr_blind_spot_envelope``'s ``total_distinct_themes`` so the
+    operator surface can honestly show e.g. 'top 20 of 35' rather than
+    presenting the page size as if it were the true total.
+
+    Factored out (sync, no DB) so the truncation/total contract is unit-testable
+    without a session.
+    """
+    nonzero = [item for item in direction_counts.items() if item[1]["miss"] > 0]
+    top = sorted(nonzero, key=lambda x: -x[1]["miss"])[:limit]
+    return {
+        "window_days": days,
+        "total_distinct_categories": len(nonzero),
+        "returned_entries": len(top),
+        "disagreements": [
+            _format_reviewer_disagreement_entry(cat, ttype, bucket)
+            for (cat, ttype), bucket in top
+        ],
+    }
+
+
 async def aggregate_sr_reviewer_disagreements(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1191,20 +1243,45 @@ async def aggregate_sr_reviewer_disagreements(
         if item[1]["miss"] > 0
     ][:limit]
     return [
-        {
-            "category": cat,
-            "task_type": ttype,
-            "count": bucket["miss"],
-            "severity_breakdown": dict(bucket["severity"]),
-            "max_severity": _max_severity(bucket["severity"]),
-            "false_positive_count": bucket["fp"],
-            "true_positive_count": bucket["tp"],
-            "false_positive_rate": round(
-                bucket["fp"] / (bucket["fp"] + bucket["tp"]), 3
-            )
-            if (bucket["fp"] + bucket["tp"]) > 0
-            else None,
-            "examples": bucket["examples"],
-        }
+        _format_reviewer_disagreement_entry(cat, ttype, bucket)
         for (cat, ttype), bucket in top
     ]
+
+
+async def aggregate_sr_reviewer_disagreements_envelope(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    days: int,
+    limit: int,
+) -> Dict[str, Any]:
+    """Same data as :func:`aggregate_sr_reviewer_disagreements` but wrapped in
+    an envelope that reports the TRUE number of distinct disagreement
+    categories in the window, independent of the truncated/returned slice.
+
+    The bare-list helper truncates to ``limit`` and the endpoint historically
+    reported ``len(returned)`` as the total — understating reality when more
+    distinct (category, task_type) disagreements exist than the page limit.
+    This envelope exposes ``total_distinct_categories`` over the full matched
+    set so the operator surface cannot silently present the page size as the
+    true total.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(load_only(Task.id, Task.context, Task.payloads, Task.created_at))
+        .order_by(Task.created_at.desc())
+        .limit(_TASK_SCAN_CAP)
+    )
+    result = await session.execute(stmt)
+    all_tasks = result.scalars().all()
+
+    direction_counts = _count_reviewer_disagreement_directions(all_tasks)
+    return _shape_reviewer_disagreement_envelope(
+        direction_counts, days=days, limit=limit
+    )
