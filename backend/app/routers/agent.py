@@ -1065,6 +1065,22 @@ async def claim_task(
         await session.commit()
         await session.refresh(task)
 
+    # Snapshot the claim-time scalars used while building the rest of the
+    # response. The best-effort enrichment below (SR-trend analytics, review
+    # effectiveness) shares this session; a DB error in any of it aborts the
+    # transaction, and the next commit then does an internal rollback that
+    # EXPIRES ``task``. After that a plain ``task.<attr>`` read does a sync
+    # lazy-load with no greenlet -> MissingGreenlet (or PendingRollbackError on
+    # the still-aborted txn) and 500s a claim that was already committed above.
+    # These values are immutable for the life of the claim, so reading them
+    # from locals keeps response building independent of the session's
+    # post-enrichment state. (incident 2026-05-29: claim 500s at agent.py:2243
+    # reading task.context after an enrichment failure expired the instance.)
+    _claimed_task_id = task.id
+    _claimed_project_id = task.project_id
+    _claimed_context = dict(task.context or {})
+    _claimed_first_payload = task.first_payload
+
     # Broadcast status change to frontend
     await broadcast_to_project(
         str(task.project_id),
@@ -1896,46 +1912,39 @@ async def claim_task(
     }
 
     # Inject playbook for ALL task types (outside the project_context gate).
-    # Defense-in-depth: the best-effort enrichment above (SR-trend analytics,
-    # review effectiveness) runs on this same session and can abort its
-    # transaction if a future load_only deferral re-introduces a lazy-load
-    # (MissingGreenlet) — its per-call handlers swallow the error but leave the
-    # session in a failed-transaction state. The claim itself was already
-    # committed far above, so a poisoned session here must NOT 500 the claim:
-    # roll back and re-read. Without this guard a single non-critical analytics
-    # failure cascades into a PendingRollbackError that fails the whole claim
-    # (incident 2026-05-29, agent.py:1889).
+    # First, recover the shared session once, centrally. The best-effort
+    # enrichment above (SR-trend analytics, review effectiveness) runs on this
+    # same session; a DB error in any of it aborts the transaction, and the
+    # subsequent commit then does an internal rollback that EXPIRES ``task``,
+    # after which any plain ``task.<attr>`` read below does a sync lazy-load
+    # with no greenlet (MissingGreenlet) or raises PendingRollbackError on the
+    # still-aborted txn — 500ing a claim that was already committed far above.
+    # Roll back any residual transaction (the claim's own write is long since
+    # committed, so nothing is lost) and re-attach the durable task + project by
+    # PK so the guarded writes below (playbook ref-counts, _shown_playbook_keys)
+    # operate on clean, non-expired instances. If recovery itself fails we
+    # degrade gracefully: every UNGUARDED downstream read uses the ``_claimed_*``
+    # snapshots rather than ``task.*``, so a still-broken session here can no
+    # longer 500 the (committed) claim. (incident 2026-05-29: claim 500s at
+    # agent.py:2243 reading task.context after an enrichment failure.)
     try:
-        project_for_playbook = await session.get(Project, task.project_id)
-    except Exception:  # noqa: BLE001
-        # Any best-effort enrichment above (SR-trend analytics, review
-        # effectiveness) can abort this session — most often an SR-trend query
-        # hitting the 120s statement_timeout (incident 2026-05-29), but also
-        # PendingRollbackError / InFailedSQLTransactionError. The claim was
-        # already committed far above, so this MUST NOT 500: roll back and
-        # re-read; if even the re-read fails, proceed without the playbook.
-        logger.warning(
-            "[AGENT] claim_task session aborted by best-effort enrichment — "
-            "rolling back and re-reading project for playbook (claim already "
-            "committed)"
+        await session.rollback()
+        task = await session.get(Task, _claimed_task_id) or task
+        project_for_playbook = await session.get(Project, _claimed_project_id)
+    except Exception:
+        logger.exception(
+            "[AGENT] claim_task post-enrichment session recovery failed — "
+            "proceeding with degraded response (claim already committed)"
         )
         project_for_playbook = None
-        try:
-            await session.rollback()
-            project_for_playbook = await session.get(Project, task.project_id)
-        except Exception:  # noqa: BLE001
-            logger.exception(
-                "[AGENT] playbook project re-read failed after rollback — "
-                "proceeding without playbook (claim already committed)"
-            )
     if project_for_playbook and project_for_playbook.design_doc:
-        task_type = (task.first_payload).get("type", "create")
+        task_type = (_claimed_first_payload or {}).get("type", "create")
         playbook_entries = {}
         _playbook_candidates = []
-        _task_direction_id = str((task.context or {}).get("direction_id") or "")
+        _task_direction_id = str(_claimed_context.get("direction_id") or "")
         _task_related_files = {
             str(f)
-            for f in ((task.context or {}).get("related_files") or [])
+            for f in (_claimed_context.get("related_files") or [])
             if isinstance(f, str) and f
         }
         _file_to_system_raw = (project_for_playbook.design_doc or {}).get(
@@ -1949,7 +1958,7 @@ async def claim_task(
             for f in _task_related_files
             if isinstance(_file_to_system.get(f), str) and _file_to_system.get(f)
         }
-        _my_task_id = str(task.id)
+        _my_task_id = str(_claimed_task_id)
         for k, v in (project_for_playbook.design_doc or {}).items():
             if k.startswith("playbook/") and isinstance(v, dict):
                 # Anti-poisoning: skip entries that are pending writes from
@@ -2147,7 +2156,7 @@ async def claim_task(
                 "Playbook capped to %d/%d entries for task %s (type=%s)",
                 len(_capped_candidates),
                 len(_playbook_candidates),
-                task.id,
+                _claimed_task_id,
                 task_type,
             )
         total_playbook_count = sum(
@@ -2164,7 +2173,7 @@ async def claim_task(
                 from app.task_locking import project_lock as _pb_project_lock
 
                 async with _pb_project_lock(
-                    session, task.project_id, skip_locked=True
+                    session, _claimed_project_id, skip_locked=True
                 ) as _pb_proj:
                     if _pb_proj is not None:
                         doc = dict(_pb_proj.design_doc or {})
@@ -2240,7 +2249,7 @@ async def claim_task(
                 )
 
     # Inject direction quality signal when total PRs >= 3 (reuse project already loaded above)
-    direction_id = (task.context or {}).get("direction_id")
+    direction_id = _claimed_context.get("direction_id")
     if direction_id and project_for_playbook:
         direction = next(
             (
@@ -2276,7 +2285,7 @@ async def claim_task(
                 rejected_stmt = (
                     select(Task)
                     .where(
-                        Task.project_id == task.project_id,
+                        Task.project_id == _claimed_project_id,
                         Task.context["direction_id"].as_string() == str(direction_id),
                         Task.context["pr_rejected"].as_string() == "true",
                     )
@@ -2403,8 +2412,8 @@ async def claim_task(
                 prior_stmt = (
                     select(Task)
                     .where(
-                        Task.project_id == task.project_id,
-                        Task.id != task.id,
+                        Task.project_id == _claimed_project_id,
+                        Task.id != _claimed_task_id,
                         Task.context["direction_id"].as_string() == str(direction_id),
                         Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
                         Task.created_at >= prior_analysis_cutoff,
@@ -2547,8 +2556,8 @@ async def claim_task(
                 success_stmt = (
                     select(Task)
                     .where(
-                        Task.project_id == task.project_id,
-                        Task.id != task.id,
+                        Task.project_id == _claimed_project_id,
+                        Task.id != _claimed_task_id,
                         Task.context["direction_id"].as_string() == str(direction_id),
                         Task.status == TaskStatus.COMPLETED,
                         Task.created_at >= prior_analysis_cutoff,
@@ -2856,7 +2865,7 @@ async def claim_task(
                 )
 
                 failure_hotspots = summarize_failure_hotspots(
-                    direction, task.project_id
+                    direction, _claimed_project_id
                 )
                 if failure_hotspots:
                     response["direction_context"]["failure_hotspots"] = failure_hotspots
@@ -2868,7 +2877,7 @@ async def claim_task(
 
     # Inject co-change affinity context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
-        related_files = (task.context or {}).get("related_files", [])
+        related_files = _claimed_context.get("related_files", [])
         if related_files:
             cochange_index = (project_for_playbook.design_doc or {}).get(
                 "cochange_index"
@@ -2897,7 +2906,7 @@ async def claim_task(
     # files into independent ones. Only pairs where both files are in the
     # finding's related_files and score >= 1.0 are surfaced.
     if task_type == "plan" and project_for_playbook:
-        plan_related_files = (task.context or {}).get("related_files", [])
+        plan_related_files = _claimed_context.get("related_files", [])
         if plan_related_files:
             cochange_index = (project_for_playbook.design_doc or {}).get(
                 "cochange_index"
@@ -2945,7 +2954,7 @@ async def claim_task(
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         module_feedback = (project_for_playbook.design_doc or {}).get("module_feedback")
         if module_feedback:
-            task_related_files = (task.context or {}).get("related_files", [])
+            task_related_files = _claimed_context.get("related_files", [])
             module_warnings = []
             for file_path in task_related_files:
                 profile = module_feedback.get(file_path)
@@ -3055,7 +3064,7 @@ async def claim_task(
                     )
 
                 by_direction = sr_trends.get("by_direction") or {}
-                task_direction_id = (task.context or {}).get("direction_id")
+                task_direction_id = _claimed_context.get("direction_id")
                 if (
                     task_direction_id
                     and isinstance(by_direction, dict)
@@ -3217,7 +3226,7 @@ async def claim_task(
             )
             if _miss_trends and isinstance(_miss_trends.get("categories"), dict):
                 # Resolve candidate categories: prefer direction-scoped when available.
-                _direction_id = (task.context or {}).get("direction_id")
+                _direction_id = _claimed_context.get("direction_id")
                 _candidate_cats: dict | None = None
                 if _direction_id:
                     _dir_entry = (_miss_trends.get("by_direction") or {}).get(
@@ -3287,7 +3296,7 @@ async def claim_task(
             file_to_system_raw if isinstance(file_to_system_raw, dict) else {}
         )
         if file_to_system:
-            arch_related_files = (task.context or {}).get("related_files", [])
+            arch_related_files = _claimed_context.get("related_files", [])
             seen_systems: dict[str, dict] = {}
             for rf in arch_related_files:
                 sys_name = file_to_system.get(rf)
@@ -3381,13 +3390,13 @@ async def claim_task(
     # Fire-and-forget: create an in_progress Check Run for review tasks so the
     # Checks tab shows the review is underway.  Must not block the claim response.
     if task_type == "review":
-        _pr_number = task.first_payload.get("pr_number")
+        _pr_number = (_claimed_first_payload or {}).get("pr_number")
         if _pr_number and project_for_playbook:
             _check_run_name = (project_for_playbook.build_config or {}).get(
                 "check_run_name", "Blueprint Code Review"
             )
             _check_run_fut = asyncio.ensure_future(
-                _create_review_check_run_bg(task.id, _pr_number, _check_run_name)
+                _create_review_check_run_bg(_claimed_task_id, _pr_number, _check_run_name)
             )
             _bg_tasks.add(_check_run_fut)
             _check_run_fut.add_done_callback(_bg_tasks.discard)

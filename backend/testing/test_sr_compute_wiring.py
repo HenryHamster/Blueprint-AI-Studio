@@ -392,3 +392,80 @@ async def test_claim_survives_sr_trend_session_poisoning(
         "claim must survive a poisoned best-effort enrichment session, got "
         f"{resp.status_code}: {resp.text[:300]}"
     )
+
+
+@pytest.mark.skipif(
+    os.getenv("USE_TEST_POSTGRES", "").lower() != "true",
+    reason="transaction-abort poisoning is PostgreSQL-specific (SQLite tolerates "
+    "a failed statement without aborting the surrounding transaction)",
+)
+@pytest.mark.asyncio
+async def test_claim_survives_enrichment_poisoning_that_expires_task(
+    client: AsyncClient, db_session
+):
+    """Regression (incident 2026-05-29, round 2): when a best-effort enrichment
+    call aborts the claim session, the *subsequent* commit does an internal
+    rollback that EXPIRES the ``task`` ORM instance. Every later UNGUARDED
+    ``task.<attr>`` read — e.g. ``task.context`` at the direction-signal block
+    (agent.py:2243) — then does a sync lazy-load with no greenlet ->
+    MissingGreenlet (or PendingRollbackError on the still-aborted txn) and 500s
+    the claim, even though the claim was already committed. This is distinct
+    from the statement_timeout root cause fixed earlier: in prod ~5 claim 500s /
+    15 min persisted on rev 00245 *after* statement_timeout went to zero, all
+    tracing to ``task.context`` lazy-loads.
+
+    The fix snapshots the immutable claim-time scalars (``_claimed_*``),
+    re-attaches the task after enrichment, and reads from the snapshots in all
+    unguarded downstream code. This test poisons the FIRST enrichment call so
+    the abort + expire lands before the direction block, and gives the task a
+    ``direction_id`` so that block actually executes and dereferences the task.
+    Pre-fix this returns 500; post-fix it must return a well-formed 200.
+    """
+    from sqlalchemy import text
+
+    project = Project(name="Poison Project Expire", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "description": "test"}],
+        context={
+            "direction_id": "test-dir-expire",
+            "related_files": ["a.py"],
+        },
+        vm_instance_id="test-vm-expire",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    from app.auth import create_agent_token
+
+    token = create_agent_token(str(task.id), "test-vm-expire")
+    headers = {"x-agent-token": token}
+
+    async def _poison(**kwargs):
+        # Abort the claim session's transaction on the FIRST best-effort
+        # enrichment call (compute_review_effectiveness, agent.py ~1740),
+        # reproducing the aborted-transaction state a DB error (lock/statement
+        # timeout) leaves. The subsequent commit then expires ``task``, exposing
+        # every unguarded ``task.*`` read further down claim_task.
+        await kwargs["session"].execute(
+            text("SELECT * FROM _no_such_table_enrichment_expire_poison")
+        )
+
+    with patch(
+        "app.review_learning.compute_review_effectiveness", new=_poison
+    ):
+        resp = await client.post("/api/agent/claim", headers=headers)
+
+    assert resp.status_code == 200, (
+        "claim must survive enrichment that aborts+expires the session, got "
+        f"{resp.status_code}: {resp.text[:400]}"
+    )
+    body = resp.json()
+    assert body.get("task_id") == str(task.id), (
+        f"claim response must be well-formed after session recovery, got {body}"
+    )
