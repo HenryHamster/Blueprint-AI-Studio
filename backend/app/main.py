@@ -1764,14 +1764,10 @@ async def health_check():
     # spiralling into a Cloud Run restart loop that froze the whole pipeline
     # (incident 2026-05-28). Now only a genuinely wedged worker — no heartbeat
     # for ORCHESTRATOR_HANG_SECONDS — is reported unhealthy (→ liveness restart).
-    last_progress = _orch._orchestrator_last_progress or _orch._orchestrator_last_cycle
-    progress_age = (
-        (_utcnow() - last_progress).total_seconds() if last_progress else None
-    )
-    orchestrator_alive = last_progress is not None
-    orchestrator_healthy = orchestrator_alive and (
-        progress_age is not None and progress_age < _orch.ORCHESTRATOR_HANG_SECONDS
-    )
+    liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
+    orchestrator_alive = liveness.alive
+    orchestrator_healthy = liveness.healthy
+    progress_age = liveness.progress_age
 
     # cycle_age = time since the last *completed* cycle. Still surfaced and used
     # as a soft "slow cycle" degraded signal for alerting, but it no longer

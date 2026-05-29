@@ -96,6 +96,84 @@ class TestMarkProgress:
         assert age < 5
 
 
+class TestWatchdogLiveness:
+    """In-process background-task watchdog coverage.
+
+    The watchdog in ``lifecycle.py`` cancels-and-restarts the orchestrator
+    purely on ``evaluate_orchestrator_liveness(...).stalled``. Before the
+    cluster-1 fix it judged liveness on full-cycle *completion* against a
+    hardcoded 120s threshold while ``/health`` used the progress heartbeat —
+    the two drifted and the watchdog killed healthy-but-slow cycles in a
+    restart loop (incident 2026-05-28). These pin the watchdog and ``/health``
+    to the SAME shared predicate so they can never disagree again.
+    """
+
+    def test_slow_but_progressing_cycle_is_not_stalled(self, restore_orch_state):
+        """A cycle running far longer than any cycle-completion threshold but
+        still heartbeating (fresh progress, stale cycle-completion timestamp)
+        must NOT be cancelled by the watchdog."""
+        now = _utcnow()
+        # Cycle completion is ancient — pre-fix this tripped the 120s watchdog.
+        _orch._orchestrator_last_cycle = now - timedelta(seconds=600)
+        _orch._orchestrator_cycle_started = now - timedelta(seconds=400)
+        # ...but progress is fresh, so the orchestrator is healthy and alive.
+        _orch._orchestrator_last_progress = now - timedelta(seconds=2)
+
+        liveness = _orch.evaluate_orchestrator_liveness(now)
+        assert liveness.stalled is False
+        assert liveness.healthy is True
+        assert liveness.alive is True
+
+    def test_no_progress_past_threshold_is_stalled(self, restore_orch_state):
+        """An orchestrator that has emitted no progress for longer than the
+        hang threshold IS cancelled, preserving genuine-hang recovery."""
+        now = _utcnow()
+        stale = now - timedelta(seconds=_orch.ORCHESTRATOR_HANG_SECONDS + 30)
+        _orch._orchestrator_last_progress = stale
+        _orch._orchestrator_last_cycle = stale
+        _orch._orchestrator_cycle_started = stale
+
+        liveness = _orch.evaluate_orchestrator_liveness(now)
+        assert liveness.stalled is True
+        assert liveness.healthy is False
+        assert liveness.reason
+
+    def test_startup_before_first_progress_is_not_stalled(self, restore_orch_state):
+        """Cold start inside the threshold window: nothing recorded yet (or a
+        cycle just started) must not be flagged as a hang to cancel."""
+        now = _utcnow()
+        _orch._orchestrator_last_progress = None
+        _orch._orchestrator_last_cycle = None
+        # Nothing has even started yet.
+        _orch._orchestrator_cycle_started = None
+        liveness = _orch.evaluate_orchestrator_liveness(now)
+        assert liveness.stalled is False
+        assert liveness.alive is False
+
+        # First cycle started but not yet past the threshold → still sane.
+        _orch._orchestrator_cycle_started = now - timedelta(
+            seconds=_orch.ORCHESTRATOR_HANG_SECONDS - 10
+        )
+        liveness = _orch.evaluate_orchestrator_liveness(now)
+        assert liveness.stalled is False
+
+    def test_first_cycle_started_but_never_progressed_is_stalled(
+        self, restore_orch_state
+    ):
+        """A first cycle that started but never emitted its first progress past
+        the threshold is a wedged startup the watchdog must recover."""
+        now = _utcnow()
+        _orch._orchestrator_last_progress = None
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = now - timedelta(
+            seconds=_orch.ORCHESTRATOR_HANG_SECONDS + 30
+        )
+
+        liveness = _orch.evaluate_orchestrator_liveness(now)
+        assert liveness.stalled is True
+        assert liveness.reason
+
+
 @pytest.mark.asyncio
 class TestHealthLiveness:
     async def test_slow_cycle_with_fresh_progress_is_healthy(

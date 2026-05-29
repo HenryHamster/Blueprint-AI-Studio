@@ -811,37 +811,27 @@ async def lifespan(app):
             try:
                 await asyncio.sleep(30)
                 # Liveness watchdog for orchestrator: task may be alive (not done())
-                # yet stuck inside a cycle — `t.done()` alone misses hangs. If
-                # `_orchestrator_last_cycle` hasn't advanced in ~120s while the task
-                # is still running, cancel so the normal restart path below kicks in.
+                # yet stuck inside a cycle — `t.done()` alone misses hangs. Judge
+                # liveness with the SAME shared predicate and threshold as the
+                # `/health` endpoint (`evaluate_orchestrator_liveness`), gated on
+                # the in-cycle progress *heartbeat* — not full-cycle completion.
+                # Gating on completion + a hardcoded short threshold previously
+                # killed healthy-but-slow cycles in a restart loop (incident
+                # 2026-05-28; /health was fixed in PR #6678 but this watchdog
+                # silently drifted). The single source of truth prevents re-drift.
                 try:
                     from app import orchestrator as _orch
 
                     orch_task = tasks.get("orchestrator")
                     if orch_task is not None and not orch_task.done():
-                        last = _orch._orchestrator_last_cycle
-                        started = _orch._orchestrator_cycle_started
-                        stall_threshold = 120.0
-                        now = _utcnow()
-                        stalled = False
-                        reason = ""
-                        if last is None and started is not None:
-                            age = (now - started).total_seconds()
-                            if age > stall_threshold:
-                                stalled = True
-                                reason = f"first cycle never completed (started {int(age)}s ago, no completion)"
-                        elif last is not None:
-                            age = (now - last).total_seconds()
-                            if age > stall_threshold:
-                                stalled = True
-                                reason = f"no cycle completion in {int(age)}s"
-                        if stalled:
+                        liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
+                        if liveness.stalled:
                             logger.error(
-                                f"[MONITOR] Orchestrator appears hung — {reason}. "
+                                f"[MONITOR] Orchestrator appears hung — {liveness.reason}. "
                                 f"Cancelling task so restart path re-spawns it."
                             )
                             cancel_reasons["orchestrator"] = (
-                                f"watchdog cancelled: {reason}"
+                                f"watchdog cancelled: {liveness.reason}"
                             )
                             orch_task.cancel()
                 except Exception as wd_exc:

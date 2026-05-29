@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, NamedTuple, Tuple
 
 from fastapi import HTTPException
 from sqlalchemy import func as _func
@@ -391,6 +391,78 @@ def _mark_orchestrator_progress() -> None:
     [[reference-orchestrator-liveness-deathspiral]] / incident 2026-05-28."""
     global _orchestrator_last_progress
     _orchestrator_last_progress = _utcnow()
+
+
+class OrchestratorLiveness(NamedTuple):
+    """Result of :func:`evaluate_orchestrator_liveness`.
+
+    - ``alive``:        a liveness signal (progress heartbeat or completed
+                        cycle) has been recorded at least once.
+    - ``healthy``:      ``alive`` AND the freshest signal is within
+                        ``ORCHESTRATOR_HANG_SECONDS`` (the ``/health`` verdict).
+    - ``stalled``:      the in-process watchdog should cancel-and-restart — a
+                        definite hang, including a first cycle that started but
+                        never made progress past the threshold.
+    - ``progress_age``: age in seconds of the freshest (progress|cycle) signal,
+                        or ``None`` if neither has been recorded yet.
+    - ``reason``:       human-readable cause when ``stalled`` (empty otherwise).
+    """
+
+    alive: bool
+    healthy: bool
+    stalled: bool
+    progress_age: float | None
+    reason: str
+
+
+def evaluate_orchestrator_liveness(
+    now: datetime | None = None,
+) -> "OrchestratorLiveness":
+    """Single source of truth for orchestrator liveness.
+
+    Shared by the HTTP ``/health`` endpoint and the in-process background-task
+    watchdog so the two judgments can never drift apart again. Liveness is gated
+    on the in-cycle progress *heartbeat* (``_orchestrator_last_progress``),
+    falling back to the last completed cycle (``_orchestrator_last_cycle``),
+    against ``ORCHESTRATOR_HANG_SECONDS``. A legitimately long-but-progressing
+    cycle is therefore healthy; only a worker that has emitted no progress for
+    longer than the threshold is hung.
+
+    Both call sites previously duplicated the signal + threshold logic — the
+    watchdog drifted to full-cycle-completion + a hardcoded 120s and started
+    killing healthy-but-slow cycles in a restart loop (incident 2026-05-28; only
+    ``/health`` was fixed in PR #6678). This helper is the de-duplicated fix.
+    """
+    if now is None:
+        now = _utcnow()
+
+    last = _orchestrator_last_progress or _orchestrator_last_cycle
+    if last is not None:
+        age = (now - last).total_seconds()
+        if age < ORCHESTRATOR_HANG_SECONDS:
+            return OrchestratorLiveness(True, True, False, age, "")
+        return OrchestratorLiveness(
+            True, False, True, age, f"no progress heartbeat in {int(age)}s"
+        )
+
+    # Cold start: no progress/cycle recorded yet. If a cycle has *started* but
+    # never reached its first heartbeat within the threshold, that is a wedged
+    # first cycle the watchdog must recover.
+    if _orchestrator_cycle_started is not None:
+        age = (now - _orchestrator_cycle_started).total_seconds()
+        if age >= ORCHESTRATOR_HANG_SECONDS:
+            return OrchestratorLiveness(
+                False,
+                False,
+                True,
+                None,
+                f"first cycle made no progress in {int(age)}s "
+                "(started, never heartbeat)",
+            )
+
+    # Nothing recorded yet, or still inside the startup window — not alive yet,
+    # but not a hang the watchdog should cancel.
+    return OrchestratorLiveness(False, False, False, None, "")
 
 
 def _resolve_ci_fix_branch(
