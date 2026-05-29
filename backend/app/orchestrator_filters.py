@@ -14,6 +14,7 @@ import logging
 import uuid
 from typing import Callable, Coroutine, Any
 
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.migration_path import is_migration_file
@@ -753,3 +754,134 @@ async def filter_pipeline_duplicates(
 
         survivors.append(eid)
     return survivors
+
+
+async def cap_pipeline_slots(
+    eligible_ids: list,
+    candidate_tasks: list[Task],
+    runtime_config: dict,
+    session,
+) -> list:
+    """Cap self-perpetuating review/fix chains to a configured slot budget.
+
+    Step 2.9 of the dispatch loop. review/fix chains are self-perpetuating
+    (review spawns fix spawns review, up to 16 iterations per PR), so without a
+    ceiling they can fill every VM slot and starve create/research tasks. Defer
+    (keep QUEUED) review/fix tasks once the configured pipeline budget — the
+    cap minus the count of already-active review/fix tasks — is exhausted.
+
+    The budget defaults to ``max(1, max_concurrent_vms // 2)`` when
+    ``runtime_config['max_pipeline_slots']`` is unset or non-numeric. Returns the
+    filtered ``eligible_ids`` with deferred review/fix ids removed in place.
+    """
+    max_pipeline_slots = runtime_config.get("max_pipeline_slots")
+    if max_pipeline_slots is None:
+        max_pipeline_slots = max(1, runtime_config["max_concurrent_vms"] // 2)
+    try:
+        max_pipeline_slots = int(max_pipeline_slots)
+    except (TypeError, ValueError):
+        max_pipeline_slots = max(1, runtime_config["max_concurrent_vms"] // 2)
+    if not (eligible_ids and max_pipeline_slots > 0):
+        return eligible_ids
+
+    pipeline_active = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.status.in_(
+                    [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                ),
+                Task.payloads[0]["type"].as_string().in_(("review", "fix")),
+            )
+        )
+    ).scalar() or 0
+    pipeline_budget = max(0, max_pipeline_slots - pipeline_active)
+    types_for_cap = {
+        t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
+    }
+    kept: list = []
+    deferred_pipeline = 0
+    pipeline_kept = 0
+    for tid in eligible_ids:
+        if types_for_cap.get(tid) in ("review", "fix"):
+            if pipeline_kept < pipeline_budget:
+                pipeline_kept += 1
+                kept.append(tid)
+            else:
+                deferred_pipeline += 1
+        else:
+            kept.append(tid)
+    if deferred_pipeline:
+        logger.info(
+            f"[ORCHESTRATOR] Pipeline-slot cap: deferred {deferred_pipeline} "
+            f"review/fix task(s) (active={pipeline_active}, cap={max_pipeline_slots})"
+        )
+    return kept
+
+
+def reserve_slots_for_types(
+    eligible_ids: list,
+    candidate_tasks: list[Task],
+    runtime_config: dict,
+    slots_available: int,
+) -> list:
+    """Promote reserved task types into the dispatch window under queue pressure.
+
+    Ensures high-priority task types (e.g. create, research) get a minimum share
+    of slots when they're queued behind self-perpetuating review/fix chains. Only
+    activates when queue pressure exists (more eligible tasks than open slots) and
+    there are reserved-type tasks waiting beyond the dispatch cutoff. The reserved
+    minimums come from ``runtime_config['reserved_slots_for_types']`` (defaults to
+    ``{"create": 1, "research": 1}``).
+
+    Returns the reordered ``eligible_ids`` (promoted reserved tasks moved into the
+    first ``slots_available`` positions, displacing non-reserved tasks).
+    """
+    reserved_config = (
+        runtime_config.get(
+            "reserved_slots_for_types", {"create": 1, "research": 1}
+        )
+        or {}
+    )
+    if not (reserved_config and len(eligible_ids) > slots_available):
+        return eligible_ids
+
+    types_by_id = {
+        t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
+    }
+    protected = set(reserved_config.keys())
+    initial = list(eligible_ids[:slots_available])
+    waiting = list(eligible_ids[slots_available:])
+    for rtype, rn in reserved_config.items():
+        try:
+            rn = int(rn)
+        except (TypeError, ValueError):
+            continue
+        if rn <= 0:
+            continue
+        current = sum(1 for tid in initial if types_by_id.get(tid) == rtype)
+        needed = rn - current
+        if needed <= 0:
+            continue
+        promote = [tid for tid in waiting if types_by_id.get(tid) == rtype][:needed]
+        if not promote:
+            continue
+        displaced = 0
+        for i in range(len(initial) - 1, -1, -1):
+            if displaced >= len(promote):
+                break
+            if types_by_id.get(initial[i]) not in protected:
+                initial.pop(i)
+                displaced += 1
+        if displaced == 0:
+            continue
+        promote = promote[:displaced]
+        promoted_set = set(promote)
+        waiting = [tid for tid in waiting if tid not in promoted_set]
+        initial.extend(promote)
+        logger.info(
+            f"[ORCHESTRATOR] Slot reservation: promoted {len(promote)} '{rtype}' "
+            f"task(s) (reserved={rn}, displaced {displaced} non-reserved)"
+        )
+    return initial + waiting

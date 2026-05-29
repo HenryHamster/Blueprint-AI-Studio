@@ -2,10 +2,12 @@
 
 The orchestrator monolith is being broken up along clean responsibility
 seams — the cycle / health / dependency classification helpers now live
-in ``app.orchestrator_health``. The orchestrator re-exports each extracted
-symbol so existing ``from app.orchestrator import X`` callers (tests,
-reaper, llm-runtime tests, background tests, pipeline-reliability tests)
-keep working.
+in ``app.orchestrator_health`` and the dispatch-list shaping passes
+(health-aware reordering, pipeline slot-cap, reserved-type promotion) now
+live in ``app.orchestrator_health`` / ``app.orchestrator_filters``. The
+orchestrator re-exports each extracted symbol so existing
+``from app.orchestrator import X`` callers (tests, reaper, llm-runtime
+tests, background tests, pipeline-reliability tests) keep working.
 
 This tripwire enforces two halves of the facade contract for each
 EXTRACTED_SYMBOLS entry, mirroring
@@ -44,6 +46,13 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_find_cycle_members",
         "_health_score_task",
         "get_confirmed_down_critical_deps",
+        # Dispatch-ordering seam: health-aware reordering pass.
+        "reorder_eligible_by_health",
+    ),
+    "app.orchestrator_filters": (
+        # Dispatch-ordering seam: pipeline slot-cap + reserved-type promotion.
+        "cap_pipeline_slots",
+        "reserve_slots_for_types",
     ),
 }
 

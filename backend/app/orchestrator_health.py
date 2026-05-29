@@ -11,13 +11,17 @@ Re-exports from ``app.orchestrator`` keep existing callers
 
 from __future__ import annotations
 
+import logging
 import uuid
-from typing import Dict
+from typing import Callable, Dict
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.models import Task, TaskStatus
+from app.models import Project, Task, TaskStatus
+
+logger = logging.getLogger("blueprint")
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +95,147 @@ def _health_score_task(task: Task) -> int:
     if ctx.get("risk") == "low":
         score += 1
     return score
+
+
+async def reorder_eligible_by_health(
+    eligible_ids: list,
+    candidate_tasks: list,
+    recent_results: list,
+    slots_available: int,
+    runtime_config: dict,
+    zone_summary: dict,
+    session: AsyncSession,
+    predict_fn: Callable[..., float],
+) -> list:
+    """Health-aware reordering of the eligible-task list under degradation.
+
+    Step 2.8 of the dispatch loop. Only activates under degradation so normal
+    priority ordering is preserved. Degradation signals: any zone in cooldown,
+    failure rate > 30% over the last 10 results, or available slots < 50% of the
+    max VM cap.
+
+    Under degradation the list is sorted by predicted P(success)
+    (``predict_fn``, injected — normally ``spawn_calibration.predict_spawn_success``)
+    with ``_health_score_task`` as the tiebreak, and a configurable confidence
+    floor (``runtime_config['dispatch_confidence_floor']``) drops tasks whose
+    P(success) is below the floor so scarce slots go to higher-confidence work.
+    Skipped tasks remain QUEUED and become eligible again next cycle.
+
+    Returns the (possibly reordered / filtered) ``eligible_ids`` list. A no-op
+    when there are <= 1 eligible tasks or no degradation signal is present.
+    """
+    if len(eligible_ids) <= 1:
+        return eligible_ids
+
+    _degradation_signals = []
+
+    if zone_summary["available"] < zone_summary["total_zones"]:
+        _degradation_signals.append(
+            f"zones {zone_summary['available']}/{zone_summary['total_zones']}"
+        )
+
+    if recent_results:
+        _hw_window = recent_results[-10:]
+        _hw_fail_count = sum(1 for r in _hw_window if r[1] == "failure")
+        _hw_fail_rate = _hw_fail_count / len(_hw_window)
+        if _hw_fail_rate > 0.30:
+            _degradation_signals.append(
+                f"failure rate {_hw_fail_count}/{len(_hw_window)}"
+            )
+
+    _max_vms = runtime_config["max_concurrent_vms"]
+    if slots_available < _max_vms * 0.5:
+        _degradation_signals.append(f"slots {slots_available}/{_max_vms}")
+
+    if not _degradation_signals:
+        return eligible_ids
+
+    _task_by_id = {t.id: t for t in candidate_tasks}
+    _original_order = list(eligible_ids)
+
+    # Load projects for candidate tasks (once per cycle) so we can compute real
+    # P(success) via predict_fn instead of relying on the static small/low-risk
+    # bonus alone. Cache the score per (project_id, direction_id, scope) since
+    # many tasks may share the same direction within a dispatch cycle.
+    _project_ids = {
+        _task_by_id[tid].project_id
+        for tid in eligible_ids
+        if tid in _task_by_id and _task_by_id[tid].project_id is not None
+    }
+    _projects_by_id: dict = {}
+    if _project_ids:
+        _proj_rows = (
+            (
+                await session.execute(
+                    select(Project).where(Project.id.in_(_project_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        _projects_by_id = {p.id: p for p in _proj_rows}
+    _confidence_cache: dict = {}
+
+    def _confidence_score(tid) -> float:
+        t = _task_by_id.get(tid)
+        if t is None:
+            return 0.5
+        ctx = t.context or {}
+        scope = ctx.get("scope") or "medium"
+        dir_id = str(ctx.get("direction_id") or "")
+        cache_key = (t.project_id, dir_id, scope)
+        if cache_key in _confidence_cache:
+            return _confidence_cache[cache_key]
+        proj = _projects_by_id.get(t.project_id)
+        direction: dict = {}
+        if proj and dir_id:
+            for d in proj.directions or []:
+                if str(d.get("id") or "") == dir_id:
+                    direction = d
+                    break
+        try:
+            score = predict_fn(scope, direction, proj)
+        except Exception:
+            score = 0.5
+        _confidence_cache[cache_key] = score
+        return score
+
+    eligible_ids = sorted(
+        eligible_ids,
+        key=lambda tid: (
+            _confidence_score(tid),
+            _health_score_task(_task_by_id[tid]) if tid in _task_by_id else 0,
+        ),
+        reverse=True,
+    )
+    if eligible_ids != _original_order:
+        logger.info(
+            "[ORCHESTRATOR] Health-aware reordering applied (%s): "
+            "%d eligible tasks reordered by P(success) confidence",
+            ", ".join(_degradation_signals),
+            len(eligible_ids),
+        )
+
+    # Confidence floor: during degraded operation, skip tasks whose P(success)
+    # is below the configured floor so scarce slots go to higher-confidence
+    # work. Skipped tasks remain QUEUED and become eligible again next cycle.
+    _conf_floor = float(runtime_config.get("dispatch_confidence_floor", 0.10) or 0.0)
+    if _conf_floor > 0:
+        _before_floor = list(eligible_ids)
+        eligible_ids = [
+            tid for tid in eligible_ids if _confidence_score(tid) >= _conf_floor
+        ]
+        _skipped = len(_before_floor) - len(eligible_ids)
+        if _skipped > 0:
+            logger.info(
+                "[ORCHESTRATOR] Confidence floor (%.2f) skipped "
+                "%d task(s) during degraded operation (%s)",
+                _conf_floor,
+                _skipped,
+                ", ".join(_degradation_signals),
+            )
+
+    return eligible_ids
 
 
 _CRITICAL_EXTERNAL_DEPS = ("github_api", "dispatch_api", "gcp")

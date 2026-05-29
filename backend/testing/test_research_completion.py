@@ -1433,7 +1433,13 @@ class TestShelveFindingsForNextCycle:
         async def fake_closing_session():
             yield fake_session
 
-        monkeypatch.setattr(rc, "closing_session", fake_closing_session)
+        # _shelve_findings_for_next_cycle was extracted to app.findings_index
+        # (re-exported via rc); patch closing_session where the function now
+        # resolves it. rc._shelve_findings_for_next_cycle is the same object
+        # via the facade re-export.
+        monkeypatch.setattr(
+            "app.findings_index.closing_session", fake_closing_session
+        )
 
         findings = [
             {"title": "f1", "description": "d1", "prompt": "p1"},
@@ -1484,7 +1490,9 @@ class TestShelveFindingsForNextCycle:
         async def fake_closing_session():
             yield fake_session
 
-        monkeypatch.setattr(rc, "closing_session", fake_closing_session)
+        monkeypatch.setattr(
+            "app.findings_index.closing_session", fake_closing_session
+        )
 
         await rc._shelve_findings_for_next_cycle(
             _uuid.uuid4(),

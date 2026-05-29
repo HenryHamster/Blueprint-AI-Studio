@@ -49,6 +49,8 @@ from app.orchestrator_filters import (
     filter_pipeline_duplicates,
     filter_migration_serialization,
     filter_scope_empty,
+    cap_pipeline_slots,
+    reserve_slots_for_types,
 )
 from app.stall_alert_diagnostics import (
     _STALL_TITLE_PREFIX,
@@ -515,6 +517,7 @@ from app.orchestrator_health import (  # noqa: F401
     _classify_stuck_tasks,
     _find_cycle_members,
     _health_score_task,
+    reorder_eligible_by_health,
 )
 
 
@@ -1725,240 +1728,38 @@ async def orchestrator_worker():
                 # Step 2.8: Health-aware reordering — boost small/low-risk tasks when degraded.
                 # Only activates under degradation so normal priority ordering is preserved.
                 # Degradation signals: any zone in cooldown, failure rate > 30%, or slots < 50% of max.
-                if len(eligible_ids) > 1:
-                    _degradation_signals = []
+                # Extracted to orchestrator_health.reorder_eligible_by_health; predict_spawn_success
+                # is injected to keep that seam free of a spawn_calibration import.
+                from app.spawn_calibration import predict_spawn_success
 
-                    _zone_summary = get_zone_health_summary()
-                    if _zone_summary["available"] < _zone_summary["total_zones"]:
-                        _degradation_signals.append(
-                            f"zones {_zone_summary['available']}/{_zone_summary['total_zones']}"
-                        )
-
-                    if recent_results:
-                        _hw_window = recent_results[-10:]
-                        _hw_fail_count = sum(1 for r in _hw_window if r[1] == "failure")
-                        _hw_fail_rate = _hw_fail_count / len(_hw_window)
-                        if _hw_fail_rate > 0.30:
-                            _degradation_signals.append(
-                                f"failure rate {_hw_fail_count}/{len(_hw_window)}"
-                            )
-
-                    _max_vms = _runtime_config["max_concurrent_vms"]
-                    if slots_available < _max_vms * 0.5:
-                        _degradation_signals.append(
-                            f"slots {slots_available}/{_max_vms}"
-                        )
-
-                    if _degradation_signals:
-                        _task_by_id = {t.id: t for t in candidate_tasks}
-                        _original_order = list(eligible_ids)
-
-                        # Load projects for candidate tasks (once per cycle) so we can
-                        # compute real P(success) via predict_spawn_success instead of
-                        # relying on the static small/low-risk bonus alone. Cache the
-                        # score per (project_id, direction_id, scope) since many tasks
-                        # may share the same direction within a dispatch cycle.
-                        from app.spawn_calibration import predict_spawn_success
-
-                        _project_ids = {
-                            _task_by_id[tid].project_id
-                            for tid in eligible_ids
-                            if tid in _task_by_id
-                            and _task_by_id[tid].project_id is not None
-                        }
-                        _projects_by_id: dict = {}
-                        if _project_ids:
-                            _proj_rows = (
-                                (
-                                    await session.execute(
-                                        select(Project).where(
-                                            Project.id.in_(_project_ids)
-                                        )
-                                    )
-                                )
-                                .scalars()
-                                .all()
-                            )
-                            _projects_by_id = {p.id: p for p in _proj_rows}
-                        _confidence_cache: dict = {}
-
-                        def _confidence_score(tid: str) -> float:
-                            t = _task_by_id.get(tid)
-                            if t is None:
-                                return 0.5
-                            ctx = t.context or {}
-                            scope = ctx.get("scope") or "medium"
-                            dir_id = str(ctx.get("direction_id") or "")
-                            cache_key = (t.project_id, dir_id, scope)
-                            if cache_key in _confidence_cache:
-                                return _confidence_cache[cache_key]
-                            proj = _projects_by_id.get(t.project_id)
-                            direction: dict = {}
-                            if proj and dir_id:
-                                for d in proj.directions or []:
-                                    if str(d.get("id") or "") == dir_id:
-                                        direction = d
-                                        break
-                            try:
-                                score = predict_spawn_success(scope, direction, proj)
-                            except Exception:
-                                score = 0.5
-                            _confidence_cache[cache_key] = score
-                            return score
-
-                        eligible_ids = sorted(
-                            eligible_ids,
-                            key=lambda tid: (
-                                _confidence_score(tid),
-                                _health_score_task(_task_by_id[tid])
-                                if tid in _task_by_id
-                                else 0,
-                            ),
-                            reverse=True,
-                        )
-                        if eligible_ids != _original_order:
-                            logger.info(
-                                "[ORCHESTRATOR] Health-aware reordering applied (%s): "
-                                "%d eligible tasks reordered by P(success) confidence",
-                                ", ".join(_degradation_signals),
-                                len(eligible_ids),
-                            )
-
-                        # Confidence floor: during degraded operation, skip tasks
-                        # whose P(success) is below the configured floor so scarce
-                        # slots go to higher-confidence work. Skipped tasks remain
-                        # QUEUED and become eligible again next cycle.
-                        _conf_floor = float(
-                            _runtime_config.get("dispatch_confidence_floor", 0.10)
-                            or 0.0
-                        )
-                        if _conf_floor > 0:
-                            _before_floor = list(eligible_ids)
-                            eligible_ids = [
-                                tid
-                                for tid in eligible_ids
-                                if _confidence_score(tid) >= _conf_floor
-                            ]
-                            _skipped = len(_before_floor) - len(eligible_ids)
-                            if _skipped > 0:
-                                logger.info(
-                                    "[ORCHESTRATOR] Confidence floor (%.2f) skipped "
-                                    "%d task(s) during degraded operation (%s)",
-                                    _conf_floor,
-                                    _skipped,
-                                    ", ".join(_degradation_signals),
-                                )
+                eligible_ids = await reorder_eligible_by_health(
+                    eligible_ids,
+                    candidate_tasks,
+                    recent_results,
+                    slots_available,
+                    _runtime_config,
+                    get_zone_health_summary(),
+                    session,
+                    predict_spawn_success,
+                )
 
                 # Step 2.9: Pipeline-slot cap — review/fix chains are self-perpetuating
                 # (review spawns fix spawns review, up to 16 iterations per PR), so
                 # without a ceiling they can fill every VM slot and starve create/
                 # research tasks. Defer (keep QUEUED) review/fix tasks once the
                 # configured pipeline budget is exhausted.
-                _max_pipeline_slots = _runtime_config.get("max_pipeline_slots")
-                if _max_pipeline_slots is None:
-                    _max_pipeline_slots = max(
-                        1, _runtime_config["max_concurrent_vms"] // 2
-                    )
-                try:
-                    _max_pipeline_slots = int(_max_pipeline_slots)
-                except (TypeError, ValueError):
-                    _max_pipeline_slots = max(
-                        1, _runtime_config["max_concurrent_vms"] // 2
-                    )
-                if eligible_ids and _max_pipeline_slots > 0:
-                    _pipeline_active = (
-                        await session.execute(
-                            select(_func.count())
-                            .select_from(Task)
-                            .where(
-                                Task.status.in_(
-                                    [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                                ),
-                                Task.payloads[0]["type"]
-                                .as_string()
-                                .in_(("review", "fix")),
-                            )
-                        )
-                    ).scalar() or 0
-                    _pipeline_budget = max(0, _max_pipeline_slots - _pipeline_active)
-                    _types_for_cap = {
-                        t.id: ((t.first_payload or {}).get("type") or "")
-                        for t in candidate_tasks
-                    }
-                    _kept: list = []
-                    _deferred_pipeline = 0
-                    _pipeline_kept = 0
-                    for tid in eligible_ids:
-                        if _types_for_cap.get(tid) in ("review", "fix"):
-                            if _pipeline_kept < _pipeline_budget:
-                                _pipeline_kept += 1
-                                _kept.append(tid)
-                            else:
-                                _deferred_pipeline += 1
-                        else:
-                            _kept.append(tid)
-                    if _deferred_pipeline:
-                        logger.info(
-                            f"[ORCHESTRATOR] Pipeline-slot cap: deferred {_deferred_pipeline} "
-                            f"review/fix task(s) (active={_pipeline_active}, cap={_max_pipeline_slots})"
-                        )
-                    eligible_ids = _kept
+                eligible_ids = await cap_pipeline_slots(
+                    eligible_ids, candidate_tasks, _runtime_config, session
+                )
 
                 # Slot reservation: ensure high-priority task types (e.g. create,
                 # research) get a minimum share of slots when they're queued behind
                 # self-perpetuating review/fix chains. Only activates when queue
                 # pressure exists (more eligible tasks than open slots) and there
                 # are reserved-type tasks waiting beyond the dispatch cutoff.
-                _reserved_config = (
-                    _runtime_config.get(
-                        "reserved_slots_for_types", {"create": 1, "research": 1}
-                    )
-                    or {}
+                eligible_ids = reserve_slots_for_types(
+                    eligible_ids, candidate_tasks, _runtime_config, slots_available
                 )
-                if _reserved_config and len(eligible_ids) > slots_available:
-                    _types_by_id = {
-                        t.id: ((t.first_payload or {}).get("type") or "")
-                        for t in candidate_tasks
-                    }
-                    _protected = set(_reserved_config.keys())
-                    _initial = list(eligible_ids[:slots_available])
-                    _waiting = list(eligible_ids[slots_available:])
-                    for _rtype, _rn in _reserved_config.items():
-                        try:
-                            _rn = int(_rn)
-                        except (TypeError, ValueError):
-                            continue
-                        if _rn <= 0:
-                            continue
-                        _current = sum(
-                            1 for tid in _initial if _types_by_id.get(tid) == _rtype
-                        )
-                        _needed = _rn - _current
-                        if _needed <= 0:
-                            continue
-                        _promote = [
-                            tid for tid in _waiting if _types_by_id.get(tid) == _rtype
-                        ][:_needed]
-                        if not _promote:
-                            continue
-                        _displaced = 0
-                        for i in range(len(_initial) - 1, -1, -1):
-                            if _displaced >= len(_promote):
-                                break
-                            if _types_by_id.get(_initial[i]) not in _protected:
-                                _initial.pop(i)
-                                _displaced += 1
-                        if _displaced == 0:
-                            continue
-                        _promote = _promote[:_displaced]
-                        _promoted_set = set(_promote)
-                        _waiting = [tid for tid in _waiting if tid not in _promoted_set]
-                        _initial.extend(_promote)
-                        logger.info(
-                            f"[ORCHESTRATOR] Slot reservation: promoted {len(_promote)} '{_rtype}' "
-                            f"task(s) (reserved={_rn}, displaced {_displaced} non-reserved)"
-                        )
-                    eligible_ids = _initial + _waiting
 
                 # Respect slot limit after conflict filtering
                 eligible_ids = eligible_ids[:slots_available]

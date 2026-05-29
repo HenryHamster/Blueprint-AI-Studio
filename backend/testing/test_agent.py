@@ -7265,13 +7265,13 @@ async def test_agent_create_pr_recreates_when_cached_pr_closed(
         new=AsyncMock(return_value=("tok", "foo", "bar")),
     )
     mocker.patch(
-        "app.routers.agent.get_pull_request",
+        "app.routers.agent_github.get_pull_request",
         new=AsyncMock(return_value={"state": "closed", "merged": False}),
     )
     mock_create = AsyncMock(
         return_value={"html_url": "https://github.com/foo/bar/pull/99", "number": 99}
     )
-    mocker.patch("app.routers.agent.create_pull_request", new=mock_create)
+    mocker.patch("app.routers.agent_github.create_pull_request", new=mock_create)
 
     token = create_agent_token(str(task.id), "agent-vm-stale-pr")
     headers = {"x-agent-token": token}
@@ -7349,11 +7349,11 @@ async def test_agent_create_pr_returns_cached_when_open(
         new=AsyncMock(return_value=("tok", "foo", "bar")),
     )
     mocker.patch(
-        "app.routers.agent.get_pull_request",
+        "app.routers.agent_github.get_pull_request",
         new=AsyncMock(return_value={"state": "open", "merged": False}),
     )
     mock_create = AsyncMock()
-    mocker.patch("app.routers.agent.create_pull_request", new=mock_create)
+    mocker.patch("app.routers.agent_github.create_pull_request", new=mock_create)
 
     token = create_agent_token(str(task.id), "agent-vm-open-pr")
     headers = {"x-agent-token": token}
@@ -7410,7 +7410,7 @@ async def test_agent_github_check_runs_validates_commit_sha(
         "app.routers.agent.get_github_token_for_task", new=AsyncMock()
     )
     get_check_runs_mock = mocker.patch(
-        "app.routers.agent.get_check_runs", new=AsyncMock()
+        "app.routers.agent_github.get_check_runs", new=AsyncMock()
     )
 
     token = create_agent_token(str(task.id), "agent-vm-check-runs-1")
@@ -7449,7 +7449,7 @@ async def test_agent_github_check_runs_response_omits_raw_token(
         new=AsyncMock(return_value=("secret-gh-token", "acme", "widget")),
     )
     get_check_runs_mock = mocker.patch(
-        "app.routers.agent.get_check_runs",
+        "app.routers.agent_github.get_check_runs",
         new=AsyncMock(
             return_value={
                 "status": "completed",
