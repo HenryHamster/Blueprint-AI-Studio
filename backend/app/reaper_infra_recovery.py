@@ -33,6 +33,17 @@ logger = logging.getLogger(__name__)
 _BATCH = 5000
 
 
+async def _safe_rollback(session) -> None:
+    """Best-effort rollback so one failed sweep can't leave the reaper's shared
+    session aborted and cascade ``PendingRollbackError`` into every subsequent
+    sweep. The reaper runs all of Steps 5-10 on a single session, so a sweep
+    that raises mid-flush must restore the session for the next one."""
+    try:
+        await session.rollback()
+    except Exception:  # noqa: BLE001
+        logger.warning("[REAPER] Rollback after sweep error failed", exc_info=True)
+
+
 async def _sweep_orphan_direction_holds(session) -> int:
     """Release direction holds whose direction_id no longer maps to a live direction.
 
@@ -249,7 +260,43 @@ async def run_infra_recovery_and_hold_maintenance(
                 pid for pid in _child_rows if pid is not None
             }
 
+        # Pre-compute idempotency_keys already held by an ACTIVE task.
+        # Resurrection flips FAILED→QUEUED, which enters the partial unique
+        # index ux_task_active_idempotency_key (active statuses only). If a
+        # live duplicate already holds that key the resurrection commit aborts
+        # with UniqueViolationError; on the reaper's shared session that single
+        # abort cascades PendingRollbackError into every downstream sweep and,
+        # via Step 9's re-raise, stalls the liveness heartbeat → restart.
+        _active_idem_keys: set[str] = set()
+        _cand_idem_keys = {
+            _t.idempotency_key for _t in _infra_failed if _t.idempotency_key
+        }
+        if _cand_idem_keys:
+            _active_idem_keys = set(
+                (
+                    await session.execute(
+                        select(Task.idempotency_key).where(
+                            Task.idempotency_key.in_(_cand_idem_keys),
+                            Task.status.in_(
+                                [
+                                    TaskStatus.QUEUED,
+                                    TaskStatus.PROVISIONING,
+                                    TaskStatus.IN_PROGRESS,
+                                    TaskStatus.EVALUATING,
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
         _resurrected = 0
+        # Keys claimed earlier in THIS batch — guards intra-batch collisions
+        # between two FAILED duplicates sharing a key (neither is active at
+        # query time, so the pre-query above can't catch the pair).
+        _resurrecting_keys: set[str] = set()
         for _t in _infra_failed:
             _ctx = _t.context or {}
             # Only resurrect infra-class failures, and only once per task.
@@ -274,6 +321,20 @@ async def run_infra_recovery_and_hold_maintenance(
             # Skip parents — they must re-evaluate via _requeue_parent_task, not
             # resurrect as leaf dispatches.
             if _t.id in _parent_ids_with_children:
+                continue
+
+            # Skip when a live duplicate (or an earlier candidate this batch)
+            # already holds this idempotency_key — flipping to QUEUED would
+            # violate ux_task_active_idempotency_key and poison the session.
+            # The active duplicate already represents the work.
+            if _t.idempotency_key and (
+                _t.idempotency_key in _active_idem_keys
+                or _t.idempotency_key in _resurrecting_keys
+            ):
+                logger.info(
+                    f"[REAPER] Skipping resurrection of {_t.id}: "
+                    "idempotency_key already held by an active task"
+                )
                 continue
 
             # Check that the specific infrastructure issue has resolved.
@@ -313,6 +374,8 @@ async def run_infra_recovery_and_hold_maintenance(
                 continue
 
             # Resurrect: reset to QUEUED with a clean slate.
+            if _t.idempotency_key:
+                _resurrecting_keys.add(_t.idempotency_key)
             logger.info(
                 f"[REAPER] Resurrecting infra-failed task {_t.id} "
                 f"(failure_category={_fail_cat}) — infrastructure recovered"
@@ -393,6 +456,7 @@ async def run_infra_recovery_and_hold_maintenance(
         logger.error(
             f"[REAPER] Infra recovery sweep error: {e}", exc_info=True
         )
+        await _safe_rollback(session)
 
     # Step 5a: Clear infra holds on directions whose root-cause signal has recovered.
     # Mirrors the signal checks in Step 5 but applies to direction-level holds
@@ -465,6 +529,7 @@ async def run_infra_recovery_and_hold_maintenance(
             f"[REAPER] Orphan direction hold sweep error: {e}",
             exc_info=True,
         )
+        await _safe_rollback(session)
 
     # Step 5d: Prune idle entries from long-lived in-memory state
     # dicts. direction_failure_streaks / circuit_breakers /
@@ -542,6 +607,7 @@ async def run_infra_recovery_and_hold_maintenance(
         logger.error(
             f"[REAPER] Stale retry_after sweep error: {e}", exc_info=True
         )
+        await _safe_rollback(session)
 
     # Step 5e: Close ACTIVE ResidualRemediationCase rows whose fingerprint
     # has not been seen in the last 72 h. Without this sweep the table
@@ -553,3 +619,4 @@ async def run_infra_recovery_and_hold_maintenance(
         logger.error(
             f"[REAPER] Stale residual case sweep error: {e}", exc_info=True
         )
+        await _safe_rollback(session)

@@ -2581,6 +2581,8 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] Queued age alert sweep error: {e}", exc_info=True
                     )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 7: Stalled strategic-cycle reaper.
                 try:
@@ -2592,6 +2594,8 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] Stalled-cycle sweep error: {e}", exc_info=True
                     )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 8: Per-(provider, model) regression scan (~15min cadence).
                 try:
@@ -2600,6 +2604,8 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] Regression scan error: {e}", exc_info=True
                     )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 9: Finalize release qualifications stuck "pending".
                 # ``session_factory=AsyncSessionLocal`` is passed explicitly so the
@@ -2625,6 +2631,8 @@ async def reaper_service():
                     await sweep_routine_message_retention(session)
                 except Exception as e:
                     logger.error(f"[REAPER] Routine message purge: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
             consecutive_errors = 0
             if _reaper_halt_state.get("_in_probe"):
                 _probe_failures = _reaper_halt_state.get("half_open_failures", 0)

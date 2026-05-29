@@ -2984,6 +2984,61 @@ async def test_step5_pr_rejected_skips_resurrection(
     assert "_resurrection_count" not in (t.context or {})
 
 
+@pytest.mark.asyncio
+async def test_step5_idempotency_collision_skipped_and_downstream_sweep_survives(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A FAILED infra task whose idempotency_key is already held by an ACTIVE
+    task must NOT be resurrected: flipping it to QUEUED would violate the
+    partial unique index ux_task_active_idempotency_key and, on the reaper's
+    shared session, cascade PendingRollbackError into every downstream sweep
+    (the production restart-loop incident). Asserts the collision is skipped
+    AND a later sweep (Step 5b far-future retry_after clearing) still runs —
+    before the fix the poisoned session would skip it."""
+    project = await _make_project(reaper_db)
+
+    # Live duplicate already occupying the idempotency_key in an ACTIVE state.
+    live = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        idempotency_key="dup-key",
+    )
+    # FAILED infra task sharing that key — the resurrection candidate that
+    # would collide on commit.
+    failed_dup = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        attempt_count=4,
+        idempotency_key="dup-key",
+        context={"failure_category": "PROVISION_FAILURE"},
+    )
+    # Independent QUEUED task with a far-future retry_after — Step 5b must clear
+    # it. If the collision poisoned the shared session, Step 5b would be skipped
+    # and this would stay set.
+    stale_retry = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        retry_after_until=datetime.utcnow() + timedelta(hours=6),
+    )
+    reaper_db.add_all([live, failed_dup, stale_retry])
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    for _t in (live, failed_dup, stale_retry):
+        await reaper_db.refresh(_t)
+
+    # Collision skipped: the FAILED dup is never resurrected.
+    assert failed_dup.status == TaskStatus.FAILED
+    assert "_resurrection_count" not in (failed_dup.context or {})
+    # The live duplicate is untouched.
+    assert live.status == TaskStatus.QUEUED
+    # Downstream sweep survived the (skipped) collision: retry_after cleared.
+    assert stale_retry.retry_after_until is None
+
+
 # ── Dependent-task unblocking on terminal failure ────────────────────────
 
 
