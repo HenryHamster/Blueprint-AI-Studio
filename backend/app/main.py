@@ -1388,18 +1388,21 @@ async def debug_orchestrator(
             ],
         }
 
-    hung = False
-    if (
-        _orch._orchestrator_cycle_started
-        and _orch._orchestrator_last_cycle
-        and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle
-    ):
-        hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
-        hung = hung_seconds > 300  # 5 minutes without completing a cycle
+    # Liveness is judged by the in-cycle progress *heartbeat* (the shared
+    # evaluate_orchestrator_liveness verdict, same as /health and the watchdog),
+    # NOT by full-cycle-completion age. A slow-but-progressing cycle is alive and
+    # not hung; only a worker with no heartbeat past ORCHESTRATOR_HANG_SECONDS (or
+    # a first cycle that started but never heartbeat) is wedged. `ago` /
+    # last_cycle_seconds_ago is preserved purely as an informational slow-cycle
+    # signal. See incident 2026-05-28 / orchestrator-operator-health-split.
+    liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
 
     return {
-        "orchestrator_alive": _orch._orchestrator_last_cycle is not None,
-        "orchestrator_hung": hung,
+        "orchestrator_alive": liveness.alive,
+        "orchestrator_hung": liveness.stalled,
+        "orchestrator_progress_age_seconds": liveness.progress_age,
+        "orchestrator_cycle_age_seconds": ago,
+        "orchestrator_liveness_reason": liveness.reason,
         "last_cycle_seconds_ago": ago,
         "queued_tasks": queued,
         "active_tasks": active,
@@ -1482,17 +1485,25 @@ async def health_detailed(
     }
 
     # --- Orchestrator ---
+    # Primary verdict comes from the shared progress-heartbeat liveness predicate
+    # (same as /health and the watchdog), NOT from full-cycle-completion age:
+    #   ok        -> healthy (fresh heartbeat)
+    #   degraded  -> alive + progressing but the last *completed* cycle is stale
+    #                (slow cycle), an informational soft signal only
+    #   down      -> genuinely wedged: no heartbeat past ORCHESTRATOR_HANG_SECONDS,
+    #                or a first cycle that started but never made progress.
+    # cycle_age is preserved as the informational slow-cycle marker.
+    liveness = _orch.evaluate_orchestrator_liveness(_utcnow())
     cycle_age: float | None = None
     if _orch._orchestrator_last_cycle:
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
-    if cycle_age is None:
+    slow_cycle = cycle_age is not None and cycle_age >= 120
+    if liveness.healthy:
+        orch_status = "degraded" if slow_cycle else "ok"
+    elif liveness.stalled or not liveness.alive:
         orch_status = "down"
-    elif cycle_age < 60:
-        orch_status = "ok"
-    elif cycle_age < 120:
-        orch_status = "degraded"
     else:
-        orch_status = "down"
+        orch_status = "degraded"
     try:
         queued = (
             await session.execute(
@@ -1517,6 +1528,7 @@ async def health_detailed(
     components["orchestrator"] = {
         "status": orch_status,
         "cycle_age_seconds": cycle_age,
+        "progress_age_seconds": liveness.progress_age,
         "queued_tasks": queued,
         "active_tasks": active,
     }

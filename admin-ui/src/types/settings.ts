@@ -143,6 +143,16 @@ export interface ProviderApisHealth {
 
 export interface OrchestratorHealth {
   last_cycle_seconds_ago: number | null;
+  // Progress-based liveness — the orchestrator's real liveness contract,
+  // judged by app.orchestrator.evaluate_orchestrator_liveness() off the
+  // in-cycle progress heartbeat (not cycle-completion age). Optional/nullable
+  // so older payloads that predate these fields still type-check; consumers
+  // fall back to cycle-age thresholds when they are absent.
+  orchestrator_alive?: boolean;
+  orchestrator_hung?: boolean;
+  orchestrator_progress_age_seconds?: number | null;
+  orchestrator_cycle_age_seconds?: number | null;
+  orchestrator_liveness_reason?: string | null;
   queued_tasks: number;
   active_tasks: number;
   pool_info: Record<string, unknown>;

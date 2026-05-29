@@ -237,3 +237,106 @@ class TestHealthLiveness:
 
         resp = await client.get("/health")
         assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+class TestAuthedOrchestratorHealth:
+    """The two AUTHENTICATED operator diagnostics — /api/debug/orchestrator and
+    /api/health/detailed — must route their orchestrator verdict through the
+    SAME shared progress-heartbeat predicate as /health and the watchdog, so a
+    slow-but-progressing cycle is never misreported as down/hung while a
+    genuinely wedged worker still is. Cycle-completion age stays only as the
+    informational slow-cycle signal. See orchestrator-operator-health-split.
+    """
+
+    async def test_debug_slow_but_progressing_is_alive_not_hung(
+        self, client, restore_orch_state
+    ):
+        """Stale completed cycle but fresh heartbeat → alive, not hung. The
+        cycle age is still surfaced as the informational slow-cycle signal."""
+        now = _utcnow()
+        _orch._orchestrator_last_cycle = now - timedelta(seconds=600)
+        _orch._orchestrator_cycle_started = now - timedelta(seconds=400)
+        _orch._orchestrator_last_progress = now - timedelta(seconds=2)
+
+        resp = await client.get("/api/debug/orchestrator")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["orchestrator_alive"] is True
+        assert body["orchestrator_hung"] is False
+        # Heartbeat liveness is fresh...
+        assert body["orchestrator_progress_age_seconds"] < 60
+        # ...while cycle-completion age stays as the informational slow signal.
+        assert body["last_cycle_seconds_ago"] >= 120
+        assert body["orchestrator_cycle_age_seconds"] >= 120
+
+    async def test_debug_wedged_worker_is_hung(self, client, restore_orch_state):
+        """No heartbeat past the hang threshold → reported hung/not-alive."""
+        now = _utcnow()
+        stale = now - timedelta(seconds=_orch.ORCHESTRATOR_HANG_SECONDS + 60)
+        _orch._orchestrator_last_cycle = stale
+        _orch._orchestrator_last_progress = stale
+        _orch._orchestrator_cycle_started = stale
+
+        resp = await client.get("/api/debug/orchestrator")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["orchestrator_hung"] is True
+
+    async def test_debug_wedged_first_cycle_is_hung(self, client, restore_orch_state):
+        """A first cycle that started but never heartbeat past the threshold is
+        a wedged startup → hung and not alive."""
+        now = _utcnow()
+        _orch._orchestrator_last_progress = None
+        _orch._orchestrator_last_cycle = None
+        _orch._orchestrator_cycle_started = now - timedelta(
+            seconds=_orch.ORCHESTRATOR_HANG_SECONDS + 30
+        )
+
+        resp = await client.get("/api/debug/orchestrator")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["orchestrator_hung"] is True
+        assert body["orchestrator_alive"] is False
+
+    async def test_detailed_slow_but_progressing_is_not_down(
+        self, client, restore_orch_state
+    ):
+        """Stale completed cycle + fresh heartbeat → status degraded (alive but
+        slow), NOT down. Progress age is surfaced alongside cycle age."""
+        now = _utcnow()
+        _orch._orchestrator_last_cycle = now - timedelta(seconds=600)
+        _orch._orchestrator_cycle_started = now - timedelta(seconds=400)
+        _orch._orchestrator_last_progress = now - timedelta(seconds=2)
+
+        resp = await client.get("/api/health/detailed")
+        assert resp.status_code == 200
+        orch = resp.json()["components"]["orchestrator"]
+        assert orch["status"] in ("ok", "degraded")
+        assert orch["status"] != "down"
+        assert orch["cycle_age_seconds"] >= 120
+        assert orch["progress_age_seconds"] < 60
+
+    async def test_detailed_fresh_cycle_is_ok(self, client, restore_orch_state):
+        """A fresh heartbeat with a fresh completed cycle → ok."""
+        now = _utcnow()
+        _orch._orchestrator_last_cycle = now - timedelta(seconds=3)
+        _orch._orchestrator_cycle_started = now - timedelta(seconds=3)
+        _orch._orchestrator_last_progress = now - timedelta(seconds=3)
+
+        resp = await client.get("/api/health/detailed")
+        assert resp.status_code == 200
+        orch = resp.json()["components"]["orchestrator"]
+        assert orch["status"] == "ok"
+
+    async def test_detailed_wedged_worker_is_down(self, client, restore_orch_state):
+        """No heartbeat past the hang threshold → status down."""
+        now = _utcnow()
+        stale = now - timedelta(seconds=_orch.ORCHESTRATOR_HANG_SECONDS + 60)
+        _orch._orchestrator_last_cycle = stale
+        _orch._orchestrator_last_progress = stale
+        _orch._orchestrator_cycle_started = stale
+
+        resp = await client.get("/api/health/detailed")
+        assert resp.status_code == 200
+        assert resp.json()["components"]["orchestrator"]["status"] == "down"

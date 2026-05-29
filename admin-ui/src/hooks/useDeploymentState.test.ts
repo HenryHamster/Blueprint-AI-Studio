@@ -122,6 +122,31 @@ describe('useDeploymentState', () => {
     });
   });
 
+  it('passes through progress-based liveness fields onto orchestratorHealth', async () => {
+    const health = {
+      last_cycle_seconds_ago: 600,
+      queued_tasks: 2,
+      active_tasks: 1,
+      pool_info: {},
+      orchestrator_alive: true,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: 4,
+      orchestrator_cycle_age_seconds: 600,
+      orchestrator_liveness_reason: 'progressing',
+    };
+    stubAllEndpoints({ '/api/debug/orchestrator': health });
+    const { result } = renderHook(() =>
+      useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }),
+    );
+    await waitFor(() => {
+      // A slow-but-progressing cycle: stale cycle age, fresh progress heartbeat.
+      expect(result.current.orchestratorHealth?.orchestrator_alive).toBe(true);
+      expect(result.current.orchestratorHealth?.orchestrator_hung).toBe(false);
+      expect(result.current.orchestratorHealth?.orchestrator_progress_age_seconds).toBe(4);
+      expect(result.current.orchestratorHealth?.orchestrator_liveness_reason).toBe('progressing');
+    });
+  });
+
   it('sets orchestratorHealth to null when /api/debug/orchestrator returns non-ok', async () => {
     mockAuthGet.mockImplementation((url: string) => {
       if (url.includes('/api/debug/orchestrator')) {

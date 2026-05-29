@@ -97,3 +97,126 @@ describe('OrchestratorHealthBar cost pill', () => {
     expect(pill.textContent).toContain('$12.43 / $50.00');
   });
 });
+
+describe('OrchestratorHealthBar cycle liveness verdict', () => {
+  beforeEach(() => {
+    apiFetchMock.mockResolvedValue(makeCostResponse(0, 0));
+  });
+
+  function healthWith(overrides: Record<string, unknown>) {
+    return {
+      last_cycle_seconds_ago: 0,
+      queued_tasks: 0,
+      active_tasks: 0,
+      pool_info: {},
+      ...overrides,
+    };
+  }
+
+  it('renders green/healthy when progressing with a fresh cycle', async () => {
+    const health = healthWith({
+      last_cycle_seconds_ago: 5,
+      orchestrator_alive: true,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: 3,
+      orchestrator_cycle_age_seconds: 5,
+      orchestrator_liveness_reason: 'progressing',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const cycle = screen.getByTitle(/Orchestrator progressing .* healthy/);
+    expect(cycle.innerHTML).toContain('bg-emerald-500');
+    expect(cycle.innerHTML).not.toContain('bg-red-500');
+    expect(cycle.innerHTML).not.toContain('bg-amber-400');
+    expect(cycle.textContent).not.toContain('⚠');
+  });
+
+  it('renders amber/degraded (NOT down) for a slow-but-progressing cycle', async () => {
+    // Cycle completion is stale (well past the legacy 120s "down" threshold)
+    // but the progress heartbeat is fresh, so the worker is healthy.
+    const health = healthWith({
+      last_cycle_seconds_ago: 600,
+      orchestrator_alive: true,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: 4,
+      orchestrator_cycle_age_seconds: 600,
+      orchestrator_liveness_reason: 'progressing',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const cycle = screen.getByTitle(/Slow cycle .* still progressing .* healthy/);
+    expect(cycle.innerHTML).toContain('bg-amber-400');
+    expect(cycle.innerHTML).not.toContain('bg-red-500');
+    // Slow-cycle is informational only — no down warning marker.
+    expect(cycle.textContent).not.toContain('⚠');
+  });
+
+  it('stays green/healthy (NOT amber) for a 60-119s progressing cycle — matches backend 120s slow-cycle contract', async () => {
+    // Backend surfaces slow/degraded only at >=120s (main.py: slow_cycle =
+    // cycle_age >= 120). A 90s progressing cycle must read healthy here too,
+    // otherwise operator surfaces contradict each other in the 60-119s band.
+    const health = healthWith({
+      last_cycle_seconds_ago: 90,
+      orchestrator_alive: true,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: 3,
+      orchestrator_cycle_age_seconds: 90,
+      orchestrator_liveness_reason: 'progressing',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const cycle = screen.getByTitle(/Orchestrator progressing .* healthy/);
+    expect(cycle.innerHTML).toContain('bg-emerald-500');
+    expect(cycle.innerHTML).not.toContain('bg-amber-400');
+    expect(cycle.innerHTML).not.toContain('bg-red-500');
+    expect(cycle.textContent).not.toContain('~');
+  });
+
+  it('renders red/down when the orchestrator is genuinely wedged (hung)', async () => {
+    const health = healthWith({
+      last_cycle_seconds_ago: 30,
+      orchestrator_alive: false,
+      orchestrator_hung: true,
+      orchestrator_progress_age_seconds: 900,
+      orchestrator_cycle_age_seconds: 30,
+      orchestrator_liveness_reason: 'no progress heartbeat for 900s',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const cycle = screen.getByTitle(/Orchestrator not progressing/);
+    expect(cycle.innerHTML).toContain('bg-red-500');
+    expect(cycle.innerHTML).not.toContain('bg-emerald-500');
+    expect(cycle.textContent).toContain('⚠');
+  });
+
+  it('does NOT go down for a stale cycle when progress is fresh (no false wedge)', async () => {
+    const health = healthWith({
+      last_cycle_seconds_ago: 130,
+      orchestrator_alive: true,
+      orchestrator_hung: false,
+      orchestrator_progress_age_seconds: 2,
+      orchestrator_cycle_age_seconds: 130,
+      orchestrator_liveness_reason: 'progressing',
+    });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    // Would have been red under the old cycle-age-only verdict (≥120s).
+    const cycle = screen.getByTitle(/still progressing .* healthy/);
+    expect(cycle.innerHTML).not.toContain('bg-red-500');
+  });
+
+  it('falls back to legacy cycle-age thresholds when liveness fields are absent', async () => {
+    const health = healthWith({ last_cycle_seconds_ago: 132 });
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} health={health} />); });
+
+    const cycle = screen.getByTitle(/Last cycle 132s ago — down \(threshold: ≥120s\)/);
+    expect(cycle.innerHTML).toContain('bg-red-500');
+    expect(cycle.textContent).toContain('⚠');
+  });
+});

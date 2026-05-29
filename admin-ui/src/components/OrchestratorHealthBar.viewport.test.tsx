@@ -15,6 +15,13 @@ vi.mock('../api', () => ({
 const baseProps = {
   health: {
     last_cycle_seconds_ago: 132,
+    // Progress-based liveness: genuinely wedged worst-case (red/down dot with
+    // the ⚠ marker) so the widest cycle-indicator rendering is exercised.
+    orchestrator_alive: false,
+    orchestrator_hung: true,
+    orchestrator_progress_age_seconds: 900,
+    orchestrator_cycle_age_seconds: 132,
+    orchestrator_liveness_reason: 'no progress heartbeat for 900s',
     queued_tasks: 18,
     active_tasks: 7,
     pool_info: {},

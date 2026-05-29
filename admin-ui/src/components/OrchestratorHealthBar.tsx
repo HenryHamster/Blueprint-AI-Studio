@@ -71,6 +71,12 @@ function monitoringDuration(since: string): string {
 const COST_AMBER_THRESHOLD = 0.6;
 const COST_RED_THRESHOLD = 0.9;
 
+// Slow-cycle (degraded) threshold, in seconds. Mirrors the backend contract in
+// backend/app/main.py (`slow_cycle = cycle_age >= 120` in both /health and
+// /api/health/detailed) so operator surfaces never disagree: a 60-119s
+// progressing cycle is healthy on every surface, and degraded begins at 120s.
+const SLOW_CYCLE_THRESHOLD_SEC = 120;
+
 export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
@@ -138,9 +144,59 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
     ).length;
   }, [tasks, now]);
 
+  // Cycle-COMPLETION age is now only a secondary, informational slow-cycle
+  // signal. The PRIMARY health verdict comes from the backend's progress-based
+  // liveness (the same contract /health and the lifecycle watchdog use): a
+  // long-but-progressing cycle is healthy, and only a genuine wedge is "down".
   const cycleAge = health?.last_cycle_seconds_ago ?? null;
-  const cycleDegraded = cycleAge !== null && cycleAge >= 60 && cycleAge < 120;
-  const cycleDown = cycleAge !== null && cycleAge >= 120;
+
+  // Liveness fields are present on current payloads; older orchestrator
+  // payloads omit them, in which case we fall back to the legacy cycle-age
+  // thresholds so nothing regresses.
+  const hasLiveness =
+    health != null &&
+    (health.orchestrator_alive !== undefined || health.orchestrator_hung !== undefined);
+  const orchestratorAlive = health?.orchestrator_alive ?? true;
+  const orchestratorHung = health?.orchestrator_hung ?? false;
+  const progressAge = health?.orchestrator_progress_age_seconds ?? null;
+  const livenessReason = health?.orchestrator_liveness_reason ?? null;
+
+  // Slow cycle is purely informational (amber hint) and never the down verdict.
+  // The threshold matches the backend's slow-cycle contract (>=120s) so a
+  // 60-119s progressing cycle never shows contradictory states across surfaces.
+  const cycleSlow = cycleAge !== null && cycleAge >= SLOW_CYCLE_THRESHOLD_SEC;
+  const cycleDown = hasLiveness
+    ? orchestratorHung || !orchestratorAlive
+    : cycleAge !== null && cycleAge >= SLOW_CYCLE_THRESHOLD_SEC;
+  // Legacy fallback (payload predates progress liveness) keeps the original
+  // cycle-age-only band: degraded at 60-119s, down at >=120s. That older
+  // contract is internally consistent with an old orchestrator and only fires
+  // when liveness fields are absent, so it is intentionally left unchanged.
+  const cycleDegraded = hasLiveness
+    ? !cycleDown && cycleSlow
+    : cycleAge !== null && cycleAge >= 60 && cycleAge < SLOW_CYCLE_THRESHOLD_SEC;
+
+  const cycleTitle = (() => {
+    if (cycleAge === null && progressAge === null) return 'No cycle data';
+    if (hasLiveness) {
+      const progressStr =
+        progressAge !== null ? `progress ${Math.round(progressAge)}s ago` : 'progress age unknown';
+      const cycleStr =
+        cycleAge !== null ? `last cycle ${Math.round(cycleAge)}s ago` : 'cycle age unknown';
+      if (cycleDown) {
+        return `Orchestrator not progressing — ${livenessReason ?? 'no progress heartbeat'} (${progressStr}, ${cycleStr})`;
+      }
+      if (cycleDegraded) {
+        return `Slow cycle (${cycleStr}) but orchestrator is still progressing (${progressStr}) — healthy`;
+      }
+      return `Orchestrator progressing (${progressStr}, ${cycleStr}) — healthy`;
+    }
+    // Legacy cycle-age-only fallback (payload predates progress liveness).
+    const ageStr = `Last cycle ${Math.round(cycleAge as number)}s ago`;
+    if (cycleDown) return `${ageStr} — down (threshold: ≥120s)`;
+    if (cycleDegraded) return `${ageStr} — degraded (threshold: ≥60s)`;
+    return `${ageStr} — healthy`;
+  })();
 
   const deployState = health?.deploy_state ?? null;
   const showDeployInfo = deployState && (
@@ -192,15 +248,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           <>
             <div
               className="flex items-center gap-1.5"
-              title={
-                cycleAge === null
-                  ? 'No cycle data'
-                  : cycleDown
-                  ? `Last cycle ${Math.round(cycleAge)}s ago — down (threshold: ≥120s)`
-                  : cycleDegraded
-                  ? `Last cycle ${Math.round(cycleAge)}s ago — degraded (threshold: ≥60s)`
-                  : `Last cycle ${Math.round(cycleAge)}s ago — healthy`
-              }
+              title={cycleTitle}
             >
               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cycleDown ? 'bg-red-500 animate-pulse' : cycleDegraded ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`} />
               <span className={cycleDown ? 'text-red-400' : cycleDegraded ? 'text-amber-400' : 'text-neutral-400'}>
