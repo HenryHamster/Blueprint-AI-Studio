@@ -2959,11 +2959,12 @@ class TestBehindRecoveryUpdateBranchGuard:
     # sufficient evidence that the caller consulted the detector.
     _GUARD_NAMES = frozenset({"pr_is_not_behind", "pr_is_not_behind_for"})
 
-    # ``app/github.py`` defines both ``update_branch`` and ``pr_is_not_behind``,
-    # and the internal ``update_branch_with_sha_retry -> update_branch`` call
-    # inside that file's helper is by definition not a behind-recovery
-    # caller.  Skip the whole file.
-    _SKIP_FILES = frozenset({"github.py"})
+    # ``app/github_pulls.py`` defines both ``update_branch`` and
+    # ``pr_is_not_behind``, and the internal
+    # ``update_branch_with_sha_retry -> update_branch`` call inside that file's
+    # helper is by definition not a behind-recovery caller.  ``app/github.py``
+    # is the re-export façade for the same symbols.  Skip both files.
+    _SKIP_FILES = frozenset({"github.py", "github_pulls.py"})
 
     # ``"<relative_path>:<function_name>"`` entries for callers that are
     # legitimately NOT behind-recovery writes.  Empty by default — every

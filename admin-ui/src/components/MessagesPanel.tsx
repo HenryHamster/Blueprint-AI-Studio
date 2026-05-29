@@ -1,18 +1,19 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, Settings, ChevronUp, BellOff, Save, MoreVertical, Pencil, Trash2, Reply } from 'lucide-react';
+import { X, MessageSquare, Send, Check, AlertTriangle, ChevronDown, Settings, ChevronUp, BellOff, Save, MoreVertical, Pencil, Trash2, Reply } from 'lucide-react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, isCriticalSeverity, ROUTINE_EVENT_LABELS, countHighSignalMessages } from './eventPrefs';
-import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown } from './muteWindow';
+import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
+import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, formatMuteCountdown } from './muteWindow';
 import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
 import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './temporaryMutes';
-import { type RoutineRow, type MessageWithDivider, routineSummary, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
+import { groupRoutineMessages, outcomeBreakdown, isFailingGroup, formatTimestamp } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import { type ProjectMessage, TYPE_CONFIG, MessageBubble, formatFromType } from './MessageBubble';
+import { type ProjectMessage, TYPE_CONFIG } from './MessageBubble';
 import { SaveViewDialog } from './SaveViewDialog';
-import { MessagesSummaryCard } from './MessagesSummaryCard';
+import { useMessageList } from './useMessageList';
+import { MessagesListView } from './MessagesListView';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -55,15 +56,6 @@ interface WebhookStats {
   last_failure_at: string | null;
   retry_queue_depth: number;
 }
-
-type MessageSummaryCounts = {
-  blockers: number;
-  questions: number;
-  feedback: number;
-  bugReports: number;
-  routine: number;
-  highSignalNotes: number;
-};
 
 interface MessagesPanelProps {
   selectedProjectId: string | null;
@@ -151,16 +143,6 @@ function MessageTypeDropdown({ value, onChange }: { value: string; onChange: (v:
           })}
         </div>
       )}
-    </div>
-  );
-}
-
-function TimeDividerRow({ label, className }: { label: string; className?: string }) {
-  return (
-    <div className={`flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2${className ? ` ${className}` : ''}`}>
-      <div className="flex-1 border-t border-neutral-800/60" />
-      <span className="shrink-0">{label}</span>
-      <div className="flex-1 border-t border-neutral-800/60" />
     </div>
   );
 }
@@ -396,171 +378,47 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [openKebabId]);
 
-  const byTime = (a: ProjectMessage, b: ProjectMessage) => {
-    const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
-    const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
-    return ta - tb;
-  };
-
-  const matchesSearch = (msg: ProjectMessage): boolean => {
-    if (!searchQuery.trim()) return true;
-    const q = searchQuery.toLowerCase();
-    if (msg.content.toLowerCase().includes(q)) return true;
-    if (msg.resolution?.toLowerCase().includes(q)) return true;
-    if (formatFromType(msg).toLowerCase().includes(q)) return true;
-    const et = msg.context.event_type as string | undefined;
-    if (et?.toLowerCase().includes(q)) return true;
-    const at = msg.context.annotation_type as string | undefined;
-    if (at?.toLowerCase().includes(q)) return true;
-    const src = msg.context.source as string | undefined;
-    if (src?.toLowerCase().includes(q)) return true;
-    return false;
-  };
-
-  const { openMessages, resolvedMessages, openFeedbackMessages } = useMemo(() => {
-    const open = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
-    return {
-      openMessages: open,
-      resolvedMessages: messages.filter(m => m.status === 'resolved'),
-      openFeedbackMessages: open.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m)),
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, criticalOnly, searchQuery]);
-
-  // Count new high-signal messages (created after divider time) — for visual divider only
-  const newHighSignalCount = dividerTime
-    ? openMessages.filter(m =>
-        m.created_at &&
-        effectiveSignal(m, eventPrefs, tempMutes) === 'high' &&
-        parseTimestamp(m.created_at).getTime() > dividerTime
-      ).length
-    : 0;
+  // Memoized message-list derivation: open/resolved split, high-signal vs routine,
+  // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
+  // new-message counts — all behind one pure hook so the panel stays focused on
+  // state, effects, and handlers.
+  const {
+    openMessages,
+    resolvedMessages,
+    openFeedbackMessages,
+    newHighSignalCount,
+    newMessageCounts,
+    totalNewCount,
+    muteActive,
+    highSignalOpen,
+    routineOpen,
+    pinnedBlockers,
+    pinnedQuestions,
+    otherHighSignal,
+    promotedGroups,
+    remainingRoutineRows,
+    autoExpandedKeys,
+    visibleRoutineCount,
+    mutedRoutineCount,
+    visibleResolved,
+    hiddenResolvedCount,
+  } = useMessageList({
+    messages,
+    eventPrefs,
+    tempMutes,
+    muteWindow,
+    searchQuery,
+    sortMode,
+    criticalOnly,
+    showResolved,
+    showOnlyNew,
+    dividerTime,
+  });
 
   // Badge/tab-title count. Passes eventPrefs/tempMutes so muted types are excluded and
   // surfaced types are included — matching App.tsx's closed-panel count exactly so the
   // badge does not jump when the operator opens the panel.
   const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
-
-  // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
-  const newMessageCounts = useMemo<MessageSummaryCounts>(() => dividerTime
-    ? {
-        blockers: openMessages.filter(m =>
-          m.message_type === 'BLOCKER' &&
-          m.created_at &&
-          parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
-        ).length,
-        feedback: openMessages.filter(m =>
-          m.message_type === 'FEEDBACK' &&
-          m.created_at &&
-          parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
-        ).length,
-        bugReports: openMessages.filter(m =>
-          m.message_type === 'BUG_REPORT' &&
-          m.created_at &&
-          parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs, tempMutes) !== 'mute'
-        ).length,
-        routine: openMessages.filter(m =>
-          effectiveSignal(m, eventPrefs, tempMutes) === 'routine' &&
-          m.created_at &&
-          parseTimestamp(m.created_at).getTime() > dividerTime
-        ).length,
-        highSignalNotes: openMessages.filter(m =>
-          m.message_type === 'NOTE' &&
-          m.created_at &&
-          parseTimestamp(m.created_at).getTime() > dividerTime &&
-          effectiveSignal(m, eventPrefs, tempMutes) === 'high'
-        ).length,
-        questions: openMessages.filter(m =>
-          m.message_type === 'QUESTION' &&
-          m.created_at &&
-          parseTimestamp(m.created_at).getTime() > dividerTime &&
-          // Match pinnedQuestions predicate (effectiveSignal === 'high'): the summary card
-          // scrolls to the pinned-questions section, so it must not announce QUESTIONs that
-          // were demoted to 'routine' and live elsewhere in the list.
-          effectiveSignal(m, eventPrefs, tempMutes) === 'high'
-        ).length,
-      }
-    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0, questions: 0 },
-  [openMessages, dividerTime, eventPrefs, tempMutes]);
-
-  // Total new count: each message counted exactly once (high-signal and routine are disjoint)
-  const totalNewCount = newHighSignalCount + newMessageCounts.routine;
-
-  // Split open messages by signal level, respecting per-event-type prefs and temp mutes, then filter by search
-  const muteActive = isMuteWindowActive(muteWindow);
-  const { highSignalOpen, routineOpen } = useMemo(() => {
-    const isNew = (m: ProjectMessage): boolean => {
-      if (!showOnlyNew || !dividerTime || !m.created_at) return true;
-      return parseTimestamp(m.created_at).getTime() > dividerTime;
-    };
-    const SEVERITY_RANK_INNER: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
-    const CONTEXT_SEVERITY_RANK_INNER: Record<string, number> = { high: 0, medium: 1, low: 2 };
-    const byTimeDescInner = (a: ProjectMessage, b: ProjectMessage) => {
-      const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
-      const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
-      return tb - ta;
-    };
-    const bySeverityInner = (a: ProjectMessage, b: ProjectMessage) => {
-      const ra = SEVERITY_RANK_INNER[a.message_type] ?? 3;
-      const rb = SEVERITY_RANK_INNER[b.message_type] ?? 3;
-      if (ra !== rb) return ra - rb;
-      const sa = (a.context.severity as string | undefined) ?? 'undefined';
-      const sb = (b.context.severity as string | undefined) ?? 'undefined';
-      const sa_rank = CONTEXT_SEVERITY_RANK_INNER[sa] ?? 3;
-      const sb_rank = CONTEXT_SEVERITY_RANK_INNER[sb] ?? 3;
-      if (sa_rank !== sb_rank) return sa_rank - sb_rank;
-      return byTimeDescInner(a, b);
-    };
-    return {
-      highSignalOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNew(m))]
-        .sort(sortMode === 'importance' ? bySeverityInner : byTimeDescInner),
-      // Always compute routine messages; mute only filters them from the non-promoted routine section
-      routineOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNew(m))].sort(byTimeDescInner),
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openMessages, eventPrefs, tempMutes, searchQuery, sortMode, showOnlyNew, dividerTime]);
-
-  // In importance mode, pin BLOCKERs and unanswered QUESTIONs at the top with visual dividers
-  const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
-  const pinnedQuestions = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'QUESTION') : [];
-  const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER' && m.message_type !== 'QUESTION') : highSignalOpen;
-
-  // Failing routine groups auto-promoted above the routine ops section
-  const { promotedGroups, remainingRoutineRows, autoExpandedKeys, visibleRoutineCount, mutedRoutineCount } = useMemo(() => {
-    const rows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
-    const promoted = rows.filter(
-      (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
-        r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
-    );
-    const promotedSet = new Set(promoted.map(r => r.key));
-    // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
-    const remaining = muteActive
-      ? rows.filter(r => promotedSet.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
-      : rows.filter(r => r.kind !== 'group' || !promotedSet.has(r.key));
-    // Auto-expand groups that have search matches
-    const withMatches = new Set(
-      rows
-        .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
-        .map(r => r.key)
-    );
-    // Calculate shown vs muted routine message counts when mute is active
-    let visible = routineOpen.length;
-    let muted = 0;
-    if (muteActive && promoted.length > 0) {
-      visible = promoted.reduce((sum, row) => sum + row.msgs.length, 0);
-      muted = routineOpen.length - visible;
-    }
-    return {
-      promotedGroups: promoted,
-      remainingRoutineRows: remaining,
-      autoExpandedKeys: searchQuery.trim() ? withMatches : new Set<string>(),
-      visibleRoutineCount: visible,
-      mutedRoutineCount: muted,
-    };
-  }, [routineOpen, eventPrefs, muteActive, searchQuery]);
 
   // Calculate 24-hour volume for each event type and memoize event types
   const { eventType24hVolume, sortedEventTypes } = useMemo(() => {
@@ -781,12 +639,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
     }
   }, [selectedProjectId]);
-
-  // Resolved: show last 5 by default, toggle to show all, filtered by search
-  const RECENT_RESOLVED = 5;
-  const sortedResolved = [...resolvedMessages.filter(m => matchesSearch(m))].sort(byTime);
-  const visibleResolved = showResolved ? sortedResolved : sortedResolved.slice(-RECENT_RESOLVED);
-  const hiddenResolvedCount = showResolved ? 0 : Math.max(0, sortedResolved.length - RECENT_RESOLVED);
 
   const fetchMessages = useCallback(async () => {
     if (!selectedProjectId) { setLoading(false); return; }
@@ -1469,423 +1321,52 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       )}
 
       {/* Messages list — chat-style scroll area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">
-        {/* Prominent banner: X new since {time} with action buttons */}
-        {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-          <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-blue-600/20 to-blue-500/10 border border-blue-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold text-blue-300 truncate">
-                {totalNewCount} new since {formatSinceTimestamp(dividerTime)}
-              </div>
-            </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                onClick={handleShowOnlyNew}
-                className="shrink-0 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
-              >
-                Show only new
-              </button>
-              <button
-                onClick={dismissDivider}
-                className="shrink-0 px-3 py-2 rounded-lg border border-blue-500/60 text-blue-300 hover:bg-blue-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
-              >
-                Mark all read
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
-        {dividerTime && !dividerDismissedRef.current && totalNewCount === 0 && !showOnlyNew && (
-          <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-emerald-600/20 to-emerald-500/10 border border-emerald-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold text-emerald-300 truncate">
-                No new since {formatSinceTimestamp(dividerTime)}
-              </div>
-            </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              <button
-                onClick={dismissDivider}
-                className="shrink-0 px-3 py-2 rounded-lg border border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
-              >
-                Reset baseline
-              </button>
-            </div>
-          </div>
-        )}
-
-        {loading ? (
-          <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
-        ) : messages.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
-            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
-            <p className="text-sm">No messages yet</p>
-            <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
-          </div>
-        ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
-            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
-            <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
-            <p className="text-xs mt-1 opacity-70">You're all caught up!</p>
-          </div>
-        ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && visibleResolved.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
-            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
-            <p className="text-sm">No matches for "{searchQuery}"</p>
-            <p className="text-xs mt-1 opacity-70">Try a different search term</p>
-          </div>
-        ) : (
-          <>
-            {/* Pinned BLOCKERs (importance mode only) */}
-            {pinnedBlockers.length > 0 && (
-              <>
-                <div className="flex items-center gap-1.5 text-[11px] text-amber-400/70 font-semibold uppercase tracking-wide px-1">
-                  <AlertTriangle className="w-3 h-3" />
-                  <span>Pinned · Blockers</span>
-                </div>
-                {insertTimeDividers(pinnedBlockers).map((item, idx) =>
-                  item.kind === 'divider' ? (
-                    <TimeDividerRow key={`divider-pinned-${idx}`} label={item.label} />
-                  ) : (
-                    <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
-                  )
-                )}
-                {(pinnedQuestions.length > 0 || otherHighSignal.length > 0) && <div className="border-t border-neutral-800/60" />}
-              </>
-            )}
-
-            {/* Pinned QUESTIONs (importance mode only) — awaiting operator reply */}
-            <div ref={questionsRefEl}>
-              {pinnedQuestions.length > 0 && (
-                <>
-                  <div className="flex items-center gap-1.5 text-[11px] text-blue-400/70 font-semibold uppercase tracking-wide px-1">
-                    <HelpCircle className="w-3 h-3" />
-                    <span>Awaiting reply · Questions</span>
-                    <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-[10px]">{pinnedQuestions.length} waiting</span>
-                  </div>
-                  {insertTimeDividers(pinnedQuestions).map((item, idx) =>
-                    item.kind === 'divider' ? (
-                      <TimeDividerRow key={`divider-questions-${idx}`} label={item.label} />
-                    ) : (
-                      <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
-                    )
-                  )}
-                  {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
-                </>
-              )}
-            </div>
-
-            {/* Divider: show before first new message if divider time is set and not dismissed */}
-            {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-              <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-[11px] text-blue-300/70">
-                <div className="flex-1 border-t border-blue-500/40" />
-                <div className="flex items-center gap-2 whitespace-nowrap font-medium">
-                  <span className="flex items-center gap-1">
-                    <ChevronUp className="w-3 h-3" />
-                    NEW since {formatTimestamp(dividerTime)}
-                  </span>
-                  <button
-                    onClick={dismissDivider}
-                    className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
-                    title="Mark all caught up and dismiss this divider"
-                  >
-                    All caught up
-                  </button>
-                </div>
-                <div className="flex-1 border-t border-blue-500/40" />
-              </div>
-            )}
-
-            {/* Summary card: show counts of new messages if divider is active */}
-            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.questions > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
-              <MessagesSummaryCard
-                newMessageCounts={newMessageCounts}
-                onScrollToBlockers={() => {
-                  blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }}
-                onScrollToQuestions={() => {
-                  questionsRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }}
-                onScrollToRoutine={() => {
-                  routineRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                }}
-              />
-            )}
-
-            {/* Other high-signal open messages */}
-            <div ref={blockersRefEl}>
-              {insertTimeDividers(otherHighSignal).map((item, idx) =>
-                item.kind === 'divider' ? (
-                  <TimeDividerRow key={`divider-high-${idx}`} label={item.label} />
-                ) : (
-                  <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
-                )
-              )}
-            </div>
-
-            {/* Auto-promoted failing routine groups */}
-            {promotedGroups.map(row => {
-              const bd = outcomeBreakdown(row.msgs);
-              const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
-              return (
-                <div key={row.key} className="border border-red-800/50 rounded-xl overflow-hidden bg-red-950/20">
-                  <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
-                    <button
-                      onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(row.key)) next.delete(row.key); else next.add(row.key); return next; })}
-                      className="flex-1 flex items-center gap-2 text-left"
-                    >
-                      <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                      <span className="text-xs text-red-300 font-medium">{row.msgs.length} {row.label}</span>
-                      {bd && <span className="text-xs text-red-400">{bd}</span>}
-                    </button>
-                    <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
-                      <Check className="w-3 h-3" />
-                    </button>
-                  </div>
-                  {isGroupExpanded && (
-                    <div className="space-y-2 p-2 border-t border-red-900/40">
-                      {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-
-            {/* Routine ops group — collapsed by default */}
-            {routineOpen.length > 0 && (
-              <div ref={routineRefEl} className="border border-neutral-800/50 rounded-xl overflow-hidden">
-                <div className="flex items-center bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors min-h-[44px]">
-                  <button
-                    onClick={() => setRoutineExpanded(e => !e)}
-                    className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
-                  >
-                    <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
-                    <span className="text-xs text-neutral-500 font-medium shrink-0">
-                      {visibleRoutineCount} routine ops
-                      {mutedRoutineCount > 0 && <span className="text-neutral-600 ml-1">({mutedRoutineCount} muted)</span>}
-                    </span>
-                    <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
-                  </button>
-                  <div className="relative shrink-0 px-2">
-                    <button
-                      onClick={() => setShowTempMuteMenu(v => !v)}
-                      className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-                      title="Temporarily mute event types"
-                    >
-                      <MoreVertical className="w-4 h-4" />
-                    </button>
-                    {showTempMuteMenu && (
-                      <>
-                        <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
-                        <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl p-2 space-y-1 min-w-48">
-                          {getTop3NoisyEventTypes().length > 0 ? (
-                            <>
-                              <p className="text-[10px] text-neutral-500 px-2 py-1">Mute for</p>
-                              {getTop3NoisyEventTypes().map(([eventType, count]) => {
-                                const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
-                                const isActive = tempMutes[eventType] && tempMutes[eventType] > Date.now();
-                                return (
-                                  <div key={eventType} className="text-xs px-2 py-1 text-neutral-400">
-                                    <div className="font-medium mb-1">{label} ({count})</div>
-                                    <div className="flex gap-1 flex-wrap">
-                                      {(
-                                        [
-                                          ['30m', 1800000, 'Mute 30m'] as const,
-                                          ['1h', 3600000, 'Mute 1h'] as const,
-                                          ['Tomorrow', 86400000, 'Mute until tomorrow'] as const,
-                                        ]
-                                      ).map(([shortLabel, ms, title]) => (
-                                        <button
-                                          key={shortLabel}
-                                          onClick={() => addTemporaryMute(eventType, ms)}
-                                          title={title}
-                                          className={`text-[11px] px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
-                                        >
-                                          {shortLabel}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  </div>
-                                );
-                              })}
-                            </>
-                          ) : (
-                            <p className="text-[10px] text-neutral-500 px-2 py-2">No recent events to mute</p>
-                          )}
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-                {muteActive && (
-                  <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-[11px] text-amber-400">
-                    🔕 Mute active, but failing groups still surface
-                  </div>
-                )}
-                {routineExpanded && (
-                  <div className="space-y-3 p-3 border-t border-neutral-800/40">
-                    {(() => {
-                      // Get first message date for each row (for single: the message, for group: first in group)
-                      const rowsWithDate = remainingRoutineRows.map(row => {
-                        const msg = row.kind === 'single' ? row.msg : row.msgs[0];
-                        return { row, firstMsg: msg };
-                      });
-
-                      // Create divider list for all messages in order
-                      const allMsgs = rowsWithDate.map(r => r.firstMsg);
-                      const msgWithDividers = insertTimeDividers(allMsgs);
-
-                      // Build a set of message IDs that have a divider before them
-                      const msgsWithDividerBefore = new Set<string>();
-                      msgWithDividers.forEach((item, idx) => {
-                        if (item.kind === 'message' && idx > 0 && msgWithDividers[idx - 1]?.kind === 'divider') {
-                          msgsWithDividerBefore.add(item.msg.id);
-                        }
-                      });
-
-                      // Also build a map of message ID to divider label
-                      const dividerLabels = new Map<string, string>();
-                      msgWithDividers.forEach((item, idx) => {
-                        if (item.kind === 'divider' && idx + 1 < msgWithDividers.length && msgWithDividers[idx + 1]?.kind === 'message') {
-                          dividerLabels.set((msgWithDividers[idx + 1] as MessageWithDivider<ProjectMessage> & { kind: 'message' }).msg.id, item.label);
-                        }
-                      });
-
-                      return rowsWithDate.map(({ row, firstMsg }) => {
-                        const hasDividerBefore = msgsWithDividerBefore.has(firstMsg.id);
-                        const dividerLabel = dividerLabels.get(firstMsg.id);
-
-                        if (row.kind === 'group') {
-                          const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
-                          const bd = outcomeBreakdown(row.msgs);
-                          return (
-                            <div key={row.key}>
-                              {hasDividerBefore && dividerLabel && (
-                                <TimeDividerRow label={dividerLabel} className="mb-2" />
-                              )}
-                              <div className="border border-neutral-800/40 rounded-xl overflow-hidden">
-                                <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
-                                  <button
-                                    onClick={() => setExpandedGroupKeys(prev => {
-                                      const next = new Set(prev);
-                                      if (next.has(row.key)) next.delete(row.key); else next.add(row.key);
-                                      return next;
-                                    })}
-                                    className="flex-1 flex items-center gap-2 text-left"
-                                  >
-                                    <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
-                                    <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
-                                  </button>
-                                  <button
-                                    onClick={() => handleResolveGroup(row.msgs)}
-                                    title="Resolve all"
-                                    className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-                                  >
-                                    <Check className="w-3 h-3" />
-                                  </button>
-                                </div>
-                                {isGroupExpanded && (
-                                  <div className="space-y-2 p-2 border-t border-neutral-800/40">
-                                    {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        if (row.kind === 'daily_digest') {
-                          const digestKey = `digest-${row.day}`;
-                          const isExpanded = expandedGroupKeys.has(digestKey);
-                          const summary = formatDailyDigestSummary(row.breakdown);
-                          return (
-                            <div key={digestKey}>
-                              {hasDividerBefore && dividerLabel && (
-                                <TimeDividerRow label={dividerLabel} className="mb-2" />
-                              )}
-                              <div className="border border-neutral-800/40 rounded-xl overflow-hidden opacity-60">
-                                <button
-                                  onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey); return next; })}
-                                  className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"
-                                >
-                                  <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-                                  <span className="text-xs text-neutral-500 font-medium">{row.count} stale routine{summary ? ` · ${summary}` : ''}</span>
-                                </button>
-                                {isExpanded && (
-                                  <div className="space-y-2 p-2 border-t border-neutral-800/40">
-                                    {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        }
-
-                        // Single message
-                        return (
-                          <div key={`single-${row.msg.id}`}>
-                            {hasDividerBefore && dividerLabel && (
-                              <TimeDividerRow label={dividerLabel} className="mb-2" />
-                            )}
-                            <MessageBubble key={row.msg.id} msg={row.msg} allMessages={messages} {...bubbleProps} />
-                          </div>
-                        );
-                      });
-                    })()}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Resolved messages (faded) */}
-            {insertTimeDividers(visibleResolved).map((item, idx) =>
-              item.kind === 'divider' ? (
-                <TimeDividerRow key={`divider-resolved-${idx}`} label={item.label} />
-              ) : (
-                <MessageBubble key={item.msg.id} msg={item.msg} faded allMessages={messages} {...bubbleProps} />
-              )
-            )}
-
-            {/* Resolved toggle + clear */}
-            {hiddenResolvedCount > 0 && (
-              <div className="flex justify-center gap-3 pt-1">
-                <button
-                  onClick={() => setShowResolved(true)}
-                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
-                >
-                  Show {hiddenResolvedCount} older resolved
-                </button>
-              </div>
-            )}
-            {showResolved && resolvedMessages.length > 0 && (
-              <div className="flex justify-center gap-3 pt-1">
-                <button
-                  onClick={() => setShowResolved(false)}
-                  className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
-                >
-                  Hide older resolved
-                </button>
-                <button
-                  onClick={handleBulkDeleteResolved}
-                  className="text-[11px] text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
-                >
-                  Clear all resolved
-                </button>
-              </div>
-            )}
-          </>
-        )}
-
-        {/* Scroll to bottom button */}
-        {showScrollDown && (
-          <button
-            onClick={scrollToBottom}
-            className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
-          >
-            <ArrowDown className="w-4 h-4" />
-          </button>
-        )}
-      </div>
+      <MessagesListView
+        scrollRef={scrollRef}
+        blockersRefEl={blockersRefEl}
+        questionsRefEl={questionsRefEl}
+        routineRefEl={routineRefEl}
+        dividerDismissedRef={dividerDismissedRef}
+        messages={messages}
+        loading={loading}
+        dividerTime={dividerTime}
+        totalNewCount={totalNewCount}
+        newMessageCounts={newMessageCounts}
+        highSignalOpen={highSignalOpen}
+        routineOpen={routineOpen}
+        pinnedBlockers={pinnedBlockers}
+        pinnedQuestions={pinnedQuestions}
+        otherHighSignal={otherHighSignal}
+        promotedGroups={promotedGroups}
+        remainingRoutineRows={remainingRoutineRows}
+        autoExpandedKeys={autoExpandedKeys}
+        visibleRoutineCount={visibleRoutineCount}
+        mutedRoutineCount={mutedRoutineCount}
+        visibleResolved={visibleResolved}
+        hiddenResolvedCount={hiddenResolvedCount}
+        resolvedMessages={resolvedMessages}
+        searchQuery={searchQuery}
+        showOnlyNew={showOnlyNew}
+        showResolved={showResolved}
+        routineExpanded={routineExpanded}
+        showScrollDown={showScrollDown}
+        muteActive={muteActive}
+        showTempMuteMenu={showTempMuteMenu}
+        expandedGroupKeys={expandedGroupKeys}
+        tempMutes={tempMutes}
+        bubbleProps={bubbleProps}
+        onDismissDivider={dismissDivider}
+        onShowOnlyNew={handleShowOnlyNew}
+        setExpandedGroupKeys={setExpandedGroupKeys}
+        setRoutineExpanded={setRoutineExpanded}
+        setShowResolved={setShowResolved}
+        setShowTempMuteMenu={setShowTempMuteMenu}
+        addTemporaryMute={addTemporaryMute}
+        getTop3NoisyEventTypes={getTop3NoisyEventTypes}
+        handleResolveGroup={handleResolveGroup}
+        handleBulkDeleteResolved={handleBulkDeleteResolved}
+        scrollToBottom={scrollToBottom}
+      />
 
       {/* Batch action bar */}
       {selectMode && selectedIds.size > 0 && (
