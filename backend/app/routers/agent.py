@@ -12,6 +12,7 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -1331,6 +1332,13 @@ async def claim_task(
         # Build lessons from high-iteration tasks (3+ review cycles).
         # Phase B4 (H-P6): drop status_log/plan_output. Loop reads context,
         # title, status, latest_status_message, plus classify_failure() inputs.
+        # These same rows are passed as `all_tasks` to the SR-trend analytics
+        # (compute_*_trend), which read `strategic_cycle_id` and
+        # `fix_loop_history` — both MUST be eager-loaded here, or the trend
+        # functions' `getattr(t, "strategic_cycle_id")` triggers a lazy-load
+        # outside the async greenlet (MissingGreenlet), which aborts the
+        # request transaction and 500s claim_task downstream (incident
+        # 2026-05-29; see reference_load_only_lazy_load_trap).
         lessons = []
         high_iter_stmt = (
             select(Task)
@@ -1343,10 +1351,13 @@ async def claim_task(
                     Task.context,
                     Task.latest_status_message,
                     Task.created_at,
+                    Task.updated_at,
                     Task.project_id,
                     Task.account_id,
                     Task.provider,
                     Task.model,
+                    Task.strategic_cycle_id,
+                    Task.fix_loop_history,
                 )
             )
             .where(
@@ -1885,8 +1896,26 @@ async def claim_task(
         "docs",
     }
 
-    # Inject playbook for ALL task types (outside the project_context gate)
-    project_for_playbook = await session.get(Project, task.project_id)
+    # Inject playbook for ALL task types (outside the project_context gate).
+    # Defense-in-depth: the best-effort enrichment above (SR-trend analytics,
+    # review effectiveness) runs on this same session and can abort its
+    # transaction if a future load_only deferral re-introduces a lazy-load
+    # (MissingGreenlet) — its per-call handlers swallow the error but leave the
+    # session in a failed-transaction state. The claim itself was already
+    # committed far above, so a poisoned session here must NOT 500 the claim:
+    # roll back and re-read. Without this guard a single non-critical analytics
+    # failure cascades into a PendingRollbackError that fails the whole claim
+    # (incident 2026-05-29, agent.py:1889).
+    try:
+        project_for_playbook = await session.get(Project, task.project_id)
+    except PendingRollbackError:
+        logger.warning(
+            "[AGENT] claim_task session transaction was aborted by best-effort "
+            "enrichment — rolling back and re-reading project for playbook "
+            "(claim already committed)"
+        )
+        await session.rollback()
+        project_for_playbook = await session.get(Project, task.project_id)
     if project_for_playbook and project_for_playbook.design_doc:
         task_type = (task.first_payload).get("type", "create")
         playbook_entries = {}
