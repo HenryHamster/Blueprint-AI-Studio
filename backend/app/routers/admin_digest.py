@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import or_
+from sqlalchemy import or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -191,6 +191,14 @@ async def _compute_digest(
     # Extend lookback to capture long-running tasks and 7 periods for trend history
     raw_lookback = _utcnow() - timedelta(hours=min(hours * 7, 24 * 14))
     lookback_start = min(raw_lookback, prev_window_start)
+
+    # Fast-fail guard: cap this analytics scan well under the 120s global
+    # statement_timeout so a slow query releases its pooled connection quickly
+    # instead of starving the shared pool (which stalls the orchestrator main
+    # cycle → "no progress heartbeat" hang). On timeout the cache layer serves
+    # the last good result (see digest_cache.DigestCache). Postgres-only.
+    if session.bind.dialect.name == "postgresql":
+        await session.execute(text("SET LOCAL statement_timeout = '30s'"))
 
     # --- Query tasks from extended lookback window ---
     # Load terminal tasks (COMPLETED/FAILED) for digest stats, plus any task

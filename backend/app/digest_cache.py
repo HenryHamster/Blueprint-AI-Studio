@@ -7,35 +7,61 @@ overlapping requests held ~4 GiB total and tipped the Cloud Run instance
 past its memory limit. Caching responses for a short window lets concurrent
 callers share the same compute; per-instance in-memory is enough because
 each Cloud Run container does its own pile-up.
+
+Serve-stale-on-failure (2026-05-29 incident): as the task table grew, the
+digest/health-overview compute started exceeding the 120s statement timeout.
+Because failures were not cached, every poll re-ran the failing query — a
+recompute storm that 500-ed the dashboard AND held a connection per attempt,
+starving the shared pool and stalling the orchestrator main cycle (the
+"no progress heartbeat in 198s" hang). The cache now falls back to the last
+successful result on failure and negative-caches it briefly, so a slow/failing
+compute can neither 500 the dashboard nor stampede the DB. Pair with a tight
+per-query statement_timeout in the compute path so a failing attempt releases
+its pool connection quickly.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, Awaitable, Callable, Dict, Hashable, Tuple
 
+logger = logging.getLogger(__name__)
+
 
 class DigestCache:
-    """TTL cache with in-flight dedup.
+    """TTL cache with in-flight dedup and serve-stale-on-failure.
 
     For a given key, at most one `compute_fn` runs at a time; concurrent
     callers await the same `asyncio.Future`. Completed results are cached
-    for `ttl` seconds. Exceptions propagate to all awaiters and are NOT
-    cached — the next call retries cleanly.
+    for `ttl` seconds. On a compute failure, the last successful result is
+    served (if any) and negative-cached for `stale_retry_ttl` seconds so the
+    failing compute is not re-run on every poll; the exception only
+    propagates when there is no prior good result to fall back to.
     """
 
-    def __init__(self, default_ttl: float = 15.0) -> None:
+    def __init__(
+        self, default_ttl: float = 15.0, stale_retry_ttl: float = 30.0
+    ) -> None:
         self._default_ttl = default_ttl
-        # key -> (result, expires_at)
+        # How long a served-stale result is reused before the compute is
+        # retried again — bounds recompute frequency during an outage.
+        self._stale_retry_ttl = stale_retry_ttl
+        # key -> (result, expires_at) — the fresh/negative TTL cache
         self._results: Dict[Hashable, Tuple[Any, float]] = {}
+        # key -> last successful result — never expires (bounded by the small
+        # set of distinct (project_id, lookback) keys); the stale fallback.
+        self._last_good: Dict[Hashable, Any] = {}
         # key -> Future being computed
         self._in_flight: Dict[Hashable, asyncio.Future[Any]] = {}
 
     def clear(self) -> None:
-        """Drop all cached results. In-flight futures are left alone so
-        awaiters don't get stranded; they finish and skip caching."""
+        """Drop all cached results (fresh + last-good). In-flight futures are
+        left alone so awaiters don't get stranded; they finish and skip
+        caching."""
         self._results.clear()
+        self._last_good.clear()
 
     async def get_or_compute(
         self,
@@ -61,6 +87,29 @@ class DigestCache:
             result = await compute_fn()
         except BaseException as exc:
             self._in_flight.pop(key, None)
+            # Serve-stale-on-failure: a slow/timing-out compute must not 500
+            # the dashboard or trigger a recompute storm. If we have a prior
+            # successful result, return it and negative-cache it for
+            # stale_retry_ttl so the next poll doesn't immediately re-run the
+            # failing compute (which would re-starve the connection pool).
+            stale = self._last_good.get(key)
+            if stale is not None and not isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt)
+            ):
+                logger.warning(
+                    "[DIGEST_CACHE] compute failed for key=%r; serving stale "
+                    "result and negative-caching for %.0fs: %s",
+                    key,
+                    self._stale_retry_ttl,
+                    exc,
+                )
+                self._results[key] = (
+                    stale,
+                    time.monotonic() + self._stale_retry_ttl,
+                )
+                if not future.done():
+                    future.set_result(stale)
+                return stale
             if not future.done():
                 future.set_exception(exc)
                 # Mark as retrieved so asyncio doesn't log
@@ -72,6 +121,7 @@ class DigestCache:
         else:
             effective_ttl = self._default_ttl if ttl is None else ttl
             self._results[key] = (result, time.monotonic() + effective_ttl)
+            self._last_good[key] = result
             self._in_flight.pop(key, None)
             if not future.done():
                 future.set_result(result)

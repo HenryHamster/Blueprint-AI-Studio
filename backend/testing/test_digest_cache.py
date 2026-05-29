@@ -135,3 +135,83 @@ async def test_cache_clear_drops_cached_results():
     cache.clear()
     await cache.get_or_compute("k", compute)
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_serves_stale_on_compute_failure():
+    """After a successful compute, a later failure serves the last good result
+    instead of raising — the 2026-05-29 anti-death-spiral guard (a digest query
+    that times out must not 500 the dashboard)."""
+    cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    calls = 0
+
+    async def compute():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"value": "good"}
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    assert await cache.get_or_compute("k", compute) == {"value": "good"}
+    await asyncio.sleep(0.1)  # expire the fresh entry
+    # Compute now fails, but the last good result is served (no exception).
+    assert await cache.get_or_compute("k", compute) == {"value": "good"}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_negative_caches_stale_to_break_recompute_storm():
+    """A served-stale result is reused for stale_retry_ttl so the failing
+    compute is not re-run on every poll (which would re-starve the pool)."""
+    cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    calls = 0
+
+    async def compute():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "good"
+        raise RuntimeError("timeout")
+
+    assert await cache.get_or_compute("k", compute) == "good"
+    await asyncio.sleep(0.1)
+    # First post-expiry call recomputes (calls=2), fails, serves + caches stale.
+    assert await cache.get_or_compute("k", compute) == "good"
+    assert calls == 2
+    # Subsequent calls within stale_retry_ttl serve stale WITHOUT recomputing.
+    assert await cache.get_or_compute("k", compute) == "good"
+    assert await cache.get_or_compute("k", compute) == "good"
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_cache_propagates_when_no_prior_good_result():
+    """With no last-good result to fall back to, the exception propagates
+    (preserves the original retry-clean behavior)."""
+    cache = DigestCache(default_ttl=60)
+
+    async def boom():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await cache.get_or_compute("k", boom)
+
+
+@pytest.mark.asyncio
+async def test_cache_does_not_serve_stale_on_cancellation():
+    """CancelledError must propagate even with a prior good result — a
+    cancelled request is not a compute failure to mask with stale data."""
+    cache = DigestCache(default_ttl=0.05, stale_retry_ttl=60)
+    calls = 0
+
+    async def compute():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "good"
+        raise asyncio.CancelledError()
+
+    assert await cache.get_or_compute("k", compute) == "good"
+    await asyncio.sleep(0.1)
+    with pytest.raises(asyncio.CancelledError):
+        await cache.get_or_compute("k", compute)

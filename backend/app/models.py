@@ -1028,6 +1028,19 @@ class Task(SQLModel, table=True):
             postgresql_where=text("post_commit_pending = true"),
             sqlite_where=text("post_commit_pending = 1"),
         ),
+        # Leading-``created_at`` index for the global (project_id=None) admin
+        # analytics scans — the digest (admin_digest._compute_digest) and
+        # health-overview (admin_health._compute_health_overview) filter
+        # ``created_at >= window`` over all projects. Every other composite has
+        # created_at TRAILING (status/project/provider/account first), so the
+        # global time-window scan had no usable index and full-scanned the
+        # whole table — as the table grew it crossed the 120s statement_timeout
+        # (incident 2026-05-29: digest timeout storm → pool starvation →
+        # orchestrator hang). A leading-created_at range scan bounds the work to
+        # the recent window. Postgres-only via alembic 0129 CONCURRENTLY DDL;
+        # this metadata Index registers the name for
+        # test_model_indexes_covered_by_migrations.
+        Index("ix_task_created_at", "created_at"),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in

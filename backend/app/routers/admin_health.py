@@ -6,6 +6,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -120,6 +121,12 @@ async def _compute_health_overview(
     session: AsyncSession,
 ) -> Dict[str, Any]:
     """Compute the unified health overview payload (cached by caller)."""
+    # Fast-fail guard (see admin_digest._compute_digest): cap this scan under
+    # the 120s global statement_timeout so a slow query releases its pooled
+    # connection quickly rather than starving the shared pool; the cache layer
+    # serves the last good result on timeout. Postgres-only.
+    if session.bind.dialect.name == "postgresql":
+        await session.execute(text("SET LOCAL statement_timeout = '30s'"))
     now = _utcnow()
     actionable_issues: List[Dict[str, Any]] = []
 
