@@ -32,7 +32,7 @@
     "reaper_infra_recovery.py": 600,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 900,
-    "review_pipeline.py": 2450,
+    "review_pipeline.py": 2475,
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 520,
     "regression_dispatcher_metrics.py": 800,

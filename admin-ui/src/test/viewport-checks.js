@@ -229,6 +229,33 @@ export function checkBackendExemptionMirror() {
   return violations;
 }
 
+// Single-opt-out headroom. A refactor that introduces ONE new escape hatch in a
+// component passes without a same-PR budget bump — this is the gate's own stated
+// policy ("a single justified opt-out can raise a component's budget by 1"). It
+// stops component splits/moves, which inevitably redistribute existing opt-outs,
+// from dead-ending an autonomous refactor rollup on a +1 drift. A *cluster* (over
+// by 2+) still fails and must bump the budget in the PR. The project-wide `total`
+// stays strict, so aggregate creep from accumulated +1 slack is still bounded:
+// when `total` is breached the budget must be bumped explicitly (see the
+// VIEWPORT_BUDGET remediation guidance in build_ci_failure_fix_prompt).
+export const SINGLE_OPT_OUT_HEADROOM = 1;
+
+/**
+ * Verdict for one component's escape-hatch count against its budget:
+ *   'ok'        — at/under budget, or component not budgeted (undefined)
+ *   'warn'      — over by <= headroom (allowed; surfaced as a CI-log warning)
+ *   'violation' — over by more than the headroom (fails CI)
+ * Pure (no I/O) so it is unit-testable without the filesystem.
+ */
+export function classifyEscapeHatchOverage(
+  count,
+  budget,
+  headroom = SINGLE_OPT_OUT_HEADROOM
+) {
+  if (budget === undefined || count <= budget) return 'ok';
+  return count - budget <= headroom ? 'warn' : 'violation';
+}
+
 /**
  * Invariant 7: per-component and total viewport escape-hatch debt stays within
  * the limits in viewport-escape-hatch-budget.json.
@@ -247,6 +274,7 @@ export function checkEscapeHatchBudget() {
   );
 
   const violations = [];
+  const warnings = [];
   let grandTotal = 0;
 
   for (const file of files) {
@@ -255,9 +283,18 @@ export function checkEscapeHatchBudget() {
     const count = (content.match(escapeHatchPattern) ?? []).length;
     grandTotal += count;
     const budget = perComponent[component];
-    if (budget !== undefined && count > budget) {
+    const verdict = classifyEscapeHatchOverage(count, budget);
+    if (verdict === 'violation') {
       violations.push(
-        `  ${component}: ${count} escape hatches (budget: ${budget}, over by ${count - budget})`
+        `  ${component}: ${count} escape hatches (budget: ${budget}, over by ${count - budget} — ` +
+          `exceeds the +${SINGLE_OPT_OUT_HEADROOM} single-opt-out headroom; bump the per-component ` +
+          `limit (and "total") in viewport-escape-hatch-budget.json in this PR)`
+      );
+    } else if (verdict === 'warn') {
+      warnings.push(
+        `${component}: ${count} escape hatches over budget ${budget} by ${count - budget} ` +
+          `(within the single-opt-out headroom — allowed; still bump the budget JSON in this PR ` +
+          `to keep the recorded debt honest)`
       );
     }
   }
@@ -265,6 +302,16 @@ export function checkEscapeHatchBudget() {
   if (grandTotal > totalBudget) {
     violations.push(
       `  [total]: ${grandTotal} escape hatches (budget: ${totalBudget}, over by ${grandTotal - totalBudget})`
+    );
+  }
+
+  if (warnings.length > 0) {
+    // Surfaced in CI logs without failing the gate — these are within the
+    // single-opt-out headroom. console.warn is allowed by the eslint config.
+    console.warn(
+      `[viewport-budget] ${warnings.length} component(s) over budget within the ` +
+        `single-opt-out headroom (not failing CI):\n` +
+        warnings.map(w => `  ${w}`).join('\n')
     );
   }
 

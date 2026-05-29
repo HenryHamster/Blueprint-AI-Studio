@@ -98,6 +98,31 @@ class TestGhTokenPromptPattern:
         assert "check-runs" not in prompt
         assert "gh-token" not in prompt
 
+    def test_build_ci_failure_fix_prompt_adds_viewport_budget_remediation(self):
+        # When CI fails on the viewport escape-hatch budget, the prompt must
+        # spell out the bump-the-JSON remediation — the agent can't infer this
+        # cross-file invariant and otherwise flails (frontend non-convergence).
+        ci_errors = (
+            "Viewport escape-hatch debt exceeds the budget in "
+            "admin-ui/src/test/viewport-escape-hatch-budget.json.\n"
+            "  CatchUpPanel: 3 escape hatches (budget: 1, over by 2)"
+        )
+        prompt = build_ci_failure_fix_prompt(
+            pr_number=7, base_branch="main", ci_errors=ci_errors
+        )
+        assert "viewport-escape-hatch-budget.json" in prompt
+        assert "bump" in prompt.lower()
+        assert "total" in prompt.lower()
+
+    def test_build_ci_failure_fix_prompt_no_viewport_hint_for_unrelated_errors(self):
+        prompt = build_ci_failure_fix_prompt(
+            pr_number=8,
+            base_branch="main",
+            ci_errors="FAILED testing/test_foo.py::test_bar - AssertionError",
+        )
+        assert "escape-hatch" not in prompt.lower()
+        assert "viewport-escape-hatch-budget.json" not in prompt
+
 
 # ── _max_review_iterations ────────────────────────────────────────────────────
 

@@ -7,6 +7,8 @@ import {
   checkBackendEslintPattern,
   checkBackendExemptionMirror,
   checkEscapeHatchBudget,
+  classifyEscapeHatchOverage,
+  SINGLE_OPT_OUT_HEADROOM,
 } from './viewport-checks.js';
 
 describe('viewport test coverage invariant', () => {
@@ -150,5 +152,31 @@ A single justified opt-out can raise a component's budget by 1; a cluster requir
         : '';
 
     expect(violations, errorMessage).toEqual([]);
+  });
+});
+
+describe('escape-hatch single-opt-out headroom (classifyEscapeHatchOverage)', () => {
+  // A refactor that splits/moves a component inevitably redistributes existing
+  // escape hatches. The headroom lets a single new opt-out through (surfaced as
+  // a CI-log warning) so the rollup doesn't dead-end; a cluster still fails and
+  // must bump the budget JSON in the PR (see build_ci_failure_fix_prompt).
+  it('is ok at or under budget', () => {
+    expect(classifyEscapeHatchOverage(0, 1)).toBe('ok');
+    expect(classifyEscapeHatchOverage(1, 1)).toBe('ok');
+  });
+
+  it('treats an unlisted component (undefined budget) as ok', () => {
+    expect(classifyEscapeHatchOverage(5, undefined)).toBe('ok');
+  });
+
+  it('warns (does NOT fail) when over by exactly the single-opt-out headroom', () => {
+    expect(SINGLE_OPT_OUT_HEADROOM).toBe(1);
+    expect(classifyEscapeHatchOverage(2, 1)).toBe('warn');
+    expect(classifyEscapeHatchOverage(4, 3)).toBe('warn');
+  });
+
+  it('is a violation when over by more than the headroom (a cluster)', () => {
+    expect(classifyEscapeHatchOverage(3, 1)).toBe('violation');
+    expect(classifyEscapeHatchOverage(10, 5)).toBe('violation');
   });
 });

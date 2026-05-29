@@ -96,6 +96,28 @@ def build_ci_failure_fix_prompt(
             "| jq '.data.details[]'`) "
             "to confirm which checks are still failing on the latest head.\n"
         )
+    # Viewport escape-hatch budget is a self-imposed CI gate that refactors trip
+    # structurally (splitting/moving a component redistributes its viewport
+    # opt-outs past the per-component cap). The agent can't be expected to know
+    # this cross-file invariant, so spell out the remediation when the failure
+    # signature is present — otherwise the fix flails (the recurring frontend
+    # non-convergence trap).
+    viewport_budget_hint = ""
+    _ci_lower = (ci_errors or "").lower()
+    if "escape-hatch" in _ci_lower and "budget" in _ci_lower:
+        viewport_budget_hint = (
+            "\nVIEWPORT ESCAPE-HATCH BUDGET — this specific failure is NOT a code bug. "
+            "'Viewport escape-hatch debt exceeds the budget' means a component has more viewport "
+            "opt-outs (data-viewport-allow-overflow / -truncation / -small-target, or an "
+            "`eslint-disable ... viewport` comment) than its cap in "
+            "admin-ui/src/test/viewport-escape-hatch-budget.json — almost always because this "
+            "refactor split or moved a component, redistributing existing opt-outs. The fix is to "
+            "BUMP that component's per-component limit (and the top-level `total`) in that JSON by "
+            "the 'over by N' amount shown in the failure, IN THIS PR. Do NOT delete the opt-outs to "
+            "force the count down unless they are genuinely removable without reintroducing "
+            "overflow/truncation. The budget is a visible, reviewable signal, not a ratchet "
+            "(a single new opt-out is already tolerated automatically).\n"
+        )
     return (
         f"PR #{pr_number} is blocked by failing CI checks (code review already approved).\n\n"
         f"IMPORTANT — verify current state before acting. Between when this task was spawned and "
@@ -106,7 +128,8 @@ def build_ci_failure_fix_prompt(
         f"conflicts surface, resolve every marker (preserve the intent of both branches) and continue "
         f"the rebase before touching anything else. A conflicting PR cannot merge no matter how green CI is.\n"
         f"{check_runs_hint}"
-        f"{failing_tests_block}\n"
+        f"{failing_tests_block}"
+        f"{viewport_budget_hint}\n"
         f"CI errors captured at spawn time:\n{ci_errors[:2000]}\n\n"
         f"Diagnose before fixing. A 'new' test failure can be: (a) your diff regressed, "
         f"(b) a sibling PR broke the test — mock-signature drift or fixture change, or (c) flake. "
