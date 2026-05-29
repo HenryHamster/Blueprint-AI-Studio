@@ -672,6 +672,20 @@ describe('Saved Views storage', () => {
 });
 
 describe('Age-based routine collapse (collapseStaleRoutineRows)', () => {
+  // Freeze the clock to a fixed mid-day UTC time so the now-relative fixtures
+  // (e.g. `Date.now() - 20min`) never straddle a UTC date boundary. Without
+  // this, test (2)'s 3-message burst lands on two calendar dates when CI runs
+  // in the 00:00–00:20 UTC window; groupRoutineMessages buckets by calendar
+  // date, so it splits the burst into sub-3 groups that render 'single' → a
+  // daily flake that blocked any PR whose frontend CI ran just after midnight.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   const makeMsg = (id: string, et: string, msSinceEpoch: number) => ({
     id,
     context: { event_type: et },
