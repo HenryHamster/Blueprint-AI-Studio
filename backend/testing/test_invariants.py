@@ -1243,6 +1243,30 @@ class TestBackendModuleSizeGuardrails:
     def test_playbook_auto(self):
         self._check_module("playbook_auto.py")
 
+    def test_models(self):
+        self._check_module("models.py")
+
+    def test_shared_state(self):
+        self._check_module("shared_state.py")
+
+    def test_strategic_spawning(self):
+        self._check_module("strategic_spawning.py")
+
+    def test_failure_classification(self):
+        self._check_module("failure_classification.py")
+
+    def test_notification_dispatch(self):
+        self._check_module("notification_dispatch.py")
+
+    def test_regression_signal_evaluators(self):
+        self._check_module("regression_signal_evaluators.py")
+
+    def test_digest_metrics(self):
+        self._check_module("digest_metrics.py")
+
+    def test_ci_completion(self):
+        self._check_module("ci_completion.py")
+
 
 _AGENT_SRC_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
@@ -1288,6 +1312,9 @@ class TestAgentModuleSizeGuardrails:
             "json-extract.ts",
             "workspacePrep.ts",
             "reset.ts",
+            "providers/runners.ts",
+            "prompts/context-prefix.ts",
+            "handlers/fresh-reviewer.ts",
         ):
             self._check_agent(relative_path)
 
@@ -1480,6 +1507,138 @@ class TestFrontendSizeGuardrails:
 
     def test_task_duration_widget(self):
         self._check_frontend("components/TaskDurationWidget.tsx")
+
+    def test_pipeline_regressions_panel(self):
+        self._check_frontend("components/PipelineRegressionsPanel.tsx")
+
+    def test_task_detail_drawer_meta(self):
+        self._check_frontend("components/TaskDetailDrawerMeta.tsx")
+
+    def test_api_ts(self):
+        self._check_frontend("api.ts")
+
+    def test_sr_trend_breakdown(self):
+        self._check_frontend("components/SrTrendBreakdown.tsx")
+
+
+# ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
+#
+# The per-file guardrails above only constrain files explicitly listed in
+# module_size_limits.json. That leaves a structural hole: a newly-created
+# large file that nobody adds to the config is invisible to the guardrail and
+# can grow without limit. This meta-test closes the complementary direction —
+# it walks each source tree and FAILS if any non-test source file exceeds a
+# generous line threshold while having NO entry in its section of the config.
+# The remedy is to add a cap entry (current size + modest headroom), making
+# the guardrail system self-extending.
+
+# Generous threshold: high enough to catch only genuine monoliths, not routine
+# files. Any uncapped file over this must gain an explicit, reviewed cap entry.
+_COVERAGE_THRESHOLD = 1500
+
+
+def _missing_cap_message(offenders: list, section: str) -> str:
+    """Direct the author to add a cap entry for each uncapped oversized file.
+    Distinct from _size_breach_message: the remedy here is to ADD a JSON key
+    (the file has no cap at all), not to bump an existing one."""
+    lines = "\n".join(
+        f"  - {rel} has {count} lines (threshold: {_COVERAGE_THRESHOLD})"
+        for rel, count in offenders
+    )
+    return (
+        f"{len(offenders)} source file(s) exceed {_COVERAGE_THRESHOLD} lines "
+        f"with NO cap entry under '{section}' in "
+        f"backend/testing/module_size_limits.json:\n\n"
+        f"{lines}\n\n"
+        f"A large file with no cap is invisible to the size guardrails and can\n"
+        f"grow without limit. Add an entry for each file above under the\n"
+        f"'{section}' section, set to its current line count plus modest\n"
+        f"headroom (e.g. current + 100). This is a reviewed config edit, not a\n"
+        f"refactor — do NOT extract or restructure the source in this PR."
+    )
+
+
+def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> list:
+    """Walk ``root`` collecting (tree_relative_path, line_count) for every file
+    whose name ends in one of ``suffixes``, is not excluded by ``is_excluded``,
+    exceeds ``_COVERAGE_THRESHOLD`` lines, and has no key in ``section``.
+    Tree-relative paths use forward slashes to match the JSON key convention."""
+    offenders = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if not name.endswith(suffixes):
+                continue
+            abs_path = os.path.join(dirpath, name)
+            rel_path = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            if is_excluded(rel_path):
+                continue
+            with open(abs_path) as f:
+                count = len(f.readlines())
+            if count > _COVERAGE_THRESHOLD and rel_path not in section:
+                offenders.append((rel_path, count))
+    offenders.sort(key=lambda item: item[1], reverse=True)
+    return offenders
+
+
+def _is_frontend_excluded(rel_path: str) -> bool:
+    return (
+        rel_path.endswith((".test.ts", ".test.tsx", ".d.ts"))
+        or rel_path.startswith("test/")
+    )
+
+
+def _is_agent_excluded(rel_path: str) -> bool:
+    return rel_path.endswith((".test.ts", ".d.ts"))
+
+
+class TestSizeGuardrailCoverage:
+    """Meta-guardrail: no large source file may escape having a cap entry.
+
+    Complements the per-file guardrail classes (which only enforce files that
+    ARE listed). Each test below scans one source tree; if it finds an
+    oversized file with no cap key, it fails with instructions to add one.
+    Skip semantics mirror the per-file classes exactly so CI behavior is
+    unchanged (backend always runs; frontend/agent skip when their src roots
+    are absent, and frontend also skips under SKIP_FRONTEND_SIZE_GUARDRAILS=1).
+    """
+
+    def test_backend_no_uncapped_large_file(self):
+        app_root = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "app")
+        )
+        offenders = _scan_uncapped(
+            app_root, MODULE_SIZE_LIMITS, (".py",), lambda _rel: False
+        )
+        assert not offenders, _missing_cap_message(offenders, "backend")
+
+    def test_frontend_no_uncapped_large_file(self):
+        import pytest
+
+        if os.getenv("SKIP_FRONTEND_SIZE_GUARDRAILS") == "1":
+            pytest.skip("SKIP_FRONTEND_SIZE_GUARDRAILS=1 set")
+        if _ADMIN_UI_SRC_ROOT is None:
+            pytest.skip(
+                "admin-ui/src not available in this test environment "
+                "(CI docker context is ./backend; mount via test-backend.sh "
+                "for local enforcement)"
+            )
+        offenders = _scan_uncapped(
+            _ADMIN_UI_SRC_ROOT,
+            FRONTEND_SIZE_LIMITS,
+            (".ts", ".tsx"),
+            _is_frontend_excluded,
+        )
+        assert not offenders, _missing_cap_message(offenders, "frontend")
+
+    def test_agent_no_uncapped_large_file(self):
+        import pytest
+
+        if _AGENT_SRC_ROOT is None:
+            pytest.skip("agent/src not available in this test environment")
+        offenders = _scan_uncapped(
+            _AGENT_SRC_ROOT, AGENT_SIZE_LIMITS, (".ts",), _is_agent_excluded
+        )
+        assert not offenders, _missing_cap_message(offenders, "agent")
 
 
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
