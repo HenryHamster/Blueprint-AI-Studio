@@ -11,6 +11,7 @@ import {
   FreshReviewerTrendBreakdown,
   SrScopeDriftVsExpansionCard,
   SrReviewerDisagreementsPanel,
+  SrReviewerDisagreementDrillPanel,
   MissRateSparkline,
   computeTargetHealth,
   type SrTrendData,
@@ -19,6 +20,7 @@ import {
   type FreshReviewerTrend,
   type SrScopeDriftVsExpansion,
   type SrReviewerDisagreementsData,
+  type SrReviewerDisagreementTasksResult,
   type SrUnhandledEdgesTask,
 } from './SrTrendBreakdown';
 
@@ -1588,6 +1590,43 @@ describe('SrReviewerDisagreementsPanel severity stratification', () => {
     );
     const badge = container.querySelector('[title*="max: CRITICAL"]');
     expect(badge).not.toBeNull();
+  });
+});
+
+function makeDrillFn(result: SrReviewerDisagreementTasksResult) {
+  return vi.fn().mockResolvedValue(result);
+}
+
+function makeDrillResult(items: SrReviewerDisagreementTasksResult['items'], total?: number): SrReviewerDisagreementTasksResult {
+  return { items, total: total ?? items.length, page: 0, page_size: 20 };
+}
+
+const SAMPLE_TASK = { task_id: 't1', title: 'Fix the bug', task_type: 'fix', scope: 'small', created_at: '2026-01-01T00:00:00Z', pr_url: null, category: 'correctness', severity: 'HIGH', description: 'Reviewer flagged null check.' };
+
+describe('SrReviewerDisagreementDrillPanel', () => {
+  it('shows empty state when no tasks returned', async () => {
+    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult([]))} />);
+    expect(await screen.findByTestId('sr-disagreement-drill-empty')).toBeInTheDocument();
+  });
+
+  it('renders a single task row with title and severity', async () => {
+    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult([SAMPLE_TASK]))} />);
+    expect(await screen.findByText('Fix the bug')).toBeInTheDocument();
+    expect(screen.getByText('HIGH')).toBeInTheDocument();
+  });
+
+  it('calls onSelectTask with task_id on row click', async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult([SAMPLE_TASK]))} onSelectTask={onSelect} />);
+    await user.click(await screen.findByText('Fix the bug'));
+    expect(onSelect).toHaveBeenCalledWith('t1');
+  });
+
+  it('shows pagination controls when total exceeds page size', async () => {
+    const items = Array.from({ length: 20 }, (_, i) => ({ ...SAMPLE_TASK, task_id: `t${i}`, title: `Task ${i}` }));
+    render(<SrReviewerDisagreementDrillPanel category="correctness" taskType="fix" days={14} fetchFn={makeDrillFn(makeDrillResult(items, 45))} />);
+    expect(await screen.findByText('1/3')).toBeInTheDocument();
   });
 });
 

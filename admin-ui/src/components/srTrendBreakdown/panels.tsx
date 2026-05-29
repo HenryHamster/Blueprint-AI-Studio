@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import {
   ExampleList,
   deltaColorClass,
@@ -15,6 +15,8 @@ import type {
   SrMissExample,
   SrReviewerDisagreement,
   SrReviewerDisagreementsData,
+  SrReviewerDisagreementTask,
+  SrReviewerDisagreementTasksResult,
   SrScopeDriftVsExpansion,
   SrTrendData,
 } from './types';
@@ -426,6 +428,65 @@ export function SrReviewerDisagreementsPanel({
           </div>
         );
       })()}
+    </div>
+  );
+}
+
+const _DRILL_PAGE_SIZE = 20;
+
+export function SrReviewerDisagreementDrillPanel({
+  category, taskType, days, fetchFn, onSelectTask,
+}: {
+  category: string;
+  taskType: string;
+  days: number;
+  fetchFn: (p: { category: string; task_type: string; days: number; page: number; page_size: number }) => Promise<SrReviewerDisagreementTasksResult>;
+  onSelectTask?: (taskId: string) => void;
+}) {
+  const [items, setItems] = useState<SrReviewerDisagreementTask[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [page, setPage] = useState(1);
+  useEffect(() => {
+    let alive = true;
+    async function load() {
+      setLoading(true);
+      try {
+        const r = await fetchFn({ category, task_type: taskType, days, page: page - 1, page_size: _DRILL_PAGE_SIZE });
+        if (alive) { setItems(r.items); setTotal(r.total); }
+      } finally {
+        if (alive) setLoading(false);
+      }
+    }
+    load();
+    return () => { alive = false; };
+  }, [fetchFn, category, taskType, days, page]);
+  const totalPages = Math.ceil(total / _DRILL_PAGE_SIZE);
+  if (loading && !items.length) return <div className="text-xs text-neutral-500 p-2">Loading…</div>;
+  if (!items.length) return <div data-testid="sr-disagreement-drill-empty" className="text-xs text-neutral-500 p-2">No tasks found.</div>;
+  return (
+    <div data-testid="sr-disagreement-drill-panel">
+      {items.map(t => (
+        // eslint-disable-next-line viewport/min-touch-target
+        <div key={t.task_id} className="py-1 border-b border-neutral-800 text-xs cursor-pointer hover:bg-neutral-800/30" onClick={() => onSelectTask?.(t.task_id)}>
+          <div className="font-medium text-neutral-200 truncate">{t.title}</div>
+          <div className="text-neutral-500 flex gap-2 flex-wrap">
+            <span>{t.task_type}</span>
+            {t.scope && <span>{t.scope}</span>}
+            <span>{t.severity}</span>
+            <span className="ml-auto">{new Date(t.created_at).toLocaleDateString()}</span>
+            {t.pr_url && <a href={t.pr_url} onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline" target="_blank" rel="noreferrer">PR</a>}
+          </div>
+          {t.description && <div className="text-neutral-600 truncate">{t.description}</div>}
+        </div>
+      ))}
+      {totalPages > 1 && (
+        <div className="flex gap-2 mt-1 text-xs text-neutral-500">
+          <button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="disabled:opacity-40">prev</button>
+          <span>{page}/{totalPages}</span>
+          <button disabled={page >= totalPages} onClick={() => setPage(p => p + 1)} className="disabled:opacity-40">next</button>
+        </div>
+      )}
     </div>
   );
 }

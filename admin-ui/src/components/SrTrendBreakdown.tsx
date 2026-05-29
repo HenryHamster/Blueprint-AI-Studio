@@ -50,6 +50,8 @@ export type {
   SrMissedTask,
   SrReviewerDisagreement,
   SrReviewerDisagreementsData,
+  SrReviewerDisagreementTask,
+  SrReviewerDisagreementTasksResult,
   SrReviewerFinding,
   SrScopeDriftVsExpansion,
   SrSeverityBucket,
@@ -73,6 +75,7 @@ export {
   EdgesTrendBreakdown,
   FreshReviewerTrendBreakdown,
   SrReviewerDisagreementsPanel,
+  SrReviewerDisagreementDrillPanel,
   SrScopeDriftVsExpansionCard,
 } from './srTrendBreakdown/panels';
 export { SrMissedRetrospective, SrUnhandledEdgesRetrospective } from './srTrendBreakdown/retrospectives';

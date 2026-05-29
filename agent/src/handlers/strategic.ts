@@ -25,8 +25,6 @@ import {
   runThinkerWithGate,
 } from '../prompts/thinker.js';
 import {
-  calcMessageAge,
-  parseResearchContext,
   buildStrategicCompletionLogs,
   readProgressArtifact,
   buildRejectedProposalsSection,
@@ -37,6 +35,17 @@ import {
   buildEfficiencySnapshotSection,
   buildPortfolioComposition,
 } from './research-plan.js';
+import {
+  buildSystemMaturitySection,
+  buildDriftSection,
+  buildOutcomeSection,
+  buildClockAndRecentWorkSection,
+  buildConversationThreadSection,
+  buildFeedbackSection,
+  buildOpenMessagesText,
+  buildDirSummaryText,
+  buildDirHealthSummary,
+} from './strategic-sections.js';
 
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -91,388 +100,35 @@ export async function handleStrategic(
       ? payload.drift_signals as Record<string, unknown>
       : null;
 
-    let systemMaturitySection = '';
-    if (systemMaturity.length > 0) {
-      const lines: string[] = ['\n## System Maturity'];
-      lines.push('Per-system health snapshots from the last self_audit run. Use these to calibrate which systems need attention vs which can absorb new feature work.');
-      for (const s of systemMaturity) {
-        const sid = strVal(s.system_id as string, '?');
-        const score = typeof s.score === 'number' ? s.score.toFixed(2) : '?';
-        const mode = strVal(s.recommended_mode as string, 'unknown');
-        const audited = strVal(s.last_audited_at as string, 'never');
-        lines.push(`\n### ${sid}  score=${score}  recommended_mode=${mode}  last_audited=${audited}`);
-        if (s.top_issues && Array.isArray(s.top_issues) && (s.top_issues as unknown[]).length > 0) {
-          lines.push('Top issues: ' + (s.top_issues as string[]).join('; '));
-        }
-      }
-      systemMaturitySection = lines.join('\n');
-    }
-
-    // Format an unknown scalar (number/string/bool) for embedding into a template literal.
-    const fmtScalar = (v: unknown, fallback = '?'): string => {
-      if (v === undefined || v === null) return fallback;
-      if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
-      return JSON.stringify(v);
-    };
-
-    let driftSection = '';
-    if (driftSignals) {
-      const byDir = driftSignals.by_direction as Record<string, Record<string, unknown>> | undefined;
-      const bySys = driftSignals.by_system as Record<string, Record<string, unknown>> | undefined;
-      const flaggedDirs = byDir ? Object.entries(byDir).filter(([, sig]) => sig.over_claim_flag || sig.stalled_despite_churn_flag) : [];
-      const flaggedSys = bySys ? Object.entries(bySys).filter(([, sig]) => sig.over_claim_flag || sig.stalled_despite_churn_flag) : [];
-      if (flaggedDirs.length > 0 || flaggedSys.length > 0) {
-        const lines: string[] = ['\n## Drift Signals (short-window claim-vs-shipped consistency)'];
-        lines.push(`Window: ${strVal(driftSignals.window_days as string, '?')} days.`);
-        lines.push('Directions or systems where claimed changes significantly exceed merged PRs — a signal of over-optimistic task output or stalled work.');
-        for (const [did, sig] of flaggedDirs) {
-          const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
-          lines.push(`- Direction ${did}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
-        }
-        for (const [sid, sig] of flaggedSys) {
-          const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
-          lines.push(`- System ${sid}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
-        }
-        driftSection = lines.join('\n');
-      }
-    }
+    const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
+    const driftSection = buildDriftSection(driftSignals);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
 
-    // Build outcome evaluation section
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
-    let outcomeSection = '';
-    if (outcomeEval && typeof outcomeEval === 'object') {
-      const window = outcomeEval.window as Record<string, unknown> | undefined;
-      const overall = outcomeEval.overall as Record<string, unknown> | undefined;
-      const systems = Array.isArray(outcomeEval.systems) ? outcomeEval.systems as Array<Record<string, unknown>> : [];
-      const dirOutcomes = Array.isArray(outcomeEval.directions) ? outcomeEval.directions as Array<Record<string, unknown>> : [];
-
-      const lines: string[] = [];
-      if (window) {
-        lines.push(`# Outcome evaluation (since vision rev ${fmtScalar(window.vision_revision, '0')})`);
-        lines.push(`Window: ${strVal(window.from as string, '?')} to ${strVal(window.to as string, '?')}`);
-      }
-      if (overall) {
-        const sr = typeof overall.success_rate === 'number' ? Math.round(overall.success_rate * 100) : '?';
-        const productRatioStr = typeof overall.product_ratio === 'number' ? `, product ratio: ${Math.round((overall.product_ratio) * 100)}%` : '';
-        lines.push(`Overall: ${fmtScalar(overall.cycles, '0')} cycles, ${fmtScalar(overall.merged, '0')} merged, ${fmtScalar(overall.failed, '0')} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')}${productRatioStr})`);
-      }
-
-      if (systems.length > 0) {
-        lines.push('');
-        lines.push('## System progress');
-        lines.push('Each vision system compared against actual direction outcomes:');
-        for (const sys of systems) {
-          const gap = (sys.directions_count as number) === 0 ? ' [NO DIRECTIONS MAPPED]' : '';
-          lines.push(`- ${strVal(sys.name as string)} (${strVal(sys.id as string)}): planned=${strVal(sys.planned_status as string)}, ${fmtScalar(sys.directions_count, '0')} directions, ${fmtScalar(sys.merged, '0')} merged, ${fmtScalar(sys.failed, '0')} failed${gap}`);
-        }
-      }
-
-      if (dirOutcomes.length > 0) {
-        lines.push('');
-        lines.push('## Direction outcomes');
-        lines.push('What each direction actually produced. Use confirmed findings to judge real impact:');
-        for (const d of dirOutcomes) {
-          const sysTag = d.system_id ? ` (system: ${strVal(d.system_id as string)})` : '';
-          lines.push(`\n### ${strVal(d.text as string)} (${strVal(d.id as string)})${sysTag} [${strVal(d.status as string)}]`);
-          lines.push(`Stats: ${fmtScalar(d.cycles, '0')} cycles, ${fmtScalar(d.merged, '0')} merged, ${fmtScalar(d.failed, '0')} failed`);
-
-          const typeDist = d.type_distribution as Record<string, number> | undefined;
-          if (typeDist && Object.keys(typeDist).length > 0) {
-            const typeParts = Object.entries(typeDist).sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c} ${t}`);
-            const productRatio = typeof d.product_ratio === 'number' ? ` (${Math.round((d.product_ratio) * 100)}% product)` : '';
-            lines.push(`Type mix: ${typeParts.join(', ')}${productRatio}`);
-          }
-
-          const lifetime = d.lifetime as Record<string, number> | undefined;
-          if (lifetime) {
-            lines.push(`Lifetime: ${lifetime.cycles || 0} total cycles, ${lifetime.merged || 0} total merged`);
-          }
-
-          const confirmedFindingCount = typeof d.confirmed_finding_count === 'number' ? d.confirmed_finding_count : null;
-          const confirmedFindingTrend = typeof d.confirmed_finding_trend === 'string' ? d.confirmed_finding_trend : null;
-          if (confirmedFindingCount !== null) {
-            let countLine = `Cumulative confirmed findings: ${confirmedFindingCount}`;
-            if (confirmedFindingTrend) {
-              countLine += ` (${confirmedFindingTrend})`;
-            }
-            lines.push(countLine);
-          }
-
-          const confirmed = Array.isArray(d.confirmed) ? d.confirmed as string[] : [];
-          if (confirmed.length > 0) {
-            lines.push(`Confirmed (shipped): ${confirmed.join('; ')}`);
-          }
-          const proposed = Array.isArray(d.proposed) ? d.proposed as string[] : [];
-          if (proposed.length > 0) {
-            lines.push(`Proposed (in-flight): ${proposed.join('; ')}`);
-          }
-          const failedApproaches = Array.isArray(d.failed_approaches) ? d.failed_approaches as string[] : [];
-          if (failedApproaches.length > 0) {
-            lines.push(`Failed approaches: ${failedApproaches.slice(0, 5).join('; ')}`);
-          }
-        }
-      }
-
-      if (lines.length > 0) {
-        outcomeSection = '\n' + lines.join('\n') + '\n';
-      }
-    }
+    const outcomeSection = buildOutcomeSection(outcomeEval);
 
     // Recent interventions — time-series view of what shipped + per-week rate deltas.
     // Given with explicit non-causal framing so the agent doesn't over-attribute.
     const recentInterventions = payload.recent_interventions as Record<string, unknown> | undefined;
-    let clockHeader = '';
-    let recentWorkSection = '';
-    if (recentInterventions && typeof recentInterventions === 'object') {
-      const merges = Array.isArray(recentInterventions.merges)
-        ? recentInterventions.merges as Array<Record<string, unknown>>
-        : [];
-      const rollingRates = recentInterventions.rolling_rates as Record<string, Record<string, unknown> | undefined> | undefined;
-      const perDirectionDelta = Array.isArray(recentInterventions.per_direction_delta)
-        ? recentInterventions.per_direction_delta as Array<Record<string, unknown>>
-        : [];
-      const hoursSinceLast = typeof recentInterventions.hours_since_last_strategic === 'number'
-        ? recentInterventions.hours_since_last_strategic
-        : null;
-
-      // Clock header: answer "since I last ran, what's happened?" before anything else.
-      // Forces the agent to notice when a cycle elapsed without meaningful throughput
-      // instead of silently re-running its last playbook.
-      if (hoursSinceLast !== null && rollingRates) {
-        const sinceLast = rollingRates.since_last_strategic || {};
-        const mergedSince = typeof sinceLast.merged === 'number' ? sinceLast.merged : 0;
-        const finishedSince = typeof sinceLast.finished === 'number' ? sinceLast.finished
-          : typeof sinceLast.created === 'number' ? sinceLast.created : 0;
-        const spawnedSince = typeof sinceLast.spawned === 'number' ? sinceLast.spawned : null;
-        const rateSince = typeof sinceLast.merge_rate === 'number' ? `${Math.round((sinceLast.merge_rate) * 100)}%` : 'n/a';
-        const spawnNote = spawnedSince != null && spawnedSince !== finishedSince
-          ? ` (${spawnedSince} spawned, some still in flight)`
-          : '';
-        clockHeader = `\n# Clock\n`
-          + `${hoursSinceLast}h since your last strategic cycle. In that window: `
-          + `${mergedSince} of ${finishedSince} finished tasks merged (${rateSince})${spawnNote}.\n`
-          + `If that's a low-value ${hoursSinceLast}h relative to the ambition you set last time, that's information — ask why before doubling down on the same plays.\n`;
-      }
-
-      // Active in-flight counts per scope: preserves visibility of
-      // still-running work now that merge rates are finished-only.
-      const activeByScope = recentInterventions.active_by_scope as Record<string, number> | undefined;
-      if (activeByScope) {
-        const parts: string[] = [];
-        for (const s of ['small', 'medium', 'large', 'unknown']) {
-          const n = activeByScope[s];
-          if (typeof n === 'number' && n > 0) parts.push(`${s}=${n}`);
-        }
-        if (parts.length > 0) {
-          clockHeader += `Currently in flight: ${parts.join(', ')} (not in the merge-rate numbers above — those only count finished tasks).\n`;
-        }
-      }
-
-      if (merges.length > 0 || rollingRates || perDirectionDelta.length > 0) {
-        const lines: string[] = ['\n# Recent Work & Rolling Outcomes'];
-        lines.push('IMPORTANT — read this carefully before acting:');
-        lines.push('- Rate numerator/denominator semantics: merge_rate = merged/finished, where "finished" means the task reached a terminal state inside the window. Tasks spawned mid-window that have not finished yet do NOT count in the denominator — so short-window rates are not biased downward by in-flight slower-scope tasks.');
-        lines.push('- "spawned" = tasks created in the window (throughput signal). "finished" = reached terminal state in the window (quality denominator). Divergence between the two is normal for slow scopes.');
-        lines.push('- Correlation is NOT causation. Rate swings can reflect task difficulty shifts, account health, rate limits, CI outages, or small-sample noise.');
-        lines.push('- Weekly buckets were replaced with rolling windows (last_24h / last_3d / last_7d / since_last_strategic) because weekly is too coarse for this pipeline\'s velocity.');
-        lines.push('- Only act on patterns visible across 2+ of the overlapping windows. A spike in last_24h that does not show in last_3d is probably noise.');
-        lines.push('- Prefer "investigate whether X helps" over "revert X".');
-
-        if (rollingRates) {
-          lines.push('\nRolling merge-rate windows (merged / finished):');
-          const order = ['since_last_strategic', 'last_24h', 'last_3d', 'last_7d'];
-          for (const w of order) {
-            const r = rollingRates[w];
-            if (!r) continue;
-            const finished = typeof r.finished === 'number' ? r.finished
-              : typeof r.created === 'number' ? r.created : 0;
-            const merged = typeof r.merged === 'number' ? r.merged : 0;
-            const spawned = typeof r.spawned === 'number' ? r.spawned : null;
-            const rate = typeof r.merge_rate === 'number' ? `${Math.round((r.merge_rate) * 100)}%` : 'n/a';
-            const spawnTail = spawned != null && spawned !== finished ? `, ${spawned} spawned` : '';
-            lines.push(`  ${w}: ${merged}/${finished} merged (${rate}${spawnTail})`);
-          }
-        }
-
-        if (perDirectionDelta.length > 0) {
-          lines.push('\nPer-direction outcomes in the rolling windows:');
-          for (const d of perDirectionDelta) {
-            const dirText = strVal(d.direction_text, '').slice(0, 100);
-            lines.push(`\n- ${dirText} (${strVal(d.direction_id)})`);
-            const sinceLast = d.since_last_strategic as Record<string, unknown> | undefined;
-            const last24h = d.last_24h as Record<string, unknown> | undefined;
-            const last3d = d.last_3d as Record<string, unknown> | undefined;
-            const fmt = (r: Record<string, unknown> | undefined): string => {
-              if (!r) return '0/0';
-              const c = typeof r.created === 'number' ? r.created : 0;
-              const m = typeof r.merged === 'number' ? r.merged : 0;
-              return `${m}/${c}`;
-            };
-            const parts: string[] = [];
-            if (sinceLast) parts.push(`since_last_strategic: ${fmt(sinceLast)}`);
-            parts.push(`last_24h: ${fmt(last24h)}`, `last_3d: ${fmt(last3d)}`);
-            lines.push(`  ${parts.join(', ')}`);
-            const recentTitles = Array.isArray(d.recent_merged_titles) ? d.recent_merged_titles : [];
-            if (recentTitles.length > 0) {
-              const formatted = recentTitles.map((t: unknown) => {
-                if (typeof t === 'string') return `"${t}"`;
-                const entry = t as Record<string, unknown>;
-                const titleStr = strVal(entry.title ?? '', '?');
-                const autoSuffix = entry.on_automain === false ? ' [NOT on automain]' : '';
-                return `"${titleStr}"${autoSuffix}`;
-              });
-              lines.push(`  Recently shipped: ${formatted.join('; ')}`);
-            }
-          }
-        }
-
-        if (merges.length > 0) {
-          lines.push('\nRecent merges (newest first, with body when informative):');
-          for (const m of merges) {
-            const title = strVal(m.pr_title, '?').slice(0, 120);
-            const pr = typeof m.pr_number === 'number' || typeof m.pr_number === 'string' ? `#${m.pr_number}` : '';
-            const hoursAgo = typeof m.hours_ago === 'number' ? `${m.hours_ago}h ago` : '?';
-            const dirText = strVal(m.direction_text, '').slice(0, 80);
-            const dirTag = dirText ? ` [direction: ${dirText}]` : ' [no direction]';
-            // on_automain=false means the task PR was merged into a rollup staging
-            // branch but the rollup itself has not yet landed on automain.
-            const autoTag = m.on_automain === false ? ' [staged, NOT on automain]' : '';
-            lines.push(`  - ${title} ${pr} (${hoursAgo})${dirTag}${autoTag}`);
-            const body = strVal(m.body, '').trim();
-            if (body) {
-              const indented = body.split('\n').map(l => `    ${l}`).join('\n');
-              lines.push(indented);
-            }
-          }
-        }
-        recentWorkSection = lines.join('\n') + '\n';
-      }
-    }
+    const { clockHeader, recentWorkSection } = buildClockAndRecentWorkSection(recentInterventions);
 
     // Unified conversation thread — chronological, shows back-and-forth
     const conversationThread = Array.isArray(payload.conversation_thread)
       ? payload.conversation_thread as Array<Record<string, unknown>>
       : [];
-    const threadSection = conversationThread.length > 0
-      ? '\n## Conversation History\n' +
-        conversationThread.map(m => {
-          const age = calcMessageAge(m);
-          const status = strVal(m.status);
-          const from = strVal(m.from);
-          const tag = status === 'resolved' ? `${from}, ${age}, RESOLVED` : `${from}, ${age}, OPEN`;
-          let line = `[${tag}] [${strVal(m.type)}] ${strVal(m.content).slice(0, 5000)}`;
-          if (status === 'resolved' && m.resolution) {
-            line += `\n  -> ${strVal(m.resolution).slice(0, 500)}`;
-          }
-          if (status === 'open') {
-            line += ` (id: ${strVal(m.id)})`;
-          }
-          return line;
-        }).join('\n') + '\n'
-      : '';
+    const threadSection = buildConversationThreadSection(conversationThread);
+    const feedbackSection = buildFeedbackSection(openMessages);
+    const openMessagesText = buildOpenMessagesText(openMessages);
 
-    // Extract open FEEDBACK messages — these are direct user requests
-    const feedbackMessages = openMessages.filter(m => strVal(m.type) === 'FEEDBACK');
-    const feedbackSection = feedbackMessages.length > 0
-      ? (() => {
-          const feedbackLines = feedbackMessages.map(m => {
-            const age = calcMessageAge(m);
-            return `- (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 5000)}`;
-          }).join('\n');
-          return `\n## User Feature Requests\nThese FEEDBACK messages are direct user requests. Strongly consider creating a direction for each unaddressed request:\n${feedbackLines}\n`;
-        })()
-      : '';
+    const dirSummaryText = buildDirSummaryText(directionsSummary);
 
-    // Flat open messages list for executor resolve operations
-    const openMessagesText = openMessages.length > 0
-      ? openMessages.map(m => {
-          const age = calcMessageAge(m);
-          return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 5000)}`;
-        }).join('\n')
-      : '';
-
-    const dirSummaryText = directionsSummary.length > 0
-      ? directionsSummary.map((d, i) => {
-          const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
-          if (d.prs_merged) parts.push(`${fmtScalar(d.prs_merged)} merged`);
-          if (d.tasks_failed) {
-            const infraFailed = (d.tasks_failed_infra as number) || 0;
-            parts.push(infraFailed > 0 ? `${fmtScalar(d.tasks_failed)} failed (${infraFailed} infra)` : `${fmtScalar(d.tasks_failed)} failed`);
-          }
-          const satNote = d.possibly_saturated ? ' [SATURATED]' : '';
-          const catNote = d.category ? ` [${strVal(d.category)}]` : '';
-          const sysNote = d.system_id ? ` (system: ${strVal(d.system_id)})` : '';
-          const dStatus = strVal(d.status, 'active');
-          let statusNote = '';
-          if (dStatus !== 'active') {
-            if (dStatus === 'paused') {
-              const tag = d.auto_paused === true ? 'AUTO_PAUSED' : 'USER_PAUSED';
-              const reason = strVal(d.paused_reason).slice(0, 80);
-              statusNote = reason ? ` [${tag}: ${reason}]` : ` [${tag}]`;
-            } else {
-              statusNote = ` [${dStatus.toUpperCase()}]`;
-            }
-          }
-
-          // Research context: show established findings count, failed approaches, open questions
-          let ctxSection = '';
-          if (typeof d.research_context === 'string' && (d.research_context).length > 0) {
-            const sections = parseResearchContext(d.research_context);
-            const ctxParts: string[] = [];
-            if (sections.established.length > 0) {
-              const confirmed = sections.established.filter(s => s.includes('(confirmed)'));
-              const proposed = sections.established.filter(s => s.includes('(proposed)'));
-              ctxParts.push(`   ${confirmed.length} confirmed findings, ${proposed.length} proposed`);
-            }
-            if (sections.failed.length > 0) {
-              ctxParts.push(`   Failed approaches: ${sections.failed.slice(0, 3).join('; ')}`);
-            }
-            if (sections.open.length > 0) {
-              ctxParts.push(`   Open questions: ${sections.open.slice(0, 3).join('; ')}`);
-            }
-            if (sections.eviction) {
-              ctxParts.push(`   \u26a0 Context trimmed: ${sections.eviction}. Earlier findings were evicted — check git history if you suspect overlap with prior work.`);
-            }
-            if (ctxParts.length > 0) ctxSection = '\n' + ctxParts.join('\n');
-          }
-
-          // Recent findings: what was actually discovered/built
-          let findingsSection = '';
-          const findings = Array.isArray(d.recent_findings) ? d.recent_findings as string[] : [];
-          if (findings.length > 0) {
-            findingsSection = `\n   Recent work: ${findings.slice(0, 5).join('; ')}`;
-          }
-
-          // Recent failures: why things failed (with category for infra vs code distinction)
-          let failuresSection = '';
-          const failures = Array.isArray(d.recent_failures) ? d.recent_failures as Array<Record<string, string>> : [];
-          if (failures.length > 0) {
-            const failLines = failures.slice(0, 3).map(f => {
-              const cat = f.category ? ` [${f.category}]` : '';
-              return `${f.title || '?'}${cat}: ${f.reason || 'unknown'}`;
-            });
-            failuresSection = `\n   Recent failures: ${failLines.join('; ')}`;
-          }
-
-          return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}`;
-        }).join('\n\n')
-      : 'No directions exist yet.';
-
-    // Build design doc section — this is the primary input for Phase 2
     const designDoc = payload.design_doc as Record<string, unknown> | undefined;
     const designDocJson = designDoc && Object.keys(designDoc).length > 0
       ? JSON.stringify(designDoc, null, 2)
       : '';
 
     // Write strategic helper scripts (strategic, fetch, design-doc)
-    // ./fetch helper — pulls full state for items the strategic packer trimmed.
-    // The strategic-spawn payload is packed under a tight byte budget (see
-    // pack_under_budget in backend/app/payload_schemas.py); when it trims a
-    // list or drops a section it records that in payload._packer_meta. The
-    // agent inspects _packer_meta and uses ./fetch to retrieve detail it
-    // actually needs (avoids a 256 KB context that the LLM has to scan).
     const projectMetadataForFetch = task.project_metadata as Record<string, unknown> | undefined;
     const fetchProjectId = (projectMetadataForFetch?.project_id as string | undefined) ?? '';
     writeStrategicHelpers(taskId, fetchProjectId, WORKSPACE);
@@ -482,24 +138,7 @@ export async function handleStrategic(
       ? payload.max_active_directions
       : 10;
     const activeDirections = directionsSummary.filter(d => strVal(d.status, 'active') === 'active');
-    const activeCount = activeDirections.length;
-    const pausedDirections = directionsSummary.filter(d => strVal(d.status) === 'paused');
-    const autoPausedCount = pausedDirections.filter(d => d.auto_paused === true).length;
-    const userPausedCount = pausedDirections.length - autoPausedCount;
-    const saturatedCount = activeDirections.filter(d => d.possibly_saturated === true).length;
-    const productCount = activeDirections.filter(d => strVal(d.category) === 'product').length;
-    const availableSlots = maxActiveDirections - activeCount;
-    const gaps: string[] = [];
-    if (productCount === 0) gaps.push('NO_PRODUCT_DIRECTIONS');
-    if (saturatedCount === activeCount && activeCount > 0) gaps.push('ALL_SATURATED');
-    if (activeCount < 3) gaps.push('BELOW_MINIMUM');
-    const pausedNote = pausedDirections.length > 0
-      ? ` Paused: ${pausedDirections.length} (${autoPausedCount} auto, ${userPausedCount} user) — listed below but not consuming active slots.`
-      : '';
-    const dirHealthSummary = [
-      `Active: ${activeCount}/${maxActiveDirections} slots used (${availableSlots} available). Saturated: ${saturatedCount}/${activeCount}. Product directions: ${productCount}.${pausedNote}`,
-      gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
-    ].join('\n');
+    const dirHealthSummary = buildDirHealthSummary(directionsSummary, maxActiveDirections);
 
     // Portfolio composition: category mix, system coverage gaps, concentration
     // risk, in-flight scope, direction age — so the thinker doesn't have to

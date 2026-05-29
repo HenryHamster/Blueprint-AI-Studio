@@ -25,7 +25,6 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app import sr_analytics as _sr_analytics
 from app.models import (
     Project,
     Task,
@@ -81,6 +80,8 @@ from app.playbook_sr_metrics import (  # noqa: F401
     _sr_skip_stats,
     _stats_for_tasks,
     _task_prompt_fingerprint,
+    compute_direction_sr_breakdown_for_endpoint,
+    compute_sr_catch_rate_by_direction,
     compute_sr_catch_rate_trends,
 )
 
@@ -126,18 +127,20 @@ from app.playbook_storage import (  # noqa: F401
 # z=1.28 ≈ 80% CI two-tailed; used by significance-gated SR trend helpers below.
 
 
-# Re-exports from app.sr_analytics for names not already covered by the
-# playbook_sr_metrics re-export block above. Existing callers continue to
+# Re-exports from sibling SR analytics modules for names not already covered by
+# the playbook_sr_metrics re-export block above. Existing callers continue to
 # ``from app.playbook_learning import <name>``.
-_FALSE_ATTESTATION_RATE_THRESHOLD = _sr_analytics._FALSE_ATTESTATION_RATE_THRESHOLD
-compute_edges_trend = _sr_analytics.compute_edges_trend
-compute_fresh_reviewer_trend = _sr_analytics.compute_fresh_reviewer_trend
-compute_sr_false_attestation_trends = _sr_analytics.compute_sr_false_attestation_trends
-compute_sr_regression_risk_test_signal_trends = (
-    _sr_analytics.compute_sr_regression_risk_test_signal_trends
+from app.sr_reviewer_trends import (  # noqa: E402,F401
+    compute_edges_trend,
+    compute_fresh_reviewer_trend,
+    compute_sr_reviewer_disagreements,
 )
-compute_sr_reviewer_disagreements = _sr_analytics.compute_sr_reviewer_disagreements
-get_sr_alert_drilldown_tasks = _sr_analytics.get_sr_alert_drilldown_tasks
+from app.sr_signal_trends import (  # noqa: E402,F401
+    _FALSE_ATTESTATION_RATE_THRESHOLD,
+    compute_sr_false_attestation_trends,
+    compute_sr_regression_risk_test_signal_trends,
+    get_sr_alert_drilldown_tasks,
+)
 
 # Capacity-management constants/functions are in playbook_capacity.py (imported above).
 # Entry-lifecycle constants (_RETIRE_MIN_FOLLOWED, _IDLE_RETIRE_DAYS,
@@ -320,186 +323,6 @@ def _finalize_examples(raw_examples: list[dict]) -> list[dict]:
         if len(result) >= _EXAMPLE_MAX_PER_CAT:
             break
     return result
-
-
-def compute_sr_catch_rate_by_direction(
-    all_tasks: list,
-    *,
-    existing_by_direction: Optional[dict] = None,
-    is_new_window: bool = True,
-    direction_text_map: Optional[dict[str, str]] = None,
-) -> dict[str, dict[str, Any]]:
-    """Compute per-direction SR catch-rate breakdown.
-
-    Groups *all_tasks* by ``context.direction_id`` and, for each direction with
-    at least :data:`_MIN_DIRECTION_SR_SAMPLE` qualifying tasks (both
-    ``_self_review_outcome`` and ``_first_attempt_rejection_categories`` present),
-    computes category-level miss rates and sample counts.
-
-    When *existing_by_direction* is provided (a previously persisted
-    ``by_direction`` snapshot), each entry is enriched with cycle-over-cycle
-    trend fields: ``previous_miss_rate``, ``trend`` ('increasing' | 'decreasing'
-    | 'stable'), and ``rate_history`` (list of recent miss_rates, capped at 5).
-    *is_new_window* controls whether the current measurement is appended to
-    ``rate_history`` (mirrors the per-category rate_history logic).
-
-    When *direction_text_map* is provided, each entry gains a ``direction_text``
-    field (truncated to 120 chars) so investigation prompts can reference the
-    human-readable direction title without a secondary lookup.
-
-    Returns a dict keyed by direction_id::
-
-        {
-          "d-abc123": {
-            "sample_count": 5,
-            "miss_rate": 0.6,
-            "direction_text": "...",  # only when direction_text_map provided
-            "categories": {
-              "regression_risk": {
-                "hit_rate": 0.4,
-                "miss_rate": 0.6,
-                "sample_count": 5,
-                "examples": [...]   # only when misses exist
-              },
-              ...
-            }
-          },
-          ...
-        }
-
-    Directions with fewer than _MIN_DIRECTION_SR_SAMPLE qualifying tasks are
-    omitted (insufficient signal). Both directions and categories are sorted
-    worst-first by miss rate for stable admin/UI rendering.
-    """
-    by_direction: dict[str, list] = {}
-    for t in all_tasks:
-        did = (t.context or {}).get("direction_id")
-        if did:
-            by_direction.setdefault(did, []).append(t)
-
-    result: dict[str, dict[str, Any]] = {}
-    for direction_id, tasks in by_direction.items():
-        count, cat_stats, _, _, _, _ = _stats_for_tasks(tasks)
-        if count < _MIN_DIRECTION_SR_SAMPLE:
-            continue
-        categories: dict[str, Any] = {}
-        for cat, stats in cat_stats.items():
-            if stats["human_count"] == 0:
-                continue
-            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
-            entry: dict[str, Any] = {
-                "hit_rate": hit_rate,
-                "miss_rate": round(1 - hit_rate, 3),
-                "sample_count": stats["human_count"],
-            }
-            ex = _finalize_examples(stats.get("miss_examples", []))
-            if ex:
-                entry["examples"] = ex
-            categories[cat] = entry
-        if categories:
-            categories = dict(
-                sorted(
-                    categories.items(),
-                    key=lambda item: (-item[1]["miss_rate"], item[0]),
-                )
-            )
-            total_samples = sum(entry["sample_count"] for entry in categories.values())
-            weighted_miss_rate = (
-                round(
-                    sum(
-                        entry["miss_rate"] * entry["sample_count"]
-                        for entry in categories.values()
-                    )
-                    / total_samples,
-                    3,
-                )
-                if total_samples
-                else None
-            )
-            overall_catch_rate = (
-                round(1 - weighted_miss_rate, 3)
-                if weighted_miss_rate is not None
-                else None
-            )
-            entry: dict[str, Any] = {
-                "sample_count": count,
-                "miss_rate": weighted_miss_rate,
-                "overall_catch_rate": overall_catch_rate,
-                "categories": categories,
-            }
-            if direction_text_map:
-                raw_text = direction_text_map.get(direction_id, "")
-                if raw_text:
-                    entry["direction_text"] = raw_text[:120]
-            if existing_by_direction is not None:
-                prev_entry: dict = dict(existing_by_direction.get(direction_id) or {})
-                prev_miss_rate = prev_entry.get("miss_rate")
-                rate_history: list = list(prev_entry.get("rate_history") or [])
-                if (
-                    is_new_window or not rate_history
-                ) and weighted_miss_rate is not None:
-                    rate_history.append(weighted_miss_rate)
-                    rate_history = rate_history[-5:]
-                if prev_miss_rate is not None and weighted_miss_rate is not None:
-                    delta = weighted_miss_rate - prev_miss_rate
-                    # Convert miss rates to hit rates for significance test
-                    curr_hit_rate = 1 - weighted_miss_rate
-                    prev_hit_rate = 1 - prev_miss_rate
-                    prev_sample_count = prev_entry.get("sample_count", 0)
-                    # Apply two-proportion z-test; trend requires both significance AND delta
-                    is_sig = _is_trend_significant(
-                        curr_hit_rate, count, prev_hit_rate, prev_sample_count
-                    )
-                    if is_sig and delta >= _TREND_DELTA_THRESHOLD:
-                        dir_trend = "increasing"
-                    elif is_sig and delta <= -_TREND_DELTA_THRESHOLD:
-                        dir_trend = "decreasing"
-                    else:
-                        dir_trend = "stable"
-                else:
-                    dir_trend = "stable"
-                entry["previous_miss_rate"] = prev_miss_rate
-                entry["trend"] = dir_trend
-                entry["rate_history"] = rate_history
-            result[direction_id] = entry
-    return dict(
-        sorted(result.items(), key=lambda item: (-(item[1]["miss_rate"] or 0), item[0]))
-    )
-
-
-def compute_direction_sr_breakdown_for_endpoint(
-    all_tasks: list,
-    direction_text_map: dict[str, str],
-    *,
-    existing_by_direction: Optional[dict] = None,
-) -> list[dict[str, Any]]:
-    """Endpoint-shaped per-direction SR breakdown.
-
-    Wraps :func:`compute_sr_catch_rate_by_direction` and decorates each entry
-    with ``direction_text`` (looked up from *direction_text_map*), exposes
-    ``sample_size`` (alias of canonical ``sample_count``), and adds
-    ``worst_category`` derived from the canonical worst-first ordering of
-    categories. Returned list preserves canonical worst-first direction
-    ordering.
-    """
-    canonical = compute_sr_catch_rate_by_direction(
-        all_tasks, existing_by_direction=existing_by_direction
-    )
-    out: list[dict[str, Any]] = []
-    for direction_id, entry in canonical.items():
-        categories = entry.get("categories") or {}
-        worst_category = next(iter(categories), None)
-        out.append(
-            {
-                "direction_id": direction_id,
-                "direction_text": direction_text_map.get(direction_id, ""),
-                "sample_size": entry["sample_count"],
-                "overall_catch_rate": entry.get("overall_catch_rate"),
-                "categories": categories,
-                "worst_category": worst_category,
-            }
-        )
-    return out
 
 
 def select_sr_miss_examples_for_injection(

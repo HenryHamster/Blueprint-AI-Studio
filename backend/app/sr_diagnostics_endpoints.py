@@ -49,6 +49,7 @@ from app.sr_blind_spots import (
     aggregate_sr_reviewer_disagreements_envelope,
     is_disallowed_blind_spot,
     is_skipped_sr_outcome as _is_skipped_sr_outcome,
+    _REVIEWER_ORIGINS,
 )
 from app.research_completion import lookup_findings_by_source_ref
 from app.playbook_learning import resolve_sr_miss_human_truth
@@ -804,6 +805,166 @@ async def list_sr_reviewer_disagreements(
     return {
         **envelope,
         "total_entries": envelope["returned_entries"],
+    }
+
+
+@router.get("/projects/{project_id}/sr-reviewer-disagreements/tasks")
+async def fetch_sr_reviewer_disagreement_tasks(
+    project_id: uuid.UUID,
+    days: int = Query(30, ge=1, le=90),
+    category: Optional[str] = Query(None),
+    task_type: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    page: int = Query(0, ge=0),
+    page_size: int = Query(50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return paginated task-level rows behind a reviewer-disagreement badge.
+
+    A disagreement is a category present in reviewer_findings where self-review
+    either passed or omitted the category.  Filters by category, task_type,
+    and severity (of the reviewer finding).
+    """
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    page_start = page * page_size
+    page_end = page_start + page_size
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.title,
+                Task.created_at,
+                Task.context,
+                Task.project_id,
+                Task.payloads,
+            )
+        )
+        .order_by(Task.created_at.desc())
+    )
+
+    page_items = []
+    total_matched = 0
+    category_counts: Dict[str, int] = defaultdict(int)
+    task_stream = await session.stream(stmt)
+    async for t in task_stream.scalars():
+        t_type = (t.first_payload or {}).get("type", "")
+        if t_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or _is_skipped_sr_outcome(sro):
+            continue
+        check_results = sro.get("check_results") or {}
+        reviewer_findings = sro.get("reviewer_findings") or []
+        if not reviewer_findings:
+            continue
+
+        reviewer_cats = {
+            f.get("category")
+            for f in reviewer_findings
+            if isinstance(f, dict) and f.get("category")
+        }
+        origin_rescued = {
+            cat
+            for cat, result in check_results.items()
+            if isinstance(result, dict) and result.get("origin") in _REVIEWER_ORIGINS
+        }
+        if origin_rescued:
+            missed_cats = origin_rescued
+        else:
+            missed_cats = {
+                cat
+                for cat in reviewer_cats
+                if check_results.get(cat) is None
+                or (check_results.get(cat) or {}).get("passed", True)
+            }
+
+        if not missed_cats:
+            continue
+        if task_type and t_type != task_type:
+            continue
+        if category and category not in missed_cats:
+            continue
+
+        # Severity filter: skip if no finding for the selected category matches severity
+        if severity and category:
+            matching = next(
+                (
+                    f
+                    for f in reviewer_findings
+                    if isinstance(f, dict)
+                    and f.get("category") == category
+                    and f.get("severity") == severity
+                ),
+                None,
+            )
+            if not matching:
+                continue
+        elif severity:
+            # Filter to tasks where any missed-cat finding has the requested severity
+            has_match = any(
+                isinstance(f, dict)
+                and f.get("category") in missed_cats
+                and f.get("severity") == severity
+                for f in reviewer_findings
+            )
+            if not has_match:
+                continue
+
+        current_index = total_matched
+        total_matched += 1
+        for cat in missed_cats:
+            category_counts[cat] += 1
+
+        if current_index < page_start or current_index >= page_end:
+            continue
+
+        sr_check_results, reviewer_findings_out = _sr_miss_drilldown(sro, missed_cats)
+        page_items.append(
+            {
+                "task_id": str(t.id),
+                "title": t.title or "",
+                "task_type": t_type,
+                "scope": ctx.get("scope"),
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "sr_check_results": sr_check_results,
+                "reviewer_findings": reviewer_findings_out,
+            }
+        )
+
+    # Batch-fetch PR artifacts for page items
+    page_task_ids = [uuid.UUID(m["task_id"]) for m in page_items]
+    pr_map: Dict[str, str] = {}
+    if page_task_ids:
+        art_result = await session.execute(
+            select(Artifact.task_id, Artifact.pr_url).where(
+                Artifact.task_id.in_(page_task_ids),
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            )
+        )
+        for row in art_result.all():
+            if row.pr_url:
+                pr_map[str(row.task_id)] = row.pr_url
+
+    items = [
+        {**m, "pr_url": pr_map.get(m["task_id"])}
+        for m in page_items
+    ]
+
+    return {
+        "items": items,
+        "total": total_matched,
+        "page": page,
+        "page_size": page_size,
+        "category_counts": dict(category_counts),
     }
 
 

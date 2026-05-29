@@ -1184,3 +1184,47 @@ export async function backfillProjectBranches(projectId: string): Promise<unknow
   if (!res.ok) throw new Error(`Failed to backfill branches: ${res.status}`);
   return res.json();
 }
+
+export interface SrDisagreementTask {
+  task_id: string;
+  title: string;
+  task_type?: string | null;
+  scope?: string | null;
+  created_at?: string | null;
+  pr_url?: string | null;
+  sr_check_results?: Record<string, { passed: boolean; issue?: string | null; origin?: string | null }>;
+  reviewer_findings?: Array<{ category: string; severity?: string | null; description: string }>;
+}
+
+export interface SrReviewerDisagreementTasksResponse {
+  items: SrDisagreementTask[];
+  total: number;
+  page?: number;
+  page_size?: number;
+  category_counts?: Record<string, number>;
+}
+
+export async function fetchSrReviewerDisagreementTasks(
+  projectId: string,
+  params?: {
+    category?: string;
+    task_type?: string;
+    severity?: string;
+    days?: number;
+    page?: number;
+    page_size?: number;
+  },
+): Promise<SrReviewerDisagreementTasksResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.category) searchParams.set('category', params.category);
+  if (params?.task_type) searchParams.set('task_type', params.task_type);
+  if (params?.severity) searchParams.set('severity', params.severity);
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  if (params?.page !== undefined) searchParams.set('page', String(params.page));
+  if (params?.page_size !== undefined) searchParams.set('page_size', String(params.page_size));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-reviewer-disagreements/tasks${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch SR reviewer disagreement tasks: ${res.status}`);
+  return res.json();
+}

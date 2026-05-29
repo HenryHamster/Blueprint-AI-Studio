@@ -251,6 +251,25 @@ export interface SrReviewerDisagreementsData {
   disagreements: SrReviewerDisagreement[];
 }
 
+export interface SrReviewerDisagreementTask {
+  task_id: string;
+  title: string;
+  task_type: string;
+  scope: string | null;
+  created_at: string;
+  pr_url: string | null;
+  category: string;
+  severity: string;
+  description: string;
+}
+
+export interface SrReviewerDisagreementTasksResult {
+  items: SrReviewerDisagreementTask[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
 export interface SrScopeDriftVsExpansion {
   consistent?: number | null;
   miss_by_expansion?: number | null;

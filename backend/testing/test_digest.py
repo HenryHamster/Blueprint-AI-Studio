@@ -10799,6 +10799,178 @@ async def test_sr_reviewer_disagreements_fp_fields(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_sr_reviewer_disagreement_tasks_basic(client: AsyncClient, db_session):
+    """GET sr-reviewer-disagreements/tasks returns task rows for disagreements."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": "Logic flaw in edge case",
+                        }
+                    ],
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements/tasks?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["task_type"] == "create"
+    assert item["reviewer_findings"][0]["category"] == "correctness"
+    assert body["category_counts"]["correctness"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreement_tasks_category_filter(
+    client: AsyncClient, db_session
+):
+    """category filter limits results to tasks with that disagreement category."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task with correctness disagreement
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"correctness": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {"category": "correctness", "severity": "HIGH", "description": "x"}
+                    ],
+                }
+            },
+        )
+    )
+    # task with security disagreement only
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "fix"}],
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {"security": {"passed": True}},
+                    "blind_spots": [],
+                    "reviewer_findings": [
+                        {"category": "security", "severity": "CRITICAL", "description": "y"}
+                    ],
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements/tasks?days=30&category=correctness"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["items"][0]["reviewer_findings"][0]["category"] == "correctness"
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreement_tasks_empty_state(
+    client: AsyncClient, db_session
+):
+    """Returns empty items list when no disagreements exist."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements/tasks?days=30"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 0
+    assert body["items"] == []
+    assert body["category_counts"] == {}
+
+
+@pytest.mark.asyncio
+async def test_sr_reviewer_disagreement_tasks_pagination(
+    client: AsyncClient, db_session
+):
+    """Pagination returns correct page slices."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for _ in range(3):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                        "reviewer_findings": [
+                            {
+                                "category": "correctness",
+                                "severity": "HIGH",
+                                "description": "issue",
+                            }
+                        ],
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    resp_p0 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements/tasks?days=30&page=0&page_size=2"
+    )
+    assert resp_p0.status_code == 200
+    body_p0 = resp_p0.json()
+    assert body_p0["total"] == 3
+    assert len(body_p0["items"]) == 2
+
+    resp_p1 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-reviewer-disagreements/tasks?days=30&page=1&page_size=2"
+    )
+    assert resp_p1.status_code == 200
+    body_p1 = resp_p1.json()
+    assert body_p1["total"] == 3
+    assert len(body_p1["items"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_digest_sr_trends_fp_fields_passthrough(client: AsyncClient, db_session):
     """Digest passes fp_count and false_positive_rate from sr_catch_rate_trends in design_doc."""
     project = make_project()

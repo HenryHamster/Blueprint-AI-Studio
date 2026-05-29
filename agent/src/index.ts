@@ -1,5 +1,4 @@
 import { spawn, execFileSync } from 'child_process';
-import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import WebSocket from 'ws';
@@ -54,7 +53,7 @@ import {
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
-  type ValidationCommand, type ProviderRunner, type ProviderName,
+  type ValidationCommand, type ProviderRunner,
 } from './providers/runners.js';
 
 export {
@@ -69,73 +68,17 @@ export { computeRefreshDelayMs, isBootstrapToken };
 // ── Failure categories ───────────────────────────────────────────────────────
 export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed';
 
-// ── OAuth credential rotation (agent → backend) ──────────────────────────────
-//
-// Some CLIs (currently Codex) refresh their OAuth tokens in-place during a
-// run by rewriting `auth.json`. The refreshed token lives only on the
-// ephemeral VM unless we propagate it back to the backend — on the next
-// task, the backend would re-push the pre-refresh token and the upstream
-// provider may reject it (invalid_grant) if it rotated the refresh token
-// on the last use.
-//
-// hashFileOrNull + the module-level `initialOAuthAuthHash` let us detect
-// the in-run mutation cheaply and skip the POST when nothing changed.
+// ── OAuth credential rotation + ClaudeTimeoutError ───────────────────────────
+import {
+  recordInitialOAuthAuthHash,
+  rotateOAuthCredentialsIfChanged as _rotateOAuthCredentialsIfChanged,
+  ClaudeTimeoutError,
+} from './oauth-rotation.js';
+export { recordInitialOAuthAuthHash, ClaudeTimeoutError };
 
-const OAUTH_AUTH_PATH_BY_PROVIDER: Partial<Record<ProviderName, string>> = {
-  openai: '/opt/agent/openai/auth.json',
-};
-
-function hashFileOrNull(path: string): string | null {
-  try {
-    const raw = fs.readFileSync(path);
-    return createHash('sha256').update(raw).digest('hex');
-  } catch {
-    return null;
-  }
-}
-
-let initialOAuthAuthHash: string | null = null;
-
-export function recordInitialOAuthAuthHash(): void {
-  const path = OAUTH_AUTH_PATH_BY_PROVIDER[PROVIDER];
-  if (!path || AUTH_MODE !== 'oauth') {
-    initialOAuthAuthHash = null;
-    return;
-  }
-  initialOAuthAuthHash = hashFileOrNull(path);
-}
-
-export async function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
-  const path = OAUTH_AUTH_PATH_BY_PROVIDER[PROVIDER];
-  if (!path || AUTH_MODE !== 'oauth') return;
-  if (!fs.existsSync(path)) return;
-  const currentHash = hashFileOrNull(path);
-  if (currentHash === null) return;
-  if (initialOAuthAuthHash !== null && currentHash === initialOAuthAuthHash) {
-    // Unchanged — nothing to rotate.
-    return;
-  }
-  let contents: string;
-  try {
-    contents = fs.readFileSync(path, 'utf-8');
-  } catch (e) {
-    throw new Error(`read ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  await apiPost('/api/agent/credentials/rotate', { secret: contents, task_id: taskId });
-  // Update the initial hash so a follow-up error path doesn't re-POST the
-  // same blob twice. Defensive; the backend is idempotent regardless.
-  initialOAuthAuthHash = currentHash;
-}
-
-// Thrown when the 45-minute kill timer fires. Carries a distinct failure
-// category so the backend can map it to AGENT_TIMEOUT (scope-downgrade path)
-// instead of CODE_ERROR (fix-tests/lint path).
-export class ClaudeTimeoutError extends Error {
-  failureCategory: FailureCategory = 'timeout';
-  constructor(message: string) {
-    super(message);
-    this.name = 'ClaudeTimeoutError';
-  }
+/** Rotate OAuth credentials if changed, bound to the local apiPost. */
+export function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
+  return _rotateOAuthCredentialsIfChanged(taskId, apiPost);
 }
 
 // ── Build configuration (from project settings, passed via claim response) ───
@@ -792,7 +735,7 @@ export function _getFirstToolUseAtForTesting(): number | null {
 export function _resetTelemetryForTesting(): void {
   firstToolUseAt = null;
   isWarmStart = false;
-  currentPromptFingerprint = null;
+  setCurrentPromptFingerprint(null);
 }
 
 /** Test-only: set the warm-start flag (mirrors what the role loop does). */
@@ -930,7 +873,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
-        ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
@@ -975,7 +918,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         metrics,
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
-        ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
         ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
@@ -1004,7 +947,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
               status_message: `[${retryMetrics.heap_used_mb}MB] ${getMessage()}`,
               metrics: retryMetrics,
               tool_trace: snapshotToolTrace(),
-              ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+              ...(getCurrentPromptFingerprint() ? { prompt_fingerprint: getCurrentPromptFingerprint() } : {}),
               ...getLlmTelemetry(),
             }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
             log('Heartbeat retry succeeded');
@@ -1576,84 +1519,29 @@ export async function pushAndCreatePR(
   return prUrl;
 }
 
-/** Normalized error fingerprint for detecting identical consecutive failures. */
-export function errorFingerprint(msg: string): string {
-  return msg.replace(/\s+/g, ' ').trim().slice(0, 2000);
-}
-
-// ── Prompt fingerprint ───────────────────────────────────────────────────────
-// SHA-256 of the static prompt content (guidance blocks + task-type sections),
-// truncated to 12 hex chars. Handlers set this before calling runClaudeCode so
-// heartbeats and task records can correlate behavioral regressions to prompt edits.
-// Task-specific noise (task IDs, file paths, payload text) must NOT be included.
-
-/** Compute a stable 12-hex SHA-256 fingerprint of static prompt content. */
-export function computePromptFingerprint(staticContent: string): string {
-  return createHash('sha256').update(staticContent).digest('hex').slice(0, 12);
-}
-
-let currentPromptFingerprint: string | null = null;
-
-/** Register the fingerprint for the current task's prompt. Call before runClaudeCode. */
-export function setCurrentPromptFingerprint(fp: string): void {
-  currentPromptFingerprint = fp;
-}
-
-export function getCurrentPromptFingerprint(): string | null {
-  return currentPromptFingerprint;
-}
-
-// ── Per-task LLM telemetry (efficiency direction d-91d8dede) ─────────────────
-// Cumulative counters posted on every heartbeat / terminal status. Bumped by
-// the LLM CLI runner (one increment per spawn) and by the stream-json result
-// parser (token totals). Reset between roles so warm-VM continuity does not
-// double-count prior roles' usage. Tokens accumulate across all turns within
-// a single CLI invocation; llm_call_count counts CLI invocations.
-let _llmCallCount = 0;
-let _totalInputTokens = 0;
-let _totalOutputTokens = 0;
-
-/** Increment the per-task LLM call counter (one per CLI invocation). */
-export function recordLlmCallStart(): void {
-  _llmCallCount += 1;
-}
-
-/** Add the input/output token totals reported by a single CLI result event. */
-export function recordLlmTokens(inputTokens: number, outputTokens: number): void {
-  if (Number.isFinite(inputTokens) && inputTokens > 0) {
-    _totalInputTokens += Math.floor(inputTokens);
-  }
-  if (Number.isFinite(outputTokens) && outputTokens > 0) {
-    _totalOutputTokens += Math.floor(outputTokens);
-  }
-}
-
-/** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
-export function getLlmTelemetry(): {
-  llm_call_count: number;
-  total_input_tokens: number;
-  total_output_tokens: number;
-} {
-  return {
-    llm_call_count: _llmCallCount,
-    total_input_tokens: _totalInputTokens,
-    total_output_tokens: _totalOutputTokens,
-  };
-}
-
-/** Reset between roles so per-task counters don't bleed across warm-VM continuity. */
-export function resetLlmTelemetry(): void {
-  _llmCallCount = 0;
-  _totalInputTokens = 0;
-  _totalOutputTokens = 0;
-}
-
-/** Estimate token count from character count (4 chars ≈ 1 token).
- *  Used for providers that run in plain-text output mode (e.g. Gemini CLI with
- *  -o text) and don't emit structured token-usage blocks in their output. */
-export function estimateTokensFromChars(chars: number): number {
-  return Math.ceil(chars / 4);
-}
+// ── Telemetry module ─────────────────────────────────────────────────────────
+import {
+  errorFingerprint,
+  computePromptFingerprint,
+  setCurrentPromptFingerprint,
+  getCurrentPromptFingerprint,
+  recordLlmCallStart,
+  recordLlmTokens,
+  getLlmTelemetry,
+  resetLlmTelemetry,
+  estimateTokensFromChars,
+} from './telemetry.js';
+export {
+  errorFingerprint,
+  computePromptFingerprint,
+  setCurrentPromptFingerprint,
+  getCurrentPromptFingerprint,
+  recordLlmCallStart,
+  recordLlmTokens,
+  getLlmTelemetry,
+  resetLlmTelemetry,
+  estimateTokensFromChars,
+};
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
 export type { DivergenceReason } from './utils/diff-detection.js';
@@ -1977,7 +1865,7 @@ async function main() {
       // — without this, the next agent's heartbeat surfaces prior-role tool
       // uses and the reaper's death-trace conflates two roles' work.
       clearToolTrace();
-      currentPromptFingerprint = null;
+      setCurrentPromptFingerprint(null);
       // Same rationale for the `./check` synthesizer's monotonic state:
       // without a reset, the next role's synthesized iterations continue
       // numbering from the prior role and carry a stale started_at.

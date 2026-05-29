@@ -8,7 +8,6 @@ import type { TaskType } from './TaskCard';
 import { DirectionProgressSection } from './DirectionProgressSection';
 import type { DirectionProgress } from './DirectionProgressSection';
 import { ErrorBoundary } from './ErrorBoundary';
-import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
 import {
   loadDismissed,
   saveDismissed,
@@ -16,7 +15,7 @@ import {
   windowToHours,
 } from './catchupHelpers';
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
-import { sortDesc, trendFor } from './catchupAnalytics';
+import { sortDesc } from './catchupAnalytics';
 import { CompletionRow, SkeletonRow } from './catchupRows';
 import type { SrTrendData } from './SrTrendBreakdown';
 import { PipelineRegressionsPanel } from './PipelineRegressionsPanel';
@@ -24,6 +23,7 @@ import { CatchUpReviewQualitySection } from './CatchUpReviewQualitySection';
 import { RecentFailureGroupsSection } from './RecentFailureGroupsSection';
 import { CatchUpNeedsAttentionSection } from './CatchUpNeedsAttentionSection';
 import type { NeedsAttentionItem } from './CatchUpNeedsAttentionSection';
+import { CatchUpCostDiagnosticsSection } from './CatchUpCostDiagnosticsSection';
 import { CatchUpRemediationPipelineSection } from './CatchUpRemediationPipelineSection';
 import { CatchUpInProgressSection } from './CatchUpInProgressSection';
 import type { ActiveTask } from './CatchUpInProgressSection';
@@ -708,8 +708,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [digest?.pipeline_filter_funnel]);
 
-  const history = useMemo(() => digest?.trend_history ?? [], [digest?.trend_history]);
-
   const { frbcEntries, mrbcEntries, cmbcEntries, carTypeEntries, dropOffEntries } = useMemo(() => {
     const rf = digest?.remediation_funnel;
     const frbc = rf?.failed_remediations_by_class ?? {};
@@ -725,10 +723,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       dropOffEntries: sortDesc(Object.entries(dropOff).filter(([, v]) => v > 0), v => v),
     };
   }, [digest?.remediation_funnel]);
-
-  const trendForCallback = useCallback((cat: string): { arrow: string; color: string } => {
-    return trendFor(history, cat);
-  }, [history]);
 
   return (
     <div className="mb-4 shrink-0">
@@ -1321,214 +1315,22 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 onSelectTask={onSelectTask}
               />
 
-              {/* Failure taxonomy root-cause pills */}
-              {digest.failure_taxonomy_distribution && digest.failure_taxonomy_distribution.total_failures > 0 && (() => {
-                const ftd = digest.failure_taxonomy_distribution;
-                if (!ftd) return null;
-                const costByTaxonomy: Record<string, number> = {};
-                const costByClass = digest.cost_by_failure_class ?? {};
-                for (const g of digest.failure_groups ?? []) {
-                  const groupCost = costByClass[g.failure_class] ?? 0;
-                  if (!groupCost || g.tasks.length === 0) continue;
-                  const perTask = groupCost / g.tasks.length;
-                  for (const t of g.tasks) {
-                    if (!t.taxonomy) continue;
-                    costByTaxonomy[t.taxonomy] = (costByTaxonomy[t.taxonomy] ?? 0) + perTask;
-                  }
-                }
-                return (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
-                    {TAXONOMY_ORDER.map(cat => {
-                      const entry = ftd.categories[cat];
-                      if (!entry || entry.count === 0) return null;
-                      const cost = costByTaxonomy[cat];
-                      const trend = trendForCallback(cat);
-                      const isActive = activeTaxonomyFilter === cat;
-                      const isDominant = ftd.dominant_category === cat;
-                      return (
-                        <button
-                          key={cat}
-                          type="button"
-                          onClick={() => {
-                            setActiveTaxonomyFilter(isActive ? null : cat);
-                            setActiveStageFilter(null);
-                            setFailuresExpanded(true);
-                          }}
-                          aria-pressed={isActive}
-                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 min-h-[44px] rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
-                          title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''}${isDominant ? ' — dominant category' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
-                        >
-                          {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
-                          {TAXONOMY_LABELS[cat]}
-                          <span className="font-bold">{entry.count}</span>
-                          <span className={`font-bold ${trend.color}`}>{trend.arrow}</span>
-                          {cost != null && cost > 0 && (
-                            <span className="inline-flex items-center font-mono font-normal opacity-80">
-                              ·<DollarSign className="w-2.5 h-2.5" />{cost.toFixed(2)}
-                            </span>
-                          )}
-                        </button>
-                      );
-                    })}
-                    {activeTaxonomyFilter && (
-                      <button
-                        type="button"
-                        onClick={() => setActiveTaxonomyFilter(null)}
-                        className="text-[10px] text-neutral-400 hover:text-neutral-200 underline underline-offset-2"
-                      >
-                        clear
-                      </button>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* Failure stage distribution pills */}
-              {digest.failure_stage_distribution && digest.failure_stage_distribution.total_classified > 0 && (() => {
-                const fsd = digest.failure_stage_distribution;
-                if (!fsd) return null;
-                return (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Pipeline stage</span>
-                  {STAGE_ORDER.map(stage => {
-                    const count = fsd.stages[stage];
-                    if (!count) return null;
-                    const isActive = activeStageFilter === stage;
-                    const isDominant = fsd.dominant_stage === stage;
-                    return (
-                      <button
-                        key={stage}
-                        type="button"
-                        onClick={() => {
-                          setActiveStageFilter(isActive ? null : stage);
-                          setActiveTaxonomyFilter(null);
-                          setFailuresExpanded(true);
-                        }}
-                        aria-pressed={isActive}
-                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 min-h-[44px] rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
-                        title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
-                      >
-                        {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
-                        {stage}
-                        <span className="font-bold">{count}</span>
-                      </button>
-                    );
-                  })}
-                  {activeStageFilter && (
-                    <button
-                      type="button"
-                      onClick={() => setActiveStageFilter(null)}
-                      className="text-[10px] text-neutral-400 hover:text-neutral-200 underline underline-offset-2"
-                    >
-                      clear
-                    </button>
-                  )}
-                </div>
-                );
-              })()}
-
-              {/* Scope conversion rate pills */}
-              {digest.scope_conversion_rates && Object.keys(digest.scope_conversion_rates).length > 0 && (() => {
-                const scr = digest.scope_conversion_rates;
-                if (!scr) return null;
-                return (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Scope conversion</span>
-                  {['small', 'medium', 'large']
-                    .filter(s => scr[s] != null)
-                    .map(scope => {
-                      const { created, merged, calibrated_in = 0, calibrated_out = 0 } = scr[scope];
-                      const recalCount = (calibrated_in || 0) + (calibrated_out || 0);
-                      const rate = created > 0 ? merged / created : null;
-                      const prev = digest.prev_scope_conversion_rates?.[scope];
-                      const prevRate = prev && prev.created > 0 ? prev.merged / prev.created : null;
-                      let trend: 'improving' | 'declining' | 'stable' | null = null;
-                      if (rate != null && prevRate != null) {
-                        const delta = rate - prevRate;
-                        trend = delta > 0.05 ? 'improving' : delta < -0.05 ? 'declining' : 'stable';
-                      }
-                      const arrow = trend === 'improving' ? '↑' : trend === 'declining' ? '↓' : trend === 'stable' ? '→' : '';
-                      const arrowColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
-                      const color = rate == null
-                        ? 'bg-neutral-500/10 text-neutral-400 border-neutral-500/20'
-                        : rate >= 0.6 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
-                        : rate >= 0.3 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                        : 'bg-red-500/10 text-red-400 border-red-500/20';
-                      return (
-                        <span
-                          key={scope}
-                          className={`text-[10px] border px-1.5 py-0.5 rounded inline-flex items-center gap-1 ${color}`}
-                          title={recalCount > 0 ? `Recalibrations: ${calibrated_in} in, ${calibrated_out} out` : undefined}
-                        >
-                          {scope}: {rate != null ? `${Math.round(rate * 100)}%` : '--'} ({merged}/{created})
-                          {arrow && <span className={arrowColor}>{arrow}</span>}
-                          {recalCount > 0 && <span className="text-neutral-400">· {recalCount} recal</span>}
-                        </span>
-                      );
-                    })}
-                </div>
-                );
-              })()}
-
-              {/* Scope mismatch diagnostics */}
-              {digest.scope_mismatch_summary && digest.scope_mismatch_summary.total_calibrated > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Scope mismatch</span>
-                    <span className="text-[10px] text-neutral-400">
-                      {digest.scope_mismatch_summary.total_calibrated} calibrated
-                    </span>
-                    {digest.scope_mismatch_summary.calibrated_success_rate != null && (
-                      <span className="text-[10px] text-neutral-500">
-                        · {Math.round(digest.scope_mismatch_summary.calibrated_success_rate * 100)}% success
-                      </span>
-                    )}
-                    {Object.entries(digest.scope_mismatch_summary.by_original_scope).map(([orig, b]) => (
-                      <span key={orig} className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded">
-                        {orig}: {b.total}
-                      </span>
-                    ))}
-                  </div>
-                  {digest.scope_mismatch_summary.top_directions.length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1 max-w-full">
-                      {digest.scope_mismatch_summary.top_directions.map(d => (
-                        <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
-                          · {(d.direction_text || d.direction_id).slice(0, 60)}{' '}
-                          <span className="text-cyan-400">{d.calibrated_count}/{d.total_tasks} ({Math.round(d.calibration_rate * 100)}%)</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Rejection pattern summary */}
-              {digest.rejection_pattern_summary && digest.rejection_pattern_summary.total_rejected > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Rejection patterns</span>
-                    <button
-                      type="button"
-                      onClick={() => setFailuresExpanded(true)}
-                      className="text-[10px] text-neutral-400 hover:text-purple-300 underline decoration-dotted underline-offset-2"
-                      title="Expand recent failures to find rejected tasks"
-                    >
-                      {digest.rejection_pattern_summary.total_rejected} rejected
-                    </button>
-                  </div>
-                  {digest.rejection_pattern_summary.top_notes.length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1 max-w-full">
-                      {digest.rejection_pattern_summary.top_notes.map((n) => (
-                        <span key={n.snippet} className="text-[10px] text-neutral-500 truncate">
-                          · {n.snippet.slice(0, 100)}{n.snippet.length > 100 ? '…' : ''}{' '}
-                          <span className="text-purple-400">×{n.count}</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
+              <CatchUpCostDiagnosticsSection
+                failureTaxonomyDistribution={digest.failure_taxonomy_distribution}
+                costByFailureClass={digest.cost_by_failure_class}
+                failureGroups={digest.failure_groups}
+                failureStageDistribution={digest.failure_stage_distribution}
+                scopeConversionRates={digest.scope_conversion_rates}
+                prevScopeConversionRates={digest.prev_scope_conversion_rates}
+                scopeMismatchSummary={digest.scope_mismatch_summary}
+                rejectionPatternSummary={digest.rejection_pattern_summary}
+                trendHistory={digest.trend_history}
+                activeTaxonomyFilter={activeTaxonomyFilter}
+                activeStageFilter={activeStageFilter}
+                onTaxonomyFilterChange={setActiveTaxonomyFilter}
+                onStageFilterChange={setActiveStageFilter}
+                onExpandFailures={() => setFailuresExpanded(true)}
+              />
 
               {/* Systemic errors — clusters of failures with matching error fingerprints */}
               {(digest.recurring_error_clusters ?? []).length > 0 && (() => {
