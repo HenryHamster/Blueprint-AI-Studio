@@ -1596,6 +1596,18 @@ class StrategicCycle(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_strategiccycle_project_created", "project_id", "created_at"),
+        # Covers the SR-trend hot query run during claim_task enrichment:
+        # WHERE project_id=? AND outcome='completed'
+        # ORDER BY phase1_started_at DESC LIMIT 4. Without it that query
+        # full-scanned + sorted every completed cycle and hit the 120s
+        # statement_timeout, poisoning the claim session (incident 2026-05-29).
+        # See migration 0128.
+        Index(
+            "ix_strategiccycle_project_outcome_phase1",
+            "project_id",
+            "outcome",
+            "phase1_started_at",
+        ),
     )
 
     @property

@@ -1468,13 +1468,17 @@ async def compute_sr_catch_rate_trends(
     previous_sev_stats: dict[str, dict] = {}
 
     cycle_stmt = (
-        select(StrategicCycle)
+        # id-only projection (only .id is used below) + the
+        # ix_strategiccycle_project_outcome_phase1 index: ordered index scan
+        # satisfies LIMIT 4 directly (was a full scan + sort of every completed
+        # cycle → 120s statement_timeout that poisoned the claim, 2026-05-29).
+        select(StrategicCycle.id)
         .where(StrategicCycle.project_id == project_id)
         .where(StrategicCycle.outcome == "completed")
         .order_by(StrategicCycle.phase1_started_at.desc())
         .limit(4)
     )
-    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+    cycle_rows = (await session.execute(cycle_stmt)).all()
 
     if len(cycle_rows) >= 2:
         # Targeted fetch scoped to the candidate cycle IDs — no date cap, no row

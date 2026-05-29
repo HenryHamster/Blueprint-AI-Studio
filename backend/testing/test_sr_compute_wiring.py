@@ -2,6 +2,7 @@
 Tests that verify SR compute functions are called from the agent task-completion path.
 """
 
+import os
 from unittest.mock import patch, AsyncMock
 
 import pytest
@@ -272,3 +273,122 @@ async def test_claim_high_iter_loadonly_keeps_sr_trend_columns_eager(db_session)
         _ = getattr(t, "strategic_cycle_id", None)
         _ = getattr(t, "updated_at", None)
         _ = getattr(t, "fix_loop_history", None)
+
+
+@pytest.mark.asyncio
+async def test_sr_trend_cycle_query_narrowed_to_id_rows(db_session):
+    """Regression (incident 2026-05-29): the SR-trend cycle query was narrowed
+    from ``select(StrategicCycle)`` to ``select(StrategicCycle.id)`` + ``.all()``
+    — only ``.id`` is used by the cycle bucketing, and the full-entity fetch
+    detoasted JSONB needlessly. Backed by the new
+    ix_strategiccycle_project_outcome_phase1 index it becomes an ordered index
+    scan that satisfies ``LIMIT 4`` directly (was a full scan + sort of every
+    completed cycle → 120s statement_timeout that poisoned the claim session).
+
+    Guards the row-shape change: result rows must still expose ``.id`` (the
+    bucketing does ``c_cycle.id`` / ``[r.id for r in cycle_rows]``), exclude
+    non-completed cycles, and come back ordered by phase1_started_at DESC.
+    """
+    from datetime import datetime
+
+    from sqlmodel import select
+
+    from app.models import StrategicCycle
+
+    project = Project(name="SR cycle query", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            StrategicCycle(
+                id="cyc-older",
+                project_id=project.id,
+                outcome="completed",
+                phase1_started_at=datetime(2026, 5, 1, 12, 0, 0),
+            ),
+            StrategicCycle(
+                id="cyc-newer",
+                project_id=project.id,
+                outcome="completed",
+                phase1_started_at=datetime(2026, 5, 20, 12, 0, 0),
+            ),
+            # Non-completed → must be excluded by the outcome filter.
+            StrategicCycle(
+                id="cyc-running",
+                project_id=project.id,
+                outcome="in_progress",
+                phase1_started_at=datetime(2026, 5, 25, 12, 0, 0),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    # Mirror of the narrowed cycle_stmt in sr_*_trends.py / sr_catch_rate_trends.py.
+    cycle_stmt = (
+        select(StrategicCycle.id)
+        .where(StrategicCycle.project_id == project.id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await db_session.execute(cycle_stmt)).all()
+
+    # DESC by phase1_started_at, non-completed excluded, and .id accessible
+    # (the exact attribute access the bucketing performs on each Row).
+    assert [r.id for r in cycle_rows] == ["cyc-newer", "cyc-older"]
+    assert cycle_rows[0].id == "cyc-newer"
+
+
+@pytest.mark.skipif(
+    os.getenv("USE_TEST_POSTGRES", "").lower() != "true",
+    reason="transaction-abort poisoning is PostgreSQL-specific (SQLite tolerates "
+    "a failed statement without aborting the surrounding transaction)",
+)
+@pytest.mark.asyncio
+async def test_claim_survives_sr_trend_session_poisoning(
+    client: AsyncClient, db_session
+):
+    """Regression (incident 2026-05-29): a best-effort SR-trend compute that
+    aborts the claim session (prod: a 120s statement_timeout → QueryCanceledError)
+    must NOT 500 the claim — the claim was already committed before enrichment.
+    The pre-fix guard caught only PendingRollbackError and its retry could itself
+    fail, so claims 500'd (~44 / 15 min). The broadened guard rolls back and
+    re-reads, degrading to no-playbook if even that fails.
+    """
+    from sqlalchemy import text
+
+    project = Project(name="Poison Project", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "description": "test"}],
+        vm_instance_id="test-vm",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    from app.auth import create_agent_token
+
+    token = create_agent_token(str(task.id), "test-vm")
+    headers = {"x-agent-token": token}
+
+    async def _poison(**kwargs):
+        # Run a failing statement on the claim session to abort its transaction,
+        # reproducing the aborted-transaction state a statement_timeout leaves.
+        await kwargs["session"].execute(
+            text("SELECT * FROM _no_such_table_sr_trend_poison")
+        )
+
+    with patch("app.sr_analytics.compute_edges_trend", new=_poison):
+        resp = await client.post("/api/agent/claim", headers=headers)
+
+    assert resp.status_code == 200, (
+        "claim must survive a poisoned best-effort enrichment session, got "
+        f"{resp.status_code}: {resp.text[:300]}"
+    )

@@ -12,7 +12,6 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -1908,14 +1907,27 @@ async def claim_task(
     # (incident 2026-05-29, agent.py:1889).
     try:
         project_for_playbook = await session.get(Project, task.project_id)
-    except PendingRollbackError:
+    except Exception:  # noqa: BLE001
+        # Any best-effort enrichment above (SR-trend analytics, review
+        # effectiveness) can abort this session — most often an SR-trend query
+        # hitting the 120s statement_timeout (incident 2026-05-29), but also
+        # PendingRollbackError / InFailedSQLTransactionError. The claim was
+        # already committed far above, so this MUST NOT 500: roll back and
+        # re-read; if even the re-read fails, proceed without the playbook.
         logger.warning(
-            "[AGENT] claim_task session transaction was aborted by best-effort "
-            "enrichment — rolling back and re-reading project for playbook "
-            "(claim already committed)"
+            "[AGENT] claim_task session aborted by best-effort enrichment — "
+            "rolling back and re-reading project for playbook (claim already "
+            "committed)"
         )
-        await session.rollback()
-        project_for_playbook = await session.get(Project, task.project_id)
+        project_for_playbook = None
+        try:
+            await session.rollback()
+            project_for_playbook = await session.get(Project, task.project_id)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[AGENT] playbook project re-read failed after rollback — "
+                "proceeding without playbook (claim already committed)"
+            )
     if project_for_playbook and project_for_playbook.design_doc:
         task_type = (task.first_payload).get("type", "create")
         playbook_entries = {}

@@ -124,13 +124,17 @@ async def compute_sr_regression_risk_test_signal_trends(
     previous_bucket: list = []
 
     cycle_stmt = (
-        select(StrategicCycle)
+        # id-only projection (bucketing below uses only .id) + the
+        # ix_strategiccycle_project_outcome_phase1 index: ordered index scan
+        # satisfies LIMIT 4 directly (was a full scan + sort of every completed
+        # cycle → 120s statement_timeout that poisoned the claim, 2026-05-29).
+        select(StrategicCycle.id)
         .where(StrategicCycle.project_id == project_id)
         .where(StrategicCycle.outcome == "completed")
         .order_by(StrategicCycle.phase1_started_at.desc())
         .limit(4)
     )
-    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+    cycle_rows = (await session.execute(cycle_stmt)).all()
 
     if len(cycle_rows) >= 2:
         task_by_cycle: dict[str, list] = {}
@@ -303,13 +307,17 @@ async def compute_sr_false_attestation_trends(
     previous_bucket: list = []
 
     cycle_stmt = (
-        select(StrategicCycle)
+        # id-only projection (bucketing below uses only .id) + the
+        # ix_strategiccycle_project_outcome_phase1 index: ordered index scan
+        # satisfies LIMIT 4 directly (was a full scan + sort of every completed
+        # cycle → 120s statement_timeout that poisoned the claim, 2026-05-29).
+        select(StrategicCycle.id)
         .where(StrategicCycle.project_id == project_id)
         .where(StrategicCycle.outcome == "completed")
         .order_by(StrategicCycle.phase1_started_at.desc())
         .limit(4)
     )
-    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+    cycle_rows = (await session.execute(cycle_stmt)).all()
 
     if len(cycle_rows) >= 2:
         task_by_cycle: dict[str, list] = {}
