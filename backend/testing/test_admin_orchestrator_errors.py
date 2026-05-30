@@ -137,6 +137,98 @@ class TestRecentOrchestratorErrors:
             app.dependency_overrides.pop(require_admin, None)
 
     @pytest.mark.asyncio
+    async def test_acknowledge_all_empty_cache_is_noop(self, client: AsyncClient):
+        """With an empty bucket cache, acknowledge-all installs no acks at all.
+
+        Regression guard: the handler must NOT fall back to a global "*"
+        wildcard suppression, which would hide every error bucket whose
+        last_seen is at or before the click timestamp — including real,
+        unseen buckets after a process restart.
+        """
+        admin_orchestrator_errors._orchestrator_errors_cache.clear()
+
+        resp = await client.post("/api/admin/orchestrator-errors/acknowledge-all")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "acknowledged", "count": 0}
+
+        # Verify via the public endpoint that no global suppression was
+        # installed: a fresh error bucket seen "now" must remain visible.
+        now = _utcnow()
+        admin_orchestrator_errors._orchestrator_errors_cache.clear()
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            return_value=[_make_entry(ATTR_TRACEBACK, now)],
+        ):
+            get_resp = await client.get("/api/admin/recent-orchestrator-errors")
+        assert get_resp.status_code == 200
+        assert len(get_resp.json()["buckets"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_all_skips_error_cached_snapshot(
+        self, client: AsyncClient
+    ):
+        """An error-cached snapshot must not seed the acknowledge-all set."""
+        admin_orchestrator_errors._orchestrator_errors_cache.clear()
+
+        def _raise(_hours: int):
+            raise RuntimeError("permission denied on logs")
+
+        # Populate the cache with an error-cached payload (empty buckets + error).
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            side_effect=_raise,
+        ):
+            err_resp = await client.get("/api/admin/recent-orchestrator-errors")
+        assert err_resp.json()["buckets"] == []
+
+        ack_resp = await client.post(
+            "/api/admin/orchestrator-errors/acknowledge-all"
+        )
+        assert ack_resp.status_code == 200
+        assert ack_resp.json()["count"] == 0
+
+        # A fresh real error bucket must remain fully visible afterwards.
+        now = _utcnow()
+        admin_orchestrator_errors._orchestrator_errors_cache.clear()
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            return_value=[_make_entry(ATTR_TRACEBACK, now)],
+        ):
+            get_resp = await client.get("/api/admin/recent-orchestrator-errors")
+        assert len(get_resp.json()["buckets"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_all_acks_visible_buckets(self, client: AsyncClient):
+        """Acknowledge-all hides the buckets currently in the cache, and only those."""
+        now = _utcnow()
+        admin_orchestrator_errors._orchestrator_errors_cache.clear()
+        with patch.object(
+            admin_orchestrator_errors,
+            "_fetch_orchestrator_error_entries",
+            return_value=[
+                _make_entry(ATTR_TRACEBACK, now),
+                _make_entry(LOCK_TRACEBACK, now),
+            ],
+        ):
+            first = await client.get("/api/admin/recent-orchestrator-errors")
+        assert len(first.json()["buckets"]) == 2
+
+        ack_resp = await client.post(
+            "/api/admin/orchestrator-errors/acknowledge-all"
+        )
+        assert ack_resp.status_code == 200
+        assert ack_resp.json()["count"] == 2
+
+        # Re-querying (cache hit) now shows them filtered out.
+        again = await client.get("/api/admin/recent-orchestrator-errors")
+        assert again.json()["buckets"] == []
+        assert again.json()["acknowledged_count"] == 2
+
+    @pytest.mark.asyncio
     async def test_cache_hit_avoids_second_fetch(self, client: AsyncClient):
         """Second call within TTL returns cached payload without re-querying."""
         now = _utcnow()

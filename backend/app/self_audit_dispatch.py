@@ -13,11 +13,11 @@ from datetime import datetime, timedelta
 
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
+from app.task_locking import with_vision_locked
 from app.shared_state import (
     get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -336,12 +336,12 @@ async def _spawn_self_audit_task(
                 )
                 # Stamp cool-down even though we're not spawning, so the
                 # dispatch decision isn't recomputed every tick while the
-                # in-flight audit runs.
-                vision = dict(project.vision or {})
-                vision["_self_audit_dispatched_at"] = _utcnow().isoformat()
-                project.vision = vision
-                flag_modified(project, "vision")
-                session.add(project)
+                # in-flight audit runs. Under a project-row FOR UPDATE lock so
+                # the stamp can't clobber a concurrent strategic vision write.
+                def _stamp_audit_cooldown(vision: dict) -> None:
+                    vision["_self_audit_dispatched_at"] = _utcnow().isoformat()
+
+                await with_vision_locked(session, project.id, _stamp_audit_cooldown)
                 await session.commit()
                 return False
 
@@ -392,15 +392,16 @@ async def _spawn_self_audit_task(
     session.add(history)
 
     # Stamp dispatch timestamp + advance round-robin offset so subsequent
-    # ticks rotate through additional systems.
-    vision = dict(project.vision or {})
-    vision["_self_audit_dispatched_at"] = _utcnow().isoformat()
-    if focus:
-        offset = int(vision.get("_self_audit_round_robin_offset", 0)) or 0
-        vision["_self_audit_round_robin_offset"] = offset + len(focus)
-    project.vision = vision
-    flag_modified(project, "vision")
-    session.add(project)
+    # ticks rotate through additional systems. Read-modify-write of the offset
+    # runs inside a project-row FOR UPDATE lock so it can't clobber (or be
+    # clobbered by) a concurrent strategic vision write.
+    def _stamp_dispatch_and_rotate(vision: dict) -> None:
+        vision["_self_audit_dispatched_at"] = _utcnow().isoformat()
+        if focus:
+            offset = int(vision.get("_self_audit_round_robin_offset", 0)) or 0
+            vision["_self_audit_round_robin_offset"] = offset + len(focus)
+
+    await with_vision_locked(session, project.id, _stamp_dispatch_and_rotate)
     await session.commit()
     logger.info(
         f"[SELF_AUDIT] Spawned self_audit task {new_task.id} for project "

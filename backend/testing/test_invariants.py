@@ -2389,15 +2389,10 @@ _LOCK_GUARD_EXEMPT: dict[str, set[str]] = {
     # design_doc and their baseline entries have been removed.
     "design_doc": set(),
     "vision": {
-        # Research vision RMW from the autonomous loop — pending migration to
-        # with_vision_locked(); counter serialization already hardened separately.
-        "autonomous_research.py",
         # Single direction-metrics vision write.
         "direction_metrics.py",
         # Debug-only vision touch ({**project.vision}).
         "routers/admin_debug.py",
-        # Self-audit dispatch vision write — pending migration to with_vision_locked().
-        "self_audit_dispatch.py",
     },
 }
 

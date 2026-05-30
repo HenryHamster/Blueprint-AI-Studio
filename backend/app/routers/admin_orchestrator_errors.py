@@ -342,12 +342,23 @@ async def acknowledge_all_orchestrator_errors(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Acknowledge all current orchestrator error buckets."""
+    """Acknowledge all currently-visible orchestrator error buckets.
+
+    Scope is the union of bucket keys across cached snapshots. Error-cached
+    snapshots (those carrying an ``error`` field from a failed log fetch) are
+    skipped so a transient upstream failure can't seed the acknowledge-all set.
+    With no buckets to acknowledge the action is a no-op — it must never install
+    a global wildcard suppression, which would hide real, unseen error buckets.
+    """
     now_dt = _utcnow()
     user_email = current_user.get("email", current_user.get("sub", "unknown"))
     acknowledged_keys: List[str] = []
     seen: set[str] = set()
     for _cached_ts, cached_payload in _orchestrator_errors_cache.values():
+        # An error-cached snapshot has an empty bucket list plus an "error"
+        # field; never let it (or any empty snapshot) widen the ack scope.
+        if cached_payload.get("error"):
+            continue
         for b in cached_payload.get("buckets", []):
             key = f"{b['exception_class']}|{b['source']}"
             if key in seen:
@@ -355,9 +366,6 @@ async def acknowledge_all_orchestrator_errors(
             seen.add(key)
             await _upsert_ack(session, key, now_dt, user_email)
             acknowledged_keys.append(key)
-    # If cache is empty but caller wants to ack everything, set a global marker
-    if not acknowledged_keys:
-        await _upsert_ack(session, "*", now_dt, user_email)
     await session.commit()
     logger.info(
         f"[ADMIN] All orchestrator errors acknowledged ({len(acknowledged_keys)} buckets) by {user_email}"

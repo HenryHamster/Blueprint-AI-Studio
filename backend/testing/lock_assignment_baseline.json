@@ -30,13 +30,11 @@
     "task_locking.py": 1
   },
   "vision": {
-    "autonomous_research.py": 4,
     "direction_metrics.py": 1,
     "research_completion.py": 1,
     "routers/admin_agent_ops.py": 1,
     "routers/admin_debug.py": 1,
     "routers/admin_projects.py": 1,
-    "self_audit_dispatch.py": 2,
     "strategic_completion.py": 10,
     "task_completion.py": 2,
     "task_lifecycle.py": 1,

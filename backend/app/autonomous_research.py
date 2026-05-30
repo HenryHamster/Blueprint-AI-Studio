@@ -8,7 +8,6 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -31,6 +30,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
 from app.autonomous_research_diagnosis import _spawn_direction_diagnosis  # noqa: F401 — re-export for backwards compat
 from app.direction_mode import (
@@ -611,10 +611,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             if await _spawn_strategic_review(
                 project, session, cycle_id=pending_sr.get("cycle_id")
             ):
-                project.vision = {**project.vision}
-                project.vision.pop("_pending_strategic_review", None)
-                flag_modified(project, "vision")
-                session.add(project)
+                def _clear_pending_sr(vision: dict) -> None:
+                    vision.pop("_pending_strategic_review", None)
+
+                await with_vision_locked(session, project.id, _clear_pending_sr)
                 logger.info(
                     f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
                 )
@@ -669,12 +669,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             + d.get("history_aggregate", {}).get("total_cycles", 0)
             for d in all_active_directions
         )
-        project.vision = {
-            **(project.vision or {}),
-            "_research_spawn_count": research_spawn_count,
-        }
-        flag_modified(project, "vision")
-        session.add(project)
+        def _seed_research_spawn_count(vision: dict) -> None:
+            vision["_research_spawn_count"] = research_spawn_count
+
+        await with_vision_locked(session, project.id, _seed_research_spawn_count)
         logger.info(
             f"[RESEARCH] Seeded _research_spawn_count={research_spawn_count} from research_history"
         )
@@ -833,35 +831,33 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             # Write a machine-readable marker so the strategic-stall signal
             # can distinguish a payload-bloat stall from a scheduling stall
             # and redirect diagnosis toward compaction rather than stuck tasks.
-            project.vision = {
-                **(project.vision or {}),
-                "_strategic_payload_bloat_skip": {
+            bloat_size = e.size
+            bloat_top = [{"key": k, "size": n} for k, n in e.top_keys[:5]]
+
+            def _mark_payload_bloat_skip(vision: dict) -> None:
+                vision["_strategic_payload_bloat_skip"] = {
                     "skipped_at": _utcnow().isoformat(),
-                    "size": e.size,
-                    "top_contributors": [
-                        {"key": k, "size": n} for k, n in e.top_keys[:5]
-                    ],
-                },
-            }
-            flag_modified(project, "vision")
-            session.add(project)
+                    "size": bloat_size,
+                    "top_contributors": bloat_top,
+                }
+
+            await with_vision_locked(session, project.id, _mark_payload_bloat_skip)
             await session.commit()
 
         if spawned:
             research_spawn_count += 1
-            new_vision = {
-                **(project.vision or {}),
-                "_research_spawn_count": research_spawn_count,
-                "_strategic_cycle_count": strategic_cycle_count,
-            }
-            # Clear any stale payload-bloat skip marker now that a strategic spawn
-            # succeeded (payload shrank back under the cap). Otherwise the marker
-            # persists in vision and the strategic-health panel + stall investigation
-            # keep flagging a bloat condition that has already recovered.
-            new_vision.pop("_strategic_payload_bloat_skip", None)
-            project.vision = new_vision
-            flag_modified(project, "vision")
-            session.add(project)
+
+            def _record_strategic_spawn(vision: dict) -> None:
+                vision["_research_spawn_count"] = research_spawn_count
+                vision["_strategic_cycle_count"] = strategic_cycle_count
+                # Clear any stale payload-bloat skip marker now that a strategic
+                # spawn succeeded (payload shrank back under the cap). Otherwise
+                # the marker persists in vision and the strategic-health panel +
+                # stall investigation keep flagging a bloat condition that has
+                # already recovered.
+                vision.pop("_strategic_payload_bloat_skip", None)
+
+            await with_vision_locked(session, project.id, _record_strategic_spawn)
             # 2026-05-03: commit BEFORE the tactical-research early-returns
             # below. Without this, when a tactical-research cap (max_parallel
             # / max_total / global rate-limit) fires, the function returns
