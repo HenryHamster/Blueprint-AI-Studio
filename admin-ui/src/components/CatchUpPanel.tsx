@@ -27,6 +27,7 @@ import { CatchUpCostDiagnosticsSection } from './CatchUpCostDiagnosticsSection';
 import { CatchUpRemediationPipelineSection } from './CatchUpRemediationPipelineSection';
 import { CatchUpFailureSignalsSection } from './CatchUpFailureSignalsSection';
 import { CatchUpInProgressSection } from './CatchUpInProgressSection';
+import { CatchUpOperationalMetricsSection } from './CatchUpOperationalMetricsSection';
 import type { ActiveTask } from './CatchUpInProgressSection';
 import type { Project } from '../types/project';
 
@@ -1365,350 +1366,30 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 onSelectTask={onSelectTask}
               />
 
-              {/* Review cap exhaustion summary */}
-              {digest.review_cap_exhaustion_summary && digest.review_cap_exhaustion_summary.count > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Review cap exhaustion</span>
-                    <span className="text-[10px] text-neutral-400">
-                      {digest.review_cap_exhaustion_summary.count} task{digest.review_cap_exhaustion_summary.count !== 1 ? 's' : ''} hit cap
-                    </span>
-                    {digest.review_cap_exhaustion_summary.avg_iterations != null && (
-                      <span className="text-[10px] text-neutral-500">
-                        · avg {digest.review_cap_exhaustion_summary.avg_iterations.toFixed(1)} iter
-                      </span>
-                    )}
-                    {digest.review_cap_exhaustion_summary.total_cost_usd > 0 && (
-                      <span className="text-[10px] text-red-400">
-                        · ${digest.review_cap_exhaustion_summary.total_cost_usd.toFixed(2)} wasted
-                      </span>
-                    )}
-                    {digest.review_cap_exhaustion_summary.avg_cost_usd != null && (
-                      <span className="text-[10px] text-neutral-500">
-                        · avg ${digest.review_cap_exhaustion_summary.avg_cost_usd.toFixed(2)}/task
-                      </span>
-                    )}
-                  </div>
-                  {digest.review_cap_exhaustion_summary.top_directions.length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1">
-                      {(() => {
-                        const dirTextById = new Map<string, string>(
-                          (digest.direction_progress ?? []).map(dp => [dp.direction_id, dp.direction_text || dp.direction_id]),
-                        );
-                        return (digest.review_cap_exhaustion_summary?.top_directions ?? []).map(d => {
-                          const text = dirTextById.get(d.direction_id) ?? d.direction_id;
-                          const label = text.length > 60 ? text.slice(0, 60) + '…' : text;
-                          return (
-                            <span key={d.direction_id} className="text-[10px] text-neutral-500 truncate">
-                              · {label}{' '}
-                              <span className="text-red-400">×{d.count}</span>
-                            </span>
-                          );
-                        });
-                      })()}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Merge retries saved (early-exit efficiency) */}
-              {digest.total_merge_retries_saved != null && digest.total_merge_retries_saved > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Early exit</span>
-                  <span className="text-[10px] text-emerald-400 inline-flex items-center gap-0.5">
-                    <CheckCircle className="w-2.5 h-2.5" />
-                    {digest.total_merge_retries_saved} {digest.total_merge_retries_saved === 1 ? 'retry' : 'retries'} saved
-                  </span>
-                  {digest.merge_early_exit_count != null && digest.merge_early_exit_count > 0 && (
-                    <span className="text-[10px] text-neutral-500">
-                      · across {digest.merge_early_exit_count} task{digest.merge_early_exit_count === 1 ? '' : 's'}
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {/* Retry overhead cost */}
-              {digest.retry_task_count != null && digest.retry_task_count > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry waste</span>
-                  <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
-                    <DollarSign className="w-2.5 h-2.5" />{(digest.retry_overhead_cost_usd ?? 0).toFixed(2)} wasted
-                  </span>
-                  <span className="text-[10px] text-neutral-400">
-                    · {digest.retry_task_count} over-retried task{digest.retry_task_count === 1 ? '' : 's'}
-                  </span>
-                  {digest.avg_retries_before_failure != null && (
-                    <span className="text-[10px] text-neutral-500">
-                      · avg {digest.avg_retries_before_failure.toFixed(1)} attempts before failure
-                    </span>
-                  )}
-                  {digest.retry_waste_by_direction && digest.retry_waste_by_direction.length > 0 && (
-                    <ul className="w-full flex flex-col gap-0.5 mt-0.5 ml-2">
-                      {digest.retry_waste_by_direction.map((d) => (
-                        <li key={d.direction_id} className="text-[10px] text-neutral-400">
-                          · <span className="text-neutral-300">{d.direction_text || d.direction_id}</span>
-                          <span className="text-amber-400 ml-1">${d.retry_cost_usd.toFixed(2)}</span>
-                          <span className="text-neutral-500 ml-1">({d.retry_task_count} task{d.retry_task_count === 1 ? '' : 's'})</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-
-              {/* Retry effectiveness */}
-              {((digest.retry_success_count ?? 0) > 0 || digest.retry_wasted_rate != null) && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry effectiveness</span>
-                  {(digest.retry_success_count ?? 0) > 0 && (
-                    <span className="text-[10px] text-emerald-400">
-                      {digest.retry_success_count} recovered
-                    </span>
-                  )}
-                  {digest.retry_wasted_rate != null && (
-                    <span className="text-[10px] text-amber-400">
-                      · {Math.round(digest.retry_wasted_rate * 100)}% wasted
-                    </span>
-                  )}
-                  {(digest.retry_recovery_cost_usd ?? 0) > 0 && (
-                    <span className="text-[10px] text-neutral-500 inline-flex items-center gap-0.5">
-                      · <DollarSign className="w-2.5 h-2.5" />{(digest.retry_recovery_cost_usd ?? 0).toFixed(2)} recovery cost
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {/* Resurrection outcomes */}
-              {digest.resurrection_outcome_summary && digest.resurrection_outcome_summary.total > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Resurrection outcomes</span>
-                  <span className="text-[10px] text-neutral-400">
-                    {digest.resurrection_outcome_summary.total} attempted
-                  </span>
-                  <span className="text-[10px] text-emerald-400">
-                    · {digest.resurrection_outcome_summary.completed} succeeded
-                  </span>
-                  <span className="text-[10px] text-amber-400">
-                    · {digest.resurrection_outcome_summary.failed_again} failed again
-                  </span>
-                  {digest.resurrection_outcome_summary.success_rate != null && (
-                    <span className="text-[10px] text-neutral-500">
-                      · {Math.round(digest.resurrection_outcome_summary.success_rate * 100)}% success
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {/* Migration health */}
-              {digest.migration_health && (() => {
-                const mh = digest.migration_health;
-                const highlight = mh.migration_tasks_failed > 0 || mh.migration_errors_in_window > 0 || mh.auto_generated_migrations > 0;
-                return (
-                  <div className={`flex flex-wrap items-center gap-1.5 ${highlight ? 'rounded px-1.5 py-1 ring-1 ring-amber-500/40 bg-amber-500/5' : ''}`}>
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Migration health</span>
-                    {mh.current_schema_revision && (
-                      <span className="text-[10px] text-neutral-400 font-mono">rev {mh.current_schema_revision}</span>
-                    )}
-                    <span className="text-[10px] text-neutral-400">· {mh.migration_tasks_in_window} task{mh.migration_tasks_in_window === 1 ? '' : 's'}</span>
-                    <span className="text-[10px] text-emerald-400">· {mh.migration_tasks_succeeded} ok</span>
-                    <span className={`text-[10px] ${mh.migration_tasks_failed > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_tasks_failed} failed</span>
-                    <span className={`text-[10px] ${mh.migration_errors_in_window > 0 ? 'text-red-400' : 'text-neutral-500'}`}>· {mh.migration_errors_in_window} errors</span>
-                    {mh.auto_generated_migrations > 0 && (
-                      <span className="text-[10px] text-amber-400 font-semibold">· ⚠ {mh.auto_generated_migrations} auto-generated</span>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* Prevention efficacy */}
-              {digest.prevention_efficacy && (() => {
-                const pe = digest.prevention_efficacy;
-                const badge = pe.assessment === 'positive' ? 'text-emerald-400'
-                  : pe.assessment === 'negative' ? 'text-red-400'
-                  : pe.assessment === 'neutral' ? 'text-neutral-400' : 'text-neutral-500';
-                return (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prevention efficacy</span>
-                    <span className={`text-[10px] font-semibold uppercase ${badge}`}>{pe.assessment.replace('_', ' ')}</span>
-                    {pe.assessment === 'no_data' ? (
-                      <span className="text-[10px] text-neutral-500">· no preventive-context data in window</span>
-                    ) : (
-                      <>
-                        <span className="text-[10px] text-neutral-400">· preventive {pe.preventive_merge_rate != null ? `${Math.round(pe.preventive_merge_rate * 100)}%` : '—'}</span>
-                        <span className="text-[10px] text-neutral-500">vs overall {pe.overall_merge_rate != null ? `${Math.round(pe.overall_merge_rate * 100)}%` : '—'}</span>
-                        <span className="text-[10px] text-neutral-500">· {pe.preventive_tasks_merged}/{pe.preventive_tasks_created} merged</span>
-                      </>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* Release-qualifier infra failures */}
-              {digest.release_qualifier_infra_metrics && (() => {
-                const rq = digest.release_qualifier_infra_metrics;
-                const alert = rq.release_infra_failure_total > 0 || rq.release_infra_failure_streak_max > 0;
-                if (!alert) return null;
-                return (
-                  <div className="flex flex-wrap items-center gap-1.5 rounded px-1.5 py-1 ring-1 ring-red-500/40 bg-red-500/5">
-                    <span className="text-[10px] font-bold text-red-400 uppercase tracking-widest">Release infra failures</span>
-                    <span className="text-[10px] text-red-400">{rq.release_infra_failure_total} of {rq.qualifier_runs_total} runs</span>
-                    {rq.release_infra_failure_streak_max > 0 && (
-                      <span className="text-[10px] text-amber-400">· streak ×{rq.release_infra_failure_streak_max}</span>
-                    )}
-                    {rq.audit_report_missing_count > 0 && (
-                      <span className="text-[10px] text-neutral-400">· {rq.audit_report_missing_count} audit missing</span>
-                    )}
-                    {rq.audit_report_parseable_but_unscoreable_count > 0 && (
-                      <span className="text-[10px] text-neutral-400">· {rq.audit_report_parseable_but_unscoreable_count} unscoreable</span>
-                    )}
-                    {rq.smoketest_report_missing_count > 0 && (
-                      <span className="text-[10px] text-neutral-400">· {rq.smoketest_report_missing_count} smoketest missing</span>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* Retry pattern summary */}
-              {digest.retry_pattern_summary && digest.retry_pattern_summary.total_multi_attempt_failures > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry patterns</span>
-                    <span className="text-[10px] text-neutral-400">
-                      {digest.retry_pattern_summary.total_multi_attempt_failures} multi-attempt
-                    </span>
-                    {digest.retry_pattern_summary.total_multi_attempt_failures > 0 && (
-                      <span className="text-[10px] text-neutral-500">
-                        · {Math.round((digest.retry_pattern_summary.repeat_class_count / digest.retry_pattern_summary.total_multi_attempt_failures) * 100)}% same class
-                      </span>
-                    )}
-                  </div>
-                  {digest.retry_pattern_summary.top_patterns.length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1">
-                      {digest.retry_pattern_summary.top_patterns.slice(0, 3).map((p) => (
-                        <span key={p.sequence} className="text-[10px] text-neutral-500 truncate font-mono">
-                          · {p.sequence}{' '}
-                          <span className="text-amber-400">×{p.count}</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Analysis overflow summary */}
-              {digest.analysis_overflow_summary && digest.analysis_overflow_summary.total_count > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Analysis overflow</span>
-                  <span className="text-[10px] text-neutral-400">
-                    {digest.analysis_overflow_summary.total_count} task{digest.analysis_overflow_summary.total_count === 1 ? '' : 's'} hit planning gate
-                  </span>
-                  {digest.analysis_overflow_summary.cost_usd > 0 && (
-                    <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
-                      <DollarSign className="w-2.5 h-2.5" />{digest.analysis_overflow_summary.cost_usd.toFixed(2)}
-                    </span>
-                  )}
-                  {Object.entries(digest.analysis_overflow_summary.by_scope).map(([scope, count]) => (
-                    <span key={scope} className="text-[10px] text-neutral-500">
-                      · {scope} ×{count}
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              {/* Provision waste */}
-              {digest.provision_waste_cost_usd != null && digest.provision_waste_cost_usd > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Provision waste</span>
-                    <span className="text-[10px] text-amber-400 inline-flex items-center gap-0.5">
-                      <DollarSign className="w-2.5 h-2.5" />{digest.provision_waste_cost_usd.toFixed(2)} burned
-                    </span>
-                    {digest.provisioning_overhead_pct != null && (
-                      <span className="text-[10px] text-neutral-500">
-                        · {(digest.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
-                      </span>
-                    )}
-                  </div>
-                  {digest.provision_waste_by_direction && digest.provision_waste_by_direction.length > 0 && (
-                    <ul className="w-full flex flex-col gap-0.5 mt-0.5 ml-2">
-                      {digest.provision_waste_by_direction.map((d) => (
-                        <li key={d.direction_id} className="text-[10px] text-neutral-400">
-                          · <span className="text-neutral-300">{d.direction_text || d.direction_id}</span>
-                          <span className="text-amber-400 ml-1">${d.provision_cost_usd.toFixed(2)}</span>
-                          <span className="text-neutral-500 ml-1">({d.provision_task_count} task{d.provision_task_count === 1 ? '' : 's'})</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-
-              {/* Provisioning overhead (standalone if no waste block) */}
-              {(digest.provision_waste_cost_usd == null || digest.provision_waste_cost_usd === 0) &&
-                digest.provisioning_overhead_pct != null && digest.provisioning_overhead_pct > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Provisioning overhead</span>
-                  <span className="text-[10px] text-neutral-400">
-                    {(digest.provisioning_overhead_pct * 100).toFixed(1)}% of total compute
-                  </span>
-                </div>
-              )}
-
-              {/* Escalation outcomes */}
-              {digest.escalation_outcome_summary && digest.escalation_outcome_summary.total_attempted > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Escalation outcomes</span>
-                    <span className="text-[10px] text-neutral-400">
-                      {digest.escalation_outcome_summary.total_attempted} attempted
-                    </span>
-                    <span className="text-[10px] text-emerald-400">
-                      · {digest.escalation_outcome_summary.total_merged} merged
-                    </span>
-                    <span className="text-[10px] text-red-400">
-                      · {digest.escalation_outcome_summary.total_failed} failed
-                    </span>
-                    {digest.escalation_outcome_summary.overall_success_rate != null && (
-                      <span className="text-[10px] text-neutral-500">
-                        · {Math.round(digest.escalation_outcome_summary.overall_success_rate * 100)}% success
-                      </span>
-                    )}
-                  </div>
-                  {Object.entries(digest.escalation_outcome_summary.by_path).length > 0 && (
-                    <div className="flex flex-col gap-0.5 ml-1">
-                      {Object.entries(digest.escalation_outcome_summary.by_path).map(([path, b]) => (
-                        <span key={path} className="text-[10px] text-neutral-500 truncate font-mono">
-                          · {path} <span className="text-neutral-400">{b.merged}/{b.attempted}</span>
-                          {b.success_rate != null && (
-                            <span className="text-neutral-500"> ({Math.round(b.success_rate * 100)}%)</span>
-                          )}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-
-              {/* Retry success rate by class */}
-              {digest.retry_success_rate_by_class && Object.keys(digest.retry_success_rate_by_class).length > 0 && (
-                <div className="flex flex-col gap-1">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Retry success by class</span>
-                  </div>
-                  <div className="flex flex-col gap-0.5 ml-1">
-                    {Object.entries(digest.retry_success_rate_by_class)
-                      .sort((a, b) => (b[1].merged + b[1].failed) - (a[1].merged + a[1].failed))
-                      .map(([cls, b]) => (
-                        <span key={cls} className="text-[10px] text-neutral-500 truncate font-mono">
-                          · {cls} <span className="text-emerald-400">{b.merged}</span>
-                          <span className="text-neutral-500">/</span>
-                          <span className="text-red-400">{b.failed}</span>
-                          <span className="text-neutral-400"> ({Math.round(b.success_rate * 100)}%)</span>
-                        </span>
-                      ))}
-                  </div>
-                </div>
-              )}
+              <CatchUpOperationalMetricsSection
+                directionProgress={digest.direction_progress ?? []}
+                reviewCapExhaustionSummary={digest.review_cap_exhaustion_summary}
+                totalMergeRetriesSaved={digest.total_merge_retries_saved}
+                mergeEarlyExitCount={digest.merge_early_exit_count}
+                retryTaskCount={digest.retry_task_count}
+                retryOverheadCostUsd={digest.retry_overhead_cost_usd}
+                avgRetriesBeforeFailure={digest.avg_retries_before_failure}
+                retryWasteByDirection={digest.retry_waste_by_direction}
+                retrySuccessCount={digest.retry_success_count}
+                retryWastedRate={digest.retry_wasted_rate}
+                retryRecoveryCostUsd={digest.retry_recovery_cost_usd}
+                resurrectionOutcomeSummary={digest.resurrection_outcome_summary}
+                migrationHealth={digest.migration_health}
+                preventionEfficacy={digest.prevention_efficacy}
+                releaseQualifierInfraMetrics={digest.release_qualifier_infra_metrics}
+                retryPatternSummary={digest.retry_pattern_summary}
+                analysisOverflowSummary={digest.analysis_overflow_summary}
+                provisionWasteCostUsd={digest.provision_waste_cost_usd}
+                provisionWasteByDirection={digest.provision_waste_by_direction}
+                provisioningOverheadPct={digest.provisioning_overhead_pct}
+                escalationOutcomeSummary={digest.escalation_outcome_summary}
+                retrySuccessRateByClass={digest.retry_success_rate_by_class}
+              />
 
               {/* Review quality */}
               <CatchUpReviewQualitySection

@@ -1,19 +1,22 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { X, MessageSquare, Send, Check, AlertTriangle, ChevronDown, Settings, ChevronUp, BellOff, Save, MoreVertical, Pencil, Trash2, Reply } from 'lucide-react';
+import { X, MessageSquare, Send, AlertTriangle, ChevronUp, Save, MoreVertical, Pencil, Trash2, Reply } from 'lucide-react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
 import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
-import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, formatMuteCountdown } from './muteWindow';
+import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
 import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
 import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './temporaryMutes';
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup, formatTimestamp } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import { type ProjectMessage, TYPE_CONFIG } from './MessageBubble';
+import { type ProjectMessage } from './MessageBubble';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
+import { MessageTypeDropdown } from './MessageTypeDropdown';
+import { MuteWindowMenu } from './MuteWindowMenu';
+import { EventVisibilityMenu } from './EventVisibilityMenu';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -92,60 +95,6 @@ function saveMessagesPanelPrefs(userId: string | null | undefined, prefs: Messag
   try { localStorage.setItem(messagesPanelPrefsKey(userId), JSON.stringify(prefs)); } catch { /* ignore */ }
 }
 
-const MSG_TYPE_OPTIONS = [
-  { label: 'Feedback', value: 'FEEDBACK' },
-  { label: 'Question', value: 'QUESTION' },
-  { label: 'Bug Report', value: 'BUG_REPORT' },
-  { label: 'Blocker', value: 'BLOCKER' },
-  { label: 'Note', value: 'NOTE' },
-];
-
-function MessageTypeDropdown({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    function handleClickOutside(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    if (open) document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, [open]);
-
-  const current = MSG_TYPE_OPTIONS.find(o => o.value === value);
-  const config = TYPE_CONFIG[value] || TYPE_CONFIG.NOTE;
-
-  return (
-    <div ref={ref} className="relative shrink-0">
-      <button
-        onClick={() => setOpen(v => !v)}
-        className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium transition-all border min-h-[44px] ${config.color} bg-neutral-900/50 border-neutral-800/50 hover:border-neutral-700`}
-      >
-        <span>{current?.label ?? value}</span>
-        <ChevronDown className={`w-3 h-3 transition-transform ${open ? 'rotate-180' : ''}`} />
-      </button>
-      {open && (
-        <div className="absolute bottom-full mb-1 left-0 z-50 min-w-[140px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
-          {MSG_TYPE_OPTIONS.map(opt => {
-            const optConfig = TYPE_CONFIG[opt.value] || TYPE_CONFIG.NOTE;
-            return (
-              <button
-                key={opt.value}
-                onClick={() => { onChange(opt.value); setOpen(false); }}
-                className={`w-full flex items-center justify-between px-3 py-2.5 text-xs hover:bg-neutral-800 transition-colors min-h-[44px] ${
-                  opt.value === value ? 'text-neutral-100' : optConfig.color
-                }`}
-              >
-                <span>{opt.label}</span>
-                {opt.value === value && <Check className="w-3 h-3 text-neutral-400" />}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
 
 async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
   try {
@@ -214,7 +163,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
   const [showWebhookDetail, setShowWebhookDetail] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
-  const [showMuteMenu, setShowMuteMenu] = useState(false);
   const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
     loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
   );
@@ -420,41 +368,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // badge does not jump when the operator opens the panel.
   const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
 
-  // Calculate 24-hour volume for each event type and memoize event types
-  const { eventType24hVolume, sortedEventTypes } = useMemo(() => {
-    const now = Date.now();
-    const twentyFourHoursMs = 24 * 60 * 60 * 1000;
-    const counts = new Map<string, number>();
-    for (const msg of messages) {
-      const et = msg.context.event_type as string | undefined;
-      if (!et) continue;
-      if (msg.created_at) {
-        const msgTime = parseTimestamp(msg.created_at).getTime();
-        if (now - msgTime <= twentyFourHoursMs) {
-          counts.set(et, (counts.get(et) ?? 0) + 1);
-        }
-      }
-    }
-
-    // Source from open messages without coupling to criticalOnly — the popover is for
-    // managing prefs across all event types, so toggling criticalOnly should not hide
-    // event types whose only currently-open messages are non-critical.
-    const allEts = [...new Set([
-      ...Object.keys(eventPrefs),
-      ...messages.filter(m => m.status === 'open')
-        .flatMap(m => { const et = m.context.event_type as string | undefined; return et ? [et] : []; }),
-    ])];
-
-    const sorted = [...allEts].sort((a, b) => {
-      const countA = counts.get(a) ?? 0;
-      const countB = counts.get(b) ?? 0;
-      return countB - countA;
-    });
-
-    return { eventType24hVolume: counts, sortedEventTypes: sorted };
-  }, [messages, eventPrefs]);
-
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
+
+  // Persist + apply a mute-window change (arm/extend pass a window, clear passes null).
+  // MuteWindowMenu owns its own open/close UI state and pushes changes back through here.
+  const setMuteWindowPersisted = useCallback((win: MuteWindow | null) => {
+    if (win) {
+      saveMuteWindow(auth.currentUser?.email, selectedProjectId, win);
+      if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, win);
+    } else {
+      clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+      if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, null);
+    }
+    setMuteWindow(win);
+  }, [selectedProjectId]);
 
   function updatePref(et: string, pref: EventPref) {
     setEventPrefs(prev => {
@@ -1113,108 +1040,19 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
               {selectMode ? 'Cancel' : 'Select'}
             </button>
           )}
-          <div className="relative">
-            <button
-              onClick={() => setShowMuteMenu(v => !v)}
-              title={muteActive && muteWindow ? `Muted · ${formatMuteCountdown(muteWindow.expiresAt)}` : 'Mute routine ops temporarily'}
-              className={`px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center text-xs font-semibold ${muteActive ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
-            >
-              {muteActive && muteWindow ? `🔕 ${formatMuteCountdown(muteWindow.expiresAt)}` : <BellOff className="w-4 h-4" />}
-            </button>
-            {showMuteMenu && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowMuteMenu(false)} />
-                <div className="absolute right-0 top-full mt-1 z-50 w-44 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-2 space-y-0.5">
-                  {muteActive ? (
-                    <>
-                      <p className="text-[10px] text-neutral-500 px-2 py-1">Mute active</p>
-                      {([['Extend +1h', 3600000], ['Extend +4h', 14400000], ['Extend +8h', 28800000]] as [string, number][]).map(([label, ms]) => (
-                        <button key={label} onClick={() => {
-                          const updated = { expiresAt: (muteWindow!.expiresAt) + ms };
-                          saveMuteWindow(auth.currentUser?.email, selectedProjectId, updated);
-                          if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, updated);
-                          setMuteWindow(updated);
-                          setShowMuteMenu(false);
-                        }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
-                      ))}
-                      <div className="border-t border-neutral-800 my-1" />
-                      <button onClick={() => {
-                        clearMuteWindow(auth.currentUser?.email, selectedProjectId);
-                        if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, null);
-                        setMuteWindow(null);
-                        setShowMuteMenu(false);
-                      }} className="w-full text-left text-xs px-2 py-2 rounded text-amber-400 hover:bg-amber-500/10 transition-colors min-h-[44px] md:min-h-auto flex items-center">End mute early</button>
-                    </>
-                  ) : (
-                    <>
-                      <p className="text-[10px] text-neutral-500 px-2 py-1">Mute routine ops for</p>
-                      {([['1 hour', 3600000], ['4 hours', 14400000], ['8 hours', 28800000]] as [string, number][]).map(([label, ms]) => (
-                        <button key={label} onClick={() => {
-                          const newWin = { expiresAt: Date.now() + ms };
-                          saveMuteWindow(auth.currentUser?.email, selectedProjectId, newWin);
-                          if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, newWin);
-                          setMuteWindow(newWin);
-                          setShowMuteMenu(false);
-                        }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
-                      ))}
-                    </>
-                  )}
-                </div>
-              </>
-            )}
-          </div>
-          <div className="relative">
-            <button
-              onClick={() => setShowPrefsPanel(v => !v)}
-              title="Event type visibility"
-              className={`p-2 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center ${showPrefsPanel ? 'text-neutral-300 bg-neutral-800 border-neutral-700' : 'text-neutral-500 hover:text-neutral-300 border-transparent'}`}
-            >
-              <Settings className="w-4 h-4" />
-            </button>
-            {showPrefsPanel && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowPrefsPanel(false)} />
-                <div className="absolute right-0 top-full mt-1 z-50 w-60 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-medium text-neutral-300">Event visibility</span>
-                    {Object.keys(eventPrefs).length > 0 && (
-                      <button onClick={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {}); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
-                    )}
-                  </div>
-                  {sortedEventTypes.length === 0 ? (
-                    <p className="text-[11px] text-neutral-600 py-1">No events loaded</p>
-                  ) : sortedEventTypes.map(et => {
-                    const pref = eventPrefs[et] ?? 'routine';
-                    const count = eventType24hVolume.get(et) ?? 0;
-                    const isHighVolume = count >= 10;
-                    return (
-                      <div key={et} className="flex items-center gap-1.5">
-                        <div className="flex items-center gap-1 flex-1 min-w-0">
-                          <span className="text-[11px] text-neutral-400 truncate">{et.replace(/_/g, ' ')}</span>
-                          {count > 0 && (
-                            <span className={`text-[10px] shrink-0 px-1.5 py-0.5 rounded-full font-medium ${
-                              isHighVolume
-                                ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30'
-                                : 'bg-neutral-800 text-neutral-500'
-                            }`}>
-                              {count}
-                            </span>
-                          )}
-                        </div>
-                        {(['surfaced', 'routine', 'mute'] as EventPref[]).map(p => (
-                          <button key={p} onClick={() => updatePref(et, p)}
-                            title={p}
-                            className={`text-[10px] px-1.5 py-0.5 rounded border transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${pref === p ? (p === 'mute' ? 'border-red-500/50 text-red-400 bg-red-500/10' : p === 'surfaced' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' : 'border-neutral-600 text-neutral-300 bg-neutral-800') : 'border-transparent text-neutral-600 hover:text-neutral-400'}`}>
-                            {p === 'surfaced' ? '↑' : p === 'mute' ? '✕' : '·'}
-                          </button>
-                        ))}
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
-            )}
-          </div>
+          <MuteWindowMenu
+            muteActive={muteActive}
+            muteWindow={muteWindow}
+            onSetMuteWindow={setMuteWindowPersisted}
+          />
+          <EventVisibilityMenu
+            open={showPrefsPanel}
+            onOpenChange={setShowPrefsPanel}
+            messages={messages}
+            eventPrefs={eventPrefs}
+            onUpdatePref={updatePref}
+            onResetAll={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {}); }}
+          />
           <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center">
             <X className="w-4 h-4" />
           </button>
