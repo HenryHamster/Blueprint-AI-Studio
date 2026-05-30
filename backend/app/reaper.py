@@ -45,6 +45,8 @@ from app.failure_classification import (
     persist_authoritative_verdict,
     persist_failure_category,
     RATE_LIMIT,
+    _stuck_llm_call_no_progress,
+    _persist_stuck_call_reclassification,
 )
 from app.retry_budget import append_failure_class_history
 from app.time_utils import _utcnow, set_retry_after
@@ -2099,7 +2101,21 @@ async def reaper_service():
                             )
                             failure_class = classification.failure_class
                             if reap_reason_code == "agent_stalled":
-                                failure_class = "agent_stalled"
+                                # A "stall" with an LLM call started but 0 output
+                                # tokens is a silent provider hang (429/529 the
+                                # Claude Code SDK absorbed via internal retry,
+                                # surfacing no rate-limit text), NOT a code stall.
+                                # Classify as RATE_LIMIT so it holds/reroutes
+                                # instead of burning the retry budget and
+                                # terminal-failing a healthy task (incident
+                                # 2026-05-29). The reap-reason text itself never
+                                # matches an AGENT_TIMEOUT keyword, so this is
+                                # checked directly rather than via the classifier.
+                                if _stuck_llm_call_no_progress(task):
+                                    failure_class = RATE_LIMIT
+                                    _persist_stuck_call_reclassification(task)
+                                else:
+                                    failure_class = "agent_stalled"
                             persist_failure_category(
                                 task,
                                 failure_class,

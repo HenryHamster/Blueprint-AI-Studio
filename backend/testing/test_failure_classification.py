@@ -184,6 +184,113 @@ class TestPersistFailureCategoryTimeoutSubtype:
         assert "timeout_subtype" not in task.context
 
 
+class TestStuckLlmCallHelper:
+    """Unit tests for the 0-output-token stuck-call detector used by both the
+    classifier (agent-reported timeouts) and the reaper (agent_stalled reaps)."""
+
+    def _t(self, summary):
+        t = _task("")
+        t.api_call_summary = summary
+        return t
+
+    def test_call_started_zero_output_is_stuck(self):
+        from app.failure_classification import _stuck_llm_call_no_progress
+
+        assert _stuck_llm_call_no_progress(
+            self._t({"llm_call_count": 1, "total_output_tokens": 0})
+        ) is True
+
+    def test_output_present_is_not_stuck(self):
+        from app.failure_classification import _stuck_llm_call_no_progress
+
+        assert _stuck_llm_call_no_progress(
+            self._t({"llm_call_count": 2, "total_output_tokens": 800})
+        ) is False
+
+    def test_no_call_started_is_not_stuck(self):
+        from app.failure_classification import _stuck_llm_call_no_progress
+
+        assert _stuck_llm_call_no_progress(
+            self._t({"llm_call_count": 0, "total_output_tokens": 0})
+        ) is False
+
+    def test_missing_or_nondict_summary_is_not_stuck(self):
+        from app.failure_classification import _stuck_llm_call_no_progress
+
+        assert _stuck_llm_call_no_progress(self._t(None)) is False
+
+
+class TestStuckLlmCallReclassifiedToRateLimit:
+    """An execution/time-limit-stall AGENT_TIMEOUT where the agent started an LLM
+    call but produced 0 output tokens is a silent provider hang (429/529 the
+    Claude Code SDK absorbed via internal retry), not a code/agent defect —
+    classify as RATE_LIMIT so it holds/reroutes instead of burning the retry
+    budget and terminal-failing a healthy task. Incident 2026-05-29."""
+
+    def _stalled(self, msg: str, summary, ctx: dict | None = None) -> Task:
+        t = _task(msg, ctx)
+        t.api_call_summary = summary
+        return t
+
+    def test_fatal_45min_timeout_zero_output_reclassifies(self):
+        # Agent self-reported 45-min ClaudeTimeoutError → "fatal error" → AGENT_TIMEOUT.
+        t = self._stalled(
+            "Fatal error: Claude Code exceeded 45-minute time limit",
+            {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
+        )
+        assert classify_failure(t) == RATE_LIMIT
+        assert t.context.get("rate_limit_inferred_from") == "stuck_llm_call_no_output"
+        assert t.context.get("rate_limit_kind") == "unknown"
+
+    def test_tool_use_stall_zero_output_reclassifies(self):
+        # Agent wraps the mid-stream stall as a fatal ClaudeTimeoutError.
+        t = self._stalled(
+            "Fatal error: mid-stream tool-use stall: tool in-flight for >30 min without result",
+            {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
+        )
+        assert classify_failure(t) == RATE_LIMIT
+
+    def test_output_tokens_present_stays_agent_timeout(self):
+        # Real work happened (output produced) before the stall → genuine timeout.
+        t = self._stalled(
+            "Fatal error: Claude Code exceeded 45-minute time limit",
+            {"llm_call_count": 3, "total_input_tokens": 5000, "total_output_tokens": 1200},
+        )
+        assert classify_failure(t) == AGENT_TIMEOUT
+
+    def test_no_llm_call_started_stays_agent_timeout(self):
+        # Pre-LLM death (provision/startup) — not a provider hang.
+        t = self._stalled(
+            "Fatal error: Claude Code exceeded 45-minute time limit",
+            {"llm_call_count": 0, "total_input_tokens": 0, "total_output_tokens": 0},
+        )
+        assert classify_failure(t) == AGENT_TIMEOUT
+
+    def test_cancellation_with_zero_output_not_reclassified(self):
+        # A deliberate orchestration cancellation also has 0 output tokens but is
+        # NOT a provider hang — it lacks an execution-stall signature, so it must
+        # stay AGENT_TIMEOUT (proves the reclassification is narrowly scoped).
+        t = self._stalled(
+            "Cancelled: dependency task failed",
+            {"llm_call_count": 1, "total_input_tokens": 0, "total_output_tokens": 0},
+        )
+        assert classify_failure(t) == AGENT_TIMEOUT
+
+    def test_missing_summary_stays_agent_timeout(self):
+        t = _task("Fatal error: Claude Code exceeded 45-minute time limit")
+        t.api_call_summary = None
+        assert classify_failure(t) == AGENT_TIMEOUT
+
+    def test_code_error_not_reclassified_even_with_zero_output(self):
+        # Reclassification is gated on AGENT_TIMEOUT — a real code error must stay
+        # CODE_ERROR even with a 0-output-token summary + a time-limit substring.
+        t = self._stalled(
+            "AssertionError: expected 1 got 2",
+            {"llm_call_count": 1, "total_input_tokens": 100, "total_output_tokens": 0},
+        )
+        assert classify_failure(t) == CODE_ERROR
+
+
 class TestNormalizeAgentFailureCategory:
     def test_generic_fatal_model_config_rejection_overrides_code_error(self):
         msg = "Fatal error: ModelNotFoundError: models/gemini-3.1-pro-preview is not found for API version v1beta"

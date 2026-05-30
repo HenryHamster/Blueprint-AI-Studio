@@ -664,6 +664,64 @@ def _pool_was_rate_limited(
         return False
 
 
+def _stuck_llm_call_no_progress(task: "Task") -> bool:
+    """True when the agent started >=1 LLM call but received 0 output tokens.
+
+    This is the signature of a provider-side hang/throttle — an Anthropic 429/529
+    that the Claude Code SDK absorbed via internal retry/backoff, emitting NO
+    rate-limit text the pattern matcher can see — as opposed to a genuine
+    agent/code stall (which would have produced output tokens before stalling).
+    Such a hang rides to the agent's 45-min wall-clock timeout (or is reaped as
+    agent_stalled) and is otherwise misclassified AGENT_TIMEOUT, burning the
+    retry budget and terminal-failing a healthy task (incident 2026-05-29).
+
+    Read from task.api_call_summary, written by the agent heartbeat
+    (routers/agent.py) on a last-write-wins basis, so it reflects the current
+    attempt's cumulative LLM telemetry. Never raises.
+    """
+    summary = getattr(task, "api_call_summary", None)
+    if not isinstance(summary, dict):
+        return False
+    try:
+        calls = int(summary.get("llm_call_count") or 0)
+        out_tokens = int(summary.get("total_output_tokens") or 0)
+    except (TypeError, ValueError):
+        return False
+    return calls >= 1 and out_tokens == 0
+
+
+def _persist_stuck_call_reclassification(task: "Task") -> None:
+    """Mark a task whose AGENT_TIMEOUT/agent_stalled was reclassified to
+    RATE_LIMIT because of a stuck (0-output-token) LLM call. Sets the
+    ``rate_limit_kind`` key the requeue path needs for cooldown bookkeeping plus
+    an operator breadcrumb explaining the inference."""
+    try:
+        ctx = dict(task.context or {})
+        ctx.setdefault("rate_limit_kind", "unknown")
+        ctx["rate_limit_correlation_reclassified"] = True
+        ctx["rate_limit_inferred_from"] = "stuck_llm_call_no_output"
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Failed to persist stuck-call reclassification marker"
+        )
+
+
+# Execution-stall text signatures. Combined with a stuck (0-output-token) LLM
+# call, these indicate a silent provider hang (the agent's 45-min
+# ClaudeTimeoutError, or a mid-stream tool_use stall) rather than a cancellation,
+# heartbeat loss, VM death, or OOM — all of which can also show 0 output tokens
+# but are NOT rate-limits. Used to scope the stuck-call→RATE_LIMIT
+# reclassification narrowly on the agent-reported (classifier) path.
+_EXECUTION_STALL_SIGNATURES = (
+    "time limit",
+    "execution timed out",
+    "tool in-flight",
+    "tool-use stall",
+    "tool_use stall",
+)
+
+
 def _text_provider_failure_override(task: "Task", combined: str) -> str | None:
     """Return a strong provider/API class from text, or None.
 
@@ -1575,6 +1633,25 @@ def classify_failure_with_confidence(
         (task.latest_status_message or "").lower() + " " + (logs or "").lower()
     ).strip()
     combined_lower = combined.lower()
+    # Silent-rate-limit reclassification. An AGENT_TIMEOUT whose text is an
+    # execution/time-limit stall (the agent's 45-min ClaudeTimeoutError, or a
+    # mid-stream tool_use stall) AND whose telemetry shows an LLM call started
+    # but produced 0 output tokens is a silent provider hang — a 429/529 the
+    # Claude Code SDK absorbed via internal retry, surfacing no rate-limit text.
+    # That is NOT a code/agent defect: treat it as RATE_LIMIT so it holds/reroutes
+    # instead of burning the retry budget and terminal-failing a healthy task.
+    # Scoped to execution-stall signatures so cancellations / heartbeat-loss /
+    # OOM (which can also show 0 output) are NOT swept in. Runs before the
+    # agent_category early-exit so the agent's own 'fatal' label can't mask it.
+    # Reaper-reaped agent_stalled stalls are handled directly in reaper.py.
+    # See incident 2026-05-29.
+    if (
+        failure_class == AGENT_TIMEOUT
+        and _stuck_llm_call_no_progress(task)
+        and any(sig in combined_lower for sig in _EXECUTION_STALL_SIGNATURES)
+    ):
+        _persist_stuck_call_reclassification(task)
+        return FailureClassification(failure_class=RATE_LIMIT, confidence=0.7)
     if agent_category:
         return FailureClassification(failure_class=failure_class, confidence=0.9)
     if failure_class == MIGRATION_ERROR:
