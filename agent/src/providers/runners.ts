@@ -5,7 +5,8 @@ import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import { getCheckRunawayStatus, isCheckInvocation, recordCheckOutcome } from '../fix-loop-events.js';
 import {
   CHECK_RUNAWAY_CONSECUTIVE_FAILURES, CHECK_RUNAWAY_MIN_INVOCATIONS, CLAUDE_RESULT_GRACE_MS,
-  CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES, MAX_CLAUDE_CHECK_INVOCATIONS, MAX_OUTPUT_BYTES,
+  CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS, LOG_TAIL_BYTES,
+  MAX_CLAUDE_CHECK_INVOCATIONS, MAX_OUTPUT_BYTES,
   PROCESS_KILL_GRACE_MS, STDERR_TAIL_BYTES, TOOL_USE_STALL_TIMEOUT_MS,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS, claudeTimeoutForEffort,
 } from '../constants.js';
@@ -410,9 +411,14 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
-  const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false };
+  const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false };
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
+  // Timestamp of the last model stream-json content event (assistant/result).
+  // Drives the LLM-no-progress watchdog: a silent provider hang (429/529 the SDK
+  // retries internally) emits non-content stdout but no content events, so this
+  // goes stale while CLAUDE_STREAM_STALL_MS (raw stdout) keeps resetting.
+  let lastStreamEventAt = Date.now();
   let lastCheckOutputOffset = -1;
   let codexTurnCompleted = false;
 
@@ -566,6 +572,34 @@ echo ""
       }
     }, 60_000);
 
+    // LLM-no-progress watchdog: a silent provider hang (Anthropic 429/529 the
+    // Claude Code SDK absorbs via internal retry) emits non-content stdout — so
+    // the raw-stdout stall watchdog keeps resetting — while producing no
+    // assistant/result content events and 0 output tokens. Detect the missing
+    // content-event progress (when no tool is legitimately in flight) and report
+    // it as a rate-limit so the orchestrator holds/reroutes instead of letting
+    // the call ride to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry-
+    // budget burn → terminal failure of a healthy task (incident 2026-05-29).
+    let llmProgressWatchdog: NodeJS.Timeout | null = setInterval(() => {
+      if (
+        !toolInFlight &&
+        Date.now() - lastStreamEventAt > LLM_NO_PROGRESS_STALL_MS &&
+        processGroupStillOwned()
+      ) {
+        sendLog(ws, `\n[runtime] llm-no-progress: no model content event for >${LLM_NO_PROGRESS_STALL_MS / 60000} min with no tool in flight — likely a provider hang (429/529 absorbed by SDK retry). Sending SIGTERM; reporting rate_limited.\n`);
+        flags.llmNoProgressHang = true;
+        if (llmProgressWatchdog) { clearInterval(llmProgressWatchdog); llmProgressWatchdog = null; }
+        const pid = originalPid;
+        if (pid !== undefined) {
+          try { process.kill(-pid, 'SIGTERM'); } catch { /* ignore */ }
+          forceKillTimer = setTimeout(() => {
+            if (!processGroupStillOwned()) return;
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* ignore */ }
+          }, PROCESS_KILL_GRACE_MS);
+        }
+      }
+    }, 60_000);
+
     let checkRunawayWatchdog: NodeJS.Timeout | null = null;
     if (enableCheckWatchdog && !process.env.DISABLE_CHECK_RUNAWAY_WATCHDOG) {
       checkRunawayWatchdog = setInterval(() => {
@@ -636,6 +670,7 @@ echo ""
             linesSinceYield += 1;
             const objType = obj.type || '';
             if (objType === 'assistant') {
+              lastStreamEventAt = Date.now();  // model is producing — reset no-progress watchdog
               if (obj.message?.content) {
                 for (const block of obj.message.content) {
                   if (block.type === 'text') {
@@ -657,6 +692,7 @@ echo ""
                 }
               }
             } else if (objType === 'result') {
+              lastStreamEventAt = Date.now();  // terminal model event — reset no-progress watchdog
               lastResultText = (obj as { result?: string }).result ?? '';
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
@@ -792,9 +828,11 @@ echo ""
               const tid = typeof obj.thread_id === 'string' ? obj.thread_id : '';
               sendLog(ws, `[codex] thread.started ${tid}\n`);
             } else if (eventType === 'turn.started') {
+              lastStreamEventAt = Date.now();  // model producing — reset no-progress watchdog
               sendLog(ws, '[codex] turn.started\n');
               statusRef.value = 'Codex thinking';
             } else if (eventType === 'turn.completed') {
+              lastStreamEventAt = Date.now();  // model producing — reset no-progress watchdog
               sendLog(ws, '[codex] turn.completed\n');
               codexTurnCompleted = true;
               const usage = obj.usage as Record<string, unknown> | undefined;
@@ -818,6 +856,7 @@ echo ""
               || eventType === 'item.updated'
               || eventType === 'item.completed'
             ) {
+              lastStreamEventAt = Date.now();  // model producing — reset no-progress watchdog
               const item = obj.item as Record<string, unknown> | undefined;
               const itemType = item && typeof item.type === 'string' ? item.type : '';
               const preview = _codexItemPreview(item);
@@ -919,6 +958,7 @@ echo ""
       if (stallWatchdog) clearTimeout(stallWatchdog);
       if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
       if (checkRunawayWatchdog) { clearInterval(checkRunawayWatchdog); checkRunawayWatchdog = null; }
+      if (llmProgressWatchdog) { clearInterval(llmProgressWatchdog); llmProgressWatchdog = null; }
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
@@ -933,6 +973,7 @@ echo ""
       if (stallWatchdog) clearTimeout(stallWatchdog);
       if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
       if (checkRunawayWatchdog) { clearInterval(checkRunawayWatchdog); checkRunawayWatchdog = null; }
+      if (llmProgressWatchdog) { clearInterval(llmProgressWatchdog); llmProgressWatchdog = null; }
       if (typeof originalPid === 'number') {
         unregisterChildPid(originalPid);
       }
@@ -965,6 +1006,13 @@ echo ""
   }
   if (flags.stalledMidStream) {
     throw new ClaudeTimeoutError(`${runner.displayName} mid-stream tool-use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result`);
+  }
+  // Checked before providerKilledByOOM: the watchdog's own SIGTERM→SIGKILL can
+  // trip the SIGKILL-without-timeout OOM heuristic above, so this RateLimitError
+  // must win. RateLimitError → failureCategory 'rate_limited' → no retry-budget
+  // burn; the orchestrator holds/reroutes instead of failing the task.
+  if (flags.llmNoProgressHang) {
+    throw new RateLimitError(`${runner.displayName} produced no model output for >${LLM_NO_PROGRESS_STALL_MS / 60000} min — provider hang/throttle (429/529 absorbed by SDK retry)`);
   }
   if (flags.providerKilledByOOM) {
     const err = new ClaudeTimeoutError(`EOOM: ${runner.displayName} received external SIGKILL before agent timeout; likely cgroup OOM`);
