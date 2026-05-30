@@ -46,6 +46,13 @@ from app.reaper import (
     _REAPER_HALF_OPEN_PROBE_LIMIT,
     get_reaper_stats,
     is_reaper_halted,
+    _mark_reaper_progress,
+    _orphan_priority_key,
+    _select_orphans_for_cycle,
+    _ORPHAN_PRIORITY_RATE_LIMITED,
+    _ORPHAN_PRIORITY_SPOT,
+    _ORPHAN_PRIORITY_PROVISION,
+    _ORPHAN_PRIORITY_DEFAULT,
 )
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
@@ -5343,3 +5350,162 @@ async def test_sweep_regression_scan_cadence_gate_suppresses_second_call(mocker)
     assert second == 0, "cadence gate must suppress second call within 15 min"
     scan_mock.assert_awaited_once()
     _rs._last_regression_scan = None  # restore for test isolation
+
+
+# ── Intra-cycle heartbeat (PART A) ──────────────────────────────────────────
+
+
+def test_mark_reaper_progress_updates_last_progress():
+    """_mark_reaper_progress() writes a fresh _reaper_last_progress timestamp."""
+    import app.reaper as reaper_mod
+
+    saved = reaper_mod._reaper_last_progress
+    try:
+        reaper_mod._reaper_last_progress = None
+        # _utcnow() is naive UTC (see app.time_utils), so bracket with naive UTC.
+        before = datetime.utcnow()
+        _mark_reaper_progress()
+        after = datetime.utcnow()
+        assert reaper_mod._reaper_last_progress is not None
+        assert before <= reaper_mod._reaper_last_progress <= after
+    finally:
+        reaper_mod._reaper_last_progress = saved
+
+
+def test_get_reaper_stats_reports_progress_age_after_heartbeat():
+    """get_reaper_stats() exposes last_progress_age_seconds (>=0 after a beat)."""
+    import app.reaper as reaper_mod
+
+    saved = reaper_mod._reaper_last_progress
+    try:
+        _mark_reaper_progress()
+        stats = get_reaper_stats()
+        assert "last_progress_age_seconds" in stats
+        assert stats["last_progress_age_seconds"] >= 0
+        assert stats["last_progress_age_seconds"] < 60
+        # Existing keys must remain present (no regression).
+        assert "last_cycle_age_seconds" in stats
+        assert "cycles_completed_total" in stats
+    finally:
+        reaper_mod._reaper_last_progress = saved
+
+
+def test_get_reaper_stats_progress_age_minus_one_when_never_marked():
+    """last_progress_age_seconds is -1 before any heartbeat is recorded."""
+    import app.reaper as reaper_mod
+
+    saved = reaper_mod._reaper_last_progress
+    try:
+        reaper_mod._reaper_last_progress = None
+        stats = get_reaper_stats()
+        assert stats["last_progress_age_seconds"] == -1
+    finally:
+        reaper_mod._reaper_last_progress = saved
+
+
+# ── Orphan priority + per-cycle cap (PART B) ────────────────────────────────
+
+
+class _FakeOrphan:
+    """Minimal stand-in for a Task exposing only the columns the priority key
+    reads (status, latest_status_message, context, vm_spot). Lets the pure
+    helpers be unit-tested without a DB session or ORM objects."""
+
+    def __init__(
+        self,
+        *,
+        tag,
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message=None,
+        context=None,
+        vm_spot=None,
+    ):
+        self.tag = tag  # test-only marker for asserting order
+        self.status = status
+        self.latest_status_message = latest_status_message
+        self.context = context
+        self.vm_spot = vm_spot
+
+
+def test_orphan_priority_key_rate_limited_is_highest_priority():
+    """Rate-limit signals (message text OR context failure_category) -> bucket 0."""
+    from app.failure_classification import RATE_LIMIT
+
+    msg_rate = _FakeOrphan(tag="m", latest_status_message="hit rate limit, retrying")
+    msg_429 = _FakeOrphan(tag="m429", latest_status_message="HTTP 429 Too Many")
+    msg_quota = _FakeOrphan(tag="mq", latest_status_message="quota exceeded")
+    ctx_rate = _FakeOrphan(tag="c", context={"failure_category": RATE_LIMIT})
+    for o in (msg_rate, msg_429, msg_quota, ctx_rate):
+        assert _orphan_priority_key(o) == _ORPHAN_PRIORITY_RATE_LIMITED
+
+
+def test_orphan_priority_key_spot_then_provision_then_default():
+    """Bucket order: spot (1) < provision (2) < default (3)."""
+    spot = _FakeOrphan(tag="s", vm_spot=True)
+    provision = _FakeOrphan(tag="p", status=TaskStatus.PROVISIONING)
+    plain = _FakeOrphan(tag="d")
+    assert _orphan_priority_key(spot) == _ORPHAN_PRIORITY_SPOT
+    assert _orphan_priority_key(provision) == _ORPHAN_PRIORITY_PROVISION
+    assert _orphan_priority_key(plain) == _ORPHAN_PRIORITY_DEFAULT
+
+
+def test_orphan_priority_key_rate_limit_beats_spot_and_provision():
+    """A rate-limited spot/provision orphan still sorts into bucket 0."""
+    rl_spot = _FakeOrphan(tag="rs", vm_spot=True, latest_status_message="rate limited")
+    rl_provision = _FakeOrphan(
+        tag="rp",
+        status=TaskStatus.PROVISIONING,
+        latest_status_message="429 quota",
+    )
+    assert _orphan_priority_key(rl_spot) == _ORPHAN_PRIORITY_RATE_LIMITED
+    assert _orphan_priority_key(rl_provision) == _ORPHAN_PRIORITY_RATE_LIMITED
+
+
+def test_select_orphans_sorts_by_priority_and_is_stable():
+    """_select_orphans_for_cycle sorts ascending by bucket; ties keep input order."""
+    rate = _FakeOrphan(tag="rate", latest_status_message="rate limit")
+    spot = _FakeOrphan(tag="spot", vm_spot=True)
+    provision = _FakeOrphan(tag="provision", status=TaskStatus.PROVISIONING)
+    plain_a = _FakeOrphan(tag="plain_a")
+    plain_b = _FakeOrphan(tag="plain_b")
+    # Deliberately scrambled input; plain_a precedes plain_b for stability check.
+    tasks = [plain_a, provision, plain_b, spot, rate]
+    selected, deferred = _select_orphans_for_cycle(tasks, cap=10)
+    assert deferred == 0
+    assert [t.tag for t in selected] == [
+        "rate",
+        "spot",
+        "provision",
+        "plain_a",
+        "plain_b",
+    ]
+
+
+def test_select_orphans_cap_truncates_keeping_highest_priority():
+    """When over cap, the top-N by priority are kept and the rest deferred."""
+    rate = _FakeOrphan(tag="rate", latest_status_message="rate limit")
+    spot = _FakeOrphan(tag="spot", vm_spot=True)
+    provision = _FakeOrphan(tag="provision", status=TaskStatus.PROVISIONING)
+    plain = _FakeOrphan(tag="plain")
+    tasks = [plain, provision, spot, rate]
+    selected, deferred = _select_orphans_for_cycle(tasks, cap=2)
+    # Cap=2 keeps the two highest-priority (rate, spot); defers provision+plain.
+    assert deferred == 2
+    assert [t.tag for t in selected] == ["rate", "spot"]
+
+
+def test_select_orphans_non_positive_cap_means_no_cap():
+    """A non-positive cap fails safe: process everything, defer nothing."""
+    tasks = [_FakeOrphan(tag=str(i)) for i in range(5)]
+    for cap in (0, -1):
+        selected, deferred = _select_orphans_for_cycle(tasks, cap=cap)
+        assert deferred == 0
+        assert len(selected) == 5
+
+
+def test_select_orphans_under_cap_returns_all():
+    """List shorter than the cap is returned in full, zero deferred."""
+    tasks = [_FakeOrphan(tag=str(i)) for i in range(3)]
+    selected, deferred = _select_orphans_for_cycle(tasks, cap=60)
+    assert deferred == 0
+    assert len(selected) == 3

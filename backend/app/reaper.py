@@ -3,12 +3,13 @@
 import asyncio
 import contextlib
 import logging
+import os
 import random
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
 
-from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
@@ -139,6 +140,37 @@ _ORPHAN_REAP_CRASH_STREAK_LIMIT = 3
 _reaper_cycles_completed_count: int = 0
 _reaper_last_cycle_completed_at: datetime | None = None
 
+# In-cycle progress heartbeat. Updated frequently *within* a cycle (cycle start
+# + once per orphan-reap / stale-EVALUATING / rescue iteration) so liveness
+# reflects "the reaper is making progress", NOT "a full cycle finished within N
+# seconds". A cycle's wall time grows O(orphan backlog) — gating liveness on
+# full-cycle completion kills a slow-but-healthy reaper, discarding its
+# in-flight orphan recovery and spiralling (logs: "no cycle completion in
+# 684→787→916s" under backlog → watchdog cancel mid-I/O → failure storm).
+# Mirrors orchestrator._orchestrator_last_progress (PR #6678). The lifecycle
+# watchdog reads the FRESHER of this and _reaper_last_cycle_completed_at; only a
+# genuinely wedged reaper (no heartbeat for REAPER_HANG_SECONDS) is restarted.
+_reaper_last_progress: datetime | None = None
+
+# How long the reaper may go without a progress heartbeat before the lifecycle
+# watchdog treats it as hung and cancels it for a fresh respawn. Env-overridable
+# for ops tuning, mirroring ORCHESTRATOR_HANG_SECONDS. Default 300.0 preserves
+# the prior hardcoded _reaper_stall_threshold (5 missed 60s cycles) — behaviour
+# is identical unless tuned.
+REAPER_HANG_SECONDS = float(os.getenv("REAPER_HANG_SECONDS", "300"))
+
+
+def _mark_reaper_progress() -> None:
+    """Heartbeat that the reaper worker is actively progressing within a cycle.
+
+    Liveness (the lifecycle watchdog) is gated on the freshness of this
+    timestamp, not on full-cycle completion, so a legitimately long cycle (large
+    orphan backlog → many sequential GitHub/VM calls) is not mistaken for a hung
+    process and killed. Kept cheap: a single timestamp write, no I/O. Mirrors
+    orchestrator._mark_orchestrator_progress (PR #6678)."""
+    global _reaper_last_progress
+    _reaper_last_progress = _utcnow()
+
 # Cycle-level circuit breaker. After N consecutive whole-cycle exceptions the
 # reaper enters HALTED state, stops cycling, and posts an ERROR alert. Resets
 # automatically on process restart (in-memory); tunable via runtime_config key
@@ -174,9 +206,18 @@ def get_reaper_stats() -> dict:
         age_seconds = max(
             0, (_utcnow() - _reaper_last_cycle_completed_at).total_seconds()
         )
+    # In-cycle progress age: seconds since the last _mark_reaper_progress()
+    # heartbeat, -1 if never marked. This is the freshest liveness signal under
+    # a long cycle (the watchdog judges on it before falling back to cycle age).
+    progress_age_seconds: float | int = -1
+    if _reaper_last_progress is not None:
+        progress_age_seconds = max(
+            0, (_utcnow() - _reaper_last_progress).total_seconds()
+        )
     return {
         "cycles_completed_total": _reaper_cycles_completed_count,
         "last_cycle_age_seconds": age_seconds,
+        "last_progress_age_seconds": progress_age_seconds,
         "halted": _reaper_halt_state["halted"],
         "halt_timestamp": _reaper_halt_state["halt_timestamp"].isoformat()
         if _reaper_halt_state["halt_timestamp"]
@@ -243,6 +284,66 @@ async def _post_reaper_recovery_alert(probe_failures: int) -> None:
 
 # Per-(provider, model) regression scan cadence state is now managed in
 # reaper_sweeps.py (sweep_regression_scan).  The constants are kept there.
+
+
+# Default per-cycle orphan-processing cap. Each orphan costs serial GitHub/VM
+# I/O (get_vm_status, disable_account_model, _capture_serial_for_vm,
+# get_pull_request — up to ~30s each), so a large backlog can blow past the
+# watchdog window. The cap bounds per-cycle work; deferred orphans re-qualify
+# automatically next cycle via the status-based Step-1 scan (no separate
+# deferral queue needed). Override via runtime_config["reaper_max_orphans_per_cycle"].
+_REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT = 60
+
+# Orphan-priority buckets (lower = processed first). Time-sensitive orphans are
+# reaped before the cap can truncate the tail.
+_ORPHAN_PRIORITY_RATE_LIMITED = 0  # rate-limited / quota — reroute ASAP
+_ORPHAN_PRIORITY_SPOT = 1  # spot VM — likelier to be preempted again
+_ORPHAN_PRIORITY_PROVISION = 2  # stuck PROVISIONING — never got a heartbeat
+_ORPHAN_PRIORITY_DEFAULT = 3  # everything else
+
+
+def _orphan_priority_key(task) -> int:
+    """Cheap priority bucket for one orphan, computed ONLY from already-loaded
+    columns (status, latest_status_message, context, vm_spot) — NO extra
+    queries. Lower number = processed first so time-sensitive orphans survive a
+    truncating cap. Pure + side-effect-free for unit testing.
+
+    Order: rate-limited (0) < spot (1) < provision-failure (2) < other (3).
+    """
+    # 0: rate-limited / quota — reroute to a fresh pool account ASAP.
+    msg = (getattr(task, "latest_status_message", None) or "").lower()
+    ctx = getattr(task, "context", None) or {}
+    failure_category = ctx.get("failure_category")
+    if (
+        "rate" in msg
+        or "429" in msg
+        or "quota" in msg
+        or failure_category == RATE_LIMIT
+    ):
+        return _ORPHAN_PRIORITY_RATE_LIMITED
+    # 1: spot VMs — cheaper but preemptible; recover before they churn again.
+    if getattr(task, "vm_spot", None) is True:
+        return _ORPHAN_PRIORITY_SPOT
+    # 2: provision-failures — VM died before first heartbeat; no agent state lost.
+    if getattr(task, "status", None) == TaskStatus.PROVISIONING:
+        return _ORPHAN_PRIORITY_PROVISION
+    # 3: everything else.
+    return _ORPHAN_PRIORITY_DEFAULT
+
+
+def _select_orphans_for_cycle(tasks: list, cap: int) -> tuple[list, int]:
+    """Sort ``tasks`` by ascending priority bucket and return the top ``cap``
+    plus the number deferred. Sort is stable (Python's sort), so within a bucket
+    the original orphan-detection order is preserved. Pure helper so the
+    cap+priority logic is unit-testable without the full reaper loop.
+
+    Returns ``(selected, deferred_count)``. A non-positive cap is treated as
+    "no cap" (process everything) to fail safe if misconfigured.
+    """
+    ordered = sorted(tasks, key=_orphan_priority_key)
+    if cap is None or cap <= 0 or len(ordered) <= cap:
+        return ordered, 0
+    return ordered[:cap], len(ordered) - cap
 
 
 _TRANSIENT_5XX_PATTERNS = frozenset(
@@ -535,6 +636,12 @@ async def reaper_service():
             # Fall through to run one probe cycle (no continue).
         try:
             async with AsyncSessionLocal() as session:
+                # Intra-cycle liveness heartbeat at the very start of the cycle
+                # body. The lifecycle watchdog judges reaper liveness on the
+                # FRESHER of this and the last completed cycle, so a long cycle
+                # under orphan backlog is not killed mid-I/O. See
+                # _mark_reaper_progress + the reaper watchdog in lifecycle.py.
+                _mark_reaper_progress()
                 # Step 1: Read active tasks WITHOUT locks (avoids blocking heartbeat writes)
                 # Phase B4 (H-P1): drop heavy ``plan_output`` JSONB from the projection.
                 # ``status_log`` MUST stay loaded because the Task.status / Task.
@@ -881,6 +988,40 @@ async def reaper_service():
                             verified.append(t)
                     orphaned_tasks = verified
 
+                # ── PER-CYCLE ORPHAN CAP + PRIORITY ORDERING ──────────────
+                # Each orphan below costs serial GitHub/VM I/O (~30-120s);
+                # a large backlog can blow past REAPER_HANG_SECONDS even with
+                # intra-cycle heartbeats keeping the watchdog at bay (a wedged
+                # cycle still starves the *next* sweep). Cap per-cycle work and
+                # process the most time-sensitive orphans first so the cap never
+                # strands a rate-limited/spot orphan behind a long tail. Sort
+                # MUST run here — before the ``expire_all`` below — because the
+                # priority key reads vm_spot/context/latest_status_message off
+                # the live ORM objects (the Step-2 lock SELECT loads full rows;
+                # after expire_all those attrs would trigger MissingGreenlet).
+                # Deferred orphans re-qualify automatically next cycle via the
+                # status-based Step-1 scan, so no separate deferral queue.
+                if orphaned_tasks:
+                    _orphan_cap = int(
+                        _runtime_config.get(
+                            "reaper_max_orphans_per_cycle",
+                            _REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT,
+                        )
+                    )
+                    orphaned_tasks, _deferred_orphans = _select_orphans_for_cycle(
+                        orphaned_tasks, _orphan_cap
+                    )
+                    if _deferred_orphans:
+                        logger.warning(
+                            "[REAPER] Orphan backlog %d exceeds per-cycle cap %d "
+                            "— processing top %d by priority, deferring %d to next "
+                            "cycle (they re-qualify via the Step-1 status scan).",
+                            len(orphaned_tasks) + _deferred_orphans,
+                            _orphan_cap,
+                            len(orphaned_tasks),
+                            _deferred_orphans,
+                        )
+
                 # ── RELEASE MULTI-ROW FOR UPDATE BEFORE EXTERNAL I/O LOOP ──
                 # Production 2026-05-04 cascade shape: the orphan-loop body
                 # below makes 4 external API calls per task — get_vm_status,
@@ -921,8 +1062,17 @@ async def reaper_service():
                 # starved agent heartbeats with 429s and triggered cascading false
                 # orphan detection on the next reaper cycle.
                 _deferred_parent_requeues: list[Task] = []
+                # Set False if the batched orphan-reap commit below hits an
+                # idempotency-key collision — gates the post-commit loops off so
+                # the rolled-back state isn't acted on (see the guard at commit).
+                _orphan_commit_ok = True
 
                 for task_id in _orphaned_task_ids:
+                    # Heartbeat per orphan: this loop is the dominant per-cycle
+                    # cost (serial GitHub/VM I/O ~30-120s each), so a backlog can
+                    # exceed REAPER_HANG_SECONDS. Marking progress here keeps the
+                    # watchdog from killing a slow-but-progressing reap.
+                    _mark_reaper_progress()
                     try:
                         # Re-validate status before acting — task may have completed/been cancelled
                         # between the initial query and now
@@ -2213,7 +2363,44 @@ async def reaper_service():
                         # task id).
                         _orphan_reap_crash_streaks.pop(str(task_id), None)
                 if orphaned_tasks:
-                    await session.commit()
+                    # Idempotency guard on the batched orphan-reap commit. The
+                    # requeue→QUEUED (rate-limit / agent-retry) and →EVALUATING
+                    # mutations above can collide on ux_task_active_idempotency_key
+                    # when a peer already created a duplicate holding that key in
+                    # an active status. Letting that IntegrityError escape aborts
+                    # this commit AND poisons the session (PendingRollbackError)
+                    # for every downstream sweep in the cycle. Because the commit
+                    # is batched, per-task attribution isn't possible here, so the
+                    # smallest safe move is: roll back, warn, and let next cycle
+                    # re-discover the still-active orphans via the Step-1 scan. The
+                    # active duplicate already represents the work, so the reap is
+                    # moot. We clear the post-commit deferred lists (the rollback
+                    # expired their ORM objects → reading attrs would MissingGreenlet)
+                    # so the post-commit loops no-op cleanly; FAILED-gated loops
+                    # also self-skip since the reaps didn't persist. Mirrors the
+                    # pre-query guard in reaper_infra_recovery.py (~270-338).
+                    try:
+                        await session.commit()
+                        _orphan_commit_ok = True
+                    except IntegrityError as _ie:
+                        _ie_msg = str(_ie)
+                        if "ux_task_active_idempotency_key" in _ie_msg:
+                            await session.rollback()
+                            _orphan_commit_ok = False
+                            _deferred_parent_requeues = []
+                            _reaper_old_vms = {}
+                            logger.warning(
+                                "[REAPER] Orphan-reap commit hit "
+                                "ux_task_active_idempotency_key (a peer already "
+                                "holds the key in an active status) — rolled back; "
+                                "still-active orphans re-qualify next cycle via the "
+                                "Step-1 scan. Detail: %s",
+                                _ie_msg[:300],
+                            )
+                        else:
+                            raise
+
+                if orphaned_tasks and _orphan_commit_ok:
 
                     # Re-fetch fresh task state by id before the post-commit loops.
                     # A per-task reap crash above triggers session.rollback() (2211),
@@ -2234,6 +2421,9 @@ async def reaper_service():
                     # on the parent task will go through fine since we only set
                     # requeue_in_flight (a marker), not a row lock.
                     for parent in _deferred_parent_requeues:
+                        # Heartbeat: parent requeue clones children + remaps deps
+                        # (multiple queries) per parent — keep the watchdog happy.
+                        _mark_reaper_progress()
                         try:
                             await _requeue_parent_task(parent, session)
                         except Exception as e:  # noqa: PERF203 — per-attempt try in deferred-requeue loop
@@ -2251,10 +2441,14 @@ async def reaper_service():
 
                     # Delete old VMs after commit (IDs captured before overwrite)
                     for old_vm in _reaper_old_vms.values():
+                        # Heartbeat: each VM delete is a GCE API call.
+                        _mark_reaper_progress()
                         await _ensure_vm_deleted(old_vm, reason="reaper")
 
                     # Trigger rollup checks for failed tasks with parents (after commit)
                     for task in _post_reap_tasks:
+                        # Heartbeat: _check_and_trigger_rollup hits GitHub per task.
+                        _mark_reaper_progress()
                         if task.status == TaskStatus.FAILED and task.parent_task_id:
                             try:
                                 await _check_and_trigger_rollup(task, session)
@@ -2266,6 +2460,8 @@ async def reaper_service():
 
                     # Immediately unblock dependents of terminally failed tasks
                     for task in _post_reap_tasks:
+                        # Heartbeat: per-task dependent-unblock opens its own session.
+                        _mark_reaper_progress()
                         if task.status == TaskStatus.FAILED:
                             try:
                                 async with AsyncSessionLocal() as dep_session:
@@ -2302,6 +2498,8 @@ async def reaper_service():
                     # same research branch block forever. Closing the dead PR
                     # removes it from the sibling rollup-wait gate.
                     for task in _post_reap_tasks:
+                        # Heartbeat: closing a dead PR is a GitHub API call per task.
+                        _mark_reaper_progress()
                         if task.status != TaskStatus.FAILED:
                             continue
                         payload = task.first_payload if task.payloads else {}
@@ -2462,6 +2660,10 @@ async def reaper_service():
                                 _c.parent_task_id, []
                             ).append((_c.id, _c.status, _c.context or {}))
                     for parent_id in _parent_ids:
+                        # Heartbeat: Step 3 calls _check_and_trigger_rollup per
+                        # parent (serial GitHub I/O) — the other dominant per-cycle
+                        # cost besides the orphan loop. Mark progress every parent.
+                        _mark_reaper_progress()
                         # Find a COMPLETED child id from the plain-tuple snapshot,
                         # then re-fetch it fresh. An earlier iteration's
                         # _check_and_trigger_rollup may have committed or rolled
@@ -2511,6 +2713,11 @@ async def reaper_service():
                     }
                     rescued = 0
                     for parent_id in _parent_ids:
+                        # Heartbeat: this rescue loop calls _requeue_parent_task
+                        # (child clone + dep remap, multiple queries) per parent —
+                        # another per-cycle cost that can extend wall time under a
+                        # large EVALUATING backlog. Mark progress every parent.
+                        _mark_reaper_progress()
                         children_snap = _children_snapshot_by_parent.get(parent_id, [])
                         if not children_snap:
                             continue

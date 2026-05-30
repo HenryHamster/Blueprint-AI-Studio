@@ -526,6 +526,13 @@ runtime_config: Dict = {
     "reaper_cycle_halt_threshold": 5,
     "reaper_cycle_halt_cooldown_seconds": 300,
     "reaper_half_open_probe_limit": 3,
+    # Per-cycle orphan-processing cap. Each orphan costs serial GitHub/VM I/O
+    # (~30-120s), so a large backlog can blow past the reaper liveness watchdog
+    # window even with intra-cycle heartbeats. The reaper processes the highest-
+    # priority orphans (rate-limited > spot > provision > other) up to this cap;
+    # the rest re-qualify next cycle via the status-based Step-1 scan. Default 60
+    # matches reaper._REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT.
+    "reaper_max_orphans_per_cycle": 60,
     # Per-scope heartbeat-stale thresholds (seconds). Large-scope tasks
     # legitimately run longer stretches without a heartbeat, so reaping at the
     # small-scope bar flags them as dead while they're still making progress.
@@ -1230,6 +1237,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "reaper_cycle_halt_threshold",
                     "reaper_cycle_halt_cooldown_seconds",
                     "reaper_half_open_probe_limit",
+                    "reaper_max_orphans_per_cycle",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))

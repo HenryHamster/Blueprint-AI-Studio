@@ -844,33 +844,46 @@ async def lifespan(app):
                 # alert noise while the operator investigates. When NOT halted but
                 # stale, cancel so the restart path re-spawns a fresh cycle.
                 try:
+                    # Re-import each iteration so we read the LIVE module globals
+                    # (a top-level ``from ... import X`` would freeze the value at
+                    # import time). Judge staleness on the FRESHER of the in-cycle
+                    # progress heartbeat and the last completed cycle — mirroring
+                    # the orchestrator's ``_orchestrator_last_progress or
+                    # _orchestrator_last_cycle`` logic (PR #6678). A long-but-
+                    # progressing reap (large orphan backlog) is therefore healthy;
+                    # only a reaper with no progress for REAPER_HANG_SECONDS is hung.
                     from app.reaper import (
                         is_reaper_halted as _is_reaper_halted,
                         _reaper_last_cycle_completed_at as _reaper_last_cycle,
+                        _reaper_last_progress as _reaper_progress,
+                        REAPER_HANG_SECONDS as _reaper_stall_threshold,
                     )
 
                     reaper_task = tasks.get("reaper")
-                    _reaper_stall_threshold = 300.0  # 5 missed 60s cycles
                     if reaper_task is not None and not reaper_task.done():
                         if _is_reaper_halted():
                             pass  # halted intentionally — do not cancel; operator reset required
-                        elif _reaper_last_cycle is not None:
-                            reaper_age = (
-                                _utcnow() - _reaper_last_cycle
-                            ).total_seconds()
-                            if reaper_age > _reaper_stall_threshold:
-                                reaper_reason = (
-                                    f"no cycle completion in {int(reaper_age)}s"
-                                )
-                                logger.error(
-                                    "[MONITOR] Reaper appears hung — %s. "
-                                    "Cancelling task so restart path re-spawns it.",
-                                    reaper_reason,
-                                )
-                                cancel_reasons["reaper"] = (
-                                    f"watchdog cancelled: {reaper_reason}"
-                                )
-                                reaper_task.cancel()
+                        else:
+                            _reaper_last = _reaper_progress or _reaper_last_cycle
+                            if _reaper_last is not None:
+                                reaper_age = (
+                                    _utcnow() - _reaper_last
+                                ).total_seconds()
+                                if reaper_age > _reaper_stall_threshold:
+                                    reaper_reason = (
+                                        f"no progress heartbeat in {int(reaper_age)}s"
+                                    )
+                                    logger.error(
+                                        "[MONITOR] Reaper appears hung — %s. "
+                                        "Cancelling task so restart path re-spawns it.",
+                                        reaper_reason,
+                                    )
+                                    cancel_reasons["reaper"] = (
+                                        f"watchdog cancelled: {reaper_reason}"
+                                    )
+                                    reaper_task.cancel()
+                            # else: never recorded progress or completed a cycle yet
+                            # — give the freshly-spawned reaper time to start.
                 except Exception as reaper_wd_exc:
                     logger.warning(
                         "[MONITOR] Reaper watchdog check failed: %s", reaper_wd_exc
