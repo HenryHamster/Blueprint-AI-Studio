@@ -2142,8 +2142,9 @@ def read_root():
     return {"status": "online", "service": "Blueprint Orchestrator"}
 
 
-# _github_token_cache, invalidate_github_token_cache, get_github_token_for_task,
-# and GitHub proxy endpoints — moved to app.routers.agent
+# _github_token_cache, invalidate_github_token_cache, get_github_token_for_task
+# — extracted to app.github_token_resolver (re-exported from app.routers.agent).
+# GitHub proxy endpoints — moved to app.routers.agent.
 
 
 # --- Static Files for Frontend (One-Line Deploy) ---

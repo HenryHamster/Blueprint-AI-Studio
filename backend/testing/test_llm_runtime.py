@@ -843,3 +843,22 @@ def test_classify_failure_uses_provider_specific_rate_limit_patterns():
     )
 
     assert classify_failure(task) == RATE_LIMIT
+
+
+def test_runtime_fallback_seam_no_circular_import_and_identical_symbols():
+    """Seam guard: the extracted module is importable standalone (no circular
+    import back through app.orchestrator) and orchestrator re-exports the exact
+    same function/table objects so the dispatch loop resolves fallbacks
+    identically."""
+    import app.orchestrator as orch
+    import app.orchestrator_runtime_env as env
+
+    assert orch._resolve_env_runtime_fallback is env._resolve_env_runtime_fallback
+    assert orch._provider_env_credential_hint is env._provider_env_credential_hint
+    assert orch._ENV_FALLBACK_DEFAULT_MODELS is env._ENV_FALLBACK_DEFAULT_MODELS
+    assert callable(orch._sync_task_payload_runtime_fields)
+    assert env._ENV_FALLBACK_DEFAULT_MODELS == {
+        "anthropic": "claude-opus-4-8",
+        "openai": "gpt-5.4",
+        "gemini": "gemini-2.5-pro",
+    }

@@ -2088,6 +2088,44 @@ async def test_merge_with_retry_respects_max_attempts_parameter(mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GitHub-helper extraction seam (task_lifecycle_github_helpers.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_github_helpers_seam_no_circular_import():
+    """The extracted GitHub-retry helpers live in their own sibling module and
+    are re-exported by task_lifecycle, so existing import paths are unchanged
+    and the new module imports cleanly without a cycle."""
+    import importlib
+
+    helpers = importlib.import_module("app.task_lifecycle_github_helpers")
+    lifecycle = importlib.import_module("app.task_lifecycle")
+
+    for name in (
+        "_merge_with_retry",
+        "_comment_with_retry",
+        "_pick_merge_method",
+        "_get_approval_gate_file_lists",
+    ):
+        # Defined in the new module...
+        assert hasattr(helpers, name), f"{name} missing from helpers module"
+        # ...and re-exported by task_lifecycle as the SAME object (so call sites
+        # and test mocks of app.task_lifecycle.<name> remain valid).
+        assert getattr(lifecycle, name) is getattr(helpers, name)
+
+
+def test_github_helpers_pick_merge_method_unchanged():
+    """_pick_merge_method behavior is preserved post-extraction: squash by
+    default, merge for back-merge conflict-resolution tasks."""
+    from app.task_lifecycle_github_helpers import _pick_merge_method
+
+    plain = Task(project_id=uuid.uuid4(), context={})
+    backmerge = Task(project_id=uuid.uuid4(), context={"backmerge_conflict": True})
+    assert _pick_merge_method(plain) == "squash"
+    assert _pick_merge_method(backmerge) == "merge"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _comment_with_retry
 # ══════════════════════════════════════════════════════════════════════════════
 

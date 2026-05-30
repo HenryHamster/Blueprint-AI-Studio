@@ -30,7 +30,6 @@ from app.models import (
     TaskHistory,
     Artifact,
     ArtifactType,
-    UserIntegration,
     _on_task_terminal_callbacks,
     _on_task_revive_callbacks,
     _utcnow,
@@ -50,9 +49,7 @@ from app.shared_state import (
 )
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
-from app.secrets_manager import get_user_secret
 from app.github import (
-    generate_installation_access_token,
     create_check_run,
     get_pull_request,
 )
@@ -62,6 +59,13 @@ from app.sr_blind_spots import (
     aggregate_sr_co_failure_pairs,
 )
 from app.pipeline_health import compute_pipeline_health_summary
+from app.claim_task_helpers import (
+    _has_local_cycle,  # noqa: F401 — re-exported for use in task_lifecycle_requeue
+    _parse_failed_approach,
+    _compute_failure_stage_pattern,
+    _build_vision_summary,
+    _build_direction_narrative,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -393,401 +397,19 @@ async def verify_agent_token(
 
 
 # ---------------------------------------------------------------------------
-# GitHub token cache (moved from main.py)
+# GitHub token cache — extracted to app.github_token_resolver (router-free).
+# Re-exported here so the 15+ existing
+# `from app.routers.agent import get_github_token_for_task` (and the cache
+# internals / invalidation helper) call sites keep working unchanged.
 # ---------------------------------------------------------------------------
 
-_github_token_cache: Dict[
-    str, Dict
-] = {}  # project_id -> {"token", "owner", "repo", "fetched_at"}
-_github_token_cache_lock = (
-    asyncio.Lock()
-)  # Prevent concurrent cache miss → duplicate token generation
-_GITHUB_TOKEN_TTL = 3000  # 50 minutes (installation tokens expire after 60min)
-
-
-def invalidate_github_token_cache(project_id: str) -> None:
-    """Remove a project's cached GitHub token, forcing re-generation on next use."""
-    removed = _github_token_cache.pop(project_id, None)
-    if removed:
-        logger.info(f"[GITHUB] Invalidated cached token for project {project_id}")
-
-
-async def get_github_token_for_task(
-    task_id: uuid.UUID,
-    session: AsyncSession,
-    force_refresh: bool = False,
-) -> tuple[str, str, str]:
-    stmt = select(Task).where(Task.id == task_id)
-    task = (await session.execute(stmt)).scalars().first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    project_id_str = str(task.project_id)
-
-    # Return cached token if still fresh (installation tokens expire after 60min)
-    if not force_refresh:
-        async with _github_token_cache_lock:
-            cached = _github_token_cache.get(project_id_str)
-            if (
-                cached
-                and (_utcnow() - cached["fetched_at"]).total_seconds()
-                < _GITHUB_TOKEN_TTL
-            ):
-                return cached["token"], cached["owner"], cached["repo"]
-
-    project_stmt = select(Project).where(Project.id == task.project_id)
-    project = (await session.execute(project_stmt)).scalars().first()
-    if not project or not project.user_id:
-        raise HTTPException(status_code=404, detail="Project or user not found")
-
-    if not project.github_owner or not project.github_repo:
-        raise HTTPException(
-            status_code=403,
-            detail="Project does not have an authorized GitHub repository",
-        )
-
-    integration_stmt = select(UserIntegration).where(
-        UserIntegration.user_id == project.user_id
-    )
-    integration = (await session.execute(integration_stmt)).scalars().first()
-
-    # Prefer dynamic App-level discovery — always finds the correct installation
-    # for this specific repo, even with multiple installations across orgs.
-    token = None
-    from app.github import get_repo_installation_token
-
-    try:
-        token = await get_repo_installation_token(
-            project.github_owner, project.github_repo
-        )
-    except Exception:  # noqa: BLE001 — fall through to stored-installation + PAT fallbacks
-        logger.debug(
-            f"[GITHUB] App-level discovery failed for {project.github_owner}/{project.github_repo}, trying fallbacks"
-        )
-
-    if not token and integration and integration.github_installation_id:
-        try:
-            token = await generate_installation_access_token(
-                integration.github_installation_id, repositories=[project.github_repo]
-            )
-        except Exception:  # noqa: BLE001 — fall through to PAT fallback
-            logger.debug(
-                f"[GITHUB] Stored installation token failed for {project.github_owner}/{project.github_repo}"
-            )
-
-    if not token and integration and integration.github_pat:
-        token = await get_user_secret(integration.github_pat)
-
-    if not token:
-        raise HTTPException(
-            status_code=400,
-            detail="GitHub integration not found. Ensure the GitHub App is installed on this repository, or register a PAT via /api/github/pat.",
-        )
-
-    # Track successful GitHub API interaction for passive health checking
-    _shared_state.last_github_success = _utcnow()
-
-    # Cache token to avoid re-generating for every API call within the same project
-    async with _github_token_cache_lock:
-        _github_token_cache[project_id_str] = {
-            "token": token,
-            "owner": project.github_owner,
-            "repo": project.github_repo,
-            "fetched_at": _utcnow(),
-        }
-        # Evict stale entries
-        stale_cutoff = _utcnow() - timedelta(seconds=_GITHUB_TOKEN_TTL + 600)
-        for k in [
-            k for k, v in _github_token_cache.items() if v["fetched_at"] < stale_cutoff
-        ]:
-            _github_token_cache.pop(k, None)
-
-    return token, project.github_owner, project.github_repo
-
-
-# ---------------------------------------------------------------------------
-# Helper: cycle detection for spawn dependency graphs
-# ---------------------------------------------------------------------------
-
-
-def _has_local_cycle(adj: Dict[str, list]) -> bool:
-    """Check for cycles in a small adjacency list (dependency graph)."""
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = dict.fromkeys(adj, WHITE)
-
-    def dfs(n):
-        color[n] = GRAY
-        for dep in adj.get(n, []):
-            if dep not in color:
-                continue  # External dep, not in our subgraph
-            if color[dep] == GRAY:
-                return True
-            if color[dep] == WHITE and dfs(dep):
-                return True
-        color[n] = BLACK
-        return False
-
-    return any(color[n] == WHITE and dfs(n) for n in adj)
-
-
-# ---------------------------------------------------------------------------
-# Helper: parse a Failed Approaches entry into {text, failure_type}
-# ---------------------------------------------------------------------------
-
-_KNOWN_FAILURE_CATEGORIES = frozenset(
-    {
-        "CODE_ERROR",
-        "PROVISION_FAILURE",
-        "AGENT_TIMEOUT",
-        "EXTERNAL_API",
-        "RATE_LIMIT",
-        "rejected in review",
-    }
+from app.github_token_resolver import (  # noqa: E402,F401
+    _GITHUB_TOKEN_TTL,
+    _github_token_cache,
+    _github_token_cache_lock,
+    get_github_token_for_task,
+    invalidate_github_token_cache,
 )
-
-
-def _parse_failed_approach(line: str) -> dict:
-    """Parse '<title> (<category>) [at=<iso> stage=<stage>] — <reason>'.
-
-    Returns {text, failure_type, failed_at, failure_stage}. Direction outcomes
-    write entries with the failure category in parentheses immediately after the
-    title, optionally followed by a ``[at=YYYY-MM-DD stage=<stage>]`` metadata
-    block. Extract those so agents can reason about *why* a prior approach
-    failed, *when* it failed, and *at what stage*. Only recognise parens whose
-    contents match a known category so prose-level parens don't get treated as
-    metadata.
-    """
-    failure_type = ""
-    failed_at = ""
-    failure_stage = ""
-    text = line
-    open_idx = line.find("(")
-    if open_idx > 0:
-        close_idx = line.find(")", open_idx)
-        if close_idx > open_idx:
-            inner = line[open_idx + 1 : close_idx].strip()
-            if inner in _KNOWN_FAILURE_CATEGORIES:
-                failure_type = inner
-                rest = line[close_idx + 1 :]
-                # Look for a [at=... stage=...] metadata block that follows the
-                # category paren with only whitespace in between.
-                meta_start = -1
-                for i, ch in enumerate(rest):
-                    if ch == "[":
-                        meta_start = i
-                        break
-                    if not ch.isspace():
-                        break
-                if meta_start >= 0:
-                    meta_end = rest.find("]", meta_start)
-                    if meta_end > meta_start:
-                        meta = rest[meta_start + 1 : meta_end]
-                        for part in meta.split():
-                            if part.startswith("at="):
-                                failed_at = part[len("at=") :]
-                            elif part.startswith("stage="):
-                                failure_stage = part[len("stage=") :]
-                        rest = rest[:meta_start].rstrip() + rest[meta_end + 1 :]
-                stripped = (line[:open_idx].rstrip() + rest).strip()
-                text = stripped if stripped else line
-    return {
-        "text": text[:200],
-        "failure_type": failure_type,
-        "failed_at": failed_at,
-        "failure_stage": failure_stage,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Helper: failure stage pattern analysis
-# ---------------------------------------------------------------------------
-
-
-def _compute_failure_stage_pattern(history: list) -> "dict | None":
-    """
-    Analyze recent research_history stage_dropout data to identify dominant failure stages.
-
-    Returns a pattern dict if 60%+ of non-infra failures cluster at one stage, else None.
-    Considers code_error, approval, and staging_only stages — agents can't address infra failures.
-    Uses the last 3 research cycles for recency.
-    """
-    recent = history[-3:]
-    code_error_total = 0
-    approval_total = 0
-    staging_only_total = 0
-    for entry in recent:
-        sd = entry.get("stage_dropout") or {}
-        code_error_total += sd.get("tasks_failed_code_error", 0)
-        approval_total += sd.get("tasks_required_approval", 0)
-        staging_only_total += sd.get("tasks_merged_staging_only", 0)
-    total_non_infra = code_error_total + approval_total + staging_only_total
-    if total_non_infra < 3:
-        return None
-    code_error_rate = code_error_total / total_non_infra
-    approval_rate = approval_total / total_non_infra
-    staging_only_rate = staging_only_total / total_non_infra
-    threshold = 0.6
-    if code_error_rate >= threshold:
-        return {
-            "stage": "code_error",
-            "rate": round(code_error_rate, 2),
-            "message": (
-                "Recent tasks for this direction frequently fail at the code/test stage — "
-                "pay extra attention to test coverage and run tests early."
-            ),
-        }
-    if approval_rate >= threshold:
-        return {
-            "stage": "approval",
-            "rate": round(approval_rate, 2),
-            "message": (
-                "Recent tasks for this direction frequently stall waiting for approval — "
-                "consider smaller, more targeted changes that require less manual review."
-            ),
-        }
-    if staging_only_rate >= threshold:
-        return {
-            "stage": "staging_only",
-            "rate": round(staging_only_rate, 2),
-            "message": (
-                "Recent tasks for this direction frequently merge to staging but fail the rollup to main — "
-                "watch for integration-level issues like merge conflicts and CI failures against the target branch."
-            ),
-        }
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Helper: compact strategic vision for the claim response
-# ---------------------------------------------------------------------------
-
-
-def _build_vision_summary(vision_raw: dict | None) -> "dict | None":
-    """Return a size-bounded, agent-safe view of project.vision.
-
-    Strips internal fields (``_strategic_failures``, ``_strategic_cycle_history``,
-    ``_strategic_frequency_override``, etc.) and truncates free-text entries so
-    the claim payload stays bounded. Returns None when there is nothing
-    meaningful to surface — so callers can skip injection entirely.
-    """
-    if not vision_raw or not isinstance(vision_raw, dict):
-        return None
-    summary: dict = {}
-    purpose = vision_raw.get("purpose")
-    if isinstance(purpose, str) and purpose.strip():
-        summary["purpose"] = purpose.strip()[:600]
-    success = vision_raw.get("success_criteria")
-    if isinstance(success, str) and success.strip():
-        summary["success_criteria"] = success.strip()[:600]
-    elif isinstance(success, list):
-        compact = [
-            str(s).strip()[:200] for s in success if isinstance(s, str) and s.strip()
-        ]
-        if compact:
-            summary["success_criteria"] = compact[:5]
-    context_field = vision_raw.get("context")
-    if isinstance(context_field, str) and context_field.strip():
-        summary["context"] = context_field.strip()[:600]
-    priorities = vision_raw.get("priorities")
-    if isinstance(priorities, list):
-        compact_p: list = []
-        for p in priorities[:5]:
-            if isinstance(p, str) and p.strip():
-                compact_p.append(p.strip()[:200])
-            elif isinstance(p, dict):
-                text = p.get("text") or p.get("title") or p.get("name")
-                if isinstance(text, str) and text.strip():
-                    compact_p.append(text.strip()[:200])
-        if compact_p:
-            summary["priorities"] = compact_p
-    systems = vision_raw.get("systems")
-    if isinstance(systems, list):
-        compact_s: list = []
-        for sys in systems[:6]:
-            if not isinstance(sys, dict):
-                continue
-            name = sys.get("name") or sys.get("id")
-            if not isinstance(name, str) or not name.strip():
-                continue
-            entry = {"name": name.strip()[:80]}
-            status = sys.get("status")
-            if isinstance(status, str) and status.strip():
-                entry["status"] = status.strip()[:40]
-            desc = sys.get("description")
-            if isinstance(desc, str) and desc.strip():
-                entry["description"] = desc.strip()[:200]
-            compact_s.append(entry)
-        if compact_s:
-            summary["systems"] = compact_s
-    revision = vision_raw.get("revision")
-    if isinstance(revision, int):
-        summary["revision"] = revision
-    last_updated = vision_raw.get("last_updated")
-    if isinstance(last_updated, str) and last_updated:
-        summary["last_updated"] = last_updated[:40]
-    if not summary:
-        return None
-    return summary
-
-
-# ---------------------------------------------------------------------------
-# Helper: direction narrative (what we know, what's open)
-# ---------------------------------------------------------------------------
-
-
-def _build_direction_narrative(direction: dict) -> "dict | None":
-    """Extract a short "where we are" narrative from a direction.
-
-    Pulls the top bullets from the Established Findings and Open Questions
-    sections of research_context, plus the most recent productive cycle
-    outcome. The aim is to give tactical agents a sense of trajectory —
-    what's been confirmed, what's still unknown — without dumping the full
-    research document into the prompt.
-    """
-    if not isinstance(direction, dict):
-        return None
-    from app.research_context import _parse_research_context
-
-    rc_text = direction.get("research_context", "") or ""
-    parsed = _parse_research_context(rc_text) if rc_text else {}
-    established = parsed.get("established", []) if isinstance(parsed, dict) else []
-    open_questions = (
-        parsed.get("open_questions", []) if isinstance(parsed, dict) else []
-    )
-
-    def _trim(items: list, limit: int, char_cap: int) -> list:
-        return [
-            item.strip()[:char_cap]
-            for item in items[:limit]
-            if isinstance(item, str) and item.strip()
-        ]
-
-    narrative: dict = {}
-    top_established = _trim(established, 3, 240)
-    if top_established:
-        narrative["established_findings"] = top_established
-    top_open = _trim(open_questions, 2, 240)
-    if top_open:
-        narrative["open_questions"] = top_open
-
-    history = direction.get("research_history") or []
-    productive = [
-        h for h in history if isinstance(h, dict) and h.get("tasks_created", 0) > 0
-    ]
-    if productive:
-        last = productive[-1]
-        merged = int(last.get("prs_merged", 0) or 0)
-        created = int(last.get("tasks_created", 0) or 0)
-        rejected = int(last.get("prs_rejected", 0) or 0)
-        if created > 0:
-            narrative["last_cycle"] = {
-                "tasks_created": created,
-                "prs_merged": merged,
-                "prs_rejected": rejected,
-            }
-    if not narrative:
-        return None
-    return narrative
 
 
 # ---------------------------------------------------------------------------
