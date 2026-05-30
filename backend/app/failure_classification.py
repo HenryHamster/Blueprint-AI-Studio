@@ -679,7 +679,20 @@ def _stuck_llm_call_no_progress(task: "Task") -> bool:
     (routers/agent.py) on a last-write-wins basis, so it reflects the current
     attempt's cumulative LLM telemetry. Never raises.
     """
-    summary = getattr(task, "api_call_summary", None)
+    # api_call_summary may be deferred (load_only) or expired on analytics call
+    # sites (digest_activity / admin activity) — reading it then triggers a
+    # synchronous lazy-load under async → MissingGreenlet, which getattr's
+    # ``default`` does NOT catch (it only catches AttributeError). Guard the
+    # access so classify_failure stays safe on partially-loaded entities; when
+    # unreadable we simply can't determine the signal and decline to reclassify
+    # (the authoritative reaper / agent_status sites pass fully-loaded entities,
+    # and any reclassification is persisted to context for analytics to read).
+    # Regression fix-forward: #6864 broke GET /api/admin/activity + digest with
+    # MissingGreenlet.
+    try:
+        summary = task.api_call_summary
+    except Exception:
+        return False
     if not isinstance(summary, dict):
         return False
     try:

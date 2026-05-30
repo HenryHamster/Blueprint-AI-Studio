@@ -219,6 +219,24 @@ class TestStuckLlmCallHelper:
 
         assert _stuck_llm_call_no_progress(self._t(None)) is False
 
+    def test_unreadable_summary_does_not_raise(self):
+        # Regression for #6864: api_call_summary is deferred/expired on analytics
+        # call sites (digest_activity / admin activity), so reading it raises
+        # MissingGreenlet under async. getattr's default does NOT catch that
+        # (not an AttributeError) — it must be guarded so classify_failure stays
+        # safe on partially-loaded entities. The helper declines (returns False),
+        # it does NOT propagate the error.
+        from sqlalchemy.exc import MissingGreenlet
+
+        from app.failure_classification import _stuck_llm_call_no_progress
+
+        class _DeferredTask:
+            @property
+            def api_call_summary(self):
+                raise MissingGreenlet("greenlet_spawn has not been called")
+
+        assert _stuck_llm_call_no_progress(_DeferredTask()) is False
+
 
 class TestStuckLlmCallReclassifiedToRateLimit:
     """An execution/time-limit-stall AGENT_TIMEOUT where the agent started an LLM
