@@ -86,7 +86,7 @@ from app.retry_prompt import (  # noqa: E402, F401, RUF100
 )
 
 
-from app.task_lifecycle_requeue import (  # noqa: E402, F401
+from app.task_lifecycle_requeue import (  # noqa: F401
     _record_parent_failure,
     _requeue_parent_task,
 )
@@ -3701,6 +3701,45 @@ async def _process_post_commit(
                     f"[STATUS] Completion handler failed for {task_type} task {task.id}: {handler_exc!r}",
                     exc_info=True,
                 )
+                # A handler that raised on a DB error (asyncpg QueryCanceledError
+                # from statement_timeout, LockNotAvailableError, a closed
+                # connection, …) leaves the session in an aborted transaction.
+                # Every recovery write below — and the downstream
+                # rollup/aggregation/final-commit sections — then fail on the
+                # poisoned session ("current transaction is aborted" / "raised as
+                # a result of Query-invoked autoflush"), so the requeue/FAIL never
+                # persists and a task the agent reported terminal is silently
+                # stranded with its work undispatched (research findings, plan
+                # children, …). Production 2026-05-29: a research task hit a 120s
+                # statement_timeout in _handle_research_completion, the requeue
+                # commit then died on autoflush, and the task stuck COMPLETED with
+                # 0 children and its findings undispatched. Roll the poisoned
+                # transaction back so recovery runs on a clean transaction.
+                # rollback() expires every ORM instance, so re-fetch the task by
+                # its (stable, argument-supplied) id before reading or mutating
+                # it — attribute access on the now-expired instance would issue a
+                # synchronous lazy-load and raise MissingGreenlet.
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[HANDLER] Rollback after handler failure failed for task %s",
+                        task_id,
+                    )
+                _recovered_task = (
+                    (await session.execute(select(Task).where(Task.id == task_id)))
+                    .scalars()
+                    .first()
+                )
+                if _recovered_task is None:
+                    # Row vanished (archived/deleted) during post-commit — nothing
+                    # left to recover.
+                    logger.warning(
+                        "[HANDLER] Task %s gone after handler failure; skipping recovery",
+                        task_id,
+                    )
+                    return {"status": "accepted"}
+                task = _recovered_task
                 # Detect transient errors (GitHub API, DB, network) and requeue instead of FAILED
                 err_str = str(handler_exc).lower()
                 is_transient = any(

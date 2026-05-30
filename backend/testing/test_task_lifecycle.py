@@ -2238,6 +2238,124 @@ async def test_process_post_commit_omits_unsent_timing_fields(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_process_post_commit_transient_handler_failure_requeues_after_rollback(
+    tl_db, mocker
+):
+    """A completion handler that raises a transient DB error must leave the task
+    REQUEUED and persisted — not silently stranded in its agent-reported status.
+
+    Regression for the 2026-05-29 silent-loss: ``_handle_research_completion``
+    hit a 120s statement_timeout, the requeue commit then died on the poisoned
+    (un-rolled-back) session, and the research task stuck COMPLETED with 0
+    children and its findings undispatched. ``_process_post_commit`` must roll
+    the aborted transaction back, re-fetch the task, and persist the requeue —
+    discarding the handler's partial (uncommitted) work rather than letting it
+    leak into the recovery commit.
+    """
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        latest_status_message="[18.6MB] Using tool: Bash",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    async def _failing_handler(t, logs, sess):
+        # Mirror the real handler: stage partial uncommitted work (a child task,
+        # like a spawned finding) and then hit a transient DB error (statement
+        # timeout). The partial work must NOT survive recovery, and the requeue
+        # must still persist.
+        sess.add(
+            Task(
+                project_id=t.project_id,
+                payloads=[{"type": "create", "prompt": "partial-handler-child"}],
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                parent_task_id=t.id,
+            )
+        )
+        raise Exception("canceling statement due to statement timeout")
+
+    # _handle_research_completion is imported lazily inside _process_post_commit
+    # (from app.research_completion), so patch it at its source module.
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        side_effect=_failing_handler,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    # Re-fetch from a brand-new session to assert what actually persisted.
+    async with factory() as verify_session:
+        refetched = (
+            await verify_session.execute(select(Task).where(Task.id == task.id))
+        ).scalars().first()
+        children = (
+            (
+                await verify_session.execute(
+                    select(Task).where(Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    assert refetched is not None
+    # Recovery persisted: the task was requeued for a fresh attempt.
+    assert refetched.status == TaskStatus.QUEUED
+    assert refetched.attempt_count == 1
+    assert (refetched.latest_status_message or "").startswith(
+        "Handler hit transient error, requeuing"
+    )
+    # The handler's partial, uncommitted work was rolled back, not persisted.
+    assert children == []
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_nontransient_handler_failure_fails_persisted(
+    tl_db, mocker
+):
+    """A non-transient handler error must persist a FAILED status (not stay stuck
+    at the agent-reported terminal status). Complements the transient-requeue
+    path: both recovery branches run after the poisoned-session rollback."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    async def _failing_handler(t, logs, sess):
+        raise ValueError("structured findings parse blew up")
+
+    # _handle_research_completion is imported lazily inside _process_post_commit
+    # (from app.research_completion), so patch it at its source module.
+    mocker.patch(
+        "app.research_completion._handle_research_completion",
+        side_effect=_failing_handler,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    async with factory() as verify_session:
+        refetched = (
+            await verify_session.execute(select(Task).where(Task.id == task.id))
+        ).scalars().first()
+
+    assert refetched is not None
+    assert refetched.status == TaskStatus.FAILED
+    assert "handler failed" in (refetched.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
     """Phase 2d: when the APPROVE branch hits CI failure and spawns a fix,
     the spawn must pass suppress_warm_handoff=True so no warm-target pin
