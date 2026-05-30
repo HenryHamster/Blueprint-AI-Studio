@@ -273,11 +273,34 @@ async def list_branches(
     return branches
 
 
+# A commit's committer-date is immutable for a given SHA, so this is safe to
+# cache for the process lifetime keyed by (owner, repo, sha). The branch-cleanup
+# sweep calls get_commit_date once per terminal branch every cycle; with a large
+# backlog of un-deletable orphan branches (e.g. the deleted-project cascade) the
+# same ~300 SHAs were re-fetched every sweep, producing ~1.3k redundant
+# GET /commits/{sha} calls in 2h and dominating the shared GitHub rate budget
+# (incident 2026-05-30). The cache collapses repeat sweeps to ~0 GitHub calls.
+# Bounded so a long-lived process can't grow it without limit; misses (None) are
+# NOT cached so a transient API error retries next cycle.
+_COMMIT_DATE_CACHE: "dict[tuple[str, str, str], datetime]" = {}
+_COMMIT_DATE_CACHE_MAX = 5000
+
+
 async def get_commit_date(
     token: str, owner: str, repo: str, sha: str
 ) -> "datetime | None":
-    """Get the committer date for a commit SHA. Returns None on error."""
+    """Get the committer date for a commit SHA. Returns None on error.
+
+    Cached by (owner, repo, sha) — commit dates are immutable, so a hit never
+    goes stale. Only successful lookups are cached; errors fall through to a
+    fresh fetch next call.
+    """
     from datetime import datetime as _dt
+
+    cache_key = (owner, repo, sha)
+    cached = _COMMIT_DATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -293,9 +316,15 @@ async def get_commit_date(
     if not date_str:
         return None
     try:
-        return _dt.fromisoformat(date_str.replace("Z", "+00:00"))
+        parsed = _dt.fromisoformat(date_str.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+    # Bounded insert: clear wholesale when oversized (cheap; entries are
+    # immutable so dropping them only costs a re-fetch, not correctness).
+    if len(_COMMIT_DATE_CACHE) >= _COMMIT_DATE_CACHE_MAX:
+        _COMMIT_DATE_CACHE.clear()
+    _COMMIT_DATE_CACHE[cache_key] = parsed
+    return parsed
 
 
 async def list_pull_requests_for_commit(
