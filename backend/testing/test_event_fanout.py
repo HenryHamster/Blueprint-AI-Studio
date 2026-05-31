@@ -170,54 +170,60 @@ class TestDecodePayload:
 # ---------------------------------------------------------------------------
 
 
-def _fake_sessionmaker():
-    """Return (sessionmaker_mock, session_mock) where the maker yields an
-    async-context-manager session."""
-    session = AsyncMock()
-    session.execute = AsyncMock()
-    session.commit = AsyncMock()
-    cm = AsyncMock()
-    cm.__aenter__ = AsyncMock(return_value=session)
-    cm.__aexit__ = AsyncMock(return_value=False)
-    maker = MagicMock(return_value=cm)
-    return maker, session
+def _fake_publish_conn():
+    """Return a fake persistent asyncpg publish connection.
+
+    ``_publish_encoded`` now runs pg_notify on the dedicated module-level
+    connection owned by ``publish_service`` (no pooled SQLAlchemy session), so
+    tests inject this directly as ``ef._publish_conn``.
+    """
+    conn = AsyncMock()
+    conn.execute = AsyncMock()
+    return conn
 
 
 class TestPublishProjectEvent:
     async def test_noop_when_not_postgres(self, monkeypatch):
         monkeypatch.setattr(ef, "_IS_POSTGRES", False)
-        maker, session = _fake_sessionmaker()
-        monkeypatch.setattr("app.database.AsyncSessionLocal", maker)
+        conn = _fake_publish_conn()
+        monkeypatch.setattr(ef, "_publish_conn", conn)
         await ef.publish_project_event("p1", "task_updated", {"id": "t1"})
-        maker.assert_not_called()
-        session.execute.assert_not_called()
+        conn.execute.assert_not_called()
 
     async def test_skips_agent_log_even_on_postgres(self, monkeypatch):
         monkeypatch.setattr(ef, "_IS_POSTGRES", True)
-        maker, session = _fake_sessionmaker()
-        monkeypatch.setattr("app.database.AsyncSessionLocal", maker)
+        conn = _fake_publish_conn()
+        monkeypatch.setattr(ef, "_publish_conn", conn)
         await ef.publish_project_event("p1", "agent_log", {"log": "x"})
-        maker.assert_not_called()
+        conn.execute.assert_not_called()
 
-    async def test_emits_pg_notify_and_commits(self, monkeypatch):
+    async def test_emits_pg_notify_on_persistent_connection(self, monkeypatch):
         monkeypatch.setattr(ef, "_IS_POSTGRES", True)
-        maker, session = _fake_sessionmaker()
-        monkeypatch.setattr("app.database.AsyncSessionLocal", maker)
+        conn = _fake_publish_conn()
+        monkeypatch.setattr(ef, "_publish_conn", conn)
         await ef.publish_project_event("p1", "task_updated", {"id": "t1"})
-        session.execute.assert_awaited_once()
-        call_args = session.execute.call_args
+        # Runs on the dedicated connection — NOT a pooled session.
+        conn.execute.assert_awaited_once()
+        call_args = conn.execute.call_args
+        # asyncpg positional placeholders: SELECT pg_notify($1, $2).
         assert "pg_notify" in str(call_args[0][0])
-        params = call_args[0][1]
-        assert params["channel"] == ef._NOTIFY_CHANNEL
-        # Payload is the JSON-encoded control event.
-        assert json.loads(params["payload"])["event"] == "task_updated"
-        session.commit.assert_awaited_once()
+        assert call_args[0][1] == ef._NOTIFY_CHANNEL
+        # Third positional arg is the JSON-encoded control event payload.
+        assert json.loads(call_args[0][2])["event"] == "task_updated"
 
     async def test_swallows_exceptions(self, monkeypatch):
         monkeypatch.setattr(ef, "_IS_POSTGRES", True)
-        maker = MagicMock(side_effect=RuntimeError("pool exhausted"))
-        monkeypatch.setattr("app.database.AsyncSessionLocal", maker)
+        conn = _fake_publish_conn()
+        conn.execute = AsyncMock(side_effect=RuntimeError("socket dead"))
+        monkeypatch.setattr(ef, "_publish_conn", conn)
         # Must not raise.
+        await ef.publish_project_event("p1", "task_updated", {"id": "t1"})
+
+    async def test_swallows_when_connection_not_ready(self, monkeypatch):
+        # publish_service hasn't established the connection yet: degrade to
+        # local-only delivery, never raise into the broadcast path.
+        monkeypatch.setattr(ef, "_IS_POSTGRES", True)
+        monkeypatch.setattr(ef, "_publish_conn", None)
         await ef.publish_project_event("p1", "task_updated", {"id": "t1"})
 
 
@@ -692,4 +698,147 @@ class TestOriginInstanceSingleDelivery:
 
         assert len(received) == 1, (
             f"originating instance must deliver exactly once, got {len(received)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cluster C12: dedicated persistent publish connection (no pooled session)
+# ---------------------------------------------------------------------------
+
+
+class TestPublishService:
+    async def test_publish_encoded_raises_when_no_connection(self, monkeypatch):
+        """Without an established persistent connection, _publish_encoded raises
+        (the caller's best-effort guard then degrades to local-only delivery)."""
+        monkeypatch.setattr(ef, "_publish_conn", None)
+        raised = False
+        try:
+            await ef._publish_encoded("{}")
+        except RuntimeError:
+            raised = True
+        assert raised, "_publish_encoded must raise when no publish connection"
+
+    async def test_publish_encoded_uses_persistent_connection_not_pool(
+        self, monkeypatch
+    ):
+        """The hot publish path runs pg_notify on the dedicated module-level
+        asyncpg connection and never checks out a pooled SQLAlchemy session
+        (the cluster-C12 root fix: decouple messaging from the pool)."""
+        conn = AsyncMock()
+        conn.execute = AsyncMock()
+        monkeypatch.setattr(ef, "_publish_conn", conn)
+
+        # Sentinel: if the pool were used the maker would be called. It must not.
+        pool_maker = MagicMock()
+        monkeypatch.setattr("app.database.AsyncSessionLocal", pool_maker)
+
+        await ef._publish_encoded('{"event":"task_updated"}')
+        conn.execute.assert_awaited_once()
+        assert "pg_notify" in str(conn.execute.call_args[0][0])
+        pool_maker.assert_not_called()
+
+    async def test_publish_service_noop_on_non_postgres(self, monkeypatch):
+        monkeypatch.setattr(ef, "_get_raw_dsn", lambda: None)
+        task = asyncio.create_task(ef.publish_service())
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def test_publish_service_establishes_connection_and_keepalive(
+        self, monkeypatch
+    ):
+        """publish_service opens a raw connection, enables TCP keepalive on it,
+        and publishes its first SELECT 1 liveness probe."""
+        monkeypatch.setattr(ef, "_publish_conn", None)
+        monkeypatch.setattr(ef, "_get_raw_dsn", lambda: "postgresql://host/db")
+        monkeypatch.setattr(ef, "_PUBLISH_KEEPALIVE_INTERVAL", 0)
+
+        fake_conn = AsyncMock()
+        fake_conn.execute = AsyncMock()
+        fake_conn.close = AsyncMock()
+
+        keepalive_calls = []
+        monkeypatch.setattr(
+            ef, "enable_tcp_keepalive", lambda c: keepalive_calls.append(c)
+        )
+
+        # Let the first probe run, then cancel via sleep on the SECOND wakeup.
+        sleep_count = {"n": 0}
+        real_sleep = asyncio.sleep
+
+        async def _fake_sleep(secs):
+            sleep_count["n"] += 1
+            if sleep_count["n"] >= 2:
+                raise asyncio.CancelledError()
+            await real_sleep(0)
+
+        with (
+            patch(
+                "app.event_fanout._asyncpg.connect",
+                new=AsyncMock(return_value=fake_conn),
+            ),
+            patch("asyncio.sleep", side_effect=_fake_sleep),
+        ):
+            try:
+                await ef.publish_service()
+            except asyncio.CancelledError:
+                pass
+
+        assert keepalive_calls == [fake_conn], "keepalive must be enabled on the conn"
+        # SELECT 1 watchdog probe ran at least once.
+        assert any(
+            "SELECT 1" in str(c.args[0]) for c in fake_conn.execute.call_args_list
+        )
+
+
+class TestListenBackoffLongevityGate:
+    async def test_immediate_termination_does_not_reset_backoff(self, monkeypatch):
+        """A connection that dies <30s after connecting must NOT reset the
+        reconnect-backoff counter, so repeated immediate terminations back off
+        exponentially instead of storming reconnects at the 1s floor."""
+        import app.broadcast as broadcast_mod
+        from app.broadcast import ConnectionManager
+
+        monkeypatch.setattr(broadcast_mod, "manager", ConnectionManager())
+        monkeypatch.setattr(ef, "_get_raw_dsn", lambda: "postgresql://host/db")
+        monkeypatch.setattr(ef, "enable_tcp_keepalive", lambda c: None)
+
+        # Each connection dies in ~0 real seconds, so a high longevity threshold
+        # guarantees no reset fires — the assertion below proves backoff escalates.
+        monkeypatch.setattr(ef, "_CONNECTION_LONGEVITY_RESET_SECONDS", 10_000)
+
+        connect_calls = []
+        waits = []
+
+        async def _make_conn(dsn, ssl=None):
+            connect_calls.append(True)
+            c = MagicMock()
+            # Fire termination immediately => connection lives ~0s.
+            c.add_termination_listener = MagicMock(side_effect=lambda cb: cb(c))
+            c.add_listener = AsyncMock()
+            c.close = AsyncMock()
+            return c
+
+        async def _capture_sleep(secs):
+            waits.append(secs)
+            # Stop after a few reconnect cycles.
+            if len(connect_calls) >= 4:
+                raise asyncio.CancelledError()
+
+        with (
+            patch("app.event_fanout._asyncpg.connect", side_effect=_make_conn),
+            patch("asyncio.sleep", side_effect=_capture_sleep),
+        ):
+            try:
+                await ef.event_fanout_service()
+            except asyncio.CancelledError:
+                pass
+
+        # Reconnect waits must ESCALATE (1, 2, 4, ...), proving backoff was NOT
+        # reset to the floor on each immediate-termination cycle.
+        assert waits[:3] == [1, 2, 4], (
+            f"backoff should escalate on immediate terminations, got {waits}"
         )

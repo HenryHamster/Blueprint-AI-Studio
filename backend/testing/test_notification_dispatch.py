@@ -1,5 +1,6 @@
 """Tests for notification_dispatch.py message builder functions."""
 
+import asyncio
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -365,6 +366,153 @@ async def test_drain_skips_not_due_entries():
         await nd._drain_retry_queue("https://example.com/hook")
     mock_del.assert_not_called()
     assert len(nd._retry_queue) == 1  # still in queue
+
+
+# ---------------------------------------------------------------------------
+# Cluster C12: per-entry webhook_url, independent drainer, maxlen eviction log
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_drain_uses_per_entry_webhook_url_not_ambient():
+    """A retry delivers to the URL snapshotted on the entry, NOT whatever
+    webhook_url runtime_config holds when the drain fires. Without this, a
+    config change between dispatch and retry leaks the retry to the wrong URL."""
+    _reset_stats()
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={"event_type": "test_event"},
+            attempts=0,
+            next_retry_at=time.monotonic() - 1,  # due now
+            webhook_url="https://original.example.com/hook",
+        )
+    )
+    deliver_mock = AsyncMock(return_value=200)
+    with patch("app.notification_dispatch._attempt_delivery", new=deliver_mock):
+        # Ambient URL is DIFFERENT — must be ignored in favour of the entry's.
+        await nd._drain_retry_queue("https://changed.example.com/new-hook")
+    deliver_mock.assert_awaited_once()
+    assert deliver_mock.call_args[0][0] == "https://original.example.com/hook"
+    assert nd.total_delivered == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_webhook_url_on_retry_entry():
+    """When a dispatch fails, the enqueued retry stores the destination URL so
+    the independent drainer can deliver it without ambient config."""
+    _reset_stats()
+    with (
+        patch(
+            "app.shared_state.runtime_config",
+            _make_runtime_config(webhook_url="https://dest.example.com/hook"),
+        ),
+        patch(
+            "app.notification_dispatch._attempt_delivery",
+            new=AsyncMock(return_value=503),
+        ),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
+        await dispatch_external_notification(uuid.uuid4(), "test_event", {"k": "v"})
+    assert len(nd._retry_queue) == 1
+    assert nd._retry_queue[0].webhook_url == "https://dest.example.com/hook"
+
+
+@pytest.mark.asyncio
+async def test_drain_drops_entry_without_any_webhook_url():
+    """An entry with no stored URL and no ambient fallback cannot be delivered
+    and is dropped (counted as failed) rather than crashing the drain."""
+    _reset_stats()
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={},
+            attempts=0,
+            next_retry_at=time.monotonic() - 1,
+            webhook_url="",
+        )
+    )
+    deliver_mock = AsyncMock(return_value=200)
+    with patch("app.notification_dispatch._attempt_delivery", new=deliver_mock):
+        await nd._drain_retry_queue("")  # no fallback either
+    deliver_mock.assert_not_called()
+    assert nd.total_failed == 1
+    assert len(nd._retry_queue) == 0
+
+
+@pytest.mark.asyncio
+async def test_independent_drain_service_flushes_without_new_dispatch():
+    """The background drainer flushes a due retry on its own schedule — proving
+    retries are no longer stranded during quiet periods (no new dispatch)."""
+    _reset_stats()
+    nd._retry_queue.append(
+        _RetryEntry(
+            project_id=uuid.uuid4(),
+            event_type="test_event",
+            payload={},
+            body={"event_type": "test_event"},
+            attempts=0,
+            next_retry_at=time.monotonic() - 1,  # due now
+            webhook_url="https://dest.example.com/hook",
+        )
+    )
+    deliver_mock = AsyncMock(return_value=200)
+    with (
+        patch("app.notification_dispatch._attempt_delivery", new=deliver_mock),
+        patch("app.notification_dispatch._RETRY_DRAIN_INTERVAL_SECONDS", 0),
+    ):
+        task = asyncio.create_task(nd.notification_retry_drain_service())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    deliver_mock.assert_awaited()
+    assert nd.total_delivered == 1
+    assert len(nd._retry_queue) == 0
+
+
+def test_enqueue_retry_logs_on_maxlen_eviction(caplog):
+    """When the bounded queue is full, _enqueue_retry logs the evicted entry so
+    a silently-dropped alert retry is at least visible in the logs."""
+    import logging
+
+    _reset_stats()
+    # Fill to capacity via the logging enqueue helper.
+    for i in range(nd._RETRY_QUEUE_MAXLEN):
+        nd._enqueue_retry(
+            _RetryEntry(
+                project_id=uuid.uuid4(),
+                event_type=f"evt_{i}",
+                payload={},
+                body={},
+                attempts=0,
+                next_retry_at=time.monotonic() + 9999,
+                webhook_url="https://h",
+            )
+        )
+    assert len(nd._retry_queue) == nd._RETRY_QUEUE_MAXLEN
+    with caplog.at_level(logging.WARNING, logger="app.notification_dispatch"):
+        nd._enqueue_retry(
+            _RetryEntry(
+                project_id=uuid.uuid4(),
+                event_type="overflow",
+                payload={},
+                body={},
+                attempts=0,
+                next_retry_at=time.monotonic() + 9999,
+                webhook_url="https://h",
+            )
+        )
+    assert any("evicting oldest" in r.message.lower() for r in caplog.records)
+    # Still bounded; the oldest was evicted to make room for the new one.
+    assert len(nd._retry_queue) == nd._RETRY_QUEUE_MAXLEN
 
 
 # ---------------------------------------------------------------------------

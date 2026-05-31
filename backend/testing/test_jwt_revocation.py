@@ -425,3 +425,101 @@ class TestJwtRevocationServiceCallback:
                     pass
 
         assert len(connect_calls) >= 2, "Should have retried after first failure"
+
+    @pytest.mark.anyio
+    async def test_enables_tcp_keepalive_on_connection(self, monkeypatch):
+        """Cluster C12: the raw LISTEN connection gets client-side TCP keepalive
+        so a silent network partition is detected instead of hanging forever."""
+        monkeypatch.setattr(
+            "app.routers.agent._terminated_task_ids", {}
+        )
+        monkeypatch.setattr(
+            "app.jwt_revocation._get_raw_dsn", lambda: "postgresql://host/db"
+        )
+
+        async def _noop_seed(conn, cache):
+            return None
+
+        monkeypatch.setattr("app.jwt_revocation._seed_deny_list", _noop_seed)
+
+        keepalive_calls = []
+        monkeypatch.setattr(
+            "app.jwt_revocation.enable_tcp_keepalive",
+            lambda c: keepalive_calls.append(c),
+        )
+
+        fake_conn = MagicMock()
+        fake_conn.add_termination_listener = MagicMock(
+            side_effect=lambda cb: cb(fake_conn)
+        )
+        fake_conn.add_listener = AsyncMock()
+        fake_conn.close = AsyncMock()
+
+        async def _cancel_on_first_sleep(secs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch(
+                "app.jwt_revocation._asyncpg.connect",
+                new=AsyncMock(return_value=fake_conn),
+            ),
+            patch("asyncio.sleep", side_effect=_cancel_on_first_sleep),
+        ):
+            from app.jwt_revocation import jwt_revocation_service
+
+            try:
+                await jwt_revocation_service()
+            except asyncio.CancelledError:
+                pass
+
+        assert keepalive_calls == [fake_conn]
+
+    @pytest.mark.anyio
+    async def test_immediate_termination_does_not_reset_backoff(self, monkeypatch):
+        """A connection that dies <30s after connecting must NOT reset backoff,
+        so repeated immediate Cloud SQL terminations back off exponentially
+        rather than storming reconnects at the 1s floor."""
+        monkeypatch.setattr("app.routers.agent._terminated_task_ids", {})
+        monkeypatch.setattr(
+            "app.jwt_revocation._get_raw_dsn", lambda: "postgresql://host/db"
+        )
+        monkeypatch.setattr("app.jwt_revocation.enable_tcp_keepalive", lambda c: None)
+        monkeypatch.setattr(
+            "app.jwt_revocation._CONNECTION_LONGEVITY_RESET_SECONDS", 10_000
+        )
+
+        async def _noop_seed(conn, cache):
+            return None
+
+        monkeypatch.setattr("app.jwt_revocation._seed_deny_list", _noop_seed)
+
+        connect_calls = []
+        waits = []
+
+        async def _make_conn(dsn, ssl=None):
+            connect_calls.append(True)
+            c = MagicMock()
+            c.add_termination_listener = MagicMock(side_effect=lambda cb: cb(c))
+            c.add_listener = AsyncMock()
+            c.close = AsyncMock()
+            return c
+
+        async def _capture_sleep(secs):
+            waits.append(secs)
+            if len(connect_calls) >= 4:
+                raise asyncio.CancelledError()
+
+        with (
+            patch("app.jwt_revocation._asyncpg.connect", side_effect=_make_conn),
+            patch("asyncio.sleep", side_effect=_capture_sleep),
+        ):
+            from app.jwt_revocation import jwt_revocation_service
+
+            try:
+                await jwt_revocation_service()
+            except asyncio.CancelledError:
+                pass
+
+        assert waits[:3] == [1, 2, 4], (
+            f"backoff should escalate on immediate terminations, got {waits}"
+        )

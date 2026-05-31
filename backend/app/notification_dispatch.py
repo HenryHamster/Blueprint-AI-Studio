@@ -86,10 +86,52 @@ class _RetryEntry:
     body: dict  # pre-built JSON body
     attempts: int  # number of attempts already made
     next_retry_at: float  # monotonic time
+    # Snapshot of the destination at the time the retry was scheduled. Stored
+    # per-entry so a retry delivers to the URL the notification was originally
+    # destined for — NOT whatever webhook_url runtime_config happens to hold
+    # when the drain fires (which can change between dispatch and retry, causing
+    # a retry to leak to the wrong endpoint). Defaulted for backward-compat with
+    # call sites/tests that construct entries positionally.
+    webhook_url: str = ""
 
 
-# Bounded in-memory retry queue (max 50 entries; oldest are dropped when full)
-_retry_queue: collections.deque[_RetryEntry] = collections.deque(maxlen=50)
+# Bounded in-memory retry queue (max 50 entries). When full, the OLDEST entry
+# is evicted on append; ``_enqueue_retry`` logs that eviction so a silently
+# dropped alert-retry is at least visible in the logs (cluster C12 — bounded
+# maxlen silently evicts). The independent drainer (``notification_retry_drain_service``)
+# flushes due entries on its own schedule regardless of new dispatches.
+_RETRY_QUEUE_MAXLEN = 50
+_retry_queue: collections.deque[_RetryEntry] = collections.deque(
+    maxlen=_RETRY_QUEUE_MAXLEN
+)
+
+# Independent retry-drainer cadence. The queue used to be drained ONLY as a
+# prefix to a new dispatch, so during quiet periods (exactly when an alert
+# retry matters most) due retries stalled indefinitely. This background service
+# flushes them on its own ~30s schedule. Per-entry webhook_url means the drainer
+# needs no ambient URL.
+_RETRY_DRAIN_INTERVAL_SECONDS = 30
+
+
+def _enqueue_retry(entry: _RetryEntry) -> None:
+    """Append a retry entry, logging when the bounded deque evicts the oldest.
+
+    ``collections.deque(maxlen=...)`` silently discards the oldest element on
+    append once full. For an alert-delivery retry queue that silent loss is a
+    real signal disappearing, so we detect the at-capacity case and log the
+    evicted entry before it is dropped.
+    """
+    if len(_retry_queue) >= _RETRY_QUEUE_MAXLEN:
+        evicted = _retry_queue[0]
+        logger.warning(
+            "[NOTIFY] Retry queue full (maxlen=%d); evicting oldest undelivered "
+            "retry (event=%s, project=%s, attempts=%d) to make room",
+            _RETRY_QUEUE_MAXLEN,
+            evicted.event_type,
+            evicted.project_id,
+            evicted.attempts,
+        )
+    _retry_queue.append(entry)
 
 
 def _record_project_stat(project_id: Any, outcome: str, reason: str = "") -> None:
@@ -177,8 +219,21 @@ async def _attempt_delivery(webhook_url: str, body: dict) -> int:
         return resp.status_code
 
 
-async def _drain_retry_queue(webhook_url: str) -> None:
-    """Process due retry entries, piggybacking on the next dispatch call."""
+async def _drain_retry_queue(webhook_url: str = "") -> None:
+    """Process due retry entries.
+
+    Called both as a prefix to a new dispatch AND independently from
+    ``notification_retry_drain_service`` on a fixed schedule, so retries are no
+    longer stranded during quiet periods (when no new dispatch ever fires).
+
+    Each retry is delivered to the URL stored ON THE ENTRY (``entry.webhook_url``)
+    — the destination snapshotted when the notification was first scheduled —
+    NOT the ambient ``webhook_url`` argument, which may have changed in
+    runtime_config between dispatch and retry. The argument is kept only as a
+    fallback for entries with no stored URL (legacy / positionally-constructed
+    entries). An entry with neither is dropped (cannot deliver to an unknown
+    destination).
+    """
     global total_delivered, total_failed, last_failure_reason
 
     now = time.monotonic()
@@ -199,8 +254,18 @@ async def _drain_retry_queue(webhook_url: str) -> None:
         _retry_queue.append(entry)
 
     for entry in due:
+        target_url = entry.webhook_url or webhook_url
+        if not target_url:
+            total_failed += 1
+            last_failure_reason = "no webhook_url on retry entry"
+            _record_project_stat(entry.project_id, "failed", last_failure_reason)
+            logger.warning(
+                "[NOTIFY] Dropping retry for %s — no target webhook_url recorded",
+                entry.event_type,
+            )
+            continue
         try:
-            status = await _attempt_delivery(webhook_url, entry.body)
+            status = await _attempt_delivery(target_url, entry.body)
             if 200 <= status < 300:
                 total_delivered += 1
                 _record_project_stat(entry.project_id, "delivered")
@@ -218,7 +283,7 @@ async def _drain_retry_queue(webhook_url: str) -> None:
             elif entry.attempts + 1 < len(_RETRY_DELAYS):
                 # Schedule another retry
                 delay = _RETRY_DELAYS[entry.attempts + 1]
-                _retry_queue.append(
+                _enqueue_retry(
                     dataclasses.replace(
                         entry,
                         attempts=entry.attempts + 1,
@@ -240,7 +305,7 @@ async def _drain_retry_queue(webhook_url: str) -> None:
         except Exception as exc:
             if entry.attempts + 1 < len(_RETRY_DELAYS):
                 delay = _RETRY_DELAYS[entry.attempts + 1]
-                _retry_queue.append(
+                _enqueue_retry(
                     dataclasses.replace(
                         entry,
                         attempts=entry.attempts + 1,
@@ -258,6 +323,28 @@ async def _drain_retry_queue(webhook_url: str) -> None:
                 logger.warning(
                     f"[NOTIFY] Exhausted retries for {entry.event_type}: {exc}"
                 )
+
+
+async def notification_retry_drain_service() -> None:
+    """Background service: flush the webhook retry queue on a fixed schedule.
+
+    Independent of new dispatches. Previously the retry queue was drained ONLY
+    as a prefix to a fresh ``dispatch_external_notification`` call, so during
+    quiet periods — exactly when a backlog of alert retries matters most — due
+    retries sat undelivered indefinitely. This loop wakes every
+    ``_RETRY_DRAIN_INTERVAL_SECONDS`` and drains using each entry's stored
+    ``webhook_url``, so it needs no ambient configuration. Best-effort: a drain
+    failure is logged and the loop continues.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_RETRY_DRAIN_INTERVAL_SECONDS)
+            if _retry_queue:
+                await _drain_retry_queue()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background loop must survive transient failures
+            logger.warning("[NOTIFY] Retry drain loop error: %s", exc)
 
 
 async def dispatch_external_notification(
@@ -349,7 +436,7 @@ async def dispatch_external_notification(
             elif status >= 400:
                 # 5xx or unexpected 4xx — schedule first retry
                 delay = _RETRY_DELAYS[0]
-                _retry_queue.append(
+                _enqueue_retry(
                     _RetryEntry(
                         project_id=project_id,
                         event_type=event_type,
@@ -357,6 +444,7 @@ async def dispatch_external_notification(
                         body=body,
                         attempts=0,
                         next_retry_at=time.monotonic() + delay,
+                        webhook_url=webhook_url,
                     )
                 )
                 logger.warning(
@@ -369,7 +457,7 @@ async def dispatch_external_notification(
         except Exception as exc:
             # Network/timeout error — schedule first retry
             delay = _RETRY_DELAYS[0]
-            _retry_queue.append(
+            _enqueue_retry(
                 _RetryEntry(
                     project_id=project_id,
                     event_type=event_type,
@@ -377,6 +465,7 @@ async def dispatch_external_notification(
                     body=body,
                     attempts=0,
                     next_retry_at=time.monotonic() + delay,
+                    webhook_url=webhook_url,
                 )
             )
             logger.warning(

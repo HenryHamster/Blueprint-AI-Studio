@@ -74,6 +74,63 @@ def split_listen_dsn(database_url: str | None) -> tuple[str | None, object | Non
     return dsn, _asyncpg_ssl_arg(ssl_value)
 
 
+# Client-side TCP keepalive tuning for the raw asyncpg LISTEN connections
+# (``event_fanout``, ``jwt_revocation``). These connections block on
+# ``terminated_event.wait()`` indefinitely, so a SILENT network partition
+# (no FIN/RST — e.g. an NLB idle drop or a mid-path firewall eviction) leaves
+# the listener hung forever with the connection appearing alive: no
+# ``add_termination_listener`` callback fires and cross-instance fanout /
+# revocation is stranded until the next process restart (incident class
+# "LISTEN connections hang forever on silent network partition"). Enabling
+# SO_KEEPALIVE with an aggressive idle/interval/count makes the kernel probe
+# the peer and tear the socket down within ~KEEPIDLE + KEEPINTVL*KEEPCNT
+# seconds of silence, which fires the termination listener and triggers
+# reconnect. Values are conservative (detect within ~45s) but well above the
+# loop's own SELECT-1 watchdog cadence so the two mechanisms compose.
+_KEEPALIVE_IDLE_SECONDS = 30
+_KEEPALIVE_INTERVAL_SECONDS = 5
+_KEEPALIVE_COUNT = 3
+
+
+def enable_tcp_keepalive(conn: object) -> None:
+    """Enable client-side TCP keepalive on a raw asyncpg connection's socket.
+
+    Best-effort: reaches through asyncpg's transport to the underlying socket
+    and sets SO_KEEPALIVE plus the TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT
+    tuning knobs where the platform exposes them (Linux always does; the
+    per-knob options are absent on some platforms, so each is guarded
+    independently). Never raises — a missing transport/option degrades to the
+    OS default keepalive (or none), not a crash, so the caller's connect path
+    is unaffected.
+    """
+    import socket
+
+    try:
+        transport = getattr(conn, "_transport", None)
+        if transport is None:
+            return
+        sock = transport.get_extra_info("socket")
+        if sock is None:
+            return
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # TCP_KEEPIDLE / KEEPINTVL / KEEPCNT are Linux (and partially macOS);
+        # guard each so absence on a platform is a no-op rather than an error.
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(
+                socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, _KEEPALIVE_IDLE_SECONDS
+            )
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(
+                socket.IPPROTO_TCP,
+                socket.TCP_KEEPINTVL,
+                _KEEPALIVE_INTERVAL_SECONDS,
+            )
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _KEEPALIVE_COUNT)
+    except Exception as exc:  # noqa: BLE001 — keepalive is best-effort hardening
+        logger.debug("[DB] enable_tcp_keepalive best-effort failed: %s", exc)
+
+
 # Counter of consecutive invalidate() failures. Once this hits the escalation
 # threshold we call `engine.sync_engine.pool.dispose()` to nuke the entire
 # pool — necessary backstop if individual connection.invalidate() calls keep

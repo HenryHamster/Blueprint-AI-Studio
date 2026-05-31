@@ -43,6 +43,7 @@ on ``task_updated``, so a compact signal payload is sufficient.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -53,9 +54,7 @@ try:
 except ImportError:  # pragma: no cover — asyncpg absent in standalone test env
     _asyncpg = None  # type: ignore[assignment]
 
-from sqlalchemy import text
-
-from app.database import split_listen_dsn
+from app.database import enable_tcp_keepalive, split_listen_dsn
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +124,41 @@ _MAX_RELAY_LINE_BYTES = 6000
 # service snapshots-and-clears atomically. Populated by enqueue_agent_log (from
 # the agent WS handler) and drained by agent_log_relay_service.
 _agent_log_buffer: dict[tuple[str, str], list[str]] = {}
+
+# --- Dedicated persistent publish connection -------------------------------
+#
+# WHY a dedicated connection (not the pooled engine)
+# --------------------------------------------------
+# Every WS control event AND every 500ms agent_log batch publishes a pg_notify.
+# Previously each one checked out a full pooled ``AsyncSessionLocal`` from the
+# shared 10+15 SQLAlchemy engine, ran ``SELECT pg_notify`` + commit, and
+# returned the connection. Under leader event-loop saturation that pool is the
+# same scarce resource the HTTP request handlers compete for, so the
+# fire-and-forget messaging path directly starved request handling (cluster
+# C12). pg_notify is a tiny, side-effect-only statement that does not need a
+# transactional pooled session at all.
+#
+# Instead we own ONE module-level raw asyncpg connection, opened and supervised
+# by ``publish_service`` (mirroring the LISTEN connector lifecycle), and run
+# every pg_notify on it. The connection is process-wide and reused, so the hot
+# publish path never touches the pool. A module-level asyncio.Lock serialises
+# concurrent publishes onto the single connection (asyncpg connections are not
+# safe for concurrent use). ``publish_service`` keeps the connection healthy
+# with TCP keepalive + a periodic SELECT 1 watchdog and reconnects on failure,
+# exactly like the LISTEN connectors.
+_publish_conn: object | None = None
+_publish_conn_lock: asyncio.Lock = asyncio.Lock()
+# Seconds between SELECT-1 liveness probes on the publish connection.
+_PUBLISH_KEEPALIVE_INTERVAL = 25
+# Bound the SELECT-1 probe so a silently-hung socket is detected, not awaited
+# forever (the keepalive watchdog's whole purpose).
+_PUBLISH_PROBE_TIMEOUT = 10
+# Minimum lifetime a connection must reach before we reset the reconnect-backoff
+# attempt counter. Resetting on EVERY successful connect caused tight reconnect
+# storms after rapid immediate-termination cycles (a connection that dies <1s
+# after connecting would still reset backoff to 1s); gating on longevity makes
+# repeated immediate terminations back off exponentially.
+_CONNECTION_LONGEVITY_RESET_SECONDS = 30
 
 
 def _get_raw_dsn() -> str | None:
@@ -225,22 +259,127 @@ async def publish_project_event(project_id: str, event_type: str, data: dict) ->
 
 
 async def _publish_encoded(encoded: str) -> None:
-    """Emit one already-encoded payload onto the NOTIFY channel and commit.
+    """Emit one already-encoded payload onto the NOTIFY channel.
 
-    The transactional ``pg_notify`` runs on its own short-lived session
-    (independent of any caller transaction); the commit is required for Postgres
-    to actually deliver the NOTIFY. Raises on failure — callers swallow.
+    Uses the dedicated persistent publish connection (see ``publish_service``)
+    rather than a pooled ``AsyncSessionLocal``, so the hot per-event /
+    per-500ms-batch path never competes with HTTP request handlers for the
+    shared SQLAlchemy pool. asyncpg's ``execute`` of ``pg_notify`` is
+    autocommitting (no explicit transaction), so the NOTIFY is delivered as
+    soon as the statement returns. A module-level lock serialises concurrent
+    publishes onto the single (non-reentrant) asyncpg connection. Raises on
+    failure (connection not yet up, or socket error) — callers swallow.
     """
-    # Late import avoids a circular dependency: broadcast -> event_fanout
-    # (publish) and event_fanout (listener) -> broadcast (manager).
-    from app.database import AsyncSessionLocal  # noqa: PLC0415
+    if _publish_conn is None:
+        # publish_service hasn't established the connection yet (or it is
+        # mid-reconnect). Raise so the caller's best-effort guard logs and
+        # degrades to local-only delivery for this event.
+        raise RuntimeError("publish connection not available")
+    async with _publish_conn_lock:
+        conn = _publish_conn
+        if conn is None:
+            raise RuntimeError("publish connection not available")
+        # asyncpg parameter placeholders are positional ($1, $2).
+        await conn.execute("SELECT pg_notify($1, $2)", _NOTIFY_CHANNEL, encoded)
 
-    async with AsyncSessionLocal() as session:
-        await session.execute(
-            text("SELECT pg_notify(:channel, :payload)"),
-            {"channel": _NOTIFY_CHANNEL, "payload": encoded},
+
+async def publish_service() -> None:
+    """Background service: own the dedicated persistent pg_notify connection.
+
+    Opens ONE raw asyncpg connection (never borrowed from the SQLAlchemy pool)
+    used by ``_publish_encoded`` for every control-event and agent_log-batch
+    pg_notify. Mirrors the LISTEN connector lifecycle: TCP keepalive on the
+    socket, a periodic SELECT 1 watchdog (bounded by ``wait_for``) to detect a
+    silently-hung socket, reconnect with bounded exponential backoff, and a
+    longevity-gated backoff reset so rapid immediate terminations back off
+    exponentially instead of storming reconnects.
+
+    No-op sleep loop on non-Postgres / when asyncpg is absent (publishes already
+    no-op via ``publish_project_event``'s ``_IS_POSTGRES`` guard).
+    """
+    global _publish_conn
+
+    dsn = _get_raw_dsn()
+    _ssl_arg = _get_ssl_arg()
+    if not dsn or _asyncpg is None:
+        logger.info(
+            "[EVENT_FANOUT] Non-Postgres dialect or asyncpg absent; publish service inactive"
         )
-        await session.commit()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(365 * 24 * 3600)
+        return
+
+    attempt = 0
+    while True:
+        try:
+            conn = await _asyncpg.connect(dsn, ssl=_ssl_arg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — connector loop must retry on any connect error
+            wait = min(1 * 2**attempt, 60)
+            logger.warning(
+                "[EVENT_FANOUT] Publish connect failed (attempt %d, retry in %ds): %s",
+                attempt,
+                wait,
+                exc,
+            )
+            attempt += 1
+            await asyncio.sleep(wait)
+            continue
+
+        enable_tcp_keepalive(conn)
+        connected_at = asyncio.get_event_loop().time()
+        async with _publish_conn_lock:
+            _publish_conn = conn
+        logger.info("[EVENT_FANOUT] Publish connection established")
+
+        try:
+            # Periodic SELECT-1 watchdog: bounds detection of a silently-hung
+            # socket (TCP keepalive is the kernel-level backstop; this is the
+            # application-level one). A failed/timed-out probe breaks to the
+            # reconnect path.
+            while True:
+                await asyncio.sleep(_PUBLISH_KEEPALIVE_INTERVAL)
+                async with _publish_conn_lock:
+                    probe_conn = _publish_conn
+                    if probe_conn is None:
+                        break
+                    await asyncio.wait_for(
+                        probe_conn.execute("SELECT 1"),
+                        timeout=_PUBLISH_PROBE_TIMEOUT,
+                    )
+                # Reset backoff only once the connection has lived long enough
+                # to be considered stable (gate on longevity, not on the mere
+                # fact of a successful connect).
+                if (
+                    attempt
+                    and asyncio.get_event_loop().time() - connected_at
+                    >= _CONNECTION_LONGEVITY_RESET_SECONDS
+                ):
+                    attempt = 0
+        except asyncio.CancelledError:
+            # Clear the shared ref WITHOUT awaiting the lock: cancellation is
+            # delivered on the single event loop and awaiting the lock here could
+            # itself re-raise before the assignment runs. A bare assignment is
+            # atomic w.r.t. the loop, so concurrent publishers see None safely.
+            if _publish_conn is conn:
+                _publish_conn = None
+            with contextlib.suppress(Exception):
+                await conn.close()
+            raise
+        except Exception as exc:  # noqa: BLE001 — connector loop logs and reconnects on any error
+            logger.warning("[EVENT_FANOUT] Publish connection error: %s", exc)
+        finally:
+            # Same rationale as the cancel path: a bare assignment is atomic on
+            # the event loop, so no lock is needed to retract the dead ref.
+            if _publish_conn is conn:
+                _publish_conn = None
+            with contextlib.suppress(Exception):
+                await conn.close()
+
+        wait = min(1 * 2**attempt, 60)
+        attempt += 1
+        await asyncio.sleep(wait)
 
 
 def enqueue_agent_log(project_id: str, task_id: str, line: str) -> None:
@@ -369,6 +508,51 @@ async def agent_log_relay_service() -> None:
             logger.warning("[EVENT_FANOUT] agent_log relay loop error: %s", exc)
 
 
+# Seconds between SELECT-1 liveness probes on a LISTEN connection while it is
+# blocked waiting for a termination event. Bounds silent-partition detection.
+_LISTEN_KEEPALIVE_INTERVAL = 25
+_LISTEN_PROBE_TIMEOUT = 10
+
+
+async def _wait_terminated_or_dead(
+    conn: object, terminated_event: asyncio.Event, label: str
+) -> None:
+    """Block until the LISTEN connection terminates OR a SELECT-1 probe fails.
+
+    ``terminated_event`` is set by asyncpg's termination listener on a clean
+    server-side close. But a SILENT network partition (NLB idle drop, firewall
+    eviction) delivers no FIN/RST, so the termination callback never fires and
+    a bare ``terminated_event.wait()`` would hang forever, stranding fanout /
+    revocation until process restart. This races the wait against a periodic
+    SELECT-1 probe (bounded by ``wait_for``); a failed/timed-out probe means
+    the socket is dead and we return so the caller reconnects. TCP keepalive
+    (set on the socket at connect) is the kernel-level backstop; this is the
+    application-level one. Returns when either condition is met; propagates
+    CancelledError.
+    """
+    while not terminated_event.is_set():
+        try:
+            await asyncio.wait_for(
+                terminated_event.wait(), timeout=_LISTEN_KEEPALIVE_INTERVAL
+            )
+            return  # terminated_event fired
+        except asyncio.TimeoutError:  # noqa: PERF203 — per-iteration probe is the loop's purpose
+            # Probe interval elapsed without a termination — verify liveness.
+            try:
+                await asyncio.wait_for(
+                    conn.execute("SELECT 1"), timeout=_LISTEN_PROBE_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — any probe failure means the socket is dead
+                logger.warning(
+                    "[%s] Liveness probe failed (silent partition?); reconnecting: %s",
+                    label,
+                    exc,
+                )
+                return
+
+
 async def event_fanout_service() -> None:
     """Background service: LISTEN for cross-instance project control events.
 
@@ -380,8 +564,12 @@ async def event_fanout_service() -> None:
     ``broadcast_to_project``, which would re-publish and loop forever.
 
     Reconnects with bounded exponential backoff (1s -> 60s) using asyncpg's
-    add_termination_listener + asyncio.Event. Mirrors
-    ``jwt_revocation.jwt_revocation_service``.
+    add_termination_listener + asyncio.Event. The raw socket has TCP keepalive
+    enabled and a companion periodic SELECT-1 watchdog bounds detection of a
+    SILENT network partition (where ``terminated_event`` would otherwise never
+    fire). The backoff reset is gated on connection longevity so rapid
+    immediate terminations back off exponentially rather than storming
+    reconnects. Mirrors ``jwt_revocation.jwt_revocation_service``.
     """
     # Late import avoids a circular dependency (broadcast imports this module's
     # publish helper); also lets us read the live module-level manager.
@@ -418,7 +606,8 @@ async def event_fanout_service() -> None:
             await asyncio.sleep(wait)
             continue
 
-        attempt = 0  # reset backoff after successful connect
+        enable_tcp_keepalive(conn)
+        connected_at = asyncio.get_event_loop().time()
         # A fresh Event starts cleared. Do not clear it again after registering
         # the termination listener or an immediate callback can be lost before
         # we enter the wait below.
@@ -477,8 +666,19 @@ async def event_fanout_service() -> None:
                 _NOTIFY_CHANNEL,
             )
 
-            # Block until the server terminates the connection.
-            await terminated_event.wait()
+            # Block until the server terminates the connection OR a liveness
+            # probe detects a silent partition.
+            await _wait_terminated_or_dead(conn, terminated_event, "EVENT_FANOUT")
+            # Reset backoff ONLY if the connection lived long enough to be
+            # considered stable (gate on longevity, not on the mere fact of a
+            # successful connect). Resetting on every connect caused tight
+            # reconnect storms after rapid immediate-termination cycles.
+            if (
+                attempt
+                and asyncio.get_event_loop().time() - connected_at
+                >= _CONNECTION_LONGEVITY_RESET_SECONDS
+            ):
+                attempt = 0
             logger.warning("[EVENT_FANOUT] Connection terminated; will reconnect")
         except asyncio.CancelledError:
             try:

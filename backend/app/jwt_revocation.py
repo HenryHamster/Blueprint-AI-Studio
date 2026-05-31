@@ -18,13 +18,55 @@ except ImportError:  # pragma: no cover — asyncpg absent in standalone test en
 
 from sqlalchemy import text
 
-from app.database import split_listen_dsn
+from app.database import enable_tcp_keepalive, split_listen_dsn
 
 logger = logging.getLogger(__name__)
 
 _NOTIFY_CHANNEL = "task_terminated"
 # True when the process is connected to Postgres; controls no-op guards.
 _IS_POSTGRES = "postgresql" in (os.getenv("DATABASE_URL") or "")
+
+# Seconds between SELECT-1 liveness probes while the LISTEN connection blocks
+# waiting for a termination event. Bounds silent-network-partition detection
+# (TCP keepalive is the kernel-level backstop; this is the application-level
+# one). The backoff reset is gated on this longevity threshold so rapid
+# immediate terminations back off exponentially rather than storming reconnects.
+_LISTEN_KEEPALIVE_INTERVAL = 25
+_LISTEN_PROBE_TIMEOUT = 10
+_CONNECTION_LONGEVITY_RESET_SECONDS = 30
+
+
+async def _wait_terminated_or_dead(conn: object, terminated_event: asyncio.Event) -> None:
+    """Block until the connection terminates OR a SELECT-1 probe fails.
+
+    ``terminated_event`` is set by asyncpg's termination listener on a clean
+    server-side close. But a SILENT network partition delivers no FIN/RST, so
+    the termination callback never fires and a bare ``terminated_event.wait()``
+    would hang forever, stranding cross-instance revocation until process
+    restart. This races the wait against a periodic SELECT-1 probe (bounded by
+    ``wait_for``); a failed/timed-out probe means the socket is dead and we
+    return so the caller reconnects. Propagates CancelledError.
+    """
+    while not terminated_event.is_set():
+        try:
+            await asyncio.wait_for(
+                terminated_event.wait(), timeout=_LISTEN_KEEPALIVE_INTERVAL
+            )
+            return
+        except asyncio.TimeoutError:  # noqa: PERF203 — per-iteration probe is the loop's purpose
+            try:
+                await asyncio.wait_for(
+                    conn.execute("SELECT 1"), timeout=_LISTEN_PROBE_TIMEOUT
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — any probe failure means the socket is dead
+                logger.warning(
+                    "[JWT_REVOCATION] Liveness probe failed (silent partition?); "
+                    "reconnecting: %s",
+                    exc,
+                )
+                return
 
 
 def _get_raw_dsn() -> str | None:
@@ -131,7 +173,8 @@ async def jwt_revocation_service() -> None:
             await asyncio.sleep(wait)
             continue
 
-        attempt = 0  # reset backoff after successful connect
+        enable_tcp_keepalive(conn)
+        connected_at = asyncio.get_event_loop().time()
         # A fresh Event starts cleared. Do not clear it again after registering
         # the termination listener or an immediate callback can be lost before
         # we enter the wait below.
@@ -157,8 +200,19 @@ async def jwt_revocation_service() -> None:
                 _NOTIFY_CHANNEL,
             )
 
-            # Block until the server terminates the connection.
-            await terminated_event.wait()
+            # Block until the server terminates the connection OR a liveness
+            # probe detects a silent partition.
+            await _wait_terminated_or_dead(conn, terminated_event)
+            # Reset backoff ONLY if the connection lived long enough to be
+            # considered stable (gate on longevity, not on the mere fact of a
+            # successful connect) — otherwise rapid immediate terminations would
+            # storm reconnects at the floor backoff.
+            if (
+                attempt
+                and asyncio.get_event_loop().time() - connected_at
+                >= _CONNECTION_LONGEVITY_RESET_SECONDS
+            ):
+                attempt = 0
             logger.warning("[JWT_REVOCATION] Connection terminated; will reconnect")
         except asyncio.CancelledError:
             try:

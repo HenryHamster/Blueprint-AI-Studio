@@ -345,18 +345,29 @@ async def lifespan(app):
         )
         # Per-instance services still run on non-leader instances.
         from app.jwt_revocation import jwt_revocation_service
-        from app.event_fanout import agent_log_relay_service, event_fanout_service
+        from app.event_fanout import (
+            agent_log_relay_service,
+            event_fanout_service,
+            publish_service,
+        )
+        from app.notification_dispatch import notification_retry_drain_service
 
         config_sync_task = asyncio.create_task(runtime_config_sync_service())
         jwt_revocation_task_nl = asyncio.create_task(jwt_revocation_service())
         event_fanout_task_nl = asyncio.create_task(event_fanout_service())
         agent_log_relay_task_nl = asyncio.create_task(agent_log_relay_service())
+        publish_task_nl = asyncio.create_task(publish_service())
+        notification_retry_task_nl = asyncio.create_task(
+            notification_retry_drain_service()
+        )
         from app.shared_state import background_tasks as _bg_tasks_nl
 
         _bg_tasks_nl["config_sync"] = config_sync_task
         _bg_tasks_nl["jwt_revocation"] = jwt_revocation_task_nl
         _bg_tasks_nl["event_fanout"] = event_fanout_task_nl
         _bg_tasks_nl["agent_log_relay"] = agent_log_relay_task_nl
+        _bg_tasks_nl["publish"] = publish_task_nl
+        _bg_tasks_nl["notification_retry_drain"] = notification_retry_task_nl
 
         # Minimal watchdog: restart per-instance services if they crash, AND
         # periodically probe the leader advisory lock so we can take over
@@ -419,6 +430,29 @@ async def lifespan(app):
                         _bg_tasks_nl["agent_log_relay"] = asyncio.create_task(
                             agent_log_relay_service()
                         )
+                    if publish_task_nl.done():
+                        exc = (
+                            publish_task_nl.exception()
+                            if not publish_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] publish DIED on non-leader (exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["publish"] = asyncio.create_task(publish_service())
+                    if notification_retry_task_nl.done():
+                        exc = (
+                            notification_retry_task_nl.exception()
+                            if not notification_retry_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] notification_retry_drain DIED on non-leader "
+                            f"(exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["notification_retry_drain"] = asyncio.create_task(
+                            notification_retry_drain_service()
+                        )
 
                     # Leader-lock probe. Try to acquire on a fresh session;
                     # if we win, the previous leader's session has closed and
@@ -479,6 +513,8 @@ async def lifespan(app):
         jwt_revocation_task_nl.cancel()
         event_fanout_task_nl.cancel()
         agent_log_relay_task_nl.cancel()
+        publish_task_nl.cancel()
+        notification_retry_task_nl.cancel()
         try:
             await asyncio.wait_for(
                 asyncio.gather(
@@ -487,6 +523,8 @@ async def lifespan(app):
                     jwt_revocation_task_nl,
                     event_fanout_task_nl,
                     agent_log_relay_task_nl,
+                    publish_task_nl,
+                    notification_retry_task_nl,
                     return_exceptions=True,
                 ),
                 timeout=10.0,
@@ -737,7 +775,11 @@ async def lifespan(app):
     # broadcast on a sibling Cloud Run instance is re-delivered to THIS
     # instance's locally-connected WebSocket clients (board updates, alerts,
     # deploy-state changes, desktop notifications).
-    from app.event_fanout import agent_log_relay_service, event_fanout_service
+    from app.event_fanout import (
+        agent_log_relay_service,
+        event_fanout_service,
+        publish_service,
+    )
 
     event_fanout_task = asyncio.create_task(event_fanout_service())
 
@@ -747,6 +789,19 @@ async def lifespan(app):
     # clients (the high-volume agent_log path the discrete control-event fanout
     # deliberately excludes).
     agent_log_relay_task = asyncio.create_task(agent_log_relay_service())
+
+    # Per-instance dedicated pg_notify publish connection — owns ONE persistent
+    # raw asyncpg connection used by every control-event / agent_log-batch
+    # pg_notify, so the hot messaging path never checks out a pooled SQLAlchemy
+    # session and never competes with HTTP request handlers for the pool.
+    publish_task = asyncio.create_task(publish_service())
+
+    # Per-instance webhook retry drainer — flushes the external-notification
+    # retry queue on its own ~30s schedule so due retries are no longer
+    # stranded during quiet periods (the queue is per-instance in memory).
+    from app.notification_dispatch import notification_retry_drain_service
+
+    notification_retry_task = asyncio.create_task(notification_retry_drain_service())
 
     # Refresh per-account model-availability caches every 30 min so a
     # provider-side preview-access change doesn't sit in dispatch rotation
@@ -773,6 +828,8 @@ async def lifespan(app):
     _bg_tasks["jwt_revocation"] = jwt_revocation_task
     _bg_tasks["event_fanout"] = event_fanout_task
     _bg_tasks["agent_log_relay"] = agent_log_relay_task
+    _bg_tasks["publish"] = publish_task
+    _bg_tasks["notification_retry_drain"] = notification_retry_task
     _bg_tasks["availability_refresh"] = availability_refresh_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
@@ -805,6 +862,8 @@ async def lifespan(app):
             "jwt_revocation": jwt_revocation_service,
             "event_fanout": event_fanout_service,
             "agent_log_relay": agent_log_relay_service,
+            "publish": publish_service,
+            "notification_retry_drain": notification_retry_drain_service,
             "availability_refresh": account_availability_refresh_service,
         }
         while True:
@@ -1061,6 +1120,8 @@ async def lifespan(app):
         jwt_revocation_task,
         event_fanout_task,
         agent_log_relay_task,
+        publish_task,
+        notification_retry_task,
         monitor_task,
     ]
     for t in tasks_to_cancel:
