@@ -2012,3 +2012,154 @@ async def test_ci_backstop_does_not_clobber_concurrently_resolved_row(eval_db, m
             f"Lost-update: backstop clobbered the CI-loop's COMPLETED resolution "
             f"with {final.status} (msg={final.latest_status_message!r})"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# C6 rework (A): the _pr_state_check_pending CONSUMER is not one-shot
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_pr_state_check_consumer_respawn_failure_persists_marker(
+    eval_db, mocker
+):
+    """C6 rework seam (A): the services ``_check_evaluating_timeouts`` consumer
+    that recovers ``_pr_state_check_pending`` must itself NOT be one-shot.
+
+    Scenario the classifier targets — a SUSTAINED transient outage:
+      * pass 1: the PRODUCER (agent_status / reaper) keeps the marker set
+        because its own review spawn failed.
+      * pass 2: this consumer re-checks the PR (still open) and re-spawns the
+        review — but the spawn ALSO fails (the outage hasn't cleared).
+
+    Pre-rework the consumer popped the marker up front (services.py ~1081) and
+    committed ``_ctx2`` UNCONDITIONALLY, so the failed re-spawn DROPPED the
+    marker → the childless EVALUATING parent was abandoned to the 6h/48h
+    backstop (the reviewer verified ``marker_present:None`` after the 2nd
+    failed spawn). The fix re-stages the marker on spawn failure so the
+    consumer self-retries on the next sweep.
+
+    Would FAIL pre-rework: ``_pr_state_check_pending`` would be absent after the
+    failed re-spawn.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+
+    # _bounded wraps GH calls in asyncio.wait_for, which detaches the coroutine
+    # into a new task — under the in-memory SQLite test session that loses the
+    # greenlet context and raises MissingGreenlet on any DB IO (a harness-only
+    # artifact; the production async engine is unaffected). Pass through so the
+    # consumer's GH-lookup + spawn path is exercised on this loop.
+    async def _passthrough_bounded(coro, *_a, **_k):
+        return await coro
+
+    mocker.patch("app.services._bounded", side_effect=_passthrough_bounded)
+    # PR is still OPEN — the consumer takes the re-spawn branch.
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    # The re-spawn FAILS (outage not cleared).
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(side_effect=RuntimeError("review spawn still failing")),
+    )
+
+    project = Project(name="PR-state consumer retry", user_id="user-consumer-retry")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.EVALUATING,
+        # Producer left the recovery marker set on its own failed spawn.
+        context={
+            "_pr_state_check_pending": True,
+            "review_loop": {"pr_number": 9090, "original_task_id": "x"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    spawn_mock.assert_awaited()
+    # Parent stays EVALUATING (recoverable), NOT abandoned.
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"consumer must leave the parent EVALUATING on re-spawn failure, got "
+        f"{parent.status}"
+    )
+    # The marker MUST persist so the NEXT sweep retries — this is the whole
+    # point of the rework. Pre-fix it would have been dropped.
+    assert (parent.context or {}).get("_pr_state_check_pending") is True, (
+        "consumer must re-stage _pr_state_check_pending on re-spawn failure so "
+        "it self-retries next sweep; otherwise the childless EVALUATING parent "
+        "is abandoned to the 6h/48h backstop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr_state_check_consumer_respawn_success_clears_marker(
+    eval_db, mocker
+):
+    """C6 rework guard (A): on a CONFIRMED re-spawn success the consumer must
+    clear ``_pr_state_check_pending`` — a childed EVALUATING parent is a
+    normally parked parent, and a leftover marker would make the next sweep
+    spawn a SECOND review."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+
+    async def _passthrough_bounded(coro, *_a, **_k):
+        return await coro
+
+    mocker.patch("app.services._bounded", side_effect=_passthrough_bounded)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, True)),
+    )
+
+    project = Project(name="PR-state consumer ok", user_id="user-consumer-ok")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_pr_state_check_pending": True,
+            "review_loop": {"pr_number": 9091, "original_task_id": "x"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    spawn_mock.assert_awaited_once()
+    assert not (parent.context or {}).get("_pr_state_check_pending"), (
+        "consumer must clear the marker on confirmed re-spawn success"
+    )

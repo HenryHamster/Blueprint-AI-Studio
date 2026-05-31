@@ -1757,6 +1757,145 @@ async def test_pipeline_exhaustion_skips_non_remediation_tasks(
 
 
 @pytest.mark.asyncio
+async def test_propagate_failure_death_before_rollup_nudge_leaves_recovery_marker(
+    db_session: AsyncSession,
+):
+    """C6 rework seam (B): ``_propagate_pipeline_failure_to_original`` commits the
+    terminal ``orig.status=CANCELLED`` BEFORE nudging the rollup
+    (``_check_and_trigger_rollup``). A death between that terminal commit and the
+    nudge would otherwise DROP the rollup trigger and strand the rollup parent in
+    EVALUATING forever (reaper Step 3 only nudges on a COMPLETED child).
+
+    The fix write-aheads a ``_rollup_nudge_pending`` marker on ``orig`` BEFORE the
+    terminal commit and clears it ONLY after the nudge succeeds, so a mid-flight
+    death leaves a recoverable trail the reaper Step-3 sweep picks up.
+
+    Here we simulate the death by making ``_check_and_trigger_rollup`` RAISE
+    (the marker + CANCELLED status are already committed; the nudge never
+    completes). Would FAIL pre-rework: no marker existed at all, so the dropped
+    nudge was unrecoverable.
+    """
+    from app.routers.agent_status import _propagate_pipeline_failure_to_original
+
+    project = await _create_project(db_session)
+    await db_session.flush()
+
+    rollup_parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(rollup_parent)
+    await db_session.flush()
+
+    original = Task(
+        project_id=project.id,
+        parent_task_id=rollup_parent.id,
+        payloads=[{"type": "create", "prompt": "regular work"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original)
+    await db_session.flush()
+
+    review = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7777,
+                "branch": "blueprint/task-y",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 7777}
+        },
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(review)
+    await db_session.flush()
+
+    with patch(
+        "app.routers.agent_status._check_and_trigger_rollup",
+        new=AsyncMock(side_effect=RuntimeError("died before/during rollup nudge")),
+    ):
+        # The function swallows its own exceptions (logs + rollback), so this
+        # returns normally even though the nudge "died".
+        await _propagate_pipeline_failure_to_original(review, db_session)
+
+    await db_session.refresh(original)
+    # Terminal status landed (it was committed before the nudge).
+    assert original.status == TaskStatus.CANCELLED
+    # The write-ahead recovery marker MUST survive the dropped nudge so the
+    # reaper Step-3 sweep can re-run the rollup trigger.
+    assert (original.context or {}).get("_rollup_nudge_pending") is True, (
+        "a death between the terminal commit and the rollup nudge must leave "
+        "_rollup_nudge_pending set so the rollup parent stays recoverable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_propagate_failure_clears_marker_on_successful_nudge(
+    db_session: AsyncSession,
+):
+    """C6 rework guard (B): on a SUCCESSFUL rollup nudge the recovery marker is
+    cleared — otherwise the reaper sweep would keep finding a stale marker."""
+    from app.routers.agent_status import _propagate_pipeline_failure_to_original
+
+    project = await _create_project(db_session)
+    await db_session.flush()
+
+    rollup_parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "rollup parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(rollup_parent)
+    await db_session.flush()
+
+    original = Task(
+        project_id=project.id,
+        parent_task_id=rollup_parent.id,
+        payloads=[{"type": "create", "prompt": "regular work"}],
+        context={},
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original)
+    await db_session.flush()
+
+    review = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 7778,
+                "branch": "blueprint/task-z",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "review_loop": {"original_task_id": str(original.id), "pr_number": 7778}
+        },
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(review)
+    await db_session.flush()
+
+    with patch(
+        "app.routers.agent_status._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+    ):
+        await _propagate_pipeline_failure_to_original(review, db_session)
+
+    await db_session.refresh(original)
+    assert original.status == TaskStatus.CANCELLED
+    assert not (original.context or {}).get("_rollup_nudge_pending"), (
+        "the marker must be cleared after a successful rollup nudge"
+    )
+
+
+@pytest.mark.asyncio
 async def test_find_matching_prior_investigation_matches_on_file_path(
     db_session: AsyncSession,
 ):

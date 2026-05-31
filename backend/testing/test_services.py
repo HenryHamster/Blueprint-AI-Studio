@@ -1876,6 +1876,283 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# C6: _sweep_post_commit_pending — transient failures must NOT burn the cap
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _make_pending_task(project_id, *, task_id, attempts, total_attempts=None):
+    """A COMPLETED task carrying a failure-set post_commit_pending marker."""
+    meta = {
+        "at": _naive_utcnow().isoformat(),
+        "reason": "post_commit_error",
+        "payload": {
+            "task_id": str(task_id),
+            "status": "COMPLETED",
+            "logs": "{}",
+        },
+        "attempts": attempts,
+    }
+    if total_attempts is not None:
+        meta["total_attempts"] = total_attempts
+    return Task(
+        id=task_id,
+        project_id=project_id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={"_post_commit_pending_meta": meta},
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_transient_failure_does_not_bump_attempts(
+    svc_db, mocker
+):
+    """C6 seam: a TRANSIENT post-commit retry failure (GitHub rate-limit / quota
+    outage, row contention) must NOT count against the 5-attempt cap. Pre-fix the
+    except handler bumped the attempt counter for ANY exception, so a sustained
+    transient outage burned the whole budget and the sweep abandoned a task
+    (post_commit_failed) that would have recovered once the outage cleared —
+    silently dropping the deferred review/fix spawn and rollup nudge.
+
+    Would FAIL pre-fix: attempts would advance 1 → 2 on the transient raise."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = _make_pending_task(project.id, task_id=task_id, attempts=1)
+    svc_db.add(task)
+    await svc_db.commit()
+
+    async def transient_fail(task_id, _payload):
+        # Mirrors a GitHub secondary-rate-limit surfacing from a post-commit
+        # GitHub call (review-spawn / rollup gate).
+        raise RuntimeError("You have exceeded a secondary rate limit (429)")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=transient_fail
+    )
+
+    await _sweep_post_commit_pending()
+
+    await svc_db.refresh(task)
+    attempts = (
+        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    )
+    assert attempts == 1, (
+        f"transient failure must NOT increment the attempt cap; got {attempts}"
+    )
+    assert task.post_commit_pending is True, "marker must persist for the next sweep"
+    assert not (task.context or {}).get("post_commit_abandoned"), (
+        "task must not be abandoned on a transient failure"
+    )
+    assert task.post_commit_failed is not True, (
+        "task must not be marked post_commit_failed on a transient failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_postcommitlocked_does_not_bump_attempts(
+    svc_db, mocker
+):
+    """C6 seam: PostCommitLocked (row still held by a peer) is pure contention —
+    retrying next sweep is correct, so it must not count toward the cap either.
+
+    Would FAIL pre-fix: the typed exception was caught by the bare `except
+    Exception` and bumped attempts like any persistent error."""
+    import uuid as _uuid
+    from app.task_lifecycle import PostCommitLocked
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = _make_pending_task(project.id, task_id=task_id, attempts=3)
+    svc_db.add(task)
+    await svc_db.commit()
+
+    async def locked(task_id, _payload):
+        raise PostCommitLocked(f"task {task_id} row held by peer after 3 retries")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=locked
+    )
+
+    await _sweep_post_commit_pending()
+
+    await svc_db.refresh(task)
+    attempts = (
+        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    )
+    assert attempts == 3, (
+        f"PostCommitLocked must NOT increment the attempt cap; got {attempts}"
+    )
+    assert task.post_commit_pending is True
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_persistent_failure_still_bumps_attempts(
+    svc_db, mocker
+):
+    """C6 guard: the cap still works for PERSISTENT failures (a genuine defect
+    that recurs every retry, e.g. a bug in a completion handler). The transient
+    carve-out must not weaken the give-up bound for non-transient errors."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = _make_pending_task(project.id, task_id=task_id, attempts=1)
+    svc_db.add(task)
+    await svc_db.commit()
+
+    async def persistent_fail(task_id, _payload):
+        raise ValueError("malformed completion payload — handler keeps crashing")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=persistent_fail
+    )
+
+    await _sweep_post_commit_pending()
+
+    await svc_db.refresh(task)
+    attempts = (
+        (task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
+    )
+    assert attempts == 2, (
+        f"persistent failure must still advance the attempt cap; got {attempts}"
+    )
+
+
+def test_post_commit_retry_is_transient_classifier():
+    """Unit coverage for the transient/persistent classifier the sweep uses."""
+    from app.services import _post_commit_retry_is_transient
+    from app.task_lifecycle import PostCommitLocked
+
+    # Transient
+    assert _post_commit_retry_is_transient(PostCommitLocked("held by peer"))
+    assert _post_commit_retry_is_transient(
+        RuntimeError("You have exceeded a secondary rate limit")
+    )
+    assert _post_commit_retry_is_transient(RuntimeError("HTTP 429 Too Many Requests"))
+    assert _post_commit_retry_is_transient(
+        RuntimeError("canceling statement due to lock_timeout")
+    )
+    # Persistent
+    assert not _post_commit_retry_is_transient(ValueError("bad payload"))
+    assert not _post_commit_retry_is_transient(KeyError("missing field"))
+    import asyncio as _asyncio
+
+    assert not _post_commit_retry_is_transient(_asyncio.TimeoutError())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# C6 rework (C): hard outer bound — transient-misclassification cannot loop forever
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_transient_failure_advances_total_attempts(
+    svc_db, mocker
+):
+    """C6 rework seam (C): a transient failure does NOT bump the 5-attempt cap,
+    but it MUST advance the hard ``total_attempts`` outer bound — otherwise a
+    PERSISTENT failure whose error string merely CONTAINS a transient substring
+    ("429"/"quota"/"lock_timeout") re-runs every sweep forever and the marker
+    never clears.
+
+    Would FAIL pre-rework: the transient branch was a bare ``continue`` that
+    wrote nothing, so ``total_attempts`` never existed and there was no outer
+    bound at all."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = _make_pending_task(project.id, task_id=task_id, attempts=1)
+    svc_db.add(task)
+    await svc_db.commit()
+
+    async def transient_fail(task_id, _payload):
+        raise RuntimeError("You have exceeded a secondary rate limit (429)")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit", side_effect=transient_fail
+    )
+
+    await _sweep_post_commit_pending()
+
+    await svc_db.refresh(task)
+    meta = (task.context or {}).get("_post_commit_pending_meta", {})
+    # 5-attempt cap untouched (transient carve-out preserved)...
+    assert meta.get("attempts") == 1, (
+        f"transient failure must NOT bump the 5-attempt cap; got {meta.get('attempts')}"
+    )
+    # ...but the hard outer bound advanced (seeded from attempts=1, now 2).
+    assert meta.get("total_attempts") == 2, (
+        f"transient failure must advance total_attempts so it can't loop "
+        f"forever; got {meta.get('total_attempts')}"
+    )
+    assert task.post_commit_pending is True
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_persistent_with_transient_string_eventually_gives_up(
+    svc_db, mocker
+):
+    """C6 rework seam (C): the unbounded-retry tail. A PERSISTENT failure whose
+    error string LOOKS transient ("429") is forever classified transient and
+    never bumps the 5-attempt cap — pre-rework it re-ran every 60s sweep forever
+    and ``post_commit_pending`` never cleared. The hard ``total_attempts`` ceiling
+    (MAX_TOTAL_ATTEMPTS) is the backstop: once total_attempts reaches it the
+    sweep terminalizes (marker clears + post_commit_failed) regardless of the
+    transient-looking string.
+
+    Seeded right at the ceiling so the very next sweep gives up.
+    Would FAIL pre-rework: no ceiling existed; the task would re-run forever."""
+    import uuid as _uuid
+    from app.services import MAX_TOTAL_ATTEMPTS
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    # attempts well under the 5-cap (so the cap can NEVER fire — proving the
+    # hard bound is what gives up), total_attempts at the ceiling.
+    task = _make_pending_task(
+        project.id,
+        task_id=task_id,
+        attempts=1,
+        total_attempts=MAX_TOTAL_ATTEMPTS,
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    async def persistent_but_transient_looking(task_id, _payload):
+        # A genuine persistent defect that happens to mention 429 in its text —
+        # the misclassification the ceiling must contain.
+        raise RuntimeError("handler crash: downstream returned 429 every time")
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        side_effect=persistent_but_transient_looking,
+    )
+
+    await _sweep_post_commit_pending()
+
+    await svc_db.refresh(task)
+    # Terminalized: marker cleared and the task marked failed — NOT looping.
+    assert task.post_commit_pending is False, (
+        "the hard total_attempts ceiling must terminalize a persistently-failing "
+        "task even when its error string looks transient"
+    )
+    assert task.post_commit_failed is True, (
+        "task must be marked post_commit_failed after exhausting the hard bound"
+    )
+    assert (task.context or {}).get("_post_commit_abandoned"), (
+        "abandonment must be recorded in context"
+    )
+    assert "_post_commit_pending_meta" not in (task.context or {}), (
+        "the retry meta must be cleared so the task stops re-appearing in sweeps"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # stale_branch_prefixes (project-driven branch cleanup)
 # stale_branch_prefixes (project-driven branch cleanup)
 # ══════════════════════════════════════════════════════════════════════════════

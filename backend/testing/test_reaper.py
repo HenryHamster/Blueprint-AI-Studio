@@ -1903,6 +1903,72 @@ async def test_step3_evaluating_parent_without_completed_child_skipped(
     assert rollup_mock.await_count == 0
 
 
+@pytest.mark.asyncio
+async def test_step3_cancelled_child_with_rollup_nudge_marker_triggers_rollup(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """C6 rework seam (B): a stale EVALUATING parent whose only un-rolled child is
+    a CANCELLED one carrying ``_rollup_nudge_pending`` MUST still trigger the
+    rollup nudge in Step 3.
+
+    ``_propagate_pipeline_failure_to_original`` sets that marker on a child it is
+    CANCELLING just before nudging the rollup; if it dies between the terminal
+    commit and the nudge, the parent has NO COMPLETED child for the normal Step-3
+    path to find. Without the marker-aware selection the parent would sit
+    EVALUATING until the backstop.
+
+    Contrast with ``test_step3_evaluating_parent_without_completed_child_skipped``
+    (a FAILED child with NO marker correctly does NOT trigger rollup) — the
+    discriminator here is the recovery marker.
+
+    Would FAIL pre-rework: Step 3 only selected COMPLETED children, so the
+    CANCELLED+marker child would be ignored and rollup never re-triggered.
+    """
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    # Stub Step 4 so an all-terminal-no-completed parent isn't requeued out from
+    # under the assertion (keeps the test focused on Step 3's marker selection).
+    mocker.patch("app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.CANCELLED,
+        context={"_rollup_nudge_pending": True},
+    )
+    reaper_db.add(child)
+    await reaper_db.commit()
+    await reaper_db.refresh(child)
+
+    await _run_reaper_once()
+
+    assert rollup_mock.await_count >= 1, (
+        "Step 3 must re-trigger rollup for a CANCELLED child carrying "
+        "_rollup_nudge_pending (dropped-nudge recovery)"
+    )
+    called_child = rollup_mock.await_args_list[0].args[0]
+    assert called_child.id == child.id
+    # Nudge succeeded (mock) — the marker is cleared so the next sweep doesn't
+    # keep re-finding it.
+    await reaper_db.refresh(child)
+    assert not (child.context or {}).get("_rollup_nudge_pending"), (
+        "the recovery marker must be cleared after a successful nudge"
+    )
+
+
 # ── Step 4: Rescue all-children-failed EVALUATING parents ────────────────
 
 
@@ -3893,6 +3959,65 @@ async def test_reap_with_open_pr_goes_to_evaluating(
     assert t.vm_instance_id is None
     assert "#1234" in (t.latest_status_message or "")
     assert "handed off to review pipeline" in (t.latest_status_message or "")
+    # C6: on confirmed spawn success the write-ahead recovery marker is dropped.
+    assert not (t.context or {}).get("_pr_state_check_pending"), (
+        "marker must be cleared once the review spawn is confirmed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reap_with_open_pr_spawn_failure_keeps_recovery_marker(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """C6 seam: when the reaper's open-PR handoff review spawn FAILS, the parent
+    must stay EVALUATING AND carry `_pr_state_check_pending=True` so the services
+    `_check_evaluating_timeouts` consumer re-checks the PR and re-spawns review.
+
+    Pre-fix the reaper flipped the parent to EVALUATING and spawned best-effort
+    with NO recovery marker — a spawn failure left a childless EVALUATING parent
+    invisible to reaper Step 3 (needs a COMPLETED child) and Step 4 (skips
+    childless parents), stranded until the 6h/48h backstop.
+    Would FAIL pre-fix: `_pr_state_check_pending` would be absent.
+    """
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("spawn boom"),
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-with-pr-spawnfail",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/5678",
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING, (
+        f"Expected EVALUATING after reaper spawn failure, got {t.status}"
+    )
+    assert (t.context or {}).get("_pr_state_check_pending") is True, (
+        "reaper spawn failure must leave _pr_state_check_pending set so the "
+        "evaluating-sweep consumer can recover the childless parent"
+    )
 
 
 @pytest.mark.asyncio

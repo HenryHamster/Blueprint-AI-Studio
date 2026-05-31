@@ -53,6 +53,15 @@ _GH_CALL_TIMEOUT_S = 30.0
 # bound so a wedged inline pass (e.g. a GitHub call that never returns) can't
 # pin the post-commit sweep indefinitely. Set just above the inner budget.
 _POST_COMMIT_CALL_TIMEOUT_S = 260.0
+# C6 rework (C): hard outer bound on post-commit sweep retries. The 5-attempt
+# cap (MAX_ATTEMPTS, local to _sweep_post_commit_pending) only counts PERSISTENT
+# failures, so a persistent failure whose error string merely CONTAINS a
+# transient substring ("429"/"quota"/"lock_timeout") is forever classified
+# transient and would re-run every sweep forever. ``total_attempts`` increments
+# on EVERY retry and terminalizes past this ceiling. Module-level so tests can
+# assert against the exact bound. Far above MAX_ATTEMPTS so a genuine multi-hour
+# transient outage still gets ~20 minutes of 60s sweeps to recover.
+MAX_TOTAL_ATTEMPTS = 20
 
 
 async def _bounded(coro, timeout_s: float, *, what: str):
@@ -288,7 +297,7 @@ async def secret_reconciliation_service():
 # analytics token helper, the models default-protected-branches constant) and
 # test patch targets that pre-date the split keep resolving — the same
 # re-export pattern ``github.py`` adopted after its own split.
-from app.branch_cleanup import (  # noqa: E402,F401
+from app.branch_cleanup import (  # noqa: F401
     _DEFAULT_PROTECTED_BRANCHES,
     _MAX_DELETES_PER_PROJECT,
     _MAX_DELETES_TOTAL,
@@ -978,6 +987,13 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                 Task.attempt_count,
                                 Task.account_id,
                                 Task.vm_instance_id,
+                                # C6 rework (A): the _pr_state_check_pending
+                                # consumer's review re-spawn falls back to
+                                # ``task.description`` for the prompt when the
+                                # payload has none. Without it loaded here that
+                                # read fires a sync lazy-load → MissingGreenlet
+                                # under the async session ([[load_only_lazy_load_trap]]).
+                                Task.description,
                             )
                         )
                         .where(
@@ -1153,9 +1169,24 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                 base_branch = (task.first_payload or {}).get(
                                     "base_branch"
                                 ) or _shared_state.get_project_integration_branch(_proj)
+                                # C6 rework (A): resolve the prompt from the
+                                # payload first, and only fall back to
+                                # ``task.description`` if it is absent. The old
+                                # ``.get("prompt", task.description or "")`` form
+                                # evaluated the default EAGERLY, touching
+                                # ``task.description`` on every call — but the
+                                # EVALUATING candidate query loads this row with
+                                # ``load_only`` and does NOT include
+                                # ``description``, so the read fired a sync
+                                # lazy-load that raises MissingGreenlet under the
+                                # async session (see [[load_only_lazy_load_trap]]),
+                                # pushing every recovery into the spawn-failure
+                                # branch in production. Read the payload key
+                                # explicitly so the deferred column is only
+                                # touched when actually needed.
                                 original_prompt = (task.first_payload or {}).get(
-                                    "prompt", task.description or ""
-                                )
+                                    "prompt"
+                                ) or (task.description or "")
                                 await _spawn_pipeline_task(
                                     task,
                                     "review",
@@ -1171,10 +1202,26 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                 logger.warning(
                                     f"[EVAL TIMEOUT pr_check] Review spawn failed for "
                                     f"task {str(task.id)[:8]}: {type(spawn_exc).__name__}: "
-                                    f"{spawn_exc}",
+                                    f"{spawn_exc} — re-staging _pr_state_check_pending "
+                                    f"so this consumer self-retries next sweep",
                                     exc_info=True,
                                 )
                                 task.latest_status_message = "Recovered _pr_state_check_pending: review spawn failed, will retry"
+                                # C6 rework (A): this consumer is NOT one-shot. The
+                                # marker was popped from _ctx2 up front (line ~1081)
+                                # and _ctx2 is committed UNCONDITIONALLY below, so a
+                                # failed re-spawn would otherwise DROP the marker and
+                                # abandon the childless EVALUATING parent to the
+                                # 6h/48h backstop — exactly the sustained-transient-
+                                # outage scenario the classifier targets (producer
+                                # keeps the marker on pass 1; consumer pass-2 spawn
+                                # fails). Re-add it so the consumer re-checks the PR
+                                # and re-spawns on the next sweep. Mirrors the
+                                # producer-side discipline in agent_status.py /
+                                # reaper.py: clear ONLY on confirmed spawn SUCCESS
+                                # (the try path above, which falls through to the
+                                # commit without re-adding the marker).
+                                _ctx2["_pr_state_check_pending"] = True
 
                         task.context = _ctx2
                         flag_modified(task, "context")
@@ -1884,6 +1931,57 @@ async def _check_evaluating_timeouts(progress_cb=None):
         )
 
 
+# Substrings that mark a post-commit retry failure as TRANSIENT (the
+# underlying cause is expected to clear on its own) rather than persistent.
+# Transient failures must NOT count against the sweeper's 5-attempt cap —
+# otherwise a multi-hour GitHub-quota outage or sustained row contention burns
+# the whole budget and the sweep gives up (post_commit_failed) on a task that
+# would have recovered, silently dropping the deferred side effects
+# (review/fix spawn, rollup nudge). The cap exists to bound a genuinely
+# non-transient defect (e.g. a malformed payload, a bug in a completion
+# handler), so only persistent failures should increment it.
+_POST_COMMIT_TRANSIENT_SUBSTRINGS = (
+    "rate limit",
+    "ratelimit",
+    "secondary rate",
+    "rate_limit",
+    "429",
+    "quota",
+    "lock_timeout",
+    "lock not available",
+    "locknotavailable",
+    "could not obtain lock",
+    "held by peer",
+)
+
+
+def _post_commit_retry_is_transient(exc: BaseException) -> bool:
+    """Classify a post-commit retry exception as transient (retriable without
+    counting against the cap) vs persistent (counts toward giving up).
+
+    Transient classes:
+      - ``PostCommitLocked``: the task row is still held by a peer
+        (the inline status pass or a concurrent post-commit). Pure contention —
+        retrying next sweep is correct.
+      - GitHub/LLM rate-limit or quota exhaustion (string-matched): clears once
+        the quota window resets; counting it against the cap would abandon a
+        task during a transient outage.
+      - Row-lock contention (LockNotAvailableError / "lock_timeout"): same as
+        PostCommitLocked but surfaced as a DBAPI error rather than the typed
+        exception.
+
+    NB: ``asyncio.TimeoutError`` (the ``_bounded`` outer ceiling) is treated as
+    PERSISTENT and DOES count — a post-commit pass that wedges past its own 240s
+    budget every time is the non-transient case the cap is meant to bound.
+    """
+    from app.task_lifecycle import PostCommitLocked
+
+    if isinstance(exc, PostCommitLocked):
+        return True
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return any(s in msg for s in _POST_COMMIT_TRANSIENT_SUBSTRINGS)
+
+
 async def _sweep_post_commit_pending():
     """Re-run _process_post_commit for terminal tasks whose prior attempt died.
 
@@ -1919,6 +2017,15 @@ async def _sweep_post_commit_pending():
     from app.schemas import AgentStatusPayload
 
     MAX_ATTEMPTS = 5
+    # C6 rework (C): the HARD outer bound (module-level MAX_TOTAL_ATTEMPTS) that
+    # transient-misclassification cannot escape. The 5-attempt cap above is
+    # incremented ONLY for PERSISTENT failures, so a genuinely persistent failure
+    # whose error string merely CONTAINS a transient substring ("429" / "quota" /
+    # "lock_timeout") is forever classified transient, never increments
+    # ``attempts``, and re-runs every 60s sweep with the marker never clearing.
+    # ``total_attempts`` increments on EVERY retry (transient OR persistent) and
+    # terminalizes past MAX_TOTAL_ATTEMPTS. No schema change: counter lives in
+    # the existing ``_post_commit_pending_meta`` JSON.
     # A write-ahead "inline_running" marker younger than this may still be a
     # live _process_post_commit pass (240s budget, 300s Cloud Run ceiling) —
     # retrying it would double-process. Past this age a still-"inline_running"
@@ -2080,19 +2187,43 @@ async def _sweep_post_commit_pending():
                         continue
 
                 attempts = int(pending_meta.get("attempts", 0) or 0)
+                # C6 rework (C): the hard outer bound. Counts EVERY retry,
+                # transient or not, so transient-misclassification can't escape
+                # it. Back-compatible default: pre-rework markers have no
+                # ``total_attempts`` — seed it from ``attempts`` so an already-
+                # in-flight task isn't reset to 0.
+                total_attempts = int(
+                    pending_meta.get("total_attempts", attempts) or attempts
+                )
                 payload_dump = pending_meta.get("payload")
 
-                if attempts >= MAX_ATTEMPTS:
+                if attempts >= MAX_ATTEMPTS or total_attempts >= MAX_TOTAL_ATTEMPTS:
                     # Give up.  Mark abandoned + clear pending so the task
-                    # doesn't keep getting picked up every sweep.
+                    # doesn't keep getting picked up every sweep. The
+                    # total_attempts ceiling is the transient-misclassification
+                    # backstop: a persistent failure that string-matches as
+                    # transient never advances ``attempts`` but DOES advance
+                    # ``total_attempts``, so it terminalizes here instead of
+                    # re-running forever.
+                    _cap = (
+                        MAX_ATTEMPTS
+                        if attempts >= MAX_ATTEMPTS
+                        else MAX_TOTAL_ATTEMPTS
+                    )
+                    _which = (
+                        "attempts" if attempts >= MAX_ATTEMPTS else "total_attempts"
+                    )
                     logger.warning(
                         f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} exceeded "
-                        f"{MAX_ATTEMPTS} attempts — marking post_commit_abandoned"
+                        f"{_cap} {_which} (attempts={attempts}, "
+                        f"total_attempts={total_attempts}) — marking "
+                        f"post_commit_abandoned"
                     )
                     new_ctx = dict(ctx)
                     new_ctx["_post_commit_abandoned"] = {
                         "at": _utcnow().isoformat(),
                         "after_attempts": attempts,
+                        "after_total_attempts": total_attempts,
                         "last_reason": pending_meta.get("reason"),
                     }
                     new_ctx.pop("_post_commit_pending_meta", None)
@@ -2169,8 +2300,73 @@ async def _sweep_post_commit_pending():
                         f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} recovered"
                     )
                 except Exception as e:
-                    # Failure — bump attempts so we eventually give up.  The
-                    # retry path in _process_post_commit's exception handler
+                    # C6 fix: transient failures (PostCommitLocked / rate-limit /
+                    # lock contention) must NOT count against the 5-attempt cap.
+                    # Otherwise a sustained GitHub-quota outage or row contention
+                    # exhausts the budget and the sweep abandons a task
+                    # (post_commit_failed) that would have recovered once the
+                    # transient cause cleared — silently dropping the deferred
+                    # side effects. The cap is reserved for persistent defects.
+                    if _post_commit_retry_is_transient(e):
+                        logger.info(
+                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} retry hit a "
+                            f"transient failure ({type(e).__name__}) — NOT counting "
+                            f"against the {MAX_ATTEMPTS}-attempt cap; will retry next sweep "
+                            f"(total_attempts {total_attempts}/{MAX_TOTAL_ATTEMPTS})"
+                        )
+                        # C6 rework (C): still advance the HARD outer bound. A
+                        # persistent failure that string-matches as transient
+                        # lands here every sweep; without bumping total_attempts
+                        # it would loop forever and the marker would never clear.
+                        # Bump in its own session/try so a bump failure on one
+                        # task doesn't poison the batch (mirrors the persistent
+                        # path below). Short lock_timeout to fail fast on
+                        # contention rather than burn cycle time.
+                        try:
+                            async with AsyncSessionLocal() as t_session:
+                                if (
+                                    t_session.bind
+                                    and t_session.bind.dialect.name == "postgresql"
+                                ):
+                                    await t_session.execute(
+                                        text("SET LOCAL lock_timeout = '5s'")
+                                    )
+                                refreshed = await t_session.get(Task, task.id)
+                                if refreshed:
+                                    new_ctx = dict(refreshed.context or {})
+                                    new_meta = dict(
+                                        new_ctx.get("_post_commit_pending_meta")
+                                        or pending_meta
+                                    )
+                                    new_meta["total_attempts"] = (
+                                        int(
+                                            new_meta.get(
+                                                "total_attempts", total_attempts
+                                            )
+                                        )
+                                        + 1
+                                    )
+                                    new_meta["last_transient_at"] = (
+                                        _utcnow().isoformat()
+                                    )
+                                    new_ctx["_post_commit_pending_meta"] = new_meta
+                                    refreshed.context = new_ctx
+                                    from sqlalchemy.orm.attributes import (
+                                        flag_modified,
+                                    )
+
+                                    flag_modified(refreshed, "context")
+                                    t_session.add(refreshed)
+                                    await t_session.commit()
+                        except Exception as t_exc:
+                            logger.warning(
+                                f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} "
+                                f"transient total_attempts bump failed (likely "
+                                f"row-lock contention): {type(t_exc).__name__}: {t_exc}"
+                            )
+                        continue
+                    # Persistent failure — bump attempts so we eventually give up.
+                    # The retry path in _process_post_commit's exception handler
                     # already bumps attempts itself if it got to set the
                     # flag again; this covers cases where it didn't.
                     logger.warning(
@@ -2204,6 +2400,16 @@ async def _sweep_post_commit_pending():
                                 )
                                 new_pending["attempts"] = (
                                     int(new_pending.get("attempts", attempts)) + 1
+                                )
+                                # C6 rework (C): persistent failures advance BOTH
+                                # the 5-attempt cap and the hard outer bound, so
+                                # the give-up check above fires on whichever
+                                # ceiling is hit first.
+                                new_pending["total_attempts"] = (
+                                    int(
+                                        new_pending.get("total_attempts", total_attempts)
+                                    )
+                                    + 1
                                 )
                                 new_pending["last_retry_at"] = _utcnow().isoformat()
                                 new_ctx["_post_commit_pending_meta"] = new_pending

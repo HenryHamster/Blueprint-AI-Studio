@@ -11,6 +11,7 @@ from typing import Dict
 
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
@@ -247,7 +248,7 @@ async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
                         severity=AlertSeverity.ERROR,
                         title="Reaper service HALTED after crash-loop",
                         message=(
-                            f"Reaper crash-looped {crash_count}× and self-halted. "
+                            f"Reaper crash-looped {crash_count}x and self-halted. "
                             f"Last error: {last_error[:300]}. "
                             "No new reap cycles until process restart or operator reset."
                         ),
@@ -574,7 +575,7 @@ async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
     return True, pr_num
 
 
-from app.reaper_sweeps import (  # noqa: E402
+from app.reaper_sweeps import (
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
@@ -1937,9 +1938,27 @@ async def reaper_service():
                                 f"Reaped mid-run with open PR #{_pr_num}; "
                                 f"handed off to review pipeline ({_display_class})"
                             )
+                            # C6 fix: write-ahead a recovery marker BEFORE the
+                            # spawn. The EVALUATING transition is persisted by the
+                            # batched orphan-reap commit regardless of whether the
+                            # spawn below succeeds; previously a spawn failure (or
+                            # a death between this commit and the spawn) left a
+                            # childless EVALUATING parent that reaper Step 3 (needs
+                            # a COMPLETED child) and Step 4 (skips childless
+                            # parents) both ignore — stranded until the 6h/48h
+                            # backstop. Setting `_pr_state_check_pending` here makes
+                            # the services `_check_evaluating_timeouts` consumer
+                            # re-check the PR and re-spawn the review. Cleared only
+                            # on confirmed spawn success below. Mirrors the
+                            # agent_status FAILED-with-open-PR handoff path.
+                            _ho_ctx = dict(task.context or {})
+                            _ho_ctx["_pr_state_check_pending"] = True
+                            task.context = _ho_ctx
+                            flag_modified(task, "context")
                             session.add(task)
                             # Spawn the review task that _process_post_commit would
                             # have spawned if the agent had reported COMPLETED.
+                            _ho_spawn_ok = False
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task
 
@@ -1977,17 +1996,44 @@ async def reaper_service():
                                     original_prompt=_original_prompt,
                                     original_task_id=str(task.id),
                                 )
+                                _ho_spawn_ok = True
                             except Exception as _spawn_exc:  # noqa: BLE001
                                 # Review spawn is best-effort from the reaper — if it
-                                # fails, reaper Step 3 (stale EVALUATING sweep) will
-                                # retry within 15 min, and the 6h hard timeout still
-                                # bounds the EVALUATING state. Don't let this crash
-                                # the reaper cycle.
+                                # fails, the `_pr_state_check_pending` marker set
+                                # above (left in place since we don't clear it on
+                                # this path) routes recovery to the services
+                                # evaluating-sweep consumer; the 6h hard timeout
+                                # still bounds the EVALUATING state. Don't let this
+                                # crash the reaper cycle.
                                 logger.warning(
                                     f"[REAPER] Review spawn failed for reaped-with-PR task {task.id}: "
-                                    f"{type(_spawn_exc).__name__}: {_spawn_exc}",
+                                    f"{type(_spawn_exc).__name__}: {_spawn_exc} — leaving "
+                                    f"_pr_state_check_pending set for the evaluating-sweep consumer",
                                     exc_info=True,
                                 )
+                                # _spawn_pipeline_task commits/rolls back internally;
+                                # a rollback expires `task` and discards our marker
+                                # mutation. Re-stage the EVALUATING handoff WITH the
+                                # recovery marker so the parent stays recoverable
+                                # rather than stranded childless.
+                                with contextlib.suppress(Exception):
+                                    task.status = TaskStatus.EVALUATING
+                                    task.vm_instance_id = None
+                                    task.last_heartbeat = None
+                                    _recover_ctx = dict(task.context or {})
+                                    _recover_ctx["_pr_state_check_pending"] = True
+                                    task.context = _recover_ctx
+                                    flag_modified(task, "context")
+                                    session.add(task)
+                            if _ho_spawn_ok:
+                                # Spawn confirmed — drop the write-ahead marker so
+                                # the consumer doesn't spawn a SECOND review on a
+                                # parent that already has its review child.
+                                _ok_ctx = dict(task.context or {})
+                                _ok_ctx.pop("_pr_state_check_pending", None)
+                                task.context = _ok_ctx
+                                flag_modified(task, "context")
+                                session.add(task)
                             # Status was set to EVALUATING above; _spawn_pipeline_task
                             # can roll back internally and expire `task` (even with
                             # expire_on_commit=False), so a task.status read here would
@@ -2118,9 +2164,6 @@ async def reaper_service():
                                         from app.retry_prompt import (
                                             _build_retry_prompt_suffix,
                                             merge_retry_prompt_suffix,
-                                        )
-                                        from sqlalchemy.orm.attributes import (
-                                            flag_modified,
                                         )
 
                                         _task_scope = (
@@ -2492,7 +2535,7 @@ async def reaper_service():
                         _mark_reaper_progress()
                         try:
                             await _requeue_parent_task(parent, session)
-                        except Exception as e:  # noqa: PERF203 — per-attempt try in deferred-requeue loop
+                        except Exception as e:  # per-attempt try in deferred-requeue loop
                             logger.error(
                                 f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
                                 exc_info=True,
@@ -2771,12 +2814,36 @@ async def reaper_service():
                         # parent (serial GitHub I/O) — the other dominant per-cycle
                         # cost besides the orphan loop. Mark progress every parent.
                         _mark_reaper_progress()
-                        # Find a COMPLETED child id from the plain-tuple snapshot,
-                        # then re-fetch it fresh. An earlier iteration's
+                        # Find a triggering child id from the plain-tuple
+                        # snapshot, then re-fetch it fresh. An earlier iteration's
                         # _check_and_trigger_rollup may have committed or rolled
                         # back — reading parent.id / child.status off the now-stale
                         # ORM batch fires a sync lazy-load that crashes the cycle
                         # on an unhealthy connection.
+                        #
+                        # Prefer a COMPLETED child (the normal stale-spawn case).
+                        # C6 rework (B): ALSO accept any child carrying the
+                        # ``_rollup_nudge_pending`` write-ahead marker, regardless
+                        # of status. ``_propagate_pipeline_failure_to_original``
+                        # sets that marker on a child it is CANCELLING just before
+                        # nudging the rollup; a death between its terminal commit
+                        # and the nudge drops the trigger, and a parent whose only
+                        # un-rolled child is that CANCELLED one has NO COMPLETED
+                        # child for the path above to find — it would sit
+                        # EVALUATING until the backstop. ``_check_and_trigger_rollup``
+                        # is keyed only on ``child.parent_task_id`` and re-evaluates
+                        # ALL siblings, so re-running it for the marker-carrying
+                        # child is correct and idempotent.
+                        _nudge_child_id = next(
+                            (
+                                cid
+                                for cid, _c_status, c_ctx in _children_snapshot_by_parent.get(
+                                    parent_id, []
+                                )
+                                if (c_ctx or {}).get("_rollup_nudge_pending")
+                            ),
+                            None,
+                        )
                         completed_child_id = next(
                             (
                                 cid
@@ -2787,9 +2854,10 @@ async def reaper_service():
                             ),
                             None,
                         )
-                        if completed_child_id is not None:
+                        trigger_child_id = completed_child_id or _nudge_child_id
+                        if trigger_child_id is not None:
                             try:
-                                child = await session.get(Task, completed_child_id)
+                                child = await session.get(Task, trigger_child_id)
                                 if child is not None:
                                     # C3: pass the heartbeat so _check_and_trigger_rollup's
                                     # per-child PR-verify loop keeps the reaper
@@ -2799,6 +2867,25 @@ async def reaper_service():
                                         session,
                                         progress_cb=_mark_reaper_progress,
                                     )
+                                    # C6 rework (B): the nudge ran without raising —
+                                    # drop the write-ahead recovery marker on the
+                                    # child that carried it (the rollup has now been
+                                    # re-evaluated). Best-effort: a leftover marker
+                                    # is self-healing (next sweep re-runs an
+                                    # idempotent check).
+                                    if _nudge_child_id is not None:
+                                        _nudged = await session.get(
+                                            Task, _nudge_child_id
+                                        )
+                                        if _nudged is not None and (
+                                            _nudged.context or {}
+                                        ).get("_rollup_nudge_pending"):
+                                            _nc = dict(_nudged.context or {})
+                                            _nc.pop("_rollup_nudge_pending", None)
+                                            _nudged.context = _nc
+                                            flag_modified(_nudged, "context")
+                                            session.add(_nudged)
+                                            await session.commit()
                             except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",
@@ -3022,7 +3109,7 @@ async def reaper_service():
                     _probe_failures,
                 )
                 with contextlib.suppress(Exception):
-                    asyncio.get_running_loop().create_task(  # noqa: RUF006
+                    asyncio.get_running_loop().create_task(
                         _post_reaper_recovery_alert(_probe_failures)
                     )
             # Liveness telemetry: only bump on the success path. If the
@@ -3065,14 +3152,14 @@ async def reaper_service():
                             "half_open_failures": _ho_failures,
                         }
                     )
-                    logger.error(
+                    logger.exception(
                         "[REAPER] HARD HALT after %d consecutive failed probe(s) "
                         "— operator reset required; last error: %s",
                         _ho_failures,
                         e,
                     )
                     with contextlib.suppress(Exception):
-                        asyncio.get_running_loop().create_task(  # noqa: RUF006
+                        asyncio.get_running_loop().create_task(
                             _post_reaper_halt_alert(consecutive_errors, str(e)[:500])
                         )
                 else:
@@ -3103,13 +3190,13 @@ async def reaper_service():
                         "crash_count": consecutive_errors,
                     }
                 )
-                logger.error(
+                logger.exception(
                     "[REAPER] HALTED after %d consecutive cycle crashes — last error: %s",
                     consecutive_errors,
                     e,
                 )
                 with contextlib.suppress(Exception):
-                    asyncio.get_running_loop().create_task(  # noqa: RUF006
+                    asyncio.get_running_loop().create_task(
                         _post_reaper_halt_alert(consecutive_errors, str(e)[:500])
                     )
 

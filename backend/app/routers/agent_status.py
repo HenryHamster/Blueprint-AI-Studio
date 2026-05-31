@@ -746,10 +746,36 @@ async def _propagate_pipeline_failure_to_original(
         orig.latest_status_message = (
             f"Pipeline {task_type} task failed — PR excluded from rollup"
         )
+        # C6 rework (B): write-ahead a rollup-nudge recovery marker on the
+        # original child BEFORE the terminal commit. The CANCELLED status is
+        # persisted by the commit below regardless of whether the rollup nudge
+        # that follows ever runs; a death (or session poison) between this
+        # commit and ``_check_and_trigger_rollup`` would otherwise DROP the
+        # rollup trigger and strand the rollup parent in EVALUATING (reaper
+        # Step 3 only nudges on a COMPLETED child — a parent whose last
+        # not-yet-rolled child is this CANCELLED one is invisible to it).
+        # The reaper Step-3 sweep consumes ``_rollup_nudge_pending`` and
+        # re-runs ``_check_and_trigger_rollup`` for the carrying child. Cleared
+        # ONLY after the nudge below succeeds (mirrors the _pr_state_check_pending
+        # producer/consumer discipline used elsewhere in this cluster).
+        _orig_ctx = dict(orig.context or {})
+        _orig_ctx["_rollup_nudge_pending"] = True
+        orig.context = _orig_ctx
+        flag_modified(orig, "context")
         session.add(orig)
         await session.commit()
         if orig.parent_task_id:
             await _check_and_trigger_rollup(orig, session)
+            # Nudge succeeded — drop the write-ahead recovery marker. (A
+            # leftover marker is self-healing: the reaper sweep would just
+            # re-run an idempotent rollup check, but clearing it keeps the
+            # candidate set small.)
+            _clear_ctx = dict(orig.context or {})
+            if _clear_ctx.pop("_rollup_nudge_pending", None) is not None:
+                orig.context = _clear_ctx
+                flag_modified(orig, "context")
+                session.add(orig)
+                await session.commit()
         logger.error(
             f"[PIPELINE] Cancelled original task {original_task_id} — {task_type} failed, skipping in rollup"
         )
@@ -1964,15 +1990,26 @@ async def update_agent_status(
                         else str(fresh.status),
                     }
                 task = fresh
+                # C6 fix: do NOT clear `_pr_state_check_pending` up front.
+                # It is the write-ahead recovery marker for THIS path: if the
+                # process dies (or the review spawn below fails) while the task
+                # sits EVALUATING, the services._check_evaluating_timeouts
+                # consumer (the `_pr_state_check_pending` branch) re-checks the
+                # PR and re-spawns the review. Clearing it before the spawn is
+                # confirmed leaves a childless EVALUATING parent invisible to
+                # that consumer. The TERMINAL branches (merged / closed-unmerged)
+                # clear it explicitly since they reach a final state with no
+                # pending spawn; only the still-open branch keeps it set until
+                # the spawn succeeds.
                 _ctx = dict(task.context or {})
-                _ctx.pop("_pr_state_check_pending", None)
-                task.context = _ctx
-                flag_modified(task, "context")
                 if _gh_pr_state == "closed" and _gh_pr_merged:
                     logger.info(
                         f"[AGENT_STATUS] Task {task.id} reported FAILED but PR #{_pr_num} was merged "
                         f"out-of-band — marking COMPLETED"
                     )
+                    _ctx.pop("_pr_state_check_pending", None)
+                    task.context = _ctx
+                    flag_modified(task, "context")
                     task.status = TaskStatus.COMPLETED
                     task.vm_instance_id = None
                     task.last_heartbeat = None
@@ -1999,7 +2036,9 @@ async def update_agent_status(
                     task.latest_status_message = (
                         f"Reported FAILED; PR #{_pr_num} was closed without merging"
                     )
-                    task.context = {**(task.context or {}), "pr_closed_unmerged": True}
+                    _ctx.pop("_pr_state_check_pending", None)
+                    task.context = {**_ctx, "pr_closed_unmerged": True}
+                    flag_modified(task, "context")
                     # Exhaust retries so the orphan-resurrection sweep skips it.
                     task.attempt_count = _runtime_config["max_retries"]
                     session.add(task)
@@ -2020,7 +2059,16 @@ async def update_agent_status(
                 task.vm_instance_id = None
                 task.last_heartbeat = None
                 task.latest_status_message = f"Reported FAILED with open PR #{_pr_num}; handed off to review pipeline ({failure_class})"
+                # C6 fix: `_pr_state_check_pending` is still in `_ctx` (we did
+                # NOT pop it up front). Keep it set as a write-ahead recovery
+                # marker through the spawn so a death (or a spawn failure)
+                # leaves the parent recoverable by the services
+                # `_pr_state_check_pending` consumer. It is cleared ONLY on
+                # confirmed spawn success below.
+                task.context = _ctx
+                flag_modified(task, "context")
                 session.add(task)
+                _spawn_ok = False
                 try:
                     from app.review_pipeline import _spawn_pipeline_task
                     from app.shared_state import (
@@ -2050,28 +2098,53 @@ async def update_agent_status(
                         original_prompt=_original_prompt,
                         original_task_id=str(task.id),
                     )
+                    _spawn_ok = True
                 except Exception as _spawn_exc:
-                    # Best-effort: if review-spawn fails, the reaper's stale-EVALUATING
-                    # sweep retries within 15min, and the 6h hard timeout bounds it.
+                    # C6 fix: review-spawn failure no longer strands the task. We
+                    # leave `_pr_state_check_pending` set (NOT cleared on the
+                    # success path below), so the services
+                    # `_check_evaluating_timeouts` consumer re-checks the PR and
+                    # re-spawns the review within its grace window — instead of
+                    # the parent sitting childless+EVALUATING until the 6h/48h
+                    # backstop, invisible to reaper Steps 3 (needs COMPLETED
+                    # child) and 4 (skips childless parents).
                     logger.warning(
                         f"[AGENT_STATUS] Review spawn failed for FAILED-with-open-PR task {_task_id_str}: "
-                        f"{type(_spawn_exc).__name__}: {_spawn_exc}",
+                        f"{type(_spawn_exc).__name__}: {_spawn_exc} — leaving "
+                        f"_pr_state_check_pending set for the evaluating-sweep consumer",
                         exc_info=True,
                     )
                     # _spawn_pipeline_task does session.flush()/commit() internally —
                     # if it raised on a flush/commit, the session is now in
                     # pending-rollback state and the commit on the next line
                     # would surface as PendingRollbackError. Recover and re-stage
-                    # the EVALUATING handoff so the task isn't stranded RUNNING.
+                    # the EVALUATING handoff WITH the recovery marker so the task
+                    # isn't stranded RUNNING and stays recoverable.
                     if await _recover_poisoned_session(session, _task_id_str):
                         task.status = TaskStatus.EVALUATING
                         task.vm_instance_id = None
                         task.last_heartbeat = None
                         task.latest_status_message = (
                             f"Reported FAILED with open PR #{_pr_num}; handed off to review pipeline "
-                            f"({failure_class}) — review spawn failed, reaper will retry"
+                            f"({failure_class}) — review spawn failed, evaluating-sweep will retry"
                         )
+                        # The rollback discarded our context mutation; re-stage
+                        # the recovery marker so the consumer can find this task.
+                        _recover_ctx = dict(task.context or {})
+                        _recover_ctx["_pr_state_check_pending"] = True
+                        task.context = _recover_ctx
+                        flag_modified(task, "context")
                         session.add(task)
+                if _spawn_ok:
+                    # Spawn confirmed — the review child exists, so drop the
+                    # write-ahead recovery marker. (A childed EVALUATING parent
+                    # is a normal parked parent; leaving the flag set would make
+                    # the consumer try to spawn a SECOND review.)
+                    _ok_ctx = dict(task.context or {})
+                    _ok_ctx.pop("_pr_state_check_pending", None)
+                    task.context = _ok_ctx
+                    flag_modified(task, "context")
+                    session.add(task)
                 await session.commit()
                 await broadcast_to_project(
                     str(task.project_id),

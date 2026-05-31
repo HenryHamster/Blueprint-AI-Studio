@@ -6087,6 +6087,101 @@ async def test_failed_with_open_pr_hands_off_to_review(
     spawn_args = spawn_mock.await_args
     assert spawn_args.args[1] == "review"
     assert spawn_args.args[3] == 3575  # pr_number
+    # C6: on confirmed spawn success the write-ahead recovery marker is dropped
+    # (a childed EVALUATING parent is a normally parked parent — leaving the
+    # flag set would make the evaluating-sweep consumer spawn a SECOND review).
+    assert not (task.context or {}).get("_pr_state_check_pending"), (
+        "marker must be cleared once the review spawn is confirmed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_with_open_pr_spawn_failure_keeps_recovery_marker(
+    client: AsyncClient, db_session, mocker
+):
+    """C6 seam: when the review spawn FAILS during the FAILED-with-open-PR
+    handoff, the task must stay EVALUATING AND keep `_pr_state_check_pending`
+    set so the services `_check_evaluating_timeouts` consumer re-checks the PR
+    and re-spawns the review.
+
+    Pre-fix the flag was popped before the spawn and never re-set on failure, so
+    the parent ended up childless+EVALUATING with NO recovery marker — invisible
+    to reaper Step 3 (needs a COMPLETED child) and Step 4 (skips childless
+    parents) and to the marker-gated sweep — stranded until the 6h/48h backstop.
+    Would FAIL pre-fix: `_pr_state_check_pending` would be absent.
+    """
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    # Spawn raises — but does NOT poison the session (it fails before any
+    # internal flush/commit). Exercises the non-poisoned spawn-failure path.
+    spawn_mock = AsyncMock(side_effect=RuntimeError("spawn boom"))
+    mocker.patch("app.review_pipeline._spawn_pipeline_task", spawn_mock)
+
+    project = Project(name="Open-PR Spawn Fail", user_id="test-user-open-pr-spawnfail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-open-pr-spawnfail",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4242",
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-open-pr-spawnfail")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "status": "FAILED",
+            "failure_category": "fatal",
+            "logs": "Refusing to delete stale branch blueprint/task-cafe: has 1 open PR(s) (#4242)",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_handoff"
+
+    await db_session.refresh(task)
+    # Task stays EVALUATING (not stranded RUNNING/FAILED) so the sweep can act.
+    assert task.status == TaskStatus.EVALUATING, (
+        f"Expected EVALUATING after spawn failure, got {task.status}"
+    )
+    # The write-ahead recovery marker MUST survive the spawn failure.
+    assert (task.context or {}).get("_pr_state_check_pending") is True, (
+        "spawn failure must leave _pr_state_check_pending set so the "
+        "evaluating-sweep consumer can recover the childless parent"
+    )
+    spawn_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
