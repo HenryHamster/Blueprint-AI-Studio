@@ -43,6 +43,7 @@ These tests exercise:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import uuid
 from datetime import datetime, timedelta
@@ -1492,4 +1493,628 @@ async def test_orphan_pr_handoff_fires_within_90s_window(db_session):
     assert task.last_heartbeat >= scope_cutoff, (
         f"Task's heartbeat ({task.last_heartbeat}) should be >= scope cutoff ({scope_cutoff}) "
         "to verify the PR-based fast cutoff is the differentiator."
+    )
+
+
+# ── C2: never hold a DB lock across GitHub/network I/O ───────────────────────
+#
+# Cluster C2 root cause: GitHub round-trips ran INSIDE critical sections.
+#   (1) _spawn_pipeline_task's scope-overflow PR signal (token + label +
+#       comment) ran while the per-PR advisory lock was held.
+#   (2) ci_completion's CI-failure create_pr_comment ran while the task row
+#       was held FOR UPDATE.
+#   (3) the reaper orphan-reap batch committed all orphans at once, so one
+#       ux_task_active_idempotency_key collision rolled back the whole batch.
+# The fix: resolve tokens before acquiring locks, defer GitHub signals to a
+# post-commit (lock-released) block, mirror the merge path's
+# capture/commit-release/relock for the CI-failure branch, and pre-query the
+# idempotency-key collision per orphan. These seam tests would FAIL pre-fix.
+
+
+@pytest.mark.asyncio
+async def test_spawn_scope_overflow_signal_fires_after_commit(db_session, mocker):
+    """C2 (1): the scope-overflow GitHub signal must run AFTER the spawn
+    commits — i.e. after the per-PR advisory lock is released, never while
+    it is held.
+
+    Seam: we observe, from inside the mocked GitHub calls, that the spawn
+    has already committed by checking — on a SEPARATE session — that the
+    durable idempotency flag ``scope_overflow_pr_signal_emitted`` is already
+    persisted on the source task. Pre-fix the label/comment ran BEFORE any
+    commit, so a peer session would NOT yet see the persisted flag when the
+    GitHub call fired; this assertion fails on the old code.
+    """
+    from unittest.mock import AsyncMock
+
+    from app.review_pipeline import (
+        SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY,
+        _spawn_pipeline_task,
+    )
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("ghs_test", "acme", "repo"),
+    )
+
+    project = Project(
+        name="C2 spawn overflow",
+        user_id="user-c2",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="overflow source",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 7777,
+                "branch": "feat/c2-overflow",
+                "base_branch": "main",
+                "prompt": "Implement feature",
+            }
+        ],
+        context={
+            "scope": "small",
+            "_pr_changed_files": [f"backend/app/m{i}.py" for i in range(7)],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    source_id = source_task.id
+
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+
+    # Observed-from-inside-the-GitHub-call: the flag must already be durable.
+    flag_visible_during_io: list[bool] = []
+
+    async def _observing_add_issue_label(*args, **kwargs):
+        async with Session() as peer:
+            peer_src = await peer.get(Task, source_id)
+            flag_visible_during_io.append(
+                bool(
+                    (peer_src.context or {}).get(
+                        SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY
+                    )
+                )
+                if peer_src is not None
+                else False
+            )
+
+    mocker.patch(
+        "app.github.add_issue_label",
+        new=AsyncMock(side_effect=_observing_add_issue_label),
+    )
+    comment_mock = mocker.patch(
+        "app.github.create_pr_comment", new_callable=AsyncMock
+    )
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=7777,
+        branch="feat/c2-overflow",
+        base_branch="main",
+        original_prompt="Implement feature",
+    )
+
+    assert spawned is True and result is not None
+    # The signal still fires exactly once.
+    assert comment_mock.await_count == 1
+    assert flag_visible_during_io == [True], (
+        "Scope-overflow GitHub signal ran while the spawn was still "
+        "uncommitted (advisory lock held). A peer session could not see the "
+        "durable idempotency flag during the GitHub call — the signal must "
+        "be deferred to the post-commit, lock-released block (C2 fix)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_scope_overflow_signal_failure_does_not_block_spawn(
+    db_session, mocker
+):
+    """C2 (1): a GitHub failure in the deferred scope-overflow signal is
+    best-effort and must NOT roll back or block the spawn — the new task is
+    committed and the idempotency flag is durable regardless.
+    """
+    from unittest.mock import AsyncMock
+
+    from app.review_pipeline import (
+        SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY,
+        _spawn_pipeline_task,
+    )
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("ghs_test", "acme", "repo"),
+    )
+    mocker.patch(
+        "app.github.add_issue_label",
+        new=AsyncMock(side_effect=RuntimeError("github down")),
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+    project = Project(
+        name="C2 spawn overflow fail",
+        user_id="user-c2",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    source_task = Task(
+        project_id=project.id,
+        title="overflow source fail",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 7778,
+                "branch": "feat/c2-overflow-fail",
+                "base_branch": "main",
+                "prompt": "Implement feature",
+            }
+        ],
+        context={
+            "scope": "small",
+            "_pr_changed_files": [f"backend/app/n{i}.py" for i in range(7)],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    source_id = source_task.id
+    new_task_id = None
+
+    result, spawned = await _spawn_pipeline_task(
+        source_task,
+        "review",
+        db_session,
+        pr_number=7778,
+        branch="feat/c2-overflow-fail",
+        base_branch="main",
+        original_prompt="Implement feature",
+    )
+    assert spawned is True and result is not None
+    new_task_id = result.id
+
+    # New task is durably committed despite the GitHub failure.
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    async with Session() as peer:
+        peer_new = await peer.get(Task, new_task_id)
+        assert peer_new is not None, (
+            "Spawned task must remain committed even when the deferred "
+            "scope-overflow GitHub signal raised — the I/O is best-effort."
+        )
+        peer_src = await peer.get(Task, source_id)
+        assert (peer_src.context or {}).get(
+            SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY
+        ) is True, (
+            "Idempotency flag must be persisted transactionally before the "
+            "GitHub call, so a failed signal never re-fires (C2)."
+        )
+
+
+@pytest.mark.asyncio
+async def test_ci_failure_releases_task_lock_around_pr_comment(db_session, mocker):
+    """C2 (2): the CI-failure branch must release the task FOR UPDATE lock
+    around ``create_pr_comment`` (mirroring the merge SUCCESS path), so a
+    concurrent worker can lock the row during the GitHub window.
+
+    Seam: from inside the mocked create_pr_comment, a SEPARATE session does
+    ``with_for_update(skip_locked=True)`` on the same task row. If the lock
+    was released (post-fix) the peer acquires it (non-None); pre-fix the row
+    is still held FOR UPDATE by handle_ci_completion and skip_locked yields
+    None. Postgres-only — SQLite has no row-level FOR UPDATE semantics.
+    """
+    from unittest.mock import AsyncMock
+
+    if not USE_POSTGRES:
+        pytest.skip("row-level FOR UPDATE lock-release assertion requires Postgres")
+
+    from app.ci_completion import handle_ci_completion
+
+    # ci_completion imports broadcast_to_project / create_pr_comment
+    # function-locally (from app.broadcast / app.github), so they are NOT
+    # module attributes of app.ci_completion — patch them at their source
+    # module (mirrors test_ci_completion.py:2425, :2424).
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("ghs_test", "acme", "repo"),
+    )
+
+    project = Project(
+        name="C2 ci-failure",
+        user_id="user-c2",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="ci task",
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {"type": "create", "pr_number": 8888, "branch": "feat/ci", "base_branch": "main"}
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 8888,
+                "branch": "feat/ci",
+                "base_branch": "main",
+                "ci_waiting": True,
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    peer_lock_acquired: list[bool] = []
+
+    async def _peer_lock_probe(*args, **kwargs):
+        async with Session() as peer:
+            row = (
+                await peer.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars().first()
+            peer_lock_acquired.append(row is not None)
+            await peer.rollback()
+
+    mocker.patch(
+        "app.github.create_pr_comment",
+        new=AsyncMock(side_effect=_peer_lock_probe),
+    )
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "pytest FAILED test_x",
+    }
+    await handle_ci_completion(
+        task, ci_result, "ghs_test", "acme", "repo", db_session, source="poll"
+    )
+
+    assert peer_lock_acquired == [True], (
+        "CI-failure create_pr_comment ran while the task row was still held "
+        "FOR UPDATE — the lock must be released around the GitHub comment "
+        "(C2 fix mirroring the merge SUCCESS path)."
+    )
+
+
+class _StopReaperLoop(Exception):
+    """Raised from a mocked asyncio.sleep to break reaper_service's loop."""
+
+
+@pytest.mark.asyncio
+async def test_reaper_orphan_idempotency_preguard_skips_active_dup(
+    db_session, mocker
+):
+    """C2 (3): the reaper orphan-reap loop pre-queries the
+    ux_task_active_idempotency_key collision per orphan and SKIPS an orphan
+    whose key is already held by an ACTIVE task — preventing the IntegrityError
+    that would otherwise roll back the ENTIRE batch's recovery work.
+
+    This drives the real ``reaper_service`` loop one cycle (the same harness
+    test_reaper.py uses: patch ``asyncio.sleep`` to raise, neutralize the
+    side-effecting deferred imports). It would PASS even if the guard were
+    reverted ONLY if it merely re-implemented the SELECT inline; instead we
+    assert the OBSERVABLE behavior the guard produces:
+
+      - the colliding orphan is left UNTOUCHED in PROVISIONING (guard skipped
+        it before mutating); revert the guard (reaper.py:1109-1134) and the
+        reap flips it off PROVISIONING → this assertion fails.
+      - an INDEPENDENT orphan in the same batch IS reaped (flipped off
+        PROVISIONING), proving the loop actually ran the reap body.
+      - the active duplicate is untouched.
+
+    Two ACTIVE rows cannot share an idempotency_key while the partial unique
+    index ``ux_task_active_idempotency_key`` is enforced (verified on both
+    SQLite and Postgres). So to construct the exact state the guard inspects —
+    an orphan that, if reaped, would collide with an already-active peer — we
+    DROP that index on the test engine for the duration of the cycle. The
+    index is what makes the collision PAINFUL (all-batch rollback); the GUARD
+    is what AVOIDS it by skipping pre-mutation, and the guard's skip decision
+    is exactly what this test isolates.
+    """
+    bind = db_session.bind
+
+    # The partial unique index forbids two coexisting active rows with one key.
+    # Drop it so we can construct the orphan-collides-with-active-peer state the
+    # guard is designed to detect, then drive the real loop. Recreated in the
+    # finally below so the shared Postgres schema (CI) is left intact for other
+    # tests; on SQLite the per-test drop_all/create_all makes this moot.
+    _idx = next(
+        idx
+        for idx in Task.__table__.indexes
+        if idx.name == "ux_task_active_idempotency_key"
+    )
+
+    async def _drop_active_idem_index():
+        try:
+            await db_session.execute(
+                text("DROP INDEX ux_task_active_idempotency_key")
+            )
+            await db_session.commit()
+        except Exception:
+            await db_session.rollback()
+
+    async def _recreate_active_idem_index():
+        with contextlib.suppress(Exception):
+            async with bind.begin() as conn:
+                await conn.run_sync(_idx.create)
+
+    await _drop_active_idem_index()
+    try:
+        await _run_reaper_preguard_body(db_session, mocker, bind)
+    finally:
+        await _recreate_active_idem_index()
+
+
+async def _run_reaper_preguard_body(db_session, mocker, bind):
+    project = Project(name="C2 reaper preguard", user_id="user-c2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dup_key = f"dup-key-{uuid.uuid4().hex}"
+    stale = datetime.utcnow() - timedelta(minutes=16)
+
+    # Active peer already holding the key in an active status.
+    active_dup = Task(
+        project_id=project.id,
+        title="active dup",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "create"}],
+        idempotency_key=dup_key,
+        last_heartbeat=datetime.utcnow(),
+    )
+    # Orphan whose reap would re-enter the key into an active status and collide
+    # with active_dup — the guard must skip it BEFORE mutating.
+    colliding_orphan = Task(
+        project_id=project.id,
+        title="colliding orphan",
+        status=TaskStatus.PROVISIONING,
+        payloads=[{"type": "create"}],
+        idempotency_key=dup_key,
+        vm_instance_id="vm-colliding",
+        started_at=stale,
+        context={"provision_zone": "us-east1-a"},
+    )
+    # Independent orphan with no colliding key — must be reaped normally,
+    # proving the loop body ran (and, pre-fix, that the all-batch rollback
+    # would have swallowed THIS orphan's recovery too).
+    independent_orphan = Task(
+        project_id=project.id,
+        title="independent orphan",
+        status=TaskStatus.PROVISIONING,
+        payloads=[{"type": "create"}],
+        idempotency_key=None,
+        vm_instance_id="vm-independent",
+        started_at=stale,
+        context={"provision_zone": "us-east1-a"},
+    )
+    db_session.add_all([active_dup, colliding_orphan, independent_orphan])
+    await db_session.commit()
+    for _t in (active_dup, colliding_orphan, independent_orphan):
+        await db_session.refresh(_t)
+
+    # Drive the real reaper loop one cycle against the same engine.
+    Session = sessionmaker(
+        bind=bind, class_=AsyncSession, expire_on_commit=False, autoflush=False
+    )
+    mocker.patch("app.reaper.AsyncSessionLocal", Session)
+    mocker.patch("asyncio.sleep", side_effect=_StopReaperLoop())
+    # Neutralize the side-effecting deferred imports (mirror reaper_side_effects).
+    from unittest.mock import AsyncMock
+
+    _vm_deleted = mocker.patch(
+        "app.main._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch("app.reaper._capture_serial_for_vm", return_value=None)
+    mocker.patch("app.reaper.record_zone_failure")
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+
+    from app.reaper import reaper_service
+
+    with contextlib.suppress(_StopReaperLoop):
+        await reaper_service()
+
+    # Read final state on a fresh session (the loop committed on its own).
+    async with Session() as verify:
+        v_dup = await verify.get(Task, active_dup.id)
+        v_collide = await verify.get(Task, colliding_orphan.id)
+        v_indep = await verify.get(Task, independent_orphan.id)
+
+    # Guard skipped the colliding orphan BEFORE mutating it: still PROVISIONING.
+    assert v_collide.status == TaskStatus.PROVISIONING, (
+        "Pre-query guard must SKIP the orphan whose idempotency_key is held by "
+        "an active task, leaving it untouched in PROVISIONING — revert the "
+        "guard (reaper.py:1109-1134) and the reap flips it off PROVISIONING "
+        f"(got {v_collide.status})."
+    )
+    # The loop actually ran: the independent orphan was reaped.
+    assert v_indep.status != TaskStatus.PROVISIONING, (
+        "Independent orphan must be reaped (flipped off PROVISIONING), proving "
+        "the orphan-reap body ran and that the guard isolated the collision to "
+        "the colliding orphan only — not an all-batch rollback (C2)."
+    )
+    # The active duplicate is untouched.
+    assert v_dup.status == TaskStatus.IN_PROGRESS
+
+    # VM-GC (C2 issue E): a guard-skipped orphan must still have its dead VM
+    # collected for deletion — the VM-collection step lives AFTER the guard in
+    # the reap body, so a bare ``continue`` would otherwise strand it.
+    _deleted_vms = {
+        (c.args[0] if c.args else c.kwargs.get("task_or_vm_id"))
+        for c in _vm_deleted.await_args_list
+    }
+    assert "vm-colliding" in _deleted_vms, (
+        "Guard-skipped orphan's VM must be collected for deletion (C2 issue E) "
+        "— it is not stranded until the active duplicate frees the key."
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_releases_parent_lock_around_review_respawn_spawn(
+    db_session, mocker
+):
+    """C2 (3 — change #3): the rollup review-respawn loop must release the
+    parent FOR UPDATE lock BEFORE the lock-free spawn window (Phase B), so a
+    peer can acquire the parent row DURING ``_spawn_pipeline_task`` (Phase C).
+
+    Pre-fix the spawn ran INSIDE the unmerged loop while the parent lock was
+    nominally held (each spawn silently committed-released it mid-loop and the
+    next iteration mutated an unlocked row). Post-fix Phase B explicitly
+    commit-releases the parent lock and Phase D re-locks with snapshot
+    validation.
+
+    Seam: from inside the mocked ``_spawn_pipeline_task`` (Phase C), a SEPARATE
+    session does ``with_for_update(skip_locked=True)`` on the parent row. If
+    the lock was released (post-fix) the peer acquires it (non-None); pre-fix
+    the parent is still held FOR UPDATE by ``_check_and_trigger_rollup`` and
+    skip_locked yields None. Postgres-only — SQLite has no row-level FOR UPDATE.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    if not USE_POSTGRES:
+        pytest.skip("row-level FOR UPDATE lock-release assertion requires Postgres")
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "acme", "repo"),
+    )
+    # PR not merged + open → the child stays "unmerged" (all_done=False) so the
+    # respawn path is reached.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "state": "open"},
+    )
+
+    project = Project(
+        name="C2 rollup respawn lock",
+        user_id="user-c2",
+        github_owner="acme",
+        github_repo="repo",
+        integration_branch="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="rollup parent",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "do thing"}],
+        context={"research_branch": "research/c2-stg", "parent_base": "main"},
+        plan_output="plan",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    parent_id = parent.id
+
+    # Unmerged stale COMPLETED child (>10min) with a valid PR artifact so it
+    # becomes a respawn candidate and Phase C actually spawns.
+    stale_time = datetime.utcnow() - timedelta(minutes=15)
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="stale child",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "implement", "base_branch": "main"}],
+        context={"review_loop": {"branch": "blueprint/c2-child"}},
+        updated_at=stale_time,
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    artifact = Artifact(
+        task_id=child.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/acme/repo/pull/4242",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+    peer_lock_acquired: list[bool] = []
+
+    async def _spawn_probe(*args, **kwargs):
+        async with Session() as peer:
+            row = (
+                await peer.execute(
+                    select(Task)
+                    .where(Task.id == parent_id)
+                    .with_for_update(skip_locked=True)
+                )
+            ).scalars().first()
+            peer_lock_acquired.append(row is not None)
+            await peer.rollback()
+        # Return a plausible spawned-review tuple so Phase C proceeds.
+        return (MagicMock(id=uuid.uuid4()), True)
+
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(side_effect=_spawn_probe),
+    )
+
+    await _check_and_trigger_rollup(child, db_session)
+
+    assert peer_lock_acquired == [True], (
+        "rollup review-respawn _spawn_pipeline_task ran while the parent row "
+        "was still held FOR UPDATE — Phase B must release the parent lock "
+        "around the lock-free spawn window (C2 change #3)."
     )

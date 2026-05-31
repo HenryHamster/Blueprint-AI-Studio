@@ -1486,6 +1486,25 @@ async def handle_ci_completion(
             return True
 
         ci_errors = ci_result.get("failed_logs", "CI checks failed")
+
+        # ── C2 lock-window break (CI-failure path) ──
+        # The task row has been held FOR UPDATE since ~1341. ``create_pr_comment``
+        # is a GitHub POST that can block 5-30s under rate-limit; holding the
+        # task lock across it starves concurrent heartbeats on this row and can
+        # trip the 60s idle_in_transaction timeout. Mirror the merge SUCCESS
+        # path (``_attempt_merge_with_retry_and_escalation``): capture a content
+        # snapshot, commit-release the lock, post the comment lock-free, then
+        # re-acquire with snapshot validation. The subsequent
+        # ``_spawn_pipeline_task`` manages its own per-PR advisory lock and
+        # commits internally, so it does not need the task lock held — but the
+        # terminal status writes below DO, hence the relock. If a peer mutated
+        # the gate fields during the unlocked window we defer to the next sweep.
+        _ci_fail_task_id = task.id
+        _ci_fail_snapshot = _capture_merge_snapshot(task)
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()  # release the task FOR UPDATE lock
+
         await create_pr_comment(
             gh_token,
             owner,
@@ -1493,6 +1512,22 @@ async def handle_ci_completion(
             ci_pr_number,
             f"**Blueprint CI**: Checks failed.\n\n```\n{ci_errors[:2000]}\n```",
         )
+
+        relocked = await _relock_merge_task(
+            session,
+            _ci_fail_task_id,
+            _ci_fail_snapshot,
+            task,
+            source=source,
+        )
+        if relocked is None:
+            logger.info(
+                f"[CI] Task {_bcast_task_id} held/mutated during CI-failure "
+                f"comment window — deferring fix spawn to next sweep ({source})"
+            )
+            return False
+        task = relocked
+
         from app.review_pipeline import build_ci_failure_fix_prompt
 
         ci_fix_prompt = build_ci_failure_fix_prompt(

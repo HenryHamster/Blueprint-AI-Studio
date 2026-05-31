@@ -2412,9 +2412,21 @@ async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
     The fix snapshots the status BEFORE commit.
 
     Simulates the post-commit expiry by expiring `task` and rewriting the
-    persisted status out-of-band right after each handler commit. The broadcast
-    must still carry the mutation-time status (COMPLETED) from the pre-commit
-    snapshot, never a re-fetched/expired value (which would be FAILED here).
+    persisted status out-of-band ONLY on the final broadcast commit (once the
+    handler has set the mutation-time status to COMPLETED). The broadcast must
+    still carry the snapshotted COMPLETED, never a re-fetched/expired value
+    (which would be FAILED here).
+
+    C2 note: the CI-failure path now commit-releases the task FOR UPDATE lock
+    around create_pr_comment and re-locks with snapshot validation before the
+    fix spawn. That earlier relock commit happens while status is still the
+    captured snapshot value (EVALUATING). We must NOT corrupt the status on
+    that commit — a spurious out-of-band status flip there would make the
+    legitimate relock false-defer (returning None) and short-circuit the
+    handler before the fix-spawn/broadcast path under test. The relock
+    re-validating the row is correct new behavior; the test artifact only
+    simulates the post-commit expiry on the FINAL broadcast commit (gated on
+    the in-session status already being COMPLETED).
     """
     from sqlalchemy import update
 
@@ -2438,19 +2450,31 @@ async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
     await db_session.commit()
     await db_session.refresh(task)
 
-    # Wrap commit so every handler commit expires `task` and rewrites the
-    # persisted status. With the bug, the post-commit task.status read would
-    # lazy-load the corrupted value (FAILED); with the snapshot fix the
-    # broadcast carries the mutation-time COMPLETED.
+    # Wrap commit so that ONLY the final broadcast commit (once the handler
+    # has set the mutation-time status to COMPLETED) expires `task` and
+    # rewrites the persisted status out-of-band. With the bug, the post-commit
+    # task.status read would lazy-load the corrupted value (FAILED); with the
+    # snapshot fix the broadcast carries the mutation-time COMPLETED. We gate
+    # on the in-session status so the earlier C2 relock commit (status still
+    # EVALUATING) is left untouched and the relock validates cleanly instead of
+    # false-deferring.
     _real_commit = db_session.commit
 
     async def _commit_then_expire():
+        # Read the in-session status BEFORE committing/expiring. Only the final
+        # broadcast commit runs after the handler set status=COMPLETED; the
+        # earlier relock commit runs with status=EVALUATING and must be left
+        # uncorrupted so the legitimate snapshot-validated relock succeeds.
+        is_final_broadcast_commit = task.status == TaskStatus.COMPLETED
         await _real_commit()
-        await db_session.execute(
-            update(Task).where(Task.id == task.id).values(status=TaskStatus.FAILED)
-        )
-        await _real_commit()
-        db_session.expire(task)
+        if is_final_broadcast_commit:
+            await db_session.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(status=TaskStatus.FAILED)
+            )
+            await _real_commit()
+            db_session.expire(task)
 
     mocker.patch.object(db_session, "commit", side_effect=_commit_then_expire)
 

@@ -894,9 +894,30 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         if unmerged:
             # Some completed but PRs not yet merged.
             # Check if any are stale (>10min) with no active review — respawn pipeline.
+            #
+            # ── C2 lock-window break (review-respawn loop) ──
+            # ``_spawn_pipeline_task`` commits internally (releasing the parent
+            # FOR UPDATE lock acquired/re-acquired above) and performs GitHub
+            # network I/O. The prior implementation called it INSIDE this loop
+            # while the parent lock was nominally held, so each spawn silently
+            # released the parent lock mid-loop and the next iteration mutated
+            # ``parent`` / ``c`` against an unlocked row — exactly the
+            # held-lock-across-IO / mutate-after-silent-release anti-pattern the
+            # merge SUCCESS path already eliminated. Mirror that path here:
+            #   Phase A — under the parent lock, decide per child and apply only
+            #             DB-local mutations (force pr_merged, respawn-cap skip),
+            #             collecting the children that need a review respawn.
+            #   Phase B — release the parent lock around the spawns.
+            #   Phase C — spawn lock-free (each spawn owns its advisory lock).
+            #   Phase D — re-lock parent with snapshot validation, apply the
+            #             cap-exhaustion escalations + status message, commit.
+            from app.shared_state import resolve_task_branch
+
             now = _utcnow()
             stale_threshold = timedelta(minutes=10)
             respawned = 0
+            # Phase A: decide under lock; collect respawn candidates.
+            respawn_candidates: list[dict] = []
             for c in unmerged:
                 age = (now - c.updated_at).total_seconds() if c.updated_at else 0
                 if age < stale_threshold.total_seconds():
@@ -1011,35 +1032,71 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # review_loop.branch or first_payload.branch — synthesizing
                 # blueprint/task-{fix_id} yields a name no agent ever pushed,
                 # so respawned reviews would fail at `git clone --branch`.
-                from app.shared_state import resolve_task_branch
                 branch = resolve_task_branch(c)
                 project = await session.get(Project, c.project_id)
                 base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
+                respawn_candidates.append(
+                    {
+                        "child_id": c.id,
+                        "pr_number": pr_number,
+                        "branch": branch,
+                        "base_branch": base_branch,
+                        "original_prompt": original_prompt,
+                        "respawn_count": respawn_count,
+                    }
+                )
+
+            # Phase B: release the parent (+ children) FOR UPDATE lock around the
+            # spawns. Capture a snapshot so the re-lock in Phase D detects peer
+            # mutation of the rollup state machine during the unlocked window.
+            # context_dirty=False: Phase A mutates CHILD contexts (full reassignment
+            # via session.add(c) — SQLA tracks those) and at most the parent's
+            # ``requires_approval`` column, never ``parent.context`` in place, so no
+            # flag_modified on the parent JSONB is needed (avoids the TOAST-write
+            # amplification the _release_parent_lock docstring warns about). The
+            # requires_approval flip is a column mutation SQLA tracks on its own;
+            # the snapshot below captures its post-mutation value, so the Phase D
+            # re-lock won't false-defer on our own escalation.
+            parent_id_local = parent.id
+            unmerged_titles = [c.title[:40] for c in unmerged]
+            pre_respawn_snapshot = await _release_parent_lock(parent, session)
+
+            # Phase C: spawn reviews lock-free. Each _spawn_pipeline_task owns its
+            # own per-PR advisory lock and commits its own work; no DB lock is held
+            # here. Cap-exhaustion escalations that must touch the parent row are
+            # deferred to Phase D (the parent is released here). Per-child mutations
+            # (respawn-count bump) are persisted on this session and committed by
+            # the Phase D relock commit.
+            cap_exhausted_prs: list[int] = []
+            for cand in respawn_candidates:
+                child = await session.get(Task, cand["child_id"])
+                if child is None:
+                    continue
                 review_task, was_spawned = await _spawn_pipeline_task(
-                    c,
+                    child,
                     "review",
                     session,
-                    pr_number,
-                    branch,
-                    base_branch,
-                    original_prompt=original_prompt,
-                    original_task_id=str(c.id),
+                    cand["pr_number"],
+                    cand["branch"],
+                    cand["base_branch"],
+                    original_prompt=cand["original_prompt"],
+                    original_task_id=str(child.id),
                 )
-                if review_task and review_task.id != c.id:
+                if review_task and review_task.id != child.id:
                     respawned += 1
                     if was_spawned:
-                        c.context = {
-                            **(c.context or {}),
-                            "_review_respawn_count": respawn_count + 1,
+                        child.context = {
+                            **(child.context or {}),
+                            "_review_respawn_count": cand["respawn_count"] + 1,
                         }
-                        session.add(c)
+                        session.add(child)
                     logger.warning(
-                        f"[ROLLUP] Respawned review for stale child {str(c.id)[:8]} "
-                        f"PR #{pr_number} → review {str(review_task.id)[:8]} "
-                        f"(respawn {_review_respawn_count(c)}/{MAX_REVIEW_RESPAWNS})"
+                        f"[ROLLUP] Respawned review for stale child {str(child.id)[:8]} "
+                        f"PR #{cand['pr_number']} → review {str(review_task.id)[:8]} "
+                        f"(respawn {_review_respawn_count(child)}/{MAX_REVIEW_RESPAWNS})"
                     )
-                elif review_task is None and c.requires_approval:
+                elif review_task is None and child.requires_approval:
                     # Cap exhaustion: _spawn_pipeline_task sets requires_approval=True on
                     # the child. But the child is COMPLETED, so the EVALUATING approval-gate
                     # timeout never fires on it — the parent would otherwise wait the full
@@ -1050,28 +1107,44 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     # via partial rollup rather than be approval-gated and timed out. (This
                     # also guards against the stuck-cycle / repeat-fingerprint paths, which set
                     # requires_approval on the child too, leaking into a parent escalation.)
-                    if _runtime_config.get("require_approval_gates", True) and not parent.requires_approval:
-                        parent.requires_approval = True
-                        logger.warning(
-                            f"[ROLLUP] Child {str(c.id)[:8]} PR #{pr_number} hit review-fix cap — "
-                            f"escalating: marked parent {parent.id} requires_approval"
-                        )
-                        try:
-                            await _maybe_create_failure_alert(
-                                parent,
-                                session,
-                                f"Rollup blocked: child PR #{pr_number} review-fix cap exhausted — manual intervention required",
-                            )
-                        except Exception as _alert_err:
-                            logger.warning(
-                                f"[ROLLUP] Failed to create cap-exhaustion alert for parent {parent.id}: {_alert_err}"
-                            )
+                    # Deferred to Phase D — the parent row is released here.
+                    if _runtime_config.get("require_approval_gates", True):
+                        cap_exhausted_prs.append(cand["pr_number"])
 
-            titles = [c.title[:40] for c in unmerged]
+            # Phase D: re-lock the parent for the terminal status write +
+            # cap-exhaustion escalation. If a peer mutated the rollup state during
+            # the unlocked spawn window, defer to the next cycle.
+            await session.commit()  # flush Phase C per-child mutations
+            parent = await _relock_parent(
+                session,
+                parent_id_local,
+                pre_respawn_snapshot,
+                parent_in_session=parent,
+            )
+            if parent is None:
+                return
+            if cap_exhausted_prs and not parent.requires_approval:
+                parent.requires_approval = True
+                for _pr in cap_exhausted_prs:
+                    logger.warning(
+                        f"[ROLLUP] Child PR #{_pr} hit review-fix cap — "
+                        f"escalating: marked parent {parent.id} requires_approval"
+                    )
+                    try:
+                        await _maybe_create_failure_alert(
+                            parent,
+                            session,
+                            f"Rollup blocked: child PR #{_pr} review-fix cap exhausted — manual intervention required",
+                        )
+                    except Exception as _alert_err:
+                        logger.warning(
+                            f"[ROLLUP] Failed to create cap-exhaustion alert for parent {parent.id}: {_alert_err}"
+                        )
+
             if respawned:
-                parent.latest_status_message = f"Recovering: respawned {respawned} review(s) for unmerged PR(s) — {', '.join(titles)}"
+                parent.latest_status_message = f"Recovering: respawned {respawned} review(s) for unmerged PR(s) — {', '.join(unmerged_titles)}"
             else:
-                parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(titles)}"
+                parent.latest_status_message = f"Blocked: {len(unmerged)} subtask(s) completed but PR not merged — {', '.join(unmerged_titles)}"
             logger.info(
                 f"[ROLLUP] Parent {parent.id} — {len(unmerged)} unmerged, {respawned} reviews respawned"
             )

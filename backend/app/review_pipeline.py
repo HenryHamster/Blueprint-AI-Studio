@@ -1163,6 +1163,36 @@ async def maybe_spawn_cross_cutting_safeguard(
     return True
 
 
+async def _emit_scope_overflow_pr_signal(session, signal: dict) -> None:
+    """Emit the deferred scope-overflow PR signal (label + comment) POST-commit.
+
+    C2 lock-window fix: token mint + add_issue_label + create_pr_comment are
+    GitHub network I/O that must NOT run while the per-PR advisory lock is held
+    (those round-trips can block 5-30s under rate-limit). The caller persists
+    the ``scope_overflow_pr_signal_emitted`` idempotency flag transactionally
+    BEFORE committing, so this is fire-and-forget / best-effort: it never
+    double-posts and a network failure here only drops one advisory
+    label/comment (logged). Token resolution itself is GitHub/secret I/O, so it
+    too stays out of the lock.
+    """
+    try:
+        from app.github import add_issue_label, create_pr_comment
+        from app.routers.agent import get_github_token_for_task
+
+        gh_token, owner, repo = await get_github_token_for_task(
+            signal["token_task_id"], session
+        )
+        _pr = signal["pr_number"]
+        await add_issue_label(gh_token, owner, repo, _pr, "scope-overflow")
+        await create_pr_comment(gh_token, owner, repo, _pr, signal["comment_body"])
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Failed to emit scope-overflow PR signal for PR "
+            f"#{signal['pr_number']}: {e}",
+            exc_info=True,
+        )
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -1218,6 +1248,13 @@ async def _spawn_pipeline_task(
     )  # local import to keep top of file lean
 
     await acquire_pr_spawn_lock(session, pr_number)
+
+    # C2 lock-window fix: the scope-overflow PR signal is GitHub network I/O
+    # and is deferred out of the advisory-lock-held section to a post-commit
+    # fire-and-forget block (see the spawn commit near the end of this
+    # function). None until a scope-overflow is detected and the signal has
+    # not yet been emitted for this chain.
+    _deferred_scope_overflow_signal: dict | None = None
 
     # Resolve the chain identifier once, so the "already merged" guard, the
     # dedup guard, and the spawn path all agree on which chain this is.
@@ -2165,43 +2202,46 @@ async def _spawn_pipeline_task(
             )
         )
         if not signal_already_emitted:
-            try:
-                from app.github import add_issue_label, create_pr_comment
-                from app.routers.agent import get_github_token_for_task
-
-                token_task_id = orig.id if orig is not None else source_task.id
-                gh_token, owner, repo = await get_github_token_for_task(
-                    token_task_id, session
-                )
-                changed_paths = overflow_warning.get("changed_files") or []
-                file_lines = "\n".join(f"- `{path}`" for path in changed_paths)
-                scope_label = overflow_warning.get("scope") or propagated_scope
-                comment_body = (
+            # C2 lock-window fix: the scope-overflow PR signal (token mint +
+            # add_issue_label + create_pr_comment) is GitHub network I/O and must
+            # NOT run while the per-PR advisory lock (acquired at the top of this
+            # function via acquire_pr_spawn_lock) is held — those round-trips can
+            # block 5-30s under rate-limit, starving concurrent spawn attempts on
+            # the same PR. The advisory lock only needs to protect the DB
+            # dedup/insert. So: mark the idempotency flag durable INSIDE this
+            # transaction (which dedups concurrent spawns the instant we commit),
+            # capture the signal payload, and emit the actual GitHub calls
+            # post-commit (after the lock releases). See the deferred-signal
+            # block after the spawn commit below.
+            changed_paths = overflow_warning.get("changed_files") or []
+            file_lines = "\n".join(f"- `{path}`" for path in changed_paths)
+            scope_label = overflow_warning.get("scope") or propagated_scope
+            _deferred_scope_overflow_signal = {
+                "token_task_id": orig.id if orig is not None else source_task.id,
+                "pr_number": pr_number,
+                "comment_body": (
                     "⚠️ Scope overflow detected for this PR.\n\n"
                     f"- Declared scope: `{scope_label}`\n"
                     f"- Non-test files changed: `{overflow_warning['non_test_file_count']}`\n"
                     f"- Scope budget: `{overflow_warning['threshold']}`\n\n"
                     "Affected files (capped):\n"
                     f"{file_lines}"
-                )
-                await add_issue_label(
-                    gh_token, owner, repo, pr_number, "scope-overflow"
-                )
-                await create_pr_comment(gh_token, owner, repo, pr_number, comment_body)
-
-                source_ctx_updated[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
-                source_task.context = source_ctx_updated
-                source_ctx = source_ctx_updated
-                if orig is not None:
-                    orig_ctx = dict(orig.context or {})
-                    orig_ctx[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
-                    orig.context = orig_ctx
-                    session.add(orig)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    f"[PIPELINE] Failed to emit scope-overflow PR signal for PR #{pr_number}: {e}",
-                    exc_info=True,
-                )
+                ),
+            }
+            # Persist the idempotency flag transactionally so a concurrent or
+            # later spawn on the same PR sees signal_already_emitted=True and
+            # does not double-post. The flag is durable on commit regardless of
+            # whether the post-commit GitHub call later succeeds — losing one
+            # advisory label/comment on a rare network failure is strictly
+            # better than holding a DB lock across that I/O.
+            source_ctx_updated[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
+            source_task.context = source_ctx_updated
+            source_ctx = source_ctx_updated
+            if orig is not None:
+                orig_ctx = dict(orig.context or {})
+                orig_ctx[SCOPE_OVERFLOW_PR_SIGNAL_EMITTED_KEY] = True
+                orig.context = orig_ctx
+                session.add(orig)
         if task_type == "review":
             overflow_instruction = (
                 "Scope-overflow context: this PR exceeded the declared scope file "
@@ -2459,4 +2499,11 @@ async def _spawn_pipeline_task(
     )
     _set_spawn_reason(source_task, SPAWN_REASON_SPAWNED)
     session.add(source_task)
+
+    # C2 lock-window fix: emit the deferred scope-overflow PR signal AFTER the
+    # spawn commit above released the per-PR advisory lock (helper does the
+    # token + label + comment best-effort, lock-free).
+    if _deferred_scope_overflow_signal is not None:
+        await _emit_scope_overflow_pr_signal(session, _deferred_scope_overflow_signal)
+
     return (new_task, True)

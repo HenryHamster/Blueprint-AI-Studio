@@ -1091,6 +1091,61 @@ async def reaper_service():
                             continue
                         task = fresh_task  # Use fresh data for all subsequent reads and writes
 
+                        # ── C2: per-orphan idempotency-key pre-query guard ──
+                        # The reap below can flip this task to QUEUED (rate-limit /
+                        # retry requeue) or EVALUATING (reaped-with-open-PR handoff),
+                        # both of which enter the partial unique index
+                        # ux_task_active_idempotency_key. If a peer already holds
+                        # this key in an active status, the BATCH commit at the end
+                        # of this loop raises IntegrityError and — because the commit
+                        # covers EVERY orphan's mutations — rolls back the entire
+                        # batch's recovery work, not just this one collision. Pre-query
+                        # the collision here and skip this orphan before mutating, so
+                        # the collision is prevented per-task rather than handled by an
+                        # all-batch rollback. The active duplicate already represents
+                        # the work, so reaping (which would requeue a redundant copy)
+                        # is moot. Mirrors the proven pre-query guard in
+                        # reaper_infra_recovery.py (~263-338).
+                        if task.idempotency_key:
+                            _dup_active = await session.scalar(
+                                select(Task.id).where(
+                                    Task.idempotency_key == task.idempotency_key,
+                                    Task.id != task.id,
+                                    Task.status.in_(
+                                        [
+                                            TaskStatus.QUEUED,
+                                            TaskStatus.PROVISIONING,
+                                            TaskStatus.IN_PROGRESS,
+                                            TaskStatus.EVALUATING,
+                                        ]
+                                    ),
+                                )
+                            )
+                            if _dup_active is not None:
+                                logger.info(
+                                    "[REAPER] Skipping orphan reap of %s — "
+                                    "idempotency_key already held by active task %s; "
+                                    "the active duplicate represents the work, reap is "
+                                    "moot (re-qualifies next cycle if it doesn't)",
+                                    task_id,
+                                    _dup_active,
+                                )
+                                # VM-GC: the VM-collection step (~1248) lives in the
+                                # reap body AFTER this guard, so a bare ``continue``
+                                # would strand this orphan's dead VM until the active
+                                # duplicate frees the idempotency key. The orphan is a
+                                # dead/stuck task (its agent died or stalled) and the
+                                # active duplicate owns a SEPARATE VM, so this VM is
+                                # collectible now. Schedule it for deletion in the
+                                # post-commit VM sweep (~2493). _ensure_vm_deleted is
+                                # idempotent, so re-collecting on a later cycle (if the
+                                # orphan re-qualifies before its row is cleaned up) is
+                                # harmless.
+                                if task.vm_instance_id:
+                                    _reaper_old_vms[str(task.id)] = task.vm_instance_id
+                                _orphan_reap_crash_streaks.pop(str(task_id), None)
+                                continue
+
                         # Determine why the reaper flagged this task. The classification slices
                         # into three cases based on status + which clock expired first.
                         if (
