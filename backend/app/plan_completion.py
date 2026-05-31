@@ -343,9 +343,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         session.add(child)
         child_tasks.append(child)
 
-    await session.commit()
-    for ct in child_tasks:
-        await session.refresh(ct)
+    # Flush to assign PKs without committing — children are not yet visible
+    # to the dispatcher because the transaction is still open.
+    await session.flush()
 
     # Inject serial dependencies for subtasks that share files (additive only).
     # Save original (explicit) deps so we can restore them if injection creates a cycle.
@@ -373,8 +373,6 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
 
     _log_file_overlaps(subtasks, "PLAN")
 
-    await session.commit()
-
     for ct in child_tasks:
         history = TaskHistory(
             task_id=ct.id,
@@ -385,11 +383,18 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
             },
         )
         session.add(history)
+
+    # Single atomic commit: children, their depends_on, and history records
+    # all land together so the dispatcher never sees QUEUED children with
+    # empty depends_on (the window that caused parallel dispatch instead of
+    # the plan-specified serial order).
+    await session.commit()
+
+    for ct in child_tasks:
         await broadcast_to_project(
             str(task.project_id),
             "task_updated",
             {"task_id": str(ct.id), "status": TaskStatus.QUEUED},
         )
 
-    await session.commit()
     logger.info(f"[PLAN] Created {len(child_tasks)} subtasks from plan {task.id}")
