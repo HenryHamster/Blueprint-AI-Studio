@@ -9951,7 +9951,11 @@ async def test_mtta_per_episode_anchoring_on_rearmed_case(db_session):
     A case with two fix cycles must report per-episode investigate→merge durations
     instead of inflated lifetime spans.
 
-    Timeline (fixed absolute datetimes to avoid flakiness):
+    Timeline (anchored relative to *now* so the case always lands inside the
+    30-day query window in ``get_regression_mtta_data`` — a fixed absolute
+    datetime drifts out of that window as wall-clock time advances and the
+    case silently disappears from the result, which is exactly the
+    deterministic ``KeyError`` this regression test guards against):
       T+0h  investigate_spawned_at  → episode-1 anchor
       T+2h  cycle-1 merged_at       → 7200s from episode-1 anchor  ✓
       T+3h  cycle-1 recovered_at    → episode-2 anchor advances here
@@ -9968,7 +9972,17 @@ async def test_mtta_per_episode_anchoring_on_rearmed_case(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    t0 = datetime(2026, 5, 1, 8, 0, 0)  # investigate_spawned_at
+    # Anchor the whole timeline a few days ago (relative to now), not at a
+    # fixed calendar date: get_regression_mtta_data only returns cases whose
+    # first_seen_at >= now - window_days (30d). A hardcoded 2026-05-01 anchor
+    # silently aged out of that window, dropping the case from the result and
+    # raising KeyError below regardless of test sharding/order. T+0h is the
+    # episode-1 investigate anchor; the per-episode durations are unchanged.
+    t0 = _utcnow() - timedelta(days=3)  # investigate_spawned_at
+    ep1_merged = t0 + timedelta(hours=2)  # 7200s from episode-1 anchor
+    ep1_recovered = t0 + timedelta(hours=3)  # advances the episode-2 anchor
+    ep2_merged = ep1_recovered + timedelta(hours=2)  # 7200s from episode-2 anchor
+    ep2_recovered = ep1_recovered + timedelta(hours=3)
     case = RegressionRemediationCase(
         project_id=project.id,
         regression_class="sr_catch_rate:correctness:rearmed",
@@ -9977,13 +9991,13 @@ async def test_mtta_per_episode_anchoring_on_rearmed_case(db_session):
         investigate_spawned_at=t0,
         fingerprint_to_fix_log=[
             # Episode 1: merged 2h after investigate_spawned_at → 7200s
-            {"fix_pr_number": 101, "merged_at": "2026-05-01T10:00:00"},
+            {"fix_pr_number": 101, "merged_at": ep1_merged.isoformat()},
             # Episode 1 recovery: 1h after merge → anchor for episode 2
-            {"recovered_at": "2026-05-01T11:00:00", "post_merge_value": 0.65},
-            # Episode 2: merged 2h after episode-2 anchor (11:00) → 7200s
+            {"recovered_at": ep1_recovered.isoformat(), "post_merge_value": 0.65},
+            # Episode 2: merged 2h after episode-2 anchor → 7200s
             # Without per-episode fix this would be measured from T+0h → 18000s
-            {"fix_pr_number": 202, "merged_at": "2026-05-01T13:00:00"},
-            {"recovered_at": "2026-05-01T14:00:00", "post_merge_value": 0.72},
+            {"fix_pr_number": 202, "merged_at": ep2_merged.isoformat()},
+            {"recovered_at": ep2_recovered.isoformat(), "post_merge_value": 0.72},
         ],
     )
     db_session.add(case)

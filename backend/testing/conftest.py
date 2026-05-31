@@ -117,6 +117,13 @@ async def db_session():
                 # Remaining dependents of project
                 "projectmember",
                 "residualremediationcase",
+                # regressionremediationcase has ON DELETE CASCADE on project_id,
+                # so the project DELETE below already reaps it — but deleting it
+                # explicitly here keeps cleanup robust if that cascade is ever
+                # weakened and stops leaked regression cases from one test
+                # bleeding into an unscoped get_regression_mtta_data() query in
+                # a sibling test that shares the same shard.
+                "regressionremediationcase",
                 "systemmaturity",
                 "messageslastseen",
                 "messagesnoiseprefs",
