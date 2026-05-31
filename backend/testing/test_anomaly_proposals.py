@@ -467,8 +467,15 @@ async def test_end_to_end_3_cycles_generates_proposal():
 
 @pytest.mark.asyncio
 async def test_direction_anomalies_tracked_with_unique_keys():
-    """Direction-level anomalies use Direction_<id> keys, not a shared 'Direction' key."""
+    """Direction-level anomalies use per-direction, per-signal keys.
+
+    The merge-decline signal persists under ``Direction_<id>_merge_decline``
+    (distinct from the fail-rate signal's ``Direction_<id>_fail_rate``), and
+    never the bare shared ``Direction`` / ``Direction_<id>`` key.
+    """
     project_id = uuid.uuid4()
+    # Both directions trip ONLY the merge-decline signal (merge rate 0.8→0.4→0.0,
+    # zero task failures so the fail-rate signal stays quiet).
     dir1 = {
         "id": "d-aaa00001",
         "text": "First direction",
@@ -500,11 +507,14 @@ async def test_direction_anomalies_tracked_with_unique_keys():
 
     proj_key = str(project_id)
     anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
-    # Each direction should have its own key
-    assert "Direction_d-aaa00001" in anomalies
-    assert "Direction_d-bbb00002" in anomalies
-    # The generic "Direction" key should NOT exist
+    # Each direction should have its own per-signal key
+    assert "Direction_d-aaa00001_merge_decline" in anomalies
+    assert "Direction_d-bbb00002_merge_decline" in anomalies
+    # The generic "Direction" key should NOT exist, nor the pre-fix bare
+    # per-direction key that collided across signal types.
     assert "Direction" not in anomalies
+    assert "Direction_d-aaa00001" not in anomalies
+    assert "Direction_d-bbb00002" not in anomalies
 
 
 @pytest.mark.asyncio
@@ -515,7 +525,7 @@ async def test_direction_anomaly_proposal_after_3_occurrences():
     now = _utcnow()
 
     _shared_state.persistent_anomalies[proj_key] = {
-        "Direction_d-test0001": {
+        "Direction_d-test0001_merge_decline": {
             "first_seen": (now - timedelta(hours=72)).isoformat(),
             "last_seen": now.isoformat(),
             "occurrence_count": 3,
@@ -534,11 +544,13 @@ async def test_direction_anomaly_proposal_after_3_occurrences():
     d = project.directions[0]
     assert d["status"] == "proposed"
     assert d["proposed_by"] == "ANOMALY_DETECTOR"
-    assert "Direction_d-test0001" in d["text"]
+    # The proposal path keys off the ``Direction_`` prefix, which still matches
+    # the new per-signal keys.
+    assert "Direction_d-test0001_merge_decline" in d["text"]
     assert (
-        _shared_state.persistent_anomalies[proj_key]["Direction_d-test0001"][
-            "occurrence_count"
-        ]
+        _shared_state.persistent_anomalies[proj_key][
+            "Direction_d-test0001_merge_decline"
+        ]["occurrence_count"]
         == 0
     )
 
@@ -576,10 +588,60 @@ async def test_multiple_direction_anomalies_tracked_independently():
         session = _make_session(tasks=[], project=project)
         await _compute_research_anomalies(project_id, session)
 
+    # Each direction trips ONLY the fail-rate signal (2-cycle history, >50%
+    # failures), so it persists under the per-signal ``_fail_rate`` key.
     proj_key = str(project_id)
     anomalies = _shared_state.persistent_anomalies[proj_key]
-    assert anomalies["Direction_d-ind00001"]["occurrence_count"] == 3
-    assert anomalies["Direction_d-ind00002"]["occurrence_count"] == 3
+    assert anomalies["Direction_d-ind00001_fail_rate"]["occurrence_count"] == 3
+    assert anomalies["Direction_d-ind00002_fail_rate"]["occurrence_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_direction_co_firing_signals_both_persist():
+    """Regression: a direction tripping BOTH direction signals in one cycle
+    must persist BOTH anomalies, not have one overwrite the other.
+
+    Before the fix both signals derived the same ``Direction_<id>`` key, so
+    whichever was processed second silently clobbered the first (data loss).
+    This direction's history trips:
+      - merge-decline: merge rate 0.80 → 0.40 → 0.00 (monotonic, >0.1 start)
+      - fail-rate:     last 2 cycles 7/10 = 70% failures (>50%)
+    """
+    project_id = uuid.uuid4()
+    both = {
+        "id": "d-both0001",
+        "text": "Direction tripping both signals",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [
+            {"tasks_created": 5, "prs_merged": 4, "tasks_failed": 0},
+            {"tasks_created": 5, "prs_merged": 2, "tasks_failed": 3},
+            {"tasks_created": 5, "prs_merged": 0, "tasks_failed": 4},
+        ],
+    }
+    project = make_project(directions=[both])
+    session = _make_session(tasks=[], project=project)
+
+    await _compute_research_anomalies(project_id, session)
+
+    proj_key = str(project_id)
+    anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
+
+    # BOTH signal types must survive under distinct keys.
+    assert "Direction_d-both0001_merge_decline" in anomalies, (
+        "merge-decline anomaly was lost — key collision with fail-rate signal"
+    )
+    assert "Direction_d-both0001_fail_rate" in anomalies, (
+        "fail-rate anomaly was lost — key collision with merge-decline signal"
+    )
+    # The pre-fix colliding key must not exist.
+    assert "Direction_d-both0001" not in anomalies
+    # Each is its own independent entry with its own severity.
+    assert anomalies["Direction_d-both0001_merge_decline"]["severity"] == "medium"
+    assert anomalies["Direction_d-both0001_fail_rate"]["severity"] == "high"
+    assert anomalies["Direction_d-both0001_merge_decline"]["occurrence_count"] == 1
+    assert anomalies["Direction_d-both0001_fail_rate"]["occurrence_count"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

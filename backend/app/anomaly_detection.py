@@ -570,6 +570,10 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                     anomalies.append(
                         {
                             "signal": f"Direction '{d_id}' merge rate declining: {rates[0]:.2f} → {rates[1]:.2f} → {rates[2]:.2f}",
+                            # Distinct persistence key so a direction tripping both
+                            # the merge-decline and the fail-rate signal keeps both
+                            # entries instead of one silently overwriting the other.
+                            "anomaly_key": f"Direction_{d_id}_merge_decline",
                             "severity": "medium",
                             "details": (
                                 f'Direction "{d_text}" (id: {d_id}) has seen a consistent decline in '
@@ -589,6 +593,9 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
                     anomalies.append(
                         {
                             "signal": f"Direction '{d_id}' has {fail_pct}% task failure rate in last 2 cycles",
+                            # Distinct persistence key (see merge-decline signal above)
+                            # so both direction signals survive when they co-fire.
+                            "anomaly_key": f"Direction_{d_id}_fail_rate",
                             "severity": "high",
                             "details": (
                                 f'Direction "{d_text}" (id: {d_id}) had {total_failed}/{total_created} tasks fail '
@@ -609,11 +616,19 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     now_iso = now.isoformat()
     seen_keys: set = set()
     for a in anomalies:
-        # Build a stable key from the signal's failure class or direction id
+        # Build a stable key from the signal's failure class or direction id.
         signal = a["signal"]
+        # Prefer an explicit anomaly_key the signal carries. Direction-level
+        # signals set this so each signal *type* gets its own persistence key
+        # (e.g. Direction_<id>_merge_decline vs Direction_<id>_fail_rate) —
+        # otherwise a direction tripping both would have one entry silently
+        # overwrite the other and lose an anomaly type.
+        explicit_key = a.get("anomaly_key")
+        if explicit_key:
+            anomaly_key = explicit_key
         # Extract anomaly key: e.g. "CODE_ERROR" from "CODE_ERROR failures..."
         # or "Direction_d-abc123" from "Direction 'd-abc123' ..."
-        if signal.startswith("Direction '"):
+        elif signal.startswith("Direction '"):
             # Include direction ID to avoid key collisions across directions
             parts = signal.split("'")
             anomaly_key = (

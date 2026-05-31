@@ -361,6 +361,9 @@ async def test_declining_merge_rate_produces_medium_anomaly():
     ]
     assert len(medium) >= 1
     assert "merge rate declining" in medium[0]["signal"]
+    # The merge-decline signal carries its own per-signal persistence key so it
+    # can never collide with the fail-rate signal for the same direction.
+    assert medium[0]["anomaly_key"] == "Direction_d-test0001_merge_decline"
 
 
 @pytest.mark.asyncio
@@ -440,6 +443,9 @@ async def test_high_direction_failure_rate_produces_high_anomaly():
     ]
     assert len(high) >= 1
     assert "failure rate" in high[0]["signal"]
+    # The fail-rate signal carries its own per-signal persistence key, distinct
+    # from the merge-decline signal's, so co-firing signals don't collide.
+    assert high[0]["anomaly_key"] == "Direction_d-faildir1_fail_rate"
 
 
 @pytest.mark.asyncio

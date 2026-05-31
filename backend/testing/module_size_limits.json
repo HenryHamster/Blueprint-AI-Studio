@@ -28,7 +28,7 @@
     "routers/admin_agent_ops.py": 1700,
     "routers/admin_pool_accounts.py": 1200,
     "max_plan_pool.py": 2750,
-    "anomaly_detection.py": 2050,
+    "anomaly_detection.py": 2100,
     "routers/agent.py": 5550,
     "services.py": 2950,
     "routers/agent_status.py": 3850,
