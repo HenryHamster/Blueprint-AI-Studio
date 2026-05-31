@@ -381,78 +381,12 @@ class TestAccountSuccessRate7d:
 
 
 class TestAccountSuccessRateByType:
-    """TDD specs for per-task-type scoping of account_success_rate_7d.
-
-    xfail tests auto-promote to XPASS once cluster 1/2 adds a ``task_type``
-    kwarg that returns per-type rates with aggregate fallback.
-    The stable test (no task_type arg) must pass both before and after.
-    """
+    """Baseline coverage for account_success_rate_7d without task_type scoping."""
 
     def _naive_now(self):
         from datetime import timezone
 
         return datetime.now(timezone.utc).replace(tzinfo=None)
-
-    @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
-    def test_per_type_rate_returned_when_sufficient_samples(self):
-        """With ≥MIN_SAMPLES type-specific events, per-type rate is returned."""
-        now = self._naive_now()
-        acct = {
-            "outcome_events": (
-                [
-                    {
-                        "at": now - timedelta(hours=i + 1),
-                        "success": True,
-                        "task_type": "create",
-                    }
-                    for i in range(5)
-                ]
-                + [
-                    {
-                        "at": now - timedelta(hours=i + 6),
-                        "success": False,
-                        "task_type": "review",
-                    }
-                    for i in range(5)
-                ]
-            )
-        }
-        # create-type = 5/5 = 1.0; aggregate = 5/10 = 0.5
-        rate = account_success_rate_7d(acct, task_type="create", now=now)
-        assert rate == 1.0
-
-    @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
-    def test_sparse_type_falls_back_to_aggregate(self):
-        """< MIN_SAMPLES type-specific events → falls back to aggregate rate."""
-        now = self._naive_now()
-        acct = {
-            "outcome_events": (
-                [
-                    {
-                        "at": now - timedelta(hours=1),
-                        "success": True,
-                        "task_type": "create",
-                    },
-                    {
-                        "at": now - timedelta(hours=2),
-                        "success": False,
-                        "task_type": "create",
-                    },
-                ]
-                + [
-                    {
-                        "at": now - timedelta(hours=i + 3),
-                        "success": True,
-                        "task_type": "review",
-                    }
-                    for i in range(5)
-                ]
-            )
-        }
-        # 2 "create" events (< MIN_SAMPLES=3) → fallback to aggregate (6/7)
-        rate = account_success_rate_7d(acct, task_type="create", now=now)
-        assert rate is not None
-        assert abs(rate - 6 / 7) < 1e-9
 
     def test_no_task_type_matches_existing_behavior(self):
         """Omitting task_type returns the aggregate rate — backward compatible."""

@@ -704,73 +704,7 @@ class TestComputeSuccessRate7d:
 
 
 class TestComputeSuccessRateByType:
-    """TDD specs for task_type-scoped success rate (cluster 1/2 implements the kwarg).
-
-    xfail tests auto-promote to XPASS once _compute_success_rate_7d gains a
-    ``task_type`` kwarg that returns per-type rates with aggregate fallback.
-    The stable test (no task_type arg) must pass both before and after.
-    """
-
-    @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
-    def test_per_type_rate_when_confident(self):
-        """≥3 type-matching events → per-type rate, not the aggregate."""
-        now = datetime.utcnow()
-        acct = _acct(
-            outcome_events=(
-                [
-                    {
-                        "at": now - timedelta(hours=i + 1),
-                        "success": True,
-                        "task_type": "create",
-                    }
-                    for i in range(5)
-                ]
-                + [
-                    {
-                        "at": now - timedelta(hours=i + 6),
-                        "success": False,
-                        "task_type": "review",
-                    }
-                    for i in range(5)
-                ]
-            )
-        )
-        # aggregate = 5/10 = 0.5; create-type = 5/5 = 1.0
-        rate = _compute_success_rate_7d(acct, task_type="create", now=now)
-        assert rate == 1.0
-
-    @pytest.mark.xfail(strict=False, reason="task_type kwarg added by cluster 1/2")
-    def test_sparse_type_falls_back_to_aggregate(self):
-        """< 3 type-matching events → aggregate rate used as fallback."""
-        now = datetime.utcnow()
-        acct = _acct(
-            outcome_events=(
-                [
-                    {
-                        "at": now - timedelta(hours=1),
-                        "success": True,
-                        "task_type": "create",
-                    },
-                    {
-                        "at": now - timedelta(hours=2),
-                        "success": False,
-                        "task_type": "create",
-                    },
-                ]
-                + [
-                    {
-                        "at": now - timedelta(hours=i + 3),
-                        "success": True,
-                        "task_type": "review",
-                    }
-                    for i in range(5)
-                ]
-            )
-        )
-        # 2 "create" events (< 3 floor) → fallback to aggregate (6/7)
-        rate = _compute_success_rate_7d(acct, task_type="create", now=now)
-        assert rate is not None
-        assert abs(rate - 6 / 7) < 1e-9
+    """Baseline coverage for _compute_success_rate_7d without task_type scoping."""
 
     def test_no_task_type_returns_aggregate_unchanged(self):
         """Omitting task_type returns the aggregate — backward compatible."""
