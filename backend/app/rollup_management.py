@@ -640,11 +640,20 @@ def _build_rollup_pr_body(
     return "\n".join(lines)
 
 
-async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> None:
+async def _check_and_trigger_rollup(
+    child_task: Task, session: AsyncSession, progress_cb=None
+) -> None:
     """Check if all siblings are done and trigger rollup PR for the parent.
 
     Called after a child task completes, fails, or is cancelled.
     Also called from admin PATCH when status/context changes.
+
+    ``progress_cb`` (C3): an optional zero-arg heartbeat invoked inside the
+    per-child PR-verification loop. The reaper's stale-EVALUATING sweep passes
+    ``_mark_reaper_progress`` so that verifying many unmerged children (each a
+    serial GitHub round-trip via _verify_pr_merged) keeps the reaper liveness
+    heartbeat fresh instead of silently consuming the whole cycle budget on one
+    fan-heavy parent. Defaults to a no-op for the request-path callers.
     """
     from app.main import _maybe_create_failure_alert, _utcnow
     from app.broadcast import broadcast_to_project
@@ -847,6 +856,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
     # rollup-prep loop) re-derive failed/completed_merged from `c.status`
     # on the same cached list and handle the post-verify FAILED case.
     for c in completed_children:
+        # C3 heartbeat: each _verify_pr_merged is a serial GitHub round-trip;
+        # a parent with many unmerged children would otherwise consume the
+        # caller's whole liveness budget on this loop alone. No-op unless the
+        # reaper sweep passed _mark_reaper_progress.
+        if progress_cb is not None:
+            progress_cb()
         if not await _verify_pr_merged(c, session):
             all_done = False
 

@@ -189,8 +189,16 @@ async def _sweep_stale_residual_cases(session) -> int:
     return closed
 
 
+def _noop_progress() -> None:
+    """Default heartbeat — does nothing. Overridden by the reaper, which passes
+    ``_mark_reaper_progress`` so this sweep's sub-steps keep the reaper liveness
+    heartbeat fresh (cluster C3). A late-bound callback avoids a circular import
+    (reaper.py imports this module)."""
+    return None
+
+
 async def run_infra_recovery_and_hold_maintenance(
-    session, now, just_reaped_ids=None
+    session, now, just_reaped_ids=None, progress_cb=None
 ) -> None:
     """Run Step 5 infrastructure-recovery sweep and hold-maintenance sub-steps.
 
@@ -202,11 +210,18 @@ async def run_infra_recovery_and_hold_maintenance(
     Step 5e: Close stale ACTIVE ResidualRemediationCase rows.
 
     Preserves all log prefixes and ordering from the original inlined code.
+
+    ``progress_cb`` (C3): called at the start of each sub-step so the reaper's
+    in-cycle liveness heartbeat advances even when one sub-step (e.g. serial
+    resurrection DB work + broadcast fan-out) runs long. Defaults to a no-op so
+    direct callers / tests need not supply it.
     """
+    _heartbeat = progress_cb or _noop_progress
     # Step 5: Infrastructure recovery sweep — resurrect recently-failed tasks
     # that exhausted their retry budget due to transient infrastructure failures
     # once the specific root cause has resolved.  Conservative: max 1 resurrection
     # per task, only for confirmed infra failure classes, only when infra is healthy.
+    _heartbeat()
     try:
         from app.max_plan_pool import (
             _all_accounts,
@@ -461,6 +476,7 @@ async def run_infra_recovery_and_hold_maintenance(
     # Step 5a: Clear infra holds on directions whose root-cause signal has recovered.
     # Mirrors the signal checks in Step 5 but applies to direction-level holds
     # in direction_failure_streaks rather than individual task resurrection.
+    _heartbeat()
     try:
         from app.max_plan_pool import (
             _all_accounts,
@@ -522,6 +538,7 @@ async def run_infra_recovery_and_hold_maintenance(
     # keeps the hold set forever — the 4-hour timeout is the only
     # escape. That strands the task behind a direction that no
     # longer exists in any project's directions list.
+    _heartbeat()
     try:
         await _sweep_orphan_direction_holds(session)
     except Exception as e:
@@ -537,6 +554,7 @@ async def run_infra_recovery_and_hold_maintenance(
     # user_debug_spawn_times all accumulate keys monotonically
     # over an instance's lifetime. On Cloud Run instances that
     # stay up for days this contributes to 4GB OOMs.
+    _heartbeat()
     try:
         from app.shared_state import sweep_stale_in_memory_state
 
@@ -553,6 +571,7 @@ async def run_infra_recovery_and_hold_maintenance(
     # Step 5b: Clear stale or malformed retry_after on QUEUED tasks.
     # A far-future or unparseable value permanently blocks dispatch
     # (orchestrator skips tasks where retry_after > now).
+    _heartbeat()
     try:
         # Audit R3-W2 (H7): cap per-tick fetch at _BATCH rows.
         # Audit R4-W2 (M2): filter ``retry_after_until IS NOT NULL``
@@ -613,6 +632,7 @@ async def run_infra_recovery_and_hold_maintenance(
     # has not been seen in the last 72 h. Without this sweep the table
     # accumulates stale ACTIVE rows for fingerprints that stopped occurring
     # organically (infra recovered, unrelated PR fixed the root cause, etc.).
+    _heartbeat()
     try:
         await _sweep_stale_residual_cases(session)
     except Exception as e:

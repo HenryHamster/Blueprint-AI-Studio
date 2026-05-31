@@ -294,6 +294,17 @@ async def _post_reaper_recovery_alert(probe_failures: int) -> None:
 # deferral queue needed). Override via runtime_config["reaper_max_orphans_per_cycle"].
 _REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT = 60
 
+# C3: per-cycle cap on the Step 3/4 stale-EVALUATING sweep. Each parent costs
+# either serial GitHub I/O (_check_and_trigger_rollup, Step 3) or a DB-heavy
+# requeue (_requeue_parent_task, Step 4). The previous unbounded SELECT could
+# pull every stale EVALUATING parent at once, growing the reaper cycle past
+# REAPER_HANG_SECONDS under a backlog (the 2026-05-30 watchdog-kill mechanism).
+# Generous default; deferred parents re-qualify next cycle (the sweep runs
+# every reaper cycle and selects oldest-stale first).
+_REAPER_MAX_EVALUATING_PER_CYCLE = int(
+    os.getenv("REAPER_MAX_EVALUATING_PER_CYCLE", "100")
+)
+
 # Orphan-priority buckets (lower = processed first). Time-sensitive orphans are
 # reaped before the cap can truncate the tail.
 _ORPHAN_PRIORITY_RATE_LIMITED = 0  # rate-limited / quota — reroute ASAP
@@ -2514,7 +2525,15 @@ async def reaper_service():
                         _mark_reaper_progress()
                         if task.status == TaskStatus.FAILED and task.parent_task_id:
                             try:
-                                await _check_and_trigger_rollup(task, session)
+                                # C3: pass the heartbeat so the per-child
+                                # _verify_pr_merged loop inside the rollup check
+                                # also heartbeats — a fan-heavy parent's PR-verify
+                                # round-trips cannot silently exhaust
+                                # REAPER_HANG_SECONDS on this loop either (mirrors
+                                # the stale-EVALUATING sweep at reaper.py:2789).
+                                await _check_and_trigger_rollup(
+                                    task, session, progress_cb=_mark_reaper_progress
+                                )
                             except Exception as e:
                                 logger.error(
                                     f"[REAPER] Rollup check failed for task {task.id}: {e}",
@@ -2697,11 +2716,29 @@ async def reaper_service():
                                     Task.status == TaskStatus.EVALUATING,
                                     Task.updated_at < stale_cutoff,
                                 )
+                                # C3: per-cycle row cap. Step 3 calls
+                                # _check_and_trigger_rollup (serial GitHub I/O)
+                                # per parent and Step 4 calls _requeue_parent_task
+                                # (DB-heavy) per parent. Without a cap a large
+                                # stale-EVALUATING backlog grows the reaper cycle
+                                # past REAPER_HANG_SECONDS mid-I/O — the same O(N)
+                                # saturation the orphan cap bounds. Oldest-stale
+                                # first (most-stuck parents); deferred parents
+                                # re-qualify next cycle (status+age scan, no
+                                # deferral queue needed).
+                                .order_by(Task.updated_at.asc())
+                                .limit(_REAPER_MAX_EVALUATING_PER_CYCLE)
                             )
                         )
                         .scalars()
                         .all()
                     )
+                    if len(evaluating_parents) >= _REAPER_MAX_EVALUATING_PER_CYCLE:
+                        logger.warning(
+                            "[REAPER] Hit per-cycle cap of %d stale EVALUATING "
+                            "parents — remainder deferred to next cycle",
+                            _REAPER_MAX_EVALUATING_PER_CYCLE,
+                        )
                     if evaluating_parents:
                         _parent_ids = [p.id for p in evaluating_parents]
                         _all_children = (
@@ -2754,7 +2791,14 @@ async def reaper_service():
                             try:
                                 child = await session.get(Task, completed_child_id)
                                 if child is not None:
-                                    await _check_and_trigger_rollup(child, session)
+                                    # C3: pass the heartbeat so _check_and_trigger_rollup's
+                                    # per-child PR-verify loop keeps the reaper
+                                    # liveness fresh on a fan-heavy parent.
+                                    await _check_and_trigger_rollup(
+                                        child,
+                                        session,
+                                        progress_cb=_mark_reaper_progress,
+                                    )
                             except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",
@@ -2877,11 +2921,22 @@ async def reaper_service():
                 # infra hold clearance (5a), orphan hold sweep (5c),
                 # in-memory state pruning (5d), stale retry_after sweep (5b),
                 # and stale residual case closure (5e).
+                # C3: Steps 5-10 previously shared one REAPER_HANG_SECONDS budget
+                # with no intra-step heartbeat, so a slow Step 5 sub-step (serial
+                # resurrection DB work, broadcast fan-out) could exhaust the
+                # window before Step 6 even started. Heartbeat at the start of
+                # each step, and pass the heartbeat into Step 5 so its sub-steps
+                # mark progress too — liveness now tracks step-level progress.
+                _mark_reaper_progress()
                 await run_infra_recovery_and_hold_maintenance(
-                    session, now, just_reaped_ids=_orphaned_task_ids
+                    session,
+                    now,
+                    just_reaped_ids=_orphaned_task_ids,
+                    progress_cb=_mark_reaper_progress,
                 )
 
                 # Step 6: QUEUED task age alerts — 3-tier INFO/WARNING/ERROR escalation.
+                _mark_reaper_progress()
                 try:
                     await sweep_queued_age_alerts(
                         session, now,
@@ -2896,6 +2951,7 @@ async def reaper_service():
                         await session.rollback()
 
                 # Step 7: Stalled strategic-cycle reaper.
+                _mark_reaper_progress()
                 try:
                     await sweep_stalled_strategic_cycles(
                         session, now,
@@ -2909,6 +2965,7 @@ async def reaper_service():
                         await session.rollback()
 
                 # Step 8: Per-(provider, model) regression scan (~15min cadence).
+                _mark_reaper_progress()
                 try:
                     await sweep_regression_scan(session)
                 except Exception as e:
@@ -2922,6 +2979,7 @@ async def reaper_service():
                 # ``session_factory=AsyncSessionLocal`` is passed explicitly so the
                 # per-version finalize session uses the same engine as this scan session
                 # (important under the test harness where the reaper patches AsyncSessionLocal).
+                _mark_reaper_progress()
                 try:
                     await sweep_stuck_qualifications(
                         session, session_factory=AsyncSessionLocal
@@ -2938,6 +2996,7 @@ async def reaper_service():
                     raise
 
                 # Step 10: Routine message retention — purge stale routine ops messages.
+                _mark_reaper_progress()
                 try:
                     await sweep_routine_message_retention(session)
                 except Exception as e:

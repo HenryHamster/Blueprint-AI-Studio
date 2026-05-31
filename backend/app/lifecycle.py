@@ -756,6 +756,155 @@ async def lifespan(app):
 
     branch_reconciliation_task = asyncio.create_task(_branch_reconciliation_service())
 
+    # ── Cluster C3: EVALUATING-timeout recovery as a dedicated background task ──
+    # Previously _check_evaluating_timeouts ran INLINE on the orchestrator's
+    # monitoring tail every 300s. That coupled the leader's dispatch-cycle
+    # liveness to the sweep's serial GitHub I/O (get_pull_request /
+    # close_pull_request / _check_and_trigger_rollup per stale EVALUATING parent):
+    # a large backlog grew the leader cycle past ORCHESTRATOR_HANG_SECONDS and
+    # the watchdog killed it mid-recovery (2026-05-30). Moving it to its own
+    # asyncio.Task with a per-tick asyncio.timeout means the dispatch cycle
+    # neither awaits it nor is timed by it; a wedged tick is bounded and the
+    # supervisor below restarts it independently. Cadence preserved at 300s.
+    # Own liveness marker for the extracted sweep (fix D) — separate from the
+    # orchestrator_worker's heartbeat so a foreign task can't mask a hung worker.
+    _eval_svc_last_progress = _utcnow()
+
+    async def _evaluating_timeout_service():
+        """Leader-only periodic EVALUATING-timeout recovery sweep (C3).
+
+        Bounded with a per-tick asyncio.timeout so a hung GitHub call cannot pin
+        this task indefinitely; the monitor restarts it on a crash/timeout.
+
+        Liveness (fix D): the sweep pumps THIS task's own heartbeat marker, not
+        the orchestrator_worker's shared ``_orchestrator_last_progress`` — a
+        foreign task pumping the worker's marker would mask a genuinely hung
+        worker from its /health gate + watchdog. This task's own bound is the
+        per-tick asyncio.timeout below + _monitor_background_tasks restart on
+        crash/timeout; ``_eval_svc_last_progress`` is recorded for future
+        per-task supervision/metrics without touching the worker's marker.
+        """
+        from app.services import _check_evaluating_timeouts
+
+        _SCAN_INTERVAL = 300  # mirrors the prior inline cadence
+        _TICK_BUDGET = 270  # < interval, so ticks never overlap-stack
+
+        def _eval_svc_heartbeat() -> None:
+            # Own liveness marker — deliberately NOT _mark_orchestrator_progress.
+            nonlocal _eval_svc_last_progress
+            _eval_svc_last_progress = _utcnow()
+
+        while True:
+            await asyncio.sleep(_SCAN_INTERVAL)
+            try:
+                async with asyncio.timeout(_TICK_BUDGET):
+                    await _check_evaluating_timeouts(progress_cb=_eval_svc_heartbeat)
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                # Expected, recoverable control flow (not a crash): the next
+                # tick retries and the underlying sweep is row-capped + per-call
+                # bounded, so a single slow tick is bounded, not fatal.
+                logger.warning(
+                    "[EVAL_TIMEOUT_SVC] tick exceeded %ds budget — abandoning this "
+                    "tick; next tick retries (rows are bounded + heartbeated)",
+                    _TICK_BUDGET,
+                )
+            except Exception as svc_exc:
+                logger.error(
+                    "[EVAL_TIMEOUT_SVC] tick error: %s", svc_exc, exc_info=True
+                )
+
+    evaluating_timeout_task = asyncio.create_task(_evaluating_timeout_service())
+
+    # ── Cluster C3: regression dispatcher + watchdog alarms as their own task ──
+    # Previously this ran INLINE at the top of every orchestrator_worker cycle
+    # (60s gate). It iterates per autonomous project, evaluating regression
+    # signals and running watchdog alarms — work that scales with project count
+    # and previously timed/blocked the leader's dispatch cycle. Extracting it
+    # mirrors the reaper/regression-recovery pattern: own schedule, own per-tick
+    # timeout, own supervisor restart. Cadence preserved at 60s.
+    async def _regression_dispatch_service():
+        """Leader-only pipeline-regression dispatcher + watchdog alarms (C3).
+
+        Enumerates autonomous projects, runs watchdog alarms once, then the
+        per-project regression dispatcher — each on its own fresh session so a
+        single project's failure can't poison the rest. Bounded by a per-tick
+        asyncio.timeout.
+        """
+        from app.regression_recovery_watchdog import (
+            run_dispatcher_watchdog_alarms as _run_watchdog_alarms,
+        )
+        from app.pipeline_regression_dispatcher import (
+            run_once as _run_regression_dispatcher,
+        )
+
+        _SCAN_INTERVAL = 60
+        _TICK_BUDGET = 55
+        while True:
+            await asyncio.sleep(_SCAN_INTERVAL)
+            try:
+                async with asyncio.timeout(_TICK_BUDGET):
+                    # Pull IDs only on a throwaway session (no Project ORM rows
+                    # in any identity map — run_once does its own session.get
+                    # and a cached partial Project would trigger a sync lazy-load
+                    # that poisons the connection). Fresh session per project
+                    # also isolates failures.
+                    try:
+                        async with AsyncSessionLocal() as _rd_id_session:
+                            _project_ids = (
+                                (
+                                    await _rd_id_session.execute(
+                                        select(Project.id).where(
+                                            Project.autonomous_enabled.is_(True)
+                                        )
+                                    )
+                                )
+                                .scalars()
+                                .all()
+                            )
+                    except Exception:
+                        logger.exception(
+                            "[REGRESSION_DISPATCHER] project enumeration failed"
+                        )
+                        _project_ids = []
+                    # Watchdog alarms run BEFORE run_once so staleness fires even
+                    # when run_once hangs or raises on the subsequent project loop.
+                    try:
+                        async with AsyncSessionLocal() as _wa_session:
+                            await _run_watchdog_alarms(
+                                _wa_session, list(_project_ids)
+                            )
+                    except Exception:
+                        logger.exception(
+                            "[REGRESSION_DISPATCHER] watchdog alarms failed"
+                        )
+                    for _pid in _project_ids:
+                        try:
+                            async with AsyncSessionLocal() as _rd_session:
+                                await _run_regression_dispatcher(_rd_session, _pid)
+                        except Exception:
+                            logger.exception(
+                                "[REGRESSION_DISPATCHER] run_once failed for project %s",
+                                _pid,
+                            )
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                # Expected, recoverable control flow (not a crash): the next tick
+                # retries; each project runs on its own isolated session.
+                logger.warning(
+                    "[REGRESSION_DISPATCHER] tick exceeded %ds budget — abandoning "
+                    "this tick; next tick retries",
+                    _TICK_BUDGET,
+                )
+            except Exception as svc_exc:
+                logger.error(
+                    "[REGRESSION_DISPATCHER] tick error: %s", svc_exc, exc_info=True
+                )
+
+    regression_dispatch_task = asyncio.create_task(_regression_dispatch_service())
+
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -824,6 +973,8 @@ async def lifespan(app):
     _bg_tasks["regression_watchdog_scan"] = regression_watchdog_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
+    _bg_tasks["evaluating_timeout"] = evaluating_timeout_task
+    _bg_tasks["regression_dispatch"] = regression_dispatch_task
     _bg_tasks["config_sync"] = config_sync_task
     _bg_tasks["jwt_revocation"] = jwt_revocation_task
     _bg_tasks["event_fanout"] = event_fanout_task
@@ -858,6 +1009,8 @@ async def lifespan(app):
             "regression_watchdog_scan": _regression_watchdog_scan_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
+            "evaluating_timeout": _evaluating_timeout_service,
+            "regression_dispatch": _regression_dispatch_service,
             "config_sync": runtime_config_sync_service,
             "jwt_revocation": jwt_revocation_service,
             "event_fanout": event_fanout_service,

@@ -29,6 +29,51 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+# ── Cluster C3: bound the leader-cycle recovery sweeps ────────────────────────
+# These three sweeps (_check_evaluating_timeouts, _recover_orphaned_tasks,
+# _sweep_post_commit_pending) run inline on the orchestrator's monitoring tail
+# and each performs serial GitHub / post-commit I/O per row. Under a large
+# EVALUATING/orphan/post-commit backlog the unbounded fan-out is O(N) serial
+# network work, which is exactly the leader-loop saturation the 2026-05-30
+# watchdog-kill incident traced to (reaper/orchestrator cycle wall-time grew
+# past the liveness window mid-I/O). We bound them with:
+#   • a per-cycle row cap (deferred rows re-qualify next cycle — the scans are
+#     status-based, no separate deferral queue needed; mirrors the reaper's
+#     _REAPER_MAX_ORPHANS_PER_CYCLE), and
+#   • a per-call asyncio.wait_for around every GitHub / post-commit await, so a
+#     single hung network call can never blow the whole sweep past the watchdog
+#     budget. A timeout on one row is logged and skipped; the next sweep retries.
+# The orchestrator heartbeat is pumped per row by the caller-side loops below.
+_EVAL_TIMEOUT_MAX_PER_CYCLE = 200
+_ORPHAN_RECOVERY_MAX_PER_CYCLE = 100
+# Per-call ceilings (seconds). Generous enough for a healthy GitHub round-trip
+# (typ. <2s, p99 ~10-15s) but well under the orchestrator's 180s hang window.
+_GH_CALL_TIMEOUT_S = 30.0
+# _process_post_commit has its own internal 240s budget; this is a hard outer
+# bound so a wedged inline pass (e.g. a GitHub call that never returns) can't
+# pin the post-commit sweep indefinitely. Set just above the inner budget.
+_POST_COMMIT_CALL_TIMEOUT_S = 260.0
+
+
+async def _bounded(coro, timeout_s: float, *, what: str):
+    """Await ``coro`` with a hard ``timeout_s`` ceiling.
+
+    On timeout, cancels the coroutine and re-raises ``asyncio.TimeoutError`` so
+    the caller's per-row try/except logs-and-skips that one row rather than
+    letting a single hung network call saturate the whole leader-cycle sweep
+    (cluster C3). ``what`` is a short label for the log line on timeout.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[C3 BOUNDED] %s exceeded %.0fs ceiling — skipping this row this cycle",
+            what,
+            timeout_s,
+        )
+        raise
+
+
 async def gcp_cleanup_service():
     """
     Background worker that runs every 5 minutes to ensure GCP VMs are in sync with the database.
@@ -839,17 +884,29 @@ async def _attempt_ci_backstop_recovery(
         return False
 
 
-async def _check_evaluating_timeouts():
+async def _check_evaluating_timeouts(progress_cb=None):
     """Detect EVALUATING tasks that are stuck and recover or fail them.
 
     - If all children are terminal but parent is still EVALUATING → trigger missed rollup.
     - If evaluating >2h with non-terminal children → WARNING alert.
     - If evaluating >evaluating_fail_hours (default 48h) → FAIL with ERROR alert.
     - Skips CI-waiting tasks (they have their own 20-min escalation timeout).
+
+    ``progress_cb`` (C3): a zero-arg liveness heartbeat pumped once per processed
+    row. This sweep now runs in its OWN background task
+    (``_evaluating_timeout_service``, lifecycle.py), so it must NOT pump the
+    orchestrator_worker's shared ``_orchestrator_last_progress`` marker — a
+    foreign task pumping the worker's heartbeat would MASK a genuinely hung
+    orchestrator_worker from its /health gate + watchdog. Instead the caller
+    threads its OWN marker (or relies on the background task's per-tick
+    asyncio.timeout + _monitor_background_tasks supervision). Defaults to a
+    no-op for direct callers / tests that don't supply one.
     """
     from app.main import _maybe_create_failure_alert
     from app.rollup_management import _check_and_trigger_rollup
     from app.shared_state import runtime_config as _runtime_config
+
+    _heartbeat = progress_cb if progress_cb is not None else (lambda: None)
 
     EVALUATING_WARN_SECONDS = 2 * 3600  # 2 hours
     # Default backstop bumped to 48h while silent-death v2 stabilizes
@@ -927,11 +984,24 @@ async def _check_evaluating_timeouts():
                             Task.status == TaskStatus.EVALUATING,
                             Task.archived.is_(False),
                         )
+                        # C3: per-cycle row cap. Without it this sweep is O(N
+                        # EVALUATING backlog) of serial GitHub I/O on the leader
+                        # cycle. Deferred rows re-qualify next cycle (the scan is
+                        # status-based; oldest-updated first so the most-stuck
+                        # parents are always serviced before the cap truncates).
+                        .order_by(Task.updated_at.asc())
+                        .limit(_EVAL_TIMEOUT_MAX_PER_CYCLE)
                     )
                 )
                 .scalars()
                 .all()
             )
+            if len(evaluating_tasks) >= _EVAL_TIMEOUT_MAX_PER_CYCLE:
+                logger.warning(
+                    "[EVAL TIMEOUT] Hit per-cycle cap of %d EVALUATING rows — "
+                    "remainder deferred to next sweep",
+                    _EVAL_TIMEOUT_MAX_PER_CYCLE,
+                )
 
             # Phase B4 (H-P2): batch the child lookup for all evaluating parents
             # into one ``IN (...)`` query instead of one-per-parent (N+1).
@@ -966,6 +1036,15 @@ async def _check_evaluating_timeouts():
                     ).append((_ec.id, _ec.status))
 
             for task in evaluating_tasks:
+                # C3 heartbeat: this loop performs serial GitHub I/O
+                # (get_pull_request / close_pull_request / _check_and_trigger_rollup)
+                # per task and is the dominant contributor to the EVALUATING-sweep
+                # wall time. Pump the CALLER'S OWN liveness marker each row so a
+                # legitimately long-but-progressing sweep is never mistaken for a
+                # hung task. NB: this is the background task's own heartbeat, NOT
+                # the orchestrator_worker's — pumping the worker's shared marker
+                # from here would mask a genuinely hung worker (fix D).
+                _heartbeat()
                 ctx = task.context or {}
 
                 # _pr_state_check_pending consumer. The agent_status FAILED→
@@ -1016,11 +1095,21 @@ async def _check_evaluating_timeouts():
                             from app.routers.agent import get_github_token_for_task
                             from app.github import get_pull_request
 
-                            gh_token, owner, repo = await get_github_token_for_task(
-                                task.id, session
+                            # C3 NOTE (fix E): get_github_token_for_task runs DB
+                            # I/O on the SHARED `session`. A _bounded() timeout
+                            # cancellation mid-query can leave the shared session
+                            # poisoned for the rest of the tick — mitigated by the
+                            # per-row try/except here (and the per-tick try in the
+                            # background service). No behaviour change.
+                            gh_token, owner, repo = await _bounded(
+                                get_github_token_for_task(task.id, session),
+                                _GH_CALL_TIMEOUT_S,
+                                what=f"eval-timeout token {str(task.id)[:8]}",
                             )
-                            pr_data = await get_pull_request(
-                                gh_token, owner, repo, pr_num
+                            pr_data = await _bounded(
+                                get_pull_request(gh_token, owner, repo, pr_num),
+                                _GH_CALL_TIMEOUT_S,
+                                what=f"eval-timeout get_pull_request #{pr_num}",
                             )
                             gh_pr_state = pr_data.get("state") or "open"
                             gh_pr_merged = bool(pr_data.get("merged"))
@@ -1330,6 +1419,73 @@ async def _check_evaluating_timeouts():
                             )
                             continue
 
+                    # C3 lost-update guard: this backstop branch reached the
+                    # FAILED decision from a NON-locked read of `task`, after
+                    # several awaits (_chain_has_active_pipeline_work,
+                    # _summarize_latest_review_for_chain, _attempt_ci_backstop_
+                    # recovery). This sweep now runs in its OWN background task
+                    # (_evaluating_timeout_service, lifecycle.py) and can
+                    # interleave with the orchestrator's CI-poll loop
+                    # (orchestrator.py:2994), which locks the SAME row FOR UPDATE
+                    # and may resolve it (e.g. COMPLETED on merge) in the window
+                    # between our read and this commit. Acquire the row lock and
+                    # RE-VALIDATE under it before clobbering: if the CI loop holds
+                    # the lock (skip_locked → None) or already moved the row out
+                    # of EVALUATING, or the timeout no longer holds on the fresh
+                    # context, defer to the next sweep instead of overwriting a
+                    # state the CI loop just committed. Locking the single row at
+                    # the decision point adds no serial coupling across rows.
+                    from app.orchestrator import _lock_task_for_mutation
+
+                    locked_task = await _lock_task_for_mutation(
+                        session,
+                        task.id,
+                        allowed_statuses=(TaskStatus.EVALUATING,),
+                        reason="eval-timeout CI backstop FAIL",
+                    )
+                    if locked_task is None:
+                        # Row is locked by the CI-poll loop, or no longer
+                        # EVALUATING (already resolved). _lock_task_for_mutation
+                        # has already committed/rolled back to release. Skip.
+                        continue
+                    # populate_existing=True refreshed `locked_task` from the DB,
+                    # so re-derive the CI-wait timer + active-pipeline guard from
+                    # the *current* context and confirm the backstop still fires.
+                    _rl_fresh = (locked_task.context or {}).get("review_loop", {}) or {}
+                    if not (
+                        _rl_fresh.get("ci_waiting") is True
+                        or (locked_task.context or {}).get("ci_waiting") is True
+                    ):
+                        # CI loop cleared ci_waiting (e.g. merged/closed) between
+                        # our read and the lock — no longer our row to fail.
+                        await session.rollback()
+                        continue
+                    _ci_ws_fresh = _rl_fresh.get("ci_wait_started")
+                    _since_fresh = None
+                    if _ci_ws_fresh is not None:
+                        with contextlib.suppress(ValueError, TypeError):
+                            _since_fresh = datetime.fromisoformat(_ci_ws_fresh)
+                    if _since_fresh is None:
+                        _since_fresh = evaluating_since
+                    _baseline_fresh = _rl_fresh.get("ci_wait_pause_baseline")
+                    _elapsed_fresh = (
+                        pause_clock.active_elapsed(
+                            _deploy_state, _since_fresh, _baseline_fresh
+                        )
+                        if _deploy_state
+                        else (now - _since_fresh).total_seconds()
+                    )
+                    if (
+                        _elapsed_fresh <= CI_BACKSTOP_SECONDS
+                        and not early_recovery_eligible
+                    ):
+                        # CI loop reset the wait clock (e.g. recovery / fresh
+                        # poll) in the unlocked window — backstop no longer due.
+                        await session.rollback()
+                        continue
+                    # Re-validated under the FOR UPDATE lock: still EVALUATING,
+                    # still CI-waiting, still past the backstop. Safe to fail.
+                    task = locked_task
                     logger.error(
                         f"[EVAL TIMEOUT] CI-waiting task {str(task.id)[:8]} has been "
                         f"EVALUATING for {hours}h — backstop timeout ({reason}), marking FAILED"
@@ -1440,7 +1596,35 @@ async def _check_evaluating_timeouts():
                     # Re-fetch a terminal child fresh to trigger rollup.
                     trigger_child = await session.get(Task, child_status_snap[0][0])
                     if trigger_child is not None:
-                        await _check_and_trigger_rollup(trigger_child, session)
+                        # C3: bound the rollup trigger — _check_and_trigger_rollup
+                        # does serial GitHub I/O (PR verify/create/merge) per
+                        # child. A hung call here would otherwise pin the whole
+                        # sweep. On timeout the session may be mid-transaction, so
+                        # roll back before the next row is processed.
+                        #
+                        # C3 NOTE (fix E): this _bounded() wraps a SHARED-session
+                        # coroutine that does DB I/O on `session`. An
+                        # asyncio.wait_for cancellation that fires mid-DB-op can
+                        # leave the shared session poisoned (PendingRollback) for
+                        # the rest of this tick — mitigated by the explicit
+                        # rollback in the except below (and the per-tick try in
+                        # the background service). No behaviour change; documenting
+                        # the failure mode for the next reader.
+                        try:
+                            await _bounded(
+                                # C3: thread the caller's own heartbeat so the
+                                # per-child PR-verify loop pumps the background
+                                # task's liveness marker, not the orchestrator's.
+                                _check_and_trigger_rollup(
+                                    trigger_child, session, progress_cb=_heartbeat
+                                ),
+                                _GH_CALL_TIMEOUT_S,
+                                what=f"eval-timeout rollup {str(task.id)[:8]}",
+                            )
+                        except asyncio.TimeoutError:
+                            with contextlib.suppress(Exception):
+                                await session.rollback()
+                            continue
                     await session.commit()
                     continue
 
@@ -1603,10 +1787,16 @@ async def _check_evaluating_timeouts():
                             try:
                                 from app.routers.agent import get_github_token_for_task
 
-                                _gh, _owner, _repo = await get_github_token_for_task(
-                                    child.id, session
+                                _gh, _owner, _repo = await _bounded(
+                                    get_github_token_for_task(child.id, session),
+                                    _GH_CALL_TIMEOUT_S,
+                                    what=f"eval-timeout token {str(child.id)[:8]}",
                                 )
-                                await close_pull_request(_gh, _owner, _repo, child_pr)
+                                await _bounded(
+                                    close_pull_request(_gh, _owner, _repo, child_pr),
+                                    _GH_CALL_TIMEOUT_S,
+                                    what=f"eval-timeout close PR #{child_pr}",
+                                )
                                 logger.info(
                                     f"[EVAL TIMEOUT] Closed orphaned PR #{child_pr} from child {str(child.id)[:8]}"
                                 )
@@ -1725,6 +1915,7 @@ async def _sweep_post_commit_pending():
         loop if the underlying cause is non-transient).
     """
     from app.routers.agent_status import _process_post_commit
+    from app.orchestrator import _mark_orchestrator_progress
     from app.schemas import AgentStatusPayload
 
     MAX_ATTEMPTS = 5
@@ -1820,6 +2011,11 @@ async def _sweep_post_commit_pending():
             )
 
             for task in tasks:
+                # C3 heartbeat: _process_post_commit per task is heavy
+                # (review-pipeline spawn, rollup gate handoff, GitHub I/O) and up
+                # to 50 run sequentially. Pump the orchestrator progress heartbeat
+                # each row so a long-but-progressing sweep is never watchdog-killed.
+                _mark_orchestrator_progress()
                 ctx = task.context or {}
                 pending_meta = ctx.get("_post_commit_pending_meta") or {}
                 # Write-ahead markers are persisted BEFORE _process_post_commit
@@ -1945,7 +2141,16 @@ async def _sweep_post_commit_pending():
                     f"(attempt {attempts + 1}/{MAX_ATTEMPTS}, reason={pending_meta.get('reason')})"
                 )
                 try:
-                    await _process_post_commit(task.id, _payload)
+                    # C3: hard outer ceiling so a wedged inline pass (e.g. a
+                    # GitHub call that never returns past _process_post_commit's
+                    # own 240s budget) can't pin the whole sweep. On timeout this
+                    # falls into the except below, which bumps the attempt counter
+                    # exactly as a genuine failure would (next sweep retries).
+                    await _bounded(
+                        _process_post_commit(task.id, _payload),
+                        _POST_COMMIT_CALL_TIMEOUT_S,
+                        what=f"post-commit {str(task.id)[:8]}",
+                    )
                     # Success — clear the flag on a fresh read (post_commit may
                     # have mutated context in other ways we want to keep).
                     async with AsyncSessionLocal() as clear_session:
@@ -2026,6 +2231,7 @@ async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
     from app.routers.agent import get_github_token_for_task
     from app.review_pipeline import _spawn_pipeline_task
+    from app.orchestrator import _mark_orchestrator_progress
     from app.models import Project
 
     try:
@@ -2058,11 +2264,25 @@ async def _recover_orphaned_tasks():
                             Task.created_at
                             >= one_hour_ago,  # Only check recent tasks, not entire history
                         )
+                        # C3: per-cycle row cap. Each candidate costs a serial
+                        # get_github_token_for_task + list-pulls GitHub round-trip;
+                        # an unbounded fan-out is the leader-cycle saturation this
+                        # cluster targets. Oldest-first so the most-stale orphans
+                        # are serviced before the cap truncates; deferred rows
+                        # re-qualify next cycle (runs every 120s).
+                        .order_by(Task.created_at.asc())
+                        .limit(_ORPHAN_RECOVERY_MAX_PER_CYCLE)
                     )
                 )
                 .scalars()
                 .all()
             )
+            if len(candidates) >= _ORPHAN_RECOVERY_MAX_PER_CYCLE:
+                logger.warning(
+                    "[RECOVERY] Hit per-cycle cap of %d orphan candidates — "
+                    "remainder deferred to next sweep",
+                    _ORPHAN_RECOVERY_MAX_PER_CYCLE,
+                )
 
             cand_ids = [t.id for t in candidates]
             if cand_ids:
@@ -2091,6 +2311,10 @@ async def _recover_orphaned_tasks():
                 children_by_parent = {}
 
             for task in candidates:
+                # C3 heartbeat: serial GitHub I/O per candidate — pump the
+                # orchestrator progress heartbeat each row so a long-but-
+                # progressing recovery pass is not watchdog-killed.
+                _mark_orchestrator_progress()
                 task_type = task.first_payload.get("type", "")
                 if task_type not in (
                     "create",
@@ -2127,8 +2351,10 @@ async def _recover_orphaned_tasks():
                     continue
 
                 try:
-                    gh_token, owner, repo = await get_github_token_for_task(
-                        task.id, session
+                    gh_token, owner, repo = await _bounded(
+                        get_github_token_for_task(task.id, session),
+                        _GH_CALL_TIMEOUT_S,
+                        what=f"recovery token {str(task.id)[:8]}",
                     )
                 except Exception:
                     logger.warning(
@@ -2152,10 +2378,14 @@ async def _recover_orphaned_tasks():
                         "Accept": "application/vnd.github.v3+json",
                         "X-GitHub-Api-Version": "2022-11-28",
                     }
-                    resp = await _github_request(
-                        "GET",
-                        f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open",
-                        headers,
+                    resp = await _bounded(
+                        _github_request(
+                            "GET",
+                            f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{branch}&state=open",
+                            headers,
+                        ),
+                        _GH_CALL_TIMEOUT_S,
+                        what=f"recovery list-pulls {str(task.id)[:8]}",
                     )
                     prs = resp.json() if resp.status_code == 200 else []
                 except Exception:

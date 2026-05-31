@@ -1902,3 +1902,113 @@ async def test_chain_has_recoverable_failed_work_ignores_code_error(eval_db):
     await eval_db.commit()
 
     assert await _chain_has_recoverable_failed_work(parent, eval_db) is False
+
+
+# ── C3 fix C: CI-backstop lost-update guard ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ci_backstop_does_not_clobber_concurrently_resolved_row(eval_db, mocker):
+    """C3 lost-update seam: _check_evaluating_timeouts now runs in its OWN
+    background task and can interleave with the orchestrator CI-poll loop on the
+    SAME ci_waiting EVALUATING row. The backstop reaches its FAILED decision from
+    a NON-locked read, then several awaits later commits FAILED. If the CI-poll
+    loop RESOLVES the row (e.g. merge → COMPLETED + ci_waiting cleared) in that
+    window, the backstop MUST NOT overwrite that resolution.
+
+    This test injects exactly that interleaving: it patches the await that runs
+    just before the FAILED decision (_chain_has_active_pipeline_work) to flip the
+    SAME row to COMPLETED on a SEPARATE session and commit — simulating the CI
+    loop winning the race. With the fix C lock+re-validate, the backstop sees the
+    row is no longer EVALUATING under the lock and DEFERS instead of clobbering.
+
+    Pre-fix (no lock/re-validate): the backstop would blindly set status=FAILED
+    on its stale in-memory instance and commit, clobbering the COMPLETED the CI
+    loop just wrote.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    from app import services as _services
+
+    project = Project(name="CI Backstop Race", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # CI-waiting task, 90 min into the wait (> 60-min backstop), ci_passed=False
+    # so it falls straight through to the FAILED block (no recovery branch).
+    ci_started = _naive_utc_ago(minutes=90).isoformat()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "prompt": "race task"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "ci_wait_started": ci_started,
+                "pr_number": 4242,
+            }
+        },
+        status_log=[
+            {
+                "t": _naive_utc_ago(minutes=90).isoformat(),
+                "msg": "Status changed: IN_PROGRESS → EVALUATING",
+            }
+        ],
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+    task_id = task.id
+
+    interleaved = {"fired": False}
+
+    async def _resolve_row_then_report_idle(_task, _session):
+        # Simulate the orchestrator CI-poll loop committing a merge resolution
+        # on the SAME row in the window between the backstop's read and its
+        # commit. The commit lands in the DB so the fix's lock+re-read (which
+        # uses populate_existing=True, refreshing from the row) observes the
+        # post-resolution state. (We commit on the sweep's own session here:
+        # the in-memory SQLite StaticPool shares a single connection across
+        # sessions, so a second concurrent session would self-deadlock; the
+        # FOR UPDATE re-validate is exercised on real Postgres in CI. Either
+        # way the assertion below proves the backstop did not clobber.)
+        if not interleaved["fired"]:
+            interleaved["fired"] = True
+            row = await _session.get(Task, task_id)
+            row.status = TaskStatus.COMPLETED
+            rl = dict((row.context or {}).get("review_loop", {}))
+            rl["ci_waiting"] = False
+            rl["ci_passed"] = True
+            rl["review_approved"] = True
+            row.context = {**(row.context or {}), "review_loop": rl}
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(row, "context")
+            row.latest_status_message = "CI loop: PR merged, rollup complete"
+            _session.add(row)
+            await _session.commit()
+        # Report "no active pipeline work" so the sweep proceeds to the FAILED
+        # decision (where the lock+re-validate must now defer).
+        return False
+
+    mocker.patch.object(
+        _services,
+        "_chain_has_active_pipeline_work",
+        side_effect=_resolve_row_then_report_idle,
+    )
+
+    await _check_evaluating_timeouts()
+
+    assert interleaved["fired"], "interleave hook did not run — test is vacuous"
+
+    # The CI loop's COMPLETED resolution must survive — the backstop must NOT
+    # have clobbered it to FAILED.
+    async with _services.AsyncSessionLocal() as verify:
+        final = await verify.get(Task, task_id)
+        assert final.status == TaskStatus.COMPLETED, (
+            f"Lost-update: backstop clobbered the CI-loop's COMPLETED resolution "
+            f"with {final.status} (msg={final.latest_status_message!r})"
+        )

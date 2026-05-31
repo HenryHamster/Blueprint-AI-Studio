@@ -121,6 +121,33 @@ def _capture_ci_polling_snapshot(task: Task) -> dict:
     }
 
 
+def _ci_waiting_sql_filter(session):
+    """Dialect-portable WHERE clause selecting only EVALUATING rows whose
+    ``context.review_loop.ci_waiting`` is truthy.
+
+    C3: the CI-poll loop previously fetched ALL EVALUATING rows (up to 200) and
+    then ``_lock_task_for_mutation``'d each one only to discover most are not
+    CI-waiting and immediately ``rollback()`` — an O(N) lock-and-rollback cost
+    on the leader's hot cycle proportional to the whole EVALUATING backlog, not
+    to the (usually small) CI-waiting subset. Pushing the filter into SQL drops
+    that cost: only genuinely CI-waiting rows are locked.
+
+    This matches EXACTLY the loop's own gate (``ci_loop.get("ci_waiting")`` where
+    ``ci_loop = context["review_loop"]``), so it is a pure prefilter — no
+    behavioural change to which tasks the loop acts on. The Python-side guard
+    inside the loop remains as cheap defense-in-depth.
+
+    Postgres: ``->'review_loop'->>'ci_waiting'`` compared to the string
+    ``'true'`` (JSONB booleans render as ``true``/``false`` via ``->>``).
+    SQLite (standalone tests): ``json_extract`` returns the integer 1 for a JSON
+    ``true``, so compare against 1.
+    """
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    if dialect_name == "sqlite":
+        return _func.json_extract(Task.context, "$.review_loop.ci_waiting") == 1
+    return Task.context["review_loop"]["ci_waiting"].astext == "true"
+
+
 async def _lock_task_for_mutation(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -238,6 +265,10 @@ _last_pool_refresh: datetime = _utcnow()
 _last_zone_health_persist: datetime = _utcnow()
 _last_anomaly_state_persist: datetime = _utcnow()
 _last_anomaly_sweep: datetime = _utcnow()
+# C3: regression dispatch + EVALUATING-timeout recovery now run as dedicated
+# background tasks (lifecycle.py) on their own schedules. These two module
+# attributes are retained for back-compat (tests / metrics) but are no longer
+# the cadence gate for those sweeps.
 _last_regression_dispatch: datetime = _utcnow()
 _last_orphan_check: datetime = _utcnow()
 _last_evaluating_timeout_check: datetime = _utcnow()
@@ -602,7 +633,6 @@ async def orchestrator_worker():
     from app.broadcast import broadcast_to_project, manager as ws_manager
     from app.services import (
         _recover_orphaned_tasks,
-        _check_evaluating_timeouts,
         _sweep_post_commit_pending,
     )
     from app.routers.agent import get_github_token_for_task
@@ -617,7 +647,7 @@ async def orchestrator_worker():
 
     global _last_pool_refresh, _orchestrator_last_cycle, _orchestrator_cycle_started
     global _orchestrator_consecutive_errors, _orchestrator_consecutive_monitoring_errors
-    global _last_orphan_check, _last_evaluating_timeout_check, _last_post_commit_sweep
+    global _last_orphan_check, _last_post_commit_sweep
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
@@ -646,65 +676,14 @@ async def orchestrator_worker():
                 await _persist_self_healing_state_bundle()
                 _last_anomaly_state_persist = _utcnow()
 
-            # Pipeline-regression dispatcher — same 60s cadence as the
-            # self-healing state bundle. Iterates per project, evaluates
-            # subscribed pipeline-wide regression signals (SR catch-rate,
-            # fix-loop divergence, success-rate trend) and spawns one
-            # investigate task per tripped class. Wrapped to never crash
-            # the orchestrator on dispatcher exceptions.
-            global _last_regression_dispatch
-            if (_utcnow() - _last_regression_dispatch).total_seconds() >= 60:
-                from app.regression_recovery_watchdog import (
-                    run_dispatcher_watchdog_alarms as _run_watchdog_alarms,
-                )
-                from app.pipeline_regression_dispatcher import (
-                    run_once as _run_regression_dispatcher,
-                )
-
-                # Pull IDs only (no Project ORM rows in any identity map). The
-                # dispatcher's run_once does ``session.get(Project, project_id)``
-                # then accesses ``project.design_doc``; if a partial Project
-                # (from ``load_only(Project.id)``) is already cached on the
-                # session, the get() returns the cached partial and the JSONB
-                # access triggers a sync lazy-load in async context that
-                # poisons the connection — every subsequent project in the
-                # loop then cascade-fails on rollback. Fresh session per
-                # project also isolates failures.
-                try:
-                    async with AsyncSessionLocal() as _rd_id_session:
-                        _project_ids = (
-                            (
-                                await _rd_id_session.execute(
-                                    select(Project.id).where(
-                                        Project.autonomous_enabled.is_(True)
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .all()
-                        )
-                except Exception:
-                    logger.exception(
-                        "[REGRESSION_DISPATCHER] project enumeration failed"
-                    )
-                    _project_ids = []
-                # Watchdog alarms run BEFORE run_once so staleness fires even
-                # when run_once hangs or raises on the subsequent project loop.
-                try:
-                    async with AsyncSessionLocal() as _wa_session:
-                        await _run_watchdog_alarms(_wa_session, list(_project_ids))
-                except Exception:
-                    logger.exception("[REGRESSION_DISPATCHER] watchdog alarms failed")
-                for _pid in _project_ids:
-                    try:
-                        async with AsyncSessionLocal() as _rd_session:
-                            await _run_regression_dispatcher(_rd_session, _pid)
-                    except Exception:
-                        logger.exception(
-                            "[REGRESSION_DISPATCHER] run_once failed for project %s",
-                            _pid,
-                        )
-                _last_regression_dispatch = _utcnow()
+            # C3: the pipeline-regression dispatcher + watchdog alarms used to
+            # run inline here on the leader's hot dispatch cycle (iterating every
+            # autonomous project). It now runs as a dedicated leader-only
+            # background task (``_regression_dispatch_service`` in lifecycle.py)
+            # with its own 60s schedule and a per-tick asyncio.timeout, so the
+            # dispatch cycle's liveness is no longer coupled to per-project
+            # regression I/O. ``_last_regression_dispatch`` is retained only as a
+            # back-compat module attribute (referenced by tests/metrics).
 
             # Independent anomaly maintenance — expires stale entries and restores
             # pipeline adjustments without depending on autonomous research cycles.
@@ -2998,7 +2977,14 @@ async def orchestrator_worker():
                     (
                         await session.execute(
                             select(Task.id)
-                            .where(Task.status == TaskStatus.EVALUATING)
+                            .where(
+                                Task.status == TaskStatus.EVALUATING,
+                                # C3: only CI-waiting rows — see
+                                # _ci_waiting_sql_filter. Drops the per-row
+                                # lock-and-rollback cost on the (typically large)
+                                # non-CI-waiting EVALUATING backlog.
+                                _ci_waiting_sql_filter(session),
+                            )
                             .limit(200)
                         )
                     )
@@ -4495,14 +4481,19 @@ async def orchestrator_worker():
             await _check_monitoring_window()
             await _check_external_health()
             await _check_pause_mode()
-            # Orphaned task recovery — every 120s
+            # Orphaned task recovery — every 120s. Stays on the leader cycle but
+            # is now bounded (per-cycle row cap + per-GitHub-call asyncio.wait_for
+            # + per-row heartbeat in services._recover_orphaned_tasks, C3) so it
+            # can no longer saturate the cycle on a large orphan backlog.
             if (_utcnow() - _last_orphan_check).total_seconds() >= 120:
                 _last_orphan_check = _utcnow()
                 await _recover_orphaned_tasks()
-            # EVALUATING task timeout — every 300s
-            if (_utcnow() - _last_evaluating_timeout_check).total_seconds() >= 300:
-                _last_evaluating_timeout_check = _utcnow()
-                await _check_evaluating_timeouts()
+            # C3: EVALUATING-timeout recovery moved OFF the leader cycle into the
+            # dedicated _evaluating_timeout_service background task (lifecycle.py)
+            # with its own 300s schedule + per-tick timeout. The dispatch cycle no
+            # longer awaits its serial GitHub I/O, so leader liveness is decoupled
+            # from EVALUATING-backlog size. (_last_evaluating_timeout_check is kept
+            # as a module attribute for back-compat with tests/metrics.)
             # _post_commit_pending sweeper — every 60s. Retries post-commit
             # processing for terminal tasks whose prior attempt timed out
             # (GitHub quota exhaustion, transient failures, etc.) without

@@ -2180,9 +2180,11 @@ async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
 
     captured: dict = {}
 
-    async def _poison_via_real_integrity_error(_child, session):
+    async def _poison_via_real_integrity_error(_child, session, progress_cb=None, **kwargs):
         # Capture the worker session and poison it with a genuine flush-level
         # IntegrityError (duplicate PK), the way a racing rollup commit would.
+        # C3: _check_and_trigger_rollup now takes an optional progress_cb
+        # heartbeat (and may grow further kwargs); accept and ignore them here.
         captured["session"] = session
         proj_id = (
             await session.execute(_text("SELECT id FROM project LIMIT 1"))
@@ -2225,7 +2227,10 @@ async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
     real_run_infra = _reaper_mod.run_infra_recovery_and_hold_maintenance
     probe = {"ran": False, "session_clean": None}
 
-    async def _probe_then_run(session, now, just_reaped_ids=None):
+    async def _probe_then_run(session, now, just_reaped_ids=None, progress_cb=None, **kwargs):
+        # C3: run_infra_recovery_and_hold_maintenance now takes an optional
+        # progress_cb heartbeat (and may grow further kwargs); accept and
+        # forward them to the real implementation.
         probe["ran"] = True
         # This is the SAME session captured by the rollup injection above.
         assert captured.get("session") is session, (
@@ -2237,7 +2242,9 @@ async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
         except Exception:
             probe["session_clean"] = False
             raise
-        return await real_run_infra(session, now, just_reaped_ids=just_reaped_ids)
+        return await real_run_infra(
+            session, now, just_reaped_ids=just_reaped_ids, progress_cb=progress_cb
+        )
 
     mocker.patch(
         "app.reaper.run_infra_recovery_and_hold_maintenance",
