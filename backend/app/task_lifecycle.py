@@ -45,6 +45,7 @@ from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
     _spawn_pipeline_task,
     build_ci_failure_fix_prompt,
+    should_auto_approve_diff,
 )
 from app.failure_classification import classify_failure
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
@@ -55,6 +56,74 @@ from app.notification_dispatch import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Verdict-word aliases used by the structured-verdict fallback parser. Each
+# canonical verdict maps to the surface forms an agent might emit. Matched only
+# when *anchored* (quoted, JSON-field, or standalone verdict line) so a bare
+# prose occurrence of "approve" cannot be read as an approval (see the fallback
+# in _process_post_commit).
+_VERDICT_TOKEN_ALIASES: dict[str, tuple[str, ...]] = {
+    "APPROVE": ("APPROVE", "APPROVED"),
+    "REQUEST_CHANGES": ("REQUEST_CHANGES", "REQUEST CHANGES"),
+}
+
+
+def _build_anchored_verdict_pattern(token: str) -> "re.Pattern[str]":
+    """Compile the anchored matcher for one canonical verdict token.
+
+    An anchored match is one of:
+      - a quoted token:                "APPROVE" / 'APPROVE' / `APPROVE`
+      - a JSON-style verdict field:    "verdict": "APPROVE"
+      - a standalone verdict line:     APPROVE   (optionally `VERDICT: APPROVE`)
+
+    A *bare* prose occurrence ("do not APPROVE this yet") matches NONE of these
+    by design — that is the false-approval class this guards against.
+    """
+    alts = "|".join(re.escape(t) for t in _VERDICT_TOKEN_ALIASES[token])
+    pattern = (
+        rf"""(["'`])(?:{alts})\1"""
+        rf"""|["']verdict["']\s*:\s*["'`](?:{alts})["'`]"""
+        rf"""|^\s*(?:verdict\s*[:=]\s*)?(?:{alts})\s*\.?\s*$"""
+    )
+    return re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+
+
+_ANCHORED_APPROVE_RE = _build_anchored_verdict_pattern("APPROVE")
+_ANCHORED_REQUEST_CHANGES_RE = _build_anchored_verdict_pattern("REQUEST_CHANGES")
+
+
+def _last_match_start(pattern: "re.Pattern[str]", text: str) -> int:
+    """Return the start index of the *last* match, or -1 when there is none."""
+    last = -1
+    for m in pattern.finditer(text):
+        last = m.start()
+    return last
+
+
+def _resolve_fallback_verdict(verdict_text: str) -> str | None:
+    """Resolve a review verdict from free text when structured parsing failed.
+
+    This is the last-resort fallback after the verdict_json field (Method 1) and
+    JSON-in-log parsing (Method 2). It requires a STRUCTURED / anchored approval
+    signal — NOT a bare prose substring — so prose like "do not APPROVE this yet"
+    or "needs changes before I can approve" can never be read as an approval and
+    merge unreviewed code.
+
+    Returns:
+      - "APPROVE" / "REQUEST_CHANGES" when an anchored verdict is found
+        (rightmost anchored token wins, so a later REQUEST_CHANGES overrides an
+        earlier APPROVE), or
+      - None when no anchored verdict is present (caller defaults to the safe
+        REQUEST_CHANGES + manual-review path).
+    """
+    approve_idx = _last_match_start(_ANCHORED_APPROVE_RE, verdict_text)
+    rc_idx = _last_match_start(_ANCHORED_REQUEST_CHANGES_RE, verdict_text)
+    if approve_idx == -1 and rc_idx == -1:
+        return None
+    if approve_idx > rc_idx:
+        return "APPROVE"
+    return "REQUEST_CHANGES"
 
 
 class PostCommitLocked(Exception):
@@ -961,8 +1030,17 @@ async def _process_post_commit(
 
                 # Auto-approve trivially small main-branch diffs: skip review and route
                 # through the same security-scan + auto-merge path used for intermediate
-                # small/medium scope. Gated by scope, direction acceptance history, and
-                # diff size; CI still gates the merge.
+                # small/medium scope. CI still gates the merge.
+                #
+                # QP6: the gate is the single, unit-tested `should_auto_approve_diff`
+                # helper (review_pipeline.py) — NOT a weaker inline copy. The helper
+                # applies the strict checks the old inline logic skipped: source-type
+                # eligibility, test-file exclusion from the line/file budgets, and the
+                # scope-overflow warning. The main-branch path keeps two *additional*
+                # live constraints on top of the helper: it only runs for non-staging
+                # PRs and only when a resolvable direction has favorable acceptance
+                # history (a missing/unknown direction is NOT auto-approved here, even
+                # though the helper would pass `direction_data=None` by default).
                 auto_approve_small = False
                 if (
                     not is_intermediate
@@ -970,28 +1048,11 @@ async def _process_post_commit(
                     and _runtime_config.get("auto_approve_small_diff_enabled", True)
                 ):
                     try:
-                        max_lines = int(
-                            _runtime_config.get("auto_approve_max_lines", 50)
-                        )
-                        max_files = int(
-                            _runtime_config.get("auto_approve_max_files", 4)
-                        )
-                        _aa_tok, _aa_owner, _aa_repo = await get_github_token_for_task(
-                            task.id, session
-                        )
-                        _aa_pr = await get_pull_request(
-                            _aa_tok,
-                            _aa_owner,
-                            _aa_repo,
-                            pr_number,
-                            project_id=str(task.project_id),
-                        )
-                        lines_changed = int(_aa_pr.get("additions", 0) or 0) + int(
-                            _aa_pr.get("deletions", 0) or 0
-                        )
-                        files_changed = int(_aa_pr.get("changed_files", 0) or 0)
+                        # Resolve the direction so the helper's acceptance-rate gate
+                        # runs against real history. The main-branch path additionally
+                        # *requires* a resolvable direction (see comment above).
                         direction_id = (task.context or {}).get("direction_id")
-                        acceptance = None
+                        _aa_dir = None
                         if direction_id:
                             _aa_proj = (
                                 (
@@ -1014,23 +1075,39 @@ async def _process_post_commit(
                                 ),
                                 None,
                             )
-                            if _aa_dir:
-                                from app.direction_metrics import (
-                                    _compute_acceptance_rate,
-                                )
+                        # Main-branch path requires a *positive* acceptance signal:
+                        # an unknown direction or a direction with no merge/reject
+                        # history (acceptance == None) is NOT auto-approved here. This
+                        # is intentionally stricter than the helper's default (which
+                        # passes unknown acceptance) because main-branch merges skip
+                        # review entirely.
+                        from app.direction_metrics import _compute_acceptance_rate
 
-                                acceptance = _compute_acceptance_rate(_aa_dir)
-                        if (
-                            0 < lines_changed <= max_lines
-                            and 0 < files_changed <= max_files
-                            and acceptance is not None
-                            and acceptance > 0.5
-                        ):
-                            auto_approve_small = True
+                        acceptance = (
+                            _compute_acceptance_rate(_aa_dir)
+                            if _aa_dir is not None
+                            else None
+                        )
+                        if acceptance is None or acceptance <= 0.5:
                             logger.info(
-                                f"[PIPELINE] PR #{pr_number} auto-approved for merge "
-                                f"({lines_changed} lines, {files_changed} files, acceptance={acceptance:.2f}) — skipping review"
+                                f"[PIPELINE] PR #{pr_number} not auto-approved — "
+                                f"direction acceptance={acceptance} (require >0.5 with "
+                                "history); defaulting to review"
                             )
+                        else:
+                            skip, reason = should_auto_approve_diff(task, _aa_dir)
+                            if skip:
+                                auto_approve_small = True
+                                logger.info(
+                                    f"[PIPELINE] PR #{pr_number} auto-approved for "
+                                    f"merge ({reason}, acceptance={acceptance:.2f}) — "
+                                    "skipping review"
+                                )
+                            else:
+                                logger.info(
+                                    f"[PIPELINE] PR #{pr_number} not auto-approved "
+                                    f"({reason}) — defaulting to review"
+                                )
                     except Exception as _aa_exc:
                         logger.info(
                             f"[PIPELINE] Auto-approve eligibility check failed for PR #{pr_number}: {_aa_exc!r} — defaulting to review"
@@ -1778,32 +1855,19 @@ async def _process_post_commit(
                         )
 
                 if not verdict_parsed:
-                    # Fallback: look for APPROVE / REQUEST_CHANGES as standalone words
-                    # (quoted or unquoted). COMMENT is no longer a valid verdict — a
-                    # stray occurrence in prose is ignored so the text falls through
-                    # to REQUEST_CHANGES (the safe default).
-                    upper_text = verdict_text.upper()
-                    approve_idx = max(
-                        upper_text.rfind('"APPROVE"'),
-                        upper_text.rfind("APPROVE"),
-                        upper_text.rfind("APPROVED"),
-                    )
-                    rc_idx = max(
-                        upper_text.rfind('"REQUEST_CHANGES"'),
-                        upper_text.rfind("REQUEST_CHANGES"),
-                        upper_text.rfind("REQUEST CHANGES"),
-                    )
-                    if approve_idx == -1 and rc_idx == -1:
+                    # Fallback: require a STRUCTURED / anchored verdict signal — NOT a
+                    # bare prose substring (see _resolve_fallback_verdict). Returns the
+                    # canonical verdict, or None when no anchored verdict is present.
+                    fallback_verdict = _resolve_fallback_verdict(verdict_text)
+                    if fallback_verdict is None:
                         verdict = "REQUEST_CHANGES"
                         feedback = "Review agent did not produce a verdict — manual review required"
                         logger.warning(
                             f"[REVIEW PIPELINE] No verdict found for task {task.id} (len={len(verdict_text)}) — defaulting to REQUEST_CHANGES, marking for manual review"
                         )
                         verdict_unparseable = True
-                    elif approve_idx > rc_idx:
-                        verdict = "APPROVE"
                     else:
-                        verdict = "REQUEST_CHANGES"
+                        verdict = fallback_verdict
 
                 # Invariant: pipeline accepts only APPROVE or REQUEST_CHANGES.
                 # Legacy COMMENT, typos, and other agent regressions normalize to

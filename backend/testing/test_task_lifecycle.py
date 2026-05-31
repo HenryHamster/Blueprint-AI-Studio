@@ -35,6 +35,7 @@ from app.task_lifecycle import (
     _process_post_commit,
     _record_parent_failure,
     _is_transient_scan_error,
+    _resolve_fallback_verdict,
 )
 from app.retry_prompt import (
     _extract_failing_tests,
@@ -5535,3 +5536,214 @@ async def test_post_commit_failed_non_safeguard_does_not_touch_gate(tl_db, mocke
     await _process_post_commit(task.id, payload, _session_factory=factory)
 
     spy.assert_not_awaited()
+
+
+# ── QP6: main-branch auto-approve gate uses the strict tested helper ──────────
+#
+# Before QP6 the live main-branch auto-approve path in _process_post_commit was
+# a WEAKER inline duplicate of should_auto_approve_diff: it checked only the
+# GitHub aggregate diff size + file count + scope=="small" + direction
+# acceptance, and SKIPPED the strict checks the tested helper applies (source-
+# type eligibility, test-file exclusion, scope-overflow). The fix routes the
+# live gate through should_auto_approve_diff (single source of truth). This test
+# pins the gap: a `docs`-type small PR with favorable direction history that the
+# weak copy auto-merged (skipping review) must now be REJECTED by the gate and
+# routed to the review pipeline. It fails against pre-fix code (which auto-merged
+# the docs PR via _merge_with_retry instead of spawning review).
+
+
+@pytest.mark.asyncio
+async def test_main_branch_auto_approve_rejects_ineligible_type_via_strict_helper(
+    tl_db, mocker
+):
+    session, factory = tl_db
+    project = await _make_project(session)
+    # Favorable direction history so the acceptance gate would PASS (isolating
+    # the source-type gap as the thing that rejects).
+    project.directions = [
+        {
+            "id": "d-docs-1",
+            "research_history": [{"prs_merged": 8, "prs_rejected": 0}],
+        }
+    ]
+    session.add(project)
+    await session.commit()
+
+    # docs task: allowed past the outer routing guard AND auto-approved by the
+    # weak inline copy, but rejected by should_auto_approve_diff (source type not
+    # in create/refactor/fix/migrate).
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="docs",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "scope": "small",
+            "direction_id": "d-docs-1",
+            "_pr_changed_files": ["docs/readme.md"],
+            "_pr_diff_summary": [
+                {"file": "docs/readme.md", "added": 5, "removed": 1}
+            ],
+        },
+    )
+    # base_branch=main → not a staging branch → is_intermediate is False, so the
+    # main-branch auto-approve gate (the QP6 path) is the one under test.
+    task.payloads = [{"type": "docs", "prompt": "update docs", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    # PR-state guard fetch + (pre-fix) weak-copy diff source. The additions/
+    # deletions/changed_files make the PR small enough that the PRE-FIX weak
+    # inline copy WOULD auto-approve this docs PR (proving the test fails against
+    # pre-fix code); the post-fix strict helper rejects it on source type.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "merged": False,
+            "state": "open",
+            "additions": 5,
+            "deletions": 1,
+            "changed_files": 1,
+        },
+    )
+    # _merge_with_retry is the discriminator: only the auto-approve path merges.
+    # The review path runs a security scan too, so the scan is NOT a discriminator.
+    merge_spy = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    # Review-spawn path dependencies.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "docs/readme.md", "status": "modified"}],
+    )
+    review_calls = []
+
+    async def _capture_spawn(src_task, ptype, *a, **kw):
+        review_calls.append(ptype)
+        return (None, False)
+
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-docs",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    # Post-fix: the strict helper rejects docs → no auto-merge, review spawned.
+    merge_spy.assert_not_awaited()
+    assert "review" in review_calls, (
+        "ineligible-type small PR must be routed to review, not auto-merged "
+        "(weak-copy gap closed)"
+    )
+
+
+# ── _resolve_fallback_verdict — structured/anchored verdict parsing ────────────
+#
+# latent-#1: the prior fallback used `verdict_text.upper().rfind("APPROVE")`, a
+# bare prose substring match. Free text like "do not APPROVE this yet" therefore
+# yielded a FALSE approval that merges unreviewed code. The fix requires a
+# structured/anchored approval signal (quoted token, JSON verdict field, or a
+# standalone verdict line). These tests pin both halves: prose must NOT approve,
+# and genuine structured approvals MUST still approve.
+
+
+class TestResolveFallbackVerdict:
+    # ---- false-positive prose that must NOT approve (the latent-#1 bug) -------
+
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "do not APPROVE this yet",
+            "Do not approve this until the tests are fixed.",
+            "needs changes before I can approve",
+            "I would approve if the migration were reversible, but it is not.",
+            "The reviewer is still deciding whether to approve.",
+            "Cannot approve — see the unhandled None case in services.py.",
+            "This is close to approval but not there.",
+            "approved-by header is missing from the commit",
+        ],
+    )
+    def test_bare_prose_approve_does_not_approve(self, prose):
+        # Pre-fix (rfind substring match) these all returned "APPROVE".
+        assert _resolve_fallback_verdict(prose) != "APPROVE"
+
+    def test_bare_prose_with_no_request_changes_token_falls_through_to_none(self):
+        # Pure prose with no anchored verdict at all → None (caller defaults to
+        # REQUEST_CHANGES + manual review). Pre-fix this returned "APPROVE".
+        assert _resolve_fallback_verdict("do not APPROVE this yet") is None
+
+    def test_prose_discussing_approval_then_requesting_changes(self):
+        text = (
+            "We discussed whether to approve. Final call below.\n"
+            'VERDICT: REQUEST_CHANGES\n'
+        )
+        assert _resolve_fallback_verdict(text) == "REQUEST_CHANGES"
+
+    # ---- genuine structured approvals that MUST still approve ----------------
+
+    def test_quoted_token_approves(self):
+        assert _resolve_fallback_verdict('the verdict is "APPROVE"') == "APPROVE"
+
+    def test_json_verdict_field_approves(self):
+        # A truncated/invalid JSON blob that Methods 1 & 2 could not parse but
+        # still carries the structured field.
+        text = '{"verdict": "APPROVE", "feedback": "looks good" '  # missing close
+        assert _resolve_fallback_verdict(text) == "APPROVE"
+
+    def test_standalone_verdict_line_approves(self):
+        text = "Reviewed all changed files.\nAPPROVE\n"
+        assert _resolve_fallback_verdict(text) == "APPROVE"
+
+    def test_verdict_prefixed_line_approves(self):
+        assert _resolve_fallback_verdict("VERDICT: APPROVE") == "APPROVE"
+
+    def test_approved_alias_quoted_approves(self):
+        assert _resolve_fallback_verdict('result: "APPROVED"') == "APPROVE"
+
+    # ---- structured REQUEST_CHANGES and precedence ---------------------------
+
+    def test_quoted_request_changes(self):
+        assert (
+            _resolve_fallback_verdict('"REQUEST_CHANGES"') == "REQUEST_CHANGES"
+        )
+
+    def test_standalone_request_changes_with_space(self):
+        assert _resolve_fallback_verdict("REQUEST CHANGES") == "REQUEST_CHANGES"
+
+    def test_rightmost_anchored_token_wins(self):
+        # An early structured APPROVE overridden by a later structured
+        # REQUEST_CHANGES → REQUEST_CHANGES (the safe, later decision).
+        text = '"APPROVE" was considered, but final:\nVERDICT: REQUEST_CHANGES'
+        assert _resolve_fallback_verdict(text) == "REQUEST_CHANGES"
+
+    def test_no_verdict_returns_none(self):
+        assert _resolve_fallback_verdict("just some unrelated log output") is None
+        assert _resolve_fallback_verdict("") is None
