@@ -67,7 +67,11 @@ from app.max_plan_pool import (
     record_completion_event,
     record_task_outcome,
 )
-from app.task_lifecycle import _process_post_commit, PostCommitLocked
+from app.task_lifecycle import (
+    _process_post_commit,
+    PostCommitFinalCommitFailed,
+    PostCommitLocked,
+)
 from app.rollup_management import _check_and_trigger_rollup
 from app.payload_schemas import validate_internal_payload as _validate_internal_payload
 from app.task_completion import _compute_first_attempt_succeeded
@@ -927,6 +931,22 @@ async def update_agent_status(
                 session.add(task)
                 await session.commit()
                 return result
+            except PostCommitFinalCommitFailed as e:
+                # C1: the retry re-ran post-commit but its FINAL commit failed
+                # again — the deferred side effects are still unpersisted. Do
+                # NOT clear post_commit_pending (leave the marker set so the
+                # sweep keeps retrying) and do NOT 500 the agent (the terminal
+                # status is already committed; the marker owns the retry).
+                logger.warning(
+                    f"[PIPELINE] Post-commit retry final-commit failed for "
+                    f"{task.id}: {e} — leaving post_commit_pending set for sweep",
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+                return {
+                    "status": "post_commit_retry_pending",
+                    "task_id": str(task.id),
+                }
             except Exception as e:
                 logger.error(
                     f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}",
@@ -2904,14 +2924,26 @@ async def update_agent_status(
             # the guard lets the retry re-run post-commit processing.
             is_timeout = isinstance(e, asyncio.TimeoutError)
             is_locked = isinstance(e, PostCommitLocked)
+            # C1: the final post-commit commit failed. The task's terminal
+            # status is already safely committed (early commit above); only the
+            # best-effort deferred side effects (spawned follow-up / remediation
+            # tasks) were dropped. We MUST preserve the write-ahead marker so the
+            # sweep retries those side effects — but the agent has nothing to do,
+            # so do NOT re-raise a 500. Persist the marker (below), then return a
+            # clean 200 ("retry pending"). Without this, _process_post_commit
+            # swallowing the failure → clean return → marker cleared → sweep
+            # never retries (incident eefbed05).
+            is_final_commit = isinstance(e, PostCommitFinalCommitFailed)
             if is_timeout:
                 reason = "post_commit_timeout"
             elif is_locked:
                 reason = "post_commit_locked"
+            elif is_final_commit:
+                reason = "post_commit_final_commit_failed"
             else:
                 reason = "post_commit_error"
             logger.error(  # noqa: TRY400 — conditional exc_info: suppress for expected timeout/lock, show for real errors
-                f"[PIPELINE] Post-commit {'timed out' if is_timeout else ('locked' if is_locked else 'failed')} for task {task.id}: {e}",
+                f"[PIPELINE] Post-commit {'timed out' if is_timeout else ('locked' if is_locked else ('final-commit failed' if is_final_commit else 'failed'))} for task {task.id}: {e}",
                 exc_info=not (is_timeout or is_locked),
             )
             # The request session may be poisoned (LockNotAvailableError tears
@@ -2931,6 +2963,17 @@ async def update_agent_status(
                 logger.exception(
                     f"[PIPELINE] Failed to set _post_commit_pending for task {task.id}: {ctx_err}"
                 )
+            # C1: a final-commit failure is non-fatal to the agent — the marker
+            # is now persisted, so the sweep owns the retry. Return a clean 200
+            # ("retry pending") rather than 500ing the agent, UNLESS the marker
+            # persist itself also failed (then there is no retry record and we
+            # must surface the failure so the agent's retry re-runs post-commit
+            # via the idempotency guard, which re-arms the marker).
+            if is_final_commit and _persist_err is None:
+                return {
+                    "status": "post_commit_retry_pending",
+                    "task_id": str(task.id),
+                }
             # Audit 2026-04-25 A9: explicitly chain the persist failure so
             # operators see both the original post-commit error AND the
             # secondary persist failure in one traceback. The bare `raise`

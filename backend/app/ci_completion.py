@@ -496,16 +496,33 @@ async def _attempt_merge_with_retry_and_escalation(
         task.context = {**(task.context or {}), "_merge_comment_posted": True}
         flag_modified(task, "context")
         if ci_orig_id:
+            # C1: the pr_merged write on the ORIGINAL (rollup-orig) task is an
+            # independent operation that must NOT share this merge-task
+            # ``session``. Two failure modes the old shared-session code had:
+            #   (1) a raise here (e.g. session.get hitting a DB error) left the
+            #       caller's session in PendingRollback, so the caller's commit
+            #       of task.status=COMPLETED silently failed or 500'd; and
+            #   (2) the function returned True regardless, so the caller treated
+            #       the merge as fully done while the rollup-unblocking
+            #       ``pr_merged`` flag was actually dropped — the rollup that
+            #       gates on that flag then defers indefinitely.
+            # Give it its OWN AsyncSessionLocal scope (mirrors
+            # maybe_finalize_qualification / reaper Step 9): it commits the flag
+            # independently and an error here is fully contained.
             try:
-                orig = await session.get(Task, uuid.UUID(ci_orig_id))
-                if orig:
-                    orig.context = {**(orig.context or {}), "pr_merged": True}
-                    if orig.status == TaskStatus.EVALUATING and not (
-                        orig.context or {}
-                    ).get("review_loop", {}).get("ci_waiting"):
-                        orig.status = TaskStatus.COMPLETED
-                        orig.latest_status_message = "Rollup PR merged"
-                    session.add(orig)
+                from app.database import AsyncSessionLocal
+
+                async with AsyncSessionLocal() as _orig_session:
+                    orig = await _orig_session.get(Task, uuid.UUID(ci_orig_id))
+                    if orig:
+                        orig.context = {**(orig.context or {}), "pr_merged": True}
+                        if orig.status == TaskStatus.EVALUATING and not (
+                            orig.context or {}
+                        ).get("review_loop", {}).get("ci_waiting"):
+                            orig.status = TaskStatus.COMPLETED
+                            orig.latest_status_message = "Rollup PR merged"
+                        _orig_session.add(orig)
+                        await _orig_session.commit()
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True

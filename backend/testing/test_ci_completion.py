@@ -1537,8 +1537,11 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
     assert task.status == TaskStatus.COMPLETED
 
     # Verify pr_merged was propagated to orig_task.
-    # SQLAlchemy identity map means session.get(Task, orig_task.id) inside the
-    # function returns the SAME Python object, so assert in-memory (no flush/refresh).
+    # C1: the orig (rollup-orig) write now runs in its OWN AsyncSessionLocal
+    # session (poison isolation), so it no longer shares the identity map with
+    # this test's ``db_session``. Refresh from the DB to read the committed
+    # value rather than the stale in-memory object.
+    await db_session.refresh(orig_task)
     assert (orig_task.context or {}).get("pr_merged") is True, (
         "pr_merged=True must be set on the original task's context after merge"
     )
@@ -1592,7 +1595,9 @@ async def test_orig_task_evaluating_without_ci_waiting_completes(db_session, moc
     )
 
     assert result is True
-    # Identity map: orig_task in test == orig inside function — check in-memory
+    # C1: orig write runs on its own dedicated session now — refresh to read
+    # the committed state rather than the stale in-memory object.
+    await db_session.refresh(orig_task)
     assert orig_task.status == TaskStatus.COMPLETED, (
         "EVALUATING orig task without ci_waiting must be completed after rollup merge"
     )
@@ -1648,7 +1653,9 @@ async def test_orig_task_with_ci_waiting_stays_evaluating(db_session, mocker):
     )
 
     assert result is True
-    # Identity map: orig_task in test == orig inside function — check in-memory
+    # C1: orig write runs on its own dedicated session now — refresh to read
+    # the committed state rather than the stale in-memory object.
+    await db_session.refresh(orig_task)
     assert orig_task.status == TaskStatus.EVALUATING, (
         "Orig task with ci_waiting=True must remain EVALUATING — it still has a CI check pending"
     )
@@ -1687,6 +1694,75 @@ async def test_merge_success_without_orig_id(db_session, mocker):
     assert result is True
     assert task.status == TaskStatus.COMPLETED
     assert "merged" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_orig_pr_merged_write_failure_does_not_poison_caller_session(
+    db_session, mocker
+):
+    """C1 containment test for the NEW dedicated-session orig (rollup-orig)
+    pr_merged write: when that write's OWN ``AsyncSessionLocal`` scope fails, the
+    failure must stay fully contained — the caller's merge-task session is never
+    touched, so the parking task is still COMPLETED in-memory and the caller can
+    still commit.
+
+    NOTE: this test does NOT reproduce the pre-fix poison, and cannot — pre-fix
+    that block had no ``AsyncSessionLocal`` at all (it wrote orig directly on the
+    caller's ``session`` via ``session.get``), so patching
+    ``app.database.AsyncSessionLocal`` would have been a no-op against the old
+    code and the test would have passed pre-fix too. It instead asserts the
+    *new* dedicated-session design's containment property: a failure opening or
+    using the dedicated session is swallowed by the block's ``except`` and does
+    not propagate to (or poison) the caller's session. The pre-/post-fix
+    behavioural difference for the merge-task session is covered by the three
+    sibling tests above (which now ``db_session.refresh(orig_task)`` because the
+    committed orig state lives in a different session's identity map).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
+    # Make ONLY the dedicated orig-session fail. The caller's ``db_session`` uses
+    # TestingSessionLocal and is unaffected by patching app.database.AsyncSessionLocal.
+    mocker.patch(
+        "app.database.AsyncSessionLocal",
+        side_effect=RuntimeError("simulated dedicated-session DB error"),
+    )
+
+    project = Project(name="Orig write failure isolation", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        context={},
+        vm_instance_id="agent-vm-orig-iso",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session, project, ci_loop_extra={"original_task_id": str(orig_task.id)}
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Must not raise — the orig-write failure is swallowed inside the dedicated
+    # session's try/except and the caller session stays clean.
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+    assert result is True
+    # Parking task mutation survived on the (un-poisoned) caller session.
+    assert task.status == TaskStatus.COMPLETED
+    # Caller session is committable (would raise PendingRollbackError pre-fix).
+    await db_session.commit()
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 """Agent-facing API endpoints (lifecycle + auth helpers)."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -1366,12 +1367,22 @@ async def claim_task(
                 logger.exception(
                     "[AGENT] Failed to compute review_effectiveness (non-critical)"
                 )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 await _refresh_sr_catch_rate(session, task.project_id)
             except Exception:
                 logger.exception(
                     "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
                 )
+                # C1: this analytics write runs on the post-claim session (the
+                # claim was already committed at the top of this handler). A
+                # raise can abort the session; without this rollback the next
+                # analytics call AND the design_doc commit below silently fail
+                # on a PendingRollback session. Mirrors agent_status.py's
+                # rollback-on-swallow discipline.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 from app.sr_analytics import compute_sr_false_attestation_trends
 
@@ -1384,6 +1395,8 @@ async def claim_task(
                 logger.exception(
                     "[AGENT] Failed to compute sr_false_attestation_trends (non-critical)"
                 )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 from app.sr_analytics import (
                     compute_sr_regression_risk_test_signal_trends,
@@ -1398,6 +1411,8 @@ async def claim_task(
                 logger.exception(
                     "[AGENT] Failed to compute sr_regression_risk_test_signal_trends (non-critical)"
                 )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 from app.sr_analytics import compute_fresh_reviewer_trend
 
@@ -1410,6 +1425,8 @@ async def claim_task(
                 logger.exception(
                     "[AGENT] Failed to compute fresh_reviewer_trend (non-critical)"
                 )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 from app.sr_analytics import compute_edges_trend
 
@@ -1420,6 +1437,8 @@ async def claim_task(
                 )
             except Exception:
                 logger.exception("[AGENT] Failed to compute edges_trend (non-critical)")
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 await _stamp_reviewer_recovery_count(
                     session, task.project_id, high_iter_rows
@@ -1428,6 +1447,8 @@ async def claim_task(
                 logger.exception(
                     "[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)"
                 )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
             try:
                 from app.sr_analytics import compute_sr_reviewer_disagreements
 
@@ -1440,6 +1461,8 @@ async def claim_task(
                 logger.exception(
                     "[AGENT] Failed to compute sr_reviewer_disagreements (non-critical)"
                 )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
         direction_concurrent_files: list[str] = []
         if current_direction_id:
@@ -1487,6 +1510,12 @@ async def claim_task(
             logger.exception(
                 "[AGENT] Failed to record review measurement attribution (non-critical)"
             )
+            # C1: if a prior analytics call left the session aborted, this
+            # commit raises PendingRollbackError. Roll back so the playbook /
+            # direction-context code and the later commits run on a clean
+            # session instead of cascading silent failures.
+            with contextlib.suppress(Exception):
+                await session.rollback()
     else:
         # Lightweight pipeline health for all other task types
         try:

@@ -2431,6 +2431,14 @@ async def reaper_service():
                                 f"[REAPER] Deferred parent requeue failed for {parent.id}: {e}",
                                 exc_info=True,
                             )
+                            # C1: _requeue_parent_task commits internally; a
+                            # failure (IntegrityError on the cloned child) leaves
+                            # the shared session aborted, which would poison the
+                            # remaining requeues, the post-reap rollup loop, and
+                            # Steps 3-10. Roll back so each subsequent operation
+                            # starts on a clean session.
+                            with contextlib.suppress(Exception):
+                                await session.rollback()
                         finally:
                             # Always clear the in-flight marker so subsequent reaper
                             # cycles can re-evaluate if requeue itself failed.
@@ -2457,6 +2465,13 @@ async def reaper_service():
                                     f"[REAPER] Rollup check failed for task {task.id}: {e}",
                                     exc_info=True,
                                 )
+                                # C1: _check_and_trigger_rollup runs FOR UPDATE
+                                # selects + commits that can raise on a DB error,
+                                # leaving the shared session aborted. Roll back so
+                                # the next task's rollup check (and Steps 3-10) do
+                                # not inherit a PendingRollback session.
+                                with contextlib.suppress(Exception):
+                                    await session.rollback()
 
                     # Immediately unblock dependents of terminally failed tasks
                     for task in _post_reap_tasks:
@@ -2698,6 +2713,13 @@ async def reaper_service():
                     logger.warning(
                         f"[REAPER] Evaluating parent sweep error: {e}", exc_info=True
                     )
+                    # C1: a sub-helper (e.g. _check_and_trigger_rollup) that
+                    # raised may have left the shared ``session`` in
+                    # PendingRollback — roll back here so Steps 4-10 run on a
+                    # clean session rather than cascading silent failures /
+                    # rollback-expiry MissingGreenlet. Mirrors Step 6/7/8/10.
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 4: Rescue EVALUATING parents whose children ALL terminated without
                 # any completing successfully.  These parents have no COMPLETED child to
@@ -2787,6 +2809,13 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] All-children-failed rescue error: {e}", exc_info=True
                     )
+                    # C1: _requeue_parent_task commits internally and an
+                    # IntegrityError (e.g. idempotency-key collision on the
+                    # cloned retry child) leaves the shared ``session`` aborted.
+                    # Roll back so Steps 5-10 don't inherit the poison. Mirrors
+                    # the Step 6/7/8/10 handlers and the Step 3 guard above.
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
                 # Step 5: Infrastructure recovery sweep + hold maintenance.
                 # Delegates to reaper_infra_recovery for resurrection (5),

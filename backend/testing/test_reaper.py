@@ -8,6 +8,7 @@ helper, and the dependent-task unblocking pass that runs after terminal
 failures.
 """
 
+import contextlib
 import uuid as _uuid_mod
 import pytest
 import pytest_asyncio
@@ -2135,6 +2136,171 @@ async def test_step4_rescues_parent_after_step3_rollup_expires_session(
     requeued_ids = {call.args[0].id for call in requeue_mock.await_args_list}
     assert parent_b.id in requeued_ids
     assert parent_a.id not in requeued_ids
+
+
+@pytest.mark.asyncio
+async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """C1 seam: a REAL session poison originating in Step 3's rollup path must
+    be ROLLED BACK by the C1 handlers (Step 3 outer except, reaper.py ~2721, and
+    its sibling Step 4 except, ~2817) so the steps that follow run on a clean
+    session instead of inheriting a PendingRollback.
+
+    Two facts this test gets right that the original (vacuous) version did not:
+
+      1. REAL driver-level poison. A failed *read* (``SELECT … FROM <missing
+         table>`` → OperationalError) does NOT poison a SQLAlchemy session —
+         empirically the next ``execute`` still succeeds, so the original
+         "inject a bad SELECT" never put the session in PendingRollback and
+         passed identically pre-/post-fix. Only a failed *flush/commit*
+         (IntegrityError on a duplicate PK — the production shape of a racing
+         writer / serialization failure that ``_check_and_trigger_rollup``'s
+         internal commit can hit) actually dooms the transaction. We inject that
+         via the rollup helper.
+
+      2. Probe the SAME session the reaper uses. The poison lands on the reaper
+         worker's own session (the one opened at reaper.py:638 and threaded
+         through Steps 3-10), not this test's ``reaper_db``. We wrap Step 5's
+         entry (``run_infra_recovery_and_hold_maintenance``) to issue a fresh
+         ``execute`` on the exact session it is handed and record whether it
+         succeeds.
+
+    Flow: Step 3 calls the (mocked) rollup helper, which flushes a duplicate-PK
+    row → IntegrityError → the worker session is now in PendingRollback. The
+    inner per-parent except logs the raise but does not roll back, so the poison
+    survives into Step 4, whose ``session.get`` for the all-failed parent then
+    fails on the poisoned session. WITHOUT the C1 rollbacks the session is still
+    poisoned when Step 5 starts and the probe raises PendingRollbackError (test
+    fails). WITH them the session is rolled back and the probe succeeds, and no
+    PendingRollbackError escapes the cycle.
+    """
+    from sqlalchemy import text as _text
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+    captured: dict = {}
+
+    async def _poison_via_real_integrity_error(_child, session):
+        # Capture the worker session and poison it with a genuine flush-level
+        # IntegrityError (duplicate PK), the way a racing rollup commit would.
+        captured["session"] = session
+        proj_id = (
+            await session.execute(_text("SELECT id FROM project LIMIT 1"))
+        ).scalar()
+        dup = _uuid_mod.uuid4()
+        for _ in range(2):
+            session.add(
+                Task(
+                    id=dup,
+                    project_id=proj_id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                )
+            )
+        with contextlib.suppress(_IntegrityError):
+            await session.flush()
+        # Prove the poison is real: a follow-up op now raises PendingRollbackError.
+        from sqlalchemy.exc import PendingRollbackError as _PRB
+
+        _poisoned = False
+        try:
+            await session.execute(_text("SELECT 1"))
+        except _PRB:
+            _poisoned = True
+        assert _poisoned, (
+            "rollup injection did not actually poison the session — a follow-up "
+            "execute unexpectedly succeeded, so this test would be vacuous"
+        )
+        raise RuntimeError("simulated rollup commit failure after real poison")
+
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+        side_effect=_poison_via_real_integrity_error,
+    )
+
+    # --- Probe the SAME worker session at Step 5 entry -----------------------
+    import app.reaper as _reaper_mod
+
+    real_run_infra = _reaper_mod.run_infra_recovery_and_hold_maintenance
+    probe = {"ran": False, "session_clean": None}
+
+    async def _probe_then_run(session, now, just_reaped_ids=None):
+        probe["ran"] = True
+        # This is the SAME session captured by the rollup injection above.
+        assert captured.get("session") is session, (
+            "Step 5 ran on a different session than Step 3 poisoned"
+        )
+        try:
+            await session.execute(_text("SELECT 1"))
+            probe["session_clean"] = True
+        except Exception:
+            probe["session_clean"] = False
+            raise
+        return await real_run_infra(session, now, just_reaped_ids=just_reaped_ids)
+
+    mocker.patch(
+        "app.reaper.run_infra_recovery_and_hold_maintenance",
+        side_effect=_probe_then_run,
+    )
+
+    project = await _make_project(reaper_db)
+
+    # Parent A: COMPLETED child → Step 3 invokes the rollup helper (which
+    # poisons the session). The completed child also makes Step 4 SKIP parent A.
+    parent_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent_a)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent_a)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent_a.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+    )
+
+    # Parent B: all children FAILED → Step 4 reaches ``session.get`` for it on
+    # the (poisoned) session, which is where the surviving poison surfaces.
+    parent_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent_b)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent_b)
+    for _ in range(2):
+        reaper_db.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent_b.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.FAILED,
+                context={"failure_category": "CODE_ERROR"},
+            )
+        )
+    await reaper_db.commit()
+
+    # Must not raise PendingRollbackError out of the cycle.
+    await _run_reaper_once()
+
+    assert captured.get("session") is not None, (
+        "the rollup helper was never called — the poison did not fire, so this "
+        "test would be vacuous"
+    )
+    assert probe["ran"], "Step 5 entry was never reached after the Step 3 poison"
+    assert probe["session_clean"] is True, (
+        "the reaper session was still in PendingRollback when Step 5 started — "
+        "the C1 Step 3/Step 4 rollbacks did not recover the poisoned session."
+    )
 
 
 @pytest.mark.asyncio

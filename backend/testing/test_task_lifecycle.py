@@ -10,6 +10,7 @@ Covers the critical functions:
 """
 
 import ast
+import contextlib
 import importlib
 import os
 import uuid
@@ -5149,3 +5150,294 @@ class TestRequeueExtractionTripwire:
             f"app.task_lifecycle_requeue.{symbol}. The facade is shadowing "
             f"the canonical implementation."
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# C1 — shared-session poison: a sub-helper that hits a REAL DB-level error must
+# not leave _process_post_commit's INTERNAL session in PendingRollback for the
+# subsequent helpers / final commit.
+#
+# Two things every test below gets right that the original (vacuous) versions
+# got wrong:
+#
+#   1. REAL driver-level poison, not an application RuntimeError. A bare
+#      ``side_effect=RuntimeError`` does NOT poison a SQLAlchemy session — the
+#      session only enters PendingRollback after a *DBAPI* error (a failed
+#      ``execute`` / flush). So each injected helper runs a genuinely-failing
+#      statement on the session it is handed (``SELECT … FROM <missing table>``
+#      → OperationalError) before raising. Only then is the session actually in
+#      the aborted state the C1 rollbacks exist to recover from.
+#
+#   2. We poison + probe the SAME session production uses — the INTERNAL one
+#      ``_process_post_commit`` opens via ``async with factory() as session``
+#      (task_lifecycle.py:568) — NOT this test's fixture ``session`` (a distinct
+#      AsyncSession; poisoning one does not poison the other even though they
+#      share the StaticPool connection). The injected helper receives that exact
+#      internal session as an argument; ``_capture_and_poison`` records it and
+#      asserts it really is poisoned, then ``_process_post_commit`` returning
+#      ``{"status": "received"}`` proves its FINAL COMMIT succeeded on that same
+#      session — i.e. the C1 rollback recovered it.
+#
+# Why each fails WITHOUT the C1 fix: on pre-C1 ``main`` none of the sub-helper
+# excepts roll back and the final commit is an unguarded ``await
+# session.commit()``. A real poison injected mid-chain therefore propagates to
+# the next unguarded DB op (a later terminal helper, which on main is NOT
+# wrapped in a per-helper try) or to the final commit, raising
+# PendingRollbackError straight out of _process_post_commit — the call raises
+# instead of returning ``{"status": "received"}``. WITH the C1 fix the rollback
+# clears the poison and the chain finishes cleanly.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from sqlalchemy import text as _sa_text
+from sqlalchemy.exc import (
+    IntegrityError as _IntegrityError,
+    PendingRollbackError as _PendingRollbackError,
+)
+
+
+async def _poison_session(session) -> None:
+    """Put ``session`` into a real aborted / PendingRollback transaction via a
+    genuine DRIVER-level error — an ORM flush that hits a PK UNIQUE violation
+    (IntegrityError).
+
+    IMPORTANT: a failing *read* (``SELECT … FROM <missing table>`` →
+    OperationalError) does NOT poison the session — empirically the next
+    ``execute`` on it still succeeds. Only a failed flush/commit (an
+    IntegrityError on a duplicate PK — the production shape of two racing
+    writers / a serialization failure) actually dooms the transaction, so the
+    next ``execute``/``commit`` raises PendingRollbackError until ``rollback()``
+    is called. That is exactly the state the C1 rollbacks exist to recover from,
+    and what a plain ``raise RuntimeError`` (which leaves the session perfectly
+    usable) cannot reproduce.
+    """
+    import uuid as _uuid
+
+    project_id = (
+        await session.execute(_sa_text("SELECT id FROM project LIMIT 1"))
+    ).scalar()
+    # Two Task rows with the SAME primary key flushed together: the second
+    # INSERT violates the PK UNIQUE constraint → IntegrityError → transaction
+    # aborted.
+    dup_id = _uuid.uuid4()
+    for _ in range(2):
+        session.add(
+            Task(
+                id=dup_id,
+                project_id=project_id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+            )
+        )
+    # Expected to fail — the duplicate-PK flush aborts the transaction. Swallow
+    # so the *caller* (the patched helper) controls what it ultimately raises.
+    with contextlib.suppress(_IntegrityError):
+        await session.flush()
+    # A failed flush CLEARS session.new/dirty. Re-add a fresh pending row (no
+    # flush) so the handler's final-commit guard (``if session.dirty or
+    # session.new``) is True on the poisoned session — mirroring production,
+    # where legitimate deferred work (terminal status, spawned tasks) is still
+    # pending when the poison occurs. Without this, the unguarded pre-C1 final
+    # commit would be SKIPPED and the poison would go undetected.
+    session.add(
+        Task(
+            id=_uuid.uuid4(),
+            project_id=project_id,
+            payloads=[{"type": "create", "prompt": "post-poison deferred work"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+    )
+
+
+def _capture_and_poison(captured: dict, session_argno: int):
+    """Build an AsyncMock side_effect that captures the internal session at
+    ``args[session_argno]``, poisons it with a real IntegrityError-level fault,
+    asserts the poison actually took (so the test proves it injected a genuine
+    driver-level fault — not a no-op that leaves the session usable), then
+    raises to exercise the helper's except + C1 rollback."""
+
+    async def _side_effect(*args, **kwargs):
+        session = args[session_argno]
+        captured["session"] = session
+        await _poison_session(session)
+        # Prove the poison is real: a follow-up op on this session now raises
+        # PendingRollbackError. If it did NOT, the injected failure was not a
+        # genuine session poison and the whole test would be vacuous — exactly
+        # the bug this rework fixes.
+        with pytest.raises(_PendingRollbackError):
+            await session.execute(_sa_text("SELECT 1"))
+        raise RuntimeError("simulated handler failure after real session poison")
+
+    return _side_effect
+
+
+@pytest.mark.asyncio
+async def test_post_commit_rollup_raise_does_not_poison_session(tl_db, mocker):
+    """C1: _check_and_trigger_rollup hitting a real DB error must roll back the
+    INTERNAL post-commit session so the rest of the chain + final commit run
+    clean. Without the fix the poison propagates to the final commit and
+    _process_post_commit raises PendingRollbackError."""
+    captured: dict = {}
+    # _check_and_trigger_rollup(task, session) — session is positional arg 1.
+    mocker.patch(
+        "app.task_lifecycle._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+        side_effect=_capture_and_poison(captured, session_argno=1),
+    )
+    session, factory = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    child = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=child.id, status=TaskStatus.COMPLETED)
+
+    # Must NOT raise PendingRollbackError — the C1 rollback after the rollup
+    # except clears the poison so the final commit on the internal session
+    # succeeds and the handler returns normally.
+    result = await _process_post_commit(child.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+    # We poisoned the INTERNAL session production uses, not the fixture session.
+    assert captured["session"] is not session
+
+
+@pytest.mark.asyncio
+async def test_post_commit_terminal_helper_raise_does_not_poison_session(
+    tl_db, mocker
+):
+    """C1: a terminal-record helper hitting a real DB error mid-chain must roll
+    back so the later helpers + final commit run on a clean INTERNAL session.
+    Without the per-helper rollback the poison reaches the next helper / final
+    commit and _process_post_commit raises."""
+    captured: dict = {}
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    # These helpers are imported lazily inside _process_post_commit via
+    # ``from app.task_completion import ...`` (task_completion re-exports the
+    # two investigation helpers). The in-function import reads them off
+    # app.task_completion at call time, so patch THAT namespace — a
+    # module-level app.task_lifecycle patch would be shadowed by the
+    # in-function import, and patching task_completion_investigation would not
+    # affect task_completion's already-bound re-export.
+    # _terminal_helper(task, status, session) — session is positional arg 2.
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal",
+        new_callable=AsyncMock,
+        side_effect=_capture_and_poison(captured, session_argno=2),
+    )
+    # The two later helpers must still be invoked on a clean (rolled-back)
+    # session. If the poison were NOT cleared, the first of these to touch the
+    # session would itself raise PendingRollbackError.
+    later_regression = mocker.patch(
+        "app.task_completion._record_regression_signal_if_matching",
+        new_callable=AsyncMock,
+    )
+    later_investigation = mocker.patch(
+        "app.task_completion._handle_investigation_terminal_failure",
+        new_callable=AsyncMock,
+    )
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    # The chain continued past the raising helper (rollback isolated the poison).
+    later_regression.assert_awaited_once()
+    later_investigation.assert_awaited_once()
+    assert captured["session"] is not session
+
+
+@pytest.mark.asyncio
+async def test_post_commit_direction_outcome_raise_does_not_poison_session(
+    tl_db, mocker
+):
+    """C1: _update_direction_research_outcomes hitting a real DB error must roll
+    back the INTERNAL session so the terminal-record chain + final commit are
+    not run poisoned. Without the fix the poison reaches a later helper / the
+    final commit and _process_post_commit raises."""
+    captured: dict = {}
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    # _update_direction_research_outcomes(project_id, direction_id,
+    # research_task_id, session) — session is positional arg 3. Imported lazily
+    # from app.direction_outcomes.
+    mocker.patch(
+        "app.direction_outcomes._update_direction_research_outcomes",
+        new_callable=AsyncMock,
+        side_effect=_capture_and_poison(captured, session_argno=3),
+    )
+    later_remediation = mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+    session, factory = tl_db
+    project = await _make_project(session)
+    # FAILED (not COMPLETED) so the COMPLETED-only research-completion handler is
+    # skipped, keeping the test focused on the 6b direction-outcomes block — which
+    # fires on COMPLETED/FAILED/CANCELLED when direction_id + research_task_id are
+    # present.
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.FAILED,
+        context={"direction_id": "d-1", "research_task_id": str(uuid.uuid4())},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+
+    # Chain continued past the raising direction-outcomes call on a clean session.
+    later_remediation.assert_awaited_once()
+    assert captured["session"] is not session
+
+
+@pytest.mark.asyncio
+async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
+    """C1: a real DB error in the strategic backstop must roll back the INTERNAL
+    session so the guarded final commit does not surface PendingRollbackError as
+    a 500 to the agent. Without the backstop rollback the unguarded final commit
+    raises PendingRollbackError straight out of the handler."""
+    captured: dict = {}
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    # strategic_cycle.get(session, cycle_id) — session is positional arg 0.
+    mocker.patch(
+        "app.strategic_cycle.get",
+        new_callable=AsyncMock,
+        side_effect=_capture_and_poison(captured, session_argno=0),
+    )
+    session, factory = tl_db
+    project = await _make_project(session)
+    # The backstop fires for ANY task carrying a strategic_cycle_id in context
+    # (it reads payload type only to pick the phase label). Use a non-strategic
+    # task type so the post-commit task acquisition takes the plain task-only
+    # lock path rather than the strategic Project→Task pair-lock (which relies
+    # on FOR UPDATE skip_locked that the SQLite test harness does not honor).
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.FAILED,
+        context={"strategic_cycle_id": str(uuid.uuid4())},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+
+    # Must return cleanly, not raise PendingRollbackError on the final commit.
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+    assert result["status"] == "received"
+    assert captured["session"] is not session

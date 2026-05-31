@@ -10,6 +10,7 @@ imports (task_lifecycle is imported BY main) and preserve test-patchability
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -62,6 +63,29 @@ class PostCommitLocked(Exception):
     """
 
 
+class PostCommitFinalCommitFailed(Exception):
+    """Raised when _process_post_commit's FINAL commit fails after the
+    post-terminal chain ran.
+
+    The final commit flushes the best-effort post-terminal side effects
+    (spawned follow-up / remediation tasks, rollup nudges, analytics,
+    artifacts). If it fails, those side effects are DROPPED — they were never
+    persisted. The task's own terminal status is safe (it was committed on the
+    early-commit / status-endpoint session before post-commit ran), so this
+    is NOT a fatal error, but the dropped side effects MUST be retried.
+
+    Distinct signal so the callers (inline status endpoint, the terminal
+    idempotency retry path, _sweep_post_commit_pending) PRESERVE the
+    write-ahead ``post_commit_pending`` marker for the sweep to retry instead
+    of clearing it on what would otherwise look like a clean return. Crucially
+    the inline / retry callers translate it to a clean 200 ("post_commit_retry
+    _pending") rather than re-raising a 500 to the agent — the work survives in
+    the marker, so there is nothing for the agent to do. See incident
+    eefbed05: a swallowed final-commit failure cleared the marker, the sweep
+    never retried, and the dependent chain orphaned.
+    """
+
+
 from app.failure_stage import (  # noqa: E402, F401, RUF100
     _TRANSIENT_SCAN_ERROR_PATTERNS,
     _derive_failure_stage,
@@ -85,13 +109,13 @@ from app.retry_prompt import (  # noqa: E402, F401, RUF100
 )
 
 
-from app.task_lifecycle_requeue import (  # noqa: E402, F401
+from app.task_lifecycle_requeue import (  # noqa: E402, F401, RUF100
     _record_parent_failure,
     _requeue_parent_task,
 )
 
 
-from app.task_lifecycle_github_helpers import (  # noqa: E402, F401
+from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
     _comment_with_retry,
     _get_approval_gate_file_lists,
     _merge_with_retry,
@@ -3700,6 +3724,15 @@ async def _process_post_commit(
                     f"[ROLLUP] Rollup check failed for task {task.id}: {e!r}",
                     exc_info=True,
                 )
+                # C1: _check_and_trigger_rollup does FOR UPDATE selects +
+                # internal commits that can raise on a DB error, leaving this
+                # post-commit ``session`` in PendingRollback. Without this
+                # rollback every subsequent post-terminal helper (direction
+                # outcomes, remediation/regression, strategic backstop) and the
+                # final commit silently fail or 500 the agent with
+                # PendingRollbackError. Roll back so the chain continues clean.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
         # 6b. Update direction research history outcomes for child tasks of a research cycle
         _task_ctx = task.context or {}
@@ -3722,10 +3755,35 @@ async def _process_post_commit(
                 logger.warning(
                     f"[RESEARCH] Failed to update direction research outcomes for task {task.id}: {_outcome_exc!r}"
                 )
+                # C1: _update_direction_research_outcomes takes the directions
+                # FOR NO KEY UPDATE lock and commits; an IntegrityError /
+                # serialization failure there leaves this session aborted. Roll
+                # back so the terminal-record helpers below + the final commit
+                # don't inherit the PendingRollback.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
-        await _record_remediation_if_terminal(task, payload.status, session)
-        await _record_regression_signal_if_matching(task, payload.status, session)
-        await _handle_investigation_terminal_failure(task, payload.status, session)
+        # C1: each terminal-record helper does its own session writes (and
+        # _record_remediation_if_terminal can call _record_remediation_outcome /
+        # spawn a follow-up that commits). They are independent operations on the
+        # shared post-commit session: a raise in one must not leave the session
+        # in PendingRollback for the next one or for the final commit below. Run
+        # each behind a rollback-on-failure guard so the chain is poison-free.
+        for _terminal_helper in (
+            _record_remediation_if_terminal,
+            _record_regression_signal_if_matching,
+            _handle_investigation_terminal_failure,
+        ):
+            try:
+                await _terminal_helper(task, payload.status, session)
+            except Exception as _helper_exc:  # noqa: PERF203 — per-helper rollback isolation in a fixed 3-item chain
+                logger.error(
+                    f"[LIFECYCLE] Terminal-record helper {_terminal_helper.__name__} "
+                    f"failed for task {task.id}: {_helper_exc!r}",
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
 
         # Release-qualifier finalization — fires from EVERY terminal path
         # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a
@@ -3796,6 +3854,16 @@ async def _process_post_commit(
                         f"{_qual_exc!r}",
                         exc_info=True,
                     )
+                    # C1 (defensive): maybe_finalize_qualification owns its own
+                    # dedicated session, so it should not poison this shared
+                    # ``session`` — but the pre-call accessors (task.context /
+                    # task.first_payload) can trigger a lazy load that aborts the
+                    # transaction, and a future refactor might touch the shared
+                    # session. Roll back to match the sibling terminal-record /
+                    # backstop / final-commit guards so the chain below stays
+                    # poison-free.
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
 
         # 7. Project State Aggregation
         # Only consider executable tasks (those with a VM) for aggregation.
@@ -3930,10 +3998,47 @@ async def _process_post_commit(
                 f"[STRATEGIC] Lifecycle backstop failed for task {task.id}: {_bk_exc!r}",
                 exc_info=True,
             )
+            # C1: strategic_cycle.mark_failure + the commit inside the backstop
+            # can raise (lock contention / DB error), leaving the session
+            # aborted. Roll back so the final commit below does not raise
+            # PendingRollbackError and return a 500 to the agent.
+            with contextlib.suppress(Exception):
+                await session.rollback()
 
-        # Final commit for any deferred changes (status, artifacts, spawned tasks)
+        # Final commit for any deferred changes (status, artifacts, spawned tasks).
+        # C1: guard the commit. The task's own terminal status was already
+        # committed on the early-commit (status-endpoint) session before this
+        # post-commit handler ran, so a failure here is NOT fatal to the task.
+        # BUT the deferred side effects it would flush (spawned follow-up /
+        # remediation tasks, rollup nudges, artifacts) are now DROPPED — they
+        # were never persisted. _process_post_commit runs behind the
+        # write-ahead ``post_commit_pending`` marker + sweep-retry machinery;
+        # both the inline path (_clear_post_commit_pending, agent_status.py
+        # ~2946) and the sweep (services.py ~1954) clear that marker on a CLEAN
+        # return, so swallowing this failure and returning {status:"received"}
+        # would clear the marker and the sweep would NEVER retry the dropped
+        # side effects (incident eefbed05: dependent chain orphaned).
+        #
+        # So roll back the poisoned transaction (cleanly closing the session)
+        # and raise PostCommitFinalCommitFailed: a distinct signal the callers
+        # treat as "PRESERVE the marker for the sweep" — while still NOT 500ing
+        # the agent (the inline/retry callers translate it to a clean 200).
         if session.dirty or session.new:
-            await session.commit()
+            try:
+                await session.commit()
+            except Exception as _commit_exc:
+                logger.error(
+                    f"[LIFECYCLE] Final post-commit commit failed for task "
+                    f"{task.id}: {_commit_exc!r} — preserving post_commit_pending "
+                    f"marker for sweep retry (deferred side effects not persisted)",
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+                raise PostCommitFinalCommitFailed(
+                    f"final post-commit commit failed for task {task.id}: "
+                    f"{_commit_exc!r}"
+                ) from _commit_exc
 
         # Broadcast AFTER all processing is complete (artifacts saved, pipeline spawned)
         await broadcast_to_project(
