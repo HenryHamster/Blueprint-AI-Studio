@@ -161,7 +161,7 @@ describe('useDeploymentState', () => {
       // At least one poll has run: orchestratorHealth should be set to null
       expect(result.current.orchestratorHealth).toBeNull();
       // And the other effects have completed (deployState set from empty response)
-      expect(result.current.deployState).toBeDefined();
+      expect(result.current.deployState).not.toBeNull();
     });
   });
 
@@ -203,7 +203,7 @@ describe('useDeploymentState', () => {
     await waitFor(() => {
       expect(result.current.detailedHealth).toBeNull();
       // Other endpoints still run; deployState should be set
-      expect(result.current.deployState).toBeDefined();
+      expect(result.current.deployState).not.toBeNull();
     });
   });
 
@@ -228,7 +228,7 @@ describe('useDeploymentState', () => {
       useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }, null),
     );
     // Wait for the standard health effects to settle (they set deployState, etc.)
-    await waitFor(() => expect(result.current.deployState).toBeDefined());
+    await waitFor(() => expect(result.current.deployState).not.toBeNull());
     // With no selectedProjectId the effect bails out immediately, leaving
     // diagnostics null (if it were fetched the mock would return {} not null).
     expect(result.current.diagnostics).toBeNull();

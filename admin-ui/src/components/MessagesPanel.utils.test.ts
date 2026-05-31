@@ -297,8 +297,15 @@ describe('HIGH_SIGNAL_NOTE_BADGE_LABELS invariants', () => {
 });
 
 describe('MuteWindow persistence', () => {
-  beforeEach(() => { localStorage.clear(); });
-  afterEach(() => { localStorage.clear(); });
+  beforeEach(() => {
+    localStorage.clear();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-15T12:00:00Z'));
+  });
+  afterEach(() => {
+    localStorage.clear();
+    vi.useRealTimers();
+  });
 
   test('loadMuteWindow returns null when no key', () => {
     expect(loadMuteWindow('user1', 'proj1')).toBeNull();
@@ -344,7 +351,7 @@ describe('MuteWindow persistence', () => {
   });
 
   test('formatMuteCountdown renders Xm left', () => {
-    const expiresAt = Date.now() + 47 * 60000 + 500; // +500ms so ceil gives exactly 47
+    const expiresAt = Date.now() + 47 * 60000; // floor(47 * 60000 / 60000) = 47
     expect(formatMuteCountdown(expiresAt)).toBe('47m left');
   });
 

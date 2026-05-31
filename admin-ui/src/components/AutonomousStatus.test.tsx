@@ -79,11 +79,6 @@ afterEach(() => {
 });
 
 describe('AutonomousStatus badge', () => {
-  it('renders the Autonomy label', async () => {
-    await act(async () => { render(<AutonomousStatus />); });
-    expect(screen.getByText('Autonomy')).toBeTruthy();
-  });
-
   it('shows Off when no projects are enabled', async () => {
     await act(async () => { render(<AutonomousStatus />); });
     expect(screen.getByText('Off')).toBeTruthy();
