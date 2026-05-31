@@ -11109,6 +11109,308 @@ async def test_pending_auto_merge_pr_closed_without_merge_drives_to_promotion_fa
     assert version.last_qualification["error"] == "pr_closed_without_merge"
 
 
+# ===========================================================================
+# Audit C9 — promotion_pending wall-clock deadline + escalating stall alert
+#
+# The promotion_pending sub-state intentionally bypasses the 6h qualification
+# timeout, but had NO replacement backstop: if the promotion PR stays open with
+# pending/absent CI (or GitHub calls fail) the terminal-state reconcile is a
+# no-op and the version strands indefinitely, blocking the self-improve loop and
+# (because the stall alert fired exactly once) becoming operator-invisible.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promotion_pending_timeout_force_fails_stranded_version(
+    db_session, mocker
+):
+    """A version stranded in promotion_pending past the wall-clock cap is
+    force-failed as 'promotion_pending_timeout', clearing the sub-state so the
+    version returns to stabilize and the normal backstop re-arms.
+
+    WITHOUT the C9 fix this version stays pending forever — no GitHub I/O is
+    even attempted here (PR state cannot be resolved), which is exactly the
+    no-op-reconcile case the old code could not recover from.
+    """
+    from datetime import timedelta
+
+    from app.release_reconciliation import (
+        _reconcile_if_promotion_pending_timed_out,
+        _promotion_pending_timeout_seconds,
+    )
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    # enabled_at is older than the cap — the promotion has stranded.
+    stranded_enabled = (
+        _utcnow()
+        - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "candidate_sha": "strandpp" * 5,  # 40 chars
+        "promotion_pending": {
+            "pr_number": 99,
+            "pr_url": "https://github.com/acme/widget/pull/99",
+            "auto_merge_enabled": True,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is True
+
+    await db_session.refresh(version)
+    # Stays open (promotion failure never touches main) and returns to stabilize.
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_pending_timeout"
+    # The sub-state is CLEARED so the qualification-timeout backstop re-arms.
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_promotion_pending_timeout_does_not_fire_before_cap(db_session):
+    """A promotion_pending sub-state younger than the cap is left untouched —
+    a slow-but-progressing promotion PR must not be force-failed."""
+    from app.release_reconciliation import _reconcile_if_promotion_pending_timed_out
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    version.last_qualification = {
+        **version.last_qualification,
+        "candidate_sha": "freshpp0" * 5,  # 40 chars
+        "promotion_pending": {
+            "pr_number": 100,
+            "pr_url": "https://github.com/acme/widget/pull/100",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is False
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    assert "promotion_pending" in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_promotion_pending_timeout_wired_into_sweep(db_session):
+    """The wall-clock deadline is reachable through the public sweep entry point
+    (sweep_stuck_qualifications), proving the wiring — not just the helper."""
+    from datetime import timedelta
+
+    from app import shared_state
+    from app.release_reconciliation import _promotion_pending_timeout_seconds
+    from app.time_utils import _utcnow
+
+    # Disable promotion so the readiness check in the same sweep is a no-op.
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    stranded_enabled = (
+        _utcnow()
+        - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "candidate_sha": "sweepstr" * 5,  # 40 chars
+        "promotion_pending": {
+            "pr_number": 101,
+            "pr_url": "https://github.com/acme/widget/pull/101",
+            "auto_merge_enabled": True,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_pending_timeout"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_promotion_pending_timeout_respects_runtime_config_override(db_session):
+    """The cap is configurable via runtime_config; a positive override changes
+    when the deadline fires (and a non-positive override is ignored)."""
+    from app import shared_state
+    from app.release_reconciliation import (
+        _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT,
+        _promotion_pending_timeout_seconds,
+    )
+
+    # Positive override is honored.
+    shared_state.runtime_config["promotion_pending_timeout_seconds"] = 3600
+    try:
+        assert _promotion_pending_timeout_seconds() == 3600
+        # Non-positive / bogus overrides fall back to the default (never disable
+        # the backstop).
+        shared_state.runtime_config["promotion_pending_timeout_seconds"] = 0
+        assert (
+            _promotion_pending_timeout_seconds()
+            == _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT
+        )
+        shared_state.runtime_config["promotion_pending_timeout_seconds"] = "garbage"
+        assert (
+            _promotion_pending_timeout_seconds()
+            == _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT
+        )
+    finally:
+        shared_state.runtime_config.pop("promotion_pending_timeout_seconds", None)
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_stall_alert_refires_and_escalates(db_session):
+    """The auto-merge stall alert is NO LONGER single-fire: it re-fires once per
+    re-alert interval and escalates from WARNING to ERROR (the highest
+    AlertSeverity) past the critical threshold, so a stranded promotion stays
+    operator-visible.
+
+    WITHOUT the C9 fix the second call returns False permanently (the old code
+    bailed once ``alerted_at`` was set), so the CRITICAL escalation never fires.
+    """
+    from datetime import timedelta
+
+    from app import release_stall_alerts as rsa
+    from app.models import AlertSeverity
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # First fire: stalled past the WARNING threshold but under critical.
+    first_enabled = _utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS + 600)
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 202,
+            "pr_url": "https://github.com/acme/widget/pull/202",
+            "auto_merge_enabled": True,
+            "enabled_at": first_enabled.isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+    assert fired is True
+
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["alert_count"] == 1
+    assert pending.get("last_alerted_at") is not None
+
+    # An immediate second call is suppressed by the re-alert interval gate.
+    fired_again = await rq._check_version_auto_merge_stall(db_session, version)
+    assert fired_again is False
+
+    # Now simulate time passing PAST both the re-alert interval and the critical
+    # threshold: push enabled_at + last_alerted_at far enough back.
+    crit_enabled = _utcnow() - timedelta(
+        seconds=rsa._AUTO_MERGE_STALL_CRITICAL_SECONDS + 600
+    )
+    old_last_alert = _utcnow() - timedelta(
+        seconds=rsa._AUTO_MERGE_REALERT_INTERVAL_SECONDS + 600
+    )
+    pend = dict(version.last_qualification["promotion_pending"])
+    pend["enabled_at"] = crit_enabled.isoformat()
+    pend["last_alerted_at"] = old_last_alert.isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": pend,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired_critical = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+    assert fired_critical is True
+
+    await db_session.refresh(version)
+    pending = version.last_qualification["promotion_pending"]
+    # Re-fired (count incremented) — proves it is no longer single-fire.
+    assert pending["alert_count"] == 2
+
+    # The most recent alert escalated to ERROR (the highest severity tier).
+    alerts = (
+        (
+            await db_session.execute(
+                _select(Alert)
+                .where(Alert.project_id == project.id)
+                .order_by(Alert.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(a.severity == AlertSeverity.ERROR for a in alerts)
+    assert any(a.severity == AlertSeverity.WARNING for a in alerts)
+
+
 # ---------------------------------------------------------------------------
 # get_latest_release_audit_report — observability helper
 #

@@ -59,7 +59,7 @@
     "release_qualifier_infra.py": 300,
     "release_qualifier_io.py": 500,
     "release_qualifier_readiness.py": 300,
-    "release_qualifier_sweep.py": 500,
+    "release_qualifier_sweep.py": 600,
     "release_reconciliation.py": 900,
     "release_readiness.py": 500,
     "release_stall_alerts.py": 800,

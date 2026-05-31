@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 
 from sqlalchemy import select
 
@@ -24,8 +25,55 @@ from app.release_promotion import (
     _resolve_github_with_session,
 )
 from app.release_scoring import _CI_RED, _classify_check_runs
+from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Audit C9: hard wall-clock deadline on the ``promotion_pending`` sub-state.
+#
+# When a qualification PASSES and promotion fires but the promotion PR's CI is
+# still pending (GitHub 405, no conflict), ``promote()`` enables auto-merge and
+# leaves ``last_qualification.status == "pending"`` with a ``promotion_pending``
+# sub-state so the reaper can confirm the merge later.  By design that sub-state
+# *bypasses* the 6h qualification-timeout backstop
+# (``_finalize_in_dedicated_session`` returns early when ``promotion_pending`` is
+# present) — the qualifier children already terminated, so that backstop no
+# longer applies and killing the version would discard a passing PR mid-CI.
+#
+# But nothing replaced that backstop for the ``promotion_pending`` state itself.
+# The only recovery is ``_reconcile_if_pending_auto_merge_landed`` detecting a
+# terminal PR state (merged / closed / CI-red); that path is a no-op when the PR
+# stays open with pending/absent CI or when the GitHub calls fail, so a version
+# can strand in ``promotion_pending`` indefinitely and block the whole
+# self-improve loop while becoming operator-invisible after the single-fire
+# stall alert.
+#
+# This deadline is the replacement backstop: once a ``promotion_pending``
+# sub-state has aged past the cap we record a ``promotion_pending_timeout``
+# failure, which clears ``promotion_pending`` (sending the version back to
+# stabilize) and re-arms the normal qualification-timeout backstop + retry
+# machinery on the next cycle.  The default (24h) is deliberately well beyond
+# the 4h stall alert and any realistic CI duration so it only fires on a
+# genuinely wedged promotion, never on a slow-but-progressing one.
+_PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
+
+
+def _promotion_pending_timeout_seconds() -> float:
+    """Resolve the ``promotion_pending`` wall-clock cap (configurable).
+
+    Read from ``runtime_config['promotion_pending_timeout_seconds']`` when set
+    to a positive number, else the 24h default.  A non-positive / unparseable
+    override is ignored so a bad config value can never disable the backstop.
+    """
+    raw = _runtime_config.get("promotion_pending_timeout_seconds")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT
+    if value <= 0:
+        return _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT
+    return value
 
 
 async def _reconcile_if_promotion_failed_landed(
@@ -373,6 +421,120 @@ async def _reconcile_if_pending_auto_merge_landed(
                 logger.exception(
                     "[RELEASE_QUALIFIER] reconcile pending_auto_merge: rollback "
                     "failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
+async def _reconcile_if_promotion_pending_timed_out(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Force-fail a ``promotion_pending`` sub-state that has stranded too long.
+
+    Audit C9: the replacement backstop for the ``promotion_pending`` sub-state,
+    which intentionally bypasses the 6h qualification timeout (see the module
+    docstring on ``_PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT``).  Pure DB work —
+    no GitHub I/O — so it fires even when GitHub calls fail (the exact case the
+    ``_reconcile_if_pending_auto_merge_landed`` terminal-state path cannot
+    handle).
+
+    For an ``open`` version with ``last_qualification.status == "pending"`` and a
+    ``promotion_pending`` sub-state whose ``enabled_at`` age exceeds the
+    configurable cap, records a ``_record_promotion_failure`` with error
+    ``promotion_pending_timeout``.  Because ``base_record`` excludes
+    ``promotion_pending``, that failure CLEARS the sub-state — the version goes
+    back to stabilize, and on the next cycle the normal qualification-timeout
+    backstop + retry machinery are re-armed.  ``main`` is never touched, so this
+    is always safe.  Returns True iff a timeout failure was recorded.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "pending":
+                return False
+            pending = qual.get("promotion_pending")
+            if not pending:
+                return False
+
+            enabled_at_str = pending.get("enabled_at")
+            if not enabled_at_str:
+                # No clock to age against — leave it; the auto-merge stall alert
+                # (which has the same missing-enabled_at guard) surfaces this.
+                return False
+            try:
+                enabled_at = datetime.fromisoformat(enabled_at_str)
+            except (ValueError, TypeError):
+                return False
+
+            age_seconds = (_utcnow() - enabled_at).total_seconds()
+            cap_seconds = _promotion_pending_timeout_seconds()
+            if age_seconds < cap_seconds:
+                return False
+
+            age_hours = age_seconds / 3600.0
+            pr_number = pending.get("pr_number")
+            pr_url: str | None = pending.get("pr_url")
+            # base_record drops promotion_pending (mirrors
+            # _reconcile_if_pending_auto_merge_landed) so the recorded failure
+            # CLEARS the sub-state and re-arms the qualification-timeout backstop.
+            base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
+
+            logger.warning(
+                "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: v%d "
+                "promotion PR #%s has been pending %.1fh (> %.1fh cap) — "
+                "force-failing as promotion_pending_timeout so the version "
+                "returns to stabilize and the normal backstop re-arms",
+                version.version_number,
+                pr_number,
+                age_hours,
+                cap_seconds / 3600.0,
+            )
+            await _record_promotion_failure(
+                session,
+                version,
+                base_record,
+                "promotion_pending_timeout",
+                detail=(
+                    f"promotion PR #{pr_number} stranded in promotion_pending "
+                    f"for {age_hours:.0f}h (> {cap_seconds / 3600.0:.0f}h cap) "
+                    f"without a terminal merge/close/CI signal — force-failed so "
+                    f"the version retries qualification"
+                ),
+                pr_url=pr_url,
+                lock_released=False,
+            )
+            await session.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
+                    "rollback failed for version %s after unexpected error",
                     version_id,
                 )
             return False

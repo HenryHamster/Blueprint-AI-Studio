@@ -34,6 +34,15 @@ _STABILIZE_STALL_MERGED_TASKS = 40
 # How long a promotion PR may await auto-merge before the stall alert fires.
 _AUTO_MERGE_STALL_SECONDS = 4 * 3600
 
+# Audit C9: the auto-merge stall alert must NOT fire only once and then go
+# permanently silent — a version stranded in promotion_pending was becoming
+# operator-invisible after the first alert.  Instead it re-fires on this cadence
+# (so a still-stuck promotion stays on the operator's radar) and escalates in
+# severity (WARNING → ERROR, the highest AlertSeverity) once the stall exceeds
+# _AUTO_MERGE_STALL_CRITICAL_SECONDS.
+_AUTO_MERGE_REALERT_INTERVAL_SECONDS = 4 * 3600
+_AUTO_MERGE_STALL_CRITICAL_SECONDS = 24 * 3600
+
 
 def _release_qualifier_module():
     from app import release_qualifier as rq
@@ -346,7 +355,20 @@ async def _check_version_auto_merge_stall(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
 ) -> bool:
-    """Alert when a promotion PR awaiting auto-merge has been pending too long."""
+    """Alert when a promotion PR awaiting auto-merge has been pending too long.
+
+    Audit C9: this alert is PERIODIC/ESCALATING, not single-fire.  A version
+    stranded in ``promotion_pending`` was previously becoming operator-invisible
+    after the first alert (the old code bailed once ``alerted_at`` was set).  Now
+    it re-fires every ``_AUTO_MERGE_REALERT_INTERVAL_SECONDS`` for as long as the
+    promotion stays stuck, escalating in severity (WARNING → ERROR, the highest
+    ``AlertSeverity``) once the stall exceeds
+    ``_AUTO_MERGE_STALL_CRITICAL_SECONDS`` — so a wedged promotion stays on the
+    operator's radar.  (The promotion_pending wall-clock deadline in
+    ``release_reconciliation`` independently force-fails the sub-state, but this
+    alert keeps the situation visible in the meantime and on any project where
+    that deadline has not yet elapsed.)
+    """
     if version.status != "open":
         return False
 
@@ -356,9 +378,6 @@ async def _check_version_auto_merge_stall(
 
     pending = qual.get("promotion_pending")
     if not pending:
-        return False
-
-    if pending.get("alerted_at"):
         return False
 
     enabled_at_str = pending.get("enabled_at")
@@ -371,26 +390,57 @@ async def _check_version_auto_merge_stall(
         return False
 
     rq = _release_qualifier_module()
-    age_seconds = (_utcnow() - enabled_at).total_seconds()
+    now = _utcnow()
+    age_seconds = (now - enabled_at).total_seconds()
     if age_seconds < rq._AUTO_MERGE_STALL_SECONDS:
         return False
+
+    # Re-alert gate: fire on the first stall and then once per re-alert interval
+    # thereafter (replaces the old fire-exactly-once ``alerted_at`` guard).  The
+    # interval is measured from the LAST alert, falling back to ``alerted_at``
+    # (written by the pre-C9 single-fire path) so an in-flight stall upgrades
+    # cleanly to the periodic cadence.
+    last_alerted_str = pending.get("last_alerted_at") or pending.get("alerted_at")
+    if last_alerted_str:
+        try:
+            last_alerted = datetime.fromisoformat(last_alerted_str)
+        except (ValueError, TypeError):
+            last_alerted = None
+        if (
+            last_alerted is not None
+            and (now - last_alerted).total_seconds()
+            < _AUTO_MERGE_REALERT_INTERVAL_SECONDS
+        ):
+            return False
 
     pr_number = pending.get("pr_number")
     pr_url = pending.get("pr_url") or ""
     auto_merge_enabled = bool(pending.get("auto_merge_enabled"))
     age_hours = int(age_seconds // 3600)
 
+    critical = age_seconds >= _AUTO_MERGE_STALL_CRITICAL_SECONDS
+    # ERROR is the highest available AlertSeverity (no CRITICAL tier exists).
+    severity = AlertSeverity.ERROR if critical else AlertSeverity.WARNING
+    severity_note = (
+        " This has now exceeded "
+        f"{_AUTO_MERGE_STALL_CRITICAL_SECONDS // 3600}h — manual intervention "
+        "is likely required (the promotion_pending backstop will force-fail it "
+        "back to stabilize)."
+        if critical
+        else ""
+    )
+
     session.add(
         Alert(
             project_id=version.project_id,
-            severity=AlertSeverity.WARNING,
+            severity=severity,
             title=(f"Release v{version.version_number} promotion auto-merge stalled"),
             message=(
                 f"Release v{version.version_number} passed qualification but "
                 f"promotion PR #{pr_number} has not merged after {age_hours}h "
                 f"(auto-merge "
                 f"{'enabled' if auto_merge_enabled else 'NOT confirmed enabled'}"
-                f"). Check the PR: {pr_url}"
+                f"). Check the PR: {pr_url}{severity_note}"
             ),
         )
     )
@@ -413,13 +463,23 @@ async def _check_version_auto_merge_stall(
         )
 
     new_qual = dict(qual)
-    new_qual["promotion_pending"] = dict(pending)
-    new_qual["promotion_pending"]["alerted_at"] = _utcnow().isoformat()
+    new_pending = dict(pending)
+    now_iso = now.isoformat()
+    # Keep ``alerted_at`` as the FIRST-fire anchor for backward compatibility;
+    # ``last_alerted_at`` drives the re-alert cadence and ``alert_count`` records
+    # the escalation history.
+    new_pending.setdefault("alerted_at", now_iso)
+    new_pending["last_alerted_at"] = now_iso
+    new_pending["alert_count"] = int(new_pending.get("alert_count") or 0) + 1
+    new_qual["promotion_pending"] = new_pending
     version.last_qualification = new_qual
     session.add(version)
 
     logger.warning(
-        "[RELEASE_QUALIFIER] auto-merge stall alert for v%d: PR #%s pending %dh (auto-merge %s)",
+        "[RELEASE_QUALIFIER] auto-merge stall alert (%s, #%d) for v%d: PR #%s "
+        "pending %dh (auto-merge %s)",
+        "ERROR" if critical else "WARNING",
+        new_pending["alert_count"],
         version.version_number,
         pr_number,
         age_hours,

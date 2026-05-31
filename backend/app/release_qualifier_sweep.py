@@ -27,6 +27,7 @@ from app.release_promotion import _notify_operator
 from app.release_reconciliation import (
     _reconcile_if_pending_auto_merge_landed,
     _reconcile_if_promotion_failed_landed,
+    _reconcile_if_promotion_pending_timed_out,
 )
 from app.release_stall_alerts import (
     _check_version_auto_merge_stall,
@@ -423,6 +424,40 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep reconciled version %s "
                 "(pending_auto_merge drove to terminal state)",
+                version_id,
+            )
+
+    # Audit C9: hard wall-clock deadline on the promotion_pending sub-state.
+    # The promotion_pending state intentionally bypasses the 6h qualification
+    # timeout (the qualifier children already terminated), but nothing replaced
+    # that backstop for the sub-state itself: if the promotion PR stays open
+    # with pending/absent CI (or every GitHub call fails) the
+    # _reconcile_if_pending_auto_merge_landed terminal-state path is a no-op and
+    # the version strands indefinitely, blocking the whole self-improve loop.
+    # This pure-DB check force-fails a promotion_pending older than the cap as
+    # promotion_pending_timeout, clearing the sub-state so the version returns to
+    # stabilize and the qualification-timeout backstop + retry machinery re-arm
+    # next cycle.  Runs AFTER the landed/closed reconcile loops (so a PR that has
+    # actually merged is recorded as a success first) and BEFORE the lifecycle
+    # alerts below.
+    for version_id in version_ids:
+        try:
+            timed_out = await _reconcile_if_promotion_pending_timed_out(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: promotion_pending timeout check "
+                "failed for version %s",
+                version_id,
+            )
+            continue
+        if timed_out:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep force-failed version %s "
+                "(promotion_pending stranded past the wall-clock cap)",
                 version_id,
             )
 
