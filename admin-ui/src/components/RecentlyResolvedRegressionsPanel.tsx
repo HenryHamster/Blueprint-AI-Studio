@@ -3,9 +3,9 @@ import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
 import { EscalationOutcomePanel, FirstAttemptComplianceTrendPanel } from './PipelineRegressionsPanel';
 import { timeAgo, formatDurationSec, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
-import { parseViewportSubkey } from '../utils/viewportRegression';
 import { LayersAffectedBadges, UntargetedLayersBadge, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
+import { RegressionClassLabel } from './regressionClassLabel';
 
 interface RecurrenceEntry {
   merged_count: number;
@@ -19,59 +19,6 @@ type ComplianceWithRecurrence = CrossLayerComplianceResponse & {
 };
 
 const LAYER_SHORT: Record<string, string> = { CI_WORKFLOW: 'CI', AGENT_VM: 'VM', AGENT_VERB: 'VERB', BASELINE_GATE: 'BASELINE', REVIEWER_PASS: 'REVIEWER' };
-
-const CLASS_PREFIX_CHIPS: Record<string, string> = {
-  viewport_regression: 'bg-violet-900/60 text-violet-300 border-violet-700/50',
-  fix_loop_divergence: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
-  sr_false_positive: 'bg-rose-900/60 text-rose-300 border-rose-700/50',
-  sr_catch_rate: 'bg-sky-900/60 text-sky-300 border-sky-700/50',
-};
-
-const ASSERTION_TYPE_CHIPS: Record<string, string> = {
-  overflow: 'bg-rose-900/60 text-rose-300 border-rose-700/50',
-  text_truncation: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
-  touch_target: 'bg-blue-900/60 text-blue-300 border-blue-700/50',
-};
-
-function RegressionClassLabel({ cls }: { cls: string }) {
-  const colon = cls.indexOf(':');
-  if (colon === -1) return <span className="font-mono text-emerald-300">{cls}</span>;
-  const prefix = cls.slice(0, colon);
-  const subkey = cls.slice(colon + 1);
-  const chipCls = CLASS_PREFIX_CHIPS[prefix];
-  if (!chipCls) return <span className="font-mono text-emerald-300">{cls}</span>;
-
-  if (prefix === 'viewport_regression') {
-    const { component, assertionType, width } = parseViewportSubkey(subkey);
-    const assertionChipCls = assertionType ? ASSERTION_TYPE_CHIPS[assertionType] : undefined;
-    return (
-      <span className="inline-flex items-center gap-1 min-w-0 flex-wrap">
-        <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
-          {prefix.replace(/_/g, ' ')}
-        </span>
-        <span className="font-mono text-emerald-300">{component}</span>
-        {assertionType && (
-          <span
-            data-testid="assertion-type-chip"
-            className={`inline-block text-[9px] font-semibold px-1 py-px rounded border shrink-0 ${assertionChipCls ?? 'bg-neutral-800/60 text-neutral-400 border-neutral-700/50'}`}
-          >
-            {assertionType.replace(/_/g, ' ')}
-          </span>
-        )}
-        {width && <span className="font-mono text-neutral-500 text-[9px]">@{width}</span>}
-      </span>
-    );
-  }
-
-  return (
-    <span className="inline-flex items-center gap-1 min-w-0">
-      <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
-        {prefix.replace(/_/g, ' ')}
-      </span>
-      <span className="font-mono text-emerald-300 truncate">{subkey}</span>
-    </span>
-  );
-}
 
 const BUCKET_LABEL: Record<string, string> = {
   compliant: 'compliant',
@@ -297,7 +244,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    <span className="text-[10px] break-all min-w-0"><RegressionClassLabel cls={c.regression_class} /></span>
+                    <span className="text-[10px] break-all min-w-0"><RegressionClassLabel cls={c.regression_class} fallbackTextCls="text-emerald-300" /></span>
                     {c.fix_pr_number != null && (
                       <span className="text-[10px] text-neutral-400">
                         PR #{c.fix_pr_number}

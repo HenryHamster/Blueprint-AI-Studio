@@ -64,6 +64,10 @@ export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
   // SR diagnostics stack rendered exclusively inside DashboardHome; viewport
   // coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline.
   'SrDiagnosticsStack',
+  // Internal inline chip/label renderer for regression_class strings; used inside
+  // MttaTimelinePanel, PipelineRegressionsPanel, and RecentlyResolvedRegressionsPanel.
+  // Never rendered standalone on operator pages — layout controlled by parent containers.
+  'regressionClassLabel',
 ]);
 
 /**

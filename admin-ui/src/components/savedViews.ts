@@ -21,7 +21,7 @@ export function savedViewsKey(userId?: string | null, projectId?: string | null)
   return `messages_saved_views:${userId || 'anonymous'}:${projectId || 'default'}`;
 }
 
-function sanitizeSavedView(raw: unknown): SavedView | null {
+export function sanitizeSavedView(raw: unknown): SavedView | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
   const id = typeof r.id === 'string' && r.id ? r.id : null;

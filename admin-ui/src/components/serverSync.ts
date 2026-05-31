@@ -1,6 +1,6 @@
 import { apiFetch, API_BASE_URL } from '../api';
 import { type EventPref } from './eventPrefs';
-import { type SavedView } from './savedViews';
+import { sanitizeSavedView, type SavedView } from './savedViews';
 import { type TemporaryMutes } from './temporaryMutes';
 import { type MuteWindow } from './muteWindow';
 
@@ -54,31 +54,6 @@ export function resolveNoisePrefs(
   serverPrefs: Record<string, EventPref> | null,
 ): Record<string, EventPref> {
   return serverPrefs ?? localPrefs;
-}
-
-function sanitizeSavedView(raw: unknown): SavedView | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const r = raw as Record<string, unknown>;
-  const id = typeof r.id === 'string' && r.id ? r.id : null;
-  const name = typeof r.name === 'string' && r.name ? r.name : null;
-  if (!id || !name) return null;
-  const prefsRaw = r.prefs && typeof r.prefs === 'object' ? r.prefs as Record<string, unknown> : {};
-  const prefs: Record<string, EventPref> = {};
-  for (const [k, v] of Object.entries(prefsRaw)) {
-    if (v === 'mute' || v === 'routine' || v === 'surfaced') prefs[k] = v;
-  }
-  return {
-    id,
-    name,
-    description: typeof r.description === 'string' ? r.description : undefined,
-    query: typeof r.query === 'string' ? r.query : '',
-    prefs,
-    sort: r.sort === 'recent' ? 'recent' : 'importance',
-    showResolved: r.showResolved === true,
-    routineExpanded: r.routineExpanded === true,
-    showOnlyNew: r.showOnlyNew === true,
-    createdAt: typeof r.createdAt === 'number' ? r.createdAt : Date.now(),
-  };
 }
 
 export async function fetchServerSavedViews(

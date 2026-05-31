@@ -7,41 +7,8 @@ import { timeAgo, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } 
 import { parseViewportSubkey } from '../utils/viewportRegression';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
+import { RegressionClassLabel } from './regressionClassLabel';
 export { EscalationOutcomePanel, FirstAttemptComplianceTrendPanel } from './PipelineRegressionsCompliancePanels';
-
-/** Prefix-to-chip color mapping for recognized composite regression classes. */
-const CLASS_PREFIX_CHIPS: Record<string, string> = {
-  viewport_regression: 'bg-violet-900/60 text-violet-300 border-violet-700/50',
-  fix_loop_divergence: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
-  sr_false_positive: 'bg-rose-900/60 text-rose-300 border-rose-700/50',
-  sr_catch_rate: 'bg-sky-900/60 text-sky-300 border-sky-700/50',
-};
-
-/**
- * Format a regression_class string for display. For recognized composite
- * classes (prefix:subkey), renders a colored chip + subkey identifier.
- * All other classes render as raw monospace text (unchanged behavior).
- */
-function RegressionClassLabel({ cls }: { cls: string }) {
-  const colon = cls.indexOf(':');
-  if (colon === -1) {
-    return <span className="font-mono text-neutral-300">{cls}</span>;
-  }
-  const prefix = cls.slice(0, colon);
-  const subkey = cls.slice(colon + 1);
-  const chipCls = CLASS_PREFIX_CHIPS[prefix];
-  if (!chipCls) {
-    return <span className="font-mono text-neutral-300">{cls}</span>;
-  }
-  return (
-    <span className="inline-flex items-center gap-1 min-w-0">
-      <span className={`inline-block text-[9px] font-semibold px-1 py-px rounded border ${chipCls} shrink-0`}>
-        {prefix.replace(/_/g, ' ')}
-      </span>
-      <span className="font-mono text-neutral-300 truncate">{subkey}</span>
-    </span>
-  );
-}
 
 interface DispatcherCycleClass {
   project_id: string;

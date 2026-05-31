@@ -68,6 +68,10 @@ _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
         # SR diagnostics stack rendered exclusively inside DashboardHome;
         # viewport coverage is provided by DashboardHome.viewport.test.tsx.
         "SrDiagnosticsStack",
+        # Internal inline chip/label renderer for regression_class strings; used inside
+        # MttaTimelinePanel, PipelineRegressionsPanel, and RecentlyResolvedRegressionsPanel.
+        # Never rendered standalone on operator pages — layout controlled by parent containers.
+        "regressionClassLabel",
     ]
 )
 
