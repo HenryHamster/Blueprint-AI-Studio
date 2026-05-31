@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Task
+from app.time_utils import _utcnow
 
 
 # Recognized per-task fix loops. Anything outside this set is rejected at
@@ -77,8 +78,13 @@ def stamp_fix_loop_divergence_computed_at(
 
     Centralising the write here keeps the design-doc key name canonical and
     lets callers avoid hardcoding it.  Pass *now* in tests to fix the clock.
+
+    Audit C10: stamp with the project-standard _utcnow() (naive UTC) so the
+    heartbeat string round-trips through the staleness watchdog's naive parse
+    identically to other task_results-derived timestamps, and bare
+    datetime.utcnow() DTZ deprecation clears.
     """
-    ts = (now or datetime.utcnow()).isoformat()
+    ts = (now or _utcnow()).isoformat()
     doc["fix_loop_divergence_signal_last_computed_at"] = ts
 
 

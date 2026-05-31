@@ -25,6 +25,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.models import Task, TaskStatus
+from app.time_utils import _utcnow
 
 _SR_SKIP_BLIND_SPOT_MARKERS = ("self-review skipped", "self-review JSON parsing failed")
 
@@ -117,8 +118,13 @@ def stamp_sr_blind_spot_computed_at(
 
     Centralising the write here keeps the design-doc key name canonical and
     lets callers avoid hardcoding it.  Pass *now* in tests to fix the clock.
+
+    Audit C10: stamp with the project-standard _utcnow() (naive UTC) so the
+    heartbeat string round-trips through the staleness watchdog's naive parse
+    identically to other timestamps, and the bare datetime.utcnow() DTZ
+    deprecation clears.
     """
-    ts = (now or datetime.utcnow()).isoformat()
+    ts = (now or _utcnow()).isoformat()
     doc["sr_blind_spot_signal_last_computed_at"] = ts
 
 
@@ -144,7 +150,7 @@ def stamp_sr_catch_rate_computed_at(
     ``signal_last_computed_at`` but ``last_sufficient_computed_at`` stays at the
     last real computation).
     """
-    ts = (now or datetime.utcnow()).isoformat()
+    ts = (now or _utcnow()).isoformat()  # Audit C10: naive-UTC stamp (see above)
     trends = dict(doc.get("sr_catch_rate_trends") or {})
     trends["signal_last_computed_at"] = ts
     if data_sufficient is not None:
@@ -176,7 +182,7 @@ async def _scan_blind_spot_counts(
     *,
     days: int,
 ) -> Dict[str, dict]:
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(
@@ -300,7 +306,7 @@ async def _scan_fp_stats(
     falling back to _first_attempt_rejection_categories).
     A hit: SR marks C as FAILED and a human confirmed C in any iteration.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(
@@ -432,7 +438,7 @@ async def aggregate_sr_execution_evidence_miss_rates(
     per category; omits categories with zero samples. Skipped/fallback SR
     envelopes are excluded.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(
@@ -1070,7 +1076,7 @@ def compute_persistent_sr_blind_spot_hint(
     Empty ``categories`` and ``hint=None`` when no persistent categories exist.
     Pass *now* in tests to pin the clock.
     """
-    _now = now or datetime.utcnow()
+    _now = now or _utcnow()
 
     def _qualifying(window_tasks):
         out = []
@@ -1221,7 +1227,7 @@ async def aggregate_sr_reviewer_disagreements(
     Returns up to ``limit`` entries sorted by count descending:
       [{"category": str, "task_type": str, "count": int}, ...]
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(
@@ -1266,7 +1272,7 @@ async def aggregate_sr_reviewer_disagreements_envelope(
     set so the operator surface cannot silently present the page size as the
     true total.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(

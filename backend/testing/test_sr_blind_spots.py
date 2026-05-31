@@ -14,6 +14,7 @@ from app.sr_blind_spots import (
     count_reviewer_disagreements_in_tasks,
     filter_disallowed_blind_spots,
     is_disallowed_blind_spot,
+    stamp_sr_blind_spot_computed_at,
     stamp_sr_catch_rate_computed_at,
     triage_sr_blind_spot_theme,
 )
@@ -1071,6 +1072,28 @@ def test_stamp_sr_catch_rate_computed_at_writes_heartbeat():
     doc: dict = {}
     stamp_sr_catch_rate_computed_at(doc, now=fixed)
     assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
+
+
+def test_stamp_helpers_default_now_emit_naive_utc_strings():
+    """Audit C10: default-now heartbeat stamps must be tz-NAIVE ISO strings.
+
+    The staleness watchdog parses these strings and subtracts a naive _utcnow().
+    A tz-aware writer (datetime.now(timezone.utc)) would emit a '+00:00' suffix
+    that the dispatcher then strips, mis-dating the freshness window. Assert both
+    sr_blind_spots stamp helpers default to naive UTC (no tz offset) so they stay
+    consistent with the watchdog and with task_results timestamps.
+    """
+    blind_doc: dict = {}
+    stamp_sr_blind_spot_computed_at(blind_doc)
+    blind_ts = blind_doc["sr_blind_spot_signal_last_computed_at"]
+    assert "+00:00" not in blind_ts and not blind_ts.endswith("Z")
+    assert datetime.fromisoformat(blind_ts).tzinfo is None
+
+    catch_doc: dict = {}
+    stamp_sr_catch_rate_computed_at(catch_doc)
+    catch_ts = catch_doc["sr_catch_rate_trends"]["signal_last_computed_at"]
+    assert "+00:00" not in catch_ts and not catch_ts.endswith("Z")
+    assert datetime.fromisoformat(catch_ts).tzinfo is None
 
 
 def test_stamp_sr_catch_rate_computed_at_preserves_existing_keys():

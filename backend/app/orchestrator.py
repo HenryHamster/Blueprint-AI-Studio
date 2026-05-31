@@ -31,7 +31,7 @@ from app.compute import (
     prepare_and_store_agent_secret,
     provision_agent_vm,
     record_zone_failure,
-    soonest_zone_recovery,
+    zone_recovery_wait_seconds,
 )
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -1837,23 +1837,25 @@ async def orchestrator_worker():
                 # Zone pre-check: skip dispatch entirely if all GCP zones are in cooldown
                 if queued_tasks and not any_zone_available():
                     global _last_zone_exhaustion_log
-                    # Audit W1/F8: use _utcnow() (naive UTC) so subtraction
-                    # against soonest_zone_recovery() (also naive) doesn't
-                    # raise on aware/naive mismatch.
+                    # _last_zone_exhaustion_log is a module-level gauge written
+                    # only here; keep it naive (_utcnow) for a consistent
+                    # self-comparison. The recovery-wait subtraction itself lives
+                    # in zone_recovery_wait_seconds() which does the aware math
+                    # against the tz-aware soonest_zone_recovery() (Audit C10 —
+                    # previously this subtracted a naive _utcnow() and raised
+                    # TypeError, firing this 60s-gated error path repeatedly).
                     now_check = _utcnow()
                     if (
                         _last_zone_exhaustion_log is None
                         or (now_check - _last_zone_exhaustion_log).total_seconds() >= 60
                     ):
                         _last_zone_exhaustion_log = now_check
-                        recovery = soonest_zone_recovery()
-                        if recovery:
-                            wait_sec = max(0, (recovery - now_check).total_seconds())
+                        wait_sec = zone_recovery_wait_seconds()
+                        if wait_sec is not None:
                             logger.info(
                                 f"[ORCHESTRATOR] All zones in cooldown — skipping dispatch (recovery in {int(wait_sec)}s)"
                             )
                         else:
-                            wait_sec = None
                             logger.info(
                                 "[ORCHESTRATOR] All zones in cooldown — skipping dispatch"
                             )
@@ -2743,17 +2745,16 @@ async def orchestrator_worker():
                                                 )
                                                 failed_task.last_heartbeat = None
                                                 failed_task.started_at = None
-                                                # Align retry with zone recovery; cap at 30 min
-                                                recovery = soonest_zone_recovery()
-                                                if recovery:
-                                                    # Audit W1/F8: _utcnow() for naive subtraction
-                                                    wait_sec = max(
-                                                        60,
-                                                        (
-                                                            recovery - _utcnow()
-                                                        ).total_seconds()
-                                                        + 60,
-                                                    )
+                                                # Align retry with zone recovery; cap at 30 min.
+                                                # Audit C10: zone_recovery_wait_seconds() does
+                                                # the tz-AWARE subtraction internally (matches
+                                                # the reaper's infra-requeue path). The previous
+                                                # naive _utcnow() subtraction here raised
+                                                # TypeError, rolling back this QUEUED status +
+                                                # retry_after_until.
+                                                recovery_wait = zone_recovery_wait_seconds()
+                                                if recovery_wait is not None:
+                                                    wait_sec = max(60, recovery_wait + 60)
                                                     delay_min = min(wait_sec / 60, 30)
                                                 else:
                                                     delay_min = 10

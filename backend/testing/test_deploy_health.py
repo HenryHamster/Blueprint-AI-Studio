@@ -1245,6 +1245,42 @@ def test_check_gcp_health_fresh_provision_failures_return_failed():
     assert ext["gcp"] is False
 
 
+def _ts_naive(minutes_ago: float) -> str:
+    """Production-faithful task_results timestamp.
+
+    record_task_result() writes _utcnow().isoformat() — a tz-NAIVE string.
+    The aware _ts() helper above predates the C10 fix and does NOT match
+    production; use this for the boundary regression below.
+    """
+    from app.time_utils import _utcnow
+
+    return (_utcnow() - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def test_check_gcp_health_naive_entries_counted_at_boundary():
+    """Audit C10 regression: cutoff must be NAIVE so naive task_results entries
+    near the staleness boundary aren't undercounted.
+
+    Pre-fix, check_gcp_health built its cutoff from datetime.now(timezone.utc)
+    (an aware '+00:00' string). String comparison against record_task_result()'s
+    naive entries made same-instant naive entries sort BELOW the aware cutoff, so
+    fresh failures just inside the 15-min window were dropped and the >=3 trip
+    never fired. With the naive cutoff, three fresh naive PROVISION_FAILUREs trip
+    the gate as intended.
+    """
+    _shared_state.deploy_monitoring["task_results"] = deque(
+        [
+            (_ts_naive(5), "failure", "PROVISION_FAILURE", "create"),
+            (_ts_naive(4), "failure", "PROVISION_FAILURE", "create"),
+            (_ts_naive(3), "failure", "PROVISION_FAILURE", "create"),
+        ],
+        maxlen=100,
+    )
+    ext = {"errors": {}}
+    assert _hcp.check_gcp_health(ext) == "gcp"
+    assert ext["gcp"] is False
+
+
 def test_check_provider_api_health_anthropic_stale_rate_limits_return_healthy(mocker):
     """Stale RATE_LIMIT entries must not keep Anthropic provider health failing."""
     mocker.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "x"}, clear=False)

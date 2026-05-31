@@ -1966,3 +1966,22 @@ def soonest_zone_recovery() -> datetime | None:
             if soonest is None or cooldown < soonest:
                 soonest = cooldown
     return soonest
+
+
+def zone_recovery_wait_seconds() -> float | None:
+    """Seconds until the soonest zone recovery, or None if a zone is available now.
+
+    Audit C10: ``soonest_zone_recovery()`` returns a tz-AWARE datetime
+    (``cooldown_expires_at`` is built from ``datetime.now(timezone.utc)``), so
+    the subtraction MUST use an aware now. Callers previously subtracted the
+    app's naive ``_utcnow()`` here, which raised ``TypeError`` during zone
+    exhaustion — silently rolling back the infra-requeue's QUEUED/retry_after
+    state and spamming the all-zones-cooldown error counter. Centralising the
+    aware subtraction in one helper removes that naive/aware footgun for every
+    caller. Result is floored at 0 so a just-expired cooldown never returns
+    negative.
+    """
+    recovery = soonest_zone_recovery()
+    if recovery is None:
+        return None
+    return max(0.0, (recovery - datetime.now(timezone.utc)).total_seconds())

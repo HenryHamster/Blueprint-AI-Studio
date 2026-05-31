@@ -899,3 +899,21 @@ def test_stamp_fix_loop_divergence_computed_at_defaults_to_utcnow():
     ts_str = doc.get("fix_loop_divergence_signal_last_computed_at", "")
     ts = datetime.fromisoformat(ts_str)
     assert before <= ts <= after
+
+
+def test_stamp_fix_loop_divergence_computed_at_emits_naive_utc_string():
+    """Audit C10: the default-now heartbeat must be a tz-NAIVE ISO string.
+
+    The staleness watchdog parses this string and subtracts a naive _utcnow().
+    A tz-aware writer (datetime.now(timezone.utc)) would emit a '+00:00' suffix
+    that round-trips back to a different (offset) instant after the dispatcher's
+    naive normalisation, mis-dating the freshness check. Assert there is no tz
+    offset in the emitted string and that it round-trips to a naive datetime.
+    """
+    from datetime import datetime
+
+    doc: dict = {}
+    stamp_fix_loop_divergence_computed_at(doc)
+    ts_str = doc["fix_loop_divergence_signal_last_computed_at"]
+    assert "+00:00" not in ts_str and not ts_str.endswith("Z")
+    assert datetime.fromisoformat(ts_str).tzinfo is None

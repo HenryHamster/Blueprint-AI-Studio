@@ -8,7 +8,7 @@ None if healthy.
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Optional
 
 import app.shared_state as _shared_state
@@ -21,6 +21,7 @@ from app.max_plan_pool import (
 )
 from app.models import LLMProviderName, Task
 from app.providers.registry import get_provider
+from app.time_utils import _utcnow
 from sqlmodel import select
 
 logger = logging.getLogger("blueprint")
@@ -197,9 +198,11 @@ def _provider_rate_limit_bursting(provider_name: str) -> bool:
     if provider_name != LLMProviderName.ANTHROPIC.value:
         return False
     recent_results = list(_shared_state.deploy_monitoring["task_results"])[-5:]
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)
-    ).isoformat()
+    # Audit C10: use _utcnow() (naive UTC) so the ISO cutoff string matches the
+    # naive timestamps record_task_result() writes into task_results — an aware
+    # cutoff sorts lexically above same-instant naive entries and undercounts at
+    # the boundary.
+    cutoff = (_utcnow() - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
     fresh_results = [r for r in recent_results if r[0] >= cutoff]
     rate_limit_count = sum(1 for r in fresh_results if r[2] == "RATE_LIMIT")
     return rate_limit_count >= 3
@@ -345,9 +348,9 @@ def check_gcp_health(ext: dict) -> Optional[str]:
 
     Returns 'gcp' if failed, None if healthy.
     """
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)
-    ).isoformat()
+    # Audit C10: naive UTC cutoff to match record_task_result()'s naive ISO
+    # timestamps (see _provider_rate_limit_bursting above).
+    cutoff = (_utcnow() - timedelta(minutes=_TASK_RESULT_STALENESS_MINUTES)).isoformat()
     fresh_all = [
         r for r in _shared_state.deploy_monitoring["task_results"] if r[0] >= cutoff
     ]

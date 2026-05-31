@@ -702,6 +702,61 @@ class TestSoonestZoneRecovery:
         assert compute.soonest_zone_recovery() is None
 
 
+class TestZoneRecoveryWaitSeconds:
+    """Regression tests for zone_recovery_wait_seconds() (Audit C10).
+
+    soonest_zone_recovery() returns a tz-AWARE datetime. The orchestrator
+    previously subtracted the app's naive _utcnow() at two sites, which raised
+    TypeError during zone exhaustion — silently rolling back the infra-requeue's
+    QUEUED/retry_after state and spamming the all-zones-cooldown error counter.
+    This helper centralises the aware subtraction so the math can't regress.
+    """
+
+    def test_none_when_zone_available(self, clean_zone_health):
+        """No cooldown state → a zone is available → None (not 0)."""
+        assert compute.zone_recovery_wait_seconds() is None
+
+    def test_aware_cooldown_does_not_raise_typeerror(self, clean_zone_health):
+        """All zones in cooldown with tz-AWARE expiries must NOT raise TypeError.
+
+        Reproduces the C10 bug: _zone_health stores aware cooldown_expires_at
+        (built from datetime.now(timezone.utc)), so any naive subtraction inside
+        the helper would raise here. The pre-fix orchestrator code did exactly
+        that. Asserts a sane positive wait instead.
+        """
+        future = datetime.now(timezone.utc) + timedelta(minutes=5)
+        _cooldown_all_zones(future)
+        wait = compute.zone_recovery_wait_seconds()
+        assert wait is not None
+        # ~300s minus a few ms of test execution; must be positive and bounded.
+        assert 240 < wait <= 300
+
+    def test_floored_at_zero_for_just_expired(self, clean_zone_health):
+        """A cooldown in the (very recent) past floors at 0, never negative.
+
+        soonest_zone_recovery() returns None once any zone is past expiry, but
+        guard the floor explicitly so a race between the two aware now() reads
+        can never produce a negative wait.
+        """
+        # Set every zone to expire 1ms in the future so soonest_zone_recovery
+        # still returns it, but by the time the helper subtracts now() it may be
+        # in the past — the max(0.0, ...) floor must hold.
+        near = datetime.now(timezone.utc) + timedelta(milliseconds=1)
+        _cooldown_all_zones(near)
+        wait = compute.zone_recovery_wait_seconds()
+        # Either None (already expired by the time soonest_zone_recovery checks)
+        # or a non-negative float — never negative, never a TypeError.
+        assert wait is None or wait >= 0.0
+
+    def test_orchestrator_imports_aware_helper(self):
+        """The orchestrator must use zone_recovery_wait_seconds(), not its own
+        naive subtraction. Guards against a future reintroduction of the C10
+        naive/aware footgun at the dispatch / infra-requeue sites."""
+        import app.orchestrator as _orch
+
+        assert _orch.zone_recovery_wait_seconds is compute.zone_recovery_wait_seconds
+
+
 class TestZoneInDisabledRegion:
     """Tests for _zone_in_disabled_region()."""
 
