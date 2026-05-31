@@ -4,15 +4,6 @@ vi.mock('../index.js', () => ({
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
 }));
 
-vi.mock('./research-direction-context.js', () => ({
-  differentiationHintFor: (reason: string) => {
-    if (reason.includes('hash match')) return 'fundamentally different scope or approach needed';
-    if (reason.includes('word overlap')) return 'target different files or subsystem';
-    if (reason.includes('file overlap')) return 'address a different aspect of these files';
-    return '';
-  },
-}));
-
 vi.mock('./research-plan.js', () => ({
   aggregateDirectionStats: (history: Array<Record<string, unknown>>, agg: Record<string, unknown>) => {
     const total = history.length + ((agg.total_cycles as number) || 0);

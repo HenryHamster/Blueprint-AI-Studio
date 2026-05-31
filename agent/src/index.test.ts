@@ -3408,12 +3408,29 @@ describe('drainJsonChunks within-chunk yielding', () => {
       lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
     }
     lines.push(JSON.stringify({ type: 'result', result: 'final-after-200-lines' }));
+
+    // Spy on setImmediate to count within-chunk yields from drainJsonChunks.
+    // WITHIN_CHUNK_YIELD_LINES=50: a 200-line chunk yields at line 51, 101, 151 => >=3.
+    // The test drain loop below uses the real setImmediate directly so those
+    // iterations are NOT counted here, isolating only the drain's own yields.
+    const realSetImmediate = globalThis.setImmediate.bind(globalThis);
+    let drainYieldCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
+      drainYieldCount++;
+      return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
+    });
     emitData(Buffer.from(lines.join('\n') + '\n'));
 
     // Drain microtasks/immediates so drainJsonChunks completes fully.
+    // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
     for (let i = 0; i < 20; i++) {
-      await new Promise(r => setImmediate(r));
+      await new Promise(r => realSetImmediate(r as () => void));
     }
+    siSpy.mockRestore();
+
+    // Assert the drain yielded to the event loop >= 3 times (WITHIN_CHUNK_YIELD_LINES=50).
+    expect(drainYieldCount).toBeGreaterThanOrEqual(3);
 
     childHandlers.close?.(0, null);
     const result = await promise.catch(() => undefined);
@@ -3439,12 +3456,29 @@ describe('drainJsonChunks within-chunk yielding', () => {
       lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
     }
     lines.push(JSON.stringify({ type: 'result', result: 'final-result-after-120-ticks' }));
+
+    // Spy on setImmediate to count within-chunk yields from drainJsonChunks.
+    // WITHIN_CHUNK_YIELD_LINES=50: a 121-line chunk yields at line 51, 101 => >=2.
+    // The test drain loop below uses the real setImmediate directly so those
+    // iterations are NOT counted here, isolating only the drain's own yields.
+    const realSetImmediate = globalThis.setImmediate.bind(globalThis);
+    let drainYieldCount = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
+      drainYieldCount++;
+      return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
+    });
     emitData(Buffer.from(lines.join('\n') + '\n'));
 
     // Drain microtasks
+    // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
     for (let i = 0; i < 20; i++) {
-      await new Promise(r => setImmediate(r));
+      await new Promise(r => realSetImmediate(r as () => void));
     }
+    siSpy.mockRestore();
+
+    // Assert the drain yielded to the event loop >= 2 times (WITHIN_CHUNK_YIELD_LINES=50).
+    expect(drainYieldCount).toBeGreaterThanOrEqual(2);
 
     childHandlers.close?.(0, null);
     const result = await promise.catch(() => undefined);

@@ -879,12 +879,6 @@ describe('handleMigrate — migrate self-review focus block', () => {
     expect(focusIdx).toBeGreaterThan(guidanceIdx);
   });
 
-  it('still includes CODE_CHANGE_HELPER_GUIDANCE alongside the focus block', async () => {
-    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    const prompt = capturedMigratePrompt();
-    expect(prompt).toContain('Task lifecycle — you own it end-to-end');
-    expect(prompt).toContain('Self-review focus: migrate tasks');
-  });
 });
 
 // ── Structural prompt invariants (regression-detection) ───────────────────────

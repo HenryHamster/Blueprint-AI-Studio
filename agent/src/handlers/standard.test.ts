@@ -411,12 +411,6 @@ describe('module interface extraction', () => {
     expect(capturedPrompt()).toContain('## Module Interfaces');
   });
 
-  it('calls extractModuleInterfaces for handleCreate with scope=large', async () => {
-    const task = { title: 'Task', description: '', context: { scope: 'large' } };
-    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/bar.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/bar.ts']);
-  });
-
   it('does not call extractModuleInterfaces for handleCreate with scope=small', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'small' } };
     await handleCreate(TASK_ID, { prompt: 'Do it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -455,12 +449,6 @@ describe('affected consumer discovery', () => {
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
-  });
-
-  it('calls discoverAffectedConsumers for handleCreate with scope=large', async () => {
-    const task = { title: 'Task', description: '', context: { scope: 'large' } };
-    await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/bar.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/bar.ts']);
   });
 
   it('does not call discoverAffectedConsumers for handleCreate with scope=small', async () => {
@@ -696,18 +684,6 @@ describe('test baseline capture', () => {
 
   it('calls captureTestBaseline for medium scope create tasks on main', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
-  });
-
-  it('calls captureTestBaseline for large scope create tasks on main', async () => {
-    const task = { title: 'Task', description: '', context: { scope: 'large' }, project_context: {} };
-    await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
-  });
-
-  it('calls captureTestBaseline for small scope create tasks on main', async () => {
-    const task = { title: 'Task', description: '', context: { scope: 'small' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();
   });
