@@ -18,7 +18,6 @@ import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelp
 import { sortDesc } from './catchupAnalytics';
 import { CompletionRow, SkeletonRow } from './catchupRows';
 import type { SrTrendData } from './SrTrendBreakdown';
-import { PipelineRegressionsPanel } from './PipelineRegressionsPanel';
 import { CatchUpReviewQualitySection } from './CatchUpReviewQualitySection';
 import { RecentFailureGroupsSection } from './RecentFailureGroupsSection';
 import { CatchUpNeedsAttentionSection } from './CatchUpNeedsAttentionSection';
@@ -945,12 +944,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     </div>
                   )}
                 </div>
-              )}
-              {/* Pipeline regressions — compact inline variant */}
-              {selectedProjectId && (
-                <ErrorBoundary level="widget">
-                  <PipelineRegressionsPanel projectId={selectedProjectId} />
-                </ErrorBoundary>
               )}
               {/* Stats row */}
               <div className="flex flex-wrap gap-x-3 gap-y-2 text-[11px] text-neutral-400">

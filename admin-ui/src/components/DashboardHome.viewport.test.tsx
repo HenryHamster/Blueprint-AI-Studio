@@ -223,15 +223,6 @@ vi.mock('../api', () => ({
     evicted_findings: [],
   })),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
-  fetchCrossLayerCompliance: vi.fn(async () => ({
-    total_classified: 0,
-    compliant: 0,
-    non_compliant: 0,
-    awaiting_backfill_count: 0,
-    compliance_rate: null,
-    failure_modes: { doc_test_only: 0, most_recent_layer_only: 0 },
-    by_class: {},
-  })),
   onboardProject: vi.fn(async () => ({})),
   setVersionPhase: vi.fn(async () => ({
     version_number: 42,
@@ -247,8 +238,6 @@ vi.mock('../api', () => ({
     ],
     total: 2,
   })),
-  CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
-  fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
   fetchLlmCostBreakdown: vi.fn(async () => ({
     window_days: 7,
     generated_at: '2026-05-20T12:00:00Z',

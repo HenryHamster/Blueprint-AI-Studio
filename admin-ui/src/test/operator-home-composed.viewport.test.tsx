@@ -303,9 +303,9 @@ describe('operator home — composed viewport regression', () => {
         );
       });
       // Two act-wrapped settles: the first lets the panels' mount-time
-      // fetches resolve; the second absorbs the follow-up state update
-      // PipelineRegressionsPanel (inside CatchUpPanel) schedules once its
-      // initial fetch lands, so no async update escapes act().
+      // fetches resolve; the second absorbs follow-up state updates the
+      // panels schedule once their initial fetches land, so no async
+      // update escapes act().
       await act(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 75));
       });

@@ -44,8 +44,6 @@ import {
 } from './DashboardMetricCards';
 import { RecurringPatternsSection } from './RecurringPatternsSection';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
-import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel, PipelineRegressionsPanel } from './PipelineRegressionsPanel';
-import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import { SystemStatusCard } from './SystemStatusCard';
 import type { Task } from '../types/task';
@@ -1034,21 +1032,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
       {/* System Health — actionable issues with remediation hints */}
       <SystemHealthCard data={healthOverview} loading={loading} tasks={tasks} onViewTask={onViewTask} />
-
-      {/* Pipeline Regressions */}
-      {selectedProjectId && <PipelineRegressionsPanel projectId={selectedProjectId} />}
-
-      {/* Manual Intervention Cases */}
-      {selectedProjectId && <ManualInterventionPanel projectId={selectedProjectId} />}
-
-      {/* Auto-Recovered Regression Cases */}
-      {selectedProjectId && <AutoRecoveredPanel projectId={selectedProjectId} />}
-
-      {/* Persistent Anomaly Tracker */}
-      {selectedProjectId && <AnomalyTrackerPanel projectId={selectedProjectId} />}
-
-      {/* Recently Resolved Regressions */}
-      {selectedProjectId && <RecentlyResolvedRegressionsPanel projectId={selectedProjectId} />}
 
       {/* Viewport Debt */}
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}

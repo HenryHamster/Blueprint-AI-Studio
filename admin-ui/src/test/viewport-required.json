@@ -16,7 +16,6 @@
     "NewProjectModal",
     "MetricsDashboard",
     "OrchestratorHealthBar",
-    "PipelineRegressionsPanel",
     "SearchFilterBar",
     "PlaybookPanel",
     "CatchUpPanel",

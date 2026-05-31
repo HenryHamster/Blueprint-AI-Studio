@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Activity, Wrench, Search, Loader2, Zap } from 'lucide-react';
+import { useState, useCallback } from 'react';
+import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Search, Loader2, Zap } from 'lucide-react';
 import { apiFetch } from '../api';
 
 export type { Alert } from '../types/alert';
@@ -66,7 +66,6 @@ interface AlertsBannerProps {
   onDismiss: (id: string) => void;
   onDismissAll?: () => void;
   onViewTask?: (taskId: string) => void;
-  manualInterventionCount?: number;
   projectId?: string;
   /** Called when operator requests an SR investigation for categories in an alert. Returns spawned task id on success. */
   onSpawnSrInvestigation?: (signal: SrInvestigationSignal) => Promise<string | null>;
@@ -74,27 +73,14 @@ interface AlertsBannerProps {
   activeInvestigationTaskIds?: Record<string, string> | null;
 }
 
-export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, manualInterventionCount = 0, projectId, onSpawnSrInvestigation, activeInvestigationTaskIds }: AlertsBannerProps) {
+export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, projectId, onSpawnSrInvestigation, activeInvestigationTaskIds }: AlertsBannerProps) {
   const [expanded, setExpanded] = useState(false);
-  const [fetchedInterventionCount, setFetchedInterventionCount] = useState(0);
-  const [fetchedStalledCount, setFetchedStalledCount] = useState(0);
   const [drilldownId, setDrilldownId] = useState<string | null>(null);
   const [drilldownRows, setDrilldownRows] = useState<DrilldownRow[]>([]);
   const [drilldownLoading, setDrilldownLoading] = useState(false);
   const [expandedFindings, setExpandedFindings] = useState<Set<string>>(new Set());
   const [spawningSrAlertId, setSpawningSrAlertId] = useState<string | null>(null);
   const [spawnedSrTaskIds, setSpawnedSrTaskIds] = useState<Record<string, string>>({});
-
-  const fetchInterventionCount = useCallback(async () => {
-    if (!projectId) return;
-    try {
-      const res = await apiFetch(`/api/admin/regression-cases/manual-intervention?project_id=${encodeURIComponent(projectId)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setFetchedInterventionCount((data.cases ?? []).length);
-      }
-    } catch { /* silent */ }
-  }, [projectId]);
 
   const openDrilldown = useCallback(async (alert: Alert) => {
     const info = parseSrAlert(alert.title);
@@ -125,29 +111,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, manu
     } finally { setSpawningSrAlertId(null); }
   }, [onSpawnSrInvestigation, spawningSrAlertId, activeInvestigationTaskIds]);
 
-  const fetchStalledCount = useCallback(async () => {
-    if (!projectId) return;
-    try {
-      const res = await apiFetch(`/api/admin/regression-cases/stalled?project_id=${encodeURIComponent(projectId)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setFetchedStalledCount((data.cases ?? []).length);
-      }
-    } catch { /* silent */ }
-  }, [projectId]);
-
-  useEffect(() => {
-    fetchInterventionCount();
-    fetchStalledCount();
-    const id = setInterval(() => {
-      fetchInterventionCount();
-      fetchStalledCount();
-    }, 60_000);
-    return () => clearInterval(id);
-  }, [fetchInterventionCount, fetchStalledCount]);
-
-  const effectiveInterventionCount = manualInterventionCount > 0 ? manualInterventionCount : fetchedInterventionCount;
-  if (alerts.length === 0 && effectiveInterventionCount === 0 && fetchedStalledCount === 0) return null;
+  if (alerts.length === 0) return null;
 
   const shouldCollapse = alerts.length > COLLAPSE_THRESHOLD;
 
@@ -305,28 +269,6 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, manu
         >
           +{hiddenCount} more alert{hiddenCount > 1 ? 's' : ''}
         </button>
-      )}
-      {effectiveInterventionCount > 0 && (
-        <div className="bg-red-950/30 border border-red-900/40 rounded-lg px-4 py-2 text-sm flex items-center gap-3">
-          <Wrench className="w-4 h-4 shrink-0 text-red-400" />
-          <div className="flex-1 min-w-0 flex items-center gap-2">
-            <span className="font-medium text-red-300">Manual Intervention Required</span>
-            <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/15 text-red-400 border-red-500/30 font-medium">
-              {effectiveInterventionCount} regression{effectiveInterventionCount > 1 ? 's' : ''}
-            </span>
-          </div>
-        </div>
-      )}
-      {fetchedStalledCount > 0 && (
-        <div className="bg-yellow-950/30 border border-yellow-900/40 rounded-lg px-4 py-2 text-sm flex items-center gap-3">
-          <Activity className="w-4 h-4 shrink-0 text-yellow-500" />
-          <div className="flex-1 min-w-0 flex items-center gap-2">
-            <span className="font-medium text-yellow-300">Stalled Regression</span>
-            <span className="text-[10px] px-1.5 py-0.5 rounded border bg-yellow-500/15 text-yellow-400 border-yellow-500/30 font-medium">
-              {fetchedStalledCount} case{fetchedStalledCount > 1 ? 's' : ''}
-            </span>
-          </div>
-        </div>
       )}
     </div>
   );

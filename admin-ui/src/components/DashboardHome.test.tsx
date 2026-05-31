@@ -219,7 +219,7 @@ function setupApiMocks({
     if (url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(promptFingerprintAnalytics ? jsonResponse(promptFingerprintAnalytics) : notFoundResponse());
     if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
     // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements,
-    // sr-recent-misses, regression-cases, task-duration-stats, etc.) return 404 so the
+    // sr-recent-misses, task-duration-stats, etc.) return 404 so the
     // component leaves the corresponding state slot at its initial null/[] sentinel rather
     // than ingesting an empty {} that would crash truthy-but-shapeless guards in JSX.
     return Promise.resolve(notFoundResponse());
@@ -1232,29 +1232,6 @@ describe('DashboardHome', () => {
       // total_operator_actions is undefined → null, so operatorActions === 0 is false → not self-sufficient
       expect(await screen.findByText('Self-sufficient: 0 / 1')).toBeInTheDocument();
     });
-  });
-
-  it('renders ManualInterventionPanel empty state when no escalations exist', async () => {
-    setupApiMocks({
-      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
-      diagnostics: makeDiagnostics(),
-    });
-
-    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-    expect(await screen.findByTestId('manual-intervention-panel')).toBeInTheDocument();
-    expect(screen.getByText('No regression cases need manual intervention')).toBeInTheDocument();
-  });
-
-  it('does not render ManualInterventionPanel when no project is selected', async () => {
-    setupApiMocks({
-      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
-    });
-
-    render(<DashboardHome tasks={[]} selectedProjectId={null} onViewTask={vi.fn()} />);
-
-    await screen.findByText('No active directions');
-    expect(screen.queryByTestId('manual-intervention-panel')).not.toBeInTheDocument();
   });
 
   it('does not render digest data when backend returns a response that fails the contract check', async () => {
