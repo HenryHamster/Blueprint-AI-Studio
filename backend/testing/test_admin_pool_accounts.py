@@ -320,17 +320,15 @@ async def test_account_health_summary_returns_per_account_data(client, inject_po
     assert a["rl_events_24h"] == 1
     assert a["health_score"] == -1.0  # 1 completion - 2 * 1 rl_event
     assert a["success_rate_7d"] == pytest.approx(2 / 3)
-    assert set(a["failure_class_counts"].keys()) == set(
-        [
-            "CODE_ERROR",
-            "RATE_LIMIT",
-            "EXTERNAL_API",
-            "PROVISION_FAILURE",
-            "MIGRATION_ERROR",
-            "AGENT_TIMEOUT",
-            "SCOPE_OVERFLOW",
-        ]
-    )
+    assert set(a["failure_class_counts"].keys()) == {
+        "CODE_ERROR",
+        "RATE_LIMIT",
+        "EXTERNAL_API",
+        "PROVISION_FAILURE",
+        "MIGRATION_ERROR",
+        "AGENT_TIMEOUT",
+        "SCOPE_OVERFLOW",
+    }
     assert all(v == 0 for v in a["failure_class_counts"].values())
     assert a["rate_limited_models"] == []
 
@@ -938,11 +936,16 @@ async def test_find_regressions_requires_both_thresholds(db_session):
     assert candidates == []
 
 
-async def test_find_regressions_returns_below_median_accounts(db_session):
-    """A two-account group where one account clearly underperforms returns a candidate."""
+async def test_find_regressions_requires_three_distinct_accounts(db_session):
+    """Regression must NOT fire with only 2 distinct accounts (degenerate median-of-two).
+
+    This is the documented HenryHamster false-positive class: with 2 accounts the
+    'median' is the midpoint of two rates, making the weaker account systematically
+    eligible for a 6h quarantine on a chance run of failures.
+    """
     from app.account_model_regression import find_account_model_regressions
 
-    project = Project(name="regression-hit", user_id="test-user-123")
+    project = Project(name="regression-two-acct", user_id="test-user-123")
     db_session.add(project)
     await db_session.flush()
 
@@ -953,7 +956,79 @@ async def test_find_regressions_returns_below_median_accounts(db_session):
             MaxPlanAccount(
                 id=acct_good_id,
                 user_id="test-user-123",
-                name="RGood",
+                name="RGood2",
+                provider=LLMProviderName.ANTHROPIC,
+                auth_mode=LLMAuthMode.OAUTH,
+            ),
+            MaxPlanAccount(
+                id=acct_bad_id,
+                user_id="test-user-123",
+                name="RBad2",
+                provider=LLMProviderName.ANTHROPIC,
+                auth_mode=LLMAuthMode.OAUTH,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    # acct_good: 10 success → rate 1.0
+    # acct_bad:  0 success, 10 fail → rate 0.0
+    # Old code: would fire (median=0.5, gap=0.5 ≥ 0.15, rate < 0.4)
+    # New code: must NOT fire because distinct_accounts == 2 < 3 (_DISTINCT_ACCOUNTS_MIN)
+    tasks = [
+        Task(
+            project_id=project.id,
+            provider="anthropic",
+            model="claude-r2",
+            account_id=acct_good,
+            status=TaskStatus.COMPLETED,
+        )
+        for _ in range(10)
+    ] + [
+        Task(
+            project_id=project.id,
+            provider="anthropic",
+            model="claude-r2",
+            account_id=acct_bad,
+            status=TaskStatus.FAILED,
+        )
+        for _ in range(10)
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    candidates = await find_account_model_regressions(db_session, [acct_good, acct_bad])
+    assert candidates == [], (
+        "Must not quarantine with only 2 accounts — the comparator is the degenerate "
+        "average-of-two which has no statistical significance"
+    )
+
+
+async def test_find_regressions_returns_below_median_accounts(db_session):
+    """A three-account group where one account clearly underperforms returns a candidate."""
+    from app.account_model_regression import find_account_model_regressions
+
+    project = Project(name="regression-hit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    acct_good1_id, acct_good2_id, acct_bad_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    acct_good1 = str(acct_good1_id)
+    acct_good2 = str(acct_good2_id)
+    acct_bad = str(acct_bad_id)
+    db_session.add_all(
+        [
+            MaxPlanAccount(
+                id=acct_good1_id,
+                user_id="test-user-123",
+                name="RGood1",
+                provider=LLMProviderName.ANTHROPIC,
+                auth_mode=LLMAuthMode.OAUTH,
+            ),
+            MaxPlanAccount(
+                id=acct_good2_id,
+                user_id="test-user-123",
+                name="RGood2b",
                 provider=LLMProviderName.ANTHROPIC,
                 auth_mode=LLMAuthMode.OAUTH,
             ),
@@ -968,41 +1043,56 @@ async def test_find_regressions_returns_below_median_accounts(db_session):
     )
     await db_session.flush()
 
-    # acct_good: 5 success → rate 1.0
-    # acct_bad:  0 success, 5 fail → rate 0.0
-    # median of [0.0, 1.0] = 0.5; relative: 0.0 < 0.5*0.8=0.4 ✓; absolute: 0.5-0.0=0.5 ≥ 0.15 ✓
-    tasks = [
-        Task(
-            project_id=project.id,
-            provider="anthropic",
-            model="claude-r",
-            account_id=acct_good,
-            status=TaskStatus.COMPLETED,
-        )
-        for _ in range(5)
-    ] + [
-        Task(
-            project_id=project.id,
-            provider="anthropic",
-            model="claude-r",
-            account_id=acct_bad,
-            status=TaskStatus.FAILED,
-        )
-        for _ in range(5)
-    ]
+    # acct_good1: 10 success → rate 1.0
+    # acct_good2: 10 success → rate 1.0
+    # acct_bad:   0 success, 10 fail → rate 0.0
+    # pool (excl. acct_bad): 20/20 = 1.0; Wilson lower ~0.83
+    # acct_bad Wilson upper ~0.31; 0.31 < 0.83 → statistically significant → fires
+    all_account_ids = [acct_good1, acct_good2, acct_bad]
+    tasks = (
+        [
+            Task(
+                project_id=project.id,
+                provider="anthropic",
+                model="claude-r",
+                account_id=acct_good1,
+                status=TaskStatus.COMPLETED,
+            )
+            for _ in range(10)
+        ]
+        + [
+            Task(
+                project_id=project.id,
+                provider="anthropic",
+                model="claude-r",
+                account_id=acct_good2,
+                status=TaskStatus.COMPLETED,
+            )
+            for _ in range(10)
+        ]
+        + [
+            Task(
+                project_id=project.id,
+                provider="anthropic",
+                model="claude-r",
+                account_id=acct_bad,
+                status=TaskStatus.FAILED,
+            )
+            for _ in range(10)
+        ]
+    )
     db_session.add_all(tasks)
     await db_session.commit()
 
-    candidates = await find_account_model_regressions(db_session, [acct_good, acct_bad])
+    candidates = await find_account_model_regressions(db_session, all_account_ids)
     assert len(candidates) == 1
     c = candidates[0]
     assert c.account_id == acct_bad
     assert c.provider == "anthropic"
     assert c.model == "claude-r"
     assert c.account_rate == 0.0
-    assert c.project_median == 0.5
-    assert c.sample_size == 5
-    assert c.distinct_accounts == 2
+    assert c.sample_size == 10
+    assert c.distinct_accounts == 3
 
 
 async def test_provider_model_breakdown_quarantine_status(client, db_session):
@@ -1309,14 +1399,35 @@ async def test_scan_account_model_regressions_dedupes_notifications(db_session):
     db_session.add(project)
     await db_session.flush()
 
-    acct_good_id, acct_bad_id = uuid.uuid4(), uuid.uuid4()
-    acct_good, acct_bad = str(acct_good_id), str(acct_bad_id)
+    # 3 distinct accounts (>= _DISTINCT_ACCOUNTS_MIN) with a genuinely
+    # significant regression so the statistical gate fires: two good accounts
+    # at 10/10 and one bad account at 0/10. acct_bad's Wilson upper bound
+    # (~0.21) is well below the pool's Wilson lower bound (~0.88), and 10 tasks
+    # clears _ACCOUNT_MIN_SAMPLE (10). This isolates the NOTIFICATION DEDUP
+    # behaviour: the same regression must fire exactly once across two ticks.
+    acct_good1_id, acct_good2_id, acct_bad_id = (
+        uuid.uuid4(),
+        uuid.uuid4(),
+        uuid.uuid4(),
+    )
+    acct_good1, acct_good2, acct_bad = (
+        str(acct_good1_id),
+        str(acct_good2_id),
+        str(acct_bad_id),
+    )
     db_session.add_all(
         [
             MaxPlanAccount(
-                id=acct_good_id,
+                id=acct_good1_id,
                 user_id="test-user-123",
-                name="DGood",
+                name="DGood1",
+                provider=LLMProviderName.ANTHROPIC,
+                auth_mode=LLMAuthMode.OAUTH,
+            ),
+            MaxPlanAccount(
+                id=acct_good2_id,
+                user_id="test-user-123",
+                name="DGood2",
                 provider=LLMProviderName.ANTHROPIC,
                 auth_mode=LLMAuthMode.OAUTH,
             ),
@@ -1331,34 +1442,55 @@ async def test_scan_account_model_regressions_dedupes_notifications(db_session):
     )
     await db_session.flush()
 
-    # 5 success on good, 5 fail on bad → bad regresses.
-    tasks = [
-        Task(
-            project_id=project.id,
-            provider="anthropic",
-            model="claude-d",
-            account_id=acct_good,
-            status=TaskStatus.COMPLETED,
-        )
-        for _ in range(5)
-    ] + [
-        Task(
-            project_id=project.id,
-            provider="anthropic",
-            model="claude-d",
-            account_id=acct_bad,
-            status=TaskStatus.FAILED,
-        )
-        for _ in range(5)
-    ]
+    # 10 success on each good account, 10 fail on bad → bad regresses.
+    tasks = (
+        [
+            Task(
+                project_id=project.id,
+                provider="anthropic",
+                model="claude-d",
+                account_id=acct_good1,
+                status=TaskStatus.COMPLETED,
+            )
+            for _ in range(10)
+        ]
+        + [
+            Task(
+                project_id=project.id,
+                provider="anthropic",
+                model="claude-d",
+                account_id=acct_good2,
+                status=TaskStatus.COMPLETED,
+            )
+            for _ in range(10)
+        ]
+        + [
+            Task(
+                project_id=project.id,
+                provider="anthropic",
+                model="claude-d",
+                account_id=acct_bad,
+                status=TaskStatus.FAILED,
+            )
+            for _ in range(10)
+        ]
+    )
     db_session.add_all(tasks)
     await db_session.commit()
 
     # Inject in-memory pool entries so the scanner sees the accounts.
     async with _max_plan_pool_lock:
-        _account_by_id[acct_good] = {
-            "id": acct_good,
-            "name": "DGood",
+        _account_by_id[acct_good1] = {
+            "id": acct_good1,
+            "name": "DGood1",
+            "enabled": True,
+            "active_tasks": 0,
+            "user_id": "test-user-123",
+            "provider": "anthropic",
+        }
+        _account_by_id[acct_good2] = {
+            "id": acct_good2,
+            "name": "DGood2",
             "enabled": True,
             "active_tasks": 0,
             "user_id": "test-user-123",
@@ -1389,13 +1521,15 @@ async def test_scan_account_model_regressions_dedupes_notifications(db_session):
         assert ev["model"] == "claude-d"
         # Notification payload must include the numeric stats.
         assert ev["account_rate"] == 0.0
-        assert ev["project_median"] == 0.5
-        assert ev["sample_size"] == 5
+        # median of per-account rates [0.0, 1.0, 1.0] = 1.0
+        assert ev["project_median"] == 1.0
+        assert ev["sample_size"] == 10
         # Second tick must dedupe — same regression, no new fire event.
         assert fired_second == []
     finally:
         async with _max_plan_pool_lock:
-            _account_by_id.pop(acct_good, None)
+            _account_by_id.pop(acct_good1, None)
+            _account_by_id.pop(acct_good2, None)
             _account_by_id.pop(acct_bad, None)
 
 
