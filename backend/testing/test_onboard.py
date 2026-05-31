@@ -828,7 +828,7 @@ class TestBuildConfigDetection:
         assert dir_config["path"] == "./"
         assert dir_config["type"] == "python"
         assert dir_config["lint_cmd"] == "ruff check"
-        assert dir_config["test_cmd"] == "pytest"
+        assert dir_config["test_cmd"] == "python3 -m pytest"
 
     @pytest.mark.asyncio
     async def test_detect_build_config_seeds_lint_cmd_for_subdir_python(self):
@@ -860,4 +860,37 @@ class TestBuildConfigDetection:
         assert dir_config["path"] == "backend/"
         assert dir_config["type"] == "python"
         assert dir_config["lint_cmd"] == "ruff check"
-        assert dir_config["test_cmd"] == "pytest"
+        assert dir_config["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_never_emits_bare_pytest(self):
+        """Regression C19: _detect_build_config must emit 'python3 -m pytest', never bare 'pytest'.
+
+        Bare 'pytest' fails on agent VMs where pytest is installed as a Python
+        package (pip3 install pytest) but is not on the OS PATH as a standalone
+        binary.  'python3 -m pytest' works in both environments.
+        """
+        root_files = [
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        for dir_cfg in config.get("directories", []):
+            test_cmd = dir_cfg.get("test_cmd", "")
+            assert test_cmd != "pytest", (
+                f"test_cmd must not be bare 'pytest'; got {test_cmd!r}. "
+                "Use 'python3 -m pytest' so bare-VM invocations succeed."
+            )
+            if "pytest" in test_cmd:
+                assert test_cmd.startswith("python3 -m pytest"), (
+                    f"pytest test_cmd must use 'python3 -m pytest'; got {test_cmd!r}"
+                )

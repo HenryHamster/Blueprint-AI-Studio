@@ -78,7 +78,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                 "path": "./",
                 "type": "python",
                 "lint_cmd": "ruff check",
-                "test_cmd": "pytest",
+                "test_cmd": "python3 -m pytest",
             }
         )
 
@@ -159,7 +159,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                     "path": f"{subdir}/",
                     "type": "python",
                     "lint_cmd": "ruff check",
-                    "test_cmd": "pytest",
+                    "test_cmd": "python3 -m pytest",
                 }
             )
             if "python" not in languages:
@@ -247,16 +247,16 @@ async def onboard_project(
         build_config.update(payload.build_config_override)
 
     # Validate final build_config structure
-    from app.schemas import BuildConfig as BuildConfigSchema  # noqa: PLC0415
+    from app.schemas import BuildConfig as BuildConfigSchema
 
     try:
         validated = (
             BuildConfigSchema(**build_config) if build_config else BuildConfigSchema()
         )
         project.build_config = validated.model_dump(exclude_none=True)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         # Detection + override produced invalid shape — store raw but log warning
-        logger.warning("[ONBOARD] build_config failed schema validation, storing raw")
+        logger.warning("[ONBOARD] build_config failed schema validation, storing raw: %s", exc)
         project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)
