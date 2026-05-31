@@ -123,11 +123,6 @@ class LLMAuthMode(str, Enum):
 # Kept here so direction_lifecycle, anomaly_detection, task_completion, and
 # strategic_completion all agree on the same thresholds and key names.
 
-# Minimum hours between successive diagnosis investigate tasks for the same
-# direction. Prevents a flood of investigate spawns when a direction keeps
-# failing health checks on every autonomous tick.
-DIAGNOSIS_DEDUP_WINDOW_HOURS = 24
-
 # Direction dict keys for diagnosis state. The `directions` JSONB field on
 # Project stores these alongside existing pause keys.
 #   DIAGNOSIS_IN_PROGRESS_KEY: bool — true while an investigate task is open
@@ -1413,7 +1408,7 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
     """
     try:
         from sqlalchemy import inspect as _sa_inspect
-        from app.jwt_revocation import emit_task_terminated_notify  # noqa: PLC0415
+        from app.jwt_revocation import emit_task_terminated_notify
 
         terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
         for instance in session.dirty:
@@ -1946,21 +1941,6 @@ class MaxPlanAccount(SQLModel, table=True):
             return False
 
 
-# --- Residual-case reaper thresholds ---
-# All are tunable via runtime_config using the same-named lowercase keys
-# (e.g. runtime_config.get("residual_stale_close_hours", RESIDUAL_STALE_CLOSE_HOURS)).
-# RESIDUAL_STALE_CLOSE_HOURS:     Hours of fingerprint silence before an ACTIVE case is
-#   closed organically OR a stuck REMEDIATING case is auto-resolved to RESOLVED.
-# RESIDUAL_RECENT_HIT_DEFER_HOURS: If a fingerprint's last_seen_at is within this window,
-#   defer the ACTIVE → CLOSED_ORGANICALLY close even if the 72 h outer window has elapsed.
-# RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD: Consecutive audit deferrals on a single
-#   fingerprint before a BLOCKER ProjectMessage is posted (one-shot per streak; resets
-#   to 0 when a fix spawns so future audit cycles can re-escalate).
-RESIDUAL_STALE_CLOSE_HOURS = 72
-RESIDUAL_RECENT_HIT_DEFER_HOURS = 1
-RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD = 5
-
-
 class ResidualCaseStatus(str, Enum):
     # Passive states (existing): set by record_residual_fingerprint + reaper
     ACTIVE = "ACTIVE"
@@ -2198,19 +2178,6 @@ class SystemMaturity(SQLModel, table=True):
             "project_id", "system_id", name="uq_system_maturity_project_system"
         ),
     )
-
-
-# --- Regression-case watchdog thresholds ---
-# Tunable via runtime_config using the same-named lowercase keys.
-# REGRESSION_WATCHDOG_ACTIVE_STALE_HOURS: Hours since updated_at before an ACTIVE
-#   case is considered stuck and escalated to NEEDS_MANUAL_INTERVENTION.  An ACTIVE
-#   case goes stale when an investigation completes with low/no confidence and no
-#   remediation task is spawned.
-# REGRESSION_WATCHDOG_MERGED_STALE_HOURS: Hours since updated_at before a MERGED
-#   case is considered stuck.  A MERGED case goes stale when the recovery scan
-#   cannot evaluate it (e.g. signal_snapshot_at_merge is empty).
-REGRESSION_WATCHDOG_ACTIVE_STALE_HOURS = 24
-REGRESSION_WATCHDOG_MERGED_STALE_HOURS = 6
 
 
 class RegressionCaseStatus(str, Enum):
