@@ -47,15 +47,18 @@ def _setup():
     _ss.direction_failure_streaks.clear()
 
 
+@pytest.fixture(autouse=True)
+def _autoclean_direction_state():
+    """Clear direction streak state before every test in this module."""
+    _setup()
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — record_direction_result
 # ---------------------------------------------------------------------------
 
 
 class TestRecordDirectionResult:
-    def setup_method(self):
-        _setup()
-
     def test_infra_failures_are_ignored_entirely(self):
         """Infra failures (RATE_LIMIT, PROVISION_FAILURE, AGENT_TIMEOUT,
         EXTERNAL_API, SCOPE_OVERFLOW) are platform noise, not the direction's
@@ -150,9 +153,6 @@ class TestRecordDirectionResult:
 
 
 class TestClearDirectionHold:
-    def setup_method(self):
-        _setup()
-
     def test_clears_hold_and_resets_count(self):
         did = _fresh_direction_id()
         for _ in range(DIRECTION_HOLD_THRESHOLD):
@@ -175,9 +175,6 @@ class TestClearDirectionHold:
 
 
 class TestIsDirectionHeldTimeout:
-    def setup_method(self):
-        _setup()
-
     def test_hold_expires_after_timeout(self):
         did = _fresh_direction_id()
         for _ in range(DIRECTION_HOLD_THRESHOLD):
@@ -207,9 +204,6 @@ class TestIsDirectionHeldTimeout:
 
 
 class TestGetDirectionHoldInfo:
-    def setup_method(self):
-        _setup()
-
     def test_returns_held_at_and_held_until_while_held(self):
         did = _fresh_direction_id()
         for _ in range(DIRECTION_HOLD_THRESHOLD):
@@ -246,9 +240,6 @@ class TestGetDirectionHoldInfo:
 
 
 class TestGetHeldDirections:
-    def setup_method(self):
-        _setup()
-
     def test_returns_held_directions(self):
         did1 = _fresh_direction_id()
         did2 = _fresh_direction_id()
@@ -291,9 +282,6 @@ class TestGetHeldDirections:
 
 
 class TestPipelineHealthSnapshot:
-    def setup_method(self):
-        _setup()
-
     def test_snapshot_includes_held_directions_key(self):
         snapshot = get_pipeline_health_snapshot()
         assert "held_directions" in snapshot
@@ -316,9 +304,6 @@ class TestPipelineHealthSnapshot:
 
 
 class TestFilterHeldDirections:
-    def setup_method(self):
-        _setup()
-
     @pytest.mark.asyncio
     async def test_task_without_direction_id_passes_through(self):
         project_id = uuid.uuid4()

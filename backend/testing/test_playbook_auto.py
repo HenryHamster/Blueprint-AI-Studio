@@ -170,6 +170,15 @@ async def test_duplicate_detection_prevents_recreation(db_session: AsyncSession)
     assert len(auto_keys_2) == 1, (
         f"Expected 1 auto entry after duplicate check, got {auto_keys_2}"
     )
+    # The single entry reflects the second call's data: 4 occurrences now
+    updated_content = doc2[auto_keys_2[0]]["content"]
+    assert "4 times" in updated_content, (
+        f"Expected updated content to mention '4 times', got: {updated_content!r}"
+    )
+    # The key is unchanged (updated in place, not a new key)
+    assert auto_keys_2[0] == auto_keys_1[0], (
+        f"Expected same key after update, key changed from {auto_keys_1[0]!r} to {auto_keys_2[0]!r}"
+    )
 
 
 @pytest.mark.asyncio

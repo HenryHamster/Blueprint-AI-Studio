@@ -60,6 +60,16 @@ def _acct(**kw) -> dict:
     return base
 
 
+@pytest.fixture(autouse=True)
+def _autoclean_pool_state():
+    """Clear all shared in-memory pool state before every test in this module."""
+    from app.failure_classification import _account_failure_log
+
+    _max_plan_pools.clear()
+    _account_by_id.clear()
+    _account_failure_log.clear()
+
+
 # ── _normalize_rl_model ─────────────────────────────────────────────────────
 
 
@@ -874,12 +884,6 @@ class TestBalancedSuccessRateBias:
             ]
         return acct
 
-    def setup_method(self):
-        _max_plan_pools.pop(self._USER, None)
-
-    def teardown_method(self):
-        _max_plan_pools.pop(self._USER, None)
-
     async def test_low_success_rate_account_deprioritized(self):
         """Account with 7d rate well below pool median is excluded when a better one exists."""
         good = self._acct_with_rate("good", success_rate=1.0)
@@ -948,20 +952,6 @@ class TestQuarantineTrigger:
             (cls, conf, now_ts - (len(records) - i) * 100)
             for i, (cls, conf) in enumerate(records)
         ]
-
-    def setup_method(self):
-        from app.failure_classification import _account_failure_log
-
-        _account_failure_log.clear()
-        _account_by_id.clear()
-        _max_plan_pools.clear()
-
-    def teardown_method(self):
-        from app.failure_classification import _account_failure_log
-
-        _account_failure_log.clear()
-        _account_by_id.clear()
-        _max_plan_pools.clear()
 
     def test_triggers_when_last_n_are_rate_limit_high_confidence(self):
         self._set_records(
@@ -1134,12 +1124,6 @@ class TestQuarantineTrigger:
 
 
 class TestDisableAccountForAuth:
-    def setup_method(self):
-        _account_by_id.clear()
-
-    def teardown_method(self):
-        _account_by_id.clear()
-
     async def test_disables_account_and_sets_reason(self):
         acct = _acct(id="a", enabled=True)
         _account_by_id["a"] = acct
@@ -1435,12 +1419,6 @@ class TestLatencyAwareSelection:
             ]
         return acct
 
-    def setup_method(self):
-        _max_plan_pools.pop(self._USER, None)
-
-    def teardown_method(self):
-        _max_plan_pools.pop(self._USER, None)
-
     async def test_faster_account_preferred_balanced(self):
         """Balanced picker selects faster account when active_tasks and success rate are equal."""
         fast = self._acct_with_duration("fast", avg_seconds=60.0)
@@ -1492,20 +1470,6 @@ class TestLatencyAwareSelection:
 
 class TestRegressionQuarantine:
     """Unit tests for the regression-kind disabled_models entry shape."""
-
-    def setup_method(self):
-        from app.failure_classification import _account_failure_log
-
-        _account_failure_log.clear()
-        _account_by_id.clear()
-        _max_plan_pools.clear()
-
-    def teardown_method(self):
-        from app.failure_classification import _account_failure_log
-
-        _account_failure_log.clear()
-        _account_by_id.clear()
-        _max_plan_pools.clear()
 
     async def test_regression_kind_does_not_cascade(self):
         """Regression on Sonnet must NOT also disable Opus / Haiku."""
@@ -1857,14 +1821,6 @@ class TestScanRegressionsDedupe:
     """Tests for scanner idempotency: a steady-state regression must NOT
     re-fire on every tick."""
 
-    def setup_method(self):
-        _account_by_id.clear()
-        _max_plan_pools.clear()
-
-    def teardown_method(self):
-        _account_by_id.clear()
-        _max_plan_pools.clear()
-
     async def test_dedupes_within_cooldown(self):
         from app.max_plan_pool import (
             _REGRESSION_COOLDOWN_SECONDS,
@@ -1954,14 +1910,6 @@ class TestPoolWideRateLimitCooldownScoping:
     """pool_wide_rate_limit_cooldown must restrict its verdict to the candidate
     set the task could actually dispatch to, so unrelated users or providers
     cannot mask a full-pool blockage or cause false RATE_LIMIT verdicts."""
-
-    def setup_method(self):
-        _max_plan_pools.clear()
-        _account_by_id.clear()
-
-    def teardown_method(self):
-        _max_plan_pools.clear()
-        _account_by_id.clear()
 
     def _add(self, user_id: str, acct_id: str, provider: str = "anthropic", **kw):
         a = _acct(id=acct_id, user_id=user_id, provider=provider, **kw)

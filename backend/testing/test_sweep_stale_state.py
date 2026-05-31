@@ -10,6 +10,8 @@ reclaims them; these tests pin the retention semantics.
 from collections import deque
 from datetime import timedelta
 
+import pytest
+
 import app.shared_state as _ss
 from app.shared_state import sweep_stale_in_memory_state
 from app.time_utils import _utcnow
@@ -23,10 +25,13 @@ def _reset_state():
     _ss.user_debug_spawn_times.clear()
 
 
-class TestDirectionFailureStreaks:
-    def setup_method(self):
-        _reset_state()
+@pytest.fixture(autouse=True)
+def _autoclean_shared_state():
+    """Reset all in-memory state dicts before every test in this module."""
+    _reset_state()
 
+
+class TestDirectionFailureStreaks:
     def test_idle_streak_pruned_when_last_failure_older_than_retention(self):
         now = _utcnow()
         _ss.direction_failure_streaks["d1"] = {
@@ -94,9 +99,6 @@ class TestDirectionFailureStreaks:
 
 
 class TestCircuitBreakers:
-    def setup_method(self):
-        _reset_state()
-
     def test_closed_breaker_with_no_recent_activity_pruned(self):
         now = _utcnow()
         _ss.circuit_breakers["p1"] = {
@@ -148,9 +150,6 @@ class TestCircuitBreakers:
 
 
 class TestAutonomousFailureCounts:
-    def setup_method(self):
-        _reset_state()
-
     def test_zero_counter_pruned(self):
         _ss.autonomous_failure_counts["p1"] = 0
         _ss.autonomous_failure_counts["p2"] = 2
@@ -161,9 +160,6 @@ class TestAutonomousFailureCounts:
 
 
 class TestMergeErrorOccurrences:
-    def setup_method(self):
-        _reset_state()
-
     def test_empty_deque_key_pruned_after_timestamps_age_out(self):
         now = _utcnow()
         stale = now - timedelta(seconds=_ss.MERGE_PATTERN_WINDOW_SECONDS * 3)
@@ -176,9 +172,6 @@ class TestMergeErrorOccurrences:
 
 
 class TestUserDebugSpawnTimes:
-    def setup_method(self):
-        _reset_state()
-
     def test_empty_deque_pruned(self):
         now = _utcnow()
         stale = now - timedelta(hours=5)
@@ -191,9 +184,6 @@ class TestUserDebugSpawnTimes:
 
 
 class TestSweepSummary:
-    def setup_method(self):
-        _reset_state()
-
     def test_empty_state_returns_zero_counts(self):
         pruned = sweep_stale_in_memory_state()
         assert all(v == 0 for v in pruned.values())

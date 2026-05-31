@@ -1695,10 +1695,6 @@ async def test_post_residual_fix_spawned_fires_external_webhook(db_session):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=False,
-    reason="close_residual_case_resolved not yet implemented; sibling cluster 1/2 will add it to notification_dispatch",
-)
 async def test_close_residual_case_resolved_transitions_to_resolved(db_session):
     """After a residual fix PR merges, close_residual_case_resolved() should
     transition the case to RESOLVED so it is excluded from future DB selection

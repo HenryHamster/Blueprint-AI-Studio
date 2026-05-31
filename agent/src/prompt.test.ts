@@ -64,6 +64,17 @@ import {
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
   writeDesignDocHelper,
+  CODE_CHANGE_HELPER_GUIDANCE,
+  CREATE_TASK_FOCUS,
+  FIX_TASK_FOCUS,
+  PLAYBOOK_GUIDANCE,
+  DEFAULT_TOOL_GUIDANCE,
+  READ_THE_FAILURE_MESSAGE,
+  SIZE_GUARDRAIL_GUIDANCE,
+  PRIOR_ATTEMPT_DIVERGENCE,
+  BEYOND_SCOPE_REPORTING,
+  SELF_REVIEW_PROMPT_VERSION,
+  assembleFailureGuidanceBlocks,
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
@@ -3592,17 +3603,14 @@ describe('formatSelfReviewBlindSpots', () => {
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — truncated_files_read & incomplete_review schema', () => {
   it('documents truncated_files_read in the schema block', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('truncated_files_read');
   });
 
   it('documents the incomplete_review categories marker', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('incomplete_review');
   });
 
   it('explains truncated_files_read as a subset of changed files (verification-only)', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/truncated_files_read[\s\S]*subset/);
   });
 });
@@ -3610,47 +3618,39 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — truncated_files_read & incomplete_revi
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
   it('includes scope-drift in the canonical category list', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`scope-drift`');
   });
 
   it('includes scope threshold table for small scope', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('small');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('50');
   });
 
   it('includes scope threshold table for medium scope', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('medium');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('200');
   });
 
   it('includes scope threshold table for large scope', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('large');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('800');
   });
 
   it('instructs agent to run git diff --stat', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --stat');
   });
 
   it('describes off-scope file modifications as a second trigger', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('related_files');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --name-only');
   });
 
   it('shows the off-scope issue format with file list', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('modified files outside declared scope');
   });
 
   it('mentions lockfile allowlist for incidental files', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('package-lock.json');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('poetry.lock');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Cargo.lock');
@@ -3658,12 +3658,10 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
   });
 
   it('mentions sibling test files as allowlisted', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/\.test\.|\.spec\./);
   });
 
-  it('keeps scope-drift as a single canonical category for both triggers', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+  it('keeps scope-drift as a single canonical category for both triggers', () => {
     // No new category id introduced — both triggers feed scope-drift.
     expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('off-scope-files');
     expect(CODE_CHANGE_HELPER_GUIDANCE).not.toContain('off_scope_files');
@@ -3673,7 +3671,6 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
   });
 
   it('per-task-type focus blocks reference the off-scope files concept', async () => {
-    const { CREATE_TASK_FOCUS, FIX_TASK_FOCUS } = await import('./prompt.js');
     expect(CREATE_TASK_FOCUS).toContain('related_files');
     expect(CREATE_TASK_FOCUS).toContain('git diff --name-only');
     expect(FIX_TASK_FOCUS).toContain('related_files');
@@ -3683,46 +3680,38 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — regression_risk category', () => {
   it('includes regression_risk in the canonical category list', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`regression_risk`');
   });
 
   it('references the test_baseline file path', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('test_baseline_');
   });
 
   it('instructs agent to omit check when baseline file is absent', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('omit');
   });
 });
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — cross-system-contract category', () => {
   it('includes cross-system-contract in the canonical category list', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`cross-system-contract`');
   });
 
   it('fires when diff touches 2+ of {admin-ui, backend, agent}', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/admin-ui.*backend.*agent|≥2|>=2/);
   });
 
   it('instructs agent to grep the other side for matching route definitions', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('grep');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('other');
   });
 
   it('specifies major severity for URL/route mismatch', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('major');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('minor');
   });
 
   it('instructs agent to record passed:true when diff is not cross-system', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('diff does not cross system boundaries');
   });
 });
@@ -3771,37 +3760,30 @@ describe('TASK_TYPE_HINTS dispatch parity', () => {
 // rather than silently invalidating the downstream assertions.
 describe('cross-cutting guidance-block fingerprints — structural invariants for prompt.ts', () => {
   it('PLAYBOOK_GUIDANCE contains fingerprint used by handler structural tests', async () => {
-    const { PLAYBOOK_GUIDANCE } = await import('./prompt.js');
     expect(PLAYBOOK_GUIDANCE).toContain('./playbook set');
   });
 
   it('DEFAULT_TOOL_GUIDANCE contains fingerprint used by handler structural tests', async () => {
-    const { DEFAULT_TOOL_GUIDANCE } = await import('./prompt.js');
     expect(DEFAULT_TOOL_GUIDANCE).toContain('Use Grep/Glob for code search');
   });
 
   it('CODE_CHANGE_HELPER_GUIDANCE contains fingerprint used by handler structural tests', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Task lifecycle — you own it end-to-end');
   });
 
   it('READ_THE_FAILURE_MESSAGE contains section header fingerprint', async () => {
-    const { READ_THE_FAILURE_MESSAGE } = await import('./prompt.js');
     expect(READ_THE_FAILURE_MESSAGE).toContain('Read The Failure Message Literally');
   });
 
   it('SIZE_GUARDRAIL_GUIDANCE contains section header fingerprint', async () => {
-    const { SIZE_GUARDRAIL_GUIDANCE } = await import('./prompt.js');
     expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Size Guardrails Are Advisory');
   });
 
   it('PRIOR_ATTEMPT_DIVERGENCE contains section header fingerprint', async () => {
-    const { PRIOR_ATTEMPT_DIVERGENCE } = await import('./prompt.js');
     expect(PRIOR_ATTEMPT_DIVERGENCE).toContain("If You're Retrying");
   });
 
   it('BEYOND_SCOPE_REPORTING contains section header fingerprint', async () => {
-    const { BEYOND_SCOPE_REPORTING } = await import('./prompt.js');
     expect(BEYOND_SCOPE_REPORTING).toContain('When You Find Bigger Problems Than Your Task');
   });
 });
@@ -3812,12 +3794,10 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
   it('is "6" (current pinned version)', async () => {
-    const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
     expect(SELF_REVIEW_PROMPT_VERSION).toBe('6');
   });
 
-  it('is a non-empty string (used as prompt_version field in self-review JSON)', async () => {
-    const { SELF_REVIEW_PROMPT_VERSION } = await import('./prompt.js');
+  it('is a non-empty string (used as prompt_version field in self-review JSON)', () => {
     expect(typeof SELF_REVIEW_PROMPT_VERSION).toBe('string');
     expect(SELF_REVIEW_PROMPT_VERSION).not.toBe('');
   });
@@ -3829,8 +3809,7 @@ describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
 // blocks. Pins block inclusion and canonical order so a dropped block or
 // reordering is caught at change-time.
 describe('assembleFailureGuidanceBlocks — structural invariants', () => {
-  it('includes all 4 required failure-guidance blocks', async () => {
-    const { assembleFailureGuidanceBlocks } = await import('./prompt.js');
+  it('includes all 4 required failure-guidance blocks', () => {
     const blocks = assembleFailureGuidanceBlocks();
     expect(blocks).toContain('Read The Failure Message Literally');    // READ_THE_FAILURE_MESSAGE
     expect(blocks).toContain('Size Guardrails Are Advisory');          // SIZE_GUARDRAIL_GUIDANCE
@@ -3838,8 +3817,7 @@ describe('assembleFailureGuidanceBlocks — structural invariants', () => {
     expect(blocks).toContain('When You Find Bigger Problems Than Your Task'); // BEYOND_SCOPE_REPORTING
   });
 
-  it('assembles blocks in canonical order (READ > SIZE > PRIOR > BEYOND)', async () => {
-    const { assembleFailureGuidanceBlocks } = await import('./prompt.js');
+  it('assembles blocks in canonical order (READ > SIZE > PRIOR > BEYOND)', () => {
     const blocks = assembleFailureGuidanceBlocks();
     const rfmIdx = blocks.indexOf('Read The Failure Message Literally');
     const sgIdx  = blocks.indexOf('Size Guardrails Are Advisory');
@@ -3975,27 +3953,22 @@ describe('formatSelfReviewCalibrationSection', () => {
 // ── CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning ───────────────
 describe('CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning', () => {
   it('includes a reasoning field in the schema example for check_results', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('"reasoning"');
   });
 
   it('requires reasoning for both pass and fail outcomes on regressing categories', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('BOTH pass and fail');
   });
 
   it('references the Self-Review Blind Spots section as the source of regressing categories', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Self-Review Blind Spots');
   });
 
   it('instructs agent to describe what was inspected in the reasoning field', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('what you inspected');
   });
 
   it('mentions the ./done exit error so agent knows to update SR JSON and re-run', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('reasoning field');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('./done');
   });
@@ -4004,62 +3977,51 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning', () => 
 // ── CODE_CHANGE_HELPER_GUIDANCE — evidence anchors for high-stakes PASS verdicts ──
 describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
   it('requires evidence anchors for PASS on correctness category', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('correctness');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
   it('requires evidence anchors for PASS on error-handling category', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('error-handling');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
   it('requires evidence anchors for PASS on security category', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('security');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
   it('requires evidence anchors for PASS on regression_risk category', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('regression_risk');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
   it('requires evidence anchors for PASS on scope-drift category', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('scope-drift');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
   it('specifies file:line format as a valid anchor type', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/file:line|path\/to\/file\.ts:/);
   });
 
   it('specifies code snippet format as a valid anchor type', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/code snippet|quoted|backtick/);
   });
 
   it('specifies scope-drift anchor formats (diff stats and file list)', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/Trigger A.*diff.*stats|Trigger B.*related_files/);
   });
 
   it('mentions that this requirement applies to high-stakes categories', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/high-stakes|five categories/);
   });
 
   it('excludes lower-stakes categories from evidence anchor requirement', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/lower-stakes|style-conventions|documentation|performance|architecture/);
   });
 
   it('documents scope-drift-specific anchor requirements (Trigger A and B)', async () => {
-    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger A');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
   });

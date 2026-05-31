@@ -58,16 +58,11 @@ async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
     adds the real updated_at column; this test pins the sweep to the real
     column and verifies the path end-to-end.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    _common_reaper_mocks(mocker)
     mock_rollup = mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Evaluating Sweep Test", user_id="user1")
     reaper_db.add(project)
@@ -96,7 +91,7 @@ async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     mock_rollup.assert_called_once()
@@ -112,14 +107,11 @@ async def test_reaper_service(reaper_db, mocker):
     Tests the background worker that terminates orphaned VMs.
     We mock asyncio.sleep to break the infinite loop after one iteration.
     """
+    _common_reaper_mocks(mocker)
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
     # Disable infra-recovery resurrection so the task stays FAILED for this assertion
     mocker.patch("app.reaper.any_zone_available", return_value=False)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Test", user_id="user1")
     reaper_db.add(project)
@@ -140,7 +132,7 @@ async def test_reaper_service(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(task)
@@ -154,12 +146,9 @@ async def test_reaper_retry_path(reaper_db, mocker):
     Tests that a task with remaining retries is reset to QUEUED (not FAILED)
     when the reaper detects a heartbeat timeout.
     """
+    _common_reaper_mocks(mocker)
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Retry Test", user_id="user1")
     reaper_db.add(project)
@@ -180,7 +169,7 @@ async def test_reaper_retry_path(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(task)
@@ -194,12 +183,8 @@ async def test_reaper_retry_preserves_analysis_artifacts(reaper_db, mocker):
     """Reaper requeue must copy _pr_diff_summary / _test_failure_summary /
     _self_review_outcome / _analysis_plan to their _previous_* equivalents so
     the agent's buildRetryContext can surface them on the next attempt."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Artifact Test", user_id="user1")
     reaper_db.add(project)
@@ -227,7 +212,7 @@ async def test_reaper_retry_preserves_analysis_artifacts(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(task)
@@ -250,14 +235,11 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
     Tests that a task at its retry limit is permanently marked FAILED
     when the reaper detects a heartbeat timeout.
     """
+    _common_reaper_mocks(mocker)
     mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
     # Disable infra-recovery resurrection so the task stays FAILED for this assertion
     mocker.patch("app.reaper.any_zone_available", return_value=False)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Terminal Test", user_id="user1")
     reaper_db.add(project)
@@ -278,7 +260,7 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(task)
@@ -294,14 +276,10 @@ async def test_reaper_persists_failure_category_on_terminal_fail(reaper_db, mock
     task.context["failure_category"] so downstream direction rollups bucket
     the failure as infrastructure, not a code defect.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    _common_reaper_mocks(mocker)
     # Disable infra-recovery resurrection so failure_category survives in context
     mocker.patch("app.reaper.any_zone_available", return_value=False)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Category Test", user_id="user1")
     reaper_db.add(project)
@@ -322,7 +300,7 @@ async def test_reaper_persists_failure_category_on_terminal_fail(reaper_db, mock
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(task)
@@ -336,12 +314,8 @@ async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
     Tests that a task whose last heartbeat was 6 minutes ago (just past the
     5-minute threshold) is detected as orphaned and re-queued.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Threshold Test", user_id="user1")
     reaper_db.add(project)
@@ -362,7 +336,7 @@ async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(task)
@@ -377,12 +351,8 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
     is reaped, _requeue_parent_task is called and the coordinator is set back
     to EVALUATING instead of being blindly re-dispatched to a new VM.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Parent Test", user_id="user1")
     reaper_db.add(project)
@@ -412,7 +382,7 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(coordinator)
@@ -2959,16 +2929,8 @@ def test_provision_gcp_script_has_settle_window_before_success_heartbeat():
 @pytest.mark.asyncio
 async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, mocker):
     """EVALUATING parent whose children ALL failed and requeue limit exhausted is set to FAILED."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
-    )
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="All-Failed Rescue Test", user_id="user1")
     reaper_db.add(project)
@@ -3006,7 +2968,7 @@ async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, m
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(parent)
@@ -3016,16 +2978,8 @@ async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, m
 @pytest.mark.asyncio
 async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mocker):
     """EVALUATING parent with at least one still-running child must NOT be rescued prematurely."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
-    )
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Running Child Test", user_id="user1")
     reaper_db.add(project)
@@ -3059,7 +3013,7 @@ async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mo
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(parent)
@@ -3070,16 +3024,8 @@ async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mo
 @pytest.mark.asyncio
 async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker):
     """Rescued parent failure message includes each child's failure_category."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
-    )
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    _common_reaper_mocks(mocker)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Failure Class Msg Test", user_id="user1")
     reaper_db.add(project)
@@ -3110,7 +3056,7 @@ async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(parent)
@@ -3121,19 +3067,11 @@ async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker
 async def test_reaper_parent_rescue_calls_requeue_before_failing(reaper_db, mocker):
     """EVALUATING parent with all-failed children calls _requeue_parent_task (re-evaluation)
     instead of being immediately set to FAILED when the requeue budget is not exhausted."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
-    )
+    _common_reaper_mocks(mocker)
     mock_requeue = mocker.patch(
         "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
     )
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Requeue Rescue Test", user_id="user1")
     reaper_db.add(project)
@@ -3163,7 +3101,7 @@ async def test_reaper_parent_rescue_calls_requeue_before_failing(reaper_db, mock
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     # _requeue_parent_task should have been called — not the parent directly set to FAILED.
@@ -3708,11 +3646,7 @@ async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.shared_state.runtime_config",
         {
@@ -3752,7 +3686,7 @@ async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(stale_task)
@@ -3780,11 +3714,7 @@ async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
         {
@@ -3814,7 +3744,7 @@ async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     from sqlmodel import select as _select
@@ -3837,11 +3767,7 @@ async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, moc
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
         {
@@ -3870,7 +3796,7 @@ async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, moc
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     from sqlmodel import select as _select
@@ -3898,11 +3824,7 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
         {
@@ -3936,7 +3858,7 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     from sqlmodel import select as _select
@@ -3959,11 +3881,7 @@ async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
     """
     mocker.patch("app.main.delete_agent_vm", return_value=True)
     mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
-
-    class StopLoopException(Exception):
-        pass
-
-    mocker.patch("asyncio.sleep", side_effect=StopLoopException("Stop"))
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
         {
@@ -3994,7 +3912,7 @@ async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
 
     try:
         await reaper_service()
-    except StopLoopException:
+    except _StopLoop:
         pass
 
     await reaper_db.refresh(stale_task)
