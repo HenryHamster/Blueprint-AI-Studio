@@ -54,7 +54,7 @@ async def create_branch(
                 f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing"
             )
             return {"ref": f"refs/heads/{branch_name}", "object": {"sha": existing_sha}}
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception(
                 f"Branch '{branch_name}' 422 but get_branch_sha also failed; falling through"
             )
@@ -327,6 +327,17 @@ async def get_commit_date(
     return parsed
 
 
+# Short-lived dedup cache for list_pull_requests_for_commit.
+# The ci_resolution fallback path calls this once per no-checks head SHA; when
+# N sibling tasks share the same branch_sha (common in rollups), each task was
+# issuing a redundant GET commits/{sha}/pulls.  A 30 s TTL matches the
+# check-runs cache so both dedup windows align.  Error results (empty list from
+# a non-200 response) are NOT cached so the next call retries the real lookup.
+_LIST_PRS_FOR_COMMIT_CACHE_TTL_S = 30
+_LIST_PRS_FOR_COMMIT_CACHE_MAX = 500
+_list_prs_for_commit_cache: "dict[tuple[str, str, str], tuple[list[dict], float]]" = {}
+
+
 async def list_pull_requests_for_commit(
     token: str,
     owner: str,
@@ -348,7 +359,19 @@ async def list_pull_requests_for_commit(
     Returns the raw list of PR dicts (each carries ``number``, ``state``,
     ``merged_at``, ``head``, ``base``).  Returns ``[]`` on any non-200 response
     or unparseable body — graceful degradation, never raises for an API error.
+
+    Results are cached for 30 s keyed by (owner, repo, sha) to deduplicate
+    simultaneous fan-out from sibling tasks watching the same branch.  Error
+    results (empty list from non-200) are NOT cached so the next call retries.
     """
+    import time as _time
+
+    cache_key = (owner, repo, sha)
+    now = _time.time()
+    cached = _list_prs_for_commit_cache.get(cache_key)
+    if cached is not None and (now - cached[1]) < _LIST_PRS_FOR_COMMIT_CACHE_TTL_S:
+        return cached[0]
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -373,6 +396,8 @@ async def list_pull_requests_for_commit(
                 sha[:8] if sha else sha,
                 response.status_code,
             )
+            # Do not cache error results — callers should retry on the next
+            # cycle rather than serve a stale empty list.
             return []
         try:
             page = response.json()
@@ -389,6 +414,17 @@ async def list_pull_requests_for_commit(
             return []
         all_prs.extend(page)
         url = response.links.get("next", {}).get("url")
+
+    # Cache successful (possibly empty-list-from-no-PRs) results.
+    _list_prs_for_commit_cache[cache_key] = (all_prs, now)
+    if len(_list_prs_for_commit_cache) > _LIST_PRS_FOR_COMMIT_CACHE_MAX:
+        cutoff = now - (_LIST_PRS_FOR_COMMIT_CACHE_TTL_S * 2)
+        for k in [
+            k
+            for k, (_, ts) in _list_prs_for_commit_cache.items()
+            if ts < cutoff
+        ]:
+            _list_prs_for_commit_cache.pop(k, None)
     return all_prs
 
 

@@ -221,11 +221,15 @@ async def get_check_runs(
         )
         if response.status_code != 200:
             logger.error(f"Failed to get check runs for {ref}: {response.text}")
+            # Tag as an API-error result so callers can skip caching it.
+            # This prevents a transient GitHub 5xx / rate-limit storm from
+            # poisoning the 30 s dedup window with a fake 'pending' verdict.
             return {
                 "status": "pending",
                 "conclusion": None,
                 "details": [],
                 "failed_logs": "",
+                "_from_api_error": True,
             }
 
         data = response.json()
@@ -365,7 +369,7 @@ async def get_check_runs(
                             )
                         got_logs = True
                         break
-                except Exception:
+                except Exception:  # noqa: BLE001
                     logger.exception(
                         f"[CI LOGS] Failed to fetch logs for check-run {name}"
                     )
@@ -387,7 +391,7 @@ async def get_check_runs(
                         path = ann.get("path", "")
                         line = ann.get("start_line", "")
                         log_lines.append(f"  [{name}] {path}:{line} — {msg}")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.exception(
                     f"[CI LOGS] Failed to fetch annotations for check-run {name}"
                 )
@@ -474,6 +478,14 @@ async def get_check_runs_cached(
         project_id=project_id,
         treat_missing_as_success=treat_missing_as_success,
     )
+    # Do NOT cache API-error results — ``get_check_runs`` tags them with
+    # ``_from_api_error=True`` when a non-200 response was received.  Caching
+    # them would poison the 30 s dedup window with a fake 'pending' verdict
+    # during GitHub 5xx / rate-limit storms, delaying CI-completion detection
+    # for every task watching that SHA.  The next call will retry the real
+    # lookup instead of serving a stale fake-pending.
+    if result.get("_from_api_error"):
+        return result
     _check_runs_cache[key] = (result, now)
     # Lazy eviction: when the dict gets oversized, drop anything older than
     # 2x TTL.  Cheap, avoids unbounded growth across long-lived processes.
