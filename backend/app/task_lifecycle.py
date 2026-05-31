@@ -872,6 +872,27 @@ async def _process_post_commit(
                             _memo_rec_exc,
                         )
 
+            # C5: release the cross-cutting safeguard merge gate when the
+            # safeguard task itself FAILS. The gate is released only on the
+            # security_audit COMPLETED branch (_handle_security_audit_completion),
+            # so a FAILED/reaped safeguard would otherwise leave orig.requires_
+            # approval=True forever — a permanent strand (services.py then 2h-
+            # timeout-FAILs the healthy parent, discarding merged siblings).
+            # Pass findings=None: a failed safeguard produced no blocker, so the
+            # gate releases (post-hoc review) rather than hanging indefinitely.
+            # _maybe_release_safeguard_gate no-ops for non-safeguard tasks.
+            if task.first_payload.get("type") == "security_audit":
+                try:
+                    from app.task_completion import _maybe_release_safeguard_gate
+
+                    await _maybe_release_safeguard_gate(task, None, session)
+                except Exception as _sg_exc:
+                    logger.warning(
+                        "[SAFEGUARD] Failed to release gate on FAILED safeguard %s: %r",
+                        task.id,
+                        _sg_exc,
+                    )
+
         # Anti-poisoning: resolve playbook entries the task wrote while
         # IN_PROGRESS. On COMPLETED, clear pending_source so peers can see
         # them. On FAILED/CANCELLED, drop them entirely so a task that

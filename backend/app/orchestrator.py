@@ -3018,6 +3018,20 @@ async def orchestrator_worker():
                     if ci_loop.get("merge_rule_blocked"):
                         await session.rollback()
                         continue  # Merge blocked by branch protection — requires manual intervention
+                    # C5: skip approval/safeguard-gated rows while the gate is set
+                    # (and gates are enabled). handle_ci_completion ->
+                    # _attempt_merge_with_retry_and_escalation now re-checks
+                    # requires_approval and refuses to merge, so polling a gated
+                    # row would just churn GitHub I/O every cycle for no progress.
+                    # The merge resumes once the safeguard/operator clears the flag
+                    # (which also re-arms ci_waiting). With gates OFF the flag is
+                    # advisory only, so do not skip. This is the orchestrator-side
+                    # half of the merge-call invariant (cluster C5 fix #2).
+                    if ci_task.requires_approval and _runtime_config.get(
+                        "require_approval_gates", True
+                    ):
+                        await session.rollback()
+                        continue
                     ci_pr_number = ci_loop.get("pr_number")
                     if not ci_pr_number:
                         await session.rollback()

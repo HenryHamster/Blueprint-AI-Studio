@@ -2042,46 +2042,113 @@ async def _check_and_trigger_rollup(
                     if parent.status != TaskStatus.EVALUATING:
                         return
 
+                    # C5 invariant: every requires_approval-set site below is
+                    # gated on require_approval_gates. With gates OFF the operator
+                    # has opted out of manual approval, so setting the flag would
+                    # only let services.py's 2h approval-gate timeout FAIL the
+                    # otherwise-healthy parent and discard already-merged siblings.
+                    # The two block classes have different gates-off behaviour:
+                    #   - scan-error (transient/non-deterministic): DEFER and retry
+                    #     next cycle — the scan may succeed on a re-run; never merge
+                    #     unscanned and never permanently block.
+                    #   - scan-blocked (deterministic injection finding): fall
+                    #     through to merge with a LOUD operator alert — re-blocking
+                    #     every cycle would be a permanent strand, and gates-off
+                    #     means the operator accepts auto-merge with post-hoc review.
+                    _gates_on = _runtime_config.get("require_approval_gates", True)
                     if rollup_scan_err is not None:
-                        parent.requires_approval = True
-                        parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}: {rollup_scan_err!r}"[
-                            :500
-                        ]
+                        if _gates_on:
+                            parent.requires_approval = True
+                            parent.latest_status_message = f"Rollup security scan failed — requires manual approval: {type(rollup_scan_err).__name__}: {rollup_scan_err!r}"[
+                                :500
+                            ]
+                            parent.context = {
+                                **parent_ctx,
+                                "rollup_pr_url": rollup_pr_url,
+                                "rollup_pr_number": rollup_pr_number,
+                            }
+                            session.add(parent)
+                            await _dispatch_rollup_approval_alert(
+                                parent,
+                                session,
+                                f"Rollup PR #{rollup_pr_number} security scan failed — requires manual approval: {type(rollup_scan_err).__name__}",
+                                pr_number=rollup_pr_number,
+                            )
+                            await session.commit()
+                            return
+                        # Gates off: defer to the next rollup cycle (the scan error
+                        # is transient; retrying is correct, blocking is not).
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} security scan failed "
+                            f"({type(rollup_scan_err).__name__}) and gates are off — "
+                            f"deferring to next cycle for re-scan (not blocking)"
+                        )
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — security scan failed "
+                            f"({type(rollup_scan_err).__name__}); retrying next cycle"
+                        )[:500]
                         parent.context = {
                             **parent_ctx,
                             "rollup_pr_url": rollup_pr_url,
                             "rollup_pr_number": rollup_pr_number,
                         }
                         session.add(parent)
-                        await _dispatch_rollup_approval_alert(
-                            parent,
-                            session,
-                            f"Rollup PR #{rollup_pr_number} security scan failed — requires manual approval: {type(rollup_scan_err).__name__}",
-                            pr_number=rollup_pr_number,
-                        )
                         await session.commit()
                         return
 
                     if rollup_scan["blocked"]:
-                        parent.requires_approval = True
-                        parent.latest_status_message = (
-                            f"Rollup security scan blocked: {rollup_scan['summary']}"
+                        if _gates_on:
+                            parent.requires_approval = True
+                            parent.latest_status_message = (
+                                f"Rollup security scan blocked: {rollup_scan['summary']}"
+                            )
+                            parent.context = {
+                                **parent_ctx,
+                                "rollup_pr_url": rollup_pr_url,
+                                "rollup_pr_number": rollup_pr_number,
+                            }
+                            # Persist + commit BEFORE the comment (releases lock for I/O).
+                            session.add(parent)
+                            await _dispatch_rollup_approval_alert(
+                                parent,
+                                session,
+                                f"Rollup PR #{rollup_pr_number} blocked by security scan: {rollup_scan['summary']}",
+                                pr_number=rollup_pr_number,
+                            )
+                            await session.commit()
+                            # Comment after the lock is released — it's an external side-effect.
+                            if rollup_scan["findings"]:
+                                try:
+                                    await create_pr_comment(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        rollup_pr_number,
+                                        rollup_scan["report"],
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}"
+                                    )
+                            return
+                        # Gates off: do NOT re-block every cycle. Fire a loud
+                        # operator alert (so the deterministic finding is visible)
+                        # and fall through to the auto-merge below. The scan report
+                        # is still posted to the PR for post-hoc review.
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} security scan BLOCKED "
+                            f"({rollup_scan['summary']}) but gates are off — alerting "
+                            f"and proceeding to merge (post-hoc review via PR comment)"
                         )
-                        parent.context = {
-                            **parent_ctx,
-                            "rollup_pr_url": rollup_pr_url,
-                            "rollup_pr_number": rollup_pr_number,
-                        }
-                        # Persist + commit BEFORE the comment (releases lock for I/O).
-                        session.add(parent)
                         await _dispatch_rollup_approval_alert(
                             parent,
                             session,
-                            f"Rollup PR #{rollup_pr_number} blocked by security scan: {rollup_scan['summary']}",
+                            f"Rollup PR #{rollup_pr_number} security scan flagged "
+                            f"({rollup_scan['summary']}) — auto-merging anyway "
+                            f"(require_approval_gates off); review post-hoc",
                             pr_number=rollup_pr_number,
                         )
                         await session.commit()
-                        # Comment after the lock is released — it's an external side-effect.
                         if rollup_scan["findings"]:
                             try:
                                 await create_pr_comment(
@@ -2095,7 +2162,19 @@ async def _check_and_trigger_rollup(
                                 logger.warning(
                                     f"[ROLLUP] Failed to post scan-block comment on PR #{rollup_pr_number}: {e}"
                                 )
-                        return
+                        # Re-acquire the parent lock dropped by the alert dispatch
+                        # path before falling through to the alembic guard + merge.
+                        parent = await _relock_parent(
+                            session,
+                            parent_id_local,
+                            pre_merge_snapshot,
+                            parent_in_session=parent,
+                        )
+                        if parent is None:
+                            return
+                        parent_ctx = parent.context or {}
+                        if parent.status != TaskStatus.EVALUATING:
+                            return
                     if rollup_scan["findings"]:
                         # Findings but not blocked — post comment outside lock window
                         # is fine; we don't mutate the parent for this case.
@@ -2126,7 +2205,18 @@ async def _check_and_trigger_rollup(
                         await session.commit()
                         return
                     if alembic_status == "block":
-                        parent.requires_approval = True
+                        # C5: gate the approval flag on require_approval_gates.
+                        # A broken combined migration chain is deterministic and
+                        # would break `alembic upgrade head` for the whole project,
+                        # so we must NOT auto-merge it regardless of the gate — but
+                        # with gates OFF we also must NOT set requires_approval
+                        # (services.py would 2h-timeout-FAIL the parent). Instead we
+                        # always spawn the re-chain fix below; gates-off relies on
+                        # that fix landing rather than on manual approval. The merge
+                        # is held either way (this branch returns before the merge).
+                        _gates_on = _runtime_config.get("require_approval_gates", True)
+                        if _gates_on:
+                            parent.requires_approval = True
                         parent.latest_status_message = (
                             f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
                             f"migration chain: {alembic_reason}"
@@ -2141,7 +2231,8 @@ async def _check_and_trigger_rollup(
                             parent,
                             session,
                             f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
-                            f"migration chain: {alembic_reason}",
+                            f"migration chain: {alembic_reason}"
+                            + ("" if _gates_on else " (gates off — re-chain fix spawned)"),
                             pr_number=rollup_pr_number,
                         )
                         await session.commit()

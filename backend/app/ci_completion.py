@@ -301,6 +301,32 @@ async def _attempt_merge_with_retry_and_escalation(
     from app.main import _maybe_create_failure_alert
     from app.models import Project
     from app.shared_state import get_project_integration_branch
+    from app.shared_state import runtime_config as _rt_cfg
+
+    # C5 invariant: the approval/safeguard gate is enforced AT the merge call,
+    # not just at the (point-in-time) set sites. Both gate flags can be set
+    # AFTER a task is parked ci_waiting (e.g. a cross-cutting safeguard spawns
+    # while CI is still pending), so the gate must be re-read here — the merge
+    # primitive is the single chokepoint every merge path funnels through
+    # (handle_ci_completion both-gates-met, the rollup gate-handoff, and the
+    # skip-review CI-wait park). With gates ON and requires_approval still set,
+    # do NOT merge: leave the task EVALUATING (caller commits) and return False.
+    # The orchestrator CI-poll loop skips requires_approval rows (added in the
+    # same change) so this does not busy-loop; the merge fires once the
+    # safeguard/operator clears the flag. With gates OFF the flag is advisory
+    # only (the set sites no longer set it), so we proceed.
+    if task.requires_approval and _rt_cfg.get("require_approval_gates", True):
+        _gate_pr = (task.context or {}).get("review_loop", {}).get("pr_number")
+        logger.info(
+            f"[CI] Merge held for PR #{_gate_pr} — task {str(task.id)[:8]} "
+            f"requires_approval (safeguard/approval gate still set); leaving "
+            f"EVALUATING, not merging"
+        )
+        task.latest_status_message = (
+            f"Merge gated — awaiting approval/safeguard for PR #{_gate_pr}"
+        )
+        session.add(task)
+        return False
 
     ci_loop = (task.context or {}).get("review_loop", {})
     ci_pr_number = ci_loop.get("pr_number")

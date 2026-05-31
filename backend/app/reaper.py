@@ -2461,6 +2461,21 @@ async def reaper_service():
                                             _streak,
                                         )
                                         del _orphan_reap_crash_streaks[_reap_key]
+                                        # C5: a quarantined (FAILED) safeguard must
+                                        # also release its cross-cutting merge gate,
+                                        # else orig.requires_approval is stranded
+                                        # forever. Runs on the same freshly-committed
+                                        # _qsession; no-ops for non-safeguard tasks.
+                                        if (_qtask.first_payload or {}).get(
+                                            "type"
+                                        ) == "security_audit":
+                                            from app.task_completion import (
+                                                _maybe_release_safeguard_gate,
+                                            )
+
+                                            await _maybe_release_safeguard_gate(
+                                                _qtask, None, _qsession
+                                            )
                             except Exception:
                                 logger.exception(
                                     "[REAPER] Failed to quarantine task %s", task_id
@@ -2623,6 +2638,43 @@ async def reaper_service():
                                     f"[PIPELINE] Failed to unblock dependents of {task.id}: {e}",
                                     exc_info=True,
                                 )
+
+                    # C5: release the cross-cutting safeguard merge gate when a
+                    # reaper-terminated safeguard task FAILS. The gate is otherwise
+                    # released only on the security_audit COMPLETED branch, so a
+                    # reaped safeguard (orphan-timeout, retries exhausted) would
+                    # leave orig.requires_approval=True forever — a permanent
+                    # strand that services.py then 2h-timeout-FAILs into a healthy
+                    # parent. Each release runs in its OWN session (mirrors the
+                    # dependent-unblock loop above and reaper Step 9
+                    # sweep_stuck_qualifications) so a failure here cannot poison
+                    # the shared reaper session. _maybe_release_safeguard_gate
+                    # no-ops for non-safeguard tasks; findings=None → release
+                    # (a reaped safeguard produced no blocker).
+                    for task in _post_reap_tasks:
+                        _mark_reaper_progress()
+                        if task.status != TaskStatus.FAILED:
+                            continue
+                        _t_payload = task.first_payload if task.payloads else {}
+                        if _t_payload.get("type") != "security_audit":
+                            continue
+                        try:
+                            from app.task_completion import (
+                                _maybe_release_safeguard_gate,
+                            )
+
+                            async with AsyncSessionLocal() as _sg_session:
+                                _sg_task = await _sg_session.get(Task, task.id)
+                                if _sg_task is not None:
+                                    await _maybe_release_safeguard_gate(
+                                        _sg_task, None, _sg_session
+                                    )
+                        except Exception as _sg_exc:  # noqa: BLE001
+                            logger.warning(
+                                f"[SAFEGUARD] Failed to release gate on reaped "
+                                f"safeguard {task.id}: {_sg_exc}",
+                                exc_info=True,
+                            )
 
                     # Close open PRs owned by terminally-failed fix tasks. When a
                     # fix exhausts retries, its PR stays OPEN on GitHub, and

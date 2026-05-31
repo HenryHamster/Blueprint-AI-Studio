@@ -1734,6 +1734,156 @@ async def test_rollup_security_scan_failure_dispatches_approval_alert(
     assert mock_dispatch.await_args.kwargs.get("pr_number") == 777
 
 
+# ---------------------------------------------------------------------------
+# Cluster C5 — gates-OFF must NOT approval-gate the parent (symptom a).
+# Pre-fix these set requires_approval unconditionally, so with gates off the
+# services.py 2h approval-gate timeout would FAIL the otherwise-healthy parent
+# and discard its already-merged siblings.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rollup_scan_failure_gates_off_defers_not_blocks(rollup_db, mocker):
+    """Transient scan error + gates OFF → defer to next cycle (no requires_approval,
+    no merge of unscanned code, no alert-storm)."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 5, "deletions": 5},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("scanner crashed"),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent12", child_risk=None
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is False, (
+        "gates off → scan error must not approval-gate the parent"
+    )
+    assert parent.status == TaskStatus.EVALUATING, "parent deferred, not failed"
+    assert "retrying next cycle" in (parent.latest_status_message or "").lower()
+    # Must not merge unscanned code on a transient error.
+    merge_mock.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rollup_scan_blocked_gates_off_alerts_and_merges(rollup_db, mocker):
+    """Deterministic scan block + gates OFF → loud operator alert, then fall
+    through to merge (post-hoc review). No requires_approval (no permanent
+    re-block every cycle)."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 5, "deletions": 5},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": True,
+            "summary": "injection found",
+            "findings": [],
+            "report": "",
+        },
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent12", child_risk=None
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is False, (
+        "gates off → scan block must not approval-gate (would re-block every cycle)"
+    )
+    mock_dispatch.assert_awaited_once()
+    # Gates off → fall through to merge after the alert. The merge firing (not
+    # the parent's final status, which follows the normal merged-intermediate
+    # path) is what proves the scan block no longer hard-stops the rollup.
+    merge_mock.assert_awaited()
+    assert parent.status != TaskStatus.FAILED, (
+        "gates off → scan block must not FAIL the parent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_scan_blocked_gates_on_still_approval_gates(rollup_db, mocker):
+    """Control: with gates ON the deterministic scan block still approval-gates
+    the parent (intended behaviour preserved)."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": True}
+    )
+    _patch_common_rollup_mocks(mocker)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 5, "deletions": 5},
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": True,
+            "summary": "injection found",
+            "findings": [],
+            "report": "",
+        },
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mock_dispatch = mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent12", child_risk=None
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    await rollup_db.refresh(parent)
+    assert parent.requires_approval is True
+    # Gates on → the block holds the merge.
+    merge_mock.assert_not_called()
+    mock_dispatch.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
     """The helper creates an Alert row and fires an APPROVAL_NEEDED notification."""

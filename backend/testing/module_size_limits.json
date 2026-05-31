@@ -37,7 +37,7 @@
     "research_completion.py": 2850,
     "findings_index.py": 350,
     "strategic_completion.py": 3200,
-    "rollup_management.py": 3250,
+    "rollup_management.py": 3300,
     "rollup_migration_validation.py": 600,
     "reaper.py": 4200,
     "reaper_sweeps.py": 550,
@@ -85,7 +85,7 @@
     "failure_classification.py": 2400,
     "notification_dispatch.py": 2250,
     "regression_signal_evaluators.py": 2000,
-    "ci_completion.py": 1700
+    "ci_completion.py": 1750
   },
   "agent": {
     "index.ts": 4600,

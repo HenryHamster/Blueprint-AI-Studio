@@ -5441,3 +5441,97 @@ async def test_post_commit_strategic_backstop_raise_does_not_500(tl_db, mocker):
     result = await _process_post_commit(task.id, payload, _session_factory=factory)
     assert result["status"] == "received"
     assert captured["session"] is not session
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cluster C5 — FAILED safeguard releases the cross-cutting merge gate.
+# Pre-fix: the gate was released ONLY on the security_audit COMPLETED branch
+# (_handle_security_audit_completion), so a FAILED/reaped safeguard left
+# orig.requires_approval=True forever — a permanent strand that the services.py
+# 2h approval-gate timeout then turns into a FAILED parent (discarding merged
+# siblings). _process_post_commit's FAILED branch must now release the gate.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_post_commit_failed_safeguard_releases_merge_gate(tl_db, mocker):
+    """A safeguard (security_audit) task that FAILS must clear the merge gate on
+    its orig — proving the FAILED post-commit path wires in
+    _maybe_release_safeguard_gate. This test FAILS against the pre-fix code,
+    where the orig stayed requires_approval=True forever."""
+    session, factory = tl_db
+
+    project = await _make_project(session)
+    # The gated original task — EVALUATING, merge held on the safeguard.
+    orig = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.EVALUATING,
+        context={"review_loop": {"review_approved": True}},
+    )
+    orig.requires_approval = True
+    session.add(orig)
+    await session.commit()
+    await session.refresh(orig)
+
+    # The safeguard task, reported FAILED by the agent.
+    safeguard = await _make_task(
+        session,
+        project.id,
+        task_type="security_audit",
+        status=TaskStatus.FAILED,
+        parent_task_id=orig.id,
+        context={
+            "safeguard_for_task_id": str(orig.id),
+            "safeguard_pr_number": 4242,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=safeguard.id, status=TaskStatus.FAILED)
+    await _process_post_commit(safeguard.id, payload, _session_factory=factory)
+
+    # Re-fetch the orig from a fresh session to assert the gate was released.
+    async with factory() as verify_session:
+        refetched_orig = (
+            await verify_session.execute(select(Task).where(Task.id == orig.id))
+        ).scalars().first()
+
+    assert refetched_orig is not None
+    assert refetched_orig.requires_approval is False, (
+        "FAILED safeguard must release the merge gate, not strand it forever"
+    )
+    # EVALUATING orig is re-armed for the CI loop (ci_waiting handoff).
+    assert (
+        (refetched_orig.context or {}).get("review_loop", {}).get("ci_waiting") is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_commit_failed_non_safeguard_does_not_touch_gate(tl_db, mocker):
+    """Control: a FAILED non-safeguard task must not invoke the gate release
+    (no orig context → no-op). Guards against over-broad wiring."""
+    session, factory = tl_db
+
+    project = await _make_project(session)
+    # A normal create task that fails — carries no safeguard_for_task_id.
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    # If the release helper were called for a non-safeguard task it would no-op,
+    # but assert it's never even invoked for a non-security_audit type.
+    spy = mocker.patch(
+        "app.task_completion._maybe_release_safeguard_gate",
+        new_callable=AsyncMock,
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    spy.assert_not_awaited()

@@ -1089,6 +1089,22 @@ async def maybe_spawn_cross_cutting_safeguard(
     ctx = orig.context or {}
     if ctx.get("safeguard_task_id"):
         return False
+    # C5 invariant: the safeguard gate is a *merge-approval* gate — it sets
+    # orig.requires_approval=True and relies on the safeguard's completion to
+    # release it. With require_approval_gates OFF the operator has opted out of
+    # manual merge gating, so spawning the safeguard would (a) burn a VM that
+    # gates nothing actionable and (b) set requires_approval, which services.py's
+    # 2h approval-gate timeout would then use to FAIL the otherwise-healthy
+    # parent (discarding merged siblings) if the safeguard ever FAILED/reaped.
+    # Early-return so no VM is wasted and no flag is set. (Gates the spawn
+    # *and* the requires_approval set in one place — the invariant the whole
+    # cluster turns on.)
+    if not _runtime_config.get("require_approval_gates", True):
+        logger.info(
+            f"[PIPELINE] Cross-cutting safeguard skipped for orig {orig.id} "
+            f"(require_approval_gates off — no merge gate to enforce)"
+        )
+        return False
     is_cross, reason = _is_cross_cutting_pr(orig)
     if not is_cross:
         return False

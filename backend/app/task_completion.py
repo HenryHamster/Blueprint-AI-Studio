@@ -1010,12 +1010,20 @@ async def _ensure_branch(
 async def _maybe_release_safeguard_gate(
     safeguard_task: Task, findings: list | None, session: AsyncSession
 ) -> None:
-    """Release or maintain the cross-cutting merge gate when a safeguard audit completes.
+    """Release or maintain the cross-cutting merge gate when a safeguard audit terminates.
 
     No-ops immediately if the task is not a safeguard (no safeguard_for_task_id in context).
     Releases the gate (clears orig.requires_approval) when no critical/high findings exist.
-    If the original task is already EVALUATING (review approved while safeguard was pending),
-    sets review_loop.ci_waiting=True so the orchestrator's CI loop attempts the merge.
+    Called on every TERMINAL safeguard path — COMPLETED (with parsed findings) AND
+    FAILED/reaped (findings=None) — so the gate cannot be permanently stranded (cluster C5).
+
+    Re-arm behaviour after clearing the flag:
+      - orig EVALUATING (review approved while safeguard was pending): set
+        review_loop.ci_waiting=True so the orchestrator's CI loop attempts the merge.
+      - orig already COMPLETED (the safeguard outlived orig's lifecycle): clearing
+        the flag alone leaves the open PR stranded forever — nothing re-attempts the
+        merge. Fire the merge directly here, guarded by an idempotency flag
+        (_safeguard_merge_fired) so a re-run / concurrent path cannot double-merge.
     """
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
@@ -1042,6 +1050,7 @@ async def _maybe_release_safeguard_gate(
     orig.requires_approval = False
     pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
     orig_ctx = dict(orig.context or {})
+    _fire_completed_orig_merge = False
     if orig.status == TaskStatus.EVALUATING and pr_num:
         # Review already approved while safeguard was pending; hand off to CI polling loop.
         orig_ctx["review_loop"] = {
@@ -1051,12 +1060,67 @@ async def _maybe_release_safeguard_gate(
         }
         orig.context = orig_ctx
         flag_modified(orig, "context")
+    elif (
+        orig.status == TaskStatus.COMPLETED
+        and pr_num
+        and not orig_ctx.get("_safeguard_merge_fired")
+    ):
+        # orig already terminalized — clearing the flag re-arms nothing, so the
+        # open PR would strand forever. Mark the idempotency flag now (persisted
+        # with the gate-clear commit) and fire the merge AFTER the commit, below.
+        orig_ctx["_safeguard_merge_fired"] = True
+        orig.context = orig_ctx
+        flag_modified(orig, "context")
+        _fire_completed_orig_merge = True
     orig.latest_status_message = (
         f"Cross-cutting safeguard passed — merge gate released (PR #{pr_num})"
     )
     session.add(orig)
     await session.commit()
     logger.info(f"[SAFEGUARD] Gate released on {safeguard_for_id[:8]} for PR #{pr_num}")
+
+    if _fire_completed_orig_merge:
+        # Best-effort: fire the held merge for the already-COMPLETED orig. The
+        # idempotency flag was committed above, so even if this raises the merge
+        # is never re-attempted from here (avoids a double-merge loop); a manual
+        # re-arm is then the operator's call. Merge only if the PR is still open.
+        from app.github import (  # noqa: PLC0415
+            get_pull_request,
+            merge_pull_request,
+        )
+
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+            _pr = await get_pull_request(gh_token, owner, repo, int(pr_num))
+            if _pr.get("merged"):
+                logger.info(
+                    f"[SAFEGUARD] PR #{pr_num} already merged — no action (orig "
+                    f"{safeguard_for_id[:8]})"
+                )
+            elif (_pr.get("state") or "open") != "open":
+                logger.info(
+                    f"[SAFEGUARD] PR #{pr_num} not open (state={_pr.get('state')}) "
+                    f"— skipping post-gate merge (orig {safeguard_for_id[:8]})"
+                )
+            else:
+                _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
+                if _res.get("merged"):
+                    logger.info(
+                        f"[SAFEGUARD] Fired held merge for COMPLETED orig "
+                        f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"
+                    )
+                else:
+                    logger.warning(
+                        f"[SAFEGUARD] Post-gate merge of PR #{pr_num} (orig "
+                        f"{safeguard_for_id[:8]}) did not merge: "
+                        f"{_res.get('message', 'unknown')}"
+                    )
+        except Exception as _merge_exc:  # noqa: BLE001
+            logger.warning(
+                f"[SAFEGUARD] Post-gate merge attempt for PR #{pr_num} (orig "
+                f"{safeguard_for_id[:8]}) failed: {_merge_exc}",
+                exc_info=True,
+            )
 
 
 async def _handle_security_audit_completion(
