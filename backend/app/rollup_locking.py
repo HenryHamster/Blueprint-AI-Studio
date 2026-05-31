@@ -7,8 +7,12 @@ sentinel that guards against peer mutation during the unlocked GitHub I/O
 window.
 """
 
+import asyncio
+import contextlib
 import logging
+import uuid
 
+from sqlalchemy import text
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
@@ -17,6 +21,200 @@ from sqlmodel import select
 from app.models import Task
 
 logger = logging.getLogger(__name__)
+
+
+class _OriginalTaskLockTimeout(Exception):
+    """Raised by ``_lock_original_task(skip_locked=False)`` when a BLOCKING
+    FOR UPDATE cannot acquire the row within the bounded ``lock_timeout``.
+
+    Only the merge-success caller blocks; it catches this to log LOUDLY and
+    leave a recoverable trail rather than silently dropping its one-shot
+    side effects (back-merge, security rescan, remediation outcome, etc.).
+    """
+
+
+async def _lock_original_task(
+    session: AsyncSession,
+    original_task_id: str | uuid.UUID,
+    *,
+    attempts: int = 3,
+    cached_task: Task | None = None,
+    source: str = "",
+    skip_locked: bool = True,
+    lock_timeout_ms: int = 8000,
+) -> Task | None:
+    """Acquire FOR UPDATE on the rollup-parent / original task.
+
+    Single home for the bounded-retry row-lock loop that the review/merge
+    sibling handlers in ``task_lifecycle`` each re-implemented (the four
+    copies the C4 audit cites: the rollup-handoff path, the empty-PR cleanup,
+    the ci_wait reset, and — formerly an unlocked ``session.get`` — the
+    merge-success ``orig`` transition).
+
+    Two lock disciplines, selected by ``skip_locked``:
+
+      * ``skip_locked=True`` (DEFAULT — sweep / recovery / handoff callers):
+        ``with_for_update(skip_locked=True)`` + bounded retry. Returns
+        ``None`` when the row is held by a peer for all ``attempts`` so the
+        caller DEFERS — the parent's own poll picks the state up next cycle.
+        These callers' work is idempotent / re-driven next cycle, so yielding
+        to a peer is correct and cheap.
+
+      * ``skip_locked=False`` (MERGE-SUCCESS caller only): the merge has
+        ALREADY succeeded on GitHub, so the ``orig`` bookkeeping carries
+        ONE-SHOT side effects (hotfix back-merge, security rescan spawn,
+        remediation-outcome record + webhook, review-playbook extraction,
+        regression-case advancement, post-merge smoketest) with NO retry
+        path — if we skip them they are dropped permanently. Yielding to a
+        peer here is wrong. Instead we BLOCK on FOR UPDATE, bounded by a
+        ``SET LOCAL lock_timeout`` (``lock_timeout_ms``) so we never hang
+        indefinitely. On a genuine (rare) timeout we raise
+        ``_OriginalTaskLockTimeout`` for the caller to log loudly + leave a
+        recoverable trail. ``attempts`` is honoured as a bounded retry on
+        the timeout (a peer's hold is brief — usually the EVALUATING→terminal
+        write — so a short re-block typically succeeds).
+
+    Why this exists / what it prevents (C4):
+      - The merge-success orig fetch used a bare ``session.get`` with no row
+        lock, so the COMPLETED transition raced ``ci_completion`` mutating
+        the SAME parent under EVALUATING. Locking removes that race.
+      - The retry loops were byte-identical; one helper keeps them symmetric
+        so a future fix lands in one place.
+
+    Behaviour:
+      - Returns the locked ``Task`` if the row was acquired.
+      - ``skip_locked=True``: returns ``None`` when the row is held by a peer
+        for all ``attempts`` (caller DEFERS) OR when the task genuinely no
+        longer exists.
+      - ``skip_locked=False``: blocks (bounded) until acquired; returns
+        ``None`` only when the task genuinely no longer exists; raises
+        ``_OriginalTaskLockTimeout`` if the bounded wait elapses.
+      - ``cached_task``: if the caller already holds a (possibly stale)
+        instance of this row in ``session``, pass it so we ``session.expire``
+        it before the FOR-UPDATE re-SELECT. ``populate_existing`` alone has
+        been observed unreliable under async + ``with_for_update(skip_locked
+        =True)`` (see ``_relock_parent``); expiring first guarantees the
+        re-SELECT cannot return stale identity-map attributes.
+    """
+    if isinstance(original_task_id, str):
+        original_task_id = uuid.UUID(original_task_id)
+    if cached_task is not None:
+        try:
+            session.expire(cached_task)
+        except InvalidRequestError:
+            session.expire_all()
+
+    if not skip_locked:
+        return await _lock_original_task_blocking(
+            session,
+            original_task_id,
+            attempts=attempts,
+            source=source,
+            lock_timeout_ms=lock_timeout_ms,
+        )
+
+    orig: Task | None = None
+    for _attempt in range(attempts):
+        stmt = (
+            select(Task)
+            .where(Task.id == original_task_id)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        orig = (await session.execute(stmt)).scalars().first()
+        if orig is not None:
+            return orig
+        # Row not returned: either held by a peer (skip_locked) or gone.
+        # Distinguish so we don't keep retrying a deleted row.
+        exists = (
+            await session.execute(
+                select(Task.id).where(Task.id == original_task_id)
+            )
+        ).first()
+        if exists is None:
+            return None  # Genuinely missing — no point retrying.
+        if _attempt < attempts - 1:
+            await asyncio.sleep(0.5 * (_attempt + 1))
+    logger.info(
+        "[ROLLUP] _lock_original_task: parent %s held by peer after %d attempts "
+        "— deferring%s",
+        original_task_id,
+        attempts,
+        f" ({source})" if source else "",
+    )
+    return None
+
+
+async def _lock_original_task_blocking(
+    session: AsyncSession,
+    original_task_id: uuid.UUID,
+    *,
+    attempts: int,
+    source: str,
+    lock_timeout_ms: int,
+) -> Task | None:
+    """BLOCKING FOR UPDATE acquire, bounded by ``SET LOCAL lock_timeout``.
+
+    Used by the merge-success caller (see ``_lock_original_task`` docstring):
+    the merge already landed on GitHub, so the one-shot ``orig`` bookkeeping
+    must run — we must NOT yield to a peer. A peer's hold on this row is brief
+    (its own EVALUATING→terminal write), so blocking for a few seconds then
+    succeeding is the correct trade. ``lock_timeout`` caps the wait so a stuck
+    peer can never produce an unbounded hang. Raises ``_OriginalTaskLockTimeout``
+    after ``attempts`` bounded blocks all time out.
+
+    SQLite (test DB) has no ``SET LOCAL lock_timeout`` and no real row-level
+    write-lock contention, so on a non-Postgres dialect we just issue a plain
+    blocking FOR UPDATE (which returns immediately there).
+    """
+    is_pg = bool(session.bind) and session.bind.dialect.name == "postgresql"
+    last_exc: Exception | None = None
+    for _attempt in range(max(1, attempts)):
+        try:
+            if is_pg:
+                # SET LOCAL reverts on the transaction's commit/rollback. Bound
+                # the wait so a wedged peer can't hang this handler forever.
+                # NB: SET is a utility statement — Postgres/asyncpg reject bind
+                # parameters here ("syntax error at or near $1"), so the value
+                # MUST be inlined. lock_timeout_ms is an int we control (never
+                # user input), so int() coercion makes the interpolation safe.
+                await session.execute(
+                    text(f"SET LOCAL lock_timeout = '{int(lock_timeout_ms)}'")
+                )
+            stmt = (
+                select(Task)
+                .where(Task.id == original_task_id)
+                .with_for_update()  # BLOCKING — no skip_locked
+                .execution_options(populate_existing=True)
+            )
+            orig = (await session.execute(stmt)).scalars().first()
+            if orig is not None:
+                return orig
+            # Row not returned by a BLOCKING lock means it's genuinely gone
+            # (a blocking FOR UPDATE never skips a held row).
+            return None
+        except Exception as exc:  # noqa: BLE001, PERF203
+            # On Postgres a lock_timeout surfaces as LockNotAvailableError
+            # (sqlstate 55P03), wrapped by SQLAlchemy. The aborted statement
+            # leaves the transaction in a failed state, so roll back before
+            # retrying the bounded block.
+            last_exc = exc
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            if _attempt < max(1, attempts) - 1:
+                await asyncio.sleep(0.5 * (_attempt + 1))
+    logger.error(
+        "[ROLLUP] _lock_original_task(blocking): parent %s still locked after "
+        "%d bounded attempts (lock_timeout=%dms)%s — the merge ALREADY landed; "
+        "one-shot post-merge effects (back-merge / rescan / remediation outcome) "
+        "are deferred to recovery, NOT dropped silently: %r",
+        original_task_id,
+        attempts,
+        lock_timeout_ms,
+        f" ({source})" if source else "",
+        last_exc,
+    )
+    raise _OriginalTaskLockTimeout(str(original_task_id))
 
 
 class _ParentMutatedDuringPRCreation(Exception):

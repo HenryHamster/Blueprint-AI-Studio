@@ -1645,18 +1645,53 @@ async def _check_and_trigger_rollup(
                             )
                             return
                         if pr_state.get("state") == "closed":
-                            logger.warning(
-                                f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry"
-                            )
-                            parent.context = {
-                                k: v
-                                for k, v in parent_ctx.items()
-                                if k not in ("rollup_pr_number", "rollup_pr_url")
-                            }
-                            parent_ctx = parent.context
-                            existing_pr = None
-                            session.add(parent)
-                            await session.commit()
+                            # C4 (4th same-class site): a closed-not-merged
+                            # rollup PR may be a TRANSIENT self-close from the
+                            # orchestrator's mergeability-reset loop (close+reopen
+                            # to force GitHub to recompute mergeable=None — see
+                            # orchestrator.py's CI poll). The orchestrator records
+                            # its own reset window via review_loop.pending_reopen
+                            # on THIS parent (the rollup PR's review_loop, seeded
+                            # at the large-rollup → review handoff). Clearing the
+                            # rollup_pr_number/rollup_pr_url markers during that
+                            # window strands the parent into re-creating a
+                            # DUPLICATE rollup PR next cycle. Mirror the other
+                            # three handlers: only treat closed as abandoned when
+                            # there is NO pending_reopen reset marker; during the
+                            # reset window DEFER and leave the markers intact so
+                            # the reopen completes and the resume path retries.
+                            _parent_loop = parent_ctx.get("review_loop", {}) or {}
+                            if _parent_loop.get("pending_reopen"):
+                                logger.info(
+                                    f"[ROLLUP] PR #{existing_pr} closed-not-merged with "
+                                    f"pending_reopen set — transient mergeability-reset, "
+                                    f"deferring (markers preserved, will retry next cycle)"
+                                )
+                                # Leave markers intact; do NOT clear, do NOT create
+                                # a duplicate. Return so we don't re-process a
+                                # momentarily-closed PR (re-scan / re-spawn review)
+                                # this cycle — the orchestrator's reopen lands and
+                                # the next rollup sweep resumes with the same PR.
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{existing_pr} mergeability-reset in "
+                                    f"progress (closed/reopen) — deferring"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                return
+                            else:
+                                logger.warning(
+                                    f"[ROLLUP] PR #{existing_pr} was closed without merge — clearing marker, will retry"
+                                )
+                                parent.context = {
+                                    k: v
+                                    for k, v in parent_ctx.items()
+                                    if k not in ("rollup_pr_number", "rollup_pr_url")
+                                }
+                                parent_ctx = parent.context
+                                existing_pr = None
+                                session.add(parent)
+                                await session.commit()
 
                 if existing_pr:
                     rollup_pr_number = existing_pr

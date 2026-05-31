@@ -1239,10 +1239,17 @@ async def test_already_merged_pr_completes_task(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_closed_pr_state_also_completes_task(db_session, mocker):
-    """
-    When get_pull_request shows state='closed' (even if merged=False),
-    treat it as already handled and complete the task.
+async def test_closed_not_merged_no_marker_defers_not_completes(db_session, mocker):
+    """C4 regression: a closed-but-NOT-merged PR with NO deliberate self-close
+    marker must NOT be treated as a success-close.
+
+    Pre-fix the gate fired on ``state == 'closed'`` regardless of ``merged``,
+    so a transient orchestrator mergeability-reset (close+reopen) that briefly
+    showed closed-not-merged was marked COMPLETED + pr_closed_success — falsely
+    succeeding an unmerged rollup that _verify_pr_merged then cemented.
+
+    Corrected behavior: defer (return False), leave the parent EVALUATING for
+    _verify_pr_merged to classify (genuine rejection vs. transient reset).
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
@@ -1271,9 +1278,90 @@ async def test_closed_pr_state_also_completes_task(db_session, mocker):
         task, "fake-token", "owner", "repo", db_session, source="webhook"
     )
 
-    assert result is True, (
-        "Closed PR (state=closed) should be treated as already handled"
+    assert result is False, (
+        "Closed-not-merged with no self-close marker must NOT be a success-close"
     )
+    assert task.status == TaskStatus.EVALUATING, (
+        "Parent must stay EVALUATING for _verify_pr_merged to classify"
+    )
+    assert not (task.context or {}).get("pr_closed_success"), (
+        "Must not falsely stamp pr_closed_success on an unmerged closed PR"
+    )
+
+
+@pytest.mark.asyncio
+async def test_closed_not_merged_pending_reopen_defers(db_session, mocker):
+    """C4: a closed-not-merged PR with review_loop.pending_reopen=True is OUR
+    own mergeability-reset window — defer (return False), do not complete."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "conflict"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "closed"},
+    )
+
+    project = Project(name="Closed PR pending_reopen", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={"pending_reopen": True})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    assert task.status == TaskStatus.EVALUATING
+    assert not (task.context or {}).get("pr_closed_success")
+
+
+@pytest.mark.asyncio
+async def test_closed_not_merged_with_success_marker_completes(db_session, mocker):
+    """C4: a closed-not-merged PR WITH an explicit deliberate-close marker
+    (pr_closed_success) IS a genuine success-close (work landed via a sibling
+    PR) and completes the task."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "conflict"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "closed"},
+    )
+
+    project = Project(name="Closed PR success marker", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    # Stamp the deliberate-close marker the way ci_completion / review pipeline
+    # would when the same change merged via a sibling PR.
+    task.context = {**(task.context or {}), "pr_closed_success": True}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is True, "Deliberate success-close marker completes the task"
     assert task.status == TaskStatus.COMPLETED
 
 

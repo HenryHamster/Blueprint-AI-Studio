@@ -48,6 +48,7 @@ from app.review_pipeline import (
 )
 from app.failure_classification import classify_failure
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
+from app.rollup_locking import _lock_original_task, _OriginalTaskLockTimeout
 from app.notification_dispatch import (
     is_residual_remediation_task,
     post_remediation_result_message,
@@ -1614,7 +1615,18 @@ async def _process_post_commit(
                     await session.commit()
                     return {"status": "accepted"}
 
-                # Early exit: skip review pipeline if PR is already merged or closed
+                # Early exit: skip only when the PR is genuinely merged/done.
+                # C4: this MUST gate on merged==True, NOT on state=='closed'.
+                # A non-merged 'closed' state may be a transient self-close
+                # from the orchestrator's mergeability-reset loop (close+reopen
+                # to force GitHub to recompute mergeable=None — see
+                # orchestrator.py close/reopen nudge). Treating that transient
+                # closed window as "review skipped" silently DROPS the
+                # review_approved handoff to the parent, stranding the rollup
+                # in EVALUATING until the 60-min/6h backstop fires. Gating on
+                # merged only — and falling through on closed-not-merged so the
+                # review verdict still reaches the parent — mirrors the fix
+                # handler's already-corrected pattern (PR #5662).
                 try:
                     (
                         gh_token_check,
@@ -1624,20 +1636,25 @@ async def _process_post_commit(
                     pr_data_check = await get_pull_request(
                         gh_token_check, owner_check, repo_check, pr_number
                     )
-                    pr_state = pr_data_check.get("state", "open")
-                    if pr_state == "closed" or pr_data_check.get("merged"):
-                        merged_label = (
-                            "merged" if pr_data_check.get("merged") else "closed"
-                        )
+                    if pr_data_check.get("merged"):
                         logger.info(
-                            f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping review pipeline for task {task.id}"
+                            f"[REVIEW PIPELINE] PR #{pr_number} already merged — skipping review pipeline for task {task.id}"
                         )
                         task.latest_status_message = (
-                            f"PR #{pr_number} already {merged_label} — review skipped"
+                            f"PR #{pr_number} already merged — review skipped"
                         )
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
+                    if pr_data_check.get("state") == "closed":
+                        # Closed but not merged — could be a transient
+                        # mergeability-reset. Proceed with the review so the
+                        # review_approved handoff is preserved; the merge gate
+                        # handles a genuinely abandoned PR gracefully.
+                        logger.info(
+                            f"[REVIEW PIPELINE] PR #{pr_number} is closed (not merged) for task {task.id} — "
+                            f"may be a transient mergeability-reset; proceeding with review"
+                        )
                 except Exception as e:
                     logger.info(
                         f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding with review"
@@ -1981,30 +1998,11 @@ async def _process_post_commit(
                                 # task row is held by a peer, defer the handoff —
                                 # the parent's own poll will pick up review_approved
                                 # on the next iteration once the lock clears.
-                                _orig = None
-                                for _attempt in range(3):
-                                    _orig_q = (
-                                        select(Task)
-                                        .where(Task.id == uuid.UUID(original_task_id))
-                                        .with_for_update(skip_locked=True)
-                                    )
-                                    _orig = (
-                                        (await session.execute(_orig_q))
-                                        .scalars()
-                                        .first()
-                                    )
-                                    if _orig is not None:
-                                        break
-                                    _orig_exists = (
-                                        await session.execute(
-                                            select(Task.id).where(
-                                                Task.id == uuid.UUID(original_task_id)
-                                            )
-                                        )
-                                    ).first()
-                                    if _orig_exists is None:
-                                        break  # Genuinely missing
-                                    await asyncio.sleep(0.5 * (_attempt + 1))
+                                _orig = await _lock_original_task(
+                                    session,
+                                    original_task_id,
+                                    source="review_rollup_handoff",
+                                )
                                 # Re-read the loop from the locked row — peer may
                                 # have flipped ci_waiting in the gap between the
                                 # peek and the lock acquisition.
@@ -2357,8 +2355,36 @@ async def _process_post_commit(
                             # Mark original create task so dependents can proceed
                             if original_task_id:
                                 try:
-                                    orig = await session.get(
-                                        Task, uuid.UUID(original_task_id)
+                                    # C4: the orig (rollup parent) was previously
+                                    # fetched via an UNLOCKED session.get, then
+                                    # transitioned EVALUATING→COMPLETED and
+                                    # committed on this shared session — racing
+                                    # ci_completion, which mutates the SAME parent
+                                    # guarded by status==EVALUATING. Two writers,
+                                    # no row lock → lost-update / false-success.
+                                    #
+                                    # The merge has ALREADY succeeded on GitHub, so
+                                    # the orig bookkeeping below carries ONE-SHOT
+                                    # side effects with NO retry path: hotfix
+                                    # back-merge (a missed back-merge breaks the
+                                    # next promotion), security-fix rescan spawn,
+                                    # remediation-outcome record + result message +
+                                    # webhook, review-playbook extraction,
+                                    # regression-case advancement, post-merge
+                                    # smoketest. A skip_locked DEFER here would skip
+                                    # the entire `if orig:` block and drop all of
+                                    # them permanently. So we BLOCK on FOR UPDATE
+                                    # (skip_locked=False) — bounded by a SET LOCAL
+                                    # lock_timeout so we never hang — and the
+                                    # peer's brief EVALUATING→terminal hold clears,
+                                    # after which the one-shot effects run. On a
+                                    # genuine (rare) timeout we log loudly + leave a
+                                    # recoverable trail (below), never silently drop.
+                                    orig = await _lock_original_task(
+                                        session,
+                                        original_task_id,
+                                        source="review_merge_success",
+                                        skip_locked=False,
                                     )
                                     if orig:
                                         orig.context = {
@@ -2373,7 +2399,13 @@ async def _process_post_commit(
                                                 _orig_project
                                             )
                                         )
-                                        # If this was a rollup PR review, mark the parent as COMPLETED
+                                        # If this was a rollup PR review, mark the
+                                        # parent COMPLETED — but only if it is STILL
+                                        # EVALUATING after the relock. A peer (e.g.
+                                        # ci_completion / reaper) may have already
+                                        # terminalized it during the merge window;
+                                        # COMPLETED is irreversible, so we must not
+                                        # overwrite a peer's terminal transition.
                                         is_rollup_merge = (
                                             orig.status == TaskStatus.EVALUATING
                                         )
@@ -2779,6 +2811,97 @@ async def _process_post_commit(
                                                 logger.info(
                                                     f"[SECURITY RESCAN] Failed to spawn security rescan: {e}"
                                                 )
+                                except _OriginalTaskLockTimeout:
+                                    # C4 fix B: the BLOCKING FOR UPDATE on the
+                                    # rollup parent hit its bounded lock_timeout —
+                                    # a peer held the row past the wait. The merge
+                                    # ALREADY landed on GitHub, so the one-shot
+                                    # post-merge effects above could not run. Do NOT
+                                    # silently drop them: leave a durable, visible,
+                                    # recoverable trail. The shared session is in a
+                                    # rolled-back state after the timeout, so use a
+                                    # FRESH independent session.
+                                    logger.error(  # noqa: TRY400 — lock_timeout is not a code fault; the traceback adds noise, the message + recovery marker are the signal
+                                        "[REVIEW PIPELINE] C4: lock_timeout acquiring "
+                                        "rollup parent %s after merging PR #%s — "
+                                        "post-merge one-shots (back-merge / rescan / "
+                                        "remediation outcome / playbook / smoketest) "
+                                        "DEFERRED to recovery, not dropped. Marking "
+                                        "parent with _post_merge_effects_deferred + "
+                                        "operator alert.",
+                                        original_task_id,
+                                        pr_number,
+                                    )
+                                    try:
+                                        from app.main import (
+                                            _maybe_create_failure_alert,
+                                        )
+
+                                        async with AsyncSessionLocal() as _rec:
+                                            _orig_rec = await _rec.get(
+                                                Task, uuid.UUID(original_task_id)
+                                            )
+                                            if _orig_rec is not None:
+                                                _rec_ctx = dict(
+                                                    _orig_rec.context or {}
+                                                )
+                                                _rec_ctx[
+                                                    "_post_merge_effects_deferred"
+                                                ] = {
+                                                    "pr_number": pr_number,
+                                                    "review_task_id": str(task.id),
+                                                    "deferred_at": _utcnow().isoformat(),
+                                                    "reason": "lock_timeout acquiring "
+                                                    "parent FOR UPDATE during "
+                                                    "merge-success bookkeeping",
+                                                }
+                                                _orig_rec.context = _rec_ctx
+                                                from sqlalchemy.orm.attributes import (
+                                                    flag_modified as _fm,
+                                                )
+
+                                                _fm(_orig_rec, "context")
+                                                _rec.add(_orig_rec)
+                                                await _maybe_create_failure_alert(
+                                                    _orig_rec,
+                                                    _rec,
+                                                    f"PR #{pr_number} merged but the "
+                                                    f"rollup parent row was locked past "
+                                                    f"the bounded wait — post-merge "
+                                                    f"effects (hotfix back-merge / "
+                                                    f"security rescan / remediation "
+                                                    f"outcome) are deferred and need a "
+                                                    f"re-drive or manual check.",
+                                                )
+                                                await _rec.commit()
+                                    except Exception as _rec_exc:
+                                        logger.error(
+                                            "[REVIEW PIPELINE] C4: failed to persist "
+                                            "deferred-effects trail for parent %s "
+                                            "(PR #%s merged): %r",
+                                            original_task_id,
+                                            pr_number,
+                                            _rec_exc,
+                                            exc_info=True,
+                                        )
+                                    # The bounded blocking lock rolled the SHARED
+                                    # session back (an aborted FOR UPDATE leaves the
+                                    # tx in PendingRollback), which EXPIRED the
+                                    # `task` ORM instance. Downstream post-handler
+                                    # sections (rollup check, direction outcomes,
+                                    # terminal records, final commit) read
+                                    # ``task.<attr>`` on this same session — an
+                                    # expired attribute access would sync lazy-load
+                                    # → MissingGreenlet. Re-fetch by stable id so the
+                                    # rest of _process_post_commit runs clean.
+                                    with contextlib.suppress(Exception):
+                                        _re_task = (
+                                            await session.execute(
+                                                select(Task).where(Task.id == task_id)
+                                            )
+                                        ).scalars().first()
+                                        if _re_task is not None:
+                                            task = _re_task
                                 except Exception as e:
                                     logger.warning(
                                         f"[REVIEW PIPELINE] Failed to set pr_merged on {original_task_id}: {e}",
@@ -2967,30 +3090,11 @@ async def _process_post_commit(
                                 # parent row is held, defer the empty-PR cleanup;
                                 # the next poll cycle will retry. Better than
                                 # 500'ing the review handler.
-                                _orig = None
-                                for _attempt in range(3):
-                                    _orig_q = (
-                                        select(Task)
-                                        .where(Task.id == uuid.UUID(original_task_id))
-                                        .with_for_update(skip_locked=True)
-                                    )
-                                    _orig = (
-                                        (await session.execute(_orig_q))
-                                        .scalars()
-                                        .first()
-                                    )
-                                    if _orig is not None:
-                                        break
-                                    _orig_exists = (
-                                        await session.execute(
-                                            select(Task.id).where(
-                                                Task.id == uuid.UUID(original_task_id)
-                                            )
-                                        )
-                                    ).first()
-                                    if _orig_exists is None:
-                                        break
-                                    await asyncio.sleep(0.5 * (_attempt + 1))
+                                _orig = await _lock_original_task(
+                                    session,
+                                    original_task_id,
+                                    source="review_empty_pr_cleanup",
+                                )
                                 if _orig:
                                     _orig_loop = (_orig.context or {}).get(
                                         "review_loop", {}
@@ -3148,30 +3252,11 @@ async def _process_post_commit(
                                 # backstop clock), not correctness; the parent
                                 # will still terminate, just on the original
                                 # baseline if reset is missed.
-                                _orig = None
-                                for _attempt in range(3):
-                                    _orig_q = (
-                                        select(Task)
-                                        .where(Task.id == uuid.UUID(original_task_id))
-                                        .with_for_update(skip_locked=True)
-                                    )
-                                    _orig = (
-                                        (await session.execute(_orig_q))
-                                        .scalars()
-                                        .first()
-                                    )
-                                    if _orig is not None:
-                                        break
-                                    _orig_exists = (
-                                        await session.execute(
-                                            select(Task.id).where(
-                                                Task.id == uuid.UUID(original_task_id)
-                                            )
-                                        )
-                                    ).first()
-                                    if _orig_exists is None:
-                                        break
-                                    await asyncio.sleep(0.5 * (_attempt + 1))
+                                _orig = await _lock_original_task(
+                                    session,
+                                    original_task_id,
+                                    source="review_ci_wait_reset",
+                                )
                                 if _orig:
                                     _orig_loop = dict(
                                         (_orig.context or {}).get("review_loop", {})

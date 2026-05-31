@@ -7848,3 +7848,391 @@ async def test_spawn_pin_funnel_records_skip_caller_suppressed(db_session, mocke
         assert snap["skipped_total"] == 1
     finally:
         _clear_spawn_pin_events()
+
+
+# ── C4: review-completion early-exit gates on merged, not closed ─────────────
+
+
+@pytest.mark.asyncio
+async def test_review_early_exit_skips_only_when_merged(db_session, mocker):
+    """C4 fix #1: the review-completion early-exit MUST gate on merged==True.
+
+    Pre-fix it short-circuited on ``state == 'closed'``, so a PR caught inside
+    the orchestrator's transient close+reopen mergeability-reset window was
+    treated as "review skipped" — silently DROPPING the review_approved handoff
+    and stranding the parent in EVALUATING until the 60-min/6h backstop.
+
+    This test drives _process_post_commit on a review task whose PR reports
+    closed-not-merged and asserts the early-exit did NOT fire (no "review
+    skipped" message), proving the handler falls through to process the verdict
+    so the handoff is preserved. (A truly merged PR — separate assertion below
+    via the message — still early-exits.)
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+
+    # Token + closed-not-merged PR. get_pull_request is imported from
+    # app.github inside _process_post_commit, so patch it there.
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    # Block any downstream fix-spawn / GitHub side effects so the test focuses on
+    # the early-exit branch decision. _spawn_pipeline_task returning (None, ...)
+    # lands the verdict path in a benign "fix not spawned" terminus.
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
+    mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
+
+    project = await _make_db_project(db_session)
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 91,
+                "branch": "blueprint/c4",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 91,
+                "branch": "blueprint/c4",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
+        latest_status_message="REQUEST_CHANGES",
+    )
+    review_task.vm_instance_id = f"agent-vm-c4-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="REQUEST_CHANGES",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(Task, review_task.id)
+        msg = (refetched.latest_status_message or "").lower()
+
+    assert "review skipped" not in msg, (
+        "Closed-not-merged PR must NOT trigger the 'review skipped' early-exit "
+        "(C4 fix #1) — that drops the review_approved handoff. Got: "
+        f"{refetched.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_early_exit_fires_when_merged(db_session, mocker):
+    """C4 fix #1 (counterpart): a genuinely MERGED PR still early-exits with
+    'review skipped' — the merged-only gate must not regress the real skip."""
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": True}),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = await _make_db_project(db_session)
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 92,
+                "branch": "blueprint/c4m",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 92,
+                "branch": "blueprint/c4m",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-c4m-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched = await fresh.get(Task, review_task.id)
+        msg = (refetched.latest_status_message or "").lower()
+
+    assert "already merged" in msg and "review skipped" in msg, (
+        "A merged PR must still hit the early-exit ('already merged — review "
+        f"skipped'). Got: {refetched.latest_status_message!r}"
+    )
+
+
+# ── C4 fix B/C: merge-success caller BLOCKS on a contended parent ───────────
+#
+# Fix #3 converted the merge-success orig fetch from a blocking session.get to
+# _lock_original_task with skip_locked. Under contention that returned None and
+# the ENTIRE `if orig:` block was SKIPPED — permanently dropping ONE-SHOT
+# post-merge side effects (hotfix back-merge, security rescan, remediation
+# outcome, review-playbook, regression-case advancement, smoketest, and the
+# rollup parent's EVALUATING→COMPLETED + pr_merged transition). The merge has
+# ALREADY landed on GitHub, so a brief BLOCK is correct: the caller now uses
+# skip_locked=False (bounded by lock_timeout). These tests cover the CALLER's
+# deferral consequence, not just that the helper returns a row.
+
+_C4_USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
+
+
+def _mock_merge_success_deps(mocker):
+    """Mock GH deps so _process_post_commit's review/APPROVE path reaches the
+    merge-success block and merges. base_branch is a NON-integration branch so
+    the CI gate is skipped (is_ci_gated_merge=False → ci_status=None)."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    # PR open + not merged, with a head sha (the merge-success path reads it).
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": "deadbeef"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "ok"}),
+    )
+    mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    # Branch cleanup + playbook touch GitHub/DB — no-op them (they're guarded
+    # in the handler anyway; mocking keeps the test focused + fast).
+    mocker.patch("app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.review_learning.extract_review_feedback_to_playbook",
+        new=AsyncMock(return_value=None),
+    )
+
+
+@pytest.mark.skipif(
+    not _C4_USE_POSTGRES,
+    reason="real FOR UPDATE row contention requires Postgres",
+)
+@pytest.mark.asyncio
+async def test_merge_success_caller_blocks_then_runs_one_shots(db_session, mocker):
+    """C4 fix B/C (the core regression): when the rollup parent (orig) row is
+    BRIEFLY held FOR UPDATE by a peer during the merge-success bookkeeping, the
+    caller must BLOCK (skip_locked=False, bounded lock_timeout) and then run the
+    one-shot effects — NOT skip them. We observe the most load-bearing one-shot:
+    the parent's EVALUATING→COMPLETED + pr_merged=True transition.
+
+    Pre-fix (skip_locked=True), the contended fetch returned None and the entire
+    `if orig:` block was skipped, leaving the parent EVALUATING with no pr_merged
+    and dropping back-merge / rescan / remediation effects permanently.
+    """
+    import asyncio
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    _mock_merge_success_deps(mocker)
+
+    project = await _make_db_project(db_session)
+
+    # The rollup PARENT (orig): EVALUATING, will be flipped COMPLETED by the
+    # one-shot block.
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+    parent_id = parent.id
+
+    # The REVIEW task: APPROVE verdict, base_branch is a non-integration branch
+    # so the CI gate is skipped, original_task_id points at the parent.
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 4242,
+                "branch": "research/c4-stg",
+                "base_branch": "research/c4-base",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 4242,
+                "branch": "research/c4-stg",
+                "base_branch": "research/c4-base",
+                "original_task_id": str(parent_id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-c4b-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+
+    # Peer session holds the parent row FOR UPDATE, then releases after a short
+    # delay — long enough that the caller MUST block, short enough to fit inside
+    # the bounded lock_timeout so the caller acquires and runs the one-shots.
+    Session = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    _peer_released = asyncio.Event()
+
+    async def _hold_then_release():
+        async with Session() as peer:
+            # Mirror the existing peer-hold seam (test_lock_window): ORM FOR
+            # UPDATE on the Task row (the Postgres table is `task`, mapped via
+            # the model — not a raw `tasks` literal).
+            held = (
+                await peer.execute(
+                    select(Task).where(Task.id == parent_id).with_for_update()
+                )
+            ).scalars().first()
+            assert held is not None
+            # Hold long enough that the caller MUST block on the parent row when
+            # it reaches the (fast, mocked) merge-success bookkeeping — but well
+            # under the caller's 8s lock_timeout so it acquires after release.
+            await asyncio.sleep(2.0)
+            await peer.rollback()  # releases the FOR UPDATE lock
+            _peer_released.set()
+
+    hold_task = asyncio.create_task(_hold_then_release())
+    # Give the peer a beat to actually acquire the lock before the caller runs.
+    await asyncio.sleep(0.2)
+
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    await hold_task
+    assert _peer_released.is_set()
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent_id)
+
+    assert refetched_parent.status == TaskStatus.COMPLETED, (
+        "Merge-success caller must BLOCK on the briefly-contended parent and "
+        "then run the one-shot transition — got status "
+        f"{refetched_parent.status!r}. A skip_locked DEFER would leave it "
+        "EVALUATING and drop all post-merge effects (C4 fix B/C regression)."
+    )
+    assert (refetched_parent.context or {}).get("pr_merged") is True, (
+        "pr_merged=True is the load-bearing one-shot — it must be set, proving "
+        "the `if orig:` block executed instead of being skipped."
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_success_caller_runs_one_shots_when_uncontended(
+    db_session, mocker
+):
+    """C4 fix B/C (non-PG baseline): with no contention the merge-success caller
+    acquires the parent and runs the one-shot transition. Mirrors the contended
+    test's assertions so the happy path is covered on SQLite too (where blocking
+    FOR UPDATE returns immediately and there is no real row contention)."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    _mock_merge_success_deps(mocker)
+
+    project = await _make_db_project(db_session)
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+    parent_id = parent.id
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 4343,
+                "branch": "research/c4-stg2",
+                "base_branch": "research/c4-base2",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 4343,
+                "branch": "research/c4-stg2",
+                "base_branch": "research/c4-base2",
+                "original_task_id": str(parent_id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-c4c-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent_id)
+
+    assert refetched_parent.status == TaskStatus.COMPLETED
+    assert (refetched_parent.context or {}).get("pr_merged") is True

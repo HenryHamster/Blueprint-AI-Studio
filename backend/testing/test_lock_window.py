@@ -2118,3 +2118,190 @@ async def test_rollup_releases_parent_lock_around_review_respawn_spawn(
         "was still held FOR UPDATE — Phase B must release the parent lock "
         "around the lock-free spawn window (C2 change #3)."
     )
+
+
+# ── C4: mergeability-reset close/reopen race seam tests ─────────────────────
+#
+# Cluster C4: the orchestrator deliberately close+reopens a PR whose
+# mergeable field is stuck at None to force GitHub to recompute. Three
+# handlers that touch the SAME PR during that transient closed-not-merged
+# window previously interpreted it as a deliberate merge/abandonment because
+# they gated on ``state == 'closed'`` rather than ``merged == True``. These
+# tests lock in the corrected merged-only / pending_reopen-aware behavior.
+
+
+@pytest.mark.asyncio
+async def test_merge_snapshot_includes_pending_reopen():
+    """C4 fix #2: ``_capture_merge_snapshot`` must include pending_reopen so a
+    CI-poll commit of pending_reopen=True during the merge's unlocked GitHub
+    window invalidates the snapshot and ``_relock_merge_task`` defers."""
+    from app.ci_completion import _capture_merge_snapshot
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="merge snapshot",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review"}],
+        context={"review_loop": {"iteration": 1, "review_approved": True}},
+    )
+    snap = _capture_merge_snapshot(task)
+    assert snap["review_loop_pending_reopen"] is False
+
+    task.context = {
+        "review_loop": {
+            "iteration": 1,
+            "review_approved": True,
+            "pending_reopen": True,
+        }
+    }
+    snap2 = _capture_merge_snapshot(task)
+    assert snap2["review_loop_pending_reopen"] is True
+    assert snap != snap2, (
+        "A pending_reopen flip MUST change the merge snapshot so _relock_merge_task "
+        "defers when the orchestrator self-closes the PR mid-merge (C4)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_relock_merge_task_defers_on_pending_reopen_flip(db_session):
+    """C4 fix #2 seam: when the orchestrator commits pending_reopen=True on the
+    parent during the merge's unlocked window, ``_relock_merge_task`` must see
+    the snapshot mismatch and return None (defer) rather than proceed into the
+    closed-state branch on a PR we deliberately closed."""
+    from app.ci_completion import _capture_merge_snapshot, _relock_merge_task
+
+    project = Project(name="C4 relock pending_reopen", user_id="user-c4")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="merge gate task",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "pr_number": 77}],
+        context={
+            "review_loop": {
+                "pr_number": 77,
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Snapshot taken BEFORE the unlocked GitHub window (pending_reopen unset).
+    pre_snapshot = _capture_merge_snapshot(task)
+    assert pre_snapshot["review_loop_pending_reopen"] is False
+
+    # Simulate the orchestrator's CI poll self-closing the PR and committing
+    # pending_reopen=True during the unlocked window. Full reassignment so
+    # SQLA's change-tracking detects the JSONB mutation without flag_modified.
+    _loop = {**((task.context or {}).get("review_loop", {})), "pending_reopen": True}
+    task.context = {**(task.context or {}), "review_loop": _loop}
+    db_session.add(task)
+    await db_session.commit()
+
+    fresh = await _relock_merge_task(
+        db_session, task.id, pre_snapshot, task, source="test"
+    )
+    assert fresh is None, (
+        "Expected _relock_merge_task to DEFER (None) after a pending_reopen flip; "
+        "proceeding would let the merge gate reach the closed-state branch on a PR "
+        "the orchestrator deliberately self-closed (C4 false-success)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_original_task_returns_locked_row(db_session):
+    """C4 fix #3: ``_lock_original_task`` re-acquires the parent row FOR UPDATE
+    and returns it when the row is free (the shared helper that replaced the
+    four duplicated skip_locked retry loops, incl. the formerly-unlocked
+    merge-success orig fetch)."""
+    from app.rollup_locking import _lock_original_task
+
+    project = Project(name="C4 lock orig", user_id="user-c4")
+    db_session.add(project)
+    await db_session.commit()
+
+    orig = Task(
+        project_id=project.id,
+        title="rollup parent",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    locked = await _lock_original_task(db_session, str(orig.id))
+    assert locked is not None
+    assert locked.id == orig.id
+    assert locked.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_lock_original_task_returns_none_when_missing(db_session):
+    """C4 fix #3: ``_lock_original_task`` returns None (no infinite retry) for a
+    genuinely missing row — the merge-success caller then defers the parent
+    bookkeeping to a peer/reaper rather than raising."""
+    from app.rollup_locking import _lock_original_task
+
+    result = await _lock_original_task(db_session, str(uuid.uuid4()), attempts=2)
+    assert result is None
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="cross-session FOR UPDATE contention requires Postgres",
+)
+@pytest.mark.asyncio
+async def test_lock_original_task_defers_when_held_by_peer(db_session):
+    """C4 fix #3 seam: when a peer holds the parent row FOR UPDATE,
+    ``_lock_original_task`` (skip_locked) must DEFER (return None) instead of
+    blocking or stealing — the merge-success path then leaves the parent
+    transition to the peer/next poll, never overwriting a terminal status."""
+    from app.rollup_locking import _lock_original_task
+
+    project = Project(name="C4 lock orig contended", user_id="user-c4")
+    db_session.add(project)
+    await db_session.commit()
+
+    orig = Task(
+        project_id=project.id,
+        title="rollup parent",
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    orig_id = orig.id
+
+    await db_session.commit()
+    db_session.expunge_all()
+
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    # Hold the row FOR UPDATE on a peer session for the duration of the lock attempt.
+    async with Session() as peer:
+        held = (
+            await peer.execute(
+                select(Task).where(Task.id == orig_id).with_for_update()
+            )
+        ).scalars().first()
+        assert held is not None
+        # attempts=2 with skip_locked → the row is never returned (peer holds it).
+        result = await _lock_original_task(db_session, str(orig_id), attempts=2)
+        await peer.rollback()
+
+    assert result is None, (
+        "Expected _lock_original_task to DEFER (None) when the parent row is held "
+        "FOR UPDATE by a peer; blocking or stealing the lock would resurrect the "
+        "lost-update race the unlocked session.get had (C4 fix #3)."
+    )

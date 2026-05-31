@@ -670,3 +670,122 @@ async def test_rollup_behind_fix_prompt_includes_noop_guidance(cleanup_db, mocke
     assert "up-to-date" in fix_prompt, fix_prompt
     assert "don't force-push" in fix_prompt, fix_prompt
     assert "changes needed" in fix_prompt, fix_prompt
+
+
+# ── C4 (4th same-class site): rollup-resume closed-not-merged gate ──────────
+#
+# rollup_management's resume path (existing rollup_pr_number) previously cleared
+# the rollup_pr_number/rollup_pr_url markers on a bare ``state == 'closed'``
+# check. During the orchestrator's transient close+reopen mergeability-reset
+# window, a rollup PR is briefly closed-not-merged; clearing the markers then
+# made the NEXT sweep create a DUPLICATE rollup PR. The fix gates the clear on
+# the absence of a pending_reopen reset marker on the parent's review_loop,
+# mirroring the other three handlers. These tests lock that in.
+
+
+def _mock_rollup_resume_closed_pr(mocker, *, merged=False):
+    """Mock just enough of the resume path so control reaches the closed-state
+    branch with a closed-not-merged existing rollup PR. ``create_pull_request``
+    is mocked so the duplicate-PR side effect is observable."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    # Resume-time existing-PR validation returns closed-not-merged.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": merged, "state": "closed"},
+    )
+    # If the markers are (wrongly) cleared, the code falls through to create a
+    # NEW rollup PR — this mock makes that duplicate observable.
+    mock_create = mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={"number": 9999, "html_url": "https://x/pull/9999"},
+    )
+    return mock_create
+
+
+@pytest.mark.asyncio
+async def test_rollup_resume_closed_pending_reopen_preserves_marker_no_duplicate(
+    cleanup_db, mocker
+):
+    """C4 4th-site fix: a closed-not-merged rollup PR WITH review_loop.pending_reopen
+    set is OUR transient mergeability-reset window. The resume path must DEFER —
+    preserve rollup_pr_number/rollup_pr_url and NOT create a duplicate PR."""
+    mock_create = _mock_rollup_resume_closed_pr(mocker, merged=False)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            # The orchestrator's CI poll records its self-close reset window
+            # via review_loop.pending_reopen on THIS parent (the rollup PR's
+            # review_loop, seeded at the large-rollup → review handoff).
+            "review_loop": {
+                "pr_number": 4242,
+                "pending_reopen": True,
+                "ci_waiting": True,
+            },
+        },
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("rollup_pr_number") == 4242, (
+        "pending_reopen reset window must NOT clear rollup_pr_number — clearing it "
+        "spawns a duplicate rollup PR next cycle (C4 4th site)."
+    )
+    assert ctx.get("rollup_pr_url"), (
+        "rollup_pr_url must also survive the reset window."
+    )
+    mock_create.assert_not_called()
+    # Parent deferred — still EVALUATING, not terminalized.
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
+    cleanup_db, mocker
+):
+    """C4 4th-site counterpart: a closed-not-merged rollup PR with NO pending_reopen
+    marker is a genuine abandonment — the resume path clears the markers (will
+    retry by creating a fresh PR), preserving the pre-fix behavior for real
+    closures."""
+    _mock_rollup_resume_closed_pr(mocker, merged=False)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={"review_loop": {"pr_number": 4242, "ci_waiting": True}},
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert "rollup_pr_number" not in ctx, (
+        "A genuine closed-not-merged (no pending_reopen) must clear the marker "
+        "so the rollup is retried."
+    )
+    assert "rollup_pr_url" not in ctx

@@ -186,6 +186,12 @@ def _capture_merge_snapshot(task: Task) -> dict:
       - review_loop.iteration: review-fix iteration counter
       - review_loop.review_approved / verdict: the review gate flag
       - review_loop.ci_passed: the CI gate flag
+      - review_loop.pending_reopen: C4 — set True by the orchestrator's CI
+        poll when it self-closes the PR for a mergeability reset. Including
+        it here means a poll-cycle commit of pending_reopen=True (i.e. an
+        in-flight reset) DURING the merge's unlocked GitHub window
+        invalidates the snapshot, so _relock_merge_task defers rather than
+        reaching the closed-state branch on a PR we deliberately closed.
     Heartbeat-only updates (last_heartbeat, last_metrics_json,
     heartbeat_count) do NOT touch any of these, so they don't trip the
     validator under heartbeat overlap.
@@ -198,6 +204,7 @@ def _capture_merge_snapshot(task: Task) -> dict:
         "review_loop_review_approved": review_loop.get("review_approved"),
         "review_loop_verdict": review_loop.get("verdict"),
         "review_loop_ci_passed": review_loop.get("ci_passed"),
+        "review_loop_pending_reopen": bool(review_loop.get("pending_reopen")),
     }
 
 
@@ -591,9 +598,18 @@ async def _attempt_merge_with_retry_and_escalation(
         # the recheck-failed branch (mirrors the original except-clause behavior).
         if _recheck_err is not None:
             raise _recheck_err
-        if _recheck_pr and (
-            _recheck_pr.get("merged") or _recheck_pr.get("state") == "closed"
-        ):
+        # C4: the success-close branch MUST key on the affirmative merged==True
+        # signal, NEVER on a bare state=='closed'. A closed-not-merged PR may be
+        # a TRANSIENT self-close from the orchestrator's mergeability-reset loop
+        # (close+reopen to recompute mergeable=None — orchestrator.py). The prior
+        # ``state == 'closed'`` arm treated that transient window as a deliberate
+        # success-close: it marked the parent COMPLETED with pr_closed_success,
+        # which _verify_pr_merged then cements (rollup_management.py) — falsely
+        # succeeding an UNMERGED rollup. The CI-poll loop already distinguishes
+        # its own self-close via review_loop.pending_reopen; this gate now does
+        # too: a closed-not-merged PR with pending_reopen set is OUR reset window
+        # → defer (return False) so the reopen completes and the gate retries.
+        if _recheck_pr and _recheck_pr.get("merged"):
             task.status = TaskStatus.COMPLETED
             # Mark a deliberate success-close so the rollup's _verify_pr_merged
             # doesn't later re-fetch this now-closed PR, see closed-not-merged,
@@ -608,6 +624,36 @@ async def _attempt_merge_with_retry_and_escalation(
                 f"[CI] PR #{ci_pr_number} was already merged — marking complete ({source})"
             )
             return True
+        if _recheck_pr and _recheck_pr.get("state") == "closed":
+            # Closed but NOT merged. If this is our own mergeability-reset
+            # window (pending_reopen), defer — the orchestrator's CI poll will
+            # reopen and the gate retries. Otherwise it's a genuine close that
+            # happened to coincide with a merge attempt; treat it as a
+            # success-close only when an explicit deliberate-close marker is
+            # present (pr_closed_empty/pr_closed_success set elsewhere), else
+            # leave the parent EVALUATING for _verify_pr_merged to classify.
+            _ci_ctx = task.context or {}
+            if ci_loop.get("pending_reopen"):
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} closed-not-merged with pending_reopen set "
+                    f"— transient mergeability-reset, deferring merge ({source})"
+                )
+                return False
+            if _ci_ctx.get("pr_closed_empty") or _ci_ctx.get("pr_closed_success"):
+                task.status = TaskStatus.COMPLETED
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} closed (deliberate success-close)"
+                )
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} closed-not-merged but marked deliberate "
+                    f"success-close — marking complete ({source})"
+                )
+                return True
+            logger.info(
+                f"[CI] PR #{ci_pr_number} closed-not-merged with no self-close marker "
+                f"— leaving parent EVALUATING for _verify_pr_merged ({source})"
+            )
+            return False
         # Detect non-transient merge blocks — escalate immediately instead of retrying.
         # Prefer mergeable_state from the refetched PR as the primary signal: it is
         # authoritative and resilient to GitHub API error-message wording changes.
