@@ -3086,18 +3086,18 @@ async def test_strategic_review_omits_efficiency_snapshot_when_no_data(db_sessio
 
 
 # ---------------------------------------------------------------------------
-# parallelism_snapshot in strategic payload
+# parallelism_snapshot removed from strategic payload
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_strategic_review_includes_parallelism_snapshot(db_session):
-    """parallelism_snapshot is built from runtime_config + Task vm timing rows.
+async def test_strategic_review_omits_parallelism_snapshot(db_session):
+    """parallelism_snapshot is no longer built or shipped in the strategic payload.
 
-    Seeds two Tasks: one currently active (vm_started_at set, vm_stopped_at
-    null) and one that completed inside the last hour. Verifies the snapshot
-    captures both the current-active count and the time-weighted recent avg,
-    plus utilization_pct derived from max_concurrent_vms.
+    It was a Blueprint VM-pool infra metric that does not generalize to an
+    arbitrary target repo. Seeds VM-timing rows that would previously have
+    populated the snapshot and confirms neither the payload key nor the
+    prompt_suffix observation note appears, and that it is gone from the schema.
     """
     project = _make_project(
         directions=[
@@ -3112,7 +3112,6 @@ async def test_strategic_review_includes_parallelism_snapshot(db_session):
     from app.time_utils import _utcnow
 
     now = _utcnow()
-    # Active task — running for 30 minutes, still in flight.
     active_task = Task(
         project_id=project.id,
         title="active",
@@ -3124,20 +3123,7 @@ async def test_strategic_review_includes_parallelism_snapshot(db_session):
         vm_started_at=now - timedelta(minutes=30),
         context={"direction_id": "d-par01"},
     )
-    # Completed task — ran 20 minutes inside the last hour.
-    done_task = Task(
-        project_id=project.id,
-        title="done",
-        description="",
-        payloads=[{"type": "research"}],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        vm_started_at=now - timedelta(minutes=40),
-        vm_stopped_at=now - timedelta(minutes=20),
-        context={"direction_id": "d-par99"},
-    )
-    db_session.add_all([active_task, done_task])
+    db_session.add(active_task)
     await db_session.commit()
 
     prev_cap = _shared_state.runtime_config.get("max_concurrent_vms")
@@ -3161,20 +3147,136 @@ async def test_strategic_review_includes_parallelism_snapshot(db_session):
     ]
     assert strategic_tasks
     payload = strategic_tasks[0].payloads[0]
-    assert "parallelism_snapshot" in payload
-    snap = payload["parallelism_snapshot"]
-    assert snap["pool_capacity_slots"] == 15
-    assert snap["current_active_vms"] == 1
-    assert snap["recent_window_minutes"] == 60
-    # Active task overlaps the window for 30 min, done task for 20 min →
-    # total ~50 min of overlap / 60 min window = ~0.83 avg active VMs.
-    assert 0.7 <= snap["recent_avg_active_vms"] <= 0.95
-    assert snap["directions_in_flight"] == 1  # only active task counts
-    assert 0 < snap["utilization_pct"] < 10
-    # And the observation note should land in prompt_suffix.
+    assert "parallelism_snapshot" not in payload
     suffix = payload.get("prompt_suffix") or ""
-    assert "throughput depends on" in suffix
-    assert "pool capacity 15 slots" in suffix
+    assert "throughput depends on" not in suffix
+    assert "pool capacity" not in suffix
+
+    # Gone from the pack schema too.
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    assert "parallelism_snapshot" not in _STRATEGIC_REVIEW_SCHEMA
+
+
+# ---------------------------------------------------------------------------
+# held_directions block in strategic payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_held_directions_block(db_session):
+    """When a direction is HELD, the strategic_review payload carries a
+    read-only held_directions block: the direction text, consecutive-failure
+    count, dominant error fingerprint, and a few RAW recent failure messages.
+    """
+    from app.shared_state import record_direction_result, DIRECTION_HOLD_THRESHOLD
+
+    _shared_state.direction_failure_streaks.clear()
+    direction_id = "d-held01"
+    project = _make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "text": "Decompose the giant module",
+                "priority": "medium",
+            }
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed three FAILED tasks on the direction so the block can surface raw
+    # failure messages + a dominant fingerprint.
+    for i in range(3):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"failed-{i}",
+                description="",
+                payloads=[{"type": "create"}],
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.FAILED,
+                created_by="ORCHESTRATOR",
+                latest_status_message=f"ImportError: cannot import name foo (attempt {i})",
+                context={"direction_id": direction_id},
+            )
+        )
+    await db_session.commit()
+
+    # Drive the direction into the HELD state.
+    try:
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(
+                direction_id,
+                success=False,
+                failure_class="CODE_ERROR",
+                project_id=str(project.id),
+            )
+        assert _shared_state.get_held_directions().get(direction_id)
+
+        spawned = await _spawn_strategic_review(project, db_session)
+    finally:
+        _shared_state.direction_failure_streaks.clear()
+
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    strategic_tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert strategic_tasks
+    payload = strategic_tasks[0].payloads[0]
+    assert "held_directions" in payload
+    held = payload["held_directions"]
+    assert isinstance(held, list) and len(held) == 1
+    entry = held[0]
+    assert entry["direction_id"] == direction_id
+    assert "Decompose the giant module" in entry["direction_text"]
+    assert entry["consecutive_failures"] == DIRECTION_HOLD_THRESHOLD
+    assert entry["last_failure_class"] == "CODE_ERROR"
+    assert entry["dominant_error_fingerprint"]
+    msgs = entry["recent_failure_messages"]
+    assert isinstance(msgs, list) and msgs
+    assert any("ImportError" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_omits_held_directions_when_none_held(db_session):
+    """When no direction is held, the held_directions block is absent."""
+    _shared_state.direction_failure_streaks.clear()
+    project = _make_project(
+        directions=[
+            {"id": "d-ok01", "status": "active", "text": "x", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    try:
+        spawned = await _spawn_strategic_review(project, db_session)
+    finally:
+        _shared_state.direction_failure_streaks.clear()
+
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    strategic_tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert strategic_tasks
+    payload = strategic_tasks[0].payloads[0]
+    assert "held_directions" not in payload
 
 
 # ---------------------------------------------------------------------------

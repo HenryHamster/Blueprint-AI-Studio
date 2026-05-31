@@ -243,10 +243,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # baseline_captured_at, last_snapshot_at. Optional; absent when no snapshot
     # data exists yet (cold-start projects).
     efficiency_snapshot: dict[str, Any] | None = None
-    # Global pool utilization snapshot (capacity, current/recent active VMs,
-    # directions in flight). Observational signal so the strategic agent can
-    # factor parallelism into width decisions.
-    parallelism_snapshot: dict[str, Any] | None = None
+    # Held directions: read-only planning context for directions that hit the
+    # consecutive-failure hold threshold. Each entry: {direction_id,
+    # direction_text, consecutive_failures, last_failure_class,
+    # dominant_error_fingerprint, recent_failure_messages}.
+    held_directions: list[dict[str, Any]] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):

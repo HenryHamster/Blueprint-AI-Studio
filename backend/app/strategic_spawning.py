@@ -497,10 +497,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_efficiency_snapshot,
     },
-    # Global pool utilization snapshot. Tiny fixed-size dict; low priority
-    # since it's purely observational and the prompt_suffix note carries the
-    # headline numbers when this gets dropped.
-    "parallelism_snapshot": {"priority": "low"},
+    # Held-directions block: directions that have hit the consecutive-failure
+    # hold threshold. Low priority — purely observational planning context the
+    # strategic agent reads to decide whether to refine/retire a stuck direction.
+    "held_directions": {"priority": "low"},
 }
 
 
@@ -1896,54 +1896,78 @@ async def _spawn_strategic_review(
             _efficiency_snapshot = _summarize_efficiency_snapshot(_raw_snapshot)
     except Exception:
         logger.exception("[STRATEGIC] efficiency snapshot fetch failed; continuing")
-    # Global pool utilization snapshot — observational signal so the strategic
-    # agent can factor parallelism into width decisions. Pool capacity is
-    # global (shared across projects), so this query is intentionally not
-    # project-scoped. Best-effort: any failure logs and leaves the field unset.
-    _parallelism_snapshot: dict | None = None
+    # Held-directions block — directions that hit the consecutive-failure hold
+    # threshold (3 consecutive CODE_ERROR failures; see
+    # shared_state.record_direction_result). Surfaces the held flag, the
+    # dominant error fingerprint, and a few RAW recent failure messages so the
+    # strategic agent can decide whether to refine or retire a stuck direction.
+    # READ-ONLY planning context: no spawner, no enforcement, no hard block.
+    # The failed-count / acceptance-rate / recent_diagnosis already reach the
+    # agent via direction_outcomes, so this block adds ONLY the held flag +
+    # dominant fingerprint + raw failure messages on top of those.
+    _held_directions_block: list[dict] = []
     try:
-        _cap_raw = _runtime_config.get("max_concurrent_vms")
-        _now_p = _utcnow()
-        _window_seconds = 60 * 60
-        _window_start = _now_p - timedelta(seconds=_window_seconds)
-        _stmt = (
-            select(Task.vm_started_at, Task.vm_stopped_at, Task.context)
-            .where(Task.vm_started_at.is_not(None))
-            .where(Task.vm_started_at < _now_p)
-            .where(
-                or_(Task.vm_stopped_at.is_(None), Task.vm_stopped_at > _window_start)
+        _held = _shared_state.get_held_directions()
+        if _held:
+            from app.anomaly_detection import _error_fingerprint
+
+            _project_id_str = str(project.id)
+            _dir_text_map = {
+                d.get("id"): d
+                for d in (project.directions or [])
+                if d.get("id")
+            }
+            # One bounded query for the project's recent FAILED tasks, then
+            # partition by direction_id in memory (mirrors the gathering logic
+            # in _spawn_direction_hold_investigation, copied here intentionally
+            # since that spawner is slated for deletion).
+            _recent_failed = (
+                (
+                    await session.execute(
+                        select(Task)
+                        .where(
+                            Task.project_id == project.id,
+                            Task.status == TaskStatus.FAILED,
+                        )
+                        .order_by(Task.created_at.desc())
+                        .limit(60)
+                    )
+                )
+                .scalars()
+                .all()
             )
-        )
-        _rows = (await session.execute(_stmt)).all()
-        _overlap_total = 0.0
-        _current_active = 0
-        _directions_in_flight: set[str] = set()
-        for _vs, _ve, _ctx in _rows:
-            if _vs is None:
-                continue
-            _end_t = _ve if _ve is not None else _now_p
-            _start_t = _vs if _vs > _window_start else _window_start
-            if _end_t > _start_t:
-                _overlap_total += (_end_t - _start_t).total_seconds()
-            if _ve is None:
-                _current_active += 1
-                _dir_id = (_ctx or {}).get("direction_id")
-                if _dir_id:
-                    _directions_in_flight.add(str(_dir_id))
-        _recent_avg = round(_overlap_total / _window_seconds, 2)
-        _parallelism_snapshot = {
-            "pool_capacity_slots": _cap_raw,
-            "current_active_vms": _current_active,
-            "recent_avg_active_vms": _recent_avg,
-            "recent_window_minutes": _window_seconds // 60,
-            "directions_in_flight": len(_directions_in_flight),
-        }
-        if isinstance(_cap_raw, int) and _cap_raw > 0:
-            _parallelism_snapshot["utilization_pct"] = round(
-                (_recent_avg / _cap_raw) * 100, 1
-            )
+            for _did, _hold_info in _held.items():
+                if _hold_info.get("project_id") != _project_id_str:
+                    continue
+                _direction = _dir_text_map.get(_did)
+                if not _direction:
+                    continue
+                _dir_failures = [
+                    t
+                    for t in _recent_failed
+                    if (t.context or {}).get("direction_id") == _did
+                ][:5]
+                _failure_messages: list[str] = []
+                _fingerprints: list[str] = []
+                for t in _dir_failures:
+                    _err = (t.latest_status_message or "(no message)")[:240]
+                    _fingerprints.append(_error_fingerprint(_err))
+                    _failure_messages.append(_err)
+                _dominant_fp = _fingerprints[0] if _fingerprints else None
+                _held_directions_block.append(
+                    {
+                        "direction_id": _did,
+                        "direction_text": (_direction.get("text") or "?")[:300],
+                        "consecutive_failures": _hold_info.get(
+                            "consecutive_failures"
+                        ),
+                        "last_failure_class": _hold_info.get("last_failure_class"),
+                        "dominant_error_fingerprint": _dominant_fp,
+                        "recent_failure_messages": _failure_messages,
+                    }
+                )
     except Exception:
-        logger.exception("[STRATEGIC] parallelism snapshot build failed; continuing")
+        logger.exception("[STRATEGIC] held-directions block build failed; continuing")
     # Post-promotion handoff — when a fresh version has just opened from a
     # successful promotion, its `goal` field was snapshotted verbatim from
     # `problem_model.intent.current_focus` at the moment the prior version
@@ -2169,34 +2193,6 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _approaches_block
             )
-    if _parallelism_snapshot:
-        _ps_parts = []
-        _ps_cap = _parallelism_snapshot.get("pool_capacity_slots")
-        _ps_avg = _parallelism_snapshot.get("recent_avg_active_vms")
-        _ps_util = _parallelism_snapshot.get("utilization_pct")
-        _ps_dirs = _parallelism_snapshot.get("directions_in_flight")
-        if _ps_cap is not None:
-            _ps_parts.append(f"pool capacity {_ps_cap} slots")
-        if _ps_avg is not None:
-            _ps_parts.append(f"recent avg {_ps_avg} active VMs over last hour")
-        if _ps_util is not None:
-            _ps_parts.append(f"utilization {_ps_util}%")
-        if _ps_dirs is not None:
-            _ps_parts.append(f"{_ps_dirs} directions currently in flight")
-        _ps_stats = "; ".join(_ps_parts)
-        _parallelism_note = (
-            "Note: pipeline throughput depends on how many directions are in "
-            "flight at once. Review iteration serializes work within a "
-            "direction (~half of its lifetime), so a small number of "
-            "directions leaves pool capacity idle even when each direction "
-            "is fully busy."
-            + (f" ({_ps_stats})." if _ps_stats else "")
-        )
-        prompt_suffix = (
-            f"{prompt_suffix}\n{_parallelism_note}"
-            if prompt_suffix
-            else _parallelism_note
-        )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -2270,8 +2266,8 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **(
-                {"parallelism_snapshot": _parallelism_snapshot}
-                if _parallelism_snapshot
+                {"held_directions": _held_directions_block}
+                if _held_directions_block
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),
