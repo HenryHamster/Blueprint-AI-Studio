@@ -15,7 +15,6 @@ export {
   buildFileTree,
   extractTestConventions,
   discoverRelatedTests,
-  discoverModuleInterfaces,
   extractModuleInterfaces,
   discoverAffectedConsumers,
 } from './prompts/discovery.js';
