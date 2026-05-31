@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from app.database import get_session, AsyncSessionLocal, engine
+from app.database import get_session, AsyncSessionLocal
 from app.models import (
     Project,
     Task,
@@ -34,7 +34,6 @@ from app.models import (
 )
 from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
 from app.auth import get_current_user
-from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_settings import router as admin_settings_router
@@ -1253,8 +1252,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Telemetry must be set up before the app starts (cannot add middleware during lifespan)
-setup_telemetry(app, engine)
 
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
