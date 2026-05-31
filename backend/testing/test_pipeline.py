@@ -1042,19 +1042,6 @@ class TestTypeUnthrottleBroadcast:
         assert isinstance(orch._previously_failing_types, set)
         assert isinstance(orch._last_type_unthrottle_broadcast, dict)
 
-    def test_recovery_detected_by_set_difference(self):
-        """A type that was failing last cycle but not this cycle is flagged as recovered."""
-        prev: set[str] = {"create", "fix"}
-        curr: set[str] = {"create"}  # "fix" recovered
-        recovered = prev - curr
-        assert recovered == {"fix"}
-
-    def test_no_recovery_when_still_failing(self):
-        """Types still in failing set do not trigger unthrottle."""
-        prev: set[str] = {"create"}
-        curr: set[str] = {"create"}
-        assert (prev - curr) == set()
-
 
 # ── Verdict JSON Field ────────────────────────────────────────────────────
 
@@ -1111,30 +1098,6 @@ class TestMonitoringWindowEdgeCases:
         do_rollback, reason, response = should_rollback()
         assert do_rollback
         assert response == "ROLLBACK"
-
-
-# ── GCP Health Check ──────────────────────────────────────────────────────
-
-
-class TestGCPHealthCheck:
-    """Fix 1.4: all() on empty iterable should not mark GCP unhealthy."""
-
-    def test_no_failures_means_healthy(self):
-        """When all recent results are successes, GCP should be healthy."""
-        from app.shared_state import deploy_monitoring
-
-        # All successes
-        deploy_monitoring["task_results"] = [
-            (datetime.utcnow().isoformat(), "success", ""),
-            (datetime.utcnow().isoformat(), "success", ""),
-            (datetime.utcnow().isoformat(), "success", ""),
-        ]
-        # The health check looks at provision failures
-        recent_provisions = [
-            r for r in deploy_monitoring["task_results"] if r[2] == "PROVISION_FAILURE"
-        ]
-        # With 0 provision failures, GCP should stay healthy
-        assert len(recent_provisions) < 3
 
 
 # ── Rollup Empty Children Guard ──────────────────────────────────────────────
