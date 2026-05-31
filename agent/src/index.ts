@@ -66,7 +66,51 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned';
+
+// ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
+// A non-error "shutdown requested" control signal. Thrown from the deep call
+// paths that previously did `setTimeout(process.exit); return` — the
+// fall-through return raced main()'s role loop (which would re-enter
+// pollForNextRole before the deferred exit fired) and skipped the terminal
+// status POST. Throwing instead unwinds the stack cleanly back to main()'s
+// role loop, which catches it, breaks, and lets the outer finally tear down
+// the workspace before a single explicit exit. Distinct from Error so the
+// global crash handler / runRoleOnce catch never mis-records it as a fault.
+export class GracefulShutdownSignal {
+  readonly reason: string;
+  readonly exitCode: number;
+  constructor(reason: string, exitCode = 0) {
+    this.reason = reason;
+    this.exitCode = exitCode;
+  }
+}
+
+// Set once a non-transient heartbeat 4xx (reassignment/deauth) is observed.
+// Read by the heartbeat loop so any in-flight tick that has already passed the
+// classification gate does not keep firing after we have decided to shut down.
+let cancelRequested = false;
+function requestCancel(): void { cancelRequested = true; }
+export function _isCancelRequestedForTesting(): boolean { return cancelRequested; }
+export function _resetCancelRequestedForTesting(): void { cancelRequested = false; }
+
+// Crash-report task identity, decoupled from process.env.TASK_ID. The role
+// loop deliberately clears TASK_ID during the warm-poll window so a benign
+// SIGTERM (VM being torn down with no follow-up work) does not overwrite the
+// prior task's status with a FATAL message. But that also stripped crash
+// context from *real* crashes (uncaughtException / unhandledRejection) that
+// happen during the poll gap — they reported with no task id and were silently
+// lost. This module-level id is set at EVERY TASK_ID assignment and is NOT
+// cleared during the poll window, so _crashReport can still attribute a
+// poll-gap crash to the warm-pinned task (labelled distinctly so the backend
+// can tell a genuine crash from the prior task's completed work).
+let _crashReportTaskId = '';
+// True while the role loop is in the warm-poll gap (TASK_ID intentionally
+// blank). Lets _crashReport label poll-gap crashes distinctly.
+let _inWarmPollWindow = false;
+function setCrashReportTaskId(taskId: string): void { _crashReportTaskId = taskId; }
+export function _getCrashReportTaskIdForTesting(): string { return _crashReportTaskId; }
+export function _setInWarmPollWindowForTesting(value: boolean): void { _inWarmPollWindow = value; }
 
 // ── OAuth credential rotation + ClaudeTimeoutError ───────────────────────────
 import {
@@ -890,6 +934,13 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
   })().catch((e: unknown) => { log(`Initial heartbeat outer error: ${String(e)}`); });
 
   heartbeatTimer = setInterval(() => { (async () => {
+    // A prior tick already classified a non-transient 4xx as reassignment and
+    // requested shutdown — don't keep firing heartbeats (or re-trip the
+    // self-terminate path) while the 5s wind-down timer runs.
+    if (cancelRequested) {
+      traceHeartbeat('periodic', Date.now(), Date.now(), 'skip-in-flight', 'cancel-requested');
+      return;
+    }
     if (heartbeatInFlight) {
       traceHeartbeat('periodic', Date.now(), Date.now(), 'skip-in-flight');
       log('Heartbeat skipped — previous still in flight');
@@ -972,7 +1023,20 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
       // Other 4xx (401/403/404 …) = task genuinely reassigned/deauthorized — graceful shutdown
       if (e instanceof Error && /failed \(4\d{2}\)/.test(e.message)) {
         log('Task no longer assigned to this VM — self-terminating gracefully');
+        // Signal the rest of the agent (incl. any later heartbeat tick that has
+        // already passed the classification gate) that we are shutting down.
+        requestCancel();
         stopHeartbeat();
+        // Best-effort terminal status POST BEFORE exiting. Without this the
+        // task is stranded IN_PROGRESS/QUEUED with no failure_category until
+        // the reaper times it out (false AGENT_TIMEOUT, discarded work). The
+        // heartbeat callback is a detached setInterval tick — a thrown
+        // GracefulShutdownSignal can't reach main()'s role loop from here — so
+        // fire a fire-and-forget SYNC status post (curl child, same mechanism
+        // as sendHeartbeatSync) that survives the imminent process.exit even
+        // if the event loop never drains. 'reassigned' tells the backend this
+        // was an intentional handoff, not a code fault.
+        postTerminalStatusSync(taskId, 'reassigned', 'Task reassigned/deauthorized — agent self-terminating after non-transient heartbeat 4xx');
         // Allow 5s for in-flight operations to wind down before hard exit.
         // VM TTL self-destruct (1hr) is the ultimate backstop.
         setTimeout(() => process.exit(0), 5000);
@@ -1037,6 +1101,53 @@ export function sendHeartbeatSync(
   } catch (e) {
     log(`Sync heartbeat failed: ${e instanceof Error ? e.message : String(e)} (non-fatal)`);
     traceHeartbeat('sync', start, Date.now(), 'err', e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * Synchronous, fire-and-forget terminal status POST — used from the heartbeat
+ * self-terminate path (cluster C7) where a thrown GracefulShutdownSignal can't
+ * reach main()'s role loop (the heartbeat is a detached setInterval tick) and
+ * the imminent process.exit would abandon any pending async apiPost. Fires curl
+ * in a child process (sync) so the request lands even though the event loop is
+ * about to stop. Without this the reassigned task is stranded IN_PROGRESS with
+ * no failure_category until the reaper times it out (false AGENT_TIMEOUT).
+ *
+ * Best-effort: a failed POST writes the stale-result file as the fallback
+ * (the next process / warm role retries it), mirroring persistAndPostStatus.
+ */
+export function postTerminalStatusSync(
+  taskId: string,
+  failureCategory: FailureCategory,
+  message: string,
+  timeoutMs = 5_000,
+) {
+  if (!taskId) return;
+  const enriched = enrichStatusPayload(taskId, {
+    task_id: taskId,
+    status: 'FAILED',
+    artifact_type: 'ERROR_LOG',
+    logs: sanitize(message),
+    failure_category: failureCategory,
+  });
+  // Persist a stale-result file FIRST so a retry path survives even if the
+  // curl below times out under a partition.
+  try {
+    writeStaleResultFile(`/tmp/task_${taskId}_result.json`, createStaleResultEnvelope(enriched));
+  } catch { /* best effort — directory may be unwritable */ }
+  try {
+    execFileSync('curl', [
+      '-sf', '-X', 'POST',
+      `${ORCHESTRATOR_URL}/api/agent/status`,
+      '-H', 'Content-Type: application/json',
+      '-H', `X-Agent-Token: ${AGENT_TOKEN}`,
+      '-d', JSON.stringify(enriched),
+    ], { timeout: timeoutMs, stdio: 'ignore' });
+    // POST landed — drop the stale-result fallback so it isn't re-posted.
+    try { fs.unlinkSync(`/tmp/task_${taskId}_result.json`); } catch { /* already gone */ }
+    log(`Terminal status (${failureCategory}) posted synchronously for task ${taskId}`);
+  } catch (e) {
+    log(`Sync terminal status POST failed: ${e instanceof Error ? e.message : String(e)} — stale-result fallback retained for retry`);
   }
 }
 
@@ -1752,7 +1863,21 @@ async function main() {
   // on the rejected promise from main().
   try {
     for (;;) {
-      const claimResult = await runRoleOnce({ reportPreClaimFailure });
+      let claimResult: RunRoleOnceResult;
+      try {
+        claimResult = await runRoleOnce({ reportPreClaimFailure });
+      } catch (roleErr) {
+        // GracefulShutdownSignal is a benign "task went terminal / reassigned"
+        // teardown request, NOT a fault. runRoleOnce's finally already stopped
+        // the heartbeat and closed the ws; break out so the outer finally
+        // tears down the workspace and we exit ONCE (no race with a deferred
+        // process.exit, no pollForNextRole re-entry, no double-role-start).
+        if (roleErr instanceof GracefulShutdownSignal) {
+          log(`Role abandoned gracefully (reason=${roleErr.reason}) — winding down`);
+          break;
+        }
+        throw roleErr;
+      }
       lastTaskId = claimResult.taskId;
       lastPrNumber = claimResult.prNumber;
       lastBaseBranch = claimResult.baseBranch;
@@ -1782,7 +1907,16 @@ async function main() {
       // AGENT_TIMEOUT. With TASK_ID empty, _crashReport's `if (taskId)`
       // gate skips the heartbeat. The 'claim' branch below restores
       // TASK_ID to the new task before any code that could crash.
+      //
+      // BUT clearing TASK_ID also stripped crash context from *genuine*
+      // crashes (uncaughtException / unhandledRejection) during the poll gap —
+      // they reported with no task id and were silently lost. _crashReportTaskId
+      // is deliberately NOT cleared here (it still points at the warm-pinned
+      // task) and _inWarmPollWindow lets _crashReport label a poll-gap crash
+      // distinctly (so a real crash is still reported without overwriting the
+      // prior task's healthy EVALUATING status the way a benign SIGTERM would).
       process.env.TASK_ID = '';
+      _inWarmPollWindow = true;
 
       let pollResult: PollResult;
       try {
@@ -1833,7 +1967,11 @@ async function main() {
       // the failure to the wrong (already-completed) task.
       if (pollResult.taskId) {
         process.env.TASK_ID = pollResult.taskId;
+        setCrashReportTaskId(pollResult.taskId);
       }
+      // We've claimed a follow-on; the poll gap is over. A crash from here on
+      // attributes to the new task (the normal active-execution path).
+      _inWarmPollWindow = false;
       try {
         await resetForNextRole({
           workspace: WORKSPACE,
@@ -1928,6 +2066,8 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   roleClaimTimestamp = Date.now();
   const taskId = strVal(task.task_id);
   process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
+  setCrashReportTaskId(taskId);  // Decoupled crash identity — survives the poll-window TASK_ID clear
+  _inWarmPollWindow = false;     // We're back in active role execution
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload = payloads[0] ?? {} as Record<string, unknown>;
   const taskType = strVal(payload.type, 'create');
@@ -2015,13 +2155,20 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
       log('Task no longer active (cancelled/superseded during startup) — abandoning role gracefully');
       sendLog(ws, '\nTask no longer active (cancelled/superseded during startup) — abandoning role gracefully.\n');
       statusRef.value = 'Task no longer active — abandoning role gracefully';
-      stopHeartbeat();
-      if (ws) ws.close();
-      // VM TTL self-destruct is the ultimate backstop; the short delay lets
-      // the final sendLog/ws close flush before exit, matching the heartbeat
-      // path's 5s wind-down (shorter here — there is no in-flight task work).
-      setTimeout(() => process.exit(0), 2000);
-      return { taskId, prNumber, baseBranch: baseBranchForReset };
+      // Throw a typed shutdown signal rather than `setTimeout(exit); return`.
+      // The old pattern returned successfully back into main()'s role loop,
+      // which then proceeded to pollForNextRole — racing the deferred 2s
+      // exit and risking a double-role-start (and leaking the in-flight
+      // teardown). The throw unwinds through this function's `finally`
+      // (which stops the heartbeat + closes the ws) and is caught in main()'s
+      // role loop, which breaks cleanly and exits once. requestCancel() stops
+      // any heartbeat tick from re-tripping its own self-terminate path.
+      requestCancel();
+      // Intentional non-Error control-flow throw: GracefulShutdownSignal must
+      // NOT be an Error so the fault-classification paths (runRoleOnce catch,
+      // global crash handler) never mis-record this benign teardown as a fault.
+      // eslint-disable-next-line @typescript-eslint/only-throw-error -- typed graceful-shutdown control signal, caught by main()'s role loop
+      throw new GracefulShutdownSignal('task_no_longer_active');
     }
     const errMsg = error instanceof Error ? error.message : String(error);
     const safeErr = sanitize(errMsg);
@@ -2096,11 +2243,23 @@ function _crashReport(label: string, detail: string, exitCode: number) {
   // path: GCE gives ~30s before SIGKILL, and a 10s blocking curl chews 1/3 of
   // that window for one best-effort flush. 3s fails fast on partition while
   // still succeeding on healthy networks.
-  const taskId = process.env.TASK_ID;
+  // Prefer the env TASK_ID (active role); fall back to the decoupled
+  // _crashReportTaskId so a crash during the warm-poll window — where the role
+  // loop deliberately blanks process.env.TASK_ID — still carries task context
+  // instead of being silently dropped (cluster C7). A benign SIGTERM during
+  // the poll gap is intentionally NOT reported against a task (it's just the VM
+  // being torn down with no follow-up work), so it keeps the empty-env path;
+  // only genuine crashes (uncaughtException / unhandledRejection) fall back to
+  // _crashReportTaskId, and they're labelled distinctly so the backend can tell
+  // a real poll-gap crash from the prior task's completed-and-EVALUATING work.
+  const envTaskId = process.env.TASK_ID;
+  const pollGapCrash = !envTaskId && _inWarmPollWindow && label !== 'SIGTERM' && !!_crashReportTaskId;
+  const taskId = envTaskId || (pollGapCrash ? _crashReportTaskId : '');
+  const reportLabel = pollGapCrash ? `${label}:during-poll` : label;
   if (taskId) {
     try {
       const metrics = collectMetrics();
-      const msg = `[FATAL:${label}] ${detail.slice(0, 300)}`;
+      const msg = `[FATAL:${reportLabel}] ${detail.slice(0, 300)}`;
       sendHeartbeatSync(taskId, `[${metrics.heap_used_mb}MB cg:${metrics.cgroup_mb || '?'}MB] ${msg}`, undefined, 3_000);
     } catch { /* best effort — we're dying anyway */ }
   }

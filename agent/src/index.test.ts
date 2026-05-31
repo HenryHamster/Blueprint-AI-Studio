@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -79,6 +79,7 @@ import {
   MAX_TEST_FIX_ATTEMPTS,
   TOOL_USE_STALL_TIMEOUT_MS,
   CLAUDE_STREAM_STALL_MS,
+  LLM_NO_PROGRESS_STALL_MS,
   TOKEN_REFRESH_FLOOR_MS,
   TOKEN_REFRESH_CEILING_MS,
   BOOTSTRAP_TOKEN_THRESHOLD_MS,
@@ -475,6 +476,94 @@ describe('isTaskNoLongerActiveError', () => {
     const genuinelyFatal = new Error('handler threw: undefined is not a function');
     expect(isTaskNoLongerActiveError(benign)).toBe(true);
     expect(isTaskNoLongerActiveError(genuinelyFatal)).toBe(false);
+  });
+});
+
+// ── Graceful shutdown signalling (cluster C7) ─────────────────────────────────
+// Regression for the deferred-exit-with-fall-through bug: the
+// isTaskNoLongerActiveError / heartbeat self-terminate paths used to do
+// `setTimeout(process.exit); return`, which returned into main()'s role loop
+// and let pollForNextRole re-enter before the exit fired (double-role-start /
+// resource leak), and the heartbeat 'Other 4xx' branch exited with NO terminal
+// status POST (task stranded IN_PROGRESS until reaper timeout → false
+// AGENT_TIMEOUT). The fix throws a typed GracefulShutdownSignal (caught in the
+// role loop to break cleanly) and posts a synchronous terminal status.
+describe('GracefulShutdownSignal (C7 graceful teardown)', () => {
+  it('is a non-Error control type so the crash handler / runRoleOnce catch never mis-records it as a fault', () => {
+    const sig = new GracefulShutdownSignal('task_no_longer_active');
+    // Must NOT be an Error — the role loop / global crash handler branch on
+    // `instanceof Error` for fault reporting; a graceful teardown must dodge it.
+    expect(sig instanceof Error).toBe(false);
+    expect(sig instanceof GracefulShutdownSignal).toBe(true);
+    expect(sig.reason).toBe('task_no_longer_active');
+    expect(sig.exitCode).toBe(0);
+  });
+
+  it('carries a custom exit code when provided', () => {
+    const sig = new GracefulShutdownSignal('reassigned', 143);
+    expect(sig.exitCode).toBe(143);
+  });
+});
+
+describe('postTerminalStatusSync (C7 heartbeat self-terminate posts FAILED)', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(fs.writeFileSync).mockReset();
+    vi.mocked(fs.unlinkSync).mockReset();
+  });
+
+  it('fires a synchronous curl POST to /api/agent/status with status=FAILED and the given failure_category', () => {
+    postTerminalStatusSync('task-c7-reassigned', 'reassigned', 'Task reassigned/deauthorized');
+
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd]) => cmd === 'curl',
+    );
+    // Without the fix the heartbeat path exits with no terminal POST at all —
+    // this assertion (a status POST WAS fired) is what fails pre-fix.
+    expect(curlCall).toBeDefined();
+    const args = curlCall?.[1] as string[];
+    // POSTs to the status endpoint (not the heartbeat endpoint).
+    expect(args.some((a) => a.includes('/api/agent/status'))).toBe(true);
+    // Body carries FAILED + the explicit reassignment category so the backend
+    // does not have to wait for the reaper to time the task out.
+    const bodyIdx = args.indexOf('-d');
+    const body = JSON.parse(args[bodyIdx + 1]) as Record<string, unknown>;
+    expect(body.status).toBe('FAILED');
+    expect(body.failure_category).toBe('reassigned');
+    expect(body.task_id).toBe('task-c7-reassigned');
+  });
+
+  it('is a no-op when taskId is empty (no spurious POST)', () => {
+    postTerminalStatusSync('', 'reassigned', 'no task');
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeUndefined();
+  });
+
+  it('retains the stale-result fallback file when the sync POST fails (no silent loss)', () => {
+    // curl throws (partition) — the stale-result file must survive so a later
+    // process / warm role retries the terminal status instead of losing it.
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('curl: timeout'); });
+    postTerminalStatusSync('task-c7-partition', 'reassigned', 'partitioned');
+    // The fallback file was written and NOT unlinked (unlink only happens on
+    // a successful POST).
+    const wrote = vi.mocked(fs.writeFileSync).mock.calls.some(
+      ([p]) => String(p).includes('task-c7-partition_result.json'),
+    );
+    expect(wrote).toBe(true);
+    const unlinked = vi.mocked(fs.unlinkSync).mock.calls.some(
+      ([p]) => String(p).includes('task-c7-partition_result.json'),
+    );
+    expect(unlinked).toBe(false);
+  });
+});
+
+describe('cancel flag (C7 reassignment shutdown signalling)', () => {
+  afterEach(() => { _resetCancelRequestedForTesting(); });
+
+  it('defaults to false and is observable via the test hook', () => {
+    _resetCancelRequestedForTesting();
+    expect(_isCancelRequestedForTesting()).toBe(false);
   });
 });
 
@@ -2963,20 +3052,40 @@ describe('mid-stream stall watchdog', () => {
     return { child, handlers, emitStdout };
   }
 
-  // Drive fake time forward in steps shorter than CLAUDE_STREAM_STALL_MS,
-  // emitting a no-op 'system' event between steps. Each emission flows through
-  // stdout.on('data') -> resetStallWatchdog(), keeping the stream-stall watchdog
-  // alive so we can isolate the tool-use stall watchdog under test. 'system'
-  // events do NOT mutate toolInFlight (only 'user' events do).
+  // Drive fake time forward in steps shorter than the SHORTEST relevant
+  // watchdog window, emitting a fresh assistant+tool_use+user burst between
+  // steps. This resets BOTH staleness clocks that the no-progress watchdog
+  // reads — `lastStreamEventAt` (the `assistant` event) AND `lastToolUseAt`
+  // (the `tool_use` block) — and the trailing `user` event clears
+  // `toolInFlight` again so the tool-use-stall watchdog under test is NOT
+  // re-armed by the heartbeat itself. The `assistant` event also flows through
+  // stdout.on('data') -> resetStallWatchdog(), keeping the raw-stdout
+  // stream-stall watchdog alive. Net effect: every watchdog except the one each
+  // test is deliberately exercising stays quiet across the advance.
+  //
+  // STEP must be shorter than every fireable window — the no-progress watchdog
+  // (LLM_NO_PROGRESS_STALL_MS) is the binding constraint after the C7 dual-
+  // staleness change, so step under that, leaving a 60s margin for the 60s
+  // watchdog tick.
   const advanceWithStreamHeartbeat = async (
     totalMs: number,
     emitStdout: (s: string) => void,
   ) => {
-    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 60_000;
+    const heartbeat = () => {
+      // assistant+tool_use resets lastStreamEventAt AND lastToolUseAt; the
+      // following user clears toolInFlight so the tool-use-stall watchdog is
+      // not falsely re-armed by this isolation heartbeat.
+      emitStdout(JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/heartbeat' } }] },
+      }));
+      emitStdout(JSON.stringify({ type: 'user' }));
+    };
     let remaining = totalMs;
     while (remaining > STEP) {
       await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(JSON.stringify({ type: 'system' }));
+      heartbeat();
       remaining -= STEP;
     }
     if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
@@ -3162,17 +3271,33 @@ describe('runProviderAgent stream-stall watchdog', () => {
     const promise = runProviderAgent('hello', ws, statusRef);
     await Promise.resolve();
 
-    // Emit data chunks just before the threshold, resetting the watchdog each time.
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 100);
-    emitData(Buffer.from('chunk1'));
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 100);
-    emitData(Buffer.from('chunk2'));
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 100);
+    // Emit a model 'assistant' content event just before the threshold each
+    // time. This resets BOTH the raw-stdout stream-stall watchdog (via
+    // stdout.on('data')) AND lastStreamEventAt (so the LLM-no-progress watchdog
+    // stays quiet — the C7 dual-staleness change makes a pure raw-byte chunk
+    // with no model content events trip the no-progress watchdog, which is
+    // correct behavior but not what this test exercises). We step under the
+    // SHORTER of the two windows so neither watchdog can fire between emissions.
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 100;
+    const contentEvent = JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'still working' }] },
+    }) + '\n';
+    await vi.advanceTimersByTimeAsync(STEP);
+    emitData(Buffer.from(contentEvent));
+    await vi.advanceTimersByTimeAsync(STEP);
+    emitData(Buffer.from(contentEvent));
+    await vi.advanceTimersByTimeAsync(STEP);
 
-    // Should not have fired SIGTERM yet — each chunk reset the watchdog.
+    // Should not have fired SIGTERM yet — each content event reset the
+    // stream-stall watchdog (and lastStreamEventAt kept the no-progress
+    // watchdog quiet).
     expect(killSpy).not.toHaveBeenCalledWith(-7002, 'SIGTERM');
 
     childHandlers.close?.(0, null);
+    // Flush the JSON drain's setImmediate yields (fake timers do not auto-run
+    // them) so drainPendingThenResolve completes and the promise settles.
+    await vi.runAllTimersAsync();
     await promise.catch(() => undefined);
     killSpy.mockRestore();
   });
@@ -3326,6 +3451,218 @@ describe('drainJsonChunks within-chunk yielding', () => {
 
     expect(result).toBeDefined();
     expect(result?.lastResultText).toBe('final-result-after-120-ticks');
+  });
+});
+
+// ── LLM-no-progress watchdog dual-staleness (cluster C7) ──────────────────────
+// Regression: the no-progress watchdog used to be gated on `!toolInFlight`. A
+// LOST tool-result event (`user`/item.completed) leaves toolInFlight stuck
+// `true`, which PERMANENTLY disabled the watchdog — a genuine provider hang
+// that happened to follow a tool call would never report and the call would
+// ride to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry burn. The fix
+// keys the watchdog off dual-staleness (content stream AND tool activity both
+// stale) so a stuck toolInFlight no longer disables it.
+describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-result)', () => {
+  type StdoutCb = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    const stdoutCbs: StdoutCb[] = [];
+    const handlers: ChildHandlers = {};
+    const child = {
+      pid,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, cb: StdoutCb) => {
+          if (event === 'data') stdoutCbs.push(cb);
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'close') handlers.close = cb as ChildHandlers['close'];
+        else if (event === 'error') handlers.error = cb as ChildHandlers['error'];
+      }),
+    };
+    const emitStdout = (line: string) => {
+      for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
+    };
+    return { child, handlers, emitStdout };
+  }
+
+  // Advance time while keeping the raw-stdout stall watchdog (CLAUDE_STREAM_STALL_MS)
+  // alive with periodic non-content 'system' events, so we isolate the
+  // no-progress watchdog. 'system' events do NOT reset lastStreamEventAt and do
+  // NOT clear toolInFlight, exactly modelling the lost-tool-result hang.
+  const advanceWithStreamHeartbeat = async (
+    totalMs: number,
+    emitStdout: (s: string) => void,
+  ) => {
+    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    let remaining = totalMs;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(JSON.stringify({ type: 'system' }));
+      remaining -= STEP;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearPidRegistry();
+  });
+
+  it('fires SIGTERM + RateLimitError when a tool_use is followed by a hang and the result event is LOST (toolInFlight stuck true)', async () => {
+    const { child, handlers, emitStdout } = makeChild(7801);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Tool issued — toolInFlight becomes true. CRUCIALLY: no matching `user`
+    // (tool result) event ever arrives, modelling a dropped/lost result event.
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/x' } }] },
+    }));
+
+    // Provider then hangs. Advance well past the no-progress window with only
+    // raw-stdout 'system' heartbeats keeping the stream-stall watchdog alive.
+    // Pre-fix (the `!toolInFlight` gate) this NEVER fires because toolInFlight
+    // is stuck true; post-fix the dual-staleness gate fires once both content
+    // and tool activity are stale.
+    await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
+
+    expect(killSpy).toHaveBeenCalledWith(-7801, 'SIGTERM');
+
+    // The watchdog reports the hang as a rate-limit (no retry-budget burn).
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+    await expect(promise).rejects.toBeInstanceOf(RateLimitError);
+
+    killSpy.mockRestore();
+  });
+
+  it('does NOT fire while a tool is legitimately producing fresh tool_use events', async () => {
+    const { child, handlers, emitStdout } = makeChild(7802);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Emit fresh tool_use events periodically — lastToolUseAt stays current, so
+    // the dual-staleness gate must NOT trip (a long legitimate tool run).
+    const STEP = LLM_NO_PROGRESS_STALL_MS - 120_000;
+    for (let i = 0; i < 3; i++) {
+      emitStdout(JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: `step ${i}` } }] },
+      }));
+      await vi.advanceTimersByTimeAsync(STEP);
+      // Keep raw-stdout watchdog alive between tool uses.
+      emitStdout(JSON.stringify({ type: 'system' }));
+    }
+
+    expect(killSpy).not.toHaveBeenCalledWith(-7802, 'SIGTERM');
+
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    // close() triggers drainPendingThenResolve, whose drain loop yields via
+    // `await new Promise(r => setImmediate(r))`. Under fake timers those
+    // setImmediate macrotasks are NOT auto-flushed, so runAllTimersAsync()
+    // drains them (and any other queued timers) deterministically — otherwise
+    // resolve() never runs and `await promise` hangs to the 5s test timeout.
+    await vi.runAllTimersAsync();
+    await promise.catch(() => undefined);
+    killSpy.mockRestore();
+  });
+});
+
+// ── final drain awaits in-flight drain (cluster C7) ───────────────────────────
+// Regression: drainPendingThenResolve's boolean mutex made drainJsonChunks()
+// early-return when a drain was already active, so the process promise resolved
+// while a drain was still mid-flight — unprocessed chunks (and their result
+// text / token telemetry) were silently dropped at process exit. The fix makes
+// the drain mutex an awaitable Promise the close handler awaits.
+describe('final drain awaits in-flight drain before resolving (C7)', () => {
+  type StdoutHandler = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    let stdoutHandler: StdoutHandler | null = null;
+    const childHandlers: ChildHandlers = {};
+    const fakeChild = {
+      pid,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, handler: StdoutHandler) => {
+          if (event === 'data') stdoutHandler = handler;
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
+        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+      }),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+    };
+    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
+  }
+
+  beforeEach(() => {
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    clearPidRegistry();
+  });
+
+  it('captures the result event from a large chunk even when close fires while the drain is still in flight', async () => {
+    const { fakeChild, childHandlers, emitData } = makeChild(8101);
+    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // A heavy multi-line chunk whose drain yields several times to the event
+    // loop. The trailing 'result' line is processed LAST — so if close resolves
+    // the promise before the in-flight drain finishes, lastResultText is lost.
+    const lines: string[] = [];
+    for (let i = 0; i < 400; i++) {
+      lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
+    }
+    lines.push(JSON.stringify({ type: 'result', result: 'drain-must-complete-before-resolve' }));
+    emitData(Buffer.from(lines.join('\n') + '\n'));
+
+    // Fire close IMMEDIATELY — before the (awaiting) drain has finished. The fix
+    // makes drainPendingThenResolve await the in-flight drain promise; pre-fix
+    // the boolean mutex early-returned and resolve() fired with the result line
+    // still unprocessed.
+    childHandlers.close?.(0, null);
+
+    const result = await promise;
+    expect(result.lastResultText).toBe('drain-must-complete-before-resolve');
   });
 });
 

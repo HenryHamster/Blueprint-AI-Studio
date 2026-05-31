@@ -581,12 +581,26 @@ echo ""
     // the call ride to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry-
     // budget burn → terminal failure of a healthy task (incident 2026-05-29).
     let llmProgressWatchdog: NodeJS.Timeout | null = setInterval(() => {
+      // Dual-staleness gate (cluster C7). The original `!toolInFlight` gate is
+      // disabled forever if the `user`/item.completed result event that clears
+      // toolInFlight is ever lost — a stuck toolInFlight=true means a genuine
+      // provider hang that happens to follow a tool call never reports, and the
+      // call rides to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry
+      // burn (the exact failure #6865 was meant to prevent). Keying off
+      // staleness instead: fire when BOTH the content stream AND any in-flight
+      // tool activity are stale. A legitimately long tool keeps lastToolUseAt
+      // fresh (its result event would too, but even a lost result no longer
+      // wedges us — once lastToolUseAt itself ages past the window with no new
+      // content, the run is genuinely stuck and we report it).
+      const contentStale = Date.now() - lastStreamEventAt > LLM_NO_PROGRESS_STALL_MS;
+      const toolActivityStale =
+        lastToolUseAt === null || Date.now() - lastToolUseAt > LLM_NO_PROGRESS_STALL_MS;
       if (
-        !toolInFlight &&
-        Date.now() - lastStreamEventAt > LLM_NO_PROGRESS_STALL_MS &&
+        contentStale &&
+        toolActivityStale &&
         processGroupStillOwned()
       ) {
-        sendLog(ws, `\n[runtime] llm-no-progress: no model content event for >${LLM_NO_PROGRESS_STALL_MS / 60000} min with no tool in flight — likely a provider hang (429/529 absorbed by SDK retry). Sending SIGTERM; reporting rate_limited.\n`);
+        sendLog(ws, `\n[runtime] llm-no-progress: no model content event or tool activity for >${LLM_NO_PROGRESS_STALL_MS / 60000} min — likely a provider hang (429/529 absorbed by SDK retry). Sending SIGTERM; reporting rate_limited.\n`);
         flags.llmNoProgressHang = true;
         if (llmProgressWatchdog) { clearInterval(llmProgressWatchdog); llmProgressWatchdog = null; }
         const pid = originalPid;
@@ -635,11 +649,16 @@ echo ""
     }
 
     const pendingJsonChunks: string[] = [];
-    let drainingJsonChunks = false;
+    // Awaitable drain mutex (cluster C7). The drain runs as a single
+    // serialized async loop; a second caller must be able to AWAIT the
+    // in-flight run rather than early-returning (the old boolean-only mutex
+    // resolved the process promise while a drain was still mid-flight, so the
+    // final unprocessed chunks — and their telemetry/result text — were
+    // silently dropped at process exit). activeJsonDrain holds the in-flight
+    // promise; drainJsonChunks() returns it so close/error can await completion.
+    let activeJsonDrain: Promise<void> | null = null;
     const HEAVY_CHUNK_BYTES = 256 * 1024;
-    const drainJsonChunks = async () => {
-      if (drainingJsonChunks) return;
-      drainingJsonChunks = true;
+    const runJsonDrain = async () => {
       try {
         while (pendingJsonChunks.length > 0) {
           const chunk = pendingJsonChunks.shift();
@@ -739,12 +758,20 @@ echo ""
           await new Promise(r => setImmediate(r));
         }
       } finally {
-        drainingJsonChunks = false;
+        activeJsonDrain = null;
       }
+    };
+    // Returns the in-flight drain promise so callers (close/error final drain)
+    // can await it. Starts a new drain only if none is running; a running drain
+    // already loops until pendingJsonChunks is empty, so pushing more chunks and
+    // awaiting the same promise is safe.
+    const drainJsonChunks = (): Promise<void> => {
+      if (!activeJsonDrain) activeJsonDrain = runJsonDrain();
+      return activeJsonDrain;
     };
 
     const pendingCodexChunks: string[] = [];
-    let drainingCodexChunks = false;
+    let activeCodexDrain: Promise<void> | null = null;
     let codexCarry = '';
     const _codexToolNameForItem = (item: unknown): string | null => {
       if (!item || typeof item !== 'object') return null;
@@ -787,9 +814,7 @@ echo ""
           return '';
       }
     };
-    const drainCodexChunks = async () => {
-      if (drainingCodexChunks) return;
-      drainingCodexChunks = true;
+    const runCodexDrain = async () => {
       try {
         while (pendingCodexChunks.length > 0) {
           const chunk = pendingCodexChunks.shift();
@@ -903,8 +928,12 @@ echo ""
           await new Promise(r => setImmediate(r));
         }
       } finally {
-        drainingCodexChunks = false;
+        activeCodexDrain = null;
       }
+    };
+    const drainCodexChunks = (): Promise<void> => {
+      if (!activeCodexDrain) activeCodexDrain = runCodexDrain();
+      return activeCodexDrain;
     };
 
     child.stdout.on('data', (data: Buffer) => {
@@ -940,10 +969,18 @@ echo ""
 
     const drainPendingThenResolve = async (resolveValue: number) => {
       try {
-        if (pendingJsonChunks.length > 0 || drainingJsonChunks) {
+        // Await the in-flight drain (if any) AND any leftover queued chunks.
+        // The old boolean mutex made drainJsonChunks() early-return when a
+        // drain was already active, so resolve() fired before the in-flight
+        // run finished — unprocessed chunks (and their result text / token
+        // telemetry) were silently lost at process exit. Now drainJsonChunks()
+        // returns the in-flight promise; awaiting it guarantees completion.
+        // Loop to catch chunks that the data handler pushed while we awaited
+        // (a fresh drain wouldn't be re-armed once activeJsonDrain cleared).
+        while (activeJsonDrain || pendingJsonChunks.length > 0) {
           await drainJsonChunks();
         }
-        if (pendingCodexChunks.length > 0 || drainingCodexChunks) {
+        while (activeCodexDrain || pendingCodexChunks.length > 0) {
           await drainCodexChunks();
         }
       } catch (e) {

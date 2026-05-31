@@ -1504,6 +1504,7 @@ class TestFailureClassificationInvariants:
             INFRA_CLASSES,
             PROVISION_FAILURE,
             RATE_LIMIT,
+            REASSIGNED,
             SCOPE_EMPTY,
             SCOPE_OVERFLOW,
         )
@@ -1518,6 +1519,7 @@ class TestFailureClassificationInvariants:
                 SCOPE_OVERFLOW,
                 BLOCKED_PRECONDITION,
                 SCOPE_EMPTY,
+                REASSIGNED,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

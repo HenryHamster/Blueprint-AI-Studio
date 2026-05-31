@@ -23,6 +23,7 @@ from app.failure_classification import (
     MIGRATION_ERROR,
     PROVISION_FAILURE,
     RATE_LIMIT,
+    REASSIGNED,
     BLOCKED_PRECONDITION,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
@@ -364,6 +365,38 @@ class TestNormalizeAgentFailureCategory:
             {"failure_category": "build_failed"},
         )
         assert classify_failure(task) == PROVISION_FAILURE
+
+    def test_reassigned_routes_to_reassigned_class(self):
+        """Agent self-terminates gracefully on a non-transient heartbeat 4xx
+        (reassignment/deauth) or cancel/supersede during startup and posts
+        failure_category='reassigned' (cluster C7). It must canonicalize to the
+        REASSIGNED class — NOT CODE_ERROR — so an intentional handoff is not
+        treated as a code fault."""
+        task = _task("Task reassigned/deauthorized — agent self-terminating")
+        assert normalize_agent_failure_category("reassigned", task) == REASSIGNED
+
+    def test_reassigned_does_not_burn_retry_budget_or_penalize_health(self):
+        """REASSIGNED must be in INFRA_CLASSES so the retry-budget reducer and
+        direction-health analytics treat it as infra (no budget burn, no health
+        penalty), matching the other graceful-exit classes (SCOPE_EMPTY etc.)."""
+        from app.failure_classification import INFRA_CLASSES
+
+        assert REASSIGNED in INFRA_CLASSES
+        assert REASSIGNED != CODE_ERROR
+
+    def test_reassigned_in_all_failure_classes(self):
+        task = _task("Task reassigned/deauthorized")
+        assert normalize_agent_failure_category("reassigned", task) == REASSIGNED
+        assert REASSIGNED in ALL_FAILURE_CLASSES
+
+    def test_reassigned_via_context_fast_path(self):
+        """classify_failure's context['failure_category'] fast path also honors
+        the lowercase 'reassigned' label (the agent writes it into context)."""
+        task = _task(
+            "Task reassigned/deauthorized — agent self-terminating",
+            {"failure_category": "reassigned"},
+        )
+        assert classify_failure(task) == REASSIGNED
 
 
 class TestClassifyFailureCodeError:

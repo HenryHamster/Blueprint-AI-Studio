@@ -67,6 +67,7 @@ from app.failure_classification import (
     MIGRATION_ERROR,
     PROVISION_FAILURE,
     RATE_LIMIT,
+    REASSIGNED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
     VIEWPORT_REGRESSION,
@@ -90,6 +91,7 @@ _FAILURE_CLASS_LABELS = {
     AGENT_STALLED: "Agent Stalled",
     BLOCKED_PRECONDITION: "Blocked — precondition",
     SCOPE_EMPTY: "Scope Empty",
+    REASSIGNED: "Agent Reassigned",
 }
 
 

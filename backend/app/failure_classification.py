@@ -138,6 +138,14 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # that prefix) and exits; the classifier routes to this class exactly as it does
 # for BLOCKED_PRECONDITION / "BLOCKER:" prefix detection.
 SCOPE_EMPTY = "SCOPE_EMPTY"
+# Agent self-terminated because the task is no longer assigned to its VM — a
+# non-transient heartbeat 4xx (401/403/404) signalling reassignment/deauth, or
+# the task was cancelled/superseded during startup. The agent did the right
+# thing by handing off gracefully (it posts this category synchronously from the
+# self-terminate path so the task isn't left IN_PROGRESS until the reaper times
+# it out → false AGENT_TIMEOUT). This is NOT a code defect: it must NOT consume
+# the retry budget or penalize direction health, so it lives in INFRA_CLASSES.
+REASSIGNED = "REASSIGNED"
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -266,6 +274,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         BLOCKED_PRECONDITION,
         AGENT_STALLED,
         SCOPE_EMPTY,
+        REASSIGNED,
     }
 )
 
@@ -282,6 +291,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
     SCOPE_EMPTY,
+    REASSIGNED,
 )
 
 
@@ -493,6 +503,15 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # ``scope_empty`` — agent-emitted when declared related_files were already
     # covered by a sibling cluster's merged PR; exits cleanly without retries.
     "scope_empty": SCOPE_EMPTY,
+    # ``reassigned`` — agent self-terminated gracefully because the task is no
+    # longer assigned to its VM (non-transient heartbeat 4xx = reassignment/
+    # deauth, or cancel/supersede during startup). Posted synchronously from the
+    # self-terminate path (cluster C7) so the task gets a terminal FAILED status
+    # instead of being stranded IN_PROGRESS until the reaper times it out (false
+    # AGENT_TIMEOUT, discarded work). An intentional handoff is NOT a code
+    # defect — REASSIGNED is in INFRA_CLASSES so it neither burns the retry
+    # budget nor penalizes direction health.
+    "reassigned": REASSIGNED,
 }
 
 
