@@ -111,11 +111,16 @@ class TestOnboardAutoRemediation:
         assert "master" not in ar["branch_whitelist"]
 
     @pytest.mark.asyncio
-    async def test_onboard_sets_integration_branch_from_detected_default(
+    async def test_onboard_sets_branch_columns_from_detected_default(
         self, client: AsyncClient, db_session
     ):
-        """integration_branch column is populated from detected default branch on onboard."""
-        from app.shared_state import get_project_integration_branch
+        """Both integration_branch and promotion_target columns are populated
+        from the detected default branch on onboard (and the matching
+        get_project_* helpers resolve to the same value)."""
+        from app.shared_state import (
+            get_project_integration_branch,
+            get_project_promotion_target,
+        )
 
         with (
             patch(
@@ -143,41 +148,8 @@ class TestOnboardAutoRemediation:
         data = resp.json()
         project = await db_session.get(Project, data["project_id"])
         assert project.integration_branch == "master"
-        assert get_project_integration_branch(project) == "master"
-
-    @pytest.mark.asyncio
-    async def test_onboard_sets_promotion_target_from_detected_default(
-        self, client: AsyncClient, db_session
-    ):
-        """promotion_target column is populated from detected default branch on onboard."""
-        from app.shared_state import get_project_promotion_target
-
-        with (
-            patch(
-                "app.routers.admin_onboard._detect_build_config",
-                new_callable=AsyncMock,
-                return_value={},
-            ),
-            patch(
-                "app.github.get_repo_installation_token",
-                new_callable=AsyncMock,
-                return_value="tok",
-            ),
-            patch(
-                "app.github.get_repo_default_branch",
-                new_callable=AsyncMock,
-                return_value="master",
-            ),
-        ):
-            resp = await client.post(
-                "/api/admin/projects/onboard",
-                json={"github_owner": "acme", "github_repo": "myrepo4"},
-            )
-
-        assert resp.status_code == 200
-        data = resp.json()
-        project = await db_session.get(Project, data["project_id"])
         assert project.promotion_target == "master"
+        assert get_project_integration_branch(project) == "master"
         assert get_project_promotion_target(project) == "master"
 
     @pytest.mark.asyncio

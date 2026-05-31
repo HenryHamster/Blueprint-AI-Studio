@@ -1605,6 +1605,17 @@ class TestClassifyCheckRuns:
     def test_in_progress_is_pending(self):
         assert rq._classify_check_runs({"status": "in_progress"}) == rq._CI_PENDING
 
+    def test_conclusion_without_status_is_pending_not_red(self):
+        """A conclusion with NO status falls through to the safe default
+        (pending), never silently RED/GREEN. This partial shape is never
+        produced by github_checks.get_check_runs — which always emits a
+        "completed" status alongside a "failure"/"success" conclusion — so the
+        defensive fall-through is correct, not a misroute. (The old CI-red
+        run_qualification test relied on this exact shape and so passed for the
+        wrong reason; it now sends the faithful completed+failure shape.)"""
+        assert rq._classify_check_runs({"conclusion": "failure"}) == rq._CI_PENDING
+        assert rq._classify_check_runs({"conclusion": "success"}) == rq._CI_PENDING
+
 
 # ===========================================================================
 # _resolve_candidate_ci — qualifier-scoped strict CI resolver
@@ -2149,9 +2160,16 @@ async def test_run_qualification_records_ci_red(db_session, mocker):
         "app.github.get_branch_sha",
         new=AsyncMock(return_value="dead" * 10),
     )
+    # The real get_check_runs_cached always emits ``status`` alongside
+    # ``conclusion`` (a "failure" conclusion is only ever produced with
+    # status="completed" — see github_checks.get_check_runs). Without the
+    # status key the prod classifier (_classify_check_runs) falls through to
+    # _CI_PENDING, so the old {"conclusion": "failure"} mock passed for the
+    # wrong reason (ci_green is False under BOTH pending and red). The faithful
+    # shape exercises the actual red-build branch.
     mocker.patch(
         "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "failure"}),
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "failure"}),
     )
 
     result = await rq.run_qualification(db_session, project.id, version)
@@ -2159,8 +2177,10 @@ async def test_run_qualification_records_ci_red(db_session, mocker):
 
     assert result["status"] == "spawned"
     assert result["ci_green"] is False
+    assert result["ci_state"] == "red"
     await db_session.refresh(version)
     assert version.last_qualification["ci_green"] is False
+    assert version.last_qualification["ci_state"] == "red"
 
 
 @pytest.mark.asyncio

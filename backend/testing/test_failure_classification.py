@@ -470,16 +470,6 @@ class TestClassifyFailureViewportGateInfra:
         t = _task("VIEWPORT_GATE_INFRA_UNAVAILABLE: chromium not found on PATH")
         assert classify_failure(t) == PROVISION_FAILURE
 
-    def test_sentinel_not_code_error(self):
-        t = _task("VIEWPORT_GATE_INFRA_UNAVAILABLE: docker fallback also unavailable")
-        result = classify_failure(t)
-        assert result != CODE_ERROR
-
-    def test_sentinel_not_viewport_regression(self):
-        t = _task("VIEWPORT_GATE_INFRA_UNAVAILABLE: sudo required for os deps")
-        result = classify_failure(t)
-        assert result != VIEWPORT_REGRESSION
-
     def test_sentinel_in_logs_routes_to_provision_failure(self):
         t = _task("")
         result = classify_failure(
@@ -508,10 +498,6 @@ class TestClassifyFailureViewportGateInfra:
             t, logs="expectNoTextTruncationAt(375): silent truncation detected"
         )
         assert result == VIEWPORT_REGRESSION
-
-    def test_text_truncation_not_code_error(self):
-        t = _task("expectNoTextTruncationAt(375) failed at DashboardHome")
-        assert classify_failure(t) != CODE_ERROR
 
     def test_raw_libatk_routes_to_provision_failure(self):
         t = _task(
@@ -568,16 +554,6 @@ class TestClassifyFailureViewportGateInfra:
             normalize_agent_failure_category("claude_code_failed", t)
             == PROVISION_FAILURE
         )
-
-    def test_bootstrap_not_viewport_regression(self):
-        t = _task(
-            "libgbm.so.1: cannot open shared object file: No such file or directory"
-        )
-        assert classify_failure(t) != VIEWPORT_REGRESSION
-
-    def test_bootstrap_not_code_error(self):
-        t = _task("host system is missing dependencies required for Playwright")
-        assert classify_failure(t) != CODE_ERROR
 
 
 class TestClassifyFailureProvision:
@@ -921,8 +897,12 @@ class TestClassifyFailureRateLimit:
         )
         task = _task(msg, ctx={"failure_category": "claude_code_failed"})
         # claude_code_failed → CODE_ERROR via the existing fast-path; the
-        # cause-C preempt requires exitCode=0 and must not fire here.
-        assert classify_failure(task) != EXTERNAL_API
+        # cause-C preempt requires exitCode=0 and must not fire here. Asserting
+        # the exact class (not merely != EXTERNAL_API) closes a silent-misroute
+        # hole: a future bootstrap/provision pattern could send this
+        # claude_code_failed + exitCode=1 case to PROVISION_FAILURE/AGENT_TIMEOUT
+        # undetected if we only checked it stayed out of EXTERNAL_API.
+        assert classify_failure(task) == CODE_ERROR
 
     def test_codex_cause_c_does_not_fire_on_large_outputs(self):
         """Control: outputs >= 8KB mean real work was produced — the

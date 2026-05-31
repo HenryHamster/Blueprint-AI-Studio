@@ -454,14 +454,31 @@ class TestNullBranchConfigDiagnostics:
             integration_branch="develop",
             promotion_target="release",
         )
-        db_session.add_all([self_repo, configured])
+        # Non-self-repo project with a null integration_branch: this is the only
+        # input that exercises the endpoint's main (else) branch, so the project
+        # must land in data["projects"] rather than self_repo_skipped.
+        misconfigured = Project(
+            name="Misconfigured",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="misconfigured-repo",
+            is_self_repo=False,
+        )
+        db_session.add_all([self_repo, configured, misconfigured])
         await db_session.commit()
 
         resp = await client.get("/api/admin/diagnostics/null-branch-config")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["total"] == 1
-        assert data["projects"] == []
+        assert data["total"] == 2
+        assert len(data["projects"]) == 1
+        listed = data["projects"][0]
+        assert listed["id"] == str(misconfigured.id)
+        assert listed["name"] == "Misconfigured"
+        assert listed["github_owner"] == "acme"
+        assert listed["github_repo"] == "misconfigured-repo"
+        assert listed["is_self_repo"] is False
+        assert "created_at" in listed
         assert len(data["self_repo_skipped"]) == 1
         skipped = data["self_repo_skipped"][0]
         assert skipped["id"] == str(self_repo.id)
@@ -1323,14 +1340,23 @@ class TestAutonomousMode:
     @pytest.mark.asyncio
     async def test_get_autonomous_status(self, client: AsyncClient, db_session):
         """Returns autonomous status summary across all user projects."""
+        from app.shared_state import runtime_config
+
         project = await _make_project(db_session, name="Auto Project")
 
         resp = await client.get("/api/admin/autonomous-status")
         assert resp.status_code == 200
         data = resp.json()
         assert "projects" in data
-        ids = [p["project_id"] for p in data["projects"]]
-        assert str(project.id) in ids
+        by_id = {p["project_id"]: p for p in data["projects"]}
+        assert str(project.id) in by_id
+        entry = by_id[str(project.id)]
+        # Freshly created project: autonomous_enabled defaults True (model default),
+        # no failures and no autonomous tasks spawned yet, rate_limit mirrors config.
+        assert entry["autonomous_enabled"] is True
+        assert entry["consecutive_failures"] == 0
+        assert entry["tasks_spawned_last_hour"] == 0
+        assert entry["rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
 
     @pytest.mark.asyncio
     async def test_get_direction_task_counts(self, client: AsyncClient, db_session):
@@ -2407,7 +2433,7 @@ class TestPlaybook:
     async def test_playbook_set_with_applicable_types(
         self, client: AsyncClient, db_session
     ):
-        """Entry can specify which task types it applies to."""
+        """Entry can specify which task types it applies to, and they persist."""
         project = await _make_project(db_session)
 
         resp = await client.put(
@@ -2419,6 +2445,13 @@ class TestPlaybook:
             },
         )
         assert resp.status_code == 200
+
+        # Read the entry back: applicable_types must round-trip through storage.
+        read = await client.get(f"/api/admin/projects/{project.id}/playbook")
+        assert read.status_code == 200
+        entries = read.json()["entries"]
+        assert "typed-tip" in entries
+        assert entries["typed-tip"]["applicable_types"] == ["create", "fix"]
 
     @pytest.mark.asyncio
     async def test_playbook_set_invalid_applicable_type_returns_400(
