@@ -59,11 +59,60 @@ def _backlog_scan_limit() -> int:
 
 
 def _teardown_defer_secs() -> int:
+    # Unconditional minimum hold (seconds) before activity-gating begins. Covers
+    # the first /api/agent/next-role poll round-trip, which records the VM
+    # heartbeat the grace loop's activity gate then reads — so the gate never
+    # evicts a VM before its agent has had a chance to poll even once.
     return _runtime_int(
         "warm_backlog_teardown_defer_secs",
         20,
         min_value=5,
         max_value=120,
+    )
+
+
+def _grace_window_secs() -> int:
+    # Bounded ceiling (seconds) for the activity-gated teardown grace window:
+    # the longest a just-idle COMPLETED VM with eligible backlog is held while
+    # its agent keeps polling /api/agent/next-role. Sized to the agent's poll
+    # ceiling (next_role_poll_timeout_secs, default 180) so the held VM lives no
+    # longer than the agent actually polls. The activity gate (below) releases
+    # sooner if the agent stops heartbeating, so this is a worst-case cap, not a
+    # fixed hold. The teardown loop floors this at _teardown_defer_secs() so the
+    # ceiling can never undercut the unconditional minimum hold.
+    return _runtime_int(
+        "warm_backlog_grace_window_secs",
+        180,
+        min_value=5,
+        max_value=600,
+    )
+
+
+def _grace_idle_cutoff_secs() -> int:
+    # Activity gate threshold (seconds). If the held VM has not heartbeated (via
+    # its /next-role poll or vm-heartbeat) within this many seconds, the agent is
+    # treated as gone (gave up / process exited / VM preempted) and teardown is
+    # released early rather than holding an idle VM to the ceiling. Comfortably
+    # exceeds the agent's ~5s poll cadence so a couple of missed polls do not
+    # evict a still-live agent.
+    return _runtime_int(
+        "warm_backlog_grace_idle_secs",
+        30,
+        min_value=10,
+        max_value=120,
+    )
+
+
+def _grace_poll_interval_secs() -> int:
+    # How often the teardown loop re-checks (claimed-work + liveness) while
+    # holding the VM. Kept at the agent's poll cadence so the loop reacts within
+    # one agent round-trip; clamped so a misconfigured value cannot busy-spin or
+    # overshoot the gate.
+    return _runtime_int(
+        "warm_backlog_grace_poll_interval_secs",
+        5,
+        min_value=1,
+        max_value=30,
     )
 
 
@@ -305,6 +354,14 @@ _scan_skipped_pinned_vm_events: deque = deque(maxlen=500)
 _scan_skipped_file_conflict_events: deque = deque(maxlen=500)
 _scan_saturated_events: deque = deque(maxlen=500)
 
+# Grace-window (activity-gated teardown hold) stage events. Each entry is a
+# single _utcnow() per occurrence. Extensions count how many poll intervals a
+# held VM survived because its agent was still polling; idle-releases and
+# ceiling-releases count the two bounded exits when no claim happened.
+_grace_window_extension_events: deque = deque(maxlen=500)
+_grace_idle_release_events: deque = deque(maxlen=500)
+_grace_ceiling_release_events: deque = deque(maxlen=500)
+
 
 def record_scan_skipped_depends_on() -> None:
     """Stage A: an eligibility scan skipped >=1 candidate for unresolved depends_on."""
@@ -325,6 +382,24 @@ def record_scan_saturated() -> None:
     """Stage A: an eligibility scan hit the per-poll _backlog_scan_limit()
     (runtime key ``warm_backlog_scan_limit``)."""
     _scan_saturated_events.append(_utcnow())
+
+
+def record_grace_window_extension() -> None:
+    """Grace stage: a held VM survived another poll interval because its agent
+    was still actively polling (activity gate held the VM open)."""
+    _grace_window_extension_events.append(_utcnow())
+
+
+def record_grace_idle_release() -> None:
+    """Grace stage: a held VM was torn down early because its agent stopped
+    heartbeating before the bounded ceiling (activity gate fired)."""
+    _grace_idle_release_events.append(_utcnow())
+
+
+def record_grace_ceiling_release() -> None:
+    """Grace stage: a held VM reached the bounded grace ceiling without claiming
+    work and was torn down."""
+    _grace_ceiling_release_events.append(_utcnow())
 
 
 def record_vm_with_eligible_backlog() -> None:
@@ -393,6 +468,15 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         ),
         "scan_polls_saturated": sum(
             1 for ts in _scan_saturated_events if ts >= cutoff
+        ),
+        "grace_window_extensions": sum(
+            1 for ts in _grace_window_extension_events if ts >= cutoff
+        ),
+        "grace_idle_releases": sum(
+            1 for ts in _grace_idle_release_events if ts >= cutoff
+        ),
+        "grace_ceiling_releases": sum(
+            1 for ts in _grace_ceiling_release_events if ts >= cutoff
         ),
     }
 
