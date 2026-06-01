@@ -1550,6 +1550,8 @@ def compute_narrative_summary(
     pr_count: int,
     error_log_map: Dict[str, str],
     failed_tasks: List[Task],
+    outer_loop_convergence_summary: Dict[str, Any] | None = None,
+    outer_loop_convergence_trend: Dict[str, Any] | None = None,
 ) -> str:
     """Build the human-readable digest narrative from precomputed metrics."""
     from app.failure_classification import (
@@ -1641,6 +1643,46 @@ def compute_narrative_summary(
                 _tax_msg = _taxonomy_msgs.get(_dom_cat)
                 if _tax_msg:
                     narrative_parts.append(_tax_msg)
+
+    if outer_loop_convergence_summary and outer_loop_convergence_trend:
+        buckets = outer_loop_convergence_trend.get("buckets") or []
+        churn_dir = (
+            outer_loop_convergence_trend.get("churn_direction")
+            or outer_loop_convergence_trend.get("trend")
+        )
+        if len(buckets) >= 2:
+            first = buckets[0].get("incidence_counts", {}).get("churn")
+            if first is None:
+                first = buckets[0].get("churn_total")
+            last = buckets[-1].get("incidence_counts", {}).get("churn")
+            if last is None:
+                last = buckets[-1].get("churn_total")
+            has_churn_signal = any(
+                (b.get("incidence_counts", {}).get("churn") or b.get("churn_total") or 0) > 0
+                for b in buckets
+            )
+            if first is not None and last is not None and has_churn_signal:
+                churn_dir = (
+                    churn_dir
+                    if churn_dir in {"falling", "rising", "flat"}
+                    else "flat"
+                )
+                if last < first:
+                    churn_dir = "falling"
+                elif last > first:
+                    churn_dir = "rising"
+                verdict = f"Review/fix churn is {churn_dir}"
+                dominant_blocker = outer_loop_convergence_summary.get("dominant_blocker")
+                if (
+                    dominant_blocker
+                    and dominant_blocker.get("count")
+                    and dominant_blocker.get("total")
+                ):
+                    verdict += (
+                        f"; the main blocker is {dominant_blocker['cause'].replace('_', ' ')}"
+                        f" ({dominant_blocker['count']}/{dominant_blocker['total']} non-converged PR chains)"
+                    )
+                narrative_parts.append(verdict + ".")
 
     if completed_count > 0:
         trend_prefix = ""
