@@ -78,7 +78,6 @@ import {
 import {
   MAX_TEST_FIX_ATTEMPTS,
   TOOL_USE_STALL_TIMEOUT_MS,
-  WORKFLOW_TOOL_STALL_TIMEOUT_MS,
   isWorkflowToolName,
   CLAUDE_STREAM_STALL_MS,
   LLM_NO_PROGRESS_STALL_MS,
@@ -3145,9 +3144,8 @@ describe('mid-stream stall watchdog', () => {
   // test is deliberately exercising stays quiet across the advance.
   //
   // STEP must be shorter than every fireable window — the no-progress watchdog
-  // (LLM_NO_PROGRESS_STALL_MS) is the binding constraint after the C7 dual-
-  // staleness change, so step under that, leaving a 60s margin for the 60s
-  // watchdog tick.
+  // (LLM_NO_PROGRESS_STALL_MS) is the binding constraint, so step under that,
+  // leaving a 60s margin for the 60s watchdog tick.
   const advanceWithStreamHeartbeat = async (
     totalMs: number,
     emitStdout: (s: string) => void,
@@ -3355,10 +3353,11 @@ describe('runProviderAgent stream-stall watchdog', () => {
     // Emit a model 'assistant' content event just before the threshold each
     // time. This resets BOTH the raw-stdout stream-stall watchdog (via
     // stdout.on('data')) AND lastStreamEventAt (so the LLM-no-progress watchdog
-    // stays quiet — the C7 dual-staleness change makes a pure raw-byte chunk
-    // with no model content events trip the no-progress watchdog, which is
-    // correct behavior but not what this test exercises). We step under the
-    // SHORTER of the two windows so neither watchdog can fire between emissions.
+    // stays quiet — with no tool in flight, a pure raw-byte chunk that carries
+    // no model content event would let lastStreamEventAt go stale and trip the
+    // no-progress watchdog, which is correct behavior but not what this test
+    // exercises). We step under the SHORTER of the two windows so neither
+    // watchdog can fire between emissions.
     const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 100;
     const contentEvent = JSON.stringify({
       type: 'assistant',
@@ -3571,15 +3570,25 @@ describe('drainJsonChunks within-chunk yielding', () => {
   });
 });
 
-// ── LLM-no-progress watchdog dual-staleness (cluster C7) ──────────────────────
-// Regression: the no-progress watchdog used to be gated on `!toolInFlight`. A
-// LOST tool-result event (`user`/item.completed) leaves toolInFlight stuck
-// `true`, which PERMANENTLY disabled the watchdog — a genuine provider hang
-// that happened to follow a tool call would never report and the call would
-// ride to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry burn. The fix
-// keys the watchdog off dual-staleness (content stream AND tool activity both
-// stale) so a stuck toolInFlight no longer disables it.
-describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-result)', () => {
+// ── LLM-no-progress watchdog: in-flight-tool suppression ──────────────────────
+// The no-progress watchdog exists for ONE failure mode: a silent provider hang
+// (429/529 the SDK retries internally) while the SDK is mid-completion-request
+// — which by definition happens with NO tool in flight. It fires ONLY when
+// `!toolInFlight && contentStale`.
+//
+// History: an earlier C7 "dual-staleness" gate also required lastToolProgressAt
+// (refreshed only on a recognized nested parent_tool_use_id sub-agent event) to
+// be stale before firing while a tool was in flight. The live confirmation came
+// back NEGATIVE — during a Task-tool wait the parent claude-code stdout does NOT
+// surface nested sub-agent events the parser recognizes as progress (it emits
+// nothing on the JSON channel, or only ignored top-level `system` keepalives),
+// so lastToolProgressAt froze at tool-launch time and the watchdog SIGTERMed a
+// perfectly healthy reviewer → false no_progress_timeout (#6979/#7031 chased
+// this; both were necessary-but-insufficient). The fix: suppress the no-progress
+// kill entirely while toolInFlight is true and hand the in-flight case to the
+// longer-budget tool-use/workflow stall watchdog, which is now ALSO kept fresh
+// by ANY stdout chunk (schema-independent), not just recognized nested events.
+describe('LLM-no-progress watchdog (in-flight-tool suppression)', () => {
   type StdoutCb = (data: Buffer) => void;
   type ChildHandlers = {
     close?: (code: number | null, signal: NodeJS.Signals | null) => void;
@@ -3641,7 +3650,16 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
     clearPidRegistry();
   });
 
-  it('fires SIGTERM + NoProgressTimeoutError when a tool_use is followed by a hang and the result event is LOST (toolInFlight stuck true)', async () => {
+  it('does NOT fire (no SIGTERM, no NoProgressTimeoutError) while a Task tool is in flight and the parent stream emits only top-level system keepalives for >15 min — the root-cause false positive', async () => {
+    // This is the exact production failure: the reviewer launches a Task/Agent
+    // fan-out, then the parent's top-level stream goes quiet (only ignored
+    // `system` keepalives) for the whole sub-agent wait. Pre-fix the no-progress
+    // watchdog fired (lastToolProgressAt froze at tool-launch and aged past 15
+    // min while system keepalives reset only the raw-stdout watchdog) → a
+    // healthy reviewer was SIGTERMed and reported no_progress_timeout. Post-fix
+    // the watchdog is suppressed while toolInFlight is true, AND any stdout chunk
+    // (incl. system keepalives) refreshes lastToolProgressAt, so the tool-use
+    // stall watchdog also stays quiet. The healthy workflow runs on.
     const { child, handlers, emitStdout } = makeChild(7801);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
@@ -3649,25 +3667,56 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
     const promise = runProviderAgent('hello', null, { value: '' });
     await Promise.resolve();
 
-    // Tool issued — toolInFlight becomes true. CRUCIALLY: no matching `user`
-    // (tool result) event ever arrives, modelling a dropped/lost result event.
+    // Task tool issued — toolInFlight becomes true. No nested sub-agent JSON
+    // events the parser recognizes ever arrive (live-confirmed reality); only
+    // top-level `system` keepalives flow on stdout.
     emitStdout(JSON.stringify({
       type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/x' } }] },
+      message: { content: [{ type: 'tool_use', name: 'Task', input: { description: 'fan out review' } }] },
     }));
 
-    // Provider then hangs. Advance well past the no-progress window with only
-    // raw-stdout 'system' heartbeats keeping the stream-stall watchdog alive.
-    // Pre-fix (the `!toolInFlight` gate) this NEVER fires because toolInFlight
-    // is stuck true; post-fix the dual-staleness gate fires once both content
-    // and tool activity are stale.
+    // Advance well past the no-progress window with only `system` heartbeats.
     await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
 
-    expect(killSpy).toHaveBeenCalledWith(-7801, 'SIGTERM');
+    // The healthy reviewer was NOT killed — no false no_progress_timeout.
+    expect(killSpy).not.toHaveBeenCalledWith(-7801, 'SIGTERM');
 
-    // No confirmed rate-limit text was ever emitted, so the hang is reported as a
-    // transient NoProgressTimeoutError (requeue without burning retry, account
-    // NOT blocked) rather than RateLimitError (which would block the account).
+    // It then completes normally.
+    emitStdout(JSON.stringify({ type: 'user' }));
+    emitStdout(JSON.stringify({ type: 'result', result: 'review complete' }));
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await vi.runAllTimersAsync();
+    const result = await promise;
+    expect(result.exitCode).toBe(0);
+    expect(killSpy).not.toHaveBeenCalledWith(-7801, 'SIGTERM');
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it('STILL fires NoProgressTimeoutError when NO tool is in flight and the content stream is silent past the window (real provider hang)', async () => {
+    // The preserved real-hang case: the SDK is mid-completion-request (no tool in
+    // flight) and emits only ignored `system` keepalives — a silent 429/529 the
+    // SDK retries internally. `!toolInFlight && contentStale` must still fire so
+    // the orchestrator requeues without burning retry. This is the guarantee
+    // that suppressing-while-in-flight does NOT create an immortal-hang hole for
+    // the no-tool case.
+    const { child, handlers, emitStdout } = makeChild(7811);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // NO tool_use ever emitted — toolInFlight stays false the whole time. Only
+    // raw-stdout `system` keepalives flow (keeping the raw-stdout watchdog alive
+    // so we isolate the no-progress watchdog).
+    await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
+
+    expect(killSpy).toHaveBeenCalledWith(-7811, 'SIGTERM');
+
+    // No confirmed rate-limit text → transient NoProgressTimeoutError (requeue
+    // without burning retry, account NOT blocked), not RateLimitError.
     child.exitCode = 143;
     child.signalCode = 'SIGTERM';
     handlers.close?.(143, 'SIGTERM');
@@ -3687,8 +3736,9 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
     const promise = runProviderAgent('hello', null, { value: '' });
     await Promise.resolve();
 
-    // Emit fresh tool_use events periodically — lastToolUseAt stays current, so
-    // the dual-staleness gate must NOT trip (a long legitimate tool run). STEP is
+    // Emit fresh tool_use events periodically — toolInFlight stays true (no
+    // top-level `user` tool-result ever clears it), so the no-progress watchdog
+    // is suppressed while the tool runs (a long legitimate tool run). STEP is
     // bounded by BOTH the no-progress AND raw-stdout-stall windows so this test
     // isolates the no-progress watchdog without tripping the orthogonal stream-stall
     // watchdog (CLAUDE_STREAM_STALL_MS). Iterate enough to cumulatively exceed the
@@ -3865,17 +3915,21 @@ describe('isWorkflowToolName', () => {
 });
 
 // ── long-running workflow / sub-agent fan-out does not false-trip watchdogs ────
-// Root-cause regression for the ~20-min thrash loop: a Blueprint agent that
+// Root-cause regression for the ~15-min thrash loop: a Blueprint agent that
 // invokes a long-running workflow / sub-agent fan-out (the built-in Task/Agent
 // tool, or the prompt-guided parallel-review/parallel-fix fan-out, which is the
-// SAME built-in tool) makes the parent's top-level stream go quiet for >12 min
-// while the workflow runs. Pre-fix, the C7 dual-staleness no-progress watchdog
-// fired (lastToolUseAt aged past LLM_NO_PROGRESS_STALL_MS) → RateLimitError →
-// the orchestrator requeued the task as rate_limited with ZERO real 429/529.
-// The fix: nested sub-agent events (parent_tool_use_id set) count as in-flight
-// tool sub-progress, keeping lastToolProgressAt fresh so neither the no-progress
-// nor the tool-use-stall watchdog false-fires — while a workflow that goes
-// genuinely silent (no sub-progress at all) still eventually times out.
+// SAME built-in tool) makes the parent's top-level stream go quiet for >15 min
+// while the workflow runs. Pre-fix, the no-progress watchdog fired (it required
+// the never-live-confirmed nested parent_tool_use_id sub-agent event to refresh
+// lastToolProgressAt; the live parent stream carries no such recognized event
+// during a Task wait, so it aged out) → NoProgressTimeoutError on a healthy
+// reviewer. The fix: (1) suppress the no-progress kill entirely while a tool is
+// in flight, and (2) refresh lastToolProgressAt on ANY stdout chunk while a tool
+// is in flight, so the tool-use/workflow stall watchdog is kept alive by any
+// output the workflow prints (sub-agent logs, system keepalives, anything),
+// independent of the exact JSON event schema. A workflow that goes FULLY dark
+// (zero stdout) is still caught — by the raw-stdout stall watchdog at
+// CLAUDE_STREAM_STALL_MS — and the wall-clock killTimer is the final backstop.
 describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
   type StdoutCb = (data: Buffer) => void;
   type ChildHandlers = {
@@ -4020,20 +4074,13 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
     killSpy.mockRestore();
   });
 
-  // Helper: keep the top-level CONTENT stream fresh (so the no-progress watchdog
-  // cannot fire) while the in-flight TOOL itself emits no sub-progress. This
-  // isolates the tool-use-stall watchdog and its workflow-aware silence budget.
-  // A top-level `assistant` text event resets lastStreamEventAt AND the raw-stdout
-  // stall watchdog (via stdout.on('data')), but is NOT a nested sub-agent event,
-  // so it does NOT refresh lastToolProgressAt — the in-flight tool stays "silent".
-  const freshContentKeepalive = (emitStdout: (s: string) => void) => {
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'text', text: 'parent still thinking' }] },
-    }));
-  };
-
-  it('STILL fires tool-use-stall (SIGTERM) when a workflow tool goes silent past the LARGER workflow budget, but NOT before', async () => {
+  it('STILL SIGTERMs a workflow tool that goes FULLY DARK (zero stdout) — the genuine-hang catch is the raw-stdout stall watchdog, NOT the no-progress watchdog', async () => {
+    // A genuinely hung fan-out: the Task tool launches and then the subprocess
+    // emits ZERO bytes — the signature of a truly dead/wedged sub-agent. With the
+    // no-progress kill suppressed while toolInFlight is true, the genuine-hang
+    // coverage is owned by the raw-stdout stall watchdog (CLAUDE_STREAM_STALL_MS),
+    // which fires on zero-stdout regardless of tool state. So removing the
+    // no-progress kill while in-flight does NOT create an immortal hang.
     const { child, handlers, emitStdout } = makeChild(7903);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
@@ -4041,55 +4088,43 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
     const promise = runProviderAgent('hello', null, { value: '' });
     await Promise.resolve();
 
-    // Workflow tool starts, then emits NO sub-progress — a genuinely hung
-    // fan-out. Top-level content is kept fresh so the no-progress watchdog stays
-    // out of it; only the tool-use-stall watchdog (workflow budget) can fire.
+    // Workflow tool starts, then emits NOTHING further — no JSON sub-progress,
+    // no keepalives, no raw bytes at all.
     emitStdout(JSON.stringify({
       type: 'assistant',
       message: { content: [{ type: 'tool_use', name: 'Task', input: {} }] },
     }));
 
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 60_000;
-
-    // Past the SHORTER ordinary tool-use budget — a workflow must NOT be killed
-    // here, proving the larger budget is in effect.
-    let elapsed = 0;
-    const beforeTarget = TOOL_USE_STALL_TIMEOUT_MS + 120_000;
-    while (elapsed < beforeTarget) {
-      const step = Math.min(STEP, beforeTarget - elapsed);
-      await vi.advanceTimersByTimeAsync(step);
-      elapsed += step;
-      freshContentKeepalive(emitStdout);
-    }
+    // The Task-launch line itself reset the raw-stdout watchdog. With no further
+    // stdout, the watchdog fires CLAUDE_STREAM_STALL_MS later. It must NOT have
+    // fired before that (the launch line is well within the window).
+    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 60_000);
     expect(killSpy).not.toHaveBeenCalledWith(-7903, 'SIGTERM');
 
-    // Continue past the larger workflow budget — now it must fire (hangs are
-    // bounded, not immortal).
-    const afterTarget = WORKFLOW_TOOL_STALL_TIMEOUT_MS + 120_000;
-    while (elapsed < afterTarget) {
-      const step = Math.min(STEP, afterTarget - elapsed);
-      await vi.advanceTimersByTimeAsync(step);
-      elapsed += step;
-      freshContentKeepalive(emitStdout);
-    }
+    await vi.advanceTimersByTimeAsync(120_000);
     expect(killSpy).toHaveBeenCalledWith(-7903, 'SIGTERM');
 
-    // Attach the rejection assertion BEFORE flushing so the eventual rejection is
-    // never momentarily unhandled when the drain's setImmediate macrotasks settle
-    // the promise under runAllTimersAsync.
-    const rejection = expect(promise).rejects.toBeInstanceOf(ClaudeTimeoutError);
+    // The raw-stdout watchdog sets no flag (flags.timedOut stays false so the
+    // wrapper proceeds to commit/push), so a clean SIGTERM close resolves the run
+    // normally rather than as a misclassified rate-limit/no_progress requeue.
     child.exitCode = 143;
     child.signalCode = 'SIGTERM';
     handlers.close?.(143, 'SIGTERM');
-    // close() routes through drainPendingThenResolve, whose drain yields via
-    // setImmediate macrotasks that fake timers do not auto-flush — drain them so
-    // the promise settles instead of hanging to the test timeout.
     await vi.runAllTimersAsync();
-    await rejection;
+    const rejection = await promise.catch((e: unknown) => e);
+    expect(rejection).not.toBeInstanceOf(NoProgressTimeoutError);
+    expect(rejection).not.toBeInstanceOf(RateLimitError);
     killSpy.mockRestore();
   }, 20_000);
 
-  it('an ordinary (non-workflow) tool that goes silent still times out at the SHORTER tool-use budget', async () => {
+  it('keeps a workflow tool ALIVE as long as it prints ANY stdout (schema-independent), even with no recognized JSON sub-progress', async () => {
+    // The belt-and-suspenders guarantee for any future out-of-stream workflow
+    // (a review backgrounded via Bash, a cloud-review poll): a workflow that
+    // prints plain non-JSON log lines — no recognized assistant/result/nested
+    // events at all — still keeps lastToolProgressAt fresh via the stdout 'data'
+    // handler, so neither the no-progress watchdog (suppressed while in-flight)
+    // NOR the tool-use/workflow stall watchdog false-fires. It rides on until
+    // genuinely dark or the wall clock.
     const { child, handlers, emitStdout } = makeChild(7904);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
@@ -4097,30 +4132,39 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
     const promise = runProviderAgent('hello', null, { value: '' });
     await Promise.resolve();
 
-    // Ordinary Bash tool — NOT a workflow — gets the shorter TOOL_USE_STALL budget.
     emitStdout(JSON.stringify({
       type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 9999' } }] },
+      message: { content: [{ type: 'tool_use', name: 'Task', input: { description: 'background review' } }] },
     }));
 
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 60_000;
-    let elapsed = 0;
-    const target = TOOL_USE_STALL_TIMEOUT_MS + 120_000;
-    while (elapsed < target) {
-      const step = Math.min(STEP, target - elapsed);
-      await vi.advanceTimersByTimeAsync(step);
-      elapsed += step;
-      freshContentKeepalive(emitStdout);
+    // Emit ONLY plain non-JSON log lines (not '{'-prefixed → never parsed as a
+    // recognized event), in steps shorter than every watchdog window, well past
+    // BOTH the no-progress window (15 min) AND the ordinary tool-use-stall budget
+    // (30 min) — the two windows that would have killed a no-stdout tool here.
+    // Kept under the 45-min wall-clock killTimer, which is the deliberate final
+    // backstop for any in-flight tool and is exercised separately.
+    const totalMs = TOOL_USE_STALL_TIMEOUT_MS + 5 * 60_000;
+    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    let remaining = totalMs;
+    let i = 0;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(`[subagent ${i++}] still investigating module group...`);
+      remaining -= STEP;
     }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
 
-    expect(killSpy).toHaveBeenCalledWith(-7904, 'SIGTERM');
+    // Never killed — any stdout chunk kept the in-flight clock fresh.
+    expect(killSpy).not.toHaveBeenCalledWith(-7904, 'SIGTERM');
 
-    const rejection = expect(promise).rejects.toBeInstanceOf(ClaudeTimeoutError);
-    child.exitCode = 143;
-    child.signalCode = 'SIGTERM';
-    handlers.close?.(143, 'SIGTERM');
+    emitStdout(JSON.stringify({ type: 'user' }));
+    emitStdout(JSON.stringify({ type: 'result', result: 'review complete' }));
+    child.exitCode = 0;
+    handlers.close?.(0, null);
     await vi.runAllTimersAsync();
-    await rejection;
+    const result = await promise;
+    expect(result.exitCode).toBe(0);
+    expect(killSpy).not.toHaveBeenCalledWith(-7904, 'SIGTERM');
     killSpy.mockRestore();
   }, 20_000);
 });
