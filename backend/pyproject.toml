@@ -68,6 +68,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # rollup_management.py runs rollup PR creation/merge under sibling-completion races,
 # branch-cleanup edge cases, and concurrent worker calls. Same intentional pattern.
 "app/rollup_management.py" = ["BLE001"]
+# rollup_pr_verification.py and rollup_branch_cleanup.py were extracted from
+# rollup_management.py; they carry the same background-worker log-and-continue
+# broad-except pattern.
+"app/rollup_pr_verification.py" = ["BLE001"]
+"app/rollup_branch_cleanup.py" = ["BLE001"]
 # orchestrator.py is the background provisioning + monitoring loop. Same
 # log-and-continue policy: crash here halts all task dispatch and health monitoring.
 # E402: re-exports symbols extracted to app.orchestrator_health via deferred mid-module

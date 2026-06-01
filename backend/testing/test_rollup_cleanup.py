@@ -797,7 +797,7 @@ async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
         return_value={"merged": True, "state": "closed"},
     )
     ctx, _ = _make_write_session_mock(db_task=None)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
@@ -827,7 +827,7 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
         ],
     )
     ctx, _ = _make_write_session_mock(db_task=None)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
@@ -897,7 +897,7 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     db_task_mock.context = {}
     ctx, write_session = _make_write_session_mock(db_task=db_task_mock)
     write_session.get = AsyncMock(return_value=db_task_mock)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
