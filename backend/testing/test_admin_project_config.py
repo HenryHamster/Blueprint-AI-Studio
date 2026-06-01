@@ -1,8 +1,9 @@
 import pytest
-from httpx import AsyncClient
+from httpx import ASGITransport, AsyncClient
 from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
+from app.main import app
 from app.models import Project
 from app.shared_state import (
     get_project_broadcast_limit,
@@ -16,7 +17,11 @@ from testing.factories import make_membership
 @pytest.fixture
 async def project_owner(db_session):
     """Create a project with test-user-123 as owner."""
-    project = Project(name="Config Test Project", user_id="test-user-123")
+    project = Project(
+        name="Config Test Project",
+        user_id="test-user-123",
+        is_self_repo=True,
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -32,13 +37,13 @@ async def project_owner(db_session):
 async def test_get_integration_branch_defaults_to_main(
     client: AsyncClient, db_session, project_owner
 ):
-    """GET /integration-branch returns 'main' when no per-project value is set."""
+    """GET /integration-branch returns 'automain' for a self-repo with no override."""
     project = project_owner
     resp = await client.get(f"/api/admin/projects/{project.id}/integration-branch")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["project_id"] == str(project.id)
-    assert data["integration_branch"] == "main"
+    assert data["integration_branch"] == "automain"
     assert data["is_default"] is True
 
 
@@ -68,7 +73,7 @@ async def test_patch_integration_branch_round_trip(
 async def test_patch_integration_branch_null_reverts_to_default(
     client: AsyncClient, db_session, project_owner
 ):
-    """PATCH with null clears the per-project override, reverting to global default."""
+    """PATCH with null clears the override and restores the self-repo automain default."""
     project = project_owner
     # Set a value first
     await client.patch(
@@ -82,6 +87,7 @@ async def test_patch_integration_branch_null_reverts_to_default(
     )
     assert resp.status_code == 200, resp.text
     data = resp.json()
+    assert data["integration_branch"] == "automain"
     assert data["is_default"] is True
 
 
@@ -108,8 +114,12 @@ async def test_two_projects_independent_integration_branches(
     client: AsyncClient, db_session
 ):
     """Two projects can each have different integration_branch values independently."""
-    p1 = Project(name="Project A", user_id="test-user-123")
-    p2 = Project(name="Project B", user_id="test-user-123")
+    p1 = Project(name="Project A", user_id="test-user-123", is_self_repo=True)
+    p2 = Project(
+        name="Project B",
+        user_id="test-user-123",
+        promotion_target="release",
+    )
     db_session.add(p1)
     db_session.add(p2)
     await db_session.commit()
@@ -122,19 +132,15 @@ async def test_two_projects_independent_integration_branches(
     await db_session.commit()
 
     await client.patch(
-        f"/api/admin/projects/{p1.id}/integration-branch",
-        json={"integration_branch": "automain"},
-    )
-    await client.patch(
         f"/api/admin/projects/{p2.id}/integration-branch",
-        json={"integration_branch": "main"},
+        json={"integration_branch": "trunk"},
     )
 
     r1 = await client.get(f"/api/admin/projects/{p1.id}/integration-branch")
     r2 = await client.get(f"/api/admin/projects/{p2.id}/integration-branch")
 
     assert r1.json()["integration_branch"] == "automain"
-    assert r2.json()["integration_branch"] == "main"
+    assert r2.json()["integration_branch"] == "trunk"
     # They are independent — p1 override doesn't affect p2
     assert r1.json()["integration_branch"] != r2.json()["integration_branch"]
 
@@ -245,7 +251,11 @@ async def test_get_project_promotion_target_helper_defaults_to_main():
 @pytest.fixture
 async def project_member(db_session):
     """Create a project where test-user-123 is a member (not owner)."""
-    project = Project(name="Member Test Project", user_id="some-other-user")
+    project = Project(
+        name="Member Test Project",
+        user_id="some-other-user",
+        is_self_repo=True,
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -612,12 +622,12 @@ async def test_get_project_broadcast_limit_helper():
 async def test_get_auto_remediation_defaults_for_main_project(
     client: AsyncClient, db_session, project_owner
 ):
-    """branch_whitelist default includes 'main' when no integration_branch is set."""
+    """Self-repo defaults whitelist the integration trunk and promotion target."""
     project = project_owner
     resp = await client.get(f"/api/admin/projects/{project.id}/auto-remediation")
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    assert "main" in data["config"]["branch_whitelist"]
+    assert data["config"]["branch_whitelist"] == ["automain", "main"]
 
 
 @pytest.mark.smoketest
@@ -664,11 +674,11 @@ async def test_get_auto_remediation_stored_value_overrides_computed_default(
 async def test_get_issue_implementation_defaults_for_main_project(
     client: AsyncClient, db_session, project_owner
 ):
-    """base_branch defaults to 'main' when no integration_branch is set."""
+    """Self-repo issue implementation defaults to the automain integration trunk."""
     project = project_owner
     resp = await client.get(f"/api/admin/projects/{project.id}/issue-implementation")
     assert resp.status_code == 200, resp.text
-    assert resp.json()["config"]["base_branch"] == "main"
+    assert resp.json()["config"]["base_branch"] == "automain"
 
 
 @pytest.mark.smoketest
@@ -761,6 +771,8 @@ async def github_project(db_session):
         user_id="test-user-123",
         github_owner="acme",
         github_repo="myrepo",
+        integration_branch="automain",
+        promotion_target="main",
     )
     db_session.add(project)
     await db_session.commit()
@@ -855,18 +867,100 @@ async def test_patch_integration_branch_502_when_no_token(
 async def test_patch_integration_branch_null_skips_remote_check(
     client: AsyncClient, db_session, github_project
 ):
-    """PATCH integration-branch with null does not call GitHub at all."""
+    """PATCH integration-branch with null skips GitHub and reverts to the safe default.
+
+    A non-self repo with NULL integration_branch resolves to the safe 'main'
+    fallback (the resolver fails safe rather than raising), so the readback
+    succeeds and the endpoint reports ``is_default``.
+    """
     project = github_project
-    with patch(
-        "app.github.get_repo_installation_token",
-        new_callable=AsyncMock,
-    ) as mock_token:
-        resp = await client.patch(
-            f"/api/admin/projects/{project.id}/integration-branch",
-            json={"integration_branch": None},
-        )
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as safe_client:
+        with patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+        ) as mock_token:
+            resp = await safe_client.patch(
+                f"/api/admin/projects/{project.id}/integration-branch",
+                json={"integration_branch": None},
+            )
     assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["integration_branch"] == "main"
+    assert body["is_default"] is True
     mock_token.assert_not_called()
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_integration_branch_returns_default_for_non_self_repo_without_override(
+    db_session, override_get_session, override_get_current_user
+):
+    """GET /integration-branch returns the safe default (not a 500) when unset.
+
+    The resolver fails safe to 'main' for a non-self repo with NULL
+    integration_branch, so the read endpoint stays observable and surfaces
+    ``is_default`` so an operator can see the column is still unconfigured.
+    """
+    project = Project(name="External Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as safe_client:
+        resp = await safe_client.get(
+            f"/api/admin/projects/{project.id}/integration-branch"
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["integration_branch"] == "main"
+    assert body["is_default"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_integration_branch_equal_to_promotion_target_blocks(
+    db_session, override_get_session, override_get_current_user
+):
+    """PATCH integration-branch returns a clean 422 (no persist) when it would
+    match the promotion target."""
+    project = Project(
+        name="Conflict Project",
+        user_id="test-user-123",
+        integration_branch="automain",
+        promotion_target="release",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://test",
+    ) as safe_client:
+        resp = await safe_client.patch(
+            f"/api/admin/projects/{project.id}/integration-branch",
+            json={"integration_branch": "release"},
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert "promotion target" in resp.json()["error"]["message"]
+    # The invalid value must NOT be persisted — the column stays at its prior
+    # value so the project never lands in a permanently-misconfigured state.
+    await db_session.refresh(project)
+    assert project.integration_branch == "automain"
 
 
 @pytest.mark.smoketest

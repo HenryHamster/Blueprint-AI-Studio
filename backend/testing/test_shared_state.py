@@ -389,7 +389,10 @@ class TestBackfillBranchColumns:
         Simulates the admin create-task and deploy-endpoint paths that create projects
         without initialising branch columns. After backfill, both integration_branch and
         promotion_target must reflect the repo's actual default (not silently resolve to
-        'main'), and the branch resolvers must return the same non-'main' value.
+        'main'). That leaves the integration branch equal to the promotion target; the
+        hot-path resolver fails safe (returns the configured value rather than raising),
+        and the unsafe integration==promotion landing is blocked at the merge/rollup
+        boundary instead.
         """
         project = _project(integration_branch=None, promotion_target=None)
         session = _make_session([project])
@@ -413,20 +416,24 @@ class TestBackfillBranchColumns:
         assert summary["filled"] == 2
         assert summary["errored"] == 0
 
-        # Regression guard: branch resolvers must not fall back to 'main' once
-        # the columns are populated by the backfill called from the auto-create path.
+        # The hot-path resolver fails safe: it returns the configured value even
+        # when integration == promotion (so read endpoints / background loops /
+        # the protected_branches property never raise). Refusing to land work on
+        # the promotion target is enforced at the merge/rollup boundary instead.
         assert _shared_state.get_project_integration_branch(project) == "develop"
         assert _shared_state.get_project_promotion_target(project) == "develop"
 
 
 class TestProjectBranchResolvers:
     @pytest.fixture(autouse=True)
-    def _reset_missing_branch_alerts(self):
-        import app.shared_state as shared_state
+    def _reset_project_branch_alerts(self):
+        import app.branch_resolution as branch_resolution
 
-        shared_state._missing_project_branch_alerts.clear()
+        branch_resolution._missing_project_branch_alerts.clear()
+        branch_resolution._blocking_project_branch_alerts.clear()
         yield
-        shared_state._missing_project_branch_alerts.clear()
+        branch_resolution._missing_project_branch_alerts.clear()
+        branch_resolution._blocking_project_branch_alerts.clear()
 
     def test_populated_branches_return_values_without_alerts(self):
         project = _project(
@@ -448,16 +455,18 @@ class TestProjectBranchResolvers:
         mock_warning.assert_not_called()
         session.add.assert_not_called()
 
-    def test_null_branch_emits_alert_once_per_project_and_column(self):
-        project = _project(integration_branch=None, promotion_target=None)
+    def test_self_repo_null_integration_resolves_to_automain_with_single_alert(self):
+        project = _project(
+            integration_branch=None,
+            promotion_target=None,
+            is_self_repo=True,
+            github_repo="BlueprintAIStudio",
+        )
         session = MagicMock()
 
-        with (
-            patch("app.branch_resolution.object_session", return_value=session),
-            patch("app.branch_resolution.logger.warning") as mock_warning,
-        ):
-            assert _shared_state.get_project_integration_branch(project) == "main"
-            assert _shared_state.get_project_integration_branch(project) == "main"
+        with patch("app.branch_resolution.object_session", return_value=session):
+            assert _shared_state.get_project_integration_branch(project) == "automain"
+            assert _shared_state.get_project_integration_branch(project) == "automain"
             assert _shared_state.get_project_promotion_target(project) == "main"
             assert _shared_state.get_project_promotion_target(project) == "main"
 
@@ -468,15 +477,27 @@ class TestProjectBranchResolvers:
         assert integration_alert.title == "Missing integration_branch"
         assert promotion_alert.severity == AlertSeverity.ERROR
         assert promotion_alert.title == "Missing promotion_target"
-        assert mock_warning.call_count == 2
-        assert mock_warning.call_args_list[0].args[1:] == (
-            str(project.id),
-            "integration_branch",
-        )
-        assert mock_warning.call_args_list[1].args[1:] == (
-            str(project.id),
-            "promotion_target",
-        )
+
+    def test_null_branch_falls_back_to_main_once_per_project_when_non_self_repo(self):
+        project = _project(integration_branch=None, promotion_target=None)
+        session = MagicMock()
+
+        with patch("app.branch_resolution.object_session", return_value=session):
+            # Fails safe to "main" for a non-self repo (never raises), so callers
+            # in read endpoints / background loops never abort on a NULL column.
+            assert _shared_state.get_project_integration_branch(project) == "main"
+            assert _shared_state.get_project_integration_branch(project) == "main"
+            assert _shared_state.get_project_promotion_target(project) == "main"
+            assert _shared_state.get_project_promotion_target(project) == "main"
+
+        # One alert per column, deduped across repeated calls.
+        assert session.add.call_count == 2
+        integration_alert = session.add.call_args_list[0].args[0]
+        promotion_alert = session.add.call_args_list[1].args[0]
+        assert integration_alert.severity == AlertSeverity.ERROR
+        assert integration_alert.title == "Missing integration_branch"
+        assert promotion_alert.severity == AlertSeverity.ERROR
+        assert promotion_alert.title == "Missing promotion_target"
 
 
 if __name__ == "__main__":

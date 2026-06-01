@@ -558,6 +558,21 @@ async def update_integration_branch_config(
                 status_code=422,
                 detail="'integration_branch' contains invalid characters",
             )
+        # Reject integration == promotion BEFORE persisting. Landing integration
+        # work directly on the promotion/release target is unsafe, and the
+        # resolver fails safe rather than raising, so an invalid value would
+        # otherwise persist silently. Validate up front and return a clean 422
+        # without writing the column (or making a remote round-trip).
+        promotion_target = get_project_promotion_target(precheck_project)
+        if branch == promotion_target:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "'integration_branch' must differ from the promotion target "
+                    f"'{promotion_target}'; landing integration work directly on "
+                    "the promotion target is not allowed."
+                ),
+            )
         await _validate_branch_exists_on_remote(precheck_project, branch)
 
     project = await lock_project_or_429(session, project_id)

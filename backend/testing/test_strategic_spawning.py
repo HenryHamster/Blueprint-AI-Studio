@@ -69,6 +69,8 @@ def _make_project(**kwargs) -> Project:
         "autonomous_enabled": True,
         "directions": [],
         "vision": {},
+        "integration_branch": "automain",
+        "promotion_target": "main",
     }
     defaults.update(kwargs)
     return Project(**defaults)
@@ -3816,7 +3818,7 @@ async def test_version_phase_includes_recent_versions(
 
 @pytest.mark.asyncio
 async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
-    """Version-phase LTS context follows integration_branch != promotion_target."""
+    """Version-phase LTS context is active only when the resolver sees distinct branches."""
     await _ensure_releaseversion_table(db_session)
 
     _patch_spawning_deps(mocker)
@@ -3838,6 +3840,9 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(skipped_project)
 
+    # integration == promotion: the version-phase LTS context is gated off
+    # (the resolver fails safe instead of raising), so the review still spawns
+    # but without invoking the version lifecycle.
     assert await _spawn_strategic_review(skipped_project, db_session) is True
     assert current_open_version.call_count == 0
     assert ensure_initial_release_version.call_count == 0
@@ -5165,18 +5170,26 @@ async def test_on_automain_false_for_root_task_ancestry_api_exception(
 class TestGetProjectIntegrationBranch:
     """get_project_integration_branch() — the canonical column-based resolver.
 
-    Per-project value lives on the project.integration_branch column; when the
-    column is unset, the helper falls back to the literal default 'main'.
+    The resolver fails SAFE and never raises, so it is safe to call from read
+    endpoints, background recovery loops, and the protected_branches property.
+    Self-repos map an unset integration branch to automain; non-self repos with
+    an unset integration branch fall back to main. Refusing to land work on the
+    promotion target is enforced at the merge/rollup boundary, not here.
     """
 
-    def test_unset_column_returns_global_default(self):
-        """Project with integration_branch=None resolves to the literal default."""
-        project = _make_project(integration_branch=None)
-        assert _shared_state.get_project_integration_branch(project) == "main"
+    def test_self_repo_without_integration_branch_resolves_to_automain(self):
+        """Self-repos preserve the documented automain fallback when unset."""
+        project = _make_project(
+            integration_branch=None,
+            promotion_target=None,
+            is_self_repo=True,
+            github_repo="BlueprintAIStudio",
+        )
+        assert _shared_state.get_project_integration_branch(project) == "automain"
 
-    def test_unset_column_ignores_global_state(self):
-        """A missing column no longer consults global runtime_config state."""
-        project = _make_project(integration_branch=None)
+    def test_non_self_repo_without_integration_branch_falls_back_to_main(self):
+        """External repos with an unset integration branch fall back to main."""
+        project = _make_project(integration_branch=None, is_self_repo=False)
         assert _shared_state.get_project_integration_branch(project) == "main"
 
     def test_column_override_used(self):
@@ -5197,10 +5210,19 @@ class TestGetProjectIntegrationBranch:
         assert _shared_state.get_project_integration_branch(project_b) == "trunk-b"
 
     def test_project_with_override_and_project_without_are_independent(self):
-        """A project with a column value and one without resolve independently."""
+        """A configured project is unaffected by another project's unset column."""
         project_with = _make_project(integration_branch="custom-trunk")
-        project_without = _make_project(integration_branch=None)
+        project_without = _make_project(integration_branch=None, is_self_repo=False)
         assert (
             _shared_state.get_project_integration_branch(project_with) == "custom-trunk"
         )
         assert _shared_state.get_project_integration_branch(project_without) == "main"
+
+    def test_same_branch_as_promotion_target_returns_configured_value(self):
+        """The resolver returns the configured value even when it equals promotion.
+
+        Refusing to land integration work on the promotion target is enforced at
+        the merge/rollup boundary; the hot-path resolver must not raise.
+        """
+        project = _make_project(integration_branch="release", promotion_target="release")
+        assert _shared_state.get_project_integration_branch(project) == "release"

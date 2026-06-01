@@ -19,6 +19,10 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
+from app.branch_resolution import (
+    InvalidProjectBranchConfiguration,
+    _signal_blocking_project_branch_configuration,
+)
 from app.models import (
     Artifact,
     ArtifactType,
@@ -40,6 +44,32 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
+
+
+def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
+    """Allow the intentionally-gated hotfix lane to merge to promotion."""
+    if not target_branch:
+        return False
+    payload = task.first_payload or {}
+    ctx = task.context or {}
+    return bool(payload.get("hotfix") or ctx.get("hotfix"))
+
+
+async def _block_admin_merge_for_branch_safety(
+    task: Task,
+    project: Project | None,
+    session: AsyncSession,
+    detail: str,
+    *,
+    issue_code: str,
+) -> None:
+    """Keep the task approval-gated and persist a branch-safety alert."""
+    if project is not None:
+        _signal_blocking_project_branch_configuration(project, issue_code, detail)
+    task.requires_approval = True
+    task.latest_status_message = detail[:500]
+    session.add(task)
+    await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -307,12 +337,55 @@ async def _handle_rollup_pr_approval(
     changes: Dict[str, Any],
 ) -> None:
     """Merge the rollup PR and optionally spawn a smoketest on human approval."""
+    _project = await session.get(Project, task.project_id)
+    try:
+        base_branch = (task.first_payload).get(
+            "base_branch"
+        ) or get_project_integration_branch(_project)
+    # Defense-in-depth: the resolver currently fails SAFE and does not raise.
+    # This guard exists so a future re-introduction of a raising resolver path
+    # refuses the merge cleanly instead of 500ing after the row is committed.
+    except InvalidProjectBranchConfiguration as exc:
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            f"Approved rollup merge refused: {exc.detail}",
+            issue_code="admin_rollup_integration_branch_invalid",
+        )
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+    from app.shared_state import (
+        get_project_promotion_target as _get_project_promotion_target,
+    )
+
+    _promotion_target = _get_project_promotion_target(_project)
+    _integration_branch = get_project_integration_branch(_project)
+    # Refuse ONLY when the merge would land on the promotion target AND that
+    # target is distinct from the integration branch. Single-trunk projects
+    # (integration == promotion) legitimately merge onto the shared trunk.
+    if (
+        base_branch == _promotion_target
+        and base_branch != _integration_branch
+        and not _promotion_target_merge_allowed(task, base_branch)
+    ):
+        detail = (
+            f"Approved rollup merge refused: target branch '{base_branch}' is this "
+            "project's promotion target. Configure a distinct integration branch "
+            "before landing fleet work."
+        )
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            detail,
+            issue_code="admin_rollup_target_matches_promotion_target",
+        )
+        raise HTTPException(status_code=409, detail=detail)
+
     try:
         from app.routers.agent import get_github_token_for_task
-        from app.shared_state import (
-            runtime_config as _runtime_config,
-            get_project_promotion_target as _get_project_promotion_target,
-        )
+        from app.shared_state import runtime_config as _runtime_config
         from app.rollup_management import _cleanup_branches
         from app.github import merge_pull_request, create_pr_comment
 
@@ -338,11 +411,6 @@ async def _handle_rollup_pr_approval(
             session.add(task)
             await session.commit()
             await _cleanup_branches(task, session)
-            _project = await session.get(Project, task.project_id)
-            base_branch = (task.first_payload).get(
-                "base_branch"
-            ) or get_project_integration_branch(_project)
-            _promotion_target = _get_project_promotion_target(_project)
             if base_branch == _promotion_target and _runtime_config.get(
                 "smoketest_enabled"
             ):
@@ -461,9 +529,49 @@ async def _handle_task_pr_approval(
     task_payload = task.first_payload
     _project = await session.get(Project, task.project_id)
     branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
-    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
-        _project
+    try:
+        base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+            _project
+        )
+    # Defense-in-depth: the resolver currently fails SAFE and does not raise.
+    # This guard exists so a future re-introduction of a raising resolver path
+    # refuses the merge cleanly instead of 500ing after the row is committed.
+    except InvalidProjectBranchConfiguration as exc:
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            f"Approved merge refused: {exc.detail}",
+            issue_code="admin_task_integration_branch_invalid",
+        )
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    from app.shared_state import (
+        get_project_promotion_target as _get_project_promotion_target,
     )
+
+    promotion_target = _get_project_promotion_target(_project)
+    integration_branch = get_project_integration_branch(_project)
+    # Refuse ONLY when the merge would land on the promotion target AND that
+    # target is distinct from the integration branch. Single-trunk projects
+    # (integration == promotion) legitimately merge onto the shared trunk.
+    if (
+        base_branch == promotion_target
+        and base_branch != integration_branch
+        and not _promotion_target_merge_allowed(task, base_branch)
+    ):
+        detail = (
+            f"Approved merge refused: target branch '{base_branch}' is this "
+            "project's promotion target. Configure a distinct integration branch "
+            "before landing fleet work."
+        )
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            detail,
+            issue_code="admin_task_target_matches_promotion_target",
+        )
+        raise HTTPException(status_code=409, detail=detail)
 
     if ctx.get("touched_critical"):
         await _merge_critical_pr(

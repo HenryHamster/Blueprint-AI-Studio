@@ -55,15 +55,48 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
 )
+from app.branch_resolution import (
+    InvalidProjectBranchConfiguration,
+    _signal_blocking_project_branch_configuration,
+)
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
+    get_project_promotion_target as _get_project_promotion_target,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
     get_project_task_branch_namespace as _get_project_task_branch_namespace,
 )
 from app.task_locking import with_directions_locked
 
 logger = logging.getLogger(__name__)
+
+
+def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
+    """Allow the intentionally-gated hotfix lane to target promotion directly."""
+    if not target_branch:
+        return False
+    payload = parent.first_payload or {}
+    ctx = parent.context or {}
+    return bool(payload.get("hotfix") or ctx.get("hotfix"))
+
+
+async def _hold_rollup_for_branch_safety(
+    parent: Task,
+    project: Project | None,
+    session: AsyncSession,
+    detail: str,
+    *,
+    issue_code: str,
+) -> None:
+    """Persist a loud hold when rollup branch resolution would hit promotion."""
+    if project is not None:
+        _signal_blocking_project_branch_configuration(project, issue_code, detail)
+    if _runtime_config.get("require_approval_gates", True):
+        parent.requires_approval = True
+    parent.latest_status_message = detail[:500]
+    session.add(parent)
+    await session.commit()
+    logger.error("[ROLLUP] %s", detail)
 
 
 async def _dispatch_rollup_approval_alert(
@@ -599,7 +632,25 @@ async def _check_and_trigger_rollup(
                 branch = resolve_task_branch(
                     c, _get_project_task_branch_namespace(project)
                 )
-                base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
+                try:
+                    base_branch = c_payload.get(
+                        "base_branch"
+                    ) or _get_project_integration_branch(project)
+                # Defense-in-depth: the resolver currently fails SAFE and does not
+                # raise. This guard exists so a future re-introduction of a raising
+                # resolver path holds the rollup instead of aborting the sweep.
+                except InvalidProjectBranchConfiguration as exc:
+                    await _hold_rollup_for_branch_safety(
+                        parent,
+                        project,
+                        session,
+                        (
+                            f"Rollup blocked: child {str(c.id)[:8]} resolved to "
+                            f"an unsafe integration branch. {exc.detail}"
+                        ),
+                        issue_code="child_integration_branch_invalid",
+                    )
+                    return
                 original_prompt = c_payload.get("prompt", c.description or "")
                 respawn_candidates.append(
                     {
@@ -873,6 +924,39 @@ async def _check_and_trigger_rollup(
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None
             project = await session.get(Project, parent.project_id)
+            promotion_target = (
+                _get_project_promotion_target(project) if project is not None else None
+            )
+            integration_branch = (
+                _get_project_integration_branch(project)
+                if project is not None
+                else None
+            )
+            # Block ONLY when the rollup would land fleet work on the promotion
+            # target AND that promotion target is genuinely distinct from the
+            # project's integration branch. Single-trunk projects (integration ==
+            # promotion, e.g. a project whose only branch is 'main') legitimately
+            # land every rollup on that shared trunk; holding those would stall
+            # the project entirely. The hotfix lane is the explicit exemption for
+            # the distinct-branch case.
+            if (
+                promotion_target
+                and target_branch == promotion_target
+                and target_branch != integration_branch
+                and not _promotion_target_rollup_allowed(parent, target_branch)
+            ):
+                await _hold_rollup_for_branch_safety(
+                    parent,
+                    project,
+                    session,
+                    (
+                        f"Rollup blocked: target branch '{target_branch}' is this "
+                        f"project's promotion target. Configure a distinct "
+                        "integration branch before landing fleet work."
+                    ),
+                    issue_code="rollup_target_matches_promotion_target",
+                )
+                return
             # Track the rollup PR number/url across the try block so the
             # exception handler can rescue a newly-created PR whose marker
             # commit failed (see orphan-PR rescue below).

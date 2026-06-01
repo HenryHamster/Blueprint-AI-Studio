@@ -16,6 +16,8 @@ from app.runtime_config_state import runtime_config
 
 logger = logging.getLogger(__name__)
 
+SELF_REPO_INTEGRATION_BRANCH = "automain"
+
 # Canonical default for task scope when not explicitly set.
 # Operational modules (orchestrator, review pipeline, research completion) use this.
 # Analytics/tracking modules use "unknown" to distinguish missing data from a real scope.
@@ -67,6 +69,16 @@ TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
 
 
 _missing_project_branch_alerts: set[tuple[str, str]] = set()
+_blocking_project_branch_alerts: set[tuple[str, str]] = set()
+
+
+class InvalidProjectBranchConfiguration(RuntimeError):
+    """Raised when a project's integration branch would route work to promotion."""
+
+    def __init__(self, project_id: Any, detail: str):
+        self.project_id = project_id
+        self.detail = detail
+        super().__init__(detail)
 
 
 def derive_task_branch(
@@ -88,18 +100,27 @@ def derive_task_branch(
     return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
-def _signal_missing_project_branch(project, column_name: str, alert_title: str) -> None:
+def _project_id_str(project) -> str:
     project_id = getattr(project, "id", None)
-    project_id_str = str(project_id) if project_id is not None else "<unknown>"
-    dedupe_key = (project_id_str, column_name)
-    if dedupe_key in _missing_project_branch_alerts:
+    return str(project_id) if project_id is not None else "<unknown>"
+
+
+def _stage_project_branch_alert(
+    project,
+    *,
+    dedupe_bucket: set[tuple[str, str]],
+    dedupe_key_suffix: str,
+    title: str,
+    message: str,
+    log_level: int,
+) -> None:
+    project_id = getattr(project, "id", None)
+    project_id_str = _project_id_str(project)
+    dedupe_key = (project_id_str, dedupe_key_suffix)
+    if dedupe_key in dedupe_bucket:
         return
-    _missing_project_branch_alerts.add(dedupe_key)
-    logger.warning(
-        "[BRANCH_RESOLVER] project %s missing %s; falling back to main",
-        project_id_str,
-        column_name,
-    )
+    dedupe_bucket.add(dedupe_key)
+    logger.log(log_level, "[BRANCH_RESOLVER] %s", message)
 
     try:
         session = object_session(project)
@@ -115,19 +136,67 @@ def _signal_missing_project_branch(project, column_name: str, alert_title: str) 
             Alert(
                 project_id=project_id,
                 severity=AlertSeverity.ERROR,
-                title=alert_title,
-                message=(
-                    f"Project {project_id_str} has NULL {column_name}; "
-                    "falling back to main until the column is populated."
-                ),
+                title=title,
+                message=message,
             )
         )
     except Exception:  # noqa: BLE001
         logger.warning(
-            "[BRANCH_RESOLVER] project %s missing %s; alert could not be staged",
+            "[BRANCH_RESOLVER] project %s branch alert could not be staged",
             project_id_str,
-            column_name,
         )
+
+
+def _signal_missing_project_branch(
+    project,
+    column_name: str,
+    alert_title: str,
+    *,
+    fallback_branch: str,
+) -> None:
+    project_id = getattr(project, "id", None)
+    project_id_str = str(project_id) if project_id is not None else "<unknown>"
+    _stage_project_branch_alert(
+        project,
+        dedupe_bucket=_missing_project_branch_alerts,
+        dedupe_key_suffix=column_name,
+        title=alert_title,
+        message=(
+            f"Project {project_id_str} has NULL {column_name}; "
+            f"falling back to {fallback_branch} until the column is populated."
+        ),
+        log_level=logging.WARNING,
+    )
+
+
+def _signal_blocking_project_branch_configuration(
+    project,
+    issue_code: str,
+    detail: str,
+) -> None:
+    _stage_project_branch_alert(
+        project,
+        dedupe_bucket=_blocking_project_branch_alerts,
+        dedupe_key_suffix=issue_code,
+        title="Blocking branch configuration",
+        message=detail,
+        log_level=logging.ERROR,
+    )
+
+
+def _uses_legacy_branch_resolver_shape(project) -> bool:
+    """Keep partial test doubles on the old fallback contract.
+
+    Real Project rows expose both integration and promotion columns plus the
+    self-repo metadata. Some older unit tests still use a minimal stub with only
+    ``integration_branch``; preserve the legacy `'main'` fallback for those
+    detached shapes so the runtime safety hardening only applies to real
+    project-like objects.
+    """
+    return project is not None and not any(
+        hasattr(project, attr)
+        for attr in ("promotion_target", "is_self_repo", "github_repo")
+    )
 
 
 def resolve_task_branch(task: Any, namespace: str) -> str:
@@ -179,14 +248,37 @@ def get_project_integration_branch(project) -> str:
     The deprecated runtime_config bridge was removed after the per-project
     column stabilized across the migration/backfill rollout.
     """
+    if _uses_legacy_branch_resolver_shape(project):
+        integration_branch = getattr(project, "integration_branch", None)
+        return integration_branch or "main"
+
     integration_branch = getattr(project, "integration_branch", None)
     if integration_branch:
         return integration_branch
-    _signal_missing_project_branch(
-        project, "integration_branch", "Missing integration_branch"
-    )
+
+    # Per-project column is unset. Fail SAFE (never raise) so the resolver can
+    # be called from read endpoints, background recovery loops, agent-facing
+    # completion handlers, and the ``Project.protected_branches`` property
+    # without a misconfiguration aborting the whole sweep or 500ing a request.
+    # Self-repo projects map an unset integration branch to the qualification
+    # trunk ("automain"); every other project falls back to "main". The
+    # operator-facing signal is still staged so the unset column stays visible.
+    # Promotion-target safety is enforced at the merge/rollup boundary (see
+    # rollup_management/admin_task_mutations), not in this hot-path resolver.
     if _is_blueprint_self_repo(project):
-        return "automain"
+        _signal_missing_project_branch(
+            project,
+            "integration_branch",
+            "Missing integration_branch",
+            fallback_branch=SELF_REPO_INTEGRATION_BRANCH,
+        )
+        return SELF_REPO_INTEGRATION_BRANCH
+    _signal_missing_project_branch(
+        project,
+        "integration_branch",
+        "Missing integration_branch",
+        fallback_branch="main",
+    )
     return "main"
 
 
@@ -264,7 +356,10 @@ def get_project_promotion_target(project) -> str:
     if promotion_target:
         return promotion_target
     _signal_missing_project_branch(
-        project, "promotion_target", "Missing promotion_target"
+        project,
+        "promotion_target",
+        "Missing promotion_target",
+        fallback_branch="main",
     )
     return "main"
 
@@ -274,10 +369,11 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
 
     Runs once at startup (called from main.py lifespan) after migrations finish.
     Only writes to columns that are still NULL — skips rows already populated so
-    the function is safe to re-run.  Self-repo projects with NULL integration_branch
-    are left untouched (migration 0124 already set them to 'automain'; if still NULL
-    they are in a state the LTS workflow manages separately).  Self-repo projects
-    with NULL promotion_target get 'main' without a GitHub round-trip.
+    the function is safe to re-run.  Self-repo projects with NULL
+    integration_branch are left untouched; the runtime resolver maps that state
+    to ``automain`` while preserving the explicit operator-facing signal that the
+    column is still unset.  Self-repo projects with NULL promotion_target get
+    'main' without a GitHub round-trip.
 
     For non-self-repo projects, resolves GitHub credentials and calls
     get_repo_default_branch().  When the GitHub API call fails, emits a per-project
@@ -324,8 +420,9 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
             summary["skipped"] += 1
             continue
 
-        # Self-repo: integration_branch managed by the LTS workflow — leave NULL
-        # as-is (migration 0124 already backfilled is_self_repo rows to 'automain').
+        # Self-repo: leave NULL as-is. The live resolver treats the self-repo's
+        # unset integration branch as automain without silently rewriting the
+        # column behind the operator's back.
         if project.is_self_repo and need_integration:
             summary["self_repo_skipped"] += 1
             need_integration = False
