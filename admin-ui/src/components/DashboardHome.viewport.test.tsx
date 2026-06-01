@@ -306,10 +306,18 @@ vi.mock('../api', () => ({
     escalation_total: 4,
     escalation_by_reason: { stuck: 2, standoff: 1, 'repeat-fingerprint': 1 },
     convergence_rate: 0.58,
+    non_converged_total: 6,
+    dominant_blocker: { cause: 'churn', count: 3, total: 6, share: 0.5 },
   })),
   fetchOuterLoopConvergenceTrend: vi.fn(async () => ({
     days: 7,
     buckets: [],
+  })),
+  fetchOuterLoopChains: vi.fn(async () => ({
+    window_hours: 24,
+    reason_filter: null,
+    total: 0,
+    chains: [],
   })),
 }));
 

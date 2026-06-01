@@ -4,6 +4,13 @@ This document describes the public HTTP surface exposed by the Blueprint orchest
 Routes are grouped by router family; the implementation lives in `backend/app/main.py`
 and the router modules under `backend/app/routers/`.
 
+The API surface is split into a few families:
+
+- Public project/task launch and status routes under `/api/*`
+- Agent lifecycle, warm handoff, GitHub proxy, and artifact upload routes under `/api/agent/*`
+- Admin settings, diagnostics, analytics, onboarding, and project-configuration routes under `/api/admin/*`
+- GitHub OAuth and webhook routes under `/api/github/*`
+
 ## Authentication
 
 - **Admin UI & User Endpoints**: Bearer token from Firebase Auth in `Authorization: Bearer <firebase_token>` header
@@ -124,6 +131,12 @@ parameter), obtained from `POST /api/projects/{project_id}/ws-ticket`.
    `{"event": "deploy_state", ...}` hydration snapshot, then streams events.
    See [WebSocket Message Format](#websocket-message-format) for the envelope.
 
+### Other project routes
+
+- `POST /api/projects/{project_id}/ws-ticket` - Mint a short-lived WebSocket ticket
+- `POST /api/projects/{project_id}/cancel` - Cancel the project and active work
+- `GET /api/projects/{project_id}/status` - Dashboard-friendly status summary
+
 ---
 
 ## Agent API
@@ -232,6 +245,46 @@ Extend the JWT expiry (renews for another 2 hours).
 
 Propagate a refreshed provider secret for the current task/account.
 
+### `GET /api/agent/github/token`
+
+Return a GitHub access token for the current task context.
+
+### `GET /api/agent/github/check-runs`
+
+List check runs relevant to the current task or PR context.
+
+### `POST /api/agent/github/commit-status`
+
+Create or update a commit status for the current repository.
+
+### `POST /api/agent/github/pr-comment`
+
+Create a pull request comment.
+
+### `POST /api/agent/github/pr-review-comment`
+
+Create an inline review comment on a pull request.
+
+### `POST /api/agent/github/pr-review`
+
+Submit a pull request review.
+
+### `POST /api/agent/github/issues`
+
+Create a GitHub issue in the target repository.
+
+### `GET /api/agent/github/issues`
+
+List GitHub issues for the target repository.
+
+### `POST /api/agent/github/branches`
+
+Create a branch through the GitHub proxy.
+
+### `POST /api/agent/github/pull-requests`
+
+Create a pull request through the GitHub proxy.
+
 ---
 
 ### `POST /api/agent/artifacts/upload-url`
@@ -271,6 +324,22 @@ VM-scoped liveness for warm-VM continuity.
 ### `POST /api/agent/next-role`
 
 Warm-VM handoff endpoint that either claims a pinned task or exits with no work.
+
+### `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
+
+Internal helper used by review workflows to merge approved changes.
+
+### `GET /api/agent/projects/{project_id}/directions/{direction_id}`
+
+Fetch a single direction for agent-side strategic work.
+
+### `GET /api/agent/projects/{project_id}/playbook/{key:path}`
+
+Read a project playbook entry.
+
+### `GET /api/agent/projects/{project_id}/gaps/{gap_id}`
+
+Fetch a specific gap entry for the agent research workflow.
 
 ---
 
@@ -336,6 +405,50 @@ The user GitHub OAuth/webhook router exposes:
 - `GET /api/github/oauth/authorize`
 - `GET /api/github/oauth/callback`
 - `POST /api/github/webhook`
+
+## Admin API
+
+Admin routes are mounted under `/api/admin` unless noted otherwise.
+
+### Common admin families
+
+- `GET /api/admin/settings`, `PATCH /api/admin/settings`, `GET /api/admin/providers`
+- `GET /api/admin/github/repos`, `GET /api/admin/github/branches`
+- `POST /api/admin/restart-orchestrator`
+- `POST /api/admin/memory/tracemalloc/start`, `POST /api/admin/memory/tracemalloc/stop`, `GET /api/admin/memory/snapshot`
+- `POST /api/admin/github-quota/refresh`, `POST /api/admin/github-quota/reset-tracking`
+- `GET /api/admin/projects`, `GET /api/admin/projects/{project_id}`, `PATCH /api/admin/projects/{project_id}`, `DELETE /api/admin/projects/{project_id}`
+- `POST /api/admin/projects/onboard`
+- `POST /api/admin/projects/{project_id}/detect-build-config`
+- `POST /api/admin/projects/{project_id}/running-update/acknowledge`
+- `GET /api/admin/autonomous-status`, `POST /api/admin/autonomous/pause-all`
+- `GET /api/admin/health-overview`, `GET /api/admin/warm-vm-state`, `GET /api/admin/pr-behind-detector-stats`
+- `GET /api/admin/activity`
+- `GET /api/admin/alerts`, `POST /api/admin/alerts/{alert_id}/dismiss`, `POST /api/admin/alerts/dismiss-all`
+- `GET /api/admin/messages`, `POST /api/admin/messages`
+- `GET /api/admin/digest`
+- `GET /api/admin/provider-cost-summary`, `GET /api/admin/fix-loop-convergence`, `GET /api/admin/outer-loop-convergence`, `GET /api/admin/pipeline-regressions`
+- `GET /api/admin/recent-orchestrator-errors`
+- `POST /api/admin/projects/{project_id}/self-audit`, `POST /api/admin/projects/{project_id}/qualify`, `POST /api/admin/tasks/{task_id}/rollup`
+- `GET /api/admin/projects/{project_id}/findings`
+- `GET|PUT /api/admin/projects/{project_id}/playbook`
+- `DELETE /api/admin/projects/{project_id}/playbook/{key}`
+- `POST /api/admin/projects/{project_id}/playbook/seed`
+- `POST /api/admin/projects/{project_id}/backfill-branches`
+- `GET|PATCH /api/admin/projects/{project_id}/integration-branch`
+- `GET|PATCH /api/admin/projects/{project_id}/promotion-target`
+
+### Deploy state routes
+
+Mounted from `backend/app/routers/deploy.py`:
+
+- `GET /deploy-state`
+- `POST /deploy-state/pause`
+- `POST /deploy-state/resume`
+- `POST /deploy-state/reset-health`
+- `POST /deploy-state/mark-stable`
+- `POST /deploy-state/rollback`
+- `GET /zone-health`
 
 ## Admin API
 

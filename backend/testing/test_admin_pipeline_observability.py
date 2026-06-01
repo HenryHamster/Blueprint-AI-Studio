@@ -126,3 +126,144 @@ async def test_outer_loop_convergence_trend_buckets_each_cycle_on_its_own_day(
     assert buckets[day_2.strftime("%Y-%m-%d")]["pr_count"] == 1
     assert buckets[day_2.strftime("%Y-%m-%d")]["convergence_rate"] == 1.0
     assert buckets[day_2.strftime("%Y-%m-%d")]["escalation_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_outer_loop_summary_includes_dominant_blocker(client, db_session):
+    """The convergence summary endpoint surfaces the additive dominant_blocker
+    key verbatim (the endpoint spreads the summary dict). The dominant blocker is
+    the single candidate CAUSE present in the most non-converged PR-chains, gated
+    so it must cover >=2 chains and >=50% of them; here both non-merged chains
+    churned, so ``churn`` dominates with share 1.0 over a non_converged_total of 2."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    tasks = [
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            context={
+                "pr_rejected": True,
+                "review_loop": {"iteration": 2, "pr_number": 1, "churn_detections": 1},
+            },
+        ),
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=now - timedelta(hours=1),
+            context={
+                "pr_rejected": True,
+                "review_loop": {"iteration": 3, "pr_number": 2, "churn_detections": 2},
+            },
+        ),
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"pr_merged": True, "review_loop": {"iteration": 1, "pr_number": 3}},
+        ),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/outer-loop-convergence?hours=24&project_id={project.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["non_converged_total"] == 2
+    assert data["dominant_blocker"] is not None
+    assert data["dominant_blocker"]["cause"] == "churn"
+    assert data["dominant_blocker"]["count"] == 2
+    assert data["dominant_blocker"]["total"] == 2
+    assert data["dominant_blocker"]["share"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_outer_loop_chains_drilldown_lists_nonmerged(client, db_session):
+    """The drill-down lists the actual non-merged PR-chains with enough context
+    to investigate; merged chains are excluded when no reason filter is given."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    rejected = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=now - timedelta(hours=1),
+        context={
+            "pr_rejected": True,
+            "review_loop": {"iteration": 3, "pr_number": 42, "churn_detections": 2},
+        },
+    )
+    merged = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=now - timedelta(hours=2),
+        context={"pr_merged": True, "review_loop": {"iteration": 1, "pr_number": 43}},
+    )
+    db_session.add_all([rejected, merged])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/outer-loop-chains?hours=24&project_id={project.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["window_hours"] == 24
+    assert data["reason_filter"] is None
+    # Only the non-merged (rejected) chain is listed by default.
+    assert data["total"] == 1
+    row = data["chains"][0]
+    assert row["pr_number"] == 42
+    assert row["terminal_reason"] == "rejected"
+    assert row["max_iteration"] == 3
+    assert row["churn_count"] == 2
+    assert str(rejected.id) in row["task_ids"]
+    assert row["project_id"] == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_outer_loop_chains_reason_filter(client, db_session):
+    """A reason filter narrows results to chains with that terminal outcome; an
+    unknown reason is rejected with 400."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    rejected = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=now - timedelta(hours=1),
+        context={"pr_rejected": True, "review_loop": {"iteration": 2, "pr_number": 42}},
+    )
+    cap = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        created_at=now - timedelta(hours=1),
+        context={
+            "failure_detail": "review_cap_exhausted",
+            "review_loop": {"iteration": 16, "pr_number": 50},
+        },
+    )
+    db_session.add_all([rejected, cap])
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/outer-loop-chains?hours=24&project_id={project.id}&reason=cap_exhausted"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["reason_filter"] == "cap_exhausted"
+    assert data["total"] == 1
+    assert data["chains"][0]["pr_number"] == 50
+    assert data["chains"][0]["terminal_reason"] == "cap_exhausted"
+
+    bad = await client.get(
+        f"/api/admin/outer-loop-chains?hours=24&project_id={project.id}&reason=bogus"
+    )
+    assert bad.status_code == 400

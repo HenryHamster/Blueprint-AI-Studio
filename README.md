@@ -4,6 +4,12 @@ Blueprint is a platform for launching, monitoring, and scaling autonomous Claude
 
 Blueprint also supports autonomous research mode: the orchestrator can generate and dispatch tasks from configurable strategic directions without manual intervention.
 
+The runtime is split across three main surfaces:
+
+- `backend/` - FastAPI orchestrator and background workers
+- `admin-ui/` - React admin dashboard on port `3001`
+- root `src/` - launcher UI on port `3000`
+
 ## Architecture
 
 ```
@@ -61,7 +67,7 @@ uvicorn app.main:app --reload --port 8080
 npm install
 npm run dev
 
-# 5. Open http://localhost:3001 and launch a task
+# 5. Open http://localhost:3000 to launch tasks, or http://localhost:3001 for the admin dashboard
 ```
 
 ## Production Setup (GCP)
@@ -95,7 +101,7 @@ See `.env.example` for the full list.
 
 ## How It Works
 
-1. Open the admin UI and click Launch Task
+1. Open the launcher UI and click Launch Task
 2. Enter a GitHub repo (`owner/repo`), base branch, and a prompt
 3. The orchestrator creates a project and task, then assigns a VM name
 4. The orchestrator worker picks up the queued task and provisions a GCP VM, or a local subprocess in `LOCAL_MODE=true`
@@ -145,6 +151,14 @@ When enabled, Blueprint continuously generates and dispatches tasks without manu
 
 Configure autonomous mode in the admin UI under Settings > Autonomous.
 
+## Backend Entry Points
+
+- `backend/app/main.py` wires the FastAPI app, middleware, router registration, startup/shutdown hooks, and schema revision checks.
+- `backend/app/routers/projects.py` owns the public task/project launch surface under `/api/*`.
+- `backend/app/routers/agent.py` and `backend/app/routers/agent_warm_continuity.py` own the agent lifecycle and warm handoff endpoints under `/api/agent/*`.
+- `backend/app/routers/admin_*.py` provide the admin dashboard, analytics, settings, diagnostics, and project configuration endpoints under `/api/admin/*` plus a few related internal paths.
+- `backend/app/orchestrator.py`, `backend/app/reaper.py`, and `backend/app/services.py` host the long-running background loops.
+
 ## Documentation
 
 Comprehensive documentation is available in the `docs/` directory:
@@ -181,6 +195,7 @@ Key test invariants:
 - Module size guardrails (`backend/testing/module_size_limits.json`) — request permission to bump limits via test assertion message
 - Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
+- Use `./check` for the fast repo gate; use `./check test` for the lightweight backend smoke pass
 
 ### Adding Features
 

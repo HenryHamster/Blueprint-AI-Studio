@@ -35,6 +35,17 @@ vi.mock('../api', () => ({
     escalation_total: 4,
     escalation_by_reason: { stuck: 2, standoff: 1, 'repeat-fingerprint': 1 },
     convergence_rate: 0.58,
+    non_converged_total: 8,
+    dominant_blocker: { cause: 'repeat_fingerprint_halt', count: 5, total: 8, share: 0.625 },
+  })),
+  fetchOuterLoopChains: vi.fn(async () => ({
+    window_hours: 24,
+    reason_filter: 'rejected',
+    total: 2,
+    chains: [
+      { pr_number: 5101, task_ids: ['t-1', 't-2'], max_iteration: 4, churn_count: 2, terminal_reason: 'rejected', project_id: 'p-1' },
+      { pr_number: 5102, task_ids: ['t-3'], max_iteration: 2, churn_count: 0, terminal_reason: 'rejected', project_id: 'p-1' },
+    ],
   })),
   fetchOuterLoopConvergenceTrend: vi.fn(async () => ({
     days: 7,
@@ -105,6 +116,21 @@ describe('OuterReviewLoopConvergenceWidget — viewport regression', () => {
     });
   }
 
+  async function mountWithDrillDownOpen() {
+    await mountAt();
+    const chip = Array.from(host!.querySelectorAll('button')).find(
+      (b) => (b.textContent ?? '').includes('rejected'),
+    );
+    if (chip) {
+      await act(async () => {
+        chip.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 80));
+      });
+    }
+  }
+
   test('renders stat grid + trend without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, mountAt);
   });
@@ -115,5 +141,13 @@ describe('OuterReviewLoopConvergenceWidget — viewport regression', () => {
 
   test('has no undocumented small touch targets at 375px', async () => {
     await expectMinTouchTargetAt(375, mountAt);
+  });
+
+  test('renders drill-down panel without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, mountWithDrillDownOpen);
+  });
+
+  test('has no undocumented small touch targets with drill-down open at 375px', async () => {
+    await expectMinTouchTargetAt(375, mountWithDrillDownOpen);
   });
 });

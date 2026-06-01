@@ -4663,6 +4663,22 @@ async def orchestrator_worker():
             if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
                 _last_post_commit_sweep = _utcnow()
                 await _sweep_post_commit_pending()
+            # Drain the deferred missing-branch alert queue into durable,
+            # idempotent operator Alerts. The synchronous branch resolvers
+            # record intent off the hot path (no DB I/O); the durable persist
+            # runs here in an async-safe context so the signal survives
+            # restarts without re-spamming (one undismissed alert per project
+            # column). Guarded so a flush failure never stalls monitoring.
+            try:
+                async with AsyncSessionLocal() as _branch_alert_session:
+                    if await _shared_state.flush_pending_branch_alerts(
+                        _branch_alert_session
+                    ):
+                        await _branch_alert_session.commit()
+            except Exception:
+                logger.exception(
+                    "[ORCHESTRATOR] Failed to flush pending branch alerts"
+                )
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1

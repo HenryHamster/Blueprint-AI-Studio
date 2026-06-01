@@ -586,8 +586,6 @@ _TERMINAL_OUTCOME_KEYS = frozenset(
 _ESCALATION_OUTCOME_KEYS = frozenset(
     {"stuck", "standoff", "repeat_fingerprint_halt"}
 )
-
-
 def _outer_loop_pct(values: List[int], p: int) -> Optional[int]:
     """Nearest-rank percentile over a list of ints (None when empty)."""
     if not values:
@@ -635,6 +633,214 @@ def _outer_loop_terminal_outcome(t: "Task") -> Optional[str]:
     return None
 
 
+def _group_outer_loop_chains(
+    all_tasks: List[Task], window_start: "datetime"
+) -> tuple:
+    """Group in-window review-loop tasks into PR-chains.
+
+    Returns ``(tasks_by_id, chains, task_id_to_chain)`` where ``chains`` maps a
+    chain key (see ``_outer_loop_chain_key``) to its iteration-tasks and
+    ``task_id_to_chain`` maps every iteration-task id AND each chain's
+    ``original_task_id`` (both str and UUID forms) back to the chain key, so an
+    escalation Alert raised against the original resolves to the right chain.
+    Shared by ``compute_outer_loop_convergence`` and ``_resolve_outer_loop_chains``.
+    """
+    tasks_by_id = {str(t.id): t for t in all_tasks}
+    loop_tasks = [
+        t
+        for t in all_tasks
+        if isinstance((t.context or {}).get("review_loop"), dict)
+        and (t.created_at is None or t.created_at >= window_start)
+    ]
+    chains: Dict[str, List[Task]] = defaultdict(list)
+    task_id_to_chain: Dict[Any, str] = {}
+    for t in loop_tasks:
+        key = _outer_loop_chain_key(t)
+        chains[key].append(t)
+        task_id_to_chain[t.id] = key
+        rl = (t.context or {}).get("review_loop") or {}
+        oid = rl.get("original_task_id")
+        if oid:
+            task_id_to_chain[oid] = key
+            try:
+                task_id_to_chain[uuid.UUID(str(oid))] = key
+            except Exception:
+                pass
+    return tasks_by_id, chains, task_id_to_chain
+
+
+def _scan_escalation_alerts(
+    escalation_alerts: List[Alert], task_id_to_chain: Dict[Any, str]
+) -> tuple:
+    """Parse review-fix escalation Alerts into chain-level reason data.
+
+    Returns ``(alert_reasons_by_chain, escalation_by_reason, escalated_task_ids)``.
+    A given ``(task_id, reason)`` pair is counted once in ``escalation_by_reason``
+    even when the same alert title recurs, so the histogram never over-counts
+    relative to the distinct-task escalation total. Shared by the convergence
+    aggregate and the chain drill-down so both read escalations identically.
+    """
+    escalation_by_reason: Dict[str, int] = {
+        "stuck": 0,
+        "standoff": 0,
+        "repeat-fingerprint": 0,
+    }
+    alert_reasons_by_chain: Dict[str, set] = defaultdict(set)
+    seen_task_reason: set = set()
+    escalated_task_ids: set = set()
+    for alert in escalation_alerts:
+        title = alert.title or ""
+        if not title.startswith(_ESCALATION_TITLE_PREFIX):
+            continue
+        if alert.task_id is not None:
+            escalated_task_ids.add(alert.task_id)
+        for label, reason in _ESCALATION_LABEL_TO_REASON.items():
+            if f"{_ESCALATION_TITLE_PREFIX}{label} " in title:
+                pair = (alert.task_id, reason)
+                if pair not in seen_task_reason:
+                    seen_task_reason.add(pair)
+                    escalation_by_reason[reason] += 1
+                    if alert.task_id is not None:
+                        alert_reasons_by_chain[
+                            task_id_to_chain.get(alert.task_id, f"task:{alert.task_id}")
+                        ].add(reason)
+                break
+    return alert_reasons_by_chain, escalation_by_reason, escalated_task_ids
+
+
+def _resolve_chain_outcome(outcome_tasks: List[Task], chain_reasons: set) -> Optional[str]:
+    """Resolve a PR-chain's single terminal outcome.
+
+    Definitive terminal states (merged > cap-exhausted > rejected) win over a
+    possibly stale structured ``review_loop_terminal_outcome`` marker; the
+    alert-derived escalation reasons (standoff > stuck > repeat-fingerprint) are
+    the last-resort fallback. This priority is the SAME one
+    ``compute_outer_loop_convergence`` used inline — extracted so the drill-down
+    endpoint reports outcomes identical to the aggregate. Critically, because
+    ``merged`` is checked first, an escalated-then-merged chain resolves to
+    ``merged`` and is never attributed to its prior escalation reason.
+    """
+    if any((t.context or {}).get("pr_merged") is True for t in outcome_tasks):
+        return "merged"
+    if any(
+        (t.context or {}).get("failure_detail") == "review_cap_exhausted"
+        for t in outcome_tasks
+    ):
+        return "cap_exhausted"
+    if any((t.context or {}).get("pr_rejected") is True for t in outcome_tasks):
+        return "rejected"
+    for t in outcome_tasks:
+        structured_outcome = _outer_loop_terminal_outcome(t)
+        if structured_outcome is not None:
+            return structured_outcome
+    if "standoff" in chain_reasons:
+        return "standoff"
+    if "stuck" in chain_reasons:
+        return "stuck"
+    if "repeat-fingerprint" in chain_reasons:
+        return "repeat_fingerprint_halt"
+    return None
+
+
+def _outer_loop_chain_observation(
+    key: str,
+    chain_tasks: List[Task],
+    tasks_by_id: Dict[str, Task],
+    chain_reasons: set,
+) -> Dict[str, Any]:
+    """Reduce one PR-chain's iteration-tasks to a single observation row.
+
+    Folds the chain-original task (which carries terminal flags like
+    ``pr_merged`` but usually no ``review_loop``) into the outcome scan, then
+    computes cycles-to-merge (``max(iteration)``), churn (``max`` of the running
+    ``churn_detections`` total), drift presence, the resolved terminal outcome,
+    and identifying context (``pr_number``, ``task_ids``, ``project_id``). Both
+    the convergence aggregate and the drill-down endpoint build from this row.
+    """
+    outcome_tasks = list(chain_tasks)
+    rl0 = (chain_tasks[0].context or {}).get("review_loop") or {}
+    oid = rl0.get("original_task_id")
+    if oid and str(oid) in tasks_by_id:
+        orig = tasks_by_id[str(oid)]
+        if orig not in outcome_tasks:
+            outcome_tasks.append(orig)
+
+    chain_iters: List[int] = []
+    chain_churn = 0
+    chain_has_drift = False
+    pr_number = rl0.get("pr_number")
+    for t in chain_tasks:
+        rl = (t.context or {}).get("review_loop") or {}
+        if pr_number is None and rl.get("pr_number") is not None:
+            pr_number = rl.get("pr_number")
+        it = rl.get("iteration")
+        if isinstance(it, (int, float)) and it >= 1:
+            chain_iters.append(int(it))
+        # churn_detections is a running total carried forward across iterations,
+        # so the chain's churn is the MAX seen (summing would double-count).
+        chain_churn = max(chain_churn, int(rl.get("churn_detections") or 0))
+        drift = rl.get("drift_signal")
+        if isinstance(drift, dict) and (drift.get("drift_in") or drift.get("drift_out")):
+            chain_has_drift = True
+
+    project_id = None
+    for t in outcome_tasks:
+        if getattr(t, "project_id", None) is not None:
+            project_id = str(t.project_id)
+            break
+
+    return {
+        "chain_key": key,
+        "outcome": _resolve_chain_outcome(outcome_tasks, chain_reasons),
+        "max_iteration": max(chain_iters) if chain_iters else None,
+        "churn_count": chain_churn,
+        "has_drift": chain_has_drift,
+        "original_task_id": str(oid) if oid else None,
+        "pr_number": pr_number,
+        "task_ids": [str(t.id) for t in chain_tasks],
+        "project_id": project_id,
+    }
+
+
+def _resolve_outer_loop_chains(
+    all_tasks: List[Task],
+    escalation_alerts: List[Alert],
+    window_start: "datetime",
+) -> List[Dict[str, Any]]:
+    """Reduce in-window review-loop tasks to one observation row per PR-chain.
+
+    Pure function — no database calls. Reuses the same grouping
+    (``_outer_loop_chain_key``), escalation-alert parsing, and per-chain outcome
+    resolution as ``compute_outer_loop_convergence``, so the chain drill-down
+    endpoint reports outcomes identical to the aggregate summary. Rows are
+    newest-first by the chain's most recent review_loop task creation time.
+    """
+    tasks_by_id, chains, task_id_to_chain = _group_outer_loop_chains(
+        all_tasks, window_start
+    )
+    alert_reasons_by_chain, _by_reason, _escalated_ids = _scan_escalation_alerts(
+        escalation_alerts, task_id_to_chain
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for key, chain_tasks in chains.items():
+        obs = _outer_loop_chain_observation(
+            key, chain_tasks, tasks_by_id, alert_reasons_by_chain.get(key, set())
+        )
+        latest_created = None
+        for t in chain_tasks:
+            created = t.created_at
+            if created is not None and (latest_created is None or created > latest_created):
+                latest_created = created
+        obs["_latest_created"] = latest_created
+        rows.append(obs)
+
+    rows.sort(key=lambda r: r["_latest_created"] or datetime.min, reverse=True)
+    for r in rows:
+        r.pop("_latest_created", None)
+    return rows
+
+
 def compute_outer_loop_convergence(
     *,
     all_tasks: List[Task],
@@ -671,30 +877,9 @@ def compute_outer_loop_convergence(
     carry review_loop), so merges are attributed even though the original is
     absent from ``loop_tasks``.
     """
-    tasks_by_id = {str(t.id): t for t in all_tasks}
-
-    loop_tasks = [
-        t
-        for t in all_tasks
-        if isinstance((t.context or {}).get("review_loop"), dict)
-        and (t.created_at is None or t.created_at >= window_start)
-    ]
-
-    # Group per-iteration review/fix tasks into PR-chains.
-    chains: Dict[str, List[Task]] = defaultdict(list)
-    task_id_to_chain: Dict[Any, str] = {}
-    for t in loop_tasks:
-        key = _outer_loop_chain_key(t)
-        chains[key].append(t)
-        task_id_to_chain[t.id] = key
-        rl = (t.context or {}).get("review_loop") or {}
-        oid = rl.get("original_task_id")
-        if oid:
-            task_id_to_chain[oid] = key
-            try:
-                task_id_to_chain[uuid.UUID(str(oid))] = key
-            except Exception:
-                pass
+    tasks_by_id, chains, task_id_to_chain = _group_outer_loop_chains(
+        all_tasks, window_start
+    )
 
     iterations: List[int] = []
     iteration_distribution = {"1": 0, "2": 0, "3": 0, "4+": 0}
@@ -717,111 +902,50 @@ def compute_outer_loop_convergence(
     standoff_pr_count = 0
     repeat_fingerprint_pr_count = 0
     overall_escalation_pr_count = 0
-    escalation_by_reason: Dict[str, int] = {
+
+    # Parse escalation Alerts into per-chain reason sets + the deduped histogram.
+    (
+        alert_reasons_by_chain,
+        escalation_by_reason,
+        escalated_task_ids,
+    ) = _scan_escalation_alerts(escalation_alerts, task_id_to_chain)
+    escalated_chain_keys: set = set()
+
+    # Per-non-converged-chain candidate-cause tallies, used to rank the single
+    # dominant non-convergence blocker. Each non-converged chain (outcome !=
+    # "merged") contributes to every cause it exhibits, so shares are normalised
+    # on ONE common base (non-converged PR-chains) rather than comparing the raw
+    # counts directly — the escalation-reason signals are reason-occurrences on a
+    # different base than the per-chain churn/drift/outcome counts.
+    non_converged_total = 0
+    blocker_cause_counts: Dict[str, int] = {
+        "churn": 0,
+        "drift": 0,
         "stuck": 0,
         "standoff": 0,
-        "repeat-fingerprint": 0,
+        "repeat_fingerprint_halt": 0,
+        "cap_exhausted": 0,
     }
 
-    alert_reasons_by_chain: Dict[str, set[str]] = defaultdict(set)
-    seen_task_reason: set[tuple[uuid.UUID | None, str]] = set()
-    escalated_task_ids: set = set()
-    escalated_chain_keys: set[str] = set()
-    for alert in escalation_alerts:
-        title = alert.title or ""
-        if not title.startswith(_ESCALATION_TITLE_PREFIX):
-            continue
-        if alert.task_id is not None:
-            escalated_task_ids.add(alert.task_id)
-        for label, reason in _ESCALATION_LABEL_TO_REASON.items():
-            if f"{_ESCALATION_TITLE_PREFIX}{label} " in title:
-                pair = (alert.task_id, reason)
-                if pair not in seen_task_reason:
-                    seen_task_reason.add(pair)
-                    escalation_by_reason[reason] += 1
-                    if alert.task_id is not None:
-                        alert_reasons_by_chain[
-                            task_id_to_chain.get(alert.task_id, f"task:{alert.task_id}")
-                        ].add(reason)
-                break
-
     for key, chain_tasks in chains.items():
-        # Fold the chain-original task (looked up by original_task_id) into the
-        # outcome scan — terminal flags like pr_merged are written there and the
-        # original usually carries no review_loop, so it is absent from chain_tasks.
-        outcome_tasks = list(chain_tasks)
-        rl0 = (chain_tasks[0].context or {}).get("review_loop") or {}
-        oid = rl0.get("original_task_id")
-        if oid and str(oid) in tasks_by_id:
-            orig = tasks_by_id[str(oid)]
-            if orig not in outcome_tasks:
-                outcome_tasks.append(orig)
+        obs = _outer_loop_chain_observation(
+            key, chain_tasks, tasks_by_id, alert_reasons_by_chain.get(key, set())
+        )
 
-        # cycles-to-merge = the highest review_loop iteration the chain reached
-        # (one observation per chain, not one per iteration-task).
-        chain_iters: List[int] = []
-        chain_churn = 0
-        chain_has_drift = False
-        for t in chain_tasks:
-            rl = (t.context or {}).get("review_loop") or {}
-            it = rl.get("iteration")
-            if isinstance(it, (int, float)) and it >= 1:
-                chain_iters.append(int(it))
-            # churn_detections is a running total carried forward across
-            # iterations, so the chain's churn is the MAX seen (summing per-task
-            # would double-count cumulative values).
-            chain_churn = max(chain_churn, int(rl.get("churn_detections") or 0))
-            drift = rl.get("drift_signal")
-            if isinstance(drift, dict) and (
-                drift.get("drift_in") or drift.get("drift_out")
-            ):
-                chain_has_drift = True
-        if chain_iters:
-            max_it = max(chain_iters)
-            iterations.append(max_it)
-            iteration_distribution["4+" if max_it >= 4 else str(max_it)] += 1
+        max_iteration = obs["max_iteration"]
+        if max_iteration is not None:
+            iterations.append(max_iteration)
+            iteration_distribution[
+                "4+" if max_iteration >= 4 else str(max_iteration)
+            ] += 1
+        chain_churn = obs["churn_count"]
         if chain_churn > 0:
             churn_total += chain_churn
             churn_pr_count += 1
-        if chain_has_drift:
+        if obs["has_drift"]:
             drift_pr_count += 1
 
-        has_merged = any((t.context or {}).get("pr_merged") is True for t in outcome_tasks)
-        has_cap_exhausted = any(
-            (t.context or {}).get("failure_detail") == "review_cap_exhausted"
-            for t in outcome_tasks
-        )
-        has_rejected = any(
-            (t.context or {}).get("pr_rejected") is True for t in outcome_tasks
-        )
-        structured_outcome = None
-        for t in outcome_tasks:
-            structured_outcome = _outer_loop_terminal_outcome(t)
-            if structured_outcome is not None:
-                break
-
-        # review_loop_terminal_outcome is a durable breadcrumb on the
-        # chain-original task, but later merge/reject paths do not clear it.
-        # Resolve the chain with definitive terminal states first so a stale
-        # escalation marker cannot mask an eventual convergence or rejection.
-        outcome = None
-        if has_merged:
-            outcome = "merged"
-        elif has_cap_exhausted:
-            outcome = "cap_exhausted"
-        elif has_rejected:
-            outcome = "rejected"
-        elif structured_outcome is not None:
-            outcome = structured_outcome
-        else:
-            chain_reasons = alert_reasons_by_chain.get(key, set())
-            if "standoff" in chain_reasons:
-                outcome = "standoff"
-            elif "stuck" in chain_reasons:
-                outcome = "stuck"
-            elif "repeat-fingerprint" in chain_reasons:
-                outcome = "repeat_fingerprint_halt"
-
+        outcome = obs["outcome"]
         if outcome in terminal_outcome_histogram:
             terminal_outcome_histogram[outcome] += 1
         if outcome == "merged":
@@ -843,6 +967,18 @@ def compute_outer_loop_convergence(
             overall_escalation_pr_count += 1
             escalated_chain_keys.add(key)
 
+        # Tally candidate non-convergence causes for the dominant-blocker ranking.
+        # A chain is non-converged when it did NOT merge; it contributes to every
+        # cause it exhibits (a chain can churn AND drift, etc.).
+        if outcome != "merged":
+            non_converged_total += 1
+            if chain_churn > 0:
+                blocker_cause_counts["churn"] += 1
+            if obs["has_drift"]:
+                blocker_cause_counts["drift"] += 1
+            if outcome in blocker_cause_counts:
+                blocker_cause_counts[outcome] += 1
+
     # Outer-loops still escalated but not yet merged/rejected count as
     # non-convergence in the denominator (oscillating / stuck awaiting a human).
     # Map escalated tasks to their chain so an unresolved escalation counts once
@@ -854,6 +990,30 @@ def compute_outer_loop_convergence(
     escalated_unresolved = escalated_chains - merged_chains - rejected_chains
     decided = len(merged_chains) + len(rejected_chains) + len(escalated_unresolved)
     convergence_rate = round(len(merged_chains) / decided, 3) if decided else None
+
+    # Rank the candidate causes and name a single dominant blocker only when one
+    # cause clearly dominates: it must be present in >=2 non-converged chains,
+    # cover >=50% of them, AND strictly outrank the runner-up (an even split is
+    # "no clear dominant"). Mirrors the dominant-failure-class gating in
+    # _build_digest_narrative; emits None on empty/ambiguous windows.
+    dominant_blocker: Optional[Dict[str, Any]] = None
+    if non_converged_total > 0:
+        ranked = sorted(
+            blocker_cause_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+        top_cause, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= 2
+            and top_count / non_converged_total >= 0.5
+            and top_count > second_count
+        ):
+            dominant_blocker = {
+                "cause": top_cause,
+                "count": top_count,
+                "total": non_converged_total,
+                "share": round(top_count / non_converged_total, 3),
+            }
 
     return {
         "prs_with_review_loop": len(chains),
@@ -895,6 +1055,8 @@ def compute_outer_loop_convergence(
         "escalation_total": len(escalated_task_ids),
         "escalation_by_reason": escalation_by_reason,
         "convergence_rate": convergence_rate,
+        "non_converged_total": non_converged_total,
+        "dominant_blocker": dominant_blocker,
     }
 
 

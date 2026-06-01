@@ -382,6 +382,96 @@ def test_escalation_by_reason_dedupes_repeated_same_reason_alerts():
     assert res["escalation_total"] == 1
 
 
+def test_dominant_blocker_named_when_one_cause_dominates():
+    """When one candidate cause covers >=50% of non-converged chains (and >=2,
+    strictly outranking runners-up), it is named with its quantified share."""
+    pid = uuid4()
+    tasks = []
+    # 7 churn-only non-converged chains (no terminal flag -> outcome None).
+    for _ in range(7):
+        tasks.append(
+            _task(
+                pid,
+                review_loop={"iteration": 2, "original_task_id": str(uuid4()), "churn_detections": 1},
+            )
+        )
+    # 4 plain-rejected non-converged chains with no churn/drift signal.
+    for _ in range(4):
+        tasks.append(
+            _task(
+                pid,
+                review_loop={"iteration": 1, "original_task_id": str(uuid4())},
+                ctx_extra={"pr_rejected": True},
+            )
+        )
+    res = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["non_converged_total"] == 11
+    blocker = res["dominant_blocker"]
+    assert blocker is not None
+    assert blocker["cause"] == "churn"
+    assert blocker["count"] == 7
+    assert blocker["total"] == 11
+    assert blocker["share"] == 0.636
+
+
+def test_dominant_blocker_none_when_no_clear_dominant():
+    """An even split between two causes has no clear dominant -> None."""
+    pid = uuid4()
+    tasks = [
+        # 2 churn-only non-converged chains.
+        _task(pid, review_loop={"iteration": 2, "original_task_id": str(uuid4()), "churn_detections": 1}),
+        _task(pid, review_loop={"iteration": 2, "original_task_id": str(uuid4()), "churn_detections": 1}),
+        # 2 drift-only non-converged chains.
+        _task(
+            pid,
+            review_loop={
+                "iteration": 2,
+                "original_task_id": str(uuid4()),
+                "drift_signal": {"drift_in": [{"file": "a.py"}], "drift_out": []},
+            },
+        ),
+        _task(
+            pid,
+            review_loop={
+                "iteration": 2,
+                "original_task_id": str(uuid4()),
+                "drift_signal": {"drift_in": [{"file": "b.py"}], "drift_out": []},
+            },
+        ),
+    ]
+    res = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["non_converged_total"] == 4
+    # churn=2 and drift=2 tie -> neither strictly dominates.
+    assert res["dominant_blocker"] is None
+
+
+def test_dominant_blocker_none_below_sample_floor():
+    """A single non-converged chain is below the count>=2 floor -> None."""
+    pid = uuid4()
+    tasks = [
+        _task(pid, review_loop={"iteration": 1, "original_task_id": str(uuid4())}, ctx_extra={"pr_merged": True}),
+        _task(
+            pid,
+            review_loop={"iteration": 2, "original_task_id": str(uuid4()), "churn_detections": 1},
+        ),
+    ]
+    res = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["non_converged_total"] == 1
+    assert res["dominant_blocker"] is None
+
+
 def test_tasks_without_review_loop_ignored():
     pid = uuid4()
     tasks = [
@@ -394,3 +484,63 @@ def test_tasks_without_review_loop_ignored():
         window_start=_utcnow() - timedelta(hours=24),
     )
     assert res["prs_with_review_loop"] == 1
+
+
+# ---------------------------------------------------------------------------
+# dominant_blocker — edge cases that must always resolve to None
+# (the gated cause-ranking happy paths live above; these guard the boundaries)
+# ---------------------------------------------------------------------------
+
+
+def test_dominant_blocker_none_on_empty_window():
+    res = compute_outer_loop_convergence(
+        all_tasks=[],
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["dominant_blocker"] is None
+
+
+def test_dominant_blocker_none_when_all_merged():
+    pid = uuid4()
+    tasks = [
+        _task(pid, review_loop={"iteration": 1}, ctx_extra={"pr_merged": True}),
+        _task(pid, review_loop={"iteration": 2}, ctx_extra={"pr_merged": True}),
+    ]
+    res = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["dominant_blocker"] is None
+
+
+def test_dominant_blocker_escalated_then_merged_not_attributed():
+    """CRITICAL invariant: a chain that escalated (stuck alert) and then merged
+    resolves to ``merged`` and must NEVER count toward a blocker. With only that
+    one chain in the window, dominant_blocker is None and non_converged_total is 0."""
+    pid = uuid4()
+    orig_id = str(uuid4())
+    chain = [
+        _task(pid, review_loop={"iteration": 1, "original_task_id": orig_id}),
+        _task(
+            pid,
+            review_loop={"iteration": 2, "original_task_id": orig_id},
+            ctx_extra={"pr_merged": True},
+        ),
+    ]
+    alerts = [
+        make_alert(
+            pid,
+            task_id=chain[0].id,
+            title="Review-fix escalation: stuck cycle on PR #5",
+        ),
+    ]
+    res = compute_outer_loop_convergence(
+        all_tasks=chain,
+        escalation_alerts=alerts,
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    # The chain merged despite the earlier escalation.
+    assert res["outcomes"]["merged"] == 1
+    assert res["dominant_blocker"] is None
