@@ -72,6 +72,15 @@ class AgentStatusPayload(BaseModel):
     # Lets the terminal status POST also carry it so tasks that skip heartbeats
     # (short-lived roles) still get a fingerprint persisted.
     prompt_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{12}$")
+    # Affirmative no-op completion reason. Set ONLY by `./done --already-done`
+    # (agent/src/prompts/done-helper.ts) when the agent verified the task's
+    # deliverable already exists on the base branch and there is no diff/PR to
+    # produce (e.g. a sibling PR already added the migration/model/endpoint). On
+    # a COMPLETED status with no PR, this is the affirmative signal that the
+    # no-op is intentional — persisted into task.context["no_op_reason"] so
+    # operators see WHY there is no PR. A no-diff finish WITHOUT this reason is
+    # not a no-op completion; the agent wrapper fails it as `incomplete`.
+    no_op_reason: str | None = Field(None, max_length=2000)
 
 
 class UploadUrlRequest(BaseModel):

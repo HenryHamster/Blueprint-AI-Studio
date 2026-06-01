@@ -30,35 +30,140 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       new bug or precondition (missing package, infra gap, agent
 #       can't even start the work). --warn-out-of-scope is for issues
 #       that already existed on main BEFORE this PR.
+#
+#   ./done --already-done "<reason>"           # no-op / already-satisfied exit:
+#       AFFIRMATIVELY signal that the task's deliverable ALREADY EXISTS on
+#       origin/${cfg.baseBranch} and no code change is needed — so there is NO
+#       diff and NO PR to produce. Marks the task COMPLETED (no PR) with the
+#       reason recorded so operators see why there's no PR.
+#
+#       Use ONLY when you have VERIFIED the deliverable is already present
+#       (e.g. a sibling PR already added the migration / model / endpoint you
+#       were asked to add, and producing a duplicate would break an invariant
+#       like Alembic chain-linearity). The reason MUST name the concrete
+#       artifact you verified and where it lives (≥30 chars), e.g.
+#       "backend/alembic/versions/0133_poolvm_registry.py + PoolVm model +
+#       EXPECTED_SCHEMA_REVISION=0133 already present on base (sibling PR #6978);
+#       a new migration would branch the revision chain".
+#
+#       This is NOT a give-up verb. If you could NOT complete the work
+#       (errored, gave up, ran out of ideas) use ./fail. If an upstream
+#       precondition blocks you use ./blocked. --already-done is strictly for
+#       "I checked and the work is genuinely already done."
 
 set -uo pipefail
 
 WARN_OUT_OF_SCOPE_REASON=""
-SKIP_NEXT=0
+ALREADY_DONE_REASON=""
+SKIP_NEXT_KIND=""
 for i in "$@"; do
-  if [ "$SKIP_NEXT" = "1" ]; then
-    WARN_OUT_OF_SCOPE_REASON="$i"
-    SKIP_NEXT=0
+  if [ -n "$SKIP_NEXT_KIND" ]; then
+    case "$SKIP_NEXT_KIND" in
+      warn) WARN_OUT_OF_SCOPE_REASON="$i" ;;
+      already) ALREADY_DONE_REASON="$i" ;;
+    esac
+    SKIP_NEXT_KIND=""
     continue
   fi
   case "$i" in
     --warn-out-of-scope)
-      SKIP_NEXT=1
+      SKIP_NEXT_KIND="warn"
       ;;
     --warn-out-of-scope=*)
       WARN_OUT_OF_SCOPE_REASON="\${i#--warn-out-of-scope=}"
       ;;
+    --already-done)
+      SKIP_NEXT_KIND="already"
+      ;;
+    --already-done=*)
+      ALREADY_DONE_REASON="\${i#--already-done=}"
+      ;;
   esac
 done
-if [ "$SKIP_NEXT" = "1" ] && [ -z "$WARN_OUT_OF_SCOPE_REASON" ]; then
+if [ "$SKIP_NEXT_KIND" = "warn" ] && [ -z "$WARN_OUT_OF_SCOPE_REASON" ]; then
   echo "Error: --warn-out-of-scope requires a reason argument" >&2
   echo "Usage: ./done --warn-out-of-scope \\"<reason>\\"" >&2
+  exit 2
+fi
+if [ "$SKIP_NEXT_KIND" = "already" ] && [ -z "$ALREADY_DONE_REASON" ]; then
+  echo "Error: --already-done requires a reason argument" >&2
+  echo "Usage: ./done --already-done \\"<reason naming the artifact you verified>\\"" >&2
   exit 2
 fi
 if [ -n "$WARN_OUT_OF_SCOPE_REASON" ] && [ \${#WARN_OUT_OF_SCOPE_REASON} -lt 30 ]; then
   echo "Error: --warn-out-of-scope reason must be at least 30 chars (you gave \${#WARN_OUT_OF_SCOPE_REASON})." >&2
   echo "       Be specific: which gates failed, which files, why fixing is out of scope." >&2
   exit 2
+fi
+if [ -n "$WARN_OUT_OF_SCOPE_REASON" ] && [ -n "$ALREADY_DONE_REASON" ]; then
+  echo "Error: --warn-out-of-scope and --already-done are mutually exclusive." >&2
+  echo "       --already-done means there is no diff/PR; --warn-out-of-scope ships a PR." >&2
+  exit 2
+fi
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+# ── --already-done: affirmative no-op completion (no PR, no diff) ──────────────
+# A LEGITIMATE "the deliverable already exists on the base branch" exit. This
+# is the ONLY clean path to COMPLETED without a PR — it requires the agent to
+# AFFIRMATIVELY assert (with a specific reason) that the work is already done,
+# so a task that merely produced no diff because it errored/gave up can NOT
+# masquerade as completed (that still routes through ./fail or the wrapper's
+# FAILED fallback). Posts COMPLETED with no artifact_type/pr_url; the reason is
+# recorded as no_op_reason on the payload AND as the logs/status message so
+# operators see why there's no PR.
+if [ -n "$ALREADY_DONE_REASON" ]; then
+  if [ \${#ALREADY_DONE_REASON} -lt 30 ]; then
+    echo "Error: --already-done reason must be at least 30 chars (you gave \${#ALREADY_DONE_REASON})." >&2
+    echo "       Name the concrete artifact you verified already exists and where (file path / sibling PR)." >&2
+    exit 2
+  fi
+  # Idempotency: if the marker already exists this is a re-run — no-op cleanly.
+  if [ -f /tmp/done_${cfg.taskId} ]; then
+    echo "[done] already marked — no-op (already-done: no PR)"
+    exit 0
+  fi
+  ND_LOGS="Completed: no changes needed — deliverable already present. $ALREADY_DONE_REASON"
+  ND_PAYLOAD=$(jq -n --arg tid "$TASK" --arg r "$ALREADY_DONE_REASON" --arg logs "$ND_LOGS" \\
+    '{task_id: $tid, status: "COMPLETED", no_op_reason: $r, logs: $logs}')
+  # Stale-result envelope: persist BEFORE the POST so a mid-retry VM kill can
+  # be replayed by the next agent boot (mirrors the PR path below).
+  ND_ENVELOPE="/tmp/task_${cfg.taskId}_result.json"
+  printf '%s' "$ND_PAYLOAD" > "$ND_ENVELOPE" 2>/dev/null || \\
+    echo "[done] WARNING: failed to persist stale-result envelope to $ND_ENVELOPE" >&2
+  ND_POSTED=0
+  for attempt in 1 2 3 4 5; do
+    HTTP=$(printf '%s' "$ND_PAYLOAD" | curl -sS -o /tmp/done_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+      -X POST "$API/api/agent/status" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || HTTP="000"
+    if [ "$HTTP" = "200" ] || [ "$HTTP" = "202" ]; then
+      ND_POSTED=1
+      break
+    fi
+    if [ "$HTTP" = "429" ] || [ "\${HTTP:0:1}" = "5" ] || [ "$HTTP" = "000" ]; then
+      BACKOFF=$((attempt * 3))
+      echo "[done] already-done POST attempt $attempt got HTTP=$HTTP — retrying in \${BACKOFF}s..." >&2
+      sleep "$BACKOFF"
+      continue
+    fi
+    echo "[done] already-done POST attempt $attempt got HTTP=$HTTP (permanent failure):" >&2
+    cat /tmp/done_resp_${cfg.taskId} >&2
+    rm -f /tmp/done_resp_${cfg.taskId}
+    exit 1
+  done
+  rm -f /tmp/done_resp_${cfg.taskId}
+  if [ "$ND_POSTED" = "0" ]; then
+    echo "[done] already-done POST failed after 5 retries — orchestrator unreachable. Marker NOT written." >&2
+    exit 1
+  fi
+  touch /tmp/done_${cfg.taskId}
+  rm -f "$ND_ENVELOPE"
+  echo ""
+  echo "[done] OK — task COMPLETED with no PR (deliverable already present)."
+  echo "[done] reason: $ALREADY_DONE_REASON"
+  exit 0
 fi
 
 PR_FILE="/tmp/pr_url_${cfg.taskId}"
@@ -76,10 +181,6 @@ if ! printf '%s' "$PR_URL" | grep -qE "$PR_URL_RE"; then
   echo "[done]   ./pr open must produce a canonical pull URL (not /commit/, /compare/, etc.)." >&2
   exit 2
 fi
-
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="${cfg.taskId}"
 
 # Idempotency: if marker already exists, this is a re-run — no-op cleanly.
 if [ -f /tmp/done_${cfg.taskId} ]; then

@@ -823,6 +823,22 @@ const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<bod
     fresh VM. Resolving locally is much cheaper than that fallback.
 - \`./done\` — marks the task COMPLETED with the PR URL. Requires
   \`./pr open\` to have run first. Idempotent (safe to re-run).
+  - \`./done --already-done "<reason>"\` — no-op / already-satisfied exit.
+    Use ONLY when you have VERIFIED that the task's deliverable ALREADY
+    EXISTS on the base branch and producing a diff would be a genuine no-op
+    (or would break an invariant — e.g. a sibling PR already added the
+    migration/model/endpoint you were asked to add, and a duplicate would
+    branch the Alembic revision chain). Marks the task COMPLETED with NO PR
+    and records your reason so operators see why there's no PR. Does NOT
+    require \`./pr open\`. The reason MUST name the concrete artifact you
+    verified and where it lives (≥30 chars), e.g. "0133_poolvm_registry.py +
+    PoolVm model + EXPECTED_SCHEMA_REVISION=0133 already on base via sibling
+    PR #6978; a new migration would break chain-linearity". This is NOT a
+    give-up verb — if you couldn't complete the work use \`./fail\`; if an
+    upstream precondition blocks you use \`./blocked\`. A bare exit with no
+    diff and no \`./done\`/\`./fail\`/\`./blocked\` is treated as INCOMPLETE
+    (it fails) — so if the work is genuinely already done you MUST call
+    \`./done --already-done\` to land it COMPLETED.
   - \`./done --warn-out-of-scope "<reason>"\` — judgment-call escape hatch.
     Use when \`./check\` fails but the failures are in **files you edited**
     and are **pre-existing on the base branch (origin/<BASE>)** AND
@@ -872,6 +888,10 @@ fallback: if you opened a PR via \`./pr open\` but didn't call \`./done\`,
 it posts COMPLETED on your behalf using the PR URL marker. Otherwise it
 posts FAILED with no useful reason — which is bad for the operator and
 bad for downstream investigation. Don't rely on the fallback.
+There is NO "exit with no diff = success" fallback: if the deliverable is
+already present and you produced no diff, you MUST call
+\`./done --already-done "<reason>"\` — a bare no-diff exit is failed as
+incomplete, never silently completed.
 
 DO use \`git status\`, \`git diff\` to inspect your work.
 DON'T directly call \`git commit\`, \`git push\`, or \`gh pr create\` — use

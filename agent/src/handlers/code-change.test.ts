@@ -275,3 +275,81 @@ describe('runCodeChangeTask promotionTarget forwarding', () => {
     );
   });
 });
+
+// ── runCodeChangeTask — no-op / already-done completion safeguard ─────────────
+// The ONLY clean path to a no-PR COMPLETED is the affirmative
+// `./done --already-done` verb (which writes /tmp/done_<id>). A bare no-diff
+// clean exit with NO marker must fail as `incomplete`, never silently complete.
+describe('runCodeChangeTask redundant-no-op completion safeguard', () => {
+  const baseOpts = {
+    taskId: 'noop-handler-task',
+    prompt: 'add Alembic migration for PoolVm registry',
+    ws: null,
+    statusRef: { value: '' },
+    workBranch: 'blueprint/noop-handler-task',
+    baseBranch: 'plan/3a47191b',
+    owner: 'owner',
+    repo: 'repo',
+    testsOnMainBranch: true,
+    baseCommit: 'abc123',
+    noChangesMessage: 'No migration changes generated.',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.unlinkSync).mockImplementation(() => {});
+    // No diff: status clean AND HEAD unchanged from baseCommit.
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return '';
+      if (args[0] === 'rev-parse') return 'abc123';
+      return '';
+    });
+  });
+
+  it('completes cleanly (no FAILED) when ./done --already-done wrote the done marker', async () => {
+    // Claude affirmatively signalled via ./done --already-done → /tmp/done_<id>.
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) =>
+      String(p) === '/tmp/done_noop-handler-task',
+    );
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // The wrapper must NOT post any terminal status itself — ./done already did.
+    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalled();
+  });
+
+  it('FAILS as incomplete on a bare no-diff clean exit with NO affirmative ./done --already-done', async () => {
+    // No markers at all: agent produced no diff but never affirmatively signalled.
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'thought about it, did nothing', lastResultText: '' });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    // It must FAIL (incomplete) — NOT silently COMPLETE despite noChangesMessage being set.
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledTimes(1);
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('FAILED');
+    expect(payload.failure_category).toBe('incomplete');
+    // And it must NOT have posted a COMPLETED with the no-changes message.
+    const completedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      c => c[1].status === 'COMPLETED',
+    );
+    expect(completedCalls).toHaveLength(0);
+    // The failure reason must point the agent at the affirmative verb.
+    expect(String(payload.logs)).toContain('./done --already-done');
+  });
+
+  it('FAILS as claude_code_failed when the subprocess exited non-zero with no diff', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'crashed', lastResultText: '' });
+
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledTimes(1);
+    const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(payload.status).toBe('FAILED');
+    expect(payload.failure_category).toBe('claude_code_failed');
+  });
+});
