@@ -1,0 +1,91 @@
+import { Plus, X } from 'lucide-react';
+import type { useDirectionForm } from '../hooks/useDirectionForm';
+
+export interface DirectionsAddFormProps {
+  form: ReturnType<typeof useDirectionForm>;
+  addDirection: () => void;
+}
+
+/**
+ * Add-direction form: text input, priority/category selects, path-tag editor,
+ * and completion-criteria textarea. Extracted verbatim from DirectionsPanel.
+ */
+export function DirectionsAddForm({ form, addDirection }: DirectionsAddFormProps) {
+  return (
+    <div className="px-5 py-3 border-b border-neutral-800 shrink-0">
+      <div className="flex flex-wrap gap-2">
+        <input
+          value={form.newText}
+          onChange={e => form.setNewText(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && addDirection()}
+          placeholder="New direction..."
+          className="flex-1 min-w-0 basis-full sm:basis-auto bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
+        />
+        <select
+          value={form.newPriority}
+          onChange={e => form.setNewPriority(e.target.value as 'high' | 'medium' | 'low')}
+          className="min-w-0 shrink bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+        >
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+        <select
+          value={form.newCategory ?? ''}
+          onChange={e => form.setNewCategory((e.target.value || null) as 'product' | 'structural' | 'mixed' | null)}
+          className="min-w-0 shrink bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600"
+        >
+          <option value="">Type…</option>
+          <option value="product">Product</option>
+          <option value="structural">Structural</option>
+          <option value="mixed">Mixed</option>
+        </select>
+        <button
+          onClick={addDirection}
+          disabled={!form.newText.trim()}
+          className="shrink-0 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 text-neutral-300 px-3 py-1.5 rounded text-xs transition-colors border border-neutral-700 flex items-center min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto justify-center"
+          aria-label="Add direction"
+        >
+          <Plus className="w-3.5 h-3.5" />
+        </button>
+      </div>
+      <div className="mt-1.5 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 flex flex-wrap gap-1 items-center focus-within:ring-1 focus-within:ring-neutral-600">
+        {form.newPathTags.map(tag => (
+          <span key={tag} className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-[10px] font-mono px-1.5 py-0.5 rounded flex items-center gap-1">
+            {tag}
+            <button
+              type="button"
+              onClick={() => form.setNewPathTags(prev => prev.filter(t => t !== tag))}
+              className="text-neutral-500 hover:text-neutral-300 transition-colors leading-none min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+            >
+              <X className="w-2.5 h-2.5" />
+            </button>
+          </span>
+        ))}
+        <input
+          value={form.newPathInput}
+          onChange={e => form.setNewPathInput(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ',') {
+              e.preventDefault();
+              const val = form.newPathInput.trim();
+              if (val && !form.newPathTags.includes(val)) form.setNewPathTags(prev => [...prev, val]);
+              form.setNewPathInput('');
+            } else if (e.key === 'Backspace' && !form.newPathInput && form.newPathTags.length > 0) {
+              form.setNewPathTags(prev => prev.slice(0, -1));
+            }
+          }}
+          placeholder={form.newPathTags.length === 0 ? 'Path scope (e.g. backend/)' : ''}
+          className="flex-1 min-w-[120px] bg-transparent text-neutral-100 text-xs focus:outline-none placeholder-neutral-600"
+        />
+      </div>
+      <textarea
+        value={form.newCompletionCriteria}
+        onChange={e => form.setNewCompletionCriteria(e.target.value)}
+        placeholder="Done when..."
+        rows={2}
+        className="mt-1.5 w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-2 py-1.5 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600 resize-y"
+      />
+    </div>
+  );
+}
