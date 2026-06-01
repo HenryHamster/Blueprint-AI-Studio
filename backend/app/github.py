@@ -84,7 +84,7 @@ async def probe_rate_limit() -> bool:
     # Pull any currently-cached installation token — doesn't spend quota
     # on a refresh.  If nothing's cached, skip the probe; real activity
     # will populate the pill soon enough.
-    from app.routers.agent import _github_token_cache
+    from app.github_token_resolver import _github_token_cache
 
     cached_token: str | None = None
     for entry in _github_token_cache.values():
@@ -350,7 +350,9 @@ async def _github_request(
                     f"token may be expired or revoked"
                 )
                 if project_id:
-                    from app.routers.agent import invalidate_github_token_cache
+                    from app.github_token_resolver import (
+                        invalidate_github_token_cache,
+                    )
 
                     invalidate_github_token_cache(project_id)
                     logger.info(
@@ -420,7 +422,7 @@ async def _github_request(
 # behave exactly as before the split.
 # ---------------------------------------------------------------------------
 
-from app.github_auth import (  # noqa: E402,F401
+from app.github_auth import (  # noqa: F401
     generate_github_app_jwt,
     get_repo_installation_token,
     exchange_oauth_code,
@@ -432,7 +434,7 @@ from app.github_auth import (  # noqa: E402,F401
     _INSTALLATION_ID_TTL_SECONDS,
     _installation_id_cache,
 )
-from app.github_checks import (  # noqa: E402,F401
+from app.github_checks import (  # noqa: F401
     update_commit_status,
     create_check_run,
     update_check_run,
@@ -444,7 +446,7 @@ from app.github_checks import (  # noqa: E402,F401
     _CHECK_RUNS_CACHE_MAX,
     _check_runs_cache,
 )
-from app.github_issues import (  # noqa: E402,F401
+from app.github_issues import (  # noqa: F401
     create_pr_comment,
     add_issue_label,
     create_pr_review_comment,
@@ -455,7 +457,7 @@ from app.github_issues import (  # noqa: E402,F401
     get_issue_comments,
     create_issue_comment,
 )
-from app.github_refs import (  # noqa: E402,F401
+from app.github_refs import (  # noqa: F401
     create_branch,
     create_tag,
     get_branch_sha,
@@ -467,7 +469,7 @@ from app.github_refs import (  # noqa: E402,F401
     is_ancestor_of,
     get_files_changed_between_refs,
 )
-from app.github_pulls import (  # noqa: E402,F401
+from app.github_pulls import (  # noqa: F401
     pr_is_not_behind,
     pr_is_not_behind_for,
     create_pull_request,
@@ -487,7 +489,7 @@ from app.github_pulls import (  # noqa: E402,F401
     _is_no_new_commits_message,
     _tag_not_behind_if_no_new_commits,
 )
-from app.github_merge_summary import (  # noqa: E402,F401
+from app.github_merge_summary import (  # noqa: F401
     build_merge_summary_body,
     post_merge_summary_comment,
     build_blueprint_pr_merge_summary_comment,

@@ -404,7 +404,7 @@ async def verify_agent_token(
 # internals / invalidation helper) call sites keep working unchanged.
 # ---------------------------------------------------------------------------
 
-from app.github_token_resolver import (  # noqa: E402,F401
+from app.github_token_resolver import (  # noqa: F401
     _GITHUB_TOKEN_TTL,
     _github_token_cache,
     _github_token_cache_lock,
