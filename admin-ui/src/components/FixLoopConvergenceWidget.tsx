@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { ResponsiveContainer, AreaChart, Area, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
+import { FIX_LOOP_LAYERS, LOOP_LABELS } from '../utils/fixLoopLayers';
 
 interface LoopAggregate {
   task_count: number;
@@ -20,7 +21,6 @@ interface ConvergenceData {
   check: LoopAggregate;
 }
 
-const LOOP_LABELS: Record<string, string> = { lint: 'Lint', test: 'Test', check: 'Check' };
 const LOOP_COLORS: Record<string, string> = {
   lint: 'text-amber-400',
   test: 'text-blue-400',
@@ -466,7 +466,7 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
             </span>
           </div>
           <div className="grid grid-cols-3 gap-2">
-            {(['lint', 'test', 'check'] as const).map(loop => (
+            {FIX_LOOP_LAYERS.map(loop => (
               <TrendSparkline key={loop} loop={loop} buckets={trendData.buckets} />
             ))}
           </div>

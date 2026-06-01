@@ -3,18 +3,31 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
-import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
+import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
 
+// Full replacement (NOT a partial mock): the real `../firebase` calls
+// initializeApp()/getAuth() at module load, which we must not run in jsdom.
+// Replacing the whole module is the point — there is no real implementation to
+// preserve here, and the only export this suite reads is `auth.currentUser`.
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
 }));
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(async () => new Response(JSON.stringify({ messages: [] }), { status: 200 })),
-  API_BASE_URL: 'http://localhost:8000',
-}));
+// Partial mock — `MessagesPanel.tsx` imports `authHeaders` (and `API_BASE_URL`)
+// from '../api' alongside `apiFetch`, and so does its serverSync helper. A
+// static factory that only declared `apiFetch`/`API_BASE_URL` left `authHeaders`
+// (and any future export) silently `undefined`; preserving the real module via
+// importOriginal keeps every transitively-needed name resolving while we still
+// stub the network call. Override only `apiFetch`.
+vi.mock('../api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api')>();
+  return {
+    ...actual,
+    apiFetch: vi.fn(async () => new Response(JSON.stringify({ messages: [] }), { status: 200 })),
+  };
+});
 
 import { apiFetch } from '../api';
 
@@ -843,8 +856,11 @@ describe('MessagesPanel toast notifications', () => {
         created_at: '2026-05-06T10:00:00Z',
       };
 
-      // Set event pref to mute failure_alert
-      localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ failure_alert: 'mute' }));
+      // Set event pref to mute failure_alert via the project-scoped key the
+      // panel actually reads on mount (loadEventPrefs(email, projectId)). Seeding
+      // the legacy flat key would only exercise the migration fallback, never the
+      // real scoped read path.
+      saveEventPrefs('test-user@example.com', 'proj-1', { failure_alert: 'mute' });
 
       // Initial load empty, then poll returns the muted failure_alert — no toast should fire
       _mockMessagesFetchSequence([[], [failureAlert]]);
@@ -874,7 +890,7 @@ describe('MessagesPanel toast notifications', () => {
       expect(mockAddToast).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
-      localStorage.removeItem(EVENT_PREFS_KEY);
+      localStorage.removeItem(eventPrefsKey('test-user@example.com', 'proj-1'));
     }
   });
 
@@ -1197,7 +1213,15 @@ describe('MessagesPanel per-event-type prefs', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
-  beforeEach(() => localStorage.removeItem(EVENT_PREFS_KEY));
+  // The panel reads prefs via loadEventPrefs(auth.currentUser.email, selectedProjectId),
+  // i.e. the project-scoped key — not the legacy flat key. Seed/clear through the
+  // same (email, projectId) the harness renders with so the real scoped read path
+  // is exercised end-to-end.
+  const PREFS_USER = 'test-user@example.com';
+  const PREFS_PROJECT = 'proj-1';
+  const scopedPrefsKey = eventPrefsKey(PREFS_USER, PREFS_PROJECT);
+
+  beforeEach(() => localStorage.removeItem(scopedPrefsKey));
 
   afterEach(() => {
     const r = root;
@@ -1205,7 +1229,7 @@ describe('MessagesPanel per-event-type prefs', () => {
     root = null;
     host?.remove();
     host = null;
-    localStorage.removeItem(EVENT_PREFS_KEY);
+    localStorage.removeItem(scopedPrefsKey);
     vi.clearAllMocks();
   });
 
@@ -1231,7 +1255,7 @@ describe('MessagesPanel per-event-type prefs', () => {
   }
 
   test('muted event_type is hidden from the routine group', async () => {
-    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'mute' }));
+    saveEventPrefs(PREFS_USER, PREFS_PROJECT, { pr_merged: 'mute' });
     const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'muted content' })];
     const el = await renderPanel(msgs);
     expect(el.textContent).not.toContain('muted content');
@@ -1240,7 +1264,7 @@ describe('MessagesPanel per-event-type prefs', () => {
 
   test('muted event_type is hidden from the high-signal area too', async () => {
     // Even a BLOCKER can be muted via explicit pref
-    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ blocker_ev: 'mute' }));
+    saveEventPrefs(PREFS_USER, PREFS_PROJECT, { blocker_ev: 'mute' });
     const msgs = [
       makeMsg({ id: 'b1', message_type: 'BLOCKER', from_type: 'agent', context: { event_type: 'blocker_ev' }, content: 'muted blocker' }),
     ];
@@ -1249,7 +1273,7 @@ describe('MessagesPanel per-event-type prefs', () => {
   });
 
   test('surfaced event_type appears in the high-signal area, not in routine group', async () => {
-    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'surfaced' }));
+    saveEventPrefs(PREFS_USER, PREFS_PROJECT, { pr_merged: 'surfaced' });
     const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'promoted content' })];
     const el = await renderPanel(msgs);
     // content is visible
@@ -1259,18 +1283,19 @@ describe('MessagesPanel per-event-type prefs', () => {
   });
 
   test('clearing all preferences returns to default classification', async () => {
-    // Start with pr_merged surfaced so it appears as high-signal
-    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ pr_merged: 'surfaced' }));
+    // Start with pr_merged surfaced (in the project-scoped store) so it appears as high-signal
+    saveEventPrefs(PREFS_USER, PREFS_PROJECT, { pr_merged: 'surfaced' });
     const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'pref msg' })];
     const el = await renderPanel(msgs);
     // With surfaced pref, content is directly visible (high-signal)
     expect(el.textContent).toContain('pref msg');
     expect(el.textContent).not.toContain('routine ops');
 
-    // Simulate "Reset all" — clear localStorage
-    localStorage.removeItem(EVENT_PREFS_KEY);
-    // loadEventPrefs() now returns {}
-    expect(loadEventPrefs()).toEqual({});
+    // Simulate "Reset all" — clear the scoped store via saveEventPrefs({}) (the
+    // panel's own reset removes the project-scoped key when prefs are emptied)
+    saveEventPrefs(PREFS_USER, PREFS_PROJECT, {});
+    // The scoped read now returns {} (no migration fallback was ever seeded)
+    expect(loadEventPrefs(PREFS_USER, PREFS_PROJECT)).toEqual({});
     // effectiveSignal falls back to classifySignalLevel — pr_merged is routine
     const msg = { message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' } };
     const { effectiveSignal: es } = await import('./MessagesPanel.utils');

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, type ReactElement } from 'react';
 import { apiFetch } from '../api';
 import type { FixLoopAttempt } from '../types/task';
+import { FIX_LOOP_LAYERS, LOOP_LABELS } from '../utils/fixLoopLayers';
 
 interface LoopSummary {
   attempts: number;
@@ -12,9 +13,6 @@ interface FixLoopHistoryResponse {
   fix_loop_history: Record<string, FixLoopAttempt[]>;
   summary: Record<string, LoopSummary>;
 }
-
-const LOOP_LABELS: Record<string, string> = { lint: 'Lint', test: 'Test', check: 'Check' };
-const LOOP_ORDER = ['lint', 'test', 'check'];
 
 const EXIT_REASON_STYLE: Record<string, string> = {
   passed: 'text-emerald-400',
@@ -217,7 +215,7 @@ export function TaskFixLoopPanel({
 
   if (loading || !data) return null;
 
-  const activeLoops = LOOP_ORDER.filter(l => (data.summary[l]?.attempts ?? 0) > 0);
+  const activeLoops = FIX_LOOP_LAYERS.filter(l => (data.summary[l]?.attempts ?? 0) > 0);
   if (activeLoops.length === 0) return null;
 
   return (
