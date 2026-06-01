@@ -3,6 +3,7 @@ import type { User } from 'firebase/auth';
 import type { DeployState, OrchestratorHealth, ProviderApisHealth } from '../types/settings';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
+import { usePoller, DEFAULT_POLL_MS } from './usePoller';
 
 interface CircuitBreakerState {
   state: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
@@ -138,14 +139,15 @@ export function useDeploymentState(
     }
   };
 
-  // Fetch deploy state on mount and periodically
+  // Fetch deploy state on mount and periodically. Leading call uses the
+  // non-silent variant (shows loading); subsequent shared-clock ticks are
+  // silent. Pauses when the tab is hidden, catches up on return.
   useEffect(() => {
     if (!user) return;
     fetchDeployState();
-    const id = setInterval(() => fetchDeployState(true), 60000);
-    return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
+  usePoller(() => { fetchDeployState(true); }, { intervalMs: 60_000, enabled: !!user, leading: false, deps: [user] });
 
   // --- Zone Health ---
   const [zoneHealth, setZoneHealth] = useState<Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null>(null);
@@ -157,12 +159,7 @@ export function useDeploymentState(
     } catch { /* ignore */ }
   };
 
-  useEffect(() => {
-    if (!user) return;
-    fetchZoneHealth();
-    const id = setInterval(fetchZoneHealth, 30000);
-    return () => clearInterval(id);
-  }, [user]);
+  usePoller(fetchZoneHealth, { intervalMs: DEFAULT_POLL_MS, enabled: !!user, deps: [user] });
 
   // --- Orchestrator Health ---
   const [orchestratorHealth, setOrchestratorHealth] = useState<OrchestratorHealth | null>(null);
@@ -175,12 +172,7 @@ export function useDeploymentState(
     } catch { setOrchestratorHealth(null); }
   };
 
-  useEffect(() => {
-    if (!user) return;
-    fetchOrchestratorHealth();
-    const id = setInterval(fetchOrchestratorHealth, 30000);
-    return () => clearInterval(id);
-  }, [user]);
+  usePoller(fetchOrchestratorHealth, { intervalMs: DEFAULT_POLL_MS, enabled: !!user, deps: [user] });
 
   // --- Detailed Health ---
   const [detailedHealth, setDetailedHealth] = useState<DetailedHealth | null>(null);
@@ -213,12 +205,7 @@ export function useDeploymentState(
     } catch { setDetailedHealth(null); }
   };
 
-  useEffect(() => {
-    if (!user) return;
-    fetchDetailedHealth();
-    const id = setInterval(fetchDetailedHealth, 30000);
-    return () => clearInterval(id);
-  }, [user]);
+  usePoller(fetchDetailedHealth, { intervalMs: DEFAULT_POLL_MS, enabled: !!user, deps: [user] });
 
   // --- Diagnostics ---
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
@@ -233,11 +220,13 @@ export function useDeploymentState(
   }, [selectedProjectId]);
 
   useEffect(() => {
-    if (!user || !selectedProjectId) { setDiagnostics(null); return; }
-    fetchDiagnostics();
-    const id = setInterval(fetchDiagnostics, 30000);
-    return () => clearInterval(id);
-  }, [user, selectedProjectId, fetchDiagnostics]);
+    if (!user || !selectedProjectId) setDiagnostics(null);
+  }, [user, selectedProjectId]);
+  usePoller(fetchDiagnostics, {
+    intervalMs: DEFAULT_POLL_MS,
+    enabled: !!user && !!selectedProjectId,
+    deps: [user, selectedProjectId, fetchDiagnostics],
+  });
 
   return {
     deployState, setDeployState,

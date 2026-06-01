@@ -18,6 +18,7 @@ import {
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
 import { sortDesc } from './catchupAnalytics';
 import { CompletionRow, SkeletonRow } from './catchupRows';
+import { usePoller } from '../hooks/usePoller';
 import { CatchUpReviewQualitySection } from './CatchUpReviewQualitySection';
 import { RecentFailureGroupsSection } from './RecentFailureGroupsSection';
 import { CatchUpNeedsAttentionSection } from './CatchUpNeedsAttentionSection';
@@ -131,7 +132,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   });
   const [openDropdown, setOpenDropdown] = useState<string | null>(null);
   const [showDismissed, setShowDismissed] = useState(false);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const autoSectionExpandedRef = useRef(false);
   const dropdownRef = useRef<HTMLDivElement | null>(null);
 
@@ -202,12 +202,15 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     }
   }, [fetchDigest, collapsed]);
 
-  // Auto-refresh
-  useEffect(() => {
-    if (collapsed || refreshInterval === 0) return;
-    intervalRef.current = setInterval(() => fetchDigest(true), refreshInterval);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [fetchDigest, collapsed, refreshInterval]);
+  // Auto-refresh on the shared, visibility-aware poll clock. Polling only
+  // (the mount/window/project effect above owns the leading fetch); pauses
+  // when the tab is hidden and catches up on return.
+  usePoller(() => fetchDigest(true), {
+    intervalMs: refreshInterval,
+    enabled: !collapsed && refreshInterval !== 0,
+    leading: false,
+    deps: [fetchDigest, collapsed, refreshInterval],
+  });
 
   // WebSocket-driven digest invalidation
   useEffect(() => {

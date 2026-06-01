@@ -9,6 +9,7 @@ import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch, fetchTask, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
@@ -688,21 +689,32 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     } catch { /* silent */ }
   }, [selectedProjectId]);
 
-  // Initial + polling
+  // Reset project-scoped state synchronously on a project/window/category
+  // switch, BEFORE the poller below fires its leading fetch. Declared ahead of
+  // usePoller and sharing the same trigger (`fetchData` changes iff those
+  // inputs change) so React runs this reset first, then the leading poll.
   useEffect(() => {
     openPRsRequestIdRef.current += 1;
     versionLifecycleRequestIdRef.current += 1;
     resetProjectScopedState();
-    void fetchData(++dashboardRequestIdRef.current);
-    // Each tick starts a fresh "latest" request by reading the CURRENT id from
-    // the ref (via increment) rather than a stale id captured at effect-setup
-    // time. Capturing the id in the closure froze polling after any manual
-    // refetch (which bumps the ref): fetchData's `requestId === ref.current`
-    // guards then permanently failed and the dashboard silently stopped
-    // applying poll responses.
-    const id = setInterval(() => void fetchData(++dashboardRequestIdRef.current), 30_000);
-    return () => clearInterval(id);
+    // fetchData is the canonical "inputs changed" signal; resetProjectScopedState
+    // is stable. Both are listed so the reset runs before the poller's leading
+    // fetch on any project/window/category switch.
   }, [fetchData, resetProjectScopedState]);
+
+  // Coordinated polling on the shared 30s clock. Pauses when the tab is hidden
+  // and catches up on return; ticks align with every other 30s poller so
+  // apiFetch's in-flight de-dup can collapse overlapping identical GETs.
+  //
+  // Each tick starts a fresh "latest" request by reading the CURRENT id from
+  // the ref (via increment) rather than a stale id captured at setup time.
+  // Capturing the id in the closure froze polling after any manual refetch
+  // (which bumps the ref): fetchData's `requestId === ref.current` guards then
+  // permanently failed and the dashboard silently stopped applying responses.
+  usePoller(
+    () => fetchData(++dashboardRequestIdRef.current),
+    { intervalMs: DEFAULT_POLL_MS, deps: [fetchData] },
+  );
 
   const refetchDashboard = useCallback(() => {
     void fetchData(++dashboardRequestIdRef.current);

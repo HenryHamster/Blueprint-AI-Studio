@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { apiFetch } from '../api';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import type { AccountHealthEntry } from './PoolAccountHealthPanel';
 
 interface QuarantineStatus {
@@ -156,14 +157,7 @@ export function ProviderModelBreakdownPanel({
     }
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    const safeLoad = async () => { if (!cancelled) await load(); };
-    safeLoad();
-    const id = setInterval(safeLoad, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedProjectId]);
+  usePoller(load, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId] });
 
   if (loading || rows.length === 0) return null;
 

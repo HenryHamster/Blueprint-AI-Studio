@@ -3,6 +3,7 @@ import { ResponsiveContainer, AreaChart, Area, Tooltip } from 'recharts';
 import { apiFetch } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 import { FIX_LOOP_LAYERS, LOOP_LABELS } from '../utils/fixLoopLayers';
+import { usePoller } from '../hooks/usePoller';
 
 interface LoopAggregate {
   task_count: number;
@@ -404,16 +405,13 @@ export function FixLoopConvergenceWidget({ trendDays = 7, projectId, onViewTask 
 
   useEffect(() => {
     mountedRef.current = true;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
-    fetchData();
-    const id = setInterval(() => {
-      if (document.visibilityState === 'visible') fetchData();
-    }, POLL_MS);
-    return () => {
-      mountedRef.current = false;
-      clearInterval(id);
-    };
-  }, [fetchData]);
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // Shared, visibility-aware poll clock. The old inline
+  // `document.visibilityState === 'visible'` gate is now centralized in
+  // usePoller (pause-when-hidden + catch-up on return).
+  usePoller(fetchData, { intervalMs: POLL_MS, deps: [fetchData] });
 
   const handleChipClick = useCallback((loop: string, exit_reason: string) => {
     setDrillDown(prev =>

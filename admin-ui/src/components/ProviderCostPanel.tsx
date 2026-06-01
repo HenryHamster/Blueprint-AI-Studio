@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { apiFetch } from '../api';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 
 interface ProviderCostRow {
@@ -29,20 +30,14 @@ export function ProviderCostPanel({
   const [data, setData] = useState<ProviderCostSummary | null>(null);
   const efficiency = useEfficiencySnapshot(selectedProjectId);
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const params = new URLSearchParams({ hours: String(windowHours) });
-        if (selectedProjectId) params.set('project_id', selectedProjectId);
-        const res = await apiFetch(`/api/admin/provider-cost-summary?${params}`);
-        if (!cancelled && res.ok) setData(await res.json());
-      } catch { /* silent */ }
-    };
-    load();
-    const id = setInterval(load, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [selectedProjectId, windowHours]);
+  usePoller(async (signal) => {
+    try {
+      const params = new URLSearchParams({ hours: String(windowHours) });
+      if (selectedProjectId) params.set('project_id', selectedProjectId);
+      const res = await apiFetch(`/api/admin/provider-cost-summary?${params}`);
+      if (!signal.aborted && res.ok) setData(await res.json());
+    } catch { /* silent */ }
+  }, { intervalMs: DEFAULT_POLL_MS, deps: [selectedProjectId, windowHours] });
 
   if (!data || data.rows.length === 0) return null;
 

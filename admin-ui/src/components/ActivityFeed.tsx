@@ -5,6 +5,7 @@ import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
 import { TAXONOMY_LABELS, TAXONOMY_COLORS } from './taxonomyConstants';
+import { usePoller } from '../hooks/usePoller';
 
 export type ActivityEventType = 'TASK_COMPLETED' | 'TASK_FAILED' | 'RESEARCH_FINDINGS' | 'DEPLOY_EVENT' | 'TASK_IN_PROGRESS';
 
@@ -381,11 +382,14 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
     fetchEvents();
   }, [fetchEvents]);
 
-  useEffect(() => {
-    if (refreshInterval <= 0) return;
-    const interval = setInterval(fetchEvents, refreshInterval);
-    return () => clearInterval(interval);
-  }, [fetchEvents, refreshInterval]);
+  // Polling only (the leading fetch above owns the loading-spinner kickoff).
+  // Coordinated on the shared visibility-aware clock; pauses when hidden.
+  usePoller(fetchEvents, {
+    intervalMs: refreshInterval,
+    enabled: refreshInterval > 0,
+    leading: false,
+    deps: [fetchEvents, refreshInterval],
+  });
 
   const filteredEvents = events.filter(e => {
     let statusMatches: boolean;

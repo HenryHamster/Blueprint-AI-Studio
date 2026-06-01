@@ -5,6 +5,7 @@ import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
+import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 import { DirectionsPanel } from './components/DirectionsPanel';
 import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
@@ -184,34 +185,32 @@ export default function App() {
     closedPanelNoisePrefsRef.current = loadEventPrefs(s.user?.email, selectedProjectId);
     closedPanelTempMutesRef.current = loadTemporaryMutes(s.user?.email, selectedProjectId);
   }, [showMessages, selectedProjectId, s.user?.email]);
-  useEffect(() => {
-    if (!selectedProjectId || showMessages) return;
+  usePoller(async (signal) => {
+    if (!selectedProjectId) return;
     const pid = selectedProjectId; // narrowed to string
-    let cancelled = false;
-    async function fetchCount() {
-      try {
-        const params = new URLSearchParams({ project_id: pid, status: 'open', limit: '100' });
-        const [res, backendTs] = await Promise.all([
-          apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`),
-          fetchBackendLastSeen(pid),
-        ]);
-        if (!res.ok || cancelled) return;
-        const data = await res.json();
-        const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
-        if (!cancelled) {
-          const noisePrefs = closedPanelNoisePrefsRef.current;
-          const tempMutes = closedPanelTempMutesRef.current;
-          setOpenMessageCount(countHighSignalMessages(msgs, noisePrefs, tempMutes));
-          const localTs = loadLastSeen(s.user?.email, pid);
-          const lastSeenTs = resolveLastSeen(localTs, backendTs);
-          setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs, noisePrefs, tempMutes));
-        }
-      } catch { /* ignore */ }
-    }
-    fetchCount();
-    const interval = setInterval(fetchCount, 30_000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [selectedProjectId, showMessages, s.user?.email]);
+    try {
+      const params = new URLSearchParams({ project_id: pid, status: 'open', limit: '100' });
+      const [res, backendTs] = await Promise.all([
+        apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`),
+        fetchBackendLastSeen(pid),
+      ]);
+      if (!res.ok || signal.aborted) return;
+      const data = await res.json();
+      const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
+      if (!signal.aborted) {
+        const noisePrefs = closedPanelNoisePrefsRef.current;
+        const tempMutes = closedPanelTempMutesRef.current;
+        setOpenMessageCount(countHighSignalMessages(msgs, noisePrefs, tempMutes));
+        const localTs = loadLastSeen(s.user?.email, pid);
+        const lastSeenTs = resolveLastSeen(localTs, backendTs);
+        setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs, noisePrefs, tempMutes));
+      }
+    } catch { /* ignore */ }
+  }, {
+    intervalMs: DEFAULT_POLL_MS,
+    enabled: !!selectedProjectId && !showMessages,
+    deps: [selectedProjectId, showMessages, s.user?.email],
+  });
 
   useEffect(() => {
     function handleSearchShortcut(e: KeyboardEvent) {
@@ -305,21 +304,18 @@ export default function App() {
   // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
   const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
   useEffect(() => {
-    if (!selectedProjectId) { setSrInvestigationTaskIds({}); return; }
-    const pid = selectedProjectId;
-    let cancelled = false;
-    async function fetchIds() {
-      try {
-        const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/sr-investigation-task-ids`);
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { task_ids?: Record<string, string> };
-        if (!cancelled) setSrInvestigationTaskIds(data.task_ids ?? {});
-      } catch { /* ignore */ }
-    }
-    fetchIds();
-    const interval = setInterval(fetchIds, 30_000);
-    return () => { cancelled = true; clearInterval(interval); };
+    if (!selectedProjectId) setSrInvestigationTaskIds({});
   }, [selectedProjectId]);
+  usePoller(async (signal) => {
+    if (!selectedProjectId) return;
+    const pid = selectedProjectId;
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/sr-investigation-task-ids`);
+      if (!res.ok || signal.aborted) return;
+      const data = (await res.json()) as { task_ids?: Record<string, string> };
+      if (!signal.aborted) setSrInvestigationTaskIds(data.task_ids ?? {});
+    } catch { /* ignore */ }
+  }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId, deps: [selectedProjectId] });
 
   const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
     if (!selectedProjectId) return null;

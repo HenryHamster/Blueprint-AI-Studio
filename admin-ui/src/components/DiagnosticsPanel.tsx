@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { ChevronDown, ChevronUp, Stethoscope, AlertTriangle, Clock, Zap, Ban } from 'lucide-react';
 import type { ProjectDiagnostics, StuckTask, FailingTaskTypes } from '../types/diagnostics';
 import { formatDurationSec } from '../utils/time';
 import { API_BASE_URL, authGet } from '../api';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 const STUCK_REASON_LABELS: Record<StuckTask['stuck_reason'], string> = {
   provision_timeout: 'VM provision timed out',
@@ -23,18 +24,12 @@ export function DiagnosticsPanel({ diagnostics, onViewTask }: DiagnosticsPanelPr
   });
   const [failingTypes, setFailingTypes] = useState<FailingTaskTypes | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await authGet(`${API_BASE_URL}/api/admin/failing-task-types`);
-        if (!cancelled && res.ok) setFailingTypes(await res.json());
-      } catch { /* leave previous value */ }
-    };
-    load();
-    const id = setInterval(load, 30000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, []);
+  usePoller(async (signal) => {
+    try {
+      const res = await authGet(`${API_BASE_URL}/api/admin/failing-task-types`);
+      if (!signal.aborted && res.ok) setFailingTypes(await res.json());
+    } catch { /* leave previous value */ }
+  }, { intervalMs: DEFAULT_POLL_MS });
 
   const toggle = () => {
     const next = !collapsed;

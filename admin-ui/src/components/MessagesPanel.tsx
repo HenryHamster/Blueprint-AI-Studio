@@ -17,6 +17,7 @@ import { MessagesListView } from './MessagesListView';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { MuteWindowMenu } from './MuteWindowMenu';
 import { EventVisibilityMenu } from './EventVisibilityMenu';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -637,11 +638,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }, [selectedProjectId, onMessageCountChange, eventPrefs]);
 
-  useEffect(() => {
-    fetchMessages();
-    const interval = setInterval(fetchMessages, 30_000);
-    return () => clearInterval(interval);
-  }, [fetchMessages]);
+  usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 
   // Auto-scroll to bottom only on initial load or when user sends a new message
   // (new message = count increased AND user is near the bottom)

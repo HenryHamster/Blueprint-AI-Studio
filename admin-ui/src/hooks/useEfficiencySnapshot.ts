@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { apiFetch } from '../api';
+import { usePoller } from './usePoller';
 
 export interface PipelineEfficiencyWindow {
   setup_p50_secs: number | null;
@@ -26,19 +27,13 @@ const POLL_MS = 60_000;
 export function useEfficiencySnapshot(projectId?: string | null): EfficiencySnapshot | null {
   const [data, setData] = useState<EfficiencySnapshot | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const params = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
-        const res = await apiFetch(`/api/admin/pipeline-efficiency${params}`);
-        if (!cancelled && res.ok) setData(await res.json() as EfficiencySnapshot);
-      } catch { /* endpoint may not be deployed */ }
-    };
-    void load();
-    const id = setInterval(load, POLL_MS);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [projectId]);
+  usePoller(async (signal) => {
+    try {
+      const params = projectId ? `?project_id=${encodeURIComponent(projectId)}` : '';
+      const res = await apiFetch(`/api/admin/pipeline-efficiency${params}`);
+      if (!signal.aborted && res.ok) setData(await res.json() as EfficiencySnapshot);
+    } catch { /* endpoint may not be deployed */ }
+  }, { intervalMs: POLL_MS, deps: [projectId] });
 
   return data;
 }

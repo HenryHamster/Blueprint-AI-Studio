@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, type RefObject } from 'react'
 import { Zap, ZapOff, AlertTriangle, RefreshCw, Lock, Clock, PlayCircle, Gauge, Pause, Server, Compass, CheckCircle2, XCircle, Activity, FileText } from 'lucide-react';
 import { API_BASE_URL, authHeaders, apiFetch } from '../api';
 import { secondsUntil, parseTimestamp } from '../utils/time';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 interface ProjectAutonomousStatus {
   project_id: string;
@@ -616,11 +617,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
     }
   }, []);
 
-  useEffect(() => {
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 30000);
-    return () => clearInterval(interval);
-  }, [fetchStatus]);
+  usePoller(fetchStatus, { intervalMs: DEFAULT_POLL_MS, deps: [fetchStatus] });
 
   // Close dropdown on outside click
   useEffect(() => {

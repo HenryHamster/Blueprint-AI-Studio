@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, Copy, Check, X, EyeOff } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
+import { usePoller } from '../hooks/usePoller';
 
 interface ErrorBucket {
   exception_class: string;
@@ -60,18 +61,13 @@ export function RecentErrorsWidget() {
 
   useEffect(() => {
     mountedRef.current = true;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
-    fetchErrors();
-    const id = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        fetchErrors();
-      }
-    }, POLL_INTERVAL_MS);
-    return () => {
-      mountedRef.current = false;
-      clearInterval(id);
-    };
-  }, [fetchErrors]);
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // Shared, visibility-aware poll clock. The old inline
+  // `document.visibilityState === 'visible'` gate is now handled centrally by
+  // usePoller (pause-when-hidden + catch-up on return).
+  usePoller(fetchErrors, { intervalMs: POLL_INTERVAL_MS, deps: [fetchErrors] });
 
   const buckets = useMemo(() => data?.buckets ?? [], [data?.buckets]);
   const totalCount = buckets.reduce((sum, b) => sum + b.count, 0);

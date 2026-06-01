@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { TrendingUp, TrendingDown, Minus, PauseCircle } from 'lucide-react';
 import { apiFetch } from '../api';
 import type { DirectionAutoPauseStats } from '../types/diagnostics';
+import { usePoller } from '../hooks/usePoller';
 
 interface DirectionAutoPauseWidgetProps {
   selectedProjectId: string | null;
@@ -31,11 +32,7 @@ export function DirectionAutoPauseWidget({ selectedProjectId }: DirectionAutoPau
     }
   }, [selectedProjectId, windowHours]);
 
-  useEffect(() => {
-    fetchStats();
-    const id = setInterval(fetchStats, POLL_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, [fetchStats]);
+  usePoller(fetchStats, { intervalMs: POLL_INTERVAL_MS, deps: [fetchStats] });
 
   if (loading && !data) {
     return (

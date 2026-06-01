@@ -6,6 +6,7 @@ import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
 import { STATUS_OPTIONS } from './constants';
 import { usePersistedState } from './hooks/usePersistedState';
+import { usePoller } from './hooks/usePoller';
 import { useAuth } from './hooks/useAuth';
 import { useViewPreferences } from './hooks/useViewPreferences';
 import { useMetrics } from './hooks/useMetrics';
@@ -307,20 +308,32 @@ export function useAppState() {
     setBuildConfig(project?.build_config ?? null);
   }, [selectedProjectId, projects]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Polling interval — only restarts when refreshInterval or user changes
+  // Leading fetches on mount / user change — kicks off the initial load.
   useEffect(() => {
     if (!user) return;
     fetchSettings();
     fetchProjects();
     fetchAlerts();
-    const projectInterval = setInterval(() => fetchProjects(true), 60000);
-    if (refreshInterval === 0) {
-      return () => { clearInterval(projectInterval); };
-    }
-    const interval = setInterval(() => { fetchTasksRef.current(); fetchAlerts(true); }, refreshInterval);
-    return () => { clearInterval(interval); clearInterval(projectInterval); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshInterval, user]);
+  }, [user]);
+
+  // Coordinated polling on the shared, visibility-aware clock. Project list
+  // refreshes every 60s; tasks+alerts refresh on the configured cadence
+  // (disabled when refreshInterval === 0). Both pause when the tab is hidden
+  // and catch up on return. Polling-only (the effect above owns the leading
+  // load) so mount behavior is unchanged.
+  usePoller(() => { fetchProjects(true); }, {
+    intervalMs: 60_000,
+    enabled: !!user,
+    leading: false,
+    deps: [user],
+  });
+  usePoller(() => { fetchTasksRef.current(); fetchAlerts(true); }, {
+    intervalMs: refreshInterval,
+    enabled: !!user && refreshInterval !== 0,
+    leading: false,
+    deps: [user, refreshInterval],
+  });
 
   // Keyboard shortcuts
   useEffect(() => {

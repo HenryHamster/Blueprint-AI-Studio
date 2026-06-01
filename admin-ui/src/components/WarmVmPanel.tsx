@@ -1,9 +1,10 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet } from '../api';
 import { parseTimestamp } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot } from '../types/warmVm';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
+import { usePoller } from '../hooks/usePoller';
 
 const POLL_INTERVAL_MS = 10_000;
 const STORAGE_KEY = 'blueprint-admin:warmVmPanelCollapsed';
@@ -63,13 +64,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
     }
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    const wrapped = async () => { if (!cancelled) await load(); };
-    void wrapped();
-    const id = setInterval(wrapped, POLL_INTERVAL_MS);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [load]);
+  usePoller(load, { intervalMs: POLL_INTERVAL_MS, deps: [load] });
 
   const toggle = () => {
     const next = !collapsed;

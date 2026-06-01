@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
+import { usePoller } from '../hooks/usePoller';
 
 interface DriftHistoryPoint {
   snapshot_at: string;
@@ -71,12 +72,7 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
     } catch { /* silent */ }
   }, [projectId]);
 
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
-    fetchSnapshot();
-    const id = setInterval(fetchSnapshot, 60_000);
-    return () => clearInterval(id);
-  }, [fetchSnapshot]);
+  usePoller(fetchSnapshot, { intervalMs: 60_000, deps: [fetchSnapshot] });
 
   if (!snapshot || snapshot.flagged_count === 0) return null;
 

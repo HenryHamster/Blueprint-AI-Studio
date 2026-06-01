@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { fetchLlmCostBreakdown, type LlmCostBreakdownResponse } from '../api';
+import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -27,19 +28,13 @@ export function LlmCostBreakdownPanel({
   // briefly renders the previous project's spend before the next load resolves.
   const [state, setState] = useState<{ projectId: string; data: LlmCostBreakdownResponse } | null>(null);
 
-  useEffect(() => {
+  usePoller(async (signal) => {
     if (!selectedProjectId) return;
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const res = await fetchLlmCostBreakdown(selectedProjectId, windowDays);
-        if (!cancelled) setState({ projectId: selectedProjectId, data: res });
-      } catch { /* silent */ }
-    };
-    load();
-    const id = setInterval(load, 30_000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [selectedProjectId, windowDays]);
+    try {
+      const res = await fetchLlmCostBreakdown(selectedProjectId, windowDays);
+      if (!signal.aborted) setState({ projectId: selectedProjectId, data: res });
+    } catch { /* silent */ }
+  }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId, deps: [selectedProjectId, windowDays] });
 
   if (!selectedProjectId || state?.projectId !== selectedProjectId) return null;
   const data = state.data;
