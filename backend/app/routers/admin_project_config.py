@@ -653,6 +653,108 @@ async def update_promotion_target_config(
 
 
 # ---------------------------------------------------------------------------
+# Approval-gate config endpoints
+# ---------------------------------------------------------------------------
+
+_APPROVAL_GATE_KEYS = ("infra_files", "critical_files")
+
+# A plausible repo-relative path: forward-slash separated, no leading slash,
+# no parent-directory traversal, no shell metacharacters.
+_VALID_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
+
+
+def _validate_approval_gate_paths(field: str, value) -> list[str]:
+    """Validate and normalise one approval-gate file list, returning trimmed paths."""
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{field}' must be a list of repo-relative path strings",
+        )
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{field}' entries must be non-empty strings",
+            )
+        path = item.strip()
+        if (
+            path.startswith("/")
+            or ".." in path.split("/")
+            or not _VALID_REPO_PATH_RE.match(path)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{field}' entry {item!r} is not a valid repo-relative path",
+            )
+        cleaned.append(path)
+    return cleaned
+
+
+def _approval_gate_response(project_id: uuid.UUID, config: dict) -> Dict[str, Any]:
+    return {
+        "project_id": str(project_id),
+        "approval_gate_config": {
+            "infra_files": list(config.get("infra_files", [])),
+            "critical_files": list(config.get("critical_files", [])),
+        },
+        "is_default": not config,
+    }
+
+
+@router.get("/projects/{project_id}/approval-gate-config")
+async def get_approval_gate_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project approval-gate file lists (infra_files / critical_files)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return _approval_gate_response(project_id, dict(project.approval_gate_config or {}))
+
+
+@router.patch("/projects/{project_id}/approval-gate-config")
+async def update_approval_gate_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project approval-gate file lists (partial update, owner-only).
+
+    Takes effect for agents immediately via the existing claim-response seam.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    unknown = set(body.keys()) - set(_APPROVAL_GATE_KEYS)
+    if unknown:
+        raise HTTPException(
+            status_code=422, detail=f"Unknown config fields: {sorted(unknown)}"
+        )
+
+    cleaned = {
+        key: _validate_approval_gate_paths(key, body[key])
+        for key in _APPROVAL_GATE_KEYS
+        if key in body
+    }
+
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
+    config = dict(project.approval_gate_config or {})
+    config.update(cleaned)
+    project.approval_gate_config = config
+    flag_modified(project, "approval_gate_config")
+    session.add(project)
+    await session.commit()
+
+    return _approval_gate_response(project_id, config)
+
+
+# ---------------------------------------------------------------------------
 # Task-branch namespace / prefix config endpoints
 # ---------------------------------------------------------------------------
 

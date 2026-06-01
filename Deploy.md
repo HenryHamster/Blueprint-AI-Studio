@@ -66,7 +66,7 @@ After creating, grab: App ID, Client ID, Client Secret, private key .pem file.
    create the project. See **[docs/ONBOARDING.md](docs/ONBOARDING.md)** for the
    full per-repository walkthrough (App install + installation-token resolution,
    the onboard endpoint and its auto-derived fields, post-onboard branch/build
-   tuning, and the `approval_gate_config` limitation).
+   tuning, and approval-gate config).
 
 6. **Launch a task**
 

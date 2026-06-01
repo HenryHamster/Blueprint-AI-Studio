@@ -1,3 +1,12 @@
+"""Global deployment settings and operations endpoints (admin router).
+
+Backs the admin Settings page and operator maintenance actions: reading and
+patching deployment-wide configuration (including LLM provider/model and auth
+mode), listing available providers, browsing GitHub repos and branches,
+refreshing GitHub quota, restarting the orchestrator, and the tracemalloc
+memory-profiling controls. External URLs are validated via ``url_security``.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select

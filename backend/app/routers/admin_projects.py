@@ -171,6 +171,7 @@ async def get_project(
         "autonomous_enabled": project.autonomous_enabled,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
+        "approval_gate_config": project.approval_gate_config or {},
         "my_role": role,
     }
 
@@ -194,10 +195,20 @@ class ProjectUpdate(BaseModel):
     # User-editable subset of problem_model — intent, constraints, context.
     # Gaps / capabilities / friction are agent-owned and not writable here.
     problem_model_patch: Dict[str, Any] | None = None
+    # Per-project approval-gate file lists (infra_files / critical_files).
+    # Partial update: only the keys supplied are replaced. Takes effect for
+    # agents immediately via the existing claim-response seam.
+    approval_gate_config: Dict[str, Any] | None = None
 
 
 _OWNER_ONLY_UPDATE_FIELDS = frozenset(
-    {"build_config", "autonomous_enabled", "design_doc", "vision"}
+    {
+        "build_config",
+        "autonomous_enabled",
+        "design_doc",
+        "vision",
+        "approval_gate_config",
+    }
 )
 
 
@@ -246,6 +257,7 @@ async def update_project(
         payload.directions is not None
         or payload.design_doc is not None
         or payload.vision is not None
+        or payload.approval_gate_config is not None
     )
     if needs_lock:
         project = await lock_project_or_429(session, project.id)
@@ -255,6 +267,7 @@ async def update_project(
                 ("directions", payload.directions),
                 ("design_doc", payload.design_doc),
                 ("vision", payload.vision),
+                ("approval_gate_config", payload.approval_gate_config),
             )
             if p is not None
         ]
@@ -374,6 +387,31 @@ async def update_project(
             k: float(v) for k, v in payload.sr_catch_rate_targets.items()
         }
         flag_modified(project, "sr_catch_rate_targets")
+
+    if payload.approval_gate_config is not None:
+        # Reuse the dedicated config router's keys + path validation so both
+        # write paths enforce identical semantics. Partial update: only the
+        # supplied keys are replaced; others are preserved.
+        from app.routers.admin_project_config import (
+            _APPROVAL_GATE_KEYS,
+            _validate_approval_gate_paths,
+        )
+
+        unknown = set(payload.approval_gate_config.keys()) - set(_APPROVAL_GATE_KEYS)
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown approval_gate_config fields: {sorted(unknown)}",
+            )
+        cleaned = {
+            key: _validate_approval_gate_paths(key, payload.approval_gate_config[key])
+            for key in _APPROVAL_GATE_KEYS
+            if key in payload.approval_gate_config
+        }
+        config = dict(project.approval_gate_config or {})
+        config.update(cleaned)
+        project.approval_gate_config = config
+        flag_modified(project, "approval_gate_config")
 
     if payload.problem_model_patch is not None:
         # User-editable subset only — intent / context / constraints. Agent-

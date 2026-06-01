@@ -8,6 +8,7 @@ Verifies that the approval gate can be configured per-project:
 
 import pytest
 import pytest_asyncio
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -15,6 +16,7 @@ from sqlmodel import SQLModel
 
 from app.task_lifecycle import _get_approval_gate_file_lists
 from app.models import Project
+from testing.factories import make_membership
 
 
 @pytest.mark.asyncio
@@ -292,3 +294,84 @@ async def test_partial_config_infra_only_sets_requires_approval_on_critical_touc
     assert touched_critical == ["src/main.py"], (
         "partial config must not silently disable the critical-file merge gate"
     )
+
+
+# ---------------------------------------------------------------------------
+# Operator write-path → agent-facing seam integration
+#
+# The HTTP endpoint's own GET/PATCH/validation contract is covered in
+# test_admin_project_config.py. These tests assert the cross-seam property
+# that is unique to this module: a config written through the owner-gated
+# admin endpoint flows straight into _get_approval_gate_file_lists — the
+# helper the claim-response seam uses to hand agents their gate lists — so
+# the write takes effect immediately with no agent-side change.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def gate_project_owner(db_session):
+    """Non-self project where test-user-123 is the owner."""
+    project = Project(name="Gate Owner Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id, user_id="test-user-123", role="owner"))
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.fixture
+async def gate_project_member(db_session):
+    """Project where test-user-123 is only a member (not owner)."""
+    project = Project(name="Gate Member Project", user_id="some-other-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id, user_id="test-user-123", role="member"))
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_patch_approval_gate_config_takes_effect_in_claim_seam(
+    client: AsyncClient, db_session, gate_project_owner
+):
+    """An owner PATCH is immediately visible to the agent-facing gate helper.
+
+    Writing infra/critical lists through the admin endpoint must round-trip
+    into _get_approval_gate_file_lists with no agent-side change, since the
+    claim response reads the same column.
+    """
+    project = gate_project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/approval-gate-config",
+        json={"infra_files": ["src/main.py", "src/db.py"], "critical_files": ["src/db.py"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+    db_session.expire(project)
+    await db_session.refresh(project)
+    infra_files, critical_files = _get_approval_gate_file_lists(project)
+    assert infra_files == {"src/main.py", "src/db.py"}
+    assert critical_files == {"src/db.py"}
+
+
+@pytest.mark.asyncio
+async def test_patch_approval_gate_config_owner_only_does_not_mutate_seam(
+    client: AsyncClient, db_session, gate_project_member
+):
+    """A non-owner PATCH is rejected (403) and leaves the gate lists empty."""
+    project = gate_project_member
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/approval-gate-config",
+        json={"infra_files": ["src/secret.py"]},
+    )
+    assert resp.status_code == 403, resp.text
+
+    db_session.expire(project)
+    await db_session.refresh(project)
+    infra_files, critical_files = _get_approval_gate_file_lists(project)
+    assert infra_files == set()
+    assert critical_files == set()

@@ -661,6 +661,47 @@ class TestUpdateProject:
         assert resp.json()["name"] == "Renamed"
 
     @pytest.mark.asyncio
+    async def test_update_approval_gate_config_round_trip(
+        self, client: AsyncClient, db_session
+    ):
+        """Owner can set approval_gate_config and read it back via GET."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "approval_gate_config": {
+                    "infra_files": ["src/main.py", "src/db.py"],
+                    "critical_files": ["src/auth.py"],
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["approval_gate_config"] == {
+            "infra_files": ["src/main.py", "src/db.py"],
+            "critical_files": ["src/auth.py"],
+        }
+
+        get_resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["approval_gate_config"]["critical_files"] == [
+            "src/auth.py"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_update_approval_gate_config_rejects_bad_path(
+        self, client: AsyncClient, db_session
+    ):
+        """An absolute or traversal path is rejected with 422."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"approval_gate_config": {"infra_files": ["../etc/passwd"]}},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_update_autonomous_enabled(self, client: AsyncClient, db_session):
         """Can toggle autonomous_enabled on a project."""
         project = await _make_project(db_session)
@@ -935,6 +976,18 @@ class TestUpdateProjectOwnerOnlyFields:
         resp = await client.patch(
             f"/api/admin/projects/{project.id}",
             json={"vision": {"text": "my vision"}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_approval_gate_config(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change approval_gate_config."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"approval_gate_config": {"infra_files": ["src/main.py"]}},
         )
         assert resp.status_code == 403
 

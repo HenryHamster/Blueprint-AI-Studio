@@ -1,3 +1,16 @@
+"""SQLModel ORM models and shared enums for the Blueprint orchestrator.
+
+This module is the single source of truth for the persisted schema: the
+SQLModel tables (``Project``, ``Task``, ``Artifact``, ``Direction``, and
+related entities), the status/type enums used across the backend
+(``ProjectStatus``, ``TaskStatus``, ``ArtifactType``, ``LLMProviderName``,
+``LLMAuthMode``, ...), and the ``NaiveUTCDateTime`` column type used uniformly
+for naive-UTC timestamps. Table definitions here must stay in lock-step with
+the Alembic migrations under ``backend/alembic/versions/`` and with
+``EXPECTED_SCHEMA_REVISION`` in ``app.main`` — see ``docs/DATA_MODELS.md`` for a
+field-level reference.
+"""
+
 from enum import Enum
 from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
@@ -313,7 +326,7 @@ class Project(SQLModel, table=True):
     )
     # Approval gate configuration for PR file-path flagging.
     # Shape: {"infra_files": [...], "critical_files": [...]}.
-    # When unset, defaults to Blueprint's hardcoded sensitive paths.
+    # When unset/empty, the file-based gate is disabled and reads as {}.
     approval_gate_config: Dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),

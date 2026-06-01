@@ -364,6 +364,32 @@ def get_project_promotion_target(project) -> str:
     return "main"
 
 
+def is_single_branch_project(project) -> bool:
+    """True when a project's integration branch IS its promotion target.
+
+    This is the canonical "LTS model inactive" predicate: when the branch the
+    pipeline builds on (:func:`get_project_integration_branch`) coincides with
+    the branch promotions land on (:func:`get_project_promotion_target`) there
+    is no separate release trunk.  It is the common default for an onboarded
+    external repo (both columns backfilled to the GitHub default branch), versus
+    Blueprint's own self-repo pair (``automain`` integration / ``main``
+    promotion), where the two differ and the LTS model is active.
+
+    The release machinery keys several short-circuits on this exact comparison —
+    ``release_promotion.promote`` records an inert already-landed success rather
+    than opening a ``release-vN -> promotion_target`` PR that would target the
+    very branch work already merges to; ``hotfix_backmerge`` skips the
+    ``promotion_target -> integration_branch`` back-merge as ``lts_inactive``;
+    and ``release_reconciliation`` bails out rather than reconciling a candidate
+    against a branch it already lives on.  Resolving both names through the
+    per-project resolver here keeps that decision in one tested place instead of
+    re-deriving the literal comparison at each call site.
+    """
+    return get_project_integration_branch(project) == get_project_promotion_target(
+        project
+    )
+
+
 async def backfill_branch_columns(session, project_id=None) -> dict:
     """Populate NULL integration_branch / promotion_target from GitHub defaults.
 

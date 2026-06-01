@@ -159,7 +159,7 @@ default off):
 
 ---
 
-## 4. Known limitation: no operator write path for `approval_gate_config`
+## 4. Configuring the file-path approval gate (`approval_gate_config`)
 
 `Project.approval_gate_config` (`backend/app/models.py`) holds the file-path
 approval gate:
@@ -174,25 +174,27 @@ At PR time, `task_lifecycle_github_helpers._get_approval_gate_file_lists` reads
 require human approval before merge. **When the column is empty, both sets are
 empty — every changed file skips the file-based approval gate.**
 
-The catch: **there is currently no operator write path for
-`approval_gate_config` on a non-self project.**
+Set the lists per project through the admin API, following the same per-project
+GET/PATCH config pattern as `integration-branch` and `promotion-target`:
 
-- It is **not** a field on `ProjectUpdate`, so `PATCH /api/admin/projects/{id}`
-  cannot set it (verify: `grep -n approval_gate_config backend/app/routers/admin_projects.py`
-  returns nothing).
-- There is no dedicated config endpoint for it in `admin_project_config.py`.
-- It is seeded **only for the self-repo**, by Alembic migration
-  `0120_seed_self_repo_approval_gate_config.py`, which writes Blueprint's default
-  infra/critical file lists **only where `is_self_repo` is true**.
+- **`GET /api/admin/projects/{project_id}/approval-gate-config`** (member) returns
+  `{ "approval_gate_config": { "infra_files": [...], "critical_files": [...] },
+  "is_default": bool }`.
+- **`PATCH /api/admin/projects/{project_id}/approval-gate-config`** (owner-only)
+  sets either or both lists (partial update). Each entry must be a plausible
+  repo-relative path string — no leading `/`, no `..` traversal, no shell
+  metacharacters — or the request returns `422`.
 
-**Implication:** a freshly onboarded non-self project falls back to empty
-approval-gate sets, so the file-based approval gate does not flag any files
-unless the lists are populated out-of-band (e.g. a manual DB update). Plan
-accordingly if your repo has sensitive infra/critical paths that should require
-approval.
+Writes take effect for agents **immediately** through the existing task-claim
+response seam, with no agent-side change: the agent's fresh-reviewer escalates
+review effort when a sensitive path is touched, and the PR merge path requires
+human approval before merging changes to those files.
 
-> If a companion change adds a write path for `approval_gate_config` (an endpoint
-> or a `ProjectUpdate` field), update this section to point operators at it.
+Blueprint's own self-repo is seeded with default infra/critical file lists by
+Alembic migration `0120_seed_self_repo_approval_gate_config.py` (only where
+`is_self_repo` is true). A freshly onboarded non-self project starts with empty
+lists, so configure them via the PATCH endpoint above if your repo has sensitive
+infra/critical paths that should require approval.
 
 ---
 
@@ -210,7 +212,9 @@ approval.
    that `autonomous_enabled` defaults **on**, so disable it via
    `PATCH /projects/{project_id}/autonomous` first if you want to gate autonomous
    spawning before turning the pipelines on.
-7. Note the `approval_gate_config` limitation if your repo has sensitive paths.
+7. Set `approval_gate_config` (`infra_files` / `critical_files`) via
+   `PATCH /api/admin/projects/{project_id}/approval-gate-config` if your repo has
+   sensitive paths that should require human approval before merge.
 
 See also: [API_REFERENCE.md — Project Onboarding](API_REFERENCE.md#project-onboarding)
 and [DATA_MODELS.md — Project](DATA_MODELS.md#project).

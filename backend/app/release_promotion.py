@@ -674,6 +674,42 @@ async def promote(
             lock_released=False,
         )
 
+    # --- Single-branch repo guard (LTS model inactive) ----------------------
+    # When the integration branch IS the promotion target there is no separate
+    # release trunk to promote onto: fleet work — including this candidate —
+    # already merges directly to that branch during qualification.  Opening a
+    # release PR (release-vN → promotion_target) would target the very branch
+    # work lands on, which is a confusing no-op at best and an erroneous
+    # self-merge at worst.  Mirror the back-merge guard
+    # (hotfix_backmerge.reconcile_main_into_automain, which skips as
+    # "lts_inactive" when the branches coincide): treat the LTS model as
+    # inactive and record an inert, already-landed success.  The candidate is
+    # already live on the single branch, so the version advances exactly like
+    # the empty-diff path WITHOUT any GitHub I/O.  The row is still FOR UPDATE-
+    # locked here (before the intermediate commit below), so write directly with
+    # lock_released=False — the same pattern the project_not_found return uses.
+    if _integration_branch == promotion_target:
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: v%d integration branch (%s) is the "
+            "promotion target — single-branch repo, LTS model inactive; "
+            "candidate %s already live, recording inert success without a "
+            "release PR",
+            version.version_number,
+            promotion_target,
+            (candidate_sha or "")[:8],
+        )
+        return await _record_promotion_success(
+            session,
+            version,
+            candidate_sha,
+            {**base_record, "lts_inactive": True},
+            "(single-branch repo — integration branch is the promotion "
+            "target; no release PR opened)",
+            empty_diff=True,
+            already_landed=True,
+            lock_released=False,
+        )
+
     release_branch = f"release-v{version.version_number}"
 
     # --- Release the ReleaseVersion row lock BEFORE any GitHub I/O ----------

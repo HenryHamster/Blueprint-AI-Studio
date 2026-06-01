@@ -1,3 +1,14 @@
+"""Authentication and authorization dependencies for the orchestrator API.
+
+Covers the platform's authentication schemes: Firebase ID tokens for
+admin/operator users (verified via the Firebase Admin SDK, initialized at
+module load), an ``ADMIN_API_KEY`` shared-secret path for programmatic
+access, and short-lived agent JWTs for VM-side requests. Also provides
+helpers for minting and verifying agent JWTs and WebSocket admission tickets,
+plus the ``get_current_user`` / ``require_admin`` FastAPI dependencies that
+resolve the caller against the ``AllowedUser`` table.
+"""
+
 from fastapi import Security, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession

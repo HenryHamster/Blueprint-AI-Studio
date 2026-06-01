@@ -28,12 +28,24 @@ Launch a new task on a repository.
 }
 ```
 
-**Response:** `{ "task_id": "uuid", "project_id": "uuid", ... }`
+**Response:**
+```json
+{
+  "status": "accepted",
+  "project_id": "uuid",
+  "message": "Project created. <N> tasks queued for provisioning."
+}
+```
+
+One `Project` and one parent `Task` are created, plus one child `Task` per
+entry in `payloads`. The child tasks are enqueued (`QUEUED`) for the
+orchestrator worker to provision; their IDs are not returned in the response —
+fetch them via `GET /api/projects/{project_id}/tasks`.
 
 **Status codes:**
-- `200` — Task created and queued
+- `200` — Project created and tasks queued
 - `429` — Rate limited (5 per minute)
-- `400` — Invalid payload or missing required fields
+- `422` — Invalid task payload (failed `validate_task_payload`)
 - `401` — Unauthorized
 
 ---
@@ -98,12 +110,19 @@ Return the current project/task status summary used by the dashboard.
 
 ### `WebSocket /api/projects/{project_id}/ws`
 
-Stream live task logs via WebSocket. Requires a `ws_ticket` query parameter obtained from `POST /api/projects/{project_id}/ws-ticket`.
+Stream live task logs and real-time project events via WebSocket. Authentication
+uses a short-lived ticket sent as the **first WebSocket message** (not a query
+parameter), obtained from `POST /api/projects/{project_id}/ws-ticket`.
 
 **Connection flow:**
-1. `POST /api/projects/{project_id}/ws-ticket` → get `{"ticket": "string", "expires_at": "ISO8601"}`
-2. Connect to `ws://orchestrator/api/projects/{project_id}/ws?ws_ticket=<ticket>`
-3. Receive JSON messages: `{"task_id": "uuid", "log": "string", "timestamp": "ISO8601"}`
+1. `POST /api/projects/{project_id}/ws-ticket` → returns `{"ticket": "string"}`
+2. Connect to `ws://orchestrator/api/projects/{project_id}/ws`
+3. Immediately send the ticket as the first JSON message: `{"ticket": "<ticket>"}`
+   (a missing/invalid ticket, a `project_id` mismatch, or no message within 5 s
+   closes the socket with code `1008`)
+4. On success the server sends `{"event": "connected", ...}` followed by a
+   `{"event": "deploy_state", ...}` hydration snapshot, then streams events.
+   See [WebSocket Message Format](#websocket-message-format) for the envelope.
 
 ---
 
@@ -255,6 +274,41 @@ Warm-VM handoff endpoint that either claims a pinned task or exits with no work.
 
 ---
 
+### `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
+
+Reviewer-merge helper invoked by a fresh-reviewer agent to record/perform the
+merge decision for the task it reviewed.
+
+---
+
+### Strategic context fetch
+
+Read-only endpoints the agent uses to pull full detail on items that were
+trimmed/summarized in the strategic claim payload. All require the agent JWT,
+are rate-limited 60/minute, and return `{ "status": "success", "data": ... }`.
+Cross-project access returns 404 (not 403) to prevent id enumeration.
+
+- `GET /api/agent/projects/{project_id}/directions/{direction_id}` — one direction
+  by id, with `research_history` capped to the most recent 20 cycles.
+- `GET /api/agent/projects/{project_id}/playbook/{key:path}` — a single
+  `playbook/<key>` design-doc entry with full content (honors `pending_source`
+  visibility rules).
+- `GET /api/agent/projects/{project_id}/gaps/{gap_id}` — a single problem-model
+  gap (active or archived) with full history/past_moves/evidence.
+
+---
+
+### `WebSocket /api/agent/ws/{task_id}`
+
+WebSocket channel used by the agent VM to stream high-throughput logs and
+real-time events back to the orchestrator. The agent must send its agent JWT as
+the first message (`{"token": "<agent_jwt>"}`) before streaming; an invalid or
+missing token closes the socket. This is the agent-side ingress counterpart to
+the read-only `WebSocket /api/projects/{project_id}/ws` that the admin UI
+consumes.
+
+---
+
 ## GitHub Proxy Endpoints
 
 Agent VMs use these to call GitHub APIs without storing credentials locally.
@@ -349,16 +403,82 @@ to its default. Each response includes `is_default`.
 - **`GET|PATCH /task-branch-namespace`** — single branch segment (no `/`).
 - **`GET|PATCH /task-branch-prefix`** — defaults to `{namespace}/`.
 - **`GET|PATCH /staging-branch-prefixes`** — list of prefixes (default `["research/", "plan/"]`).
+- **`GET|PATCH /approval-gate-config`** — `{ "approval_gate_config": { "infra_files": [...],
+  "critical_files": [...] }, "is_default": bool }`. PATCH is a partial update (send either or
+  both lists) and validates that every entry is a plausible repo-relative path string (no
+  leading `/`, no `..` traversal, no shell metacharacters → 422). Writes take effect for
+  agents immediately through the existing task-claim response seam (no agent-side change).
 - **`PATCH /api/admin/projects/{project_id}`** (`ProjectUpdate`, owner-only for
   `build_config`) — updates the full `build_config` blob, including
   `stale_branch_prefixes`, `protected_branches`, and `enable_self_improvement`.
-  > **Note:** `approval_gate_config` (`infra_files` / `critical_files`) is **not**
-  > a field on `ProjectUpdate` and has no per-project write endpoint — see the
-  > known-limitation callout in [ONBOARDING.md](ONBOARDING.md).
 - **`GET|PATCH /auto-remediation`**, **`/issue-implementation`**, **`/auto-review`**
   — automation pipelines (all seeded `enabled: false`).
 - **`PATCH /projects/{project_id}/autonomous`** — `{ "enabled": bool }` toggles
   `autonomous_enabled`.
+
+---
+
+## System & Diagnostics
+
+Top-level operational endpoints defined directly on the app in
+`backend/app/main.py` (not under a router prefix). Health and metrics endpoints
+are unauthenticated so external monitors and load balancers can reach them; the
+profile, detailed-health, and debug endpoints require a valid Firebase/admin
+token.
+
+### `GET /`
+
+Unauthenticated liveness ping. Returns `{ "status": "online", "service": "Blueprint Orchestrator" }`.
+
+### `GET /health`
+
+Unauthenticated health check for external monitoring (Cloud Function, load
+balancer). Non-leader instances always report healthy; on the leader, liveness is
+gated on the orchestrator worker's in-cycle progress heartbeat. Returns
+`{ "status", "is_leader", "revision", ... }`. Only a DB outage (or a genuinely
+wedged worker) yields a `503` that removes the instance from the load balancer —
+provider/external dependency degradation is surfaced but does not fail the check.
+
+### `GET /metrics`
+
+Prometheus-compatible metrics in the text exposition format
+(`text/plain`). Unauthenticated by default; if the `METRICS_TOKEN` env var is
+set, the request must include a matching `?token=<value>` query parameter
+(`403` otherwise). Exposes orchestrator cycle age, active VM counts, consecutive
+autonomous-failure counts, and related gauges.
+
+### `GET /api/version`
+
+Public version endpoint used by the frontend for compatibility checks. Returns
+`{ "sha": "<git-sha>", "revision": "<alembic-revision>" }`.
+
+### `GET /api/me`
+
+Authenticated. Returns the calling user's profile:
+`{ "user_id", "email", "role" }`.
+
+### `GET /api/health/detailed`
+
+Authenticated. Returns structured health status for all system components
+(database with latency, providers, external dependencies, and a pipeline-health
+snapshot): `{ "status", "components": {...}, "pipeline_health": {...} }`.
+
+### `GET /api/debug/orchestrator`
+
+Authenticated diagnostic endpoint that reports whether the orchestrator loop is
+alive, including counts of `QUEUED` (non-approval-gated) and active
+(`PROVISIONING`/`IN_PROGRESS`) tasks.
+
+### `GET /api/admin/viewport-failures/download-url`
+
+Authenticated. Generates a 1-hour signed GCS download URL for a viewport-failure
+screenshot so the regression panel can display it without a per-task DB lookup.
+
+**Query parameters:** `project_id` (uuid), `component` (string), `width` (int).
+
+**Response:** `{ "url": "https://storage.googleapis.com/..." }`. Returns `503`
+if artifact storage is unavailable. The object path mirrors what the agent
+uploads via `POST /api/agent/viewport/failure-screenshot-upload-url`.
 
 ---
 
@@ -396,22 +516,31 @@ Notable examples: `/api/deploy` (5/min), `/api/projects` (30/min),
 
 ## WebSocket Message Format
 
-All WebSocket messages are JSON:
+Every message the server pushes over `/api/projects/{project_id}/ws` is JSON with
+a two-field envelope — an `event` discriminator and an `data` payload object
+(shape varies by event):
 
 ```json
 {
-  "type": "log|status|error|heartbeat",
-  "task_id": "uuid",
-  "timestamp": "ISO8601",
-  "data": {...}
+  "event": "<event_type>",
+  "data": { ... }
 }
 ```
 
-**Message types:**
-- `log` — Task output log line
-- `status` — Task status changed
-- `error` — Error event
-- `heartbeat` — Keep-alive ping
+Common `event` values consumed by the admin UI:
+- `connected` — sent once on successful auth; `data` carries `{"project_id"}`
+- `deploy_state` — initial hydration snapshot of current deploy state
+- `agent_log` — a line of agent/task output
+- `task_updated` — a task's status or fields changed
+- `artifact_created` — a new artifact was produced
+- `autonomous_activity` / `autonomous_paused` — autonomous-mode lifecycle events
+- `pipeline_throttle` — pipeline throttling notice
+- `pong` — keep-alive reply (the client may send `{"type": "ping"}`)
+
+Additional `event` types are emitted for pipeline, release, and self-review
+telemetry (e.g. `pr_merged`, `failure_alert`, `cycle_summary`,
+`review_feedback`); clients should ignore unrecognized `event` values. The
+broadcast envelope is built in `backend/app/broadcast.py`.
 
 ---
 

@@ -633,6 +633,38 @@ async def test_open_backmerge_pr_missing_project_is_blocked(db_session):
     assert result["error"] == "project_not_found"
 
 
+async def test_open_backmerge_pr_skipped_when_single_branch(db_session, mocker):
+    """On a single-branch repo (integration_branch == promotion_target) the
+    one-shot back-merge skips cleanly as inactive WITHOUT touching GitHub — it
+    must never open a PR whose head equals its base. Mirrors the back-merge
+    reconciler's guard so the hotfix-merge handler is safe for external
+    single-branch projects."""
+    project = await _make_project(
+        db_session, integration_branch="main", promotion_target="main"
+    )
+    create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 1, "html_url": "http://pr/1"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session,
+        project.id,
+        merged_pr_url="http://pr/hotfix-1",
+        hotfix_task_id=uuid.uuid4(),
+    )
+    await db_session.commit()
+
+    assert result == {"status": "skipped", "reason": "lts_inactive"}
+    # GitHub is never touched — no PR opened, no merge attempted.
+    create_mock.assert_not_called()
+    merge_mock.assert_not_called()
+    # And no Alert / task is raised for the inert skip.
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
 # ===========================================================================
 # reconcile_main_into_automain — the periodic reconciler
 # ===========================================================================
@@ -802,6 +834,64 @@ async def test_reconcile_activates_for_custom_branch_names(db_session, mocker):
     assert result["status"] == "merged"
     assert create_mock.call_args.kwargs["head"] == "mylts"
     assert create_mock.call_args.kwargs["base"] == "mytrunk"
+
+
+async def test_open_backmerge_pr_skipped_when_integration_equals_promotion(
+    db_session, mocker
+):
+    """The single-branch external-repo case (integration_branch ==
+    promotion_target) short-circuits open_backmerge_pr explicitly: GitHub is
+    never touched, no Alert, no task — the back-merge tail is genuinely inert
+    rather than relying on a degenerate empty-diff PR to no-op by accident.
+
+    This is the direct hotfix entry point (task_lifecycle.py calls
+    open_backmerge_pr, not the reconciler), so its inertness must be guarded
+    independently of reconcile_main_into_automain."""
+    project = await _make_project(
+        db_session, integration_branch="main", promotion_target="main"
+    )
+    create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 1, "html_url": "http://pr/1"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session,
+        project.id,
+        merged_pr_url="http://pr/hotfix-1",
+        hotfix_task_id=uuid.uuid4(),
+    )
+    await db_session.commit()
+
+    assert result == {"status": "skipped", "reason": "lts_inactive"}
+    # No GitHub I/O at all — not even a PR-creation attempt.
+    create_mock.assert_not_called()
+    merge_mock.assert_not_called()
+    # No Alert and no resolution task for a single-branch repo.
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_open_backmerge_pr_skipped_single_branch_custom_name(db_session, mocker):
+    """The single-branch guard is config-driven, not hardcoded to 'main': any
+    project whose integration_branch equals its promotion_target short-circuits,
+    resolving the names through the per-project branch resolver."""
+    project = await _make_project(
+        db_session, integration_branch="trunk", promotion_target="trunk"
+    )
+    create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 2, "html_url": "http://pr/2"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result == {"status": "skipped", "reason": "lts_inactive"}
+    create_mock.assert_not_called()
+    merge_mock.assert_not_called()
 
 
 async def test_reconcile_skipped_when_integration_equals_promotion(db_session, mocker):

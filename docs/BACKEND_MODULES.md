@@ -17,7 +17,9 @@ FastAPI application entry point. Defines:
 - Lifecycle hooks (startup, shutdown)
 - VM deletion tracking (`_orchestrator_deleted_vms`) to distinguish orchestrator cleanup from GCP preemption
 
-**Key functions:**
+**Key functions** (canonical implementations live in `vm_lifecycle.py`; `main.py`
+re-exports them with `# noqa: F401` for back-compat — new code should import from
+`app.vm_lifecycle` directly):
 - `_ensure_vm_deleted()` — Retry-safe VM deletion with GCP coordination
 - `fire_and_forget_vm_delete()` — Non-blocking background VM cleanup
 - `is_orchestrator_initiated_delete()` — Check if VM was deleted by orchestrator (for reaper)
@@ -67,8 +69,8 @@ Pydantic request/response DTOs for API endpoints.
 
 **Key schemas:**
 - `DeployPayload` — Launch task request
-- `AgentStatusPayload` — Task completion/failure report (~200 fields for telemetry)
-- `HeartbeatRequest` — Agent keep-alive (~100 fields for metrics)
+- `AgentStatusPayload` — Task completion/failure report (many optional telemetry fields)
+- `HeartbeatRequest` — Agent keep-alive (carries optional metrics/tool-trace fields)
 - `SpawnTaskRequest` — Child task creation
 - `GitHubPRReviewRequest` — PR review submission
 - `HeartbeatMetrics`, `ToolTraceEntry` — Structured telemetry
@@ -108,6 +110,18 @@ Authentication & authorization.
 
 ---
 
+### `lifecycle.py`
+
+Application startup/shutdown lifecycle (extracted from `main.py`). Responsibilities:
+- Launches and supervises the background worker tasks (`orchestrator_worker`,
+  `reaper_service`, `gcp_cleanup_service`, `secret_reconciliation_service`,
+  `pipeline_alert_scan_service`, `digest_precompute_service`, and others)
+- Session-scoped advisory-lock leader election (only the leader instance runs the
+  full worker set; non-leaders run a reduced set)
+- Background-task crash monitoring with operator alerts
+
+---
+
 ## Orchestration
 
 ### `orchestrator.py`
@@ -121,8 +135,12 @@ Main coordination loop. Implements:
 - **Circuit breaker** — Halts new tasks if a project exceeds failure threshold
 
 **Key functions:**
-- `orchestrator_worker()` — Main polling loop (runs every 10s)
-- `_provision_task()` — Handles the transition from QUEUED → PROVISIONING → (awaiting agent claim)
+- `orchestrator_worker()` — Main polling loop (runs every 10s); also drives
+  autonomous-research spawning by calling `_check_idle_research()` each cycle
+- `_lock_provisioning_task_for_vm()` — Locks an existing PROVISIONING task to a VM
+  before handing it to the agent (the provisioning flow is spread across
+  `orchestrator_worker()` and its inner `_provision_and_handle()` helper rather
+  than a single `_provision_task()` entry point)
 
 ---
 
@@ -135,6 +153,22 @@ Background worker that kills VMs on heartbeat timeout.
 - For timed-out IN_PROGRESS tasks, marks task as FAILED and deletes VM
 - Uses `is_orchestrator_initiated_delete()` to avoid misclassifying orchestrator-initiated cleanup as spot preemption
 - Logs all preemptions and orphan cleanup for metrics
+
+---
+
+### `vm_lifecycle.py`
+
+Canonical home for orchestrator-side VM deletion tracking (extracted from `main.py`,
+which re-exports for back-compat).
+
+**Key functions:**
+- `_ensure_vm_deleted()` — Retry-safe VM deletion coordinated with GCP
+- `fire_and_forget_vm_delete()` — Non-blocking background VM cleanup
+- `is_orchestrator_initiated_delete()` — Distinguish orchestrator cleanup from GCP
+  preemption so the reaper does not misclassify it
+
+Also maintains the in-process set of orchestrator-deleted VMs and GCP VM-count
+caching used for concurrency limits.
 
 ---
 
@@ -181,9 +215,12 @@ High-level task state machine.
 - IN_PROGRESS → FAILED (agent reported failure)
 
 **Functions:**
-- `transition_task_status()` — Atomically update task status with validation
-- `record_task_history()` — Audit trail entry
-- `_verify_state_transition()` — Enforce valid state machine
+- `_process_post_commit()` — The async entry point that processes an agent's
+  terminal status report: resolves the verdict, advances the task through its
+  terminal states, records history, and triggers follow-on work. State-transition
+  and history logic is embedded here and in `lifecycle.py` rather than in
+  standalone `transition_task_status()` / `record_task_history()` helpers.
+- `_has_active_strategic_task()`, `_increment_research_spawn_count()` — strategic-cycle helpers
 
 ---
 
@@ -235,11 +272,15 @@ Main loop for autonomous task spawning.
 
 ### `strategic_spawning.py`
 
-Decides which directions to spawn from and creates research tasks.
+Builds the enriched payload (design-doc view, problem model, system-maturity rows,
+efficiency snapshot) that is shipped to the strategic agent each cycle. It is a
+context/payload builder, **not** the spawner — the actual direction selection and
+research-task creation live in `autonomous_research.py` (`_spawn_research_task`,
+`_check_idle_research`).
 
 **Functions:**
-- `select_direction_for_spawn()` — Pick an active direction using weighted random selection
-- `spawn_research_task()` — Create a child research task
+- `_agent_view_design_doc()` — Strip operator-only keys from the design doc before it goes to the agent
+- `_agent_view_problem_model()` — Trim per-gap history to stay under the payload size cap
 
 ---
 
@@ -271,12 +312,9 @@ Direction state management (pause, resume, complete).
 
 ---
 
-### `autonomous_research_diagnosis.py`
-
-Auto-pause investigation. When a direction is auto-paused:
-1. Spawns an `investigate` task to diagnose the issue
-2. Stores investigation findings in the direction
-3. Recommends whether to resume or mark completed
+> **Note:** auto-pause diagnosis is not a standalone module. The
+> `diagnosis_in_progress` / `diagnosis_task_id` markers on a direction (see
+> `docs/DATA_MODELS.md`) are managed within `direction_lifecycle.py`.
 
 ---
 
@@ -483,9 +521,12 @@ GCS artifact storage interface.
 
 ---
 
-### `telemetry.py`
+### `fix_loop_telemetry.py`
 
-Distributed tracing setup (OpenTelemetry / Cloud Trace integration).
+Records per-iteration fix-loop telemetry (lint/test fix attempts and outcomes)
+reported by agents. (There is no general `telemetry.py` / OpenTelemetry tracing
+module; execution metrics arrive on the agent status and heartbeat payloads and
+are aggregated by `digest_metrics.py`.)
 
 ---
 
@@ -545,6 +586,16 @@ Credential rotation for running agents.
 
 **Endpoints:**
 - `POST /api/agent/credentials/rotate` — Propagate refreshed provider secret
+
+### `routers/agent_strategic_fetch.py`
+
+Read-only endpoints for an agent to pull full detail on strategic-payload items
+that were trimmed at claim time (agent JWT, rate-limited 60/min).
+
+**Endpoints:**
+- `GET /api/agent/projects/{project_id}/directions/{direction_id}`
+- `GET /api/agent/projects/{project_id}/playbook/{key:path}`
+- `GET /api/agent/projects/{project_id}/gaps/{gap_id}`
 
 ---
 
@@ -737,9 +788,13 @@ Spawns research tasks from strategic directions without manual intervention.
 4. Deduplication: avoids re-proposing completed work
 
 **Functions:**
-- `autonomous_research_worker()` — Main background loop
-- `_select_eligible_direction()` — Ranking & conflict-free selection
-- `_spawn_research_task()` — Create task from direction
+- `_check_idle_research()` — Idle-pipeline entry point; called each `orchestrator_worker()`
+  cycle (there is no dedicated `autonomous_research_worker` loop — autonomy piggybacks
+  on the orchestrator loop)
+- `_check_autonomous_research(owner, repo)` — Event-driven entry point invoked from the
+  GitHub webhook handler
+- `_spawn_research_task()` / `_spawn_research_task_inner()` — Create a research task from a direction
+- `_spawn_periodic_task()` — Spawn periodic non-research strategic tasks
 
 ---
 
@@ -765,17 +820,12 @@ Handles completion of strategic-mode tasks (design doc updates, reviews, etc.).
 
 ### Telemetry & Analytics
 
-#### `telemetry.py`
+#### Execution metrics
 
-Collects execution metrics from agent heartbeats.
-
-**Metrics:**
-- Token usage
-- Time per phase (planning, coding, review)
-- Tool invocations
-- Error types and frequencies
-
-Used for cost reporting and performance analysis.
+Execution metrics (token usage, time per phase, tool invocations, error
+frequencies) are not collected by a dedicated `telemetry.py`. They arrive on
+the `AgentStatusPayload` (terminal report) and `HeartbeatRequest` (keep-alive)
+schemas and are aggregated for cost/performance reporting by the modules below.
 
 ---
 

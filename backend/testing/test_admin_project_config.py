@@ -1059,6 +1059,116 @@ async def test_patch_promotion_target_null_skips_remote_check(
 
 
 # ---------------------------------------------------------------------------
+# Approval-gate config tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_approval_gate_config_defaults_empty(
+    client: AsyncClient, db_session, project_owner
+):
+    """GET /approval-gate-config returns empty lists and is_default when unset."""
+    project = project_owner
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/approval-gate-config"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["approval_gate_config"] == {"infra_files": [], "critical_files": []}
+    assert data["is_default"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_approval_gate_config_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH then GET returns the stored infra/critical file lists; agents read it via the column."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/approval-gate-config",
+        json={
+            "infra_files": ["src/main.py", "src/db.py"],
+            "critical_files": ["src/auth.py"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["approval_gate_config"]["infra_files"] == ["src/main.py", "src/db.py"]
+    assert data["approval_gate_config"]["critical_files"] == ["src/auth.py"]
+    assert data["is_default"] is False
+
+    get_resp = await client.get(
+        f"/api/admin/projects/{project.id}/approval-gate-config"
+    )
+    assert get_resp.json()["approval_gate_config"]["critical_files"] == ["src/auth.py"]
+
+    # The claim-response seam reads straight off the column.
+    await db_session.refresh(project)
+    assert project.approval_gate_config["infra_files"] == ["src/main.py", "src/db.py"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_approval_gate_config_partial_update_merges(
+    client: AsyncClient, db_session, project_owner
+):
+    """A PATCH supplying only one key leaves the other key untouched."""
+    project = project_owner
+    await client.patch(
+        f"/api/admin/projects/{project.id}/approval-gate-config",
+        json={"infra_files": ["a.py"], "critical_files": ["a.py"]},
+    )
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/approval-gate-config",
+        json={"critical_files": ["b.py"]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["approval_gate_config"]["infra_files"] == ["a.py"]
+    assert data["approval_gate_config"]["critical_files"] == ["b.py"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_approval_gate_config_rejects_bad_paths(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH rejects unknown fields, non-list values, and implausible paths."""
+    project = project_owner
+    bad_bodies = [
+        {"bogus_field": ["x.py"]},
+        {"infra_files": "src/main.py"},
+        {"infra_files": [""]},
+        {"infra_files": ["/etc/passwd"]},
+        {"infra_files": ["../secrets.py"]},
+        {"critical_files": ["src/$(cmd).py"]},
+    ]
+    for body in bad_bodies:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/approval-gate-config",
+            json=body,
+        )
+        assert resp.status_code == 422, f"expected 422 for {body!r}, got {resp.text}"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_approval_gate_config_requires_owner_role(
+    client: AsyncClient, db_session, project_member
+):
+    """A member (non-owner) cannot PATCH approval-gate-config."""
+    project = project_member
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/approval-gate-config",
+        json={"infra_files": ["src/main.py"]},
+    )
+    assert resp.status_code == 403, resp.text
+
+
+# ---------------------------------------------------------------------------
 # Per-project staging/cleanup branch config round-trip tests
 # ---------------------------------------------------------------------------
 

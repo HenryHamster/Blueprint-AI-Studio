@@ -60,18 +60,17 @@ class Project(SQLModel, table=True):
   `{namespace}/{prefix}-{hex}`. Tuned via `.../task-branch-namespace`.
 
 **`approval_gate_config`** — shape `{"infra_files": [...], "critical_files": [...]}`.
-Read at PR time by `task_lifecycle_github_helpers._get_approval_gate_file_lists` to
-decide which changed files require human approval before merge. **When empty
-(the default), both sets are empty and every changed file skips the file-based
-approval gate.**
+Read at PR time by `task_lifecycle_github_helpers._get_approval_gate_file_lists`
+to decide which changed files require human approval before merge. **When
+empty (the default), both sets are empty and every changed file skips the
+file-based approval gate.**
 
-> ⚠️ **No operator write path on non-self projects.** `approval_gate_config` is
-> not a field on `ProjectUpdate` and has no dedicated config endpoint, so it
-> cannot be set through the admin API. It is seeded **only for the self-repo**
-> (`is_self_repo = true`) by Alembic migration
-> `0120_seed_self_repo_approval_gate_config.py`. A non-self project therefore
-> falls back to empty approval-gate sets unless populated out-of-band. See
-> [ONBOARDING.md — Known limitation](ONBOARDING.md#4-known-limitation-no-operator-write-path-for-approval_gate_config).
+Operators manage it through `GET|PATCH /api/admin/projects/{id}/approval-gate-config`
+(`admin_project_config.py`): GET is member-gated, PATCH is owner-gated and a
+partial update of the `infra_files` / `critical_files` lists. It is still seeded
+**only for the self-repo** (`is_self_repo = true`) by Alembic migration
+`0120_seed_self_repo_approval_gate_config.py`, but non-self projects can now be
+set directly through the admin API.
 
 > Project membership is a separate `ProjectMember` table (no `members`
 > relationship on `Project`). There is no circuit-breaker column on the
@@ -316,7 +315,7 @@ The direction blob has an open vocabulary; the promoted/known keys are:
 {
   "id": "string",                 // direction_key
   "text": "string",               // "Reduce test latency", etc.
-  "status": "active|proposed|paused|rejected|expired",
+  "status": "active|proposed|paused|rejected|expired|completed|retired|superseded",
   "priority": "high|medium|low",
   "spawned_task_ids": ["uuid", ...],
   "last_spawned_at": "ISO8601 | null",

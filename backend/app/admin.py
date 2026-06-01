@@ -1,3 +1,14 @@
+"""Admin task-management API router (``/api/admin``).
+
+Hosts the operator-facing task endpoints: listing and inspecting tasks
+(including serial-console output and PR file diffs), creating tasks, bulk
+archive/action operations, and the review-control actions (request changes,
+request a fresh reviewer, reset iteration cap, archive/unarchive, patch). All
+routes require an authenticated user via the router-level ``get_current_user``
+dependency. Task-mutation logic is delegated to ``admin_task_mutations`` and
+shared access checks to ``admin_helpers``.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession

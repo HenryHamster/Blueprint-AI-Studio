@@ -1,3 +1,12 @@
+"""Operator-triggered pipeline action endpoints (admin router).
+
+Exposes the manual levers operators pull on a project or task from the admin
+UI: spawning a ``self-audit``, kicking off the release ``qualify`` gate,
+clearing wave dependencies, triggering a rollup for a task, and listing a
+project's findings. Each route resolves the project/task with a role check via
+``admin_helpers`` and validates internal payloads through ``payload_schemas``.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession

@@ -1955,6 +1955,12 @@ async def _make_project_and_version(db_session, *, phase: str = "build"):
         user_id="rq-user",
         github_owner="acme",
         github_repo="widget",
+        # Distinct integration/promotion pair (the multi-branch LTS model these
+        # promote tests intend — head=release-vN, base="main"). Without an
+        # explicit pair a non-self repo resolves to main/main, which is the
+        # single-branch case promote() now short-circuits as lts_inactive.
+        integration_branch="automain",
+        promotion_target="main",
     )
     db_session.add(project)
     await db_session.commit()
@@ -3117,6 +3123,130 @@ async def test_promote_success_opens_next_version(db_session, mocker):
     # promoted_sha is the re-resolved main HEAD (the merge commit), not the
     # candidate — merge_method="merge" produced a new commit.
     assert version.promoted_sha == merge_sha
+
+
+@pytest.mark.asyncio
+async def test_promote_single_branch_repo_is_inert_lts_inactive(db_session, mocker):
+    """On a single-branch repo (integration branch == promotion target) promote()
+    must NOT open or merge a release PR into the very branch work lands on. It
+    mirrors the back-merge ``lts_inactive`` guard: record an inert, already-landed
+    success (the candidate is already live) and advance the version, with zero
+    GitHub I/O."""
+    project = Project(
+        name="RQ-SingleBranch",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="solo",
+        # Single-branch model: the integration branch IS the promotion target.
+        integration_branch="trunk",
+        promotion_target="trunk",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    branch_mock = mocker.patch("app.github.create_branch", new=AsyncMock())
+    pr_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    merge_mock = mocker.patch("app.github.merge_pull_request", new=AsyncMock())
+
+    result = await rq.promote(
+        db_session,
+        version,
+        "1234" * 10,
+        composite={"confidence": 0.91},
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    assert result["next_version_number"] == 2
+    # No GitHub I/O whatsoever — the guard short-circuits before any branch/PR work.
+    branch_mock.assert_not_called()
+    pr_mock.assert_not_called()
+    merge_mock.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == "1234" * 10
+    assert version.last_qualification.get("lts_inactive") is True
+    assert version.last_qualification.get("already_landed") is True
+
+
+@pytest.mark.asyncio
+async def test_promote_end_to_end_over_custom_branch_pair(db_session, mocker):
+    """End-to-end qualify->promote->merge for a NON-self project whose
+    integration/promotion branches are a CUSTOM pair (trunk -> release), not the
+    self-repo automain/main fixture every other promote success test uses.
+
+    Per-project branch resolution (audit C4): the release PR must open
+    release-v{N} -> the project's promotion_target ('release', NOT 'main'); the
+    idempotency ancestry check and the post-merge HEAD re-resolution must both
+    use 'release'; and the release tag message must reference the custom
+    integration -> promotion pair.  This proves the promote tail honours the
+    per-project branch resolver rather than hardcoded literals."""
+    project = Project(
+        name="RQ-CustomPair",
+        user_id="rq-user",
+        github_owner="acme",
+        github_repo="ext",
+        # Custom multi-branch pair — distinct from the automain/main fixture.
+        integration_branch="trunk",
+        promotion_target="release",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    merge_sha = "release" * 5 + "00000"
+
+    async def _branch_sha(token, owner, repo, branch):
+        # promote() re-resolves the promotion target's HEAD after the merge —
+        # it MUST ask for 'release', never the hardcoded 'main'.
+        assert branch == "release", f"unexpected branch {branch!r}"
+        return merge_sha
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    is_ancestor_mock, _del_mock, _state_mock = _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    create_mock = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 9, "html_url": "http://pr/9"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    tag_mock = mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    result = await rq.promote(
+        db_session, version, "abcd" * 10, composite={"confidence": 0.93}
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    assert result["next_version_number"] == 2
+    # The PR opens release-v1 -> the per-project promotion_target, NOT 'main'.
+    assert create_mock.call_args.kwargs["head"] == "release-v1"
+    assert create_mock.call_args.kwargs["base"] == "release"
+    # The idempotency ancestry pre-check used the custom promotion target
+    # (is_ancestor_of(token, owner, repo, candidate_sha, promotion_target, ...)).
+    assert is_ancestor_mock.call_args.args[4] == "release"
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    # promoted_sha is the re-resolved 'release' HEAD (asserted in _branch_sha).
+    assert version.promoted_sha == merge_sha
+    # The release tag message references the custom integration -> promotion pair.
+    assert "trunk → release" in tag_mock.call_args.kwargs["message"]
 
 
 @pytest.mark.asyncio
@@ -12047,6 +12177,363 @@ async def test_reconcile_promotion_failed_uses_project_promotion_target(
         new=AsyncMock(return_value="gh-token"),
     )
     # Candidate is now on the promotion_target branch (operator merged it).
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+
+    branch_sha_calls: list[str] = []
+
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
+        branch_sha_calls.append(branch)
+        return release_head_sha
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value=None))
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == release_head_sha
+
+    # promoted_sha must be resolved from the per-project promotion_target.
+    assert "release" in branch_sha_calls, (
+        f"Expected get_branch_sha call for 'release' but got: {branch_sha_calls}"
+    )
+    assert "main" not in branch_sha_calls, (
+        "Got unexpected 'main' branch call — should use per-project promotion_target"
+    )
+
+
+# ===========================================================================
+# Non-self qualify -> promote -> reconcile tail — the promotion MERGE step and
+# the pending-auto-merge reconciliation path over a custom branch pair.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_finalize_promote_merges_over_custom_branch_pair(db_session, mocker):
+    """End-to-end qualify -> promote -> merge for a non-self project with a
+    custom integration/promotion branch pair.
+
+    The other custom-branch tests cover the candidate snapshot and the ancestry
+    check, but the actual promotion MERGE step (open + merge the
+    release-branch -> promotion-target PR) was only ever exercised with the
+    hardcoded automain/main fixture.  This drives a confident candidate through
+    ``_finalize_qualification`` -> ``promote`` and asserts the PR is opened from
+    the release branch into the project's configured ``promotion_target``
+    (resolved via the per-project branch resolver, NOT a hardcoded 'main'),
+    merged with ``merge_method='merge'``, and the version is promoted.
+    """
+    from app import shared_state
+    from app.branch_resolution import get_project_promotion_target
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="develop",
+        promotion_target="staging",
+        phase="stabilize",
+    )
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 10,
+                "test_count_delta": 4,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    merge_sha = "stgmerge" * 5  # 40-char post-merge promotion-target HEAD
+
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
+        return merge_sha
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    # is_ancestor_of=False on the idempotency pre-check: the candidate is NOT yet
+    # on the promotion target, so promote() proceeds to open + merge a real PR.
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    create_mock = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 42, "html_url": "http://pr/42"}),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    # The PR head is the release branch; its base is the per-project promotion
+    # target — resolved through the branch resolver, never a hardcoded 'main'.
+    assert create_mock.call_args.kwargs["head"] == "release-v1"
+    assert (
+        create_mock.call_args.kwargs["base"]
+        == get_project_promotion_target(project)
+        == "staging"
+    )
+    merge_mock.assert_awaited_once()
+    assert merge_mock.call_args.kwargs["merge_method"] == "merge"
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == merge_sha
+
+
+@pytest.mark.asyncio
+async def test_promote_inert_when_integration_equals_promotion_target(
+    db_session, mocker
+):
+    """Single-branch external repo (integration_branch == promotion_target).
+
+    This is the common default when onboarding an external repo.  promote() has
+    an explicit single-branch guard (mirroring the back-merge guard in
+    hotfix_backmerge.reconcile_main_into_automain): when the integration branch
+    IS the promotion target it records an inert, already-landed success and
+    returns BEFORE any GitHub I/O — without opening a release branch, opening a
+    PR, merging, or even running the idempotency ancestry check.  Documents that
+    the promote tail is genuinely inert for this configuration via that explicit
+    guard, not merely by accident of the ancestry short-circuit.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="main",
+        promotion_target="main",
+        phase="stabilize",
+    )
+    candidate = "snglbrnc" * 5  # already on the shared single branch
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # integration == promotion: the explicit single-branch guard fires first, so
+    # the ancestry check must never be reached.  Track is_ancestor_of calls to
+    # prove the guard short-circuits ahead of any GitHub I/O.
+    ancestor_calls: list[str] = []
+
+    async def _is_ancestor(token, owner, repo, sha, branch, **kwargs):
+        ancestor_calls.append(branch)
+        return True
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.create_tag", new=AsyncMock(return_value={"ref": "refs/tags/v1"})
+    )
+    branch_mock = mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    create_mock = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 1, "html_url": "http://pr/1"}),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.95},
+        base_record={"candidate_sha": candidate},
+    )
+    await db_session.commit()
+
+    # Inert promote tail: recorded as an already-landed success with NO branch,
+    # PR, or merge against the shared single branch.
+    assert result["status"] == "promoted"
+    branch_mock.assert_not_called()
+    create_mock.assert_not_called()
+    merge_mock.assert_not_called()
+    # The explicit single-branch guard returns before any GitHub I/O, so the
+    # idempotency ancestry check is never reached.
+    assert ancestor_calls == []
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification["status"] == "promoted"
+    assert version.last_qualification.get("already_landed") is True
+    # The guard marks the LTS model inactive for this single-branch repo.
+    assert version.last_qualification.get("lts_inactive") is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_pr_closed_without_merge(db_session, mocker):
+    """_reconcile_if_pending_auto_merge_landed drives a promotion_pending version
+    to promotion_failed when its auto-merge PR was closed WITHOUT merging.
+
+    This out-of-band reconciliation path (and its PR-closed-without-merge
+    sub-branch) had no test coverage.  With the candidate NOT on the promotion
+    target and the PR closed-unmerged, the version must move to
+    promotion_failed — clearing the promotion_pending sub-state so the normal
+    qualification retry machinery re-arms instead of stranding indefinitely.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="develop",
+        promotion_target="staging",
+        phase="build",
+    )
+    candidate_sha = "pendclos" * 5  # 40 chars
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "promotion_pending": {
+            "pr_number": 55,
+            "pr_url": "http://pr/55",
+            "enabled_at": "2026-05-19T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # Candidate is NOT on the promotion target — the PR did not land.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+
+    reconciled = await rq._reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "pr_closed_without_merge"
+    # The sub-state is cleared so the qualification backstop / retry re-arms.
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_pr_ci_red(db_session, mocker):
+    """_reconcile_if_pending_auto_merge_landed drives a promotion_pending version
+    to promotion_failed when its still-open auto-merge PR has conclusively
+    failed CI.
+
+    The CI-red sub-branch of the reconciliation path was untested.  An open PR
+    whose head commit reports a completed failing build means auto-merge will
+    never fire, so the version must be force-failed (clearing the
+    promotion_pending sub-state) rather than left waiting forever.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="develop",
+        promotion_target="staging",
+        phase="build",
+    )
+    candidate_sha = "pendcird" * 5  # 40 chars
+    pr_head_sha = "prheadci" * 5  # 40 chars
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "promotion_pending": {
+            "pr_number": 66,
+            "pr_url": "http://pr/66",
+            "enabled_at": "2026-05-19T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "head": {"sha": pr_head_sha}}),
+    )
+    # Override the autouse green default: the PR head's build conclusively failed.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "failure"}),
+    )
+
+    reconciled = await rq._reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "pr_ci_red"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pending_auto_merge_uses_project_promotion_target(
+    db_session, mocker
+):
+    """When a pending-auto-merge version is reconciled (candidate landed on the
+    promotion_target out-of-band), promoted_sha is resolved from the project's
+    promotion_target branch, not the global runtime_config default.
+
+    A project with promotion_target='release' should call get_branch_sha with
+    'release' to resolve the promoted merge commit SHA, not 'main'.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="build",
+    )
+
+    candidate_sha = "pendauto" * 5  # 40 chars
+    release_head_sha = "relhead2" * 5  # 40 chars
+
+    version.last_qualification = {
+        "status": "pending",
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/acme/custom/pull/42",
+            "enabled_at": "2025-01-01T00:00:00",
+        },
+        "candidate_sha": candidate_sha,
+        "confidence": 0.9,
+        "sub_scores": {},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # Candidate is now on the promotion_target branch (auto-merge landed).
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
 
     branch_sha_calls: list[str] = []

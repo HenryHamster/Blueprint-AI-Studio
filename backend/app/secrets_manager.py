@@ -1,3 +1,13 @@
+"""Google Secret Manager helpers for per-user sensitive tokens.
+
+Async wrappers around the blocking ``google.cloud.secretmanager`` client for
+storing, retrieving, and deleting user-scoped secrets (e.g. GitHub PATs).
+``store_user_secret`` creates the secret if needed and adds a new version,
+returning the GCP resource name that the rest of the app persists and later
+resolves via ``get_user_secret``. The GCP project is read from the
+``GCP_PROJECT_ID`` environment variable.
+"""
+
 import os
 import logging
 import asyncio

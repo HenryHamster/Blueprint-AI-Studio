@@ -1,3 +1,15 @@
+"""Agent VM lifecycle: provisioning, deletion, and local-mode subprocesses.
+
+The compute layer the orchestrator and reaper call to bring agent runners up
+and down. In GCP mode it provisions Compute Engine VMs — bounded by a
+concurrency slot gate, with cross-region/zone fallback (``FALLBACK_ZONES``)
+and classification of infrastructure-wide provision failures
+(``INFRA_PROVISION_PATTERNS``) so transient outages don't burn task retry
+budgets. When ``LOCAL_MODE`` is set, the same entry points
+(``provision_agent_vm`` / ``delete_agent_vm``) run the agent as a local
+subprocess instead. Per-VM boot secrets are built via ``compute_manifest``.
+"""
+
 import asyncio
 import base64 as _base64
 import json
