@@ -792,3 +792,147 @@ async def test_scan_skip_no_events_when_all_eligible(db_session):
         assert snap["scan_polls_saturated"] == 0
     finally:
         _clear_funnel_events(wbr)
+
+
+# ---------------------------------------------------------------------------
+# Bounded, activity-gated grace-window teardown (_deferred_backlog_teardown)
+# ---------------------------------------------------------------------------
+
+
+def _set_grace_config(monkeypatch, wbr, *, defer, window, idle, interval):
+    monkeypatch.setitem(wbr._runtime_config, "warm_backlog_teardown_defer_secs", defer)
+    monkeypatch.setitem(wbr._runtime_config, "warm_backlog_grace_window_secs", window)
+    monkeypatch.setitem(wbr._runtime_config, "warm_backlog_grace_idle_secs", idle)
+    monkeypatch.setitem(
+        wbr._runtime_config, "warm_backlog_grace_poll_interval_secs", interval
+    )
+
+
+@pytest.mark.asyncio
+async def test_grace_window_claim_skips_teardown(monkeypatch, mocker):
+    """A claim landing during the window returns without deleting the VM."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    _set_grace_config(monkeypatch, wbr, defer=20, window=60, idle=30, interval=5)
+    mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
+    delete_mock = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+    # Not claimed on the first check, claimed on the second.
+    mocker.patch(
+        "app.vm_lifecycle._vm_claimed_backlog_work",
+        new_callable=mocker.AsyncMock,
+        side_effect=[False, True],
+    )
+
+    await vml._deferred_backlog_teardown("agent-vm-grace-claim", "agent_completion")
+
+    delete_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_grace_window_idle_release_tears_down_early(monkeypatch, mocker):
+    """When the agent stops heartbeating before the ceiling, the activity gate
+    releases the hold early and the VM is torn down (idle release)."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+    try:
+        _set_grace_config(monkeypatch, wbr, defer=20, window=120, idle=30, interval=5)
+        mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        # Agent never claims and is not alive (stopped polling).
+        mocker.patch(
+            "app.vm_lifecycle._vm_claimed_backlog_work",
+            new_callable=mocker.AsyncMock,
+            return_value=False,
+        )
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=False)
+
+        await vml._deferred_backlog_teardown("agent-vm-grace-idle", "agent_completion")
+
+        delete_mock.assert_awaited_once()
+        assert len(wbr._grace_idle_release_events) == 1
+        assert len(wbr._grace_ceiling_release_events) == 0
+    finally:
+        wbr._grace_idle_release_events.clear()
+        wbr._grace_ceiling_release_events.clear()
+        wbr._grace_window_extension_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_grace_window_extends_until_bounded_ceiling(monkeypatch, mocker):
+    """A still-polling but never-claiming VM is extended each interval and torn
+    down at the bounded ceiling (not held indefinitely)."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+    try:
+        _set_grace_config(monkeypatch, wbr, defer=20, window=50, idle=30, interval=5)
+        mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        mocker.patch(
+            "app.vm_lifecycle._vm_claimed_backlog_work",
+            new_callable=mocker.AsyncMock,
+            return_value=False,
+        )
+        # Agent keeps polling the whole time.
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+
+        await vml._deferred_backlog_teardown("agent-vm-grace-ceil", "agent_completion")
+
+        delete_mock.assert_awaited_once()
+        assert len(wbr._grace_ceiling_release_events) == 1
+        assert len(wbr._grace_idle_release_events) == 0
+        # min_hold=20, ceiling=50, interval=5 -> extensions at 20,25,...,45 = 6.
+        assert len(wbr._grace_window_extension_events) == 6
+    finally:
+        wbr._grace_idle_release_events.clear()
+        wbr._grace_ceiling_release_events.clear()
+        wbr._grace_window_extension_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_grace_window_ceiling_floored_at_min_hold(monkeypatch, mocker):
+    """A grace ceiling configured below the minimum hold is floored at the
+    minimum hold, so the unconditional first-poll window is never undercut."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    # window (5) < defer (20): ceiling must floor to 20, so the loop runs the
+    # min-hold sleep and then immediately hits the ceiling.
+    _set_grace_config(monkeypatch, wbr, defer=20, window=5, idle=30, interval=5)
+    sleep_mock = mocker.patch(
+        "app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock
+    )
+    delete_mock = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.vm_lifecycle._vm_claimed_backlog_work",
+        new_callable=mocker.AsyncMock,
+        return_value=False,
+    )
+    alive_mock = mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+
+    await vml._deferred_backlog_teardown("agent-vm-grace-floor", "agent_completion")
+
+    # The unconditional min-hold sleep used 20 (the floored value), not 5.
+    assert sleep_mock.await_args_list[0].args[0] == 20
+    delete_mock.assert_awaited_once()
+    # Ceiling hit immediately after min-hold; no activity-gate iteration ran.
+    alive_mock.assert_not_called()

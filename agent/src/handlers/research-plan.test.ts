@@ -1469,6 +1469,36 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('"type"');
   });
 
+  // ── handlePlan affirmative no-op (#7021 principle one layer up) ───────────────
+  // The plan prompt must instruct the agent to emit an affirmative no_op_reason
+  // sentinel when there is genuinely nothing to decompose, NOT a silent empty
+  // plan. The backend (_handle_plan_completion) lands such a plan CANCELLED;
+  // an empty plan WITHOUT the reason still FAILS. These pins fail loudly if a
+  // future edit drops the no-op guidance and reopens the no-op→FAILED bug.
+
+  it('handlePlan prompt instructs emitting no_op_reason for verified nothing-to-decompose', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('no_op_reason');
+  });
+
+  it('handlePlan prompt states the >=30-char floor and "already done" semantics for the no-op', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // ≥30-char floor must be communicated so the affirmation can't be trivially auto-filled.
+    expect(p).toContain('30 char');
+    // Must frame the no-op as "already done", not a give-up path.
+    expect(p).toMatch(/ALREADY DONE|already done/);
+    expect(p).toContain('NOT a give-up');
+  });
+
+  it('handlePlan prompt warns against silent empty plans / filler subtasks', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('silent empty plan');
+    expect(p).toContain('filler subtasks');
+  });
+
   // ── handleResearch fingerprints ──────────────────────────────────────────────
 
   it('handleResearch prompt contains "Explore aggressively" (read-only exploration directive)', async () => {

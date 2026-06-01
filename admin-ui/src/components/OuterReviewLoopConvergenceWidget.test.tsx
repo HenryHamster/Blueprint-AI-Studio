@@ -3,9 +3,10 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act, type ComponentProps } from 'react';
 import { OuterReviewLoopConvergenceWidget } from './OuterReviewLoopConvergenceWidget';
 
-const { fetchOuterLoopConvergenceMock, fetchOuterLoopConvergenceTrendMock } = vi.hoisted(() => ({
+const { fetchOuterLoopConvergenceMock, fetchOuterLoopConvergenceTrendMock, fetchOuterLoopChainsMock } = vi.hoisted(() => ({
   fetchOuterLoopConvergenceMock: vi.fn(),
   fetchOuterLoopConvergenceTrendMock: vi.fn(),
+  fetchOuterLoopChainsMock: vi.fn(),
 }));
 
 vi.mock('recharts', () => ({
@@ -47,7 +48,18 @@ const TREND = {
 vi.mock('../api', () => ({
   fetchOuterLoopConvergence: (...args: unknown[]) => fetchOuterLoopConvergenceMock(...args),
   fetchOuterLoopConvergenceTrend: (...args: unknown[]) => fetchOuterLoopConvergenceTrendMock(...args),
+  fetchOuterLoopChains: (...args: unknown[]) => fetchOuterLoopChainsMock(...args),
 }));
+
+const CHAINS_RESPONSE = {
+  window_hours: 24,
+  reason_filter: 'rejected',
+  total: 2,
+  chains: [
+    { pr_number: 4201, task_ids: ['t-1', 't-2'], max_iteration: 5, churn_count: 3, terminal_reason: 'rejected', project_id: 'p-1' },
+    { pr_number: 4202, task_ids: ['t-3'], max_iteration: 2, churn_count: 0, terminal_reason: 'rejected', project_id: 'p-1' },
+  ],
+};
 
 const POPULATED = {
   window_hours: 24,
@@ -72,10 +84,13 @@ const POPULATED = {
   escalation_total: 3,
   escalation_by_reason: { stuck: 2, standoff: 1, 'repeat-fingerprint': 0 },
   convergence_rate: 0.625,
+  non_converged_total: 6,
+  dominant_blocker: { cause: 'churn', count: 4, total: 6, share: 0.667 },
 };
 
 fetchOuterLoopConvergenceMock.mockImplementation(async () => summaryPayload);
 fetchOuterLoopConvergenceTrendMock.mockImplementation(async () => TREND);
+fetchOuterLoopChainsMock.mockImplementation(async () => CHAINS_RESPONSE);
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -111,8 +126,10 @@ describe('OuterReviewLoopConvergenceWidget', () => {
   afterEach(() => {
     fetchOuterLoopConvergenceMock.mockReset();
     fetchOuterLoopConvergenceTrendMock.mockReset();
+    fetchOuterLoopChainsMock.mockReset();
     fetchOuterLoopConvergenceMock.mockImplementation(async () => summaryPayload);
     fetchOuterLoopConvergenceTrendMock.mockImplementation(async () => TREND);
+    fetchOuterLoopChainsMock.mockImplementation(async () => CHAINS_RESPONSE);
     if (root) {
       const r = root;
       act(() => r.unmount());
@@ -141,6 +158,81 @@ describe('OuterReviewLoopConvergenceWidget', () => {
     expect(text).toContain('2 · 22%');
     expect(text).toContain('3 · 33%');
     expect(text).toContain('2026-05-02 · 5 PRs · churn 1 · escalations 0');
+    // Dominant non-convergence blocker callout leads with the single named cause.
+    expect(text).toContain('dominant non-convergence blocker');
+    expect(text).toContain('issue-churn');
+    expect(text).toContain('4 of 6 non-converged PR chains');
+    expect(text).toContain('67%');
+  });
+
+  test('omits the dominant-blocker callout when absent or null', async () => {
+    summaryPayload = { ...POPULATED, dominant_blocker: null, non_converged_total: 6 };
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+
+    expect(text).not.toContain('dominant non-convergence blocker');
+    // The rest of the widget still renders.
+    expect(text).toContain('9 PR cycles');
+  });
+
+  test('surfaces a churn trend direction indicator', async () => {
+    summaryPayload = POPULATED;
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+    expect(text).toContain('churn trend');
+    // TREND churn goes 2 -> 1 across buckets, i.e. falling.
+    expect(text).toContain('falling');
+  });
+
+  test('clicking a terminal-outcome chip opens the drill-down panel and lists chains', async () => {
+    summaryPayload = POPULATED;
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+
+    const rejectedBtn = Array.from(host.querySelectorAll('button')).find(
+      (b) => (b.textContent ?? '').includes('rejected'),
+    );
+    expect(rejectedBtn).toBeTruthy();
+
+    await act(async () => {
+      rejectedBtn!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await flushWidget();
+
+    expect(fetchOuterLoopChainsMock).toHaveBeenCalled();
+    const callArgs = fetchOuterLoopChainsMock.mock.calls[0];
+    expect(callArgs[2]).toBe('rejected'); // reason arg
+    const text = host.textContent ?? '';
+    expect(text).toContain('PR #4201');
+    expect(text).toContain('2 tasks');
+    expect(text).toContain('churn 3');
+  });
+
+  test('clicking the same chip again closes the drill-down panel', async () => {
+    summaryPayload = POPULATED;
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+
+    const findRejected = () =>
+      Array.from(host!.querySelectorAll('button')).find((b) => (b.textContent ?? '').includes('rejected'));
+
+    await act(async () => {
+      findRejected()!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await flushWidget();
+    expect(host.textContent).toContain('PR #4201');
+
+    await act(async () => {
+      findRejected()!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await flushWidget();
+    expect(host.textContent).not.toContain('PR #4201');
   });
 
   test('renders nothing when there are no PRs with a review loop', async () => {

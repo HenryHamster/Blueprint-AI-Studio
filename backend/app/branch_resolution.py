@@ -9,7 +9,6 @@ a thin facade so existing importers are unaffected. Behaviour-preserving.
 import logging
 from typing import Any, Dict
 
-from sqlalchemy.orm import object_session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.runtime_config_state import runtime_config
@@ -71,6 +70,16 @@ TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
 _missing_project_branch_alerts: set[tuple[str, str]] = set()
 _blocking_project_branch_alerts: set[tuple[str, str]] = set()
 
+# Process-local queue of branch-misconfiguration alert intents recorded by the
+# SYNCHRONOUS resolvers (which run on async orchestrator/reaper hot loops and
+# must never issue DB I/O). Each item is a dict carrying ``project_id``,
+# ``title``, ``message`` and ``severity``. The orchestrator drains this queue
+# asynchronously via :func:`flush_pending_branch_alerts`, which performs the
+# durable, idempotent SELECT-then-INSERT so exactly one undismissed alert
+# exists per (project, missing column) — surviving restarts (the in-memory
+# dedup sets above forget across restarts; the DB-level dedup does not).
+_pending_durable_branch_alerts: list[dict] = []
+
 
 class InvalidProjectBranchConfiguration(RuntimeError):
     """Raised when a project's integration branch would route work to promotion."""
@@ -113,6 +122,7 @@ def _stage_project_branch_alert(
     title: str,
     message: str,
     log_level: int,
+    severity: str = "ERROR",
 ) -> None:
     project_id = getattr(project, "id", None)
     project_id_str = _project_id_str(project)
@@ -122,29 +132,108 @@ def _stage_project_branch_alert(
     dedupe_bucket.add(dedupe_key)
     logger.log(log_level, "[BRANCH_RESOLVER] %s", message)
 
-    try:
-        session = object_session(project)
-    except Exception:  # noqa: BLE001
-        session = None
-    if session is None or project_id is None:
+    # These resolvers are SYNCHRONOUS and called from async orchestrator/reaper
+    # hot loops, so we MUST NOT issue DB I/O here (a sync query from an async
+    # context risks MissingGreenlet, and per-resolve I/O would load the hot
+    # path). Instead record intent into a process-local queue that the
+    # orchestrator drains asynchronously via flush_pending_branch_alerts(),
+    # which performs the durable, idempotent persist. The in-memory dedupe
+    # bucket above keeps this to one enqueue per (project, column) per process.
+    # Skip when there is no real project id to key the durable dedup on (fake
+    # test doubles / detached objects lacking ``id``).
+    if project_id is None:
         return
+    _pending_durable_branch_alerts.append(
+        {
+            "project_id": project_id,
+            "title": title,
+            "message": message,
+            "severity": severity,
+        }
+    )
 
+
+async def flush_pending_branch_alerts(session) -> int:
+    """Drain the pending branch-misconfiguration queue into durable Alerts.
+
+    Called from the orchestrator's periodic monitoring seam in an async-safe
+    context (off the synchronous resolver hot path). For each queued intent it
+    performs a SELECT-then-INSERT keyed on an *undismissed*, task-less
+    ``(project_id, title)`` Alert — mirroring
+    :func:`app.alert_dispatch._create_strategic_alert` — so exactly one
+    undismissed alert exists per (project, missing column).
+
+    This makes the missing-branch signal durable and idempotent across
+    restarts: the in-memory dedupe sets forget on restart and the resolver
+    re-enqueues, but the SELECT prevents creating a second row when an
+    undismissed alert already exists. The signal clears naturally once the
+    column is populated (the resolver stops enqueuing) or the alert is
+    dismissed (a fresh row is then created on the next encounter).
+
+    Never raises — per-item failures are logged and the item is re-queued for a
+    later flush so a transient DB error does not silently drop the signal.
+    Returns the number of new alerts created.
+    """
+    global _pending_durable_branch_alerts
+    if not _pending_durable_branch_alerts:
+        return 0
+    pending = _pending_durable_branch_alerts
+    _pending_durable_branch_alerts = []
+
+    from sqlmodel import select
+
+    from app.broadcast import broadcast_to_project
     from app.models import Alert, AlertSeverity
 
-    try:
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.ERROR,
-                title=title,
-                message=message,
+    created = 0
+    failed: list[dict] = []
+    for item in pending:
+        project_id = item.get("project_id")
+        title = item.get("title")
+        if project_id is None or not title:
+            continue
+        try:
+            existing = await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title == title,
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                )
             )
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[BRANCH_RESOLVER] project %s branch alert could not be staged",
-            project_id_str,
-        )
+            if existing.scalars().first() is not None:
+                continue
+            try:
+                severity = AlertSeverity(item.get("severity") or "ERROR")
+            except ValueError:
+                severity = AlertSeverity.ERROR
+            alert = Alert(
+                project_id=project_id,
+                severity=severity,
+                title=title,
+                message=item.get("message") or title,
+            )
+            session.add(alert)
+            created += 1
+            await broadcast_to_project(
+                str(project_id),
+                "alert_created",
+                {
+                    "alert_id": str(alert.id),
+                    "severity": severity.value,
+                    "title": title,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            failed.append(item)
+            logger.warning(
+                "[BRANCH_RESOLVER] could not persist pending branch alert for "
+                "project %s (will retry next flush)",
+                project_id,
+            )
+    if failed:
+        _pending_durable_branch_alerts.extend(failed)
+    return created
 
 
 def _signal_missing_project_branch(

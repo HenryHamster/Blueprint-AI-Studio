@@ -1637,8 +1637,17 @@ async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
     integration branch, pr_merged must stay unset and the branch-safety alert
     must be staged.
     """
+    import app.branch_resolution as branch_resolution
+    from app.branch_resolution import flush_pending_branch_alerts
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
     from sqlmodel import select
+
+    # The synchronous resolver records the branch-misconfiguration alert intent
+    # off the hot path (no inline DB I/O); the durable persist runs in an
+    # async-safe context. Reset the process-local queue + dedupe set so this
+    # test sees only its own enqueue (mirrors test_shared_state isolation).
+    branch_resolution._blocking_project_branch_alerts.clear()
+    branch_resolution._pending_durable_branch_alerts.clear()
 
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
@@ -1685,6 +1694,11 @@ async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
     await db_session.refresh(orig_task)
     assert orig_task.status == TaskStatus.COMPLETED
     assert (orig_task.context or {}).get("pr_merged") is not True
+
+    # Drain the deferred branch-alert queue into durable Alerts the way the
+    # orchestrator monitoring loop does, then assert the operator signal landed.
+    await flush_pending_branch_alerts(db_session)
+    await db_session.commit()
 
     alert = (
         await db_session.execute(

@@ -3,9 +3,11 @@ import { ResponsiveContainer, AreaChart, Area, Tooltip } from 'recharts';
 import {
   fetchOuterLoopConvergence,
   fetchOuterLoopConvergenceTrend,
+  fetchOuterLoopChains,
   type OuterLoopConvergenceSummary,
   type OuterLoopConvergenceTrendBucket,
   type OuterLoopConvergenceTrendResponse,
+  type OuterLoopChain,
 } from '../api';
 import { usePoller } from '../hooks/usePoller';
 
@@ -61,6 +63,16 @@ const TERMINAL_OUTCOME_TONES: Record<string, string> = {
   repeat_fingerprint_halt: 'bg-orange-500/20 text-orange-300 border-orange-500/30',
   drift: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
 };
+// Human labels for the candidate non-convergence causes ranked by the backend
+// dominant-blocker attribution (keys mirror digest_metrics.blocker_cause_counts).
+const BLOCKER_CAUSE_LABELS: Record<string, string> = {
+  churn: 'issue-churn',
+  drift: 'file drift',
+  stuck: 'stuck cycles',
+  standoff: 'dispute standoff',
+  repeat_fingerprint_halt: 'repeat-fingerprint halt',
+  cap_exhausted: 'review-cap exhaustion',
+};
 const INCIDENCE_LABELS: Record<string, string> = {
   churn: 'churn',
   stuck: 'stuck',
@@ -74,6 +86,29 @@ const INCIDENCE_TONES: Record<string, string> = {
   standoff: 'bg-fuchsia-500/20 text-fuchsia-400 border-fuchsia-500/30',
   repeat_fingerprint: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
   overall_escalations: 'bg-red-500/20 text-red-400 border-red-500/30',
+};
+
+// Valid drill-down `reason` values accepted by GET /api/admin/outer-loop-chains
+// (mirrors _OUTER_LOOP_DRILLDOWN_REASONS in admin_pipeline_observability.py).
+// Terminal-outcome keys map 1:1; incidence/escalation keys map onto their
+// terminal-reason analog. Chips whose key has no mapping stay non-interactive.
+const DRILLDOWN_REASONS = new Set([
+  'rejected',
+  'cap_exhausted',
+  'stuck',
+  'standoff',
+  'repeat_fingerprint_halt',
+  'merged',
+]);
+const INCIDENCE_DRILLDOWN_REASON: Record<string, string | undefined> = {
+  stuck: 'stuck',
+  standoff: 'standoff',
+  repeat_fingerprint: 'repeat_fingerprint_halt',
+};
+const ESCALATION_DRILLDOWN_REASON: Record<string, string | undefined> = {
+  stuck: 'stuck',
+  standoff: 'standoff',
+  'repeat-fingerprint': 'repeat_fingerprint_halt',
 };
 
 function formatPercent(rate: number | null | undefined): string {
@@ -165,19 +200,42 @@ function MetricChip({
   value,
   tone,
   title,
+  onClick,
+  active,
 }: {
   label: string;
   value: string;
   tone?: string;
   title?: string;
+  onClick?: () => void;
+  active?: boolean;
 }) {
-  return (
-    <span
-      className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border ${tone ?? 'bg-neutral-800 text-neutral-300 border-neutral-700'}`}
-      title={title}
-    >
+  const toneCls = tone ?? 'bg-neutral-800 text-neutral-300 border-neutral-700';
+  const content = (
+    <>
       {label}
       <span className="font-bold">{value}</span>
+    </>
+  );
+  if (onClick) {
+    return (
+      <button
+        data-viewport-allow-small-target
+        type="button"
+        onClick={onClick}
+        className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border cursor-pointer hover:brightness-125 transition-all ${toneCls} ${active ? 'ring-1 ring-white/40' : ''}`}
+        title={title}
+      >
+        {content}
+      </button>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border ${toneCls}`}
+      title={title}
+    >
+      {content}
     </span>
   );
 }
@@ -257,6 +315,160 @@ function ConvergenceTrend({ buckets }: { buckets: OuterLoopConvergenceTrendBucke
   );
 }
 
+function getBucketChurn(bucket: OuterLoopConvergenceTrendBucket): number {
+  return getOptionalCount(bucket.incidence_counts?.churn) ?? bucket.churn_total;
+}
+
+type ChurnDirection = 'falling' | 'rising' | 'flat';
+
+// Compare the first vs. last bucket's churn to answer "is churn falling?". This
+// is presentation of already-aggregated per-day churn_total, not client-side
+// re-derivation of any metric.
+function getChurnDirection(buckets: OuterLoopConvergenceTrendBucket[]): ChurnDirection {
+  if (buckets.length < 2) return 'flat';
+  const first = getBucketChurn(buckets[0]);
+  const last = getBucketChurn(buckets[buckets.length - 1]);
+  if (last < first) return 'falling';
+  if (last > first) return 'rising';
+  return 'flat';
+}
+
+const CHURN_DIRECTION_META: Record<ChurnDirection, { glyph: string; label: string; tone: string }> = {
+  // Falling churn is the desirable direction, so it reads green.
+  falling: { glyph: '▼', label: 'falling', tone: 'text-emerald-400' },
+  rising: { glyph: '▲', label: 'rising', tone: 'text-red-400' },
+  flat: { glyph: '▬', label: 'flat', tone: 'text-neutral-400' },
+};
+
+function ChurnTrend({ buckets }: { buckets: OuterLoopConvergenceTrendBucket[] }) {
+  const data = buckets.map(b => ({ date: b.date, churn: getBucketChurn(b) }));
+  const hasData = data.some(d => d.churn > 0);
+  if (!hasData) return <span className="text-neutral-600 text-xs">no data</span>;
+  return (
+    <div className="h-12">
+      <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
+        <AreaChart data={data} margin={{ top: 1, right: 0, left: 0, bottom: 1 }}>
+          <defs>
+            <linearGradient id="outer-churn" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#fb923c" stopOpacity={0.3} />
+              <stop offset="100%" stopColor="#fb923c" stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <Tooltip
+            contentStyle={TOOLTIP_CONTENT_STYLE}
+            labelStyle={TOOLTIP_LABEL_STYLE}
+            itemStyle={TOOLTIP_ITEM_STYLE}
+            content={({ active, payload, label }) => {
+              if (!active || !payload?.length) return null;
+              const point = payload[0]?.payload as { churn: number } | undefined;
+              if (!point) return null;
+              return (
+                <div style={TOOLTIP_CONTENT_STYLE}>
+                  <div style={TOOLTIP_LABEL_STYLE}>{String(label)}</div>
+                  <div style={TOOLTIP_ITEM_STYLE}>churn: {point.churn}</div>
+                </div>
+              );
+            }}
+            isAnimationActive={false}
+          />
+          <Area type="monotone" dataKey="churn" stroke="#fb923c" fill="url(#outer-churn)" strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function ChainDrillDownPanel({
+  reason,
+  hours,
+  projectId,
+  onClose,
+}: {
+  reason: string;
+  hours: number;
+  projectId?: string;
+  onClose: () => void;
+}) {
+  const [chains, setChains] = useState<OuterLoopChain[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const panelMountedRef = useRef(true);
+
+  const fetchChains = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const body = await fetchOuterLoopChains(hours, projectId, reason, 50);
+      if (!panelMountedRef.current) return;
+      setChains(body.chains);
+      setTotal(body.total);
+      setLoading(false);
+    } catch (e) {
+      if (!panelMountedRef.current) return;
+      if (isAbortError(e)) return;
+      setError(e instanceof Error ? e.message : String(e));
+      setLoading(false);
+    }
+  }, [reason, hours, projectId]);
+
+  useEffect(() => {
+    panelMountedRef.current = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
+    fetchChains();
+    return () => { panelMountedRef.current = false; };
+  }, [fetchChains]);
+
+  const reasonCls = TERMINAL_OUTCOME_TONES[reason] ?? INCIDENCE_TONES[reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
+  const reasonLabel = TERMINAL_OUTCOME_LABELS[reason] ?? reason.replace(/_/g, ' ');
+
+  return (
+    <div className="mt-2 bg-neutral-900/80 rounded-lg border border-neutral-700 p-3">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-neutral-400">PR chains</span>
+          <span className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded border ${reasonCls}`}>
+            {reasonLabel}
+          </span>
+          {!loading && <span className="text-[10px] text-neutral-500">{total} chain{total !== 1 ? 's' : ''}</span>}
+        </div>
+        <button data-viewport-allow-small-target type="button" onClick={onClose} className="text-neutral-500 hover:text-neutral-300 text-xs leading-none px-1" aria-label="Close">✕</button>
+      </div>
+
+      {loading && <p className="text-[10px] text-neutral-500">Loading…</p>}
+      {error && <p className="text-[10px] text-red-400">{error}</p>}
+      {!loading && !error && chains.length === 0 && (
+        <p className="text-[10px] text-neutral-600">No PR chains found for this outcome.</p>
+      )}
+      {!loading && !error && chains.length > 0 && (
+        <div className="flex flex-col gap-1.5 max-h-64 overflow-y-auto pr-1">
+          {chains.map((c, i) => (
+            <div key={c.pr_number ?? `chain-${i}`} className="bg-neutral-800/60 rounded p-2 flex flex-col gap-0.5 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[11px] text-neutral-200 font-medium">
+                  {c.pr_number != null ? `PR #${c.pr_number}` : 'no PR'}
+                </span>
+                {c.terminal_reason && (
+                  <span className={`text-[10px] px-1 py-0.5 rounded border ${TERMINAL_OUTCOME_TONES[c.terminal_reason] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`}>
+                    {TERMINAL_OUTCOME_LABELS[c.terminal_reason] ?? c.terminal_reason.replace(/_/g, ' ')}
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] text-neutral-600">{c.max_iteration} iter</span>
+                <span className="text-[10px] text-neutral-600">churn {c.churn_count}</span>
+                <span className="text-[10px] text-neutral-500 truncate min-w-0" title={c.task_ids.join(', ')}>
+                  {c.task_ids.length} task{c.task_ids.length !== 1 ? 's' : ''}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function OuterReviewLoopConvergenceWidget({
   trendDays = 7,
   projectId,
@@ -266,7 +478,12 @@ export function OuterReviewLoopConvergenceWidget({
   const [trendData, setTrendData] = useState<OuterLoopConvergenceTrendResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [drillDown, setDrillDown] = useState<string | null>(null);
   const mountedRef = useRef(true);
+
+  const handleChipClick = useCallback((reason: string) => {
+    setDrillDown(prev => (prev === reason ? null : reason));
+  }, []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -309,6 +526,10 @@ export function OuterReviewLoopConvergenceWidget({
   const terminalOutcomes = getTerminalOutcomeEntries(data);
   const incidenceEntries = getIncidenceEntries(data);
   const latestBucket = trendData?.buckets.at(-1) ?? null;
+  const trendBuckets = trendData?.buckets ?? [];
+  const showTrend = trendBuckets.length >= 2;
+  const churnDirection = getChurnDirection(trendBuckets);
+  const churnDirMeta = CHURN_DIRECTION_META[churnDirection];
 
   return (
     <section>
@@ -324,6 +545,18 @@ export function OuterReviewLoopConvergenceWidget({
         <StatCard value={data.iteration_p95 != null ? String(data.iteration_p95) : '—'} label="p95 cycles" />
       </div>
 
+      {data.dominant_blocker && (
+        <div className="mt-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2">
+          <p className="text-[10px] uppercase tracking-wide text-amber-300/80">dominant non-convergence blocker</p>
+          <p className="mt-0.5 text-xs text-amber-100">
+            <span className="font-bold">
+              {BLOCKER_CAUSE_LABELS[data.dominant_blocker.cause] ?? data.dominant_blocker.cause.replace(/_/g, ' ')}
+            </span>
+            {` — ${data.dominant_blocker.count} of ${data.dominant_blocker.total} non-converged PR chains (${formatPercent(data.dominant_blocker.share)})`}
+          </p>
+        </div>
+      )}
+
       <div className="mt-2 flex flex-col gap-1">
         <span className="text-[10px] text-neutral-500">cycles-to-terminal distribution</span>
         <IterDistBar dist={data.iteration_distribution} />
@@ -332,14 +565,20 @@ export function OuterReviewLoopConvergenceWidget({
       <div className="mt-2 flex flex-col gap-1">
         <span className="text-[10px] text-neutral-500">terminal outcomes</span>
         <div className="flex flex-wrap gap-1">
-          {terminalOutcomes.map(({ key, count }) => (
-            <MetricChip
-              key={key}
-              label={TERMINAL_OUTCOME_LABELS[key] ?? key.replace(/_/g, ' ')}
-              value={String(count)}
-              tone={count > 0 ? TERMINAL_OUTCOME_TONES[key] : undefined}
-            />
-          ))}
+          {terminalOutcomes.map(({ key, count }) => {
+            const canDrill = DRILLDOWN_REASONS.has(key);
+            return (
+              <MetricChip
+                key={key}
+                label={TERMINAL_OUTCOME_LABELS[key] ?? key.replace(/_/g, ' ')}
+                value={String(count)}
+                tone={count > 0 ? TERMINAL_OUTCOME_TONES[key] : undefined}
+                title={canDrill ? `Show ${key.replace(/_/g, ' ')} PR chains` : undefined}
+                onClick={canDrill ? () => handleChipClick(key) : undefined}
+                active={drillDown === key}
+              />
+            );
+          })}
           <MetricChip
             label="drift"
             value={String(data.drift_pr_count)}
@@ -352,14 +591,20 @@ export function OuterReviewLoopConvergenceWidget({
       <div className="mt-2 flex flex-col gap-1">
         <span className="text-[10px] text-neutral-500">incidence</span>
         <div className="flex flex-wrap gap-1">
-          {incidenceEntries.map(({ key, count, rate }) => (
-            <MetricChip
-              key={key}
-              label={INCIDENCE_LABELS[key] ?? key.replace(/_/g, ' ')}
-              value={`${count} · ${formatPercent(rate)}`}
-              tone={count > 0 ? INCIDENCE_TONES[key] : undefined}
-            />
-          ))}
+          {incidenceEntries.map(({ key, count, rate }) => {
+            const reason = INCIDENCE_DRILLDOWN_REASON[key];
+            return (
+              <MetricChip
+                key={key}
+                label={INCIDENCE_LABELS[key] ?? key.replace(/_/g, ' ')}
+                value={`${count} · ${formatPercent(rate)}`}
+                tone={count > 0 ? INCIDENCE_TONES[key] : undefined}
+                title={reason ? `Show ${key.replace(/_/g, ' ')} PR chains` : undefined}
+                onClick={reason ? () => handleChipClick(reason) : undefined}
+                active={reason != null && drillDown === reason}
+              />
+            );
+          })}
           <MetricChip
             label="churn events"
             value={String(data.churn_total)}
@@ -370,29 +615,54 @@ export function OuterReviewLoopConvergenceWidget({
 
       {escReasons.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1">
-          {escReasons.map(([reason, count]) => (
-            <MetricChip
-              key={reason}
-              label={ESCALATION_LABELS[reason] ?? reason}
-              value={String(count)}
-              tone="bg-red-500/20 text-red-400 border-red-500/30"
-              title={`Escalation alerts tagged ${reason}`}
-            />
-          ))}
+          {escReasons.map(([reason, count]) => {
+            const drillReason = ESCALATION_DRILLDOWN_REASON[reason];
+            return (
+              <MetricChip
+                key={reason}
+                label={ESCALATION_LABELS[reason] ?? reason}
+                value={String(count)}
+                tone="bg-red-500/20 text-red-400 border-red-500/30"
+                title={drillReason ? `Show ${reason} PR chains` : `Escalation alerts tagged ${reason}`}
+                onClick={drillReason ? () => handleChipClick(drillReason) : undefined}
+                active={drillReason != null && drillDown === drillReason}
+              />
+            );
+          })}
         </div>
       )}
 
-      {trendData && trendData.buckets.length >= 2 && (
-        <div className="mt-3">
-          <div className="flex items-center gap-2 mb-1.5">
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day convergence trend</p>
-            <span className="flex items-center gap-1 text-[10px] text-neutral-600">
-              <span className="inline-block w-3 border-t border-emerald-400" /> converged %
-            </span>
+      {drillDown && (
+        <ChainDrillDownPanel
+          reason={drillDown}
+          hours={data.window_hours || windowHours}
+          projectId={projectId}
+          onClose={() => setDrillDown(null)}
+        />
+      )}
+
+      {showTrend && (
+        <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 mb-1.5">
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day convergence trend</p>
+              <span className="flex items-center gap-1 text-[10px] text-neutral-600">
+                <span className="inline-block w-3 border-t border-emerald-400" /> converged %
+              </span>
+            </div>
+            <ConvergenceTrend buckets={trendBuckets} />
           </div>
-          <ConvergenceTrend buckets={trendData.buckets} />
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wide">{trendDays}-day churn trend</p>
+              <span className={`inline-flex items-center gap-0.5 text-[10px] font-semibold ${churnDirMeta.tone}`} title={`Churn is ${churnDirMeta.label} across the window`}>
+                <span aria-hidden>{churnDirMeta.glyph}</span> {churnDirMeta.label}
+              </span>
+            </div>
+            <ChurnTrend buckets={trendBuckets} />
+          </div>
           {latestBucket && (
-            <p className="mt-1 text-[10px] text-neutral-600">{getTrendBucketSummary(latestBucket)}</p>
+            <p className="mt-1 text-[10px] text-neutral-600 sm:col-span-2">{getTrendBucketSummary(latestBucket)}</p>
           )}
         </div>
       )}

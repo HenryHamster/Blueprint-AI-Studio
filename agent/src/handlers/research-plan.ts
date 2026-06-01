@@ -910,6 +910,16 @@ Output EXACTLY one JSON block as the VERY LAST thing in your response:
   ]
 }
 
+Affirmative no-op (nothing to decompose):
+If — and ONLY if — your exploration shows there is genuinely nothing to build (the requested work is ALREADY DONE on this branch, or the task is not actionable as code subtasks), do NOT emit a silent empty plan and do NOT invent filler subtasks. Instead emit this affirmative no-op sentinel as the LAST JSON block:
+
+{
+  "subtasks": [],
+  "no_op_reason": "Specific, verified reason (at least 30 chars) naming exactly what is already present / why no code subtasks are needed — cite the concrete files, symbols, or sibling work you checked, e.g. 'app/config.py already loads repo layout from settings.REPO_LAYOUT and shared_state.py:get_repo_root() derives all paths from it; no hardcoded layout remains to de-hardcode'."
+}
+
+The no_op_reason MUST be at least 30 characters and name the concrete evidence you verified. This is the ONLY clean way for a plan to complete with zero subtasks — an empty "subtasks" array WITHOUT a specific no_op_reason is treated as a failed plan. This is NOT a give-up path: only use it when you have actually VERIFIED the work is already done or genuinely needs no code change. If you simply could not figure out how to decompose the task, that is a real plan failure — let the agent exit non-zero rather than emitting a bogus no_op_reason.
+
 Risk guidance:
 - risk=high: changes to auth flows, JWT/token handling, database models (models.py), Alembic migrations, core orchestration (main.py worker loops), VM provisioning (compute.py), any change that if wrong could cause data loss or security breach
 - risk=medium: new API endpoints, changes to existing API request/response shapes, new agent handler types, frontend state management, WebSocket protocol changes

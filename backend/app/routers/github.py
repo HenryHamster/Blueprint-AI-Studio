@@ -56,6 +56,19 @@ _WEBHOOK_DEDUP_MAX = 1000
 _WEBHOOK_DEDUP_TTL = 600  # 10 minutes
 
 
+async def _load_tasks_for_artifacts(
+    session: AsyncSession, artifacts: list[Artifact]
+) -> dict:
+    task_ids = {art.task_id for art in artifacts if art.task_id is not None}
+    if not task_ids:
+        return {}
+
+    task_rows = (
+        await session.execute(select(Task).where(Task.id.in_(task_ids)))
+    ).scalars().all()
+    return {task.id: task for task in task_rows}
+
+
 class GitHubPATInstallRequest(BaseModel):
     pat: str = Field(..., min_length=10)
 
@@ -395,9 +408,10 @@ async def github_webhook(
                         logger.info(
                             f"[WEBHOOK] PR {pr_url_suffix} merged but no matching artifacts found — agent may not have reported yet"
                         )
+                    task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
                     affected_tasks = []
                     for art in pr_artifacts:
-                        pr_task = await session.get(Task, art.task_id)
+                        pr_task = task_map.get(art.task_id)
                         if pr_task and not (pr_task.context or {}).get("pr_merged"):
                             pr_task.context = {
                                 **(pr_task.context or {}),
@@ -537,8 +551,9 @@ async def github_webhook(
                     if pr_artifacts:
                         pr_body = data.get("pull_request", {}).get("body") or ""
                         rejection_note = pr_body[:500] if pr_body else None
+                        task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
                         for art in pr_artifacts:
-                            pr_task = await session.get(Task, art.task_id)
+                            pr_task = task_map.get(art.task_id)
                             if pr_task and not (pr_task.context or {}).get(
                                 "pr_rejected"
                             ):
@@ -781,8 +796,9 @@ async def github_webhook(
         ).endswith("[bot]")
 
         signals_recorded = []
+        task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
         for art in pr_artifacts:
-            pr_task = await session.get(Task, art.task_id)
+            pr_task = task_map.get(art.task_id)
             if not pr_task:
                 continue
 

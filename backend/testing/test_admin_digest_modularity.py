@@ -442,6 +442,7 @@ _PIPELINE_OBS_ENDPOINTS = (
     "get_fix_loop_diverged_tasks",
     "get_outer_loop_convergence",
     "get_outer_loop_convergence_trend",
+    "get_outer_loop_chains",
     "get_pipeline_regressions",
     "get_warm_reuse_funnel",
     "get_pipeline_efficiency",

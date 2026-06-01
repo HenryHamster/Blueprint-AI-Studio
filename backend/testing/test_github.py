@@ -23,6 +23,53 @@ class MockResponse:
         return self._json_data
 
 
+@pytest.mark.asyncio
+async def test_load_tasks_for_artifacts_batches_by_task_id():
+    """Artifact task lookup is batched into one query and deduped by task_id."""
+    from app.routers.github import _load_tasks_for_artifacts
+
+    class _ArtifactStub:
+        def __init__(self, task_id):
+            self.task_id = task_id
+
+    class _TaskStub:
+        def __init__(self, task_id):
+            self.id = task_id
+
+    class _ScalarResultStub:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _ExecuteResultStub:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _ScalarResultStub(self._rows)
+
+    class _SessionStub:
+        def __init__(self, rows):
+            self.rows = rows
+            self.executions = 0
+
+        async def execute(self, _stmt):
+            self.executions += 1
+            return _ExecuteResultStub(self.rows)
+
+    session = _SessionStub([_TaskStub(1), _TaskStub(2)])
+    artifacts = [_ArtifactStub(1), _ArtifactStub(2), _ArtifactStub(1)]
+
+    task_map = await _load_tasks_for_artifacts(session, artifacts)
+
+    assert session.executions == 1
+    assert set(task_map) == {1, 2}
+    assert task_map[1].id == 1
+    assert task_map[2].id == 2
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_validate_fine_grained_pat_rejects_classic_token():

@@ -220,6 +220,13 @@ export interface OuterLoopIncidenceRates {
   [key: string]: number | null | undefined;
 }
 
+export interface OuterLoopDominantBlocker {
+  cause: string;
+  count: number;
+  total: number;
+  share: number;
+}
+
 export interface OuterLoopConvergenceSummary {
   window_hours: number;
   prs_with_review_loop: number;
@@ -236,6 +243,8 @@ export interface OuterLoopConvergenceSummary {
   escalation_total: number;
   escalation_by_reason: Record<string, number>;
   convergence_rate: number | null;
+  non_converged_total?: number;
+  dominant_blocker?: OuterLoopDominantBlocker | null;
 }
 
 export interface OuterLoopConvergenceTrendBucket {
@@ -275,6 +284,44 @@ export async function fetchOuterLoopConvergenceTrend(
   if (projectId) params.set('project_id', projectId);
   const res = await apiFetch(`/api/admin/outer-loop-convergence-trend?${params.toString()}`, undefined, 2, 30000, signal);
   if (!res.ok) throw new Error(`Failed to fetch outer-loop convergence trend: ${res.status}`);
+  return res.json();
+}
+
+/** A single outer review<->fix PR-chain behind a terminal outcome / blocker. */
+export interface OuterLoopChain {
+  pr_number: number | null;
+  task_ids: string[];
+  max_iteration: number;
+  churn_count: number;
+  terminal_reason: string | null;
+  project_id: string | null;
+}
+
+export interface OuterLoopChainsResponse {
+  window_hours: number;
+  reason_filter: string | null;
+  total: number;
+  chains: OuterLoopChain[];
+}
+
+/**
+ * List the specific PR-chains behind a terminal outcome / blocker reason.
+ * When `reason` is omitted the backend returns all non-merged chains (the
+ * actionable set). Mirrors the retry/timeout/abort semantics of the other
+ * outer-loop fetchers.
+ */
+export async function fetchOuterLoopChains(
+  hours = 24,
+  projectId?: string,
+  reason?: string,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<OuterLoopChainsResponse> {
+  const params = new URLSearchParams({ hours: String(hours), limit: String(limit) });
+  if (projectId) params.set('project_id', projectId);
+  if (reason) params.set('reason', reason);
+  const res = await apiFetch(`/api/admin/outer-loop-chains?${params.toString()}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch outer-loop chains: ${res.status}`);
   return res.json();
 }
 

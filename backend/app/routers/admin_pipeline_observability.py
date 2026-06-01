@@ -754,6 +754,137 @@ async def get_outer_loop_convergence_trend(
     return {"days": days, "buckets": buckets}
 
 
+# Terminal-outcome / escalation reasons the chain drill-down can filter on. Kept
+# in lockstep with the per-chain outcomes resolved by digest_metrics
+# (_resolve_chain_outcome): the five non-merge blockers plus ``merged`` itself.
+_OUTER_LOOP_DRILLDOWN_REASONS = (
+    "rejected",
+    "cap_exhausted",
+    "stuck",
+    "standoff",
+    "repeat_fingerprint_halt",
+    "merged",
+)
+
+
+@router.get("/outer-loop-chains")
+async def get_outer_loop_chains(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    reason: str | None = Query(
+        None,
+        description=(
+            "Filter chains by terminal outcome / escalation reason: rejected, "
+            "cap_exhausted, stuck, standoff, repeat_fingerprint_halt, or merged. "
+            "When omitted, all non-merged chains are returned."
+        ),
+    ),
+    limit: int = Query(50, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """List the specific OUTER review<->fix PR-chains behind a terminal outcome.
+
+    Outer-loop analog of ``/fix-loop-diverged-tasks``: where
+    ``/outer-loop-convergence`` reports the dominant non-merge blocker as a
+    single count, this lists the actual PR-chains so an operator can open and
+    investigate them. Read-only; reuses the SAME ``require_admin`` dependency,
+    row caps, original-task hydration, and chain grouping as the other
+    outer-loop endpoints. When ``reason`` is omitted, all non-merged chains are
+    returned (the actionable set); otherwise only chains matching that outcome.
+    """
+    from app.digest_metrics import _resolve_outer_loop_chains  # noqa: PLC0415
+
+    if reason is not None and reason not in _OUTER_LOOP_DRILLDOWN_REASONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid reason '{reason}'. Must be one of: "
+                f"{', '.join(_OUTER_LOOP_DRILLDOWN_REASONS)}."
+            ),
+        )
+
+    cutoff = _utcnow() - timedelta(hours=hours)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+        .order_by(Task.created_at.desc())
+        .limit(_OUTER_LOOP_TASK_CAP)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    tasks = list((await session.execute(stmt)).scalars().all())
+    if len(tasks) >= _OUTER_LOOP_TASK_CAP:
+        logger.warning(
+            "[OUTER-LOOP] chain drill-down task query hit the %d-row cap "
+            "(hours=%d, project=%s); some PR-chains may be omitted",
+            _OUTER_LOOP_TASK_CAP,
+            hours,
+            project_id,
+        )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+
+    chains = _resolve_outer_loop_chains(
+        all_tasks=[
+            *tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in tasks}
+            ],
+        ],
+        escalation_alerts=alerts,
+        window_start=cutoff,
+    )
+
+    if reason is not None:
+        selected = [c for c in chains if c["outcome"] == reason]
+    else:
+        selected = [
+            c
+            for c in chains
+            if c["outcome"] is not None and c["outcome"] != "merged"
+        ]
+
+    rows = [
+        {
+            "pr_number": c["pr_number"],
+            "task_ids": c["task_ids"],
+            "max_iteration": c["max_iteration"],
+            "churn_count": c["churn_count"],
+            "terminal_reason": c["outcome"],
+            "project_id": c["project_id"],
+        }
+        for c in selected[:limit]
+    ]
+
+    return {
+        "window_hours": hours,
+        "reason_filter": reason,
+        "total": len(rows),
+        "chains": rows,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Fix-loop diverged-task drill-down endpoint
 # ---------------------------------------------------------------------------

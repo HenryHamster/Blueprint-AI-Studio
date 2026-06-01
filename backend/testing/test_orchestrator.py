@@ -2746,9 +2746,19 @@ class TestWarmVMSkipProvision:
         """The direct CI poll merge path must not stamp pr_merged when GitHub
         reports a merged PR whose base branch is the project's promotion target
         rather than its integration branch."""
+        import app.branch_resolution as branch_resolution
+        from app.branch_resolution import flush_pending_branch_alerts
         from app.models import Alert
         from app.orchestrator import _apply_ci_merged_landed_signal
         from sqlmodel import select as _select
+
+        # The synchronous resolver records the branch-misconfiguration alert
+        # intent off the hot path (no inline DB I/O); the durable persist runs
+        # later in an async-safe context (the orchestrator monitoring loop).
+        # Reset the process-local queue + dedupe set so this test sees only its
+        # own enqueue (mirrors test_shared_state isolation).
+        branch_resolution._blocking_project_branch_alerts.clear()
+        branch_resolution._pending_durable_branch_alerts.clear()
 
         project = make_project(
             name="CI promotion target",
@@ -2790,6 +2800,12 @@ class TestWarmVMSkipProvision:
         await db_session.refresh(task)
         assert task.status == TaskStatus.COMPLETED
         assert (task.context or {}).get("pr_merged") is not True
+
+        # Drain the deferred branch-alert queue into durable Alerts the way the
+        # orchestrator monitoring loop does, then assert the operator signal landed.
+        await flush_pending_branch_alerts(db_session)
+        await db_session.commit()
+
         alert = (
             await db_session.execute(
                 _select(Alert).where(

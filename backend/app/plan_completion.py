@@ -149,6 +149,48 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     project = await session.get(Project, task.project_id)
     plan_data = _parse_plan_output(logs)
     if not plan_data or not plan_data.get("subtasks"):
+        # Affirmative plan no-op (mirrors the #7021 `./done --already-done`
+        # principle one layer up): a plan agent that VERIFIED there is genuinely
+        # nothing to decompose (work already shipped / not actionable) emits the
+        # sentinel ``{"subtasks": [], "no_op_reason": "<reason>"}``. This is a
+        # clean terminal, NOT a failure — so skip the CODE_ERROR classification,
+        # the failure alert, and the direction decomp-quality ding.
+        #
+        # GUARDRAIL (load-bearing): the affirmation MUST be a >=30-char
+        # ``no_op_reason`` carried in a parsed plan object. A crashed / timed-out
+        # / malformed agent produces no plan_data (parser returns None) or no
+        # such reason, so it still falls through to the FAILED branch below.
+        # The >=30-char floor prevents a trivially auto-filled empty affirmation.
+        _no_op_reason = None
+        if isinstance(plan_data, dict):
+            _raw_reason = plan_data.get("no_op_reason")
+            if isinstance(_raw_reason, str) and len(_raw_reason.strip()) >= 30:
+                _no_op_reason = _raw_reason.strip()[:2000]
+        if _no_op_reason is not None:
+            from app.failure_classification import SCOPE_EMPTY, persist_failure_category
+
+            # Land CANCELLED (matching the SCOPE_EMPTY clean-no-op path in
+            # agent_status.py): a deterministic "nothing to build" result that
+            # must not be retried, alerted on, or counted as a decomposition
+            # failure. CANCELLED plans are excluded from the direction
+            # decomposition-quality rollup by construction (it filters on
+            # COMPLETED/FAILED), so this also satisfies the no-decomp-ding goal.
+            ctx = dict(task.context or {})
+            ctx["no_op_reason"] = _no_op_reason
+            task.context = ctx
+            task.latest_status_message = (
+                f"Plan no-op — nothing to decompose: {_no_op_reason}"
+            )[:500]
+            task.status = TaskStatus.CANCELLED
+            persist_failure_category(task, SCOPE_EMPTY)
+            session.add(task)
+            await session.commit()
+            logger.info(
+                f"[PLAN] Affirmative no-op for plan {task.id} — CANCELLED "
+                f"(reason: {_no_op_reason[:120]})"
+            )
+            return
+
         task.latest_status_message = "Plan agent produced no valid subtasks"
         task.status = TaskStatus.FAILED
         from app.failure_classification import (

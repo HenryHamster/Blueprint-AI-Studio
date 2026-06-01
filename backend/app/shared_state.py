@@ -75,6 +75,7 @@ from app.branch_resolution import (  # noqa: F401
     backfill_task_branch_namespace,
     derive_task_branch,
     ensure_project_pr_title_prefix,
+    flush_pending_branch_alerts,
     get_project_broadcast_limit,
     get_project_integration_branch,
     get_project_promotion_target,

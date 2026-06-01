@@ -9,8 +9,9 @@ Guide to `backend/app/` modules and their responsibilities.
 ### `main.py`
 
 FastAPI application entry point. Defines:
-- Registers the router families under `backend/app/routers/` plus the dedicated
-  admin, agent-status, warm-continuity, and credential-rotation routers
+- Registers the router families under `backend/app/routers/`, including the
+  public project/task routes, admin dashboard routes, agent lifecycle routes,
+  GitHub proxy routes, warm-continuity routes, and deploy-state routes
 - WebSocket handlers for real-time log streaming
 - Request/response validation via Pydantic schemas
 - CORS, rate limiting, error handling middleware
@@ -251,6 +252,78 @@ Task type → handler mapping and validation.
 - Ops/system: `deps`, `self_audit`, `release_audit`, `memo`
 
 Each type has a handler in `agent/src/handlers/`.
+
+---
+
+## HTTP Routers
+
+### `backend/app/routers/projects.py`
+
+Public project/task launch endpoints under `/api/*`.
+
+**Routes:**
+- `POST /api/deploy`
+- `GET /api/projects`
+- `GET /api/projects/{project_id}`
+- `GET /api/projects/{project_id}/tasks`
+- `POST /api/projects/{project_id}/ws-ticket`
+- `POST /api/projects/{project_id}/cancel`
+- `GET /api/projects/{project_id}/status`
+
+### `backend/app/routers/agent.py`
+
+Primary agent lifecycle surface under `/api/agent/*`.
+
+**Routes:**
+- `POST /api/agent/claim`
+- `POST /api/agent/status`
+- `POST /api/agent/heartbeat`
+- `POST /api/agent/spawn`
+- `POST /api/agent/refresh-token`
+- `POST /api/agent/artifacts/upload-url`
+- `POST /api/agent/viewport/failure-screenshot-upload-url`
+- `GET /api/agent/github/token`
+- `GET /api/agent/github/check-runs`
+- `POST /api/agent/github/commit-status`
+- `POST /api/agent/github/pr-comment`
+- `POST /api/agent/github/pr-review-comment`
+- `POST /api/agent/github/pr-review`
+- `POST /api/agent/github/issues`
+- `GET /api/agent/github/issues`
+- `POST /api/agent/github/branches`
+- `POST /api/agent/github/pull-requests`
+- `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
+
+### `backend/app/routers/agent_warm_continuity.py`
+
+Warm-VM continuity and backlog-reuse endpoints under `/api/agent/*`.
+
+**Routes:**
+- `POST /api/agent/vm-heartbeat`
+- `POST /api/agent/next-role`
+
+### `backend/app/routers/github.py`
+
+GitHub OAuth, PAT, and webhook integration under `/api/github/*`.
+
+**Routes:**
+- `POST /api/github/pat`
+- `GET /api/github/oauth/authorize`
+- `GET /api/github/oauth/callback`
+- `POST /api/github/webhook`
+
+### `backend/app/routers/deploy.py`
+
+Deployment-state and zone-health operational routes.
+
+**Routes:**
+- `GET /deploy-state`
+- `POST /deploy-state/pause`
+- `POST /deploy-state/resume`
+- `POST /deploy-state/reset-health`
+- `POST /deploy-state/mark-stable`
+- `POST /deploy-state/rollback`
+- `GET /zone-health`
 
 ---
 
