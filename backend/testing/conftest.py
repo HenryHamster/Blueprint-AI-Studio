@@ -90,48 +90,49 @@ _app_database._LazyEngine._engine = engine
 async def db_session():
     """
     Provides a database session for each test.
-    - PostgreSQL (CI): nested savepoint pattern — test commits go to savepoint,
-      outer transaction rolled back after test for full isolation.
+    - PostgreSQL (CI): tests commit normally; isolation is achieved by
+      ``DELETE``-ing every app table after each test in a FK-order-INDEPENDENT
+      way — the order is computed from SQLModel metadata (children before
+      parents), so there is no hand-maintained list to drift out of sync.
     - SQLite (local): creates/drops all tables per test.
     """
     if USE_POSTGRES:
         # Use a fresh session per test. Tests commit normally.
-        # Isolation is achieved by truncating all tables after each test.
+        # Isolation is achieved by deleting all table rows after each test.
         async with TestingSessionLocal() as session:
             yield session
 
-        # Clean up: delete test data in dependency order (avoids FK violations and ORM event triggers)
-        async with engine.begin() as conn:
-            for table in (
-                # Tables with FK to task must come before task
-                "strategiccycle",
-                "projectmessage",
-                # Tables with FK to task only
-                "artifact",
-                "taskhistory",
-                # Other dependents before task/project
-                "alert",
-                "orchestratorerrorack",
-                # task has FK to project
-                "task",
-                # Remaining dependents of project
-                "projectmember",
-                "residualremediationcase",
-                "systemmaturity",
-                "messageslastseen",
-                "messagesnoiseprefs",
-                "messagessavedviews",
-                # Drift time-series (project_id not a FK constraint, safe to delete standalone)
-                "directiondriftsnapshot",
-                # Base tables
-                "project",
-                "maxplanaccount",
-                "userintegration",
-                "alloweduser",
-            ):
-                await conn.execute(sqlalchemy.text(f"DELETE FROM {table}"))
-            # Reset deploymentstate to empty (singleton, don't delete)
-            await conn.execute(sqlalchemy.text("DELETE FROM deploymentstate"))
+        # Clean up: wipe every app table, FK-order-INDEPENDENTLY. The table
+        # order is derived from SQLModel's metadata (the same source the schema
+        # is built from), so adding a new model table is picked up
+        # automatically — there is no hand-maintained dependency-ordered DELETE
+        # loop to silently drift out of sync with the schema (design-audit P6).
+        #
+        # We DELETE rather than TRUNCATE deliberately. TRUNCATE (even
+        # TRUNCATE ... CASCADE) takes an ``AccessExclusiveLock`` on every named
+        # table *and* every cascade-reachable FK child, which conflicts with
+        # ANY other lock — including the plain reads/writes still held by
+        # endpoint request-sessions and background tasks that a test's
+        # ``/api/...`` call left in flight (those run on separate connections
+        # of the same NullPool engine / the production lazy engine). Two such
+        # connections grabbing the cascade locks in different orders deadlock,
+        # which is exactly the ``DeadlockDetectedError`` the CASCADE variant hit
+        # on CI shards 1 & 2. ``DELETE`` only takes a ``RowExclusiveLock``,
+        # which coexists with concurrent reads and never escalates to a
+        # whole-table exclusive lock, so it is deadlock-free in this harness.
+        #
+        # ``sorted_tables`` is ordered parents-before-children (FK-dependency
+        # order); reversing it gives children-before-parents, so each DELETE
+        # runs after its dependents are already empty and no FK constraint is
+        # violated. ``alembic_version`` is NOT a SQLModel table, so it is
+        # intentionally left untouched (the migration head must persist).
+        ordered_tables = list(reversed(SQLModel.metadata.sorted_tables))
+        if ordered_tables:
+            async with engine.begin() as conn:
+                for table in ordered_tables:
+                    await conn.execute(
+                        sqlalchemy.text(f'DELETE FROM "{table.name}"')
+                    )
     else:
         async with engine.begin() as conn:
             await conn.run_sync(SQLModel.metadata.create_all)
