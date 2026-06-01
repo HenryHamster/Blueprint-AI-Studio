@@ -321,15 +321,27 @@ function getBucketChurn(bucket: OuterLoopConvergenceTrendBucket): number {
 
 type ChurnDirection = 'falling' | 'rising' | 'flat';
 
-// Compare the first vs. last bucket's churn to answer "is churn falling?". This
-// is presentation of already-aggregated per-day churn_total, not client-side
+// Compare churn across the entire window by averaging the first and second halves.
+// This is robust to single-day anomalies at the endpoints and reflects the overall trend.
+// This is presentation of already-aggregated per-day churn_total, not client-side
 // re-derivation of any metric.
 function getChurnDirection(buckets: OuterLoopConvergenceTrendBucket[]): ChurnDirection {
   if (buckets.length < 2) return 'flat';
-  const first = getBucketChurn(buckets[0]);
-  const last = getBucketChurn(buckets[buckets.length - 1]);
-  if (last < first) return 'falling';
-  if (last > first) return 'rising';
+
+  // Split into two halves and compare average churn per half
+  const midpoint = Math.ceil(buckets.length / 2);
+  const firstHalf = buckets.slice(0, midpoint);
+  const secondHalf = buckets.slice(midpoint);
+
+  const avgFirstHalf = firstHalf.reduce((sum, b) => sum + getBucketChurn(b), 0) / firstHalf.length;
+  const avgSecondHalf = secondHalf.reduce((sum, b) => sum + getBucketChurn(b), 0) / secondHalf.length;
+
+  // Small threshold (1%) to avoid flip-flopping on near-equal halves
+  const threshold = 0.01 * Math.max(avgFirstHalf, avgSecondHalf, 1);
+  const difference = avgSecondHalf - avgFirstHalf;
+
+  if (difference < -threshold) return 'falling';
+  if (difference > threshold) return 'rising';
   return 'flat';
 }
 
