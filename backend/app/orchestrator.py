@@ -51,6 +51,9 @@ from app.orchestrator_filters import (
     filter_scope_empty,
     cap_pipeline_slots,
     reserve_slots_for_types,
+    apply_project_fairness,
+    _project_fairness_weight,
+    collect_dep_uuids,
 )
 from app.stall_alert_diagnostics import (
     _STALL_TITLE_PREFIX,
@@ -1269,6 +1272,51 @@ async def orchestrator_worker():
                     return available
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
+                #
+                # Batch-fetch ALL dependency rows across EVERY candidate in ONE
+                # IN(...) query (mirrors the EVALUATING sweep at services.py:1006
+                # and the deadlock scan below). The previous implementation issued
+                # one ``select(Task).where(Task.id.in_(dep_uuids))`` per candidate
+                # with deps — 50 tasks x 2-5 deps = 50-250 SELECTs every cycle.
+                # Now it's one.
+                #
+                # The dep rows are read in a SEPARATE read-only session and then
+                # DETACHED (expunge_all) before the loop runs. The per-task
+                # retry_after / infra_wait blocks below commit on the MAIN
+                # ``session``, and a commit expires every instance loaded in that
+                # session; loading the dep rows in their own session and detaching
+                # them keeps their already-loaded column values (status / context /
+                # payloads, read via first_payload) intact for the downstream
+                # ``_check_candidate_task_deps`` reads — a full ``select(Task)``
+                # (no load_only) loads every column, so reading them on a detached
+                # instance returns the cached value rather than firing a sync
+                # lazy-load → MissingGreenlet (the rollback-expiry / detached-read
+                # trap in reference_load_only_lazy_load_trap.md). The
+                # replacement-clone lookup inside _check_candidate_task_deps still
+                # uses the main ``session`` (unchanged) — it's rare, not part of
+                # the N+1, and returns a fresh attached row.
+                # Per-candidate validation (with error logging) is still re-run
+                # in the loop below; collect_dep_uuids silently skips malformed
+                # ids here so one bad row can't poison the shared batch.
+                _all_dep_uuids = collect_dep_uuids(candidate_tasks)
+
+                _dep_by_id: dict[uuid.UUID, Task] = {}
+                if _all_dep_uuids:
+                    async with AsyncSessionLocal() as _dep_batch_session:
+                        _dep_rows = (
+                            (
+                                await _dep_batch_session.execute(
+                                    select(Task).where(Task.id.in_(_all_dep_uuids))
+                                )
+                            )
+                            .scalars()
+                            .all()
+                        )
+                        _dep_by_id = {dt.id: dt for dt in _dep_rows}
+                        # Detach so the rows survive the main session's per-task
+                        # commits below with their loaded columns intact.
+                        _dep_batch_session.expunge_all()
+
                 eligible_ids = []
                 for task in candidate_tasks:
                     # Skip tasks held back due to retry_after hold (audit W1:
@@ -1333,10 +1381,11 @@ async def orchestrator_worker():
                             exc_info=True,
                         )
                         continue  # Don't dispatch — deps can't be validated
-                    dep_result = await session.execute(
-                        select(Task).where(Task.id.in_(dep_uuids))
-                    )
-                    dep_tasks = dep_result.scalars().all()
+                    # Look the dep rows up from the single batch fetched above
+                    # (was one SELECT per candidate — the N+1 this fix removes).
+                    dep_tasks = [
+                        _dep_by_id[du] for du in dep_uuids if du in _dep_by_id
+                    ]
 
                     # Detect deleted dependencies — treat as failed to prevent premature dispatch
                     if len(dep_tasks) < len(dep_uuids):
@@ -1729,6 +1778,31 @@ async def orchestrator_worker():
                 # configured pipeline budget is exhausted.
                 eligible_ids = await cap_pipeline_slots(
                     eligible_ids, candidate_tasks, _runtime_config, session
+                )
+
+                # Step 2.95: Per-project fairness — round-robin the eligible
+                # tasks across their owning projects BEFORE the slot cap below.
+                # The candidate scan orders globally by (priority desc,
+                # created_at asc); without fairness a single autonomous project
+                # that fanned out dozens of tasks fills the entire dispatch
+                # window (eligible_ids[:slots_available]) and starves every
+                # other project for multiple cycles. Weighted round-robin keeps
+                # each project's internal order intact (per-project priority/age
+                # is untouched) and is a pure permutation — every eligible task
+                # stays dispatchable, so this is behavior-preserving for valid
+                # dispatch and only changes *whose* task wins a contended slot.
+                # Weight is derived from each project's highest queued priority
+                # (no dedicated tier column exists) so urgent projects still get
+                # proportionally more turns without monopolizing the window.
+                _project_by_id = {
+                    t.id: t.project_id for t in candidate_tasks
+                }
+                _fairness_weight = {
+                    t.id: _project_fairness_weight(t.priority)
+                    for t in candidate_tasks
+                }
+                eligible_ids = apply_project_fairness(
+                    eligible_ids, _project_by_id, _fairness_weight
                 )
 
                 # Slot reservation: ensure high-priority task types (e.g. create,

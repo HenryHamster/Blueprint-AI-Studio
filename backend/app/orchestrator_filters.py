@@ -76,6 +76,43 @@ def rollup_overlap_defers(
     return should_defer, stale_overlap
 
 
+def _coerce_uuid(raw) -> "uuid.UUID | None":
+    """Parse *raw* into a UUID, returning None on any malformed value.
+
+    Kept as a standalone helper (rather than an inline ``try`` in the
+    ``collect_dep_uuids`` loop) so the exception handling lives outside the
+    hot loop body — both readable and PERF-clean.
+    """
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError):
+        # ValueError: malformed hex string. AttributeError: non-str without a
+        # .replace (e.g. an int). TypeError: None or a bytes-like value passed
+        # positionally (uuid.UUID(None) / uuid.UUID(b"...")). Any of these is a
+        # bad dep id that must be SKIPPED, not allowed to crash the shared
+        # batched dep-fetch (collect_dep_uuids) for every other candidate.
+        return None
+
+
+def collect_dep_uuids(candidate_tasks: list[Task]) -> set:
+    """Collect every valid ``depends_on`` UUID across all candidates.
+
+    Helper for the dispatch loop's single batched dependency fetch (the N+1
+    fix): one ``IN (...)`` query over this set replaces the old per-candidate
+    ``select(Task).where(Task.id.in_(dep_uuids))``. Malformed dep ids are
+    silently skipped here — per-candidate validation (with error logging) is
+    still re-run inside the dispatch loop, so one bad row can't poison the
+    shared batch nor swallow the diagnostic.
+    """
+    out: set = set()
+    for cand in candidate_tasks:
+        for d in cand.depends_on or []:
+            du = _coerce_uuid(d)
+            if du is not None:
+                out.add(du)
+    return out
+
+
 def apply_pipeline_cap(
     eligible_ids: list,
     types_for_cap: dict,
@@ -944,3 +981,103 @@ def reserve_slots_for_types(
             f"task(s) (reserved={rn}, displaced {displaced} non-reserved)"
         )
     return initial + waiting
+
+
+def _project_fairness_weight(priority) -> int:
+    """Map a task priority to a round-robin weight (turns per round).
+
+    Higher-priority work earns proportionally more turns per round so a
+    project whose queued tasks are urgent is serviced faster than one whose
+    tasks are routine — the "weighted by tier" knob. With no dedicated tier
+    column, ``Task.priority`` is the available signal (already loaded on the
+    candidate batch). The mapping is intentionally coarse and bounded so a
+    single high-priority project still cannot starve the others: weight grows
+    by ~1 turn per priority point, clamped to ``[1, 4]``. NULL/unknown
+    priority normalizes to the baseline weight of 1.
+    """
+    try:
+        p = int(priority)
+    except (TypeError, ValueError):
+        p = 0
+    return max(1, min(4, 1 + p))
+
+
+def apply_project_fairness(
+    eligible_ids: list,
+    project_by_id: dict,
+    weight_by_id: dict | None = None,
+) -> list:
+    """Round-robin ``eligible_ids`` across projects so no one project starves.
+
+    Pure single source of truth for the per-project fairness pass (Step 2.95,
+    applied BEFORE the slot cap at ``eligible_ids[:slots_available]``). Without
+    it, the candidate scan's global ``priority desc, created_at asc`` ordering
+    lets a single autonomous project that fanned out dozens of tasks occupy the
+    entire dispatch window, starving every other project for multiple cycles
+    (violates the multi-project fairness promise).
+
+    The reorder interleaves projects in a weighted round-robin while preserving
+    each project's *internal* order (so the per-project priority/age ordering
+    from the candidate scan is untouched). Behavior-preserving for valid
+    dispatch: this is a permutation of ``eligible_ids`` — no id is dropped or
+    added, every eligible task remains dispatchable, and the downstream slot
+    cap still truncates to ``slots_available``.
+
+    Args:
+        eligible_ids: candidate ids in current dispatch order.
+        project_by_id: mapping ``id -> project_id`` (a None project_id is
+            treated as its own bucket, keyed by None).
+        weight_by_id: optional mapping ``id -> int`` round-robin weight; the
+            first-seen id per project sets that project's weight. Defaults to
+            weight 1 for every project (plain round-robin).
+
+    Returns:
+        The reordered ``eligible_ids`` (a permutation; same length / membership).
+    """
+    if len(eligible_ids) <= 1:
+        return eligible_ids
+
+    # Group ids per project, preserving each project's internal order. Project
+    # buckets are kept in first-appearance order so the highest-priority
+    # project (which sorts first in the candidate scan) still leads round 1.
+    buckets: dict = {}
+    project_weight: dict = {}
+    for tid in eligible_ids:
+        pid = project_by_id.get(tid)
+        if pid not in buckets:
+            buckets[pid] = []
+            w = (weight_by_id or {}).get(tid, 1)
+            try:
+                w = int(w)
+            except (TypeError, ValueError):
+                w = 1
+            project_weight[pid] = max(1, w)
+        buckets[pid].append(tid)
+
+    if len(buckets) <= 1:
+        return eligible_ids  # single project — nothing to interleave
+
+    # Weighted round-robin: each round, draw up to ``weight`` ids from every
+    # non-empty project bucket (in first-appearance order). A project with a
+    # higher weight is serviced more per round but never to the exclusion of
+    # the others, so wide fan-out from one project no longer monopolizes the
+    # dispatch window.
+    ordered: list = []
+    cursors = dict.fromkeys(buckets, 0)
+    remaining = len(eligible_ids)
+    while remaining > 0:
+        progressed = False
+        for pid, ids in buckets.items():
+            take = project_weight[pid]
+            c = cursors[pid]
+            drawn = 0
+            while drawn < take and c < len(ids):
+                ordered.append(ids[c])
+                c += 1
+                drawn += 1
+                remaining -= 1
+                progressed = True
+            cursors[pid] = c
+        if not progressed:  # safety: all buckets drained
+            break
+    return ordered

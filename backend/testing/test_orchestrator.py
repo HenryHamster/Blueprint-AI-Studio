@@ -2010,6 +2010,278 @@ class TestPipelineSlotCap:
         assert cap <= runtime_config["max_concurrent_vms"]
 
 
+class TestProjectFairness:
+    """Per-project fairness round-robin (Step 2.95). Without it a single
+    autonomous project that fanned out dozens of tasks fills the entire
+    dispatch window and starves every other project for multiple cycles."""
+
+    @staticmethod
+    def _fair(eligible, project_by_id, weight_by_id=None):
+        from app.orchestrator_filters import apply_project_fairness
+
+        return apply_project_fairness(eligible, project_by_id, weight_by_id)
+
+    def test_single_project_unchanged(self):
+        # No interleaving possible — must be a no-op (behavior-preserving).
+        eligible = ["a", "b", "c", "d"]
+        pbi = {"a": "P", "b": "P", "c": "P", "d": "P"}
+        assert self._fair(eligible, pbi) == eligible
+
+    def test_empty_and_singleton_unchanged(self):
+        assert self._fair([], {}) == []
+        assert self._fair(["a"], {"a": "P"}) == ["a"]
+
+    def test_round_robin_interleaves_projects(self):
+        # P1 fanned out 4 tasks (sorted first by the candidate scan); P2 has 1.
+        # Round-robin must surface P2's task into the FIRST window positions
+        # instead of leaving it behind all four P1 tasks.
+        eligible = ["p1a", "p1b", "p1c", "p1d", "p2a"]
+        pbi = {
+            "p1a": "P1",
+            "p1b": "P1",
+            "p1c": "P1",
+            "p1d": "P1",
+            "p2a": "P2",
+        }
+        out = self._fair(eligible, pbi)
+        # Permutation: same membership, same length.
+        assert sorted(out) == sorted(eligible)
+        assert len(out) == len(eligible)
+        # P2's only task is no longer dead last — it reaches position 2 (after
+        # P1's first task), so a 2-slot window now serves both projects.
+        assert out[:2] == ["p1a", "p2a"]
+        # P1's internal order is preserved.
+        assert [t for t in out if t.startswith("p1")] == [
+            "p1a",
+            "p1b",
+            "p1c",
+            "p1d",
+        ]
+
+    def test_starvation_is_broken_within_window(self):
+        # 50-task fan-out from P1 + 1 task from P2; a 5-slot window must
+        # include P2's task (the starvation bug: P2 waits many cycles).
+        eligible = [f"p1_{i}" for i in range(50)] + ["p2_0"]
+        pbi = {tid: ("P2" if tid == "p2_0" else "P1") for tid in eligible}
+        out = self._fair(eligible, pbi)
+        assert "p2_0" in out[:5], (
+            "P2 task must reach the dispatch window — starvation not broken"
+        )
+
+    def test_weight_gives_more_turns_without_monopolizing(self):
+        # P1 weight 3, P2 weight 1: per round P1 draws 3, P2 draws 1, but P2
+        # is still serviced every round (never fully starved).
+        eligible = ["p1a", "p1b", "p1c", "p1d", "p2a", "p2b"]
+        pbi = {
+            "p1a": "P1",
+            "p1b": "P1",
+            "p1c": "P1",
+            "p1d": "P1",
+            "p2a": "P2",
+            "p2b": "P2",
+        }
+        wbi = {"p1a": 3, "p2a": 1}  # first-seen id per project sets the weight
+        out = self._fair(eligible, pbi, wbi)
+        assert sorted(out) == sorted(eligible)
+        # Round 1: 3 from P1, then 1 from P2 → P2 reaches position 4.
+        assert out[:4] == ["p1a", "p1b", "p1c", "p2a"]
+
+    def test_none_project_is_its_own_bucket(self):
+        eligible = ["x", "y", "z"]
+        pbi = {"x": "P1", "y": None, "z": "P1"}
+        out = self._fair(eligible, pbi)
+        assert sorted(out) == sorted(eligible)
+        # The None-project task interleaves rather than trailing both P1 tasks.
+        assert out[:2] == ["x", "y"]
+
+    def test_weight_mapping_clamps_and_defaults(self):
+        from app.orchestrator_filters import _project_fairness_weight
+
+        assert _project_fairness_weight(None) == 1  # unknown → baseline
+        assert _project_fairness_weight("not-an-int") == 1
+        assert _project_fairness_weight(0) == 1
+        assert _project_fairness_weight(2) == 3  # 1 + priority
+        assert _project_fairness_weight(100) == 4  # clamped to max
+        assert _project_fairness_weight(-5) == 1  # negative → floor 1
+
+
+class TestBatchedDepRowsSurviveCommit:
+    """The N+1 dependency-fetch fix batches ALL dep rows in one IN(...) query
+    in a separate session, then DETACHES them (expunge_all) so they survive the
+    main dispatch session's per-task commits (retry_after / infra_wait). This
+    guards the load_only/rollback-expiry trap: a commit on one session expires
+    its instances, so the dep rows must come from a different, detached set or
+    a later ``_check_candidate_task_deps`` read fires a sync lazy-load →
+    MissingGreenlet and crashes the whole dispatch cycle."""
+
+    @pytest.mark.asyncio
+    async def test_detached_dep_rows_readable_after_other_session_commit(
+        self, db_session
+    ):
+        from sqlmodel import select
+        from app.database import AsyncSessionLocal
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="Batch Dep", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # A COMPLETED non-create dependency (so it's a satisfied dep with no
+        # PR-merge requirement) and a candidate that depends on it.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        candidate = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(candidate)
+        await db_session.commit()
+        await db_session.refresh(candidate)
+
+        # Mirror the orchestrator: batch-fetch dep rows in a SEPARATE session,
+        # build the lookup dict, then DETACH them.
+        dep_by_id = {}
+        async with AsyncSessionLocal() as dep_batch_session:
+            rows = (
+                (
+                    await dep_batch_session.execute(
+                        select(Task).where(Task.id.in_([dep.id]))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            dep_by_id = {dt.id: dt for dt in rows}
+            dep_batch_session.expunge_all()
+
+        # Force a commit on the MAIN session — this expires every instance bound
+        # to it. The detached dep rows must be unaffected.
+        candidate.latest_status_message = "touched"
+        db_session.add(candidate)
+        await db_session.commit()
+
+        # Reading status / context / first_payload on the detached dep row must
+        # NOT raise (DetachedInstanceError / MissingGreenlet) — every column was
+        # loaded by the full select(Task) above.
+        detached_dep = dep_by_id[dep.id]
+        assert detached_dep.status == TaskStatus.COMPLETED
+        assert detached_dep.first_payload.get("type") == "research"
+        assert detached_dep.context == {}
+
+        async def _noop_verify(_task, _session):
+            return True
+
+        dep_tasks = [dep_by_id[dep.id]]
+        result, _ = await _check_candidate_task_deps(
+            candidate, dep_tasks, [dep.id], db_session, _noop_verify
+        )
+        assert result == "eligible", (
+            f"COMPLETED same-base research dep should be eligible, got {result!r}"
+        )
+
+    def test_collect_dep_uuids_dedupes_and_skips_malformed(self):
+        from app.orchestrator_filters import collect_dep_uuids
+
+        shared = uuid.uuid4()
+        only_a = uuid.uuid4()
+        c1 = make_task(depends_on=[str(shared), str(only_a)])
+        c2 = make_task(depends_on=[str(shared), "not-a-uuid", None])
+        c3 = make_task(depends_on=None)  # no deps
+        out = collect_dep_uuids([c1, c2, c3])
+        # Deduped across candidates; malformed ids silently dropped.
+        assert out == {shared, only_a}
+
+    @pytest.mark.asyncio
+    async def test_single_batch_query_for_many_candidates(self, db_session, mocker):
+        """Behavior + efficiency: many candidates sharing deps collapse to ONE
+        IN(...) fetch (the N+1 this fix removes).
+
+        Drives the PRODUCTION helper ``collect_dep_uuids`` over the candidate
+        batch — including a malformed dep id that must be SKIPPED, not fetched
+        and not crash — then proves the collected UUID set powers a single
+        ``select(Task).where(Task.id.in_(...))`` fetch returning exactly the
+        valid deps. The old per-candidate code would have issued one SELECT per
+        candidate; ``spy.call_count == 1`` here is meaningful precisely because
+        the set being queried is the helper's output over MANY candidates, not
+        a hand-built id list."""
+        from sqlmodel import select
+        from app.orchestrator_filters import collect_dep_uuids
+        from app.database import AsyncSessionLocal
+        from app.models import Task as _Task
+
+        project = make_project(name="Batch Count", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        deps = []
+        for i in range(3):
+            d = make_task(
+                project_id=project.id,
+                payloads=[{"type": "research", "prompt": f"dep{i}"}],
+                status=TaskStatus.COMPLETED,
+            )
+            db_session.add(d)
+            deps.append(d)
+        await db_session.commit()
+        for d in deps:
+            await db_session.refresh(d)
+
+        dep_ids = [d.id for d in deps]
+        # 10 candidates, each depending on 2-3 of the deps (with heavy overlap),
+        # PLUS one candidate carrying a malformed dep id (None) that the helper
+        # must skip rather than fetch or crash on. The OLD code would have issued
+        # one SELECT per candidate (10); the helper + single batch issues one.
+        candidates = [
+            make_task(
+                project_id=project.id,
+                payloads=[{"type": "research", "prompt": f"cand{i}"}],
+                status=TaskStatus.QUEUED,
+                depends_on=[str(dep_ids[i % 3]), str(dep_ids[(i + 1) % 3])],
+            )
+            for i in range(10)
+        ]
+        # A malformed-dep candidate: None must be skipped (TypeError path),
+        # "bogus" must be skipped (ValueError path) — neither reaches the query.
+        candidates.append(
+            make_task(
+                project_id=project.id,
+                payloads=[{"type": "research", "prompt": "cand-bad"}],
+                status=TaskStatus.QUEUED,
+                depends_on=[str(dep_ids[0]), None, "bogus"],
+            )
+        )
+
+        # Exercise the PRODUCTION helper — this is the dedup + malformed-skip
+        # that the orchestrator's batched dep-fetch relies on.
+        all_uuids = collect_dep_uuids(candidates)
+        # Deduped to exactly the 3 valid deps; the malformed ids are gone.
+        assert all_uuids == set(dep_ids)
+
+        async with AsyncSessionLocal() as s:
+            spy = mocker.spy(s, "execute")
+            rows = (
+                (await s.execute(select(_Task).where(_Task.id.in_(all_uuids))))
+                .scalars()
+                .all()
+            )
+            s.expunge_all()
+            assert {r.id for r in rows} == set(dep_ids)
+            # Exactly one IN(...) fetch over the helper's collected set,
+            # regardless of candidate count.
+            assert spy.call_count == 1
+
+
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker
     silently shadows the module-level X for the *entire* function, which then

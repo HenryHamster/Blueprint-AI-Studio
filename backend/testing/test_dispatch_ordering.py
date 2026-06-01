@@ -20,7 +20,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.orchestrator_filters import cap_pipeline_slots, reserve_slots_for_types
+from app.orchestrator_filters import (
+    cap_pipeline_slots,
+    reserve_slots_for_types,
+    apply_project_fairness,
+    _project_fairness_weight,
+)
 from app.orchestrator_health import reorder_eligible_by_health
 
 
@@ -261,3 +266,74 @@ def test_reserve_no_promotion_when_reserved_type_already_present():
         slots_available=2,
     )
     assert out == ["c1", "r1", "r2"]
+
+
+# ---------------------------------------------------------------------------
+# apply_project_fairness  (Step 2.95 — round-robin across projects)
+# ---------------------------------------------------------------------------
+
+
+def _by_project(tasks):
+    return {t.id: t.project_id for t in tasks}
+
+
+def _weights(tasks):
+    return {t.id: _project_fairness_weight(getattr(t, "priority", 0)) for t in tasks}
+
+
+def test_fairness_noop_for_single_project():
+    tasks = [_task(t, project_id="P") for t in ("a", "b", "c")]
+    eligible = ["a", "b", "c"]
+    out = apply_project_fairness(eligible, _by_project(tasks))
+    assert out == eligible  # nothing to interleave
+
+
+def test_fairness_breaks_single_project_monopoly_in_window():
+    # P1 fanned out 40 tasks, P2 + P3 one each — the candidate scan orders all
+    # 40 P1 tasks first, so without fairness a 4-slot window dispatches only
+    # P1 and starves P2/P3 for cycles. Fairness must surface P2 + P3.
+    tasks = [_task(f"p1_{i}", project_id="P1") for i in range(40)]
+    tasks += [_task("p2", project_id="P2"), _task("p3", project_id="P3")]
+    eligible = [f"p1_{i}" for i in range(40)] + ["p2", "p3"]
+    out = apply_project_fairness(eligible, _by_project(tasks))
+    # Permutation — no task lost.
+    assert sorted(out) == sorted(eligible)
+    # A realistic 4-slot dispatch window now serves all three projects.
+    window = out[:4]
+    assert "p2" in window and "p3" in window, (
+        f"fairness must break P1 monopoly within the window, got {window}"
+    )
+
+
+def test_fairness_composes_with_slot_cap():
+    # End-to-end composition mirroring the dispatch loop: fairness reorders,
+    # then the slot cap (eligible_ids[:slots_available]) truncates. Two projects
+    # each with 3 tasks, 4 slots → fairness guarantees the smaller project is
+    # represented rather than fully crowded out.
+    tasks = [_task(f"a{i}", project_id="A") for i in range(3)]
+    tasks += [_task(f"b{i}", project_id="B") for i in range(3)]
+    eligible = ["a0", "a1", "a2", "b0", "b1", "b2"]
+    fair = apply_project_fairness(eligible, _by_project(tasks), _weights(tasks))
+    slots_available = 4
+    dispatched = fair[:slots_available]
+    assert any(t.startswith("a") for t in dispatched)
+    assert any(t.startswith("b") for t in dispatched)
+    # Round-robin (weight 1 each): a0, b0, a1, b1.
+    assert dispatched == ["a0", "b0", "a1", "b1"]
+
+
+def test_fairness_weight_from_priority_gives_more_turns():
+    # P1 tasks priority 2 (weight 3), P2 tasks priority 0 (weight 1). P1 draws
+    # 3 per round but P2 is still serviced every round — no starvation.
+    p1 = [_task(f"p1_{i}", project_id="P1") for i in range(4)]
+    for t in p1:
+        t.priority = 2
+    p2 = [_task(f"p2_{i}", project_id="P2") for i in range(2)]
+    for t in p2:
+        t.priority = 0
+    tasks = p1 + p2
+    eligible = [t.id for t in tasks]
+    out = apply_project_fairness(eligible, _by_project(tasks), _weights(tasks))
+    assert sorted(out) == sorted(eligible)
+    # Round 1: 3 P1 (weight 3) then 1 P2 (weight 1).
+    assert out[:4] == ["p1_0", "p1_1", "p1_2", "p2_0"]
