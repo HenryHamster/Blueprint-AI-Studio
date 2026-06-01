@@ -14,6 +14,9 @@ Usage as CLI:
 """
 
 import json
+import os
+import shutil
+import subprocess
 import sys
 import urllib.request
 import urllib.error
@@ -25,18 +28,111 @@ CONFIG_FILE = ".blueprint-config.json"
 _config_cache: dict | None = None
 
 
+def _config_search_paths() -> list[Path]:
+    """Config-file locations checked in priority order (keeps secrets out of the repo)."""
+    paths: list[Path] = []
+    explicit = os.environ.get("BLUEPRINT_CONFIG")
+    if explicit:
+        paths.append(Path(explicit).expanduser())
+    paths.append(Path(__file__).resolve().parent.parent / CONFIG_FILE)  # repo root
+    paths.append(Path.home() / CONFIG_FILE)                             # ~/.blueprint-config.json
+    return paths
+
+
+# ── gcloud bootstrap fallback ───────────────────────────────────────────────
+# If no config file/env is found, regenerate it from Cloud Run + Secret Manager
+# on any machine with `gcloud auth login`. Overridable per-deployment via env so
+# this isn't hardcoded to one project. The secret is cached only to the home-dir
+# config file — never echoed, never committed.
+GCP_SERVICE = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
+GCP_REGION = os.environ.get("BLUEPRINT_GCP_REGION", "us-central1")
+GCP_API_KEY_SECRET = os.environ.get("BLUEPRINT_API_KEY_SECRET", "ADMIN_API_KEY")
+DEFAULT_REPO = os.environ.get("BLUEPRINT_DEFAULT_REPO", "HenryHamster/BlueprintAIStudio")
+DEFAULT_BASE_BRANCH = os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main")
+
+
+def _gcloud(*args: str) -> str | None:
+    """Run a read-only gcloud command; return stripped stdout, or None on any failure.
+
+    Resolves the executable via shutil.which (finds gcloud.cmd on Windows) and
+    runs .cmd/.bat shims through the shell so CreateProcess can launch them.
+    """
+    exe = shutil.which("gcloud")
+    if not exe:
+        return None
+    use_shell = exe.lower().endswith((".cmd", ".bat"))
+    cmd = subprocess.list2cmdline([exe, *args]) if use_shell else [exe, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, shell=use_shell)
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    out = proc.stdout.strip()
+    return out if proc.returncode == 0 and out else None
+
+
+def _bootstrap_from_gcloud() -> dict | None:
+    """Last resort: rebuild config from Cloud Run + Secret Manager and cache it to ~/.
+
+    Requires an authenticated gcloud (the same boundary that protects the
+    secret). Returns None when gcloud is unavailable/unauthed so callers fall
+    through to guidance.
+    """
+    api_key = _gcloud("secrets", "versions", "access", "latest", f"--secret={GCP_API_KEY_SECRET}")
+    if not api_key:
+        return None
+    api_url = _gcloud("run", "services", "describe", GCP_SERVICE,
+                      f"--region={GCP_REGION}", "--format=value(status.url)")
+    if not api_url:
+        return None
+    cfg = {"api_url": api_url, "api_key": api_key,
+           "default_repo": DEFAULT_REPO, "default_base_branch": DEFAULT_BASE_BRANCH}
+    home_path = Path.home() / CONFIG_FILE
+    try:
+        home_path.write_text(json.dumps(cfg, indent=2) + "\n")
+        try:
+            home_path.chmod(0o600)
+        except OSError:
+            pass
+        print(f"[blueprint_api] bootstrapped config from gcloud -> {home_path}", file=sys.stderr)
+    except OSError:
+        pass  # usable in-memory even if we cannot cache it
+    return cfg
+
+
 def load_config() -> dict:
-    """Load API config from project root. Exits with guidance if missing."""
+    """Load API config. Search order: $BLUEPRINT_CONFIG -> repo root -> ~/ -> env vars.
+
+    Prefer ~/.blueprint-config.json or BLUEPRINT_API_URL/BLUEPRINT_API_KEY env
+    vars so credentials never live in the (gitignored-but-still-local) repo tree.
+    """
     global _config_cache
     if _config_cache is not None:
         return _config_cache
-    config_path = Path(__file__).resolve().parent.parent / CONFIG_FILE
-    if not config_path.exists():
-        print(f"ERROR: {config_path} not found.")
-        print("Create it with: api_url, api_key, default_repo, default_base_branch")
-        sys.exit(1)
-    _config_cache = json.loads(config_path.read_text())
-    return _config_cache
+    for config_path in _config_search_paths():
+        if config_path.exists():
+            _config_cache = json.loads(config_path.read_text())
+            return _config_cache
+    env_url, env_key = os.environ.get("BLUEPRINT_API_URL"), os.environ.get("BLUEPRINT_API_KEY")
+    if env_url and env_key:
+        _config_cache = {
+            "api_url": env_url,
+            "api_key": env_key,
+            "default_repo": os.environ.get("BLUEPRINT_DEFAULT_REPO", ""),
+            "default_base_branch": os.environ.get("BLUEPRINT_DEFAULT_BASE_BRANCH", "main"),
+        }
+        return _config_cache
+    bootstrapped = _bootstrap_from_gcloud()
+    if bootstrapped is not None:
+        _config_cache = bootstrapped
+        return _config_cache
+    searched = "\n  ".join(str(p) for p in _config_search_paths())
+    print("ERROR: no Blueprint API config found. Searched:\n  " + searched)
+    print("Fix with any of:")
+    print("  - run `gcloud auth login` (config auto-bootstraps from Secret Manager), or")
+    print("  - create ~/.blueprint-config.json "
+          "(keys: api_url, api_key, default_repo, default_base_branch), or")
+    print("  - export BLUEPRINT_API_URL + BLUEPRINT_API_KEY.")
+    sys.exit(1)
 
 
 def api(method: str, path: str, body: dict | None = None, timeout: int = 30) -> Any:

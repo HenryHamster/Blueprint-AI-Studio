@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -29,7 +30,6 @@ import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / '.blueprint-config.json'
@@ -47,8 +47,17 @@ STUCK_THRESHOLDS_SEC = {
 
 
 def _load_config(path: Path) -> dict:
-    with path.open(encoding='utf-8') as f:
-        return json.load(f)
+    """Load API config via the shared loader.
+
+    An explicit --config that exists wins; otherwise blueprint_api searches
+    repo-root / ~ / env / gcloud-bootstrap, so the config no longer has to live
+    in the repo tree.
+    """
+    if path and Path(path).exists():
+        os.environ["BLUEPRINT_CONFIG"] = str(path)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from blueprint_api import load_config as _shared_load_config
+    return _shared_load_config()
 
 
 def _api_get(api_url: str, api_key: str, path: str, params: dict | None = None) -> dict:
