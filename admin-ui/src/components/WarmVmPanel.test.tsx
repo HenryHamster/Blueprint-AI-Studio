@@ -298,3 +298,137 @@ describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
     ).toBeNull();
   });
 });
+
+describe('WarmVmPanel — warm-pool toggle + pool metrics', () => {
+  const stateWithPool: WarmVmStateResponse = {
+    ...baseState,
+    pool_metrics: {
+      enabled: true,
+      target_size: 5,
+      current_size: 4,
+      idle_count: 3,
+      idle_ttl_secs: 1800,
+      projected_idle_cost_usd: 0.1234,
+      funnel: {
+        window_hours: 24,
+        pool_lease_hits: 12,
+        cold_dispatches: 4,
+        total_dispatches: 16,
+        pool_hit_rate: 0.75,
+        lease_miss_by_reason: {},
+        lease_miss_total: 0,
+      },
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(baseState), { status: 200 }),
+    );
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('{}', { status: 200 }),
+    );
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('pool toggle PATCHes warm_pool_enabled independently (enable from NO-POOL)', async () => {
+    // baseState carries no pool_metrics → poolOn is false → button reads NO-POOL.
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    const btn = screen.getByText('NO-POOL');
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith(
+        'http://localhost:8000/api/admin/settings',
+        expect.objectContaining({ method: 'PATCH' }),
+      );
+    });
+    const [, opts] = (apiFetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(opts.body as string);
+    // Flips ONLY the pool flag — must not touch sibling warm flags (the
+    // independent-flip regression class the backlog-reuse test also guards).
+    expect(body).toEqual({ warm_pool_enabled: true });
+  });
+
+  test('pool toggle DISABLEs warm_pool_enabled when currently enabled', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithPool), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const btn = await screen.findByText('POOL');
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalled());
+    const [, opts] = (apiFetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(opts.body as string);
+    expect(body).toEqual({ warm_pool_enabled: false });
+  });
+
+  test('renders PoolMetricsRow with size, idle, cost, and hit rate', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithPool), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const row = await screen.findByTestId('pool-metrics-row');
+    expect(row.textContent).toContain('Warm Pool (enabled)');
+    expect(screen.getByText('size').parentElement?.textContent).toContain('4');
+    expect(screen.getByText('size').parentElement?.textContent).toContain('5');
+    expect(screen.getByText('idle').parentElement?.textContent).toContain('3');
+    // 0.1234 → "$0.12" (>= $0.01 branch, 2dp).
+    expect(screen.getByTestId('pool-idle-cost').textContent).toBe('$0.12');
+    // hit rate 0.75 → 75%.
+    expect(screen.getByText('hit rate').parentElement?.textContent).toContain('75%');
+    expect(screen.getByText('hits').parentElement?.textContent).toContain('12');
+    expect(screen.getByText('cold').parentElement?.textContent).toContain('4');
+  });
+
+  test('idle cost and hit rate fall back to em-dash when absent/null', async () => {
+    const stateNoCost: WarmVmStateResponse = {
+      ...baseState,
+      pool_metrics: {
+        enabled: true,
+        target_size: 2,
+        current_size: 0,
+        idle_count: 0,
+        // projected_idle_cost_usd omitted → fmtUsd returns '—'.
+        funnel: {
+          window_hours: 24,
+          pool_lease_hits: 0,
+          cold_dispatches: 0,
+          total_dispatches: 0,
+          pool_hit_rate: null, // no dispatches yet → '—'.
+          lease_miss_by_reason: {},
+          lease_miss_total: 0,
+        },
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateNoCost), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.getByTestId('pool-idle-cost').textContent).toBe('—');
+    expect(screen.getByText('hit rate').parentElement?.textContent).toContain('—');
+  });
+
+  test('does not render PoolMetricsRow when pool_metrics is absent', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('pool-metrics-row')).toBeNull();
+    // The toggle still renders in its disabled (NO-POOL) state.
+    expect(screen.getByText('NO-POOL')).toBeTruthy();
+  });
+});

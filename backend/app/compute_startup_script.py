@@ -306,3 +306,172 @@ def build_agent_startup_script(
     echo "Agent finished. Terminating VM..."
     poweroff
     """
+
+
+def build_pool_agent_startup_script(
+    *,
+    vm_instance_id: str,
+    secret_version_name: str,
+    orchestrator_url: str,
+    materialize_manifest_b64: str,
+) -> str:
+    """TASKLESS (warm-pool) variant of the agent startup script.
+
+    Differs from :func:`build_agent_startup_script` only in task binding: it has
+    NO ``task_id``, so every provisioning beacon / failure report targets
+    ``/api/agent/vm-heartbeat`` (VM-scoped auth) with a ``vm_instance_id`` body
+    instead of ``/api/agent/heartbeat`` with a ``task_id``. The credential fetch
+    + manifest materialization + service start are otherwise identical, and the
+    poll-first marker (``BLUEPRINT_POOL_MODE``) is already baked into
+    ``/etc/agent.env`` by the taskless manifest, so the agent boots in pool mode
+    and polls ``/api/agent/next-role`` for a lease.
+
+    Per CLAUDE.md cross-language guidance: the only embedded non-bash here is the
+    pre-existing base64-decoded ``materialize_manifest.py`` and a single-line
+    ``python3 -c`` token extraction — no nested multi-line heredocs.
+    """
+    ORCHESTRATOR_URL = orchestrator_url
+    _MATERIALIZE_MANIFEST_B64 = materialize_manifest_b64
+    return f"""#!/bin/bash
+    set -euo pipefail
+
+    # Pool VMs are taskless: liveness + failure reports go to /api/agent/vm-heartbeat
+    # (VM-scoped auth) keyed on vm_instance_id, NOT /api/agent/heartbeat (task-scoped).
+    EARLY_TOKEN=""
+    VM_INSTANCE_ID="{vm_instance_id}"
+    _report_failure() {{
+      local line=$1
+      local cmd="$2"
+      echo "FATAL: Pool startup script failed at line $line: $cmd"
+      local TOKEN=""
+      local ORCH="{ORCHESTRATOR_URL}"
+      if [ -f /etc/agent.env ]; then
+        TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
+      fi
+      if [ -z "$TOKEN" ] && [ -n "$EARLY_TOKEN" ]; then
+        TOKEN="$EARLY_TOKEN"
+      fi
+      if [ -n "$TOKEN" ] && [ -n "$ORCH" ]; then
+        curl -sf -X POST "$ORCH/api/agent/vm-heartbeat" \
+          -H "Content-Type: application/json" \
+          -H "X-Agent-Token: $TOKEN" \
+          -d "$(printf '{{"vm_instance_id": "%s"}}' "$VM_INSTANCE_ID")" \
+          --connect-timeout 5 --max-time 10 || true
+      fi
+      poweroff
+    }}
+    trap '_report_failure $LINENO "$BASH_COMMAND"' ERR
+    echo "Starting Pool Agent VM Initialization (taskless)..."
+
+    # 1. Self-Destruct Mechanism (Defense in Depth)
+    TTL_SECONDS=3600
+    (
+      sleep $TTL_SECONDS
+      echo "TTL reached ($TTL_SECONDS s). Gracefully stopping agent service..."
+      systemctl stop blueprint-agent 2>/dev/null || true
+      sleep 30
+      echo "Force terminating VM..."
+      poweroff
+    ) &
+    TTL_PID=$!
+
+    # 2. Retrieve credentials from Secret Manager.
+    SECRET_VERSION="{secret_version_name}"
+    echo "Fetching agent credentials from Secret Manager..."
+    CREDS=""
+    for attempt in 1 2 3; do
+      if CREDS="$(gcloud secrets versions access "$SECRET_VERSION" 2>&1)"; then
+        echo "Secret fetched (attempt $attempt)"
+        break
+      fi
+      echo "Secret fetch failed (attempt $attempt): $CREDS"
+      if [ $attempt -lt 3 ]; then
+        sleep $((attempt * 10))
+      else
+        echo "FATAL: Secret Manager access failed after 3 attempts"
+        false  # Triggers ERR trap
+      fi
+    done
+
+    # VM-scoped beacon helper. The VM-scoped token comes from CREDS (env file
+    # not written yet at first call).
+    _send_vm_beacon() {{
+      local tok="$1"
+      if [ -z "$tok" ]; then
+        echo "[POOL_BEACON_SKIPPED] no token yet" >&2
+        return 0
+      fi
+      local err="" curl_exit=0
+      err="$(curl -sf -X POST "{ORCHESTRATOR_URL}/api/agent/vm-heartbeat" \
+        -H "Content-Type: application/json" \
+        -H "X-Agent-Token: $tok" \
+        -d "$(printf '{{"vm_instance_id": "%s"}}' "$VM_INSTANCE_ID")" \
+        --connect-timeout 5 --max-time 10 2>&1 >/dev/null)" || curl_exit=$?
+      if [ "$curl_exit" -ne 0 ]; then
+        echo "[POOL_BEACON_FAILED] ${{err:-curl failed with exit $curl_exit}}" >&2
+      fi
+    }}
+    EARLY_TOKEN="$(printf '%s' "$CREDS" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("env",{{}}).get("AGENT_SECRET_TOKEN",""))' 2>/dev/null || true)"
+    _send_vm_beacon "$EARLY_TOKEN"
+
+    # 3. Materialize manifest via the base64-embedded materialize_manifest.py.
+    MANIFEST_PATH=/tmp/agent_secret_manifest.json
+    PY_STDERR=/tmp/agent_manifest_py.err
+    MATERIALIZE_PY=/tmp/materialize_manifest.py
+    printf '%s' "$CREDS" > "$MANIFEST_PATH"
+    echo '{_MATERIALIZE_MANIFEST_B64}' | base64 -d > "$MATERIALIZE_PY"
+    if timeout 60 python3 "$MATERIALIZE_PY" "$MANIFEST_PATH" /etc/agent.env 2>"$PY_STDERR"; then
+      :
+    else
+      echo "materialize_manifest failed: $(cat "$PY_STDERR" 2>/dev/null || echo 'no stderr')" >&2
+      rm -f "$MANIFEST_PATH" "$PY_STDERR" "$MATERIALIZE_PY"
+      false  # trigger ERR trap
+    fi
+    rm -f "$MANIFEST_PATH" "$PY_STDERR" "$MATERIALIZE_PY"
+
+    AGENT_TOKEN="$(grep '^AGENT_SECRET_TOKEN=' /etc/agent.env | cut -d= -f2- | tr -d '"' || true)"
+    _send_vm_beacon "$AGENT_TOKEN"
+
+    # 4. Agent diagnostics — log baked-in code version for debugging.
+    echo "Agent source files:"
+    ls -la /opt/agent/src/handlers/ 2>/dev/null || echo "  (no handlers directory)"
+
+    # 5. Start the systemd service. The agent boots poll-first (BLUEPRINT_POOL_MODE
+    # is in /etc/agent.env) and polls /api/agent/next-role for a lease.
+    echo "Starting blueprint-agent service (pool mode)..."
+    systemctl daemon-reload
+    timeout 60 systemctl restart blueprint-agent || {{
+        echo "Service start failed"
+        poweroff
+        exit 1
+    }}
+
+    # Settle window: confirm the agent stays active before reporting healthy.
+    sleep 30
+    # shellcheck disable=SC1091
+    [ -f /etc/agent.env ] && . /etc/agent.env || true
+    AGENT_TOKEN="${{AGENT_SECRET_TOKEN:-}}"
+    if systemctl is-active --quiet blueprint-agent; then
+      _send_vm_beacon "$AGENT_TOKEN"
+      echo "POOL_PROVISION_HEALTH_OK"
+    else
+      echo "Agent service did not stay healthy through the settle window" >&2
+    fi
+
+    # Wait for the service to finish (with TTL guard).
+    POLL_START=$(date +%s)
+    while systemctl is-active --quiet blueprint-agent; do
+      sleep 5
+      ELAPSED=$(( $(date +%s) - POLL_START ))
+      if [ $ELAPSED -gt $TTL_SECONDS ]; then
+        echo "Service exceeded TTL, stopping..."
+        systemctl stop blueprint-agent 2>/dev/null || true
+        break
+      fi
+    done
+
+    # 6. Cancel TTL watchdog and self-terminate.
+    kill $TTL_PID 2>/dev/null || true
+    echo "Pool agent finished. Terminating VM..."
+    poweroff
+    """

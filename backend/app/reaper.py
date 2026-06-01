@@ -3338,6 +3338,25 @@ async def reaper_service():
                     logger.error(f"[REAPER] Routine message purge: {e}", exc_info=True)
                     with contextlib.suppress(Exception):
                         await session.rollback()
+
+                # Step 11: Idle warm-pool VM reaper — retire over-TTL / zombie /
+                # stale-image / stuck-RETIRING pool members (Task-row reaper is
+                # blind to taskless pool VMs). Inert when warm_pool_enabled=False.
+                _mark_reaper_progress()
+                try:
+                    from app.warm_pool_maintainer import sweep_idle_pool_vms
+
+                    pool_retired = await sweep_idle_pool_vms(
+                        session, now, runtime_config=_runtime_config
+                    )
+                    if pool_retired:
+                        logger.info(
+                            f"[REAPER] Step 11: retired {pool_retired} idle pool VM(s)"
+                        )
+                except Exception as e:
+                    logger.error(f"[REAPER] Idle pool VM sweep error: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
             consecutive_errors = 0
             if _reaper_halt_state.get("_in_probe"):
                 _probe_failures = _reaper_halt_state.get("half_open_failures", 0)

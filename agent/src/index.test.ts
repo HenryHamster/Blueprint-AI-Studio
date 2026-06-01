@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, _setAgentTokenForTesting, main, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -94,6 +94,8 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
   if (v === undefined || v === null) throw new Error(msg);
   return v;
 }
+
+const initialPoolPriorTaskId = '00000000-0000-0000-0000-000000000000';
 
 // ── computeRefreshDelayMs ─────────────────────────────────────────────────────
 /** Build a minimal JWT with a given exp claim (no real signature needed). */
@@ -2694,6 +2696,254 @@ describe('pollForNextRole', () => {
       heartbeatIntervalMs: 200,
     });
     expect(result).toEqual({ action: 'exit', reason: 'recovered' });
+  });
+});
+
+describe('bootstrapPoolMode', () => {
+  const originalTaskId = process.env.TASK_ID;
+  const originalWarmHandoff = process.env.BLUEPRINT_WARM_HANDOFF;
+
+  beforeEach(() => {
+    delete process.env.TASK_ID;
+    delete process.env.BLUEPRINT_WARM_HANDOFF;
+  });
+
+  afterEach(() => {
+    if (originalTaskId !== undefined) process.env.TASK_ID = originalTaskId;
+    else delete process.env.TASK_ID;
+    if (originalWarmHandoff !== undefined) process.env.BLUEPRINT_WARM_HANDOFF = originalWarmHandoff;
+    else delete process.env.BLUEPRINT_WARM_HANDOFF;
+    vi.restoreAllMocks();
+  });
+
+  it('keeps polling across empty windows, then rotates into the first claimed task without warm handoff', async () => {
+    const pollOnce = vi
+      .fn()
+      .mockResolvedValueOnce({ action: 'exit', reason: 'poll_timeout' })
+      .mockResolvedValueOnce({ action: 'claim', taskId: 'pool-task-1', agentToken: 'pool-jwt-1' });
+
+    const result = await bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-1',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-1',
+      maxIdleLifetimeMs: 1_000,
+      pollWindowMs: 250,
+      pollOnce,
+    });
+
+    expect(result).toEqual({ action: 'claim', taskId: 'pool-task-1', agentToken: 'pool-jwt-1' });
+    expect(pollOnce).toHaveBeenCalledTimes(2);
+    expect(pollOnce).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      vmInstanceId: 'pool-vm-1',
+      priorTaskId: initialPoolPriorTaskId,
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-1',
+      timeoutMs: 250,
+    }));
+    expect(process.env.TASK_ID).toBe('pool-task-1');
+    expect(getAgentHeaders()['X-Agent-Token']).toBe('pool-jwt-1');
+    expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
+  });
+
+  it('exits cleanly when max idle lifetime is exhausted without a claim', async () => {
+    let fakeNow = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => fakeNow);
+    const pollOnce = vi.fn().mockImplementation(() => {
+      fakeNow += 60;
+      return { action: 'exit', reason: 'poll_timeout' } as const;
+    });
+
+    const result = await bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-2',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-2',
+      maxIdleLifetimeMs: 100,
+      pollWindowMs: 80,
+      pollOnce,
+    });
+
+    expect(result).toEqual({ action: 'exit', reason: 'max_idle_lifetime_exceeded' });
+    expect(pollOnce).toHaveBeenCalledTimes(2);
+    expect(process.env.TASK_ID).toBeUndefined();
+  });
+});
+
+describe('main pool-mode startup ordering', () => {
+  const originalPoolMode = process.env.BLUEPRINT_POOL_MODE;
+  const originalVmInstanceId = process.env.VM_INSTANCE_ID;
+  const originalTaskId = process.env.TASK_ID;
+  const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    process.env.BLUEPRINT_POOL_MODE = '1';
+    process.env.VM_INSTANCE_ID = 'pool-vm-main-test';
+    delete process.env.TASK_ID;
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
+    _setAgentTokenForTesting('vm-bootstrap-jwt');
+    _setAgentRuntimeFingerprintForTesting(null);
+  });
+
+  afterEach(() => {
+    _stopHeartbeatForTesting();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    if (originalPoolMode !== undefined) process.env.BLUEPRINT_POOL_MODE = originalPoolMode;
+    else delete process.env.BLUEPRINT_POOL_MODE;
+    if (originalVmInstanceId !== undefined) process.env.VM_INSTANCE_ID = originalVmInstanceId;
+    else delete process.env.VM_INSTANCE_ID;
+    if (originalTaskId !== undefined) process.env.TASK_ID = originalTaskId;
+    else delete process.env.TASK_ID;
+    if (originalAnthropicApiKey !== undefined) process.env.ANTHROPIC_API_KEY = originalAnthropicApiKey;
+    else delete process.env.ANTHROPIC_API_KEY;
+    _setAgentTokenForTesting('');
+    _setAgentRuntimeFingerprintForTesting(null);
+  });
+
+  it('starts the claimed-task heartbeat before stale-result replay, uses persisted replay tokens, and abandons unrecoverable legacy envelopes', async () => {
+    const makeTaskToken = (sub: string): string => {
+      const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+      const payload = Buffer.from(JSON.stringify({ sub })).toString('base64url');
+      return `${header}.${payload}.sig`;
+    };
+    const now = Date.now();
+    const events: string[] = [];
+    let nextRoleBody: { vm_instance_id?: string; prior_task_id?: string; prior_pr_number?: number | null } | null = null;
+    const statusReplayTokens: string[] = [];
+    const heartbeatTokens: string[] = [];
+    (fs.readdirSync as unknown as ReturnType<typeof vi.fn>).mockImplementation((path: string) => {
+      if (path === '/tmp') events.push('stale-scan');
+      return ['task_stale-persisted_result.json', 'task_stale-legacy_result.json'];
+    });
+    mockReadFileSync.mockImplementation((path: string) => {
+      if (path === '/opt/agent/AGENT_RUNTIME_FINGERPRINT') {
+        events.push('fingerprint-read');
+        return 'AGENT_RUNTIME_FINGERPRINT=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+      }
+      if (path === '/tmp/task_stale-persisted_result.json') {
+        return JSON.stringify({
+          payload: { task_id: 'stale-persisted', status: 'FAILED' },
+          retry: { attempts: 0, createdAt: now - 1_000, nextAttemptAt: now - 1 },
+          agentToken: 'persisted-stale-jwt',
+        });
+      }
+      if (path === '/tmp/task_stale-legacy_result.json') {
+        return JSON.stringify({
+          payload: { task_id: 'stale-legacy', status: 'FAILED' },
+          retry: { attempts: 0, createdAt: now - 1_000, nextAttemptAt: now - 1 },
+        });
+      }
+      return '';
+    });
+
+    (spawn as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      events.push('provider-validation');
+      return {
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+          if (event === 'close') void Promise.resolve().then(() => { handler(0); });
+        }),
+        kill: vi.fn(),
+      };
+    });
+
+    fetchMock.mockImplementation((input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        events.push('vm-heartbeat');
+        return Promise.resolve({
+          status: 204,
+          json: () => Promise.resolve({}),
+        });
+      }
+      if (url.endsWith('/api/agent/heartbeat')) {
+        events.push('task-heartbeat');
+        heartbeatTokens.push((init?.headers as Record<string, string> | undefined)?.['X-Agent-Token'] ?? '');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ status: 'ok' }),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/next-role')) {
+        events.push('next-role');
+        const requestBody = typeof init?.body === 'string' ? init.body : '{}';
+        nextRoleBody = JSON.parse(requestBody) as {
+          vm_instance_id?: string;
+          prior_task_id?: string;
+          prior_pr_number?: number | null;
+        };
+        if (nextRoleBody.prior_task_id !== initialPoolPriorTaskId) {
+          return Promise.resolve({ status: 422, json: () => Promise.resolve({ detail: 'prior_task_id must be a UUID' }) });
+        }
+        return Promise.resolve({
+          status: 200,
+          json: () => Promise.resolve({
+            action: 'claim',
+            task_id: 'pool-task-main-1',
+            agent_token: makeTaskToken('pool-task-main-1'),
+          }),
+        });
+      }
+      if (url === 'http://metadata.google.internal/computeMetadata/v1/instance/image') {
+        events.push('vm-image-fetch');
+        return Promise.resolve({ ok: true, text: () => Promise.resolve('projects/test/global/images/agent-1234567890') });
+      }
+      if (url.endsWith('/api/agent/status')) {
+        const body = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as { task_id?: string };
+        events.push(`status-replay:${body.task_id ?? 'unknown'}`);
+        statusReplayTokens.push((init?.headers as Record<string, string> | undefined)?.['X-Agent-Token'] ?? '');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ status: 'ok' }),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/claim')) {
+        events.push('claim-replay');
+        return Promise.resolve({ status: 400, ok: false, text: () => Promise.resolve('claim replay stopped test') });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+
+    await expect(main()).rejects.toThrow('POST /api/agent/claim failed (400): claim replay stopped test');
+
+    expect(events.indexOf('vm-heartbeat')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('next-role')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('task-heartbeat')).toBeGreaterThan(events.indexOf('next-role'));
+    // Provider auth is validated pre-claim in pool mode (a bad-cred VM must fail
+    // before bootstrapPoolMode flips a task IN_PROGRESS), so provider-validation
+    // lands BEFORE next-role — see the validate-before-claim block in main().
+    expect(events.indexOf('provider-validation')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('provider-validation')).toBeLessThan(events.indexOf('next-role'));
+    expect(events.indexOf('vm-image-fetch')).toBeGreaterThan(events.indexOf('next-role'));
+    expect(events.indexOf('stale-scan')).toBeGreaterThan(events.indexOf('next-role'));
+    expect(events.indexOf('status-replay:stale-persisted')).toBeGreaterThan(events.indexOf('stale-scan'));
+    expect(events.indexOf('status-replay:stale-persisted')).toBeGreaterThan(events.indexOf('task-heartbeat'));
+    expect(events.indexOf('claim-replay')).toBeGreaterThan(events.indexOf('status-replay:stale-persisted'));
+    expect(events).not.toContain('status-replay:stale-legacy');
+    expect(heartbeatTokens).toEqual([makeTaskToken('pool-task-main-1')]);
+    expect(statusReplayTokens).toEqual(['persisted-stale-jwt']);
+    expect(nextRoleBody).toEqual({
+      vm_instance_id: 'pool-vm-main-test',
+      prior_task_id: initialPoolPriorTaskId,
+      prior_pr_number: null,
+    });
+    expect(process.env.TASK_ID).toBe('pool-task-main-1');
+    expect(getAgentHeaders()['X-Agent-Token']).toBe(makeTaskToken('pool-task-main-1'));
+    expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
+    expect(vi.mocked(fs.unlinkSync).mock.calls).toEqual(expect.arrayContaining([
+      ['/tmp/task_stale-persisted_result.json'],
+      ['/tmp/task_stale-legacy_result.json'],
+    ]));
   });
 });
 

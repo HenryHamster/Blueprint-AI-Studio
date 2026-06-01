@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -33,6 +34,9 @@ from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
 from app.models import (
+    PoolIdleCostLedger,
+    PoolVm,
+    PoolVmState,
     Project,
     Task,
     TaskStatus,
@@ -41,6 +45,7 @@ from app.models import (
     get_task_total_vm_cost_usd,
 )
 from app.task_locking import project_lock
+from app.vm_cost_rates import idle_cost_usd
 
 router = APIRouter()
 
@@ -167,6 +172,7 @@ async def _load_recent_tasks(
                 Task.status,
                 Task.context,
                 Task.vm_spot,
+                Task.vm_machine_type,
                 Task.vm_provisioned_at,
                 Task.vm_stopped_at,
                 Task.vm_cold_start_ms,
@@ -182,17 +188,127 @@ async def _load_recent_tasks(
     return list((await session.execute(stmt)).scalars().all())
 
 
-def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
-    """Total VM cost / merged PR count over the window. None when no merges."""
+def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
+    """Return (total task-attached VM cost, merged-PR count) over the window."""
     total_cost = 0.0
     merged = 0
     for t in tasks:
         total_cost += get_task_total_vm_cost_usd(t)
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
             merged += 1
+    return total_cost, merged
+
+
+def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
+    """Total VM cost / merged PR count over the window. None when no merges."""
+    total_cost, merged = _cost_and_merges(tasks)
     if not merged:
         return None
     return round(total_cost / merged, 4)
+
+
+# ---------------------------------------------------------------------------
+# Warm-pool idle-VM cost accounting (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# Idle pool members still bill GCE wall-clock even though they carry no task, so
+# task-attached cost (get_task_total_vm_cost_usd) understates real spend once a
+# pool exists — pre-warming could make cost_per_merged_pr look BETTER while
+# total spend rises. We make that honest two ways:
+#   1. settle_pool_vm_idle_cost() banks elapsed idle seconds * the fleet
+#      per-second rate onto PoolVm.idle_cost_banked when a member leaves IDLE
+#      (the lease / reaper paths in app.warm_pool are the intended callers).
+#   2. compute_pool_idle_cost() sums that banked cost AND the live (not-yet-
+#      settled) accrual of currently-IDLE members, so the figure is correct even
+#      before any settle call fires.
+# The figure is surfaced as a clearly-labelled companion to cost_per_merged_pr
+# (cost_per_merged_pr_incl_pool_idle) rather than folded into the immutable
+# baseline axis, so existing drift comparisons stay apples-to-apples.
+
+
+def settle_pool_vm_idle_cost(
+    member: PoolVm, *, now: Optional[datetime] = None
+) -> float:
+    """Bank elapsed idle cost onto ``member.idle_cost_banked``; return the amount.
+
+    Computes ``(now - idle_since) * fleet_rate`` at the fleet machine type /
+    spot mode, adds it to the running ``idle_cost_banked`` total, and advances
+    ``idle_since`` to ``now`` so the same span is never billed twice. A no-op
+    (returns 0.0) when the member is not currently idle or no time has elapsed.
+    The caller owns the transaction (commit).
+    """
+    if member.idle_since is None:
+        return 0.0
+    if now is None:
+        now = _utcnow()
+    elapsed = (now - member.idle_since).total_seconds()
+    if elapsed <= 0:
+        return 0.0
+    cost = idle_cost_usd(elapsed)
+    member.idle_cost_banked = (member.idle_cost_banked or 0.0) + cost
+    member.idle_since = now
+    return cost
+
+
+async def compute_pool_idle_cost(
+    session: AsyncSession, project_id: Optional[uuid.UUID] = None
+) -> Dict[str, Any]:
+    """Aggregate warm-pool size + idle cost (banked + live accrual).
+
+    When ``project_id`` is given the scan is scoped to that tenant's members;
+    otherwise it spans every pool member (the fleet-wide admin view).
+
+    ``pool_size`` counts live members (PROVISIONING/IDLE/LEASED); RETIRING
+    members are excluded from the size but their already-banked idle cost is
+    still summed so teardown never erases measured spend. ``live_idle_cost_usd``
+    is the not-yet-settled accrual of currently-IDLE members.
+
+    Because the idle reaper HARD-DELETES a member's row on teardown, the banked
+    cost of every already-reaped member is carried in the durable
+    ``PoolIdleCostLedger`` (written atomically with the delete). That carry-
+    forward is summed into ``settled_idle_cost_usd`` here so spend survives the
+    delete — without it the metric would only ever see members that happen to
+    still exist at snapshot time, undercounting by the bulk of pool idle cost.
+    """
+    stmt = select(PoolVm)
+    if project_id is not None:
+        stmt = stmt.where(PoolVm.project_id == project_id)
+    members = list((await session.execute(stmt)).scalars().all())
+
+    now = _utcnow()
+    settled = 0.0
+    live = 0.0
+    pool_size = 0
+    idle_count = 0
+    for m in members:
+        settled += m.idle_cost_banked or 0.0
+        if m.state == PoolVmState.RETIRING:
+            continue
+        pool_size += 1
+        if m.state == PoolVmState.IDLE and m.idle_since is not None:
+            idle_count += 1
+            elapsed = (now - m.idle_since).total_seconds()
+            if elapsed > 0:
+                live += idle_cost_usd(elapsed)
+
+    # Carry-forward: durable idle spend of members already reaped (rows deleted).
+    ledger_stmt = select(
+        func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0)
+    )
+    if project_id is not None:
+        ledger_stmt = ledger_stmt.where(
+            PoolIdleCostLedger.project_id == project_id
+        )
+    retired_idle = float((await session.execute(ledger_stmt)).scalar() or 0.0)
+    settled += retired_idle
+
+    return {
+        "pool_size": pool_size,
+        "idle_count": idle_count,
+        "settled_idle_cost_usd": round(settled, 6),
+        "retired_idle_cost_usd": round(retired_idle, 6),
+        "live_idle_cost_usd": round(live, 6),
+        "total_idle_cost_usd": round(settled + live, 6),
+    }
 
 
 def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
@@ -532,6 +648,19 @@ async def compute_current_axes(
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
     tasks = await _load_recent_tasks(session, project_id)
+    pool_metrics = await compute_pool_idle_cost(session, project_id)
+
+    # Honest net-cost companion: fold the project's warm-pool idle cost into the
+    # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
+    # axis look better while real spend rises. Kept SEPARATE from the immutable
+    # AXIS_COST_PER_MERGED_PR baseline (drift comparisons stay apples-to-apples).
+    total_vm_cost, merged = _cost_and_merges(tasks)
+    cost_incl_pool_idle: Optional[float] = (
+        round((total_vm_cost + pool_metrics["total_idle_cost_usd"]) / merged, 4)
+        if merged
+        else None
+    )
+
     return {
         AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
         AXIS_VM_COLD_START_P50_MS: _compute_vm_cold_start_p50_ms(tasks),
@@ -541,6 +670,9 @@ async def compute_current_axes(
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
+        "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
+        "pool_metrics": pool_metrics,
+        "cost_per_merged_pr_incl_pool_idle": cost_incl_pool_idle,
     }
 
 
@@ -695,6 +827,13 @@ async def read_baseline_with_drift(
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
         "reuse_funnel": get_reuse_funnel_snapshot(),
+        # Warm-pool idle cost from the latest snapshot, plus the net-cost
+        # companion that folds it into cost_per_merged_pr (see compute_current_axes).
+        "pool_idle_cost_usd": latest.get("pool_idle_cost_usd"),
+        "pool_metrics": latest.get("pool_metrics"),
+        "cost_per_merged_pr_incl_pool_idle": latest.get(
+            "cost_per_merged_pr_incl_pool_idle"
+        ),
     }
 
 

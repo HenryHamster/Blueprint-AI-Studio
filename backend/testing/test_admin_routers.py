@@ -2758,6 +2758,134 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_warm_reuse_tuning_knobs_round_trip(self, client: AsyncClient):
+        """The warm-reuse tuning knobs are PATCHable and visible on GET."""
+        from app.shared_state import runtime_config as _rc
+
+        keys = (
+            "warm_pin_clear_rate_threshold",
+            "warm_continuity_cooldown_seconds",
+            "warm_backlog_reuse_failure_rate_threshold",
+            "warm_backlog_reuse_cooldown_seconds",
+            "warm_backlog_scan_limit",
+            "warm_backlog_teardown_defer_secs",
+        )
+        original = {key: _rc.get(key) for key in keys}
+        payload = {
+            "warm_pin_clear_rate_threshold": 12,
+            "warm_continuity_cooldown_seconds": 2400,
+            "warm_backlog_reuse_failure_rate_threshold": 7,
+            "warm_backlog_reuse_cooldown_seconds": 2400,
+            "warm_backlog_scan_limit": 17,
+            "warm_backlog_teardown_defer_secs": 30,
+        }
+        try:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            for key, expected in payload.items():
+                assert body[key] == expected
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={key: value for key, value in original.items() if value is not None},
+            )
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("warm_pin_clear_rate_threshold", 0),
+            ("warm_pin_clear_rate_threshold", 101),
+            ("warm_continuity_cooldown_seconds", 59),
+            ("warm_continuity_cooldown_seconds", 86401),
+            ("warm_backlog_reuse_failure_rate_threshold", 0),
+            ("warm_backlog_reuse_failure_rate_threshold", 101),
+            ("warm_backlog_reuse_cooldown_seconds", 59),
+            ("warm_backlog_reuse_cooldown_seconds", 86401),
+            ("warm_backlog_scan_limit", 0),
+            ("warm_backlog_scan_limit", 101),
+            ("warm_backlog_teardown_defer_secs", 4),
+            ("warm_backlog_teardown_defer_secs", 121),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_patch_warm_reuse_tuning_knobs_reject_out_of_bounds(
+        self, client: AsyncClient, field: str, bad_value: int
+    ):
+        """Out-of-range warm-reuse tuning values are rejected."""
+        resp = await client.patch("/api/admin/settings", json={field: bad_value})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_warm_pool_config_round_trip(self, client: AsyncClient):
+        """warm_pool_enabled / target_size / idle_ttl_secs PATCH, round-trip on
+        GET, and are independent of the other warm flags."""
+        from app.shared_state import runtime_config as _rc
+
+        keys = (
+            "warm_pool_enabled",
+            "warm_pool_target_size",
+            "warm_pool_idle_ttl_secs",
+            "warm_pool_idle_ttl_seconds",
+        )
+        original = {key: _rc.get(key) for key in keys}
+        payload = {
+            "warm_pool_enabled": True,
+            "warm_pool_target_size": 7,
+            "warm_pool_idle_ttl_secs": 1200,
+        }
+        try:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_enabled"] is True
+            assert body["warm_pool_target_size"] == 7
+            assert body["warm_pool_idle_ttl_secs"] == 1200
+            # TTL dual-key sync: the idle-reaper in warm_pool_maintainer.py reads
+            # the ``_seconds`` variant, so a PATCH to ``_secs`` MUST also write
+            # ``_seconds`` or operator TTL changes never reach the maintainer
+            # (regressed once — fix commit 560fd11). Assert the runtime_config
+            # value directly, not via GET (GET surfaces only the ``_secs`` key).
+            assert _rc.get("warm_pool_idle_ttl_seconds") == 1200
+            assert _rc.get("warm_pool_idle_ttl_secs") == 1200
+            # Independently switchable: flipping the pool flag must not touch the
+            # chain-continuity flag.
+            assert "warm_continuity_enabled" in body
+
+            # Boolean type-guard on the master switch.
+            bad = await client.patch(
+                "/api/admin/settings", json={"warm_pool_enabled": "true"}
+            )
+            assert bad.status_code == 400
+            bad2 = await client.patch(
+                "/api/admin/settings", json={"warm_pool_enabled": 1}
+            )
+            assert bad2.status_code == 400
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={k: v for k, v in original.items() if v is not None},
+            )
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("warm_pool_target_size", -1),
+            ("warm_pool_target_size", 51),
+            ("warm_pool_idle_ttl_secs", 59),
+            ("warm_pool_idle_ttl_secs", 86401),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_patch_warm_pool_config_reject_out_of_bounds(
+        self, client: AsyncClient, field: str, bad_value: int
+    ):
+        """Out-of-range warm-pool sizing values are rejected (target 0..50,
+        idle TTL 60..86400)."""
+        resp = await client.patch("/api/admin/settings", json={field: bad_value})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
         """The automain/LTS release-control flags — promotion_enabled,
         smoketest_enabled — are settable via PATCH and visible on GET

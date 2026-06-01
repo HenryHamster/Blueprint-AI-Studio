@@ -72,7 +72,7 @@ async def test_compute_current_axes_values(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Two merged tasks, each 5min on-demand. 1 cold (12s), 1 warm (no cold sample).
+    # Two merged tasks, one on-demand and one e2-standard-4. 1 cold (12s), 1 warm (no cold sample).
     # Warm signal lives in context['_timing']['warm_start'] (the column is only
     # ever written False at cold-provision time); the cold task participates in
     # the denominator via its vm_provisioned_at.
@@ -81,6 +81,7 @@ async def test_compute_current_axes_values(db_session):
         _make_efficient_task(
             project.id,
             vm_cold_start_ms=None,
+            vm_machine_type="e2-standard-4",
             api_call_summary={"llm_call_count": 80},
             context={
                 "pr_merged": True,
@@ -93,8 +94,8 @@ async def test_compute_current_axes_values(db_session):
 
     axes = await compute_current_axes(db_session, project.id)
 
-    # 2 merged * 300s * ON_DEMAND_RATE / 2 merged = 300 * ON_DEMAND_RATE
-    expected_cpm = round(300 * ON_DEMAND_RATE, 4)
+    # 300s * (e2-standard-2 + e2-standard-4) / 2 merged.
+    expected_cpm = round(300 * (ON_DEMAND_RATE + (0.134 / 3600)) / 2, 4)
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
     assert axes[AXIS_VM_COLD_START_P50_MS] == 12000.0
     assert axes[AXIS_VM_REUSE_RATE] == 0.5
