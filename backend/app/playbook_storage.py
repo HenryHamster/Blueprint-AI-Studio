@@ -257,7 +257,34 @@ async def finalize_pending_playbook_entries(
 
 
 def _archive_least_useful_entry(doc: dict) -> dict:
-    """Move the least-useful playbook entry to ``playbook_archive`` in *doc*."""
+    """Move the least-useful playbook entry to ``playbook_archive`` in *doc*.
+
+    This is the single source of truth for capacity-eviction selection; both
+    the storage path (``success_patterns``, ``admin_notifications``, and the
+    ``playbook_learning`` re-export) and the capacity path
+    (``playbook_capacity.maybe_archive_for_capacity`` — used by
+    ``playbook_auto``, ``review_learning`` and ``admin_agent_ops``) route
+    through here so the eviction order can never diverge again.
+
+    "Least useful" is determined by a reverse-sort over the tuple
+    ``(stale, effectiveness, age_days, key)`` — the entry with the highest
+    tuple is archived first:
+
+    1. ``stale_file_refs`` flag (stale entries first).
+    2. ``effectiveness``: a *proven low-rate* entry must always rank worse
+       (be archived before) an *untried* zero-count entry. To guarantee that,
+       entries with enough observations (``followed_count >=
+       _MIN_FOLLOWED_FOR_RATE``) use ``1.0 - success_rate`` which lives in
+       ``[0, 1]`` (1 == always-fails == worst), while untried/under-observed
+       entries fall back to ``-confirmed_count`` which lives in ``[-inf, 0]``
+       (0 == never confirmed). Because every rate-based score is ``>= 0`` and
+       every raw-count score is ``<= 0``, a measured poor performer is always
+       evicted before an unobserved entry.
+    3. Entry age (oldest ``updated_at`` first).
+    4. Key name (deterministic tie-break).
+
+    Returns the mutated *doc*; unchanged if there are no archiveable entries.
+    """
     now = _utcnow()
     candidates: list[tuple[int, float, int, str]] = []
     for key, value in doc.items():
@@ -276,11 +303,13 @@ def _archive_least_useful_entry(doc: dict) -> dict:
                 age_days = (now - updated).days
             except (ValueError, TypeError):
                 pass
-        effectiveness = (
-            -(confirmed / followed)
-            if followed >= _MIN_FOLLOWED_FOR_RATE
-            else -confirmed
-        )
+        # Rate-based entries map to [0, 1] (1 == worst, archived first); raw-count
+        # entries map to [-inf, 0] (0 == untried). Reverse-sorted, this guarantees a
+        # proven low-rate entry archives BEFORE an untried zero-count entry.
+        if followed >= _MIN_FOLLOWED_FOR_RATE:
+            effectiveness = 1.0 - (confirmed / followed)
+        else:
+            effectiveness = -confirmed
         candidates.append((stale, effectiveness, age_days, key))
 
     if not candidates:
