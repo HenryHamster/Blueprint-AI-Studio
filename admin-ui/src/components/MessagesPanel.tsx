@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { X, MessageSquare, Send, AlertTriangle, ChevronUp, Save, MoreVertical, Pencil, Trash2, Reply } from 'lucide-react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
@@ -7,16 +6,16 @@ import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToa
 import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
 import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
 import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './temporaryMutes';
-import { groupRoutineMessages, outcomeBreakdown, isFailingGroup, formatTimestamp } from './messageGrouping';
+import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
 import { type ProjectMessage } from './MessageBubble';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
-import { MessageTypeDropdown } from './MessageTypeDropdown';
-import { MuteWindowMenu } from './MuteWindowMenu';
-import { EventVisibilityMenu } from './EventVisibilityMenu';
+import { MessagesPanelHeader, type WebhookStats } from './MessagesPanelHeader';
+import { MessagesComposer } from './MessagesComposer';
+import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
 const DEFAULT_VIEW_ID = '__default__';
@@ -50,15 +49,6 @@ function viewMatches(
     if (view.prefs[k] !== state.prefs[k]) return false;
   }
   return true;
-}
-
-interface WebhookStats {
-  total_dispatched: number;
-  total_delivered: number;
-  total_failed: number;
-  last_failure_reason: string;
-  last_failure_at: string | null;
-  retry_queue_depth: number;
 }
 
 interface MessagesPanelProps {
@@ -162,7 +152,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [sortMode, setSortMode] = useState<'importance' | 'recent'>('importance');
   const [searchQuery, setSearchQuery] = useState('');
   const [webhookStats, setWebhookStats] = useState<WebhookStats | null>(null);
-  const [showWebhookDetail, setShowWebhookDetail] = useState(false);
   const [muteWindow, setMuteWindow] = useState<MuteWindow | null>(() => loadMuteWindow(auth.currentUser?.email, selectedProjectId));
   const [tempMutes, setTempMutes] = useState<TemporaryMutes>(() =>
     loadTemporaryMutes(auth.currentUser?.email, selectedProjectId),
@@ -704,14 +693,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }
 
-  // Auto-resize textarea
-  function handleTextareaInput() {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 96)}px`; // max 3 rows ~96px
-  }
-
   async function handleSubmit() {
     if (!selectedProjectId || !newContent.trim()) return;
     setSubmitting(true);
@@ -927,217 +908,51 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">
       {/* Header */}
-      <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
-        {/* Persistent last-visit anchor */}
-        {dividerTime && (
-          <div className="flex items-center gap-2 text-xs text-neutral-500 px-1">
-            <span>Last visit: {formatTimestamp(dividerTime)}</span>
-            {totalNewCount > 0 && (
-              <span className="text-blue-400 font-medium">
-                ({totalNewCount} new)
-              </span>
-            )}
-          </div>
-        )}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <MessageSquare className="w-4 h-4 text-neutral-400" />
-            <h2 className="text-sm font-semibold text-neutral-100">Messages</h2>
-            {newHighSignalCount > 0 && (
-              <span className="bg-blue-600/30 text-blue-300 border border-blue-500/50 text-xs font-semibold px-2 py-0.5 rounded-full animate-pulse">
-                {newHighSignalCount} new
-              </span>
-            )}
-            {highSignalOpen.length > 0 && (
-              <span className="bg-amber-500/20 text-amber-400 border border-amber-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
-                {highSignalOpen.length} high
-              </span>
-            )}
-            {openMessages.length > 0 && (
-              <span className="bg-blue-500/20 text-blue-400 border border-blue-500/40 text-xs font-semibold px-2 py-0.5 rounded-full">
-                {openMessages.length}
-              </span>
-            )}
-            {mutedCount > 0 && (
-              <button onClick={() => setShowPrefsPanel(true)} className="text-[11px] text-neutral-600 hover:text-neutral-400 transition-colors">
-                {mutedCount} muted
-              </button>
-            )}
-            {webhookStats && webhookStats.total_dispatched > 0 && (
-              <div className="relative">
-                <button
-                  onClick={() => setShowWebhookDetail(v => !v)}
-                  title="Webhook delivery health"
-                  className={`text-[11px] px-2 py-0.5 rounded-full border font-semibold transition-colors min-h-[44px] md:min-h-[28px] flex items-center ${
-                    webhookStats.total_failed > 0
-                      ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
-                      : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
-                  }`}
-                >
-                  {webhookStats.total_failed > 0 ? `${webhookStats.total_failed} webhook err` : 'webhooks ok'}
-                </button>
-                {showWebhookDetail && (
-                  <>
-                    <div className="fixed inset-0 z-40" onClick={() => setShowWebhookDetail(false)} />
-                    <div className="absolute left-0 top-full mt-1 z-50 w-52 bg-neutral-900 border border-neutral-700 rounded-xl shadow-xl p-3 space-y-1 text-[11px]">
-                      <p className="text-neutral-300 font-medium mb-1.5">Webhook delivery</p>
-                      <div className="flex justify-between text-neutral-400"><span>Delivered</span><span className="text-emerald-400">{webhookStats.total_delivered}</span></div>
-                      <div className="flex justify-between text-neutral-400"><span>Failed</span><span className={webhookStats.total_failed > 0 ? 'text-amber-400' : 'text-neutral-500'}>{webhookStats.total_failed}</span></div>
-                      <div className="flex justify-between text-neutral-400"><span>Retry queue</span><span>{webhookStats.retry_queue_depth}</span></div>
-                      {webhookStats.last_failure_reason && (
-                        <p className="mt-1 text-neutral-600 truncate" title={webhookStats.last_failure_reason}>Last err: {webhookStats.last_failure_reason.slice(0, 40)}</p>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-          </div>
-          <div className="flex items-center gap-1 flex-wrap justify-end">
-          <button
-            onClick={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
-            title="Toggle sort order"
-            className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
-          >
-            {sortMode === 'importance' ? 'Importance' : 'Recent'}
-          </button>
-          <button
-            onClick={() => setCriticalOnly(v => !v)}
-            title={criticalOnly ? 'Show all severities' : 'Critical only (BLOCKER, BUG, critical NOTEs)'}
-            className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
-              criticalOnly
-                ? 'text-amber-400 bg-amber-500/10 border-amber-500/30'
-                : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
-            }`}
-          >
-            <AlertTriangle className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={() => setShowOnlyNew(v => !v)}
-            disabled={!dividerTime}
-            title={!dividerTime ? 'No messages to filter (visit first)' : showOnlyNew ? 'Show all messages' : 'Only new since last visit'}
-            className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${
-              showOnlyNew && dividerTime
-                ? 'text-blue-400 bg-blue-500/10 border-blue-500/30'
-                : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
-            }`}
-          >
-            <ChevronUp className="w-3.5 h-3.5" />
-          </button>
-          {openFeedbackMessages.length > 1 && (
-            <button
-              onClick={() => {
-                if (selectMode) { setSelectMode(false); setSelectedIds(new Set()); }
-                else { setSelectMode(true); setSelectedIds(new Set(openFeedbackMessages.map(m => m.id))); }
-              }}
-              className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
-                selectMode ? 'text-purple-400 bg-purple-500/10 border border-purple-500/30' : 'text-neutral-500 hover:text-neutral-300 border border-transparent'
-              }`}
-            >
-              {selectMode ? 'Cancel' : 'Select'}
-            </button>
-          )}
-          <MuteWindowMenu
-            muteActive={muteActive}
-            muteWindow={muteWindow}
-            onSetMuteWindow={setMuteWindowPersisted}
-          />
-          <EventVisibilityMenu
-            open={showPrefsPanel}
-            onOpenChange={setShowPrefsPanel}
-            messages={messages}
-            eventPrefs={eventPrefs}
-            onUpdatePref={updatePref}
-            onResetAll={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {}); }}
-          />
-          <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center">
-            <X className="w-4 h-4" />
-          </button>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            placeholder="Search messages..."
-            className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
-          />
-          <button
-            onClick={openSaveDialog}
-            title="Save current filters as a view"
-            className="shrink-0 flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-200 border border-neutral-800/60 hover:border-neutral-700 transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto"
-          >
-            <Save className="w-3.5 h-3.5" />
-            <span className="hidden md:inline">Save view</span>
-          </button>
-        </div>
-        {/* Saved views tab strip with compact tabs: allows small touch targets for view-switcher buttons */}
-        <div
-          className="flex items-center gap-1 overflow-x-auto -mx-1 px-1"
-          data-testid="saved-views-tab-strip"
-          data-viewport-allow-small-target
-        >
-          {(() => {
-            const tabs: { id: string; name: string; isDefault: boolean; view: SavedView | null }[] = [
-              { id: DEFAULT_VIEW_ID, name: 'Default', isDefault: true, view: null },
-              ...savedViews.map(v => ({ id: v.id, name: v.name, isDefault: false, view: v })),
-            ];
-            return tabs.map(tab => {
-              const isActive = activeViewId === tab.id;
-              const showModified = isActive && activeTabModified;
-              return (
-                <div key={tab.id} className="relative shrink-0 flex items-center">
-                  <button
-                    onClick={() => applyView(tab.id)}
-                    title={tab.view?.description || tab.name}
-                    className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs transition-colors border min-h-[44px] md:min-h-[36px] ${
-                      isActive
-                        ? 'bg-blue-500/15 text-blue-300 border-blue-500/40'
-                        : 'text-neutral-500 hover:text-neutral-300 border-transparent hover:border-neutral-800/60'
-                    }`}
-                  >
-                    <span>{tab.name}</span>
-                    {showModified && (
-                      <span title="Filters changed" className="w-1.5 h-1.5 rounded-full bg-amber-400" data-testid="view-modified-dot" />
-                    )}
-                  </button>
-                  {!tab.isDefault && tab.view && (
-                    <div ref={openKebabId === tab.id ? kebabRef : undefined} className="relative">
-                      <button
-                        onClick={() => setOpenKebabId(prev => (prev === tab.id ? null : tab.id))}
-                        title="Manage view"
-                        aria-label={`Manage view ${tab.name}`}
-                        className="text-neutral-600 hover:text-neutral-300 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-                      >
-                        <MoreVertical className="w-3.5 h-3.5" />
-                      </button>
-                      {openKebabId === tab.id && (
-                        <div className="absolute right-0 top-full mt-1 z-50 min-w-[120px] bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl overflow-hidden">
-                          <button
-                            onClick={() => openRenameDialog(tab.view!)}
-                            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px]"
-                          >
-                            <Pencil className="w-3 h-3" />
-                            Rename
-                          </button>
-                          <button
-                            onClick={() => deleteView(tab.id)}
-                            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-red-500/10 transition-colors min-h-[44px]"
-                          >
-                            <Trash2 className="w-3 h-3" />
-                            Delete
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            });
-          })()}
-        </div>
-      </div>
+      <MessagesPanelHeader
+        dividerTime={dividerTime}
+        totalNewCount={totalNewCount}
+        newHighSignalCount={newHighSignalCount}
+        highSignalOpenCount={highSignalOpen.length}
+        openCount={openMessages.length}
+        mutedCount={mutedCount}
+        webhookStats={webhookStats}
+        sortMode={sortMode}
+        criticalOnly={criticalOnly}
+        showOnlyNew={showOnlyNew}
+        selectMode={selectMode}
+        openFeedbackCount={openFeedbackMessages.length}
+        muteActive={muteActive}
+        muteWindow={muteWindow}
+        onSetMuteWindow={setMuteWindowPersisted}
+        showPrefsPanel={showPrefsPanel}
+        onShowPrefsChange={setShowPrefsPanel}
+        messages={messages}
+        eventPrefs={eventPrefs}
+        onUpdatePref={updatePref}
+        onResetAllPrefs={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {}); }}
+        searchQuery={searchQuery}
+        onSearchChange={setSearchQuery}
+        onOpenSaveDialog={openSaveDialog}
+        savedViews={savedViews}
+        activeViewId={activeViewId}
+        defaultViewId={DEFAULT_VIEW_ID}
+        activeTabModified={activeTabModified}
+        openKebabId={openKebabId}
+        setOpenKebabId={setOpenKebabId}
+        kebabRef={kebabRef}
+        onApplyView={applyView}
+        onRenameView={openRenameDialog}
+        onDeleteView={deleteView}
+        onToggleSort={() => setSortMode(m => m === 'importance' ? 'recent' : 'importance')}
+        onToggleCriticalOnly={() => setCriticalOnly(v => !v)}
+        onToggleShowOnlyNew={() => setShowOnlyNew(v => !v)}
+        onToggleSelectMode={() => {
+          if (selectMode) { setSelectMode(false); setSelectedIds(new Set()); }
+          else { setSelectMode(true); setSelectedIds(new Set(openFeedbackMessages.map(m => m.id))); }
+        }}
+        onOpenMutedPrefs={() => setShowPrefsPanel(true)}
+        onClose={onClose}
+      />
 
       {/* Save view dialog */}
       {showSaveDialog && (
@@ -1205,56 +1020,25 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {/* Batch action bar */}
       {selectMode && selectedIds.size > 0 && (
-        <div className="px-4 md:px-6 py-2 border-t border-neutral-800 bg-neutral-900 flex items-center gap-3 shrink-0">
-          <span className="text-xs text-neutral-400">{selectedIds.size} selected</span>
-          <button
-            onClick={handleBatchCreateDirections}
-            disabled={batchCreating}
-            className="text-xs bg-purple-600 hover:bg-purple-500 text-white px-3 py-1.5 rounded-lg disabled:opacity-40 transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
-          >
-            {batchCreating ? 'Creating...' : 'Create Directions'}
-          </button>
-        </div>
+        <MessagesBatchActionBar
+          selectedCount={selectedIds.size}
+          batchCreating={batchCreating}
+          onCreateDirections={handleBatchCreateDirections}
+        />
       )}
 
       {/* Compose area — bottom, chat-style */}
-      <div className="px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50">
-        {/* Reply quote bar */}
-        {replyTo && (
-          <div className="flex items-center gap-2 mb-2 px-3 py-1.5 bg-neutral-800/60 border-l-2 border-blue-500/50 rounded-r-lg">
-            <Reply className="w-3 h-3 text-blue-400 shrink-0" />
-            <span className="text-xs text-neutral-400 truncate flex-1">
-              Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
-            </span>
-            <button onClick={() => setReplyTo(null)} className="text-neutral-500 hover:text-neutral-300 p-0.5 shrink-0 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
-              <X className="w-3 h-3" />
-            </button>
-          </div>
-        )}
-        <div className="flex gap-2 items-end">
-          <MessageTypeDropdown value={newType} onChange={setNewType} />
-          <div className="flex-1 relative">
-            <textarea
-              ref={textareaRef}
-              value={newContent}
-              onChange={e => { setNewContent(e.target.value); handleTextareaInput(); }}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
-              }}
-              placeholder="Type a message..."
-              rows={1}
-              className="w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed"
-            />
-          </div>
-          <button
-            onClick={handleSubmit}
-            disabled={submitting || !newContent.trim()}
-            className="bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center"
-          >
-            <Send className="w-4 h-4" />
-          </button>
-        </div>
-      </div>
+      <MessagesComposer
+        textareaRef={textareaRef}
+        newType={newType}
+        newContent={newContent}
+        submitting={submitting}
+        replyTo={replyTo}
+        onChangeType={setNewType}
+        onChangeContent={setNewContent}
+        onCancelReply={() => setReplyTo(null)}
+        onSubmit={handleSubmit}
+      />
     </div>
   );
 }
