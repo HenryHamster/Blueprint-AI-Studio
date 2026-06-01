@@ -1,17 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import {
-  AlertTriangle,
-  CheckCircle,
-  ExternalLink,
-  GitMerge,
-} from 'lucide-react';
-import { ResponsiveContainer, AreaChart, Area } from 'recharts';
+import { AlertTriangle } from 'lucide-react';
 import { apiFetch, fetchTask, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse, type SrReviewerDisagreementsEnvelope } from '../api';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
-import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { timeAgo, formatDurationSec } from '../utils/time';
-import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
 import { PRMonitorSection, type OpenPR } from './PRMonitorSection';
@@ -33,8 +24,6 @@ import { type SrMissedTask, type DirectionSrEntry } from './SrTrendBreakdown';
 import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
 import { SrDiagnosticsStack, type BlindSpotsData, type DirectionSrBreakdownData } from './SrDiagnosticsStack';
 import {
-  Skeleton,
-  FAILURE_CLASS_COLORS,
   MetricCard,
   FailedCard,
   SuccessRateCard,
@@ -44,9 +33,20 @@ import {
   SrCatchRateCard,
 } from './DashboardMetricCards';
 import { RecurringPatternsSection } from './RecurringPatternsSection';
-import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
+import { TAXONOMY_ORDER } from './dashboardConstants';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import { SystemStatusCard } from './SystemStatusCard';
+import { PipelineEfficiencyPanel } from './PipelineEfficiencyPanel';
+import { FailureClassPill } from './FailureClassPill';
+import { SystemHealthCard, type HealthOverviewResponse } from './SystemHealthCard';
+import { AnomalyThrottleBanner } from './AnomalyThrottleBanner';
+import { FailureTaxonomyBreakdown } from './FailureTaxonomyBreakdown';
+import { ReviewRejectionBreakdown } from './ReviewRejectionBreakdown';
+import { CostOfFailuresWidget } from './CostOfFailuresWidget';
+import { ResearchYieldFunnel } from './ResearchYieldFunnel';
+import { OpenResidualCasesSection } from './OpenResidualCasesSection';
+import { RejectionPatternSummary } from './RejectionPatternSummary';
+import { RecentMergesTimeline } from './RecentMergesTimeline';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
 import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
@@ -60,97 +60,16 @@ export type { FailureGroup };
 
 // ---------- local types ----------
 
-interface HealthOverviewIssue {
-  severity: 'critical' | 'warning' | 'info';
-  title: string;
-  hint: string;
-  task_ids: string[];
-  category: string;
-}
-
-interface HealthOverviewResponse {
-  overall_status: 'healthy' | 'degraded' | 'unhealthy';
-  success_rate: { current: number | null; trend: string | null; window_hours: number };
-  queue_depth: { queued: number; active: number; evaluating: number };
-  actionable_issues: HealthOverviewIssue[];
-}
-
-const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
-  heartbeat_lost: 'heartbeat lost',
-  oom: 'OOM',
-  execution_timeout: 'exec timeout',
-  cascade_cancellation: 'cascade',
-  iteration_limit: 'iter limit',
-  process_crash: 'crash',
-  unknown: 'unknown',
-};
-
 // SrFixIterationBucket and SrTrendWithFixIterations are defined and exported from ReviewQualitySection
 export type { SrFixIterationBucket, SrTrendWithFixIterations };
 
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
 export type { DirectionSrEntry };
 
-const TAXONOMY_STROKE: Record<string, string> = {
-  scope_related: '#22d3ee',
-  review_quality: '#a855f7',
-  infra_related: '#f59e0b',
-  code_defect: '#ef4444',
-};
-
-const REVIEW_CAT_ORDER = ['lint', 'type', 'logic', 'scope', 'architecture', 'other'] as const;
-const REVIEW_CAT_COLORS: Record<string, string> = {
-  lint: 'bg-amber-500/20 text-amber-400 border-amber-500/30',
-  type: 'bg-orange-500/20 text-orange-400 border-orange-500/30',
-  logic: 'bg-red-500/20 text-red-400 border-red-500/30',
-  scope: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
-  architecture: 'bg-purple-500/20 text-purple-400 border-purple-500/30',
-  other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
-};
-
 export interface SparkPoint {
   active: number;
   queued: number;
   failed: number;
-}
-
-// ---------- Pipeline Efficiency Panel ----------
-
-function EffDelta({ delta, lowerIsBetter }: { delta: number | null | undefined; lowerIsBetter: boolean }) {
-  if (delta === null || delta === undefined || delta === 0) return null;
-  const improving = lowerIsBetter ? delta < 0 : delta > 0;
-  return <span className={`ml-0.5 ${improving ? 'text-emerald-400' : 'text-red-400'}`}>{delta > 0 ? '↑' : '↓'}</span>;
-}
-
-function PipelineEfficiencyPanel({ projectId }: { projectId: string | null }) {
-  const data = useEfficiencySnapshot(projectId);
-  if (!data) return null;
-
-  const w24 = data.window_24h;
-  const w7 = data.window_7d;
-
-  return (
-    <section>
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Pipeline Efficiency</h2>
-      <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400">
-        <span>
-          <span className="text-neutral-500">cold-start p50</span>{': '}
-          <span className="font-mono text-neutral-300">{fmtEffSecs(w24?.setup_p50_secs)}</span>
-          <EffDelta delta={w24?.vs_prior_setup_p50_delta} lowerIsBetter />
-        </span>
-        <span>
-          <span className="text-neutral-500">reuse rate</span>{': '}
-          <span className="font-mono text-neutral-300">{fmtEffRate(w24?.warm_reuse_rate)}</span>
-          <EffDelta delta={w24?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
-        </span>
-        <span>
-          <span className="text-neutral-500">review cycles p50</span>{': '}
-          <span className="font-mono text-neutral-300">{fmtEffIter(w7?.review_iter_median)}</span>
-          <EffDelta delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
-        </span>
-      </div>
-    </section>
-  );
 }
 
 // ---------- props ----------
@@ -166,214 +85,6 @@ export interface DashboardHomeProps {
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
 }
-
-// ---------- helpers ----------
-
-const FAILURE_CLASS_STROKE: Record<string, string> = {
-  CODE_ERROR: '#f87171',
-  PROVISION_FAILURE: '#fb923c',
-  AGENT_TIMEOUT: '#fbbf24',
-  RATE_LIMIT: '#facc15',
-  EXTERNAL_API: '#c084fc',
-  SCOPE_OVERFLOW: '#2dd4bf',
-};
-
-const TASK_TYPE_COLORS: Record<string, string> = {
-  create: 'bg-emerald-500/20 text-emerald-400',
-  fix: 'bg-red-500/20 text-red-400',
-  review: 'bg-amber-500/20 text-amber-400',
-  research: 'bg-blue-500/20 text-blue-400',
-  plan: 'bg-purple-500/20 text-purple-400',
-  refactor: 'bg-cyan-500/20 text-cyan-400',
-};
-
-
-// ---------- failure class pill ----------
-
-function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; sparkData?: { v: number }[]; cost?: number }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const colorClass = FAILURE_CLASS_COLORS[group.failure_class] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-  const stroke = FAILURE_CLASS_STROKE[group.failure_class] ?? '#a3a3a3';
-  const topTasks = group.tasks.slice(0, 3);
-  const hasSpark = sparkData && sparkData.length >= 3;
-
-  useEffect(() => {
-    if (!open) return;
-    function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    }
-    document.addEventListener('mousedown', handleClick);
-    return () => document.removeEventListener('mousedown', handleClick);
-  }, [open]);
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        className={`inline-flex items-center justify-center gap-1.5 text-[10px] font-semibold px-3 py-2 rounded border min-h-11 ${colorClass} cursor-pointer`}
-        onClick={() => setOpen(v => !v)}
-        title={`${group.label}: ${group.count} failure${group.count !== 1 ? 's' : ''}`}
-      >
-        {group.label}
-        <span className="font-bold">{group.count}</span>
-        {cost != null && cost > 0 && (
-          <span className="font-mono text-[9px] opacity-80">${cost.toFixed(2)}</span>
-        )}
-        {hasSpark && (
-          <span className="w-16 h-3 inline-block">
-            <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
-              <AreaChart data={sparkData}>
-                <defs>
-                  <linearGradient id={`fsp-${group.failure_class}`} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={stroke} stopOpacity={0.4} />
-                    <stop offset="100%" stopColor={stroke} stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <Area type="monotone" dataKey="v" stroke={stroke} fill={`url(#fsp-${group.failure_class})`} strokeWidth={1} dot={false} isAnimationActive={false} />
-              </AreaChart>
-            </ResponsiveContainer>
-          </span>
-        )}
-      </button>
-      {open && topTasks.length > 0 && (
-        <div className="absolute z-10 top-full mt-1 left-0 w-64 bg-neutral-900 border border-neutral-700 rounded-lg p-2 shadow-lg">
-          <div className="space-y-1">
-            {topTasks.map(t => (
-              <div key={t.task_id} className="text-[10px] text-neutral-300 flex items-center gap-1 min-w-0">
-                {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
-                  <span className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
-                    {TAXONOMY_LABELS[t.taxonomy]}
-                  </span>
-                )}
-                <span className="truncate">{t.title}</span>
-                {group.failure_class === 'AGENT_TIMEOUT' && t.timeout_subtype && (
-                  <span
-                    className="shrink-0 text-[9px] font-mono px-1 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"
-                    title={`Timeout subtype: ${t.timeout_subtype}`}
-                  >
-                    {TIMEOUT_SUBTYPE_LABELS[t.timeout_subtype] ?? t.timeout_subtype}
-                  </span>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ---------- cost breakdown pill ----------
-
-// ---------- system health card ----------
-
-const _HEALTH_SEV_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
-const _HEALTH_SEV_ICON: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
-const _HEALTH_STATUS_STYLE: Record<string, { badge: string; label: string }> = {
-  healthy: { badge: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400', label: 'Healthy' },
-  degraded: { badge: 'bg-amber-500/10 border-amber-500/30 text-amber-400', label: 'Degraded' },
-  unhealthy: { badge: 'bg-red-500/10 border-red-500/30 text-red-400', label: 'Unhealthy' },
-};
-
-function SystemHealthCard({
-  data,
-  loading,
-  tasks,
-  onViewTask,
-}: {
-  data: HealthOverviewResponse | null;
-  loading: boolean;
-  tasks: Task[];
-  onViewTask: (task: Task) => void;
-}) {
-  const status = data?.overall_status ?? 'healthy';
-  const statusStyle = _HEALTH_STATUS_STYLE[status] ?? _HEALTH_STATUS_STYLE.healthy;
-  const sr = data?.success_rate;
-  const qd = data?.queue_depth;
-  const issues = data?.actionable_issues ?? [];
-  const trendColor = sr?.trend === 'improving' ? 'text-emerald-400' : sr?.trend === 'declining' ? 'text-red-400' : 'text-neutral-400';
-  const trendIcon = sr?.trend === 'improving' ? '↑' : sr?.trend === 'declining' ? '↓' : '→';
-
-  return (
-    <section>
-      <div className="flex items-center gap-2 mb-2">
-        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">System Health</h2>
-        {!loading && data && (
-          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${statusStyle.badge}`}>
-            {statusStyle.label}
-          </span>
-        )}
-      </div>
-      {loading ? (
-        <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-14 w-full" /></div>
-      ) : (
-        <>
-          {data && (sr?.current != null || qd) && (
-            <div className="flex flex-wrap gap-2 mb-2">
-              {sr?.current != null && (
-                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-1.5">
-                  <span className="text-neutral-500">Success</span>
-                  <span className="font-mono font-bold text-neutral-200">{Math.round(sr.current * 100)}%</span>
-                  {sr.trend && <span className={`text-[10px] ${trendColor}`}>{trendIcon}</span>}
-                </div>
-              )}
-              {qd && (
-                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-2">
-                  <span className="text-neutral-500">Queue</span>
-                  <span className="font-mono text-neutral-300" title="queued">{qd.queued}q</span>
-                  <span className="font-mono text-neutral-300" title="active">{qd.active}a</span>
-                  <span className="font-mono text-neutral-300" title="evaluating">{qd.evaluating}e</span>
-                </div>
-              )}
-            </div>
-          )}
-          {issues.length === 0 ? (
-            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
-              <CheckCircle className="w-4 h-4" />
-              All systems healthy
-            </div>
-          ) : (
-            <div className="space-y-1.5">
-              {issues.map((issue, i) => {
-                const borderCls = _HEALTH_SEV_BORDER[issue.severity] ?? 'border-l-neutral-500';
-                const iconCls = _HEALTH_SEV_ICON[issue.severity] ?? 'text-neutral-400';
-                const linkedTasks = issue.task_ids.slice(0, 3)
-                  .map(id => tasks.find(t => t.id === id))
-                  .filter((t): t is Task => t != null);
-                return (
-                  <div key={i} className={`bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg p-3`}>
-                    <div className="flex items-start gap-2">
-                      <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${iconCls}`} />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-xs text-neutral-200">{issue.title}</p>
-                        {issue.hint && <p className="text-[10px] text-neutral-500 mt-0.5">{issue.hint}</p>}
-                        {linkedTasks.length > 0 && (
-                          <div className="flex flex-wrap gap-1 mt-1.5">
-                            {linkedTasks.map(t => (
-                              <button
-                                key={t.id}
-                                onClick={() => onViewTask(t)}
-                                className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-700/60 transition-colors truncate max-w-[200px] min-h-[44px] flex items-center"
-                              >
-                                {(t.title ?? t.id).slice(0, 40)}
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </>
-      )}
-    </section>
-  );
-}
-
-// ---------- skeleton ----------
 
 // ---------- component ----------
 
@@ -852,47 +563,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           )}
 
           {/* Section 1c: Failure Taxonomy Breakdown */}
-          {!loading && digest?.failure_taxonomy_distribution && digest.failure_taxonomy_distribution.total_failures > 0 && (
-            <section>
-              <div className="flex flex-wrap gap-1.5 items-center">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Taxonomy</span>
-                {TAXONOMY_ORDER.map(k => {
-                  const tax = digest.failure_taxonomy_distribution;
-                  if (!tax) return null;
-                  const cat = tax.categories[k];
-                  if (!cat) return null;
-                  const isDominant = tax.dominant_category === k;
-                  const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-                  const cls = isDominant ? `${base} ring-1 ring-current` : base;
-                  const stroke = TAXONOMY_STROKE[k] ?? '#a3a3a3';
-                  const taxSpark = taxSparkMap[k] ?? [];
-                  const hasSpark = taxSpark.length >= 3;
-                  return (
-                    <span key={k} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
-                      {TAXONOMY_LABELS[k]}
-                      <span className="font-bold">{cat.count}</span>
-                      <span className="opacity-70">{cat.percentage}%</span>
-                      {hasSpark && (
-                        <span className="w-16 h-3 inline-block">
-                          <ResponsiveContainer width="100%" height="100%" minWidth={1} minHeight={1}>
-                            <AreaChart data={taxSpark}>
-                              <defs>
-                                <linearGradient id={`tsp-${k}`} x1="0" y1="0" x2="0" y2="1">
-                                  <stop offset="0%" stopColor={stroke} stopOpacity={0.4} />
-                                  <stop offset="100%" stopColor={stroke} stopOpacity={0} />
-                                </linearGradient>
-                              </defs>
-                              <Area type="monotone" dataKey="v" stroke={stroke} fill={`url(#tsp-${k})`} strokeWidth={1} dot={false} isAnimationActive={false} />
-                            </AreaChart>
-                          </ResponsiveContainer>
-                        </span>
-                      )}
-                    </span>
-                  );
-                })}
-              </div>
-            </section>
-          )}
+          {!loading && <FailureTaxonomyBreakdown digest={digest} taxSparkMap={taxSparkMap} />}
 
           {/* Section 1d: Failure Stage Distribution */}
           {!loading && <FailureStageWidget distribution={digest?.failure_stage_distribution} />}
@@ -923,31 +594,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           )}
 
           {/* Section 1d2: Review Rejection Reason Breakdown */}
-          {!loading && (() => {
-            const cats = digest?.first_attempt_success_rate?.first_attempt_by_review_category;
-            if (!cats || Object.keys(cats).length === 0) return null;
-            const ordered = REVIEW_CAT_ORDER.filter(k => cats[k] != null);
-            const extras = Object.keys(cats).filter(k => !REVIEW_CAT_ORDER.includes(k as typeof REVIEW_CAT_ORDER[number]));
-            const allKeys = [...ordered, ...extras];
-            return (
-              <section>
-                <div className="flex flex-wrap gap-1.5 items-center">
-                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Review Rejection</span>
-                  {allKeys.map(k => {
-                    const pct = cats[k];
-                    if (pct == null) return null;
-                    const color = REVIEW_CAT_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-                    return (
-                      <span key={k} className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border ${color}`} title={`${k}: ${Math.round(pct * 100)}% of first-attempt rejections`}>
-                        {k}
-                        <span className="font-bold">{Math.round(pct * 100)}%</span>
-                      </span>
-                    );
-                  })}
-                </div>
-              </section>
-            );
-          })()}
+          {!loading && <ReviewRejectionBreakdown digest={digest} />}
 
           {/* Section 1d3: Review Quality */}
           <ReviewQualitySection
@@ -1000,72 +647,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           />
 
           {/* Section 1d4: Cost of Failures */}
-          {!loading && (digest?.total_failed_cost_usd ?? 0) > 0 && (
-            <section>
-              <div className="flex flex-wrap gap-1.5 items-center">
-                <span className="text-[10px] text-neutral-500 uppercase tracking-wide mr-1">Cost of Failures</span>
-                <span className="text-sm font-bold text-red-400">${(digest?.total_failed_cost_usd ?? 0).toFixed(2)}</span>
-                {Object.entries(digest?.cost_by_failure_class ?? {})
-                  .sort((a, b) => b[1] - a[1])
-                  .map(([cls, cost]) => {
-                    const color = FAILURE_CLASS_COLORS[cls] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
-                    return (
-                      <span key={cls} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${color}`}>
-                        {cls}
-                        <span className="font-bold">${cost.toFixed(2)}</span>
-                      </span>
-                    );
-                  })}
-              </div>
-            </section>
-          )}
+          {!loading && <CostOfFailuresWidget digest={digest} />}
 
           {/* Section 1e: Pipeline Filter Funnel */}
-          {!loading && digest?.pipeline_filter_funnel && (digest.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
-            const ff = digest.pipeline_filter_funnel;
-            const produced = ff.findings_produced ?? 0;
-            const created = ff.tasks_created ?? 0;
-            const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
-            const FILTER_KEYS: { key: string; label: string }[] = [
-              { key: 'hash_dedup', label: 'hash dedup' },
-              { key: 'word_overlap', label: 'word overlap' },
-              { key: 'file_overlap', label: 'file overlap' },
-              { key: 'type_filtered', label: 'type filter' },
-              { key: 'empty_prompt', label: 'empty prompt' },
-              { key: 'batch_cap', label: 'batch cap' },
-            ];
-            const drops = FILTER_KEYS
-              .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
-              .filter(f => f.v > 0)
-              .sort((a, b) => b.v - a.v);
-            const topDrop = drops[0];
-            return (
-              <section>
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
-                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
-                  <span>
-                    <span className="font-semibold text-neutral-200">{created}</span>
-                    <span className="text-neutral-500"> / {produced} findings &rarr; tasks </span>
-                    <span className="font-semibold text-neutral-200">({pct}%)</span>
-                  </span>
-                  {topDrop && (
-                    <span className="text-neutral-500">
-                      top drop: <span className="text-neutral-300">{topDrop.label}</span> <span className="font-mono text-neutral-400">-{topDrop.v}</span>
-                    </span>
-                  )}
-                  {drops.length > 1 && (
-                    <span className="flex flex-wrap gap-1">
-                      {drops.slice(1).map(d => (
-                        <span key={d.key} className="text-[10px] text-neutral-500" title={d.label}>
-                          {d.label} <span className="font-mono text-neutral-400">-{d.v}</span>
-                        </span>
-                      ))}
-                    </span>
-                  )}
-                </div>
-              </section>
-            );
-          })()}
+          {!loading && <ResearchYieldFunnel digest={digest} />}
 
           {/* Section 1f: Remediation Funnel */}
           {selectedProjectId && (
@@ -1077,36 +662,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               onViewTask={handleViewTaskById}
             />
           )}
-          {!loading && (() => {
-            const groups = digest?.remediation_funnel?.residual_remediation_funnel?.open_cases_by_error_class ?? [];
-            if (!groups.length) return null;
-            return (
-              <section>
-                <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Open Residual Cases</h2>
-                <div className="space-y-2">
-                  {groups.map((group) => (
-                    <div key={group.error_class} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2">
-                      <div className="flex items-center justify-between mb-1 text-xs">
-                        <span className="font-semibold text-neutral-300">{group.error_class} · {group.count}</span>
-                        <span className="text-neutral-500">{group.most_recent_at ? `latest ${timeAgo(group.most_recent_at)}` : 'no timestamp'}</span>
-                      </div>
-                      <div className="space-y-1">
-                        {group.cases.slice(0, 8).map((c) => (
-                          <div key={c.fingerprint} className="text-[11px] text-neutral-400 border border-neutral-800/60 rounded px-2 py-1">
-                            <div className="flex items-center justify-between gap-2">
-                              <span className="font-mono truncate min-w-0">{c.fingerprint.slice(0, 18)}…</span>
-                              <span className="text-neutral-500 shrink-0">{c.status} · {c.hit_count} hits · {c.last_seen_at ? timeAgo(c.last_seen_at) : 'unknown age'}</span>
-                            </div>
-                            {c.sample_message && <div className="truncate text-neutral-500">{c.sample_message}</div>}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            );
-          })()}
+          {!loading && <OpenResidualCasesSection digest={digest} />}
 
           {/* Section 1f2: System Maturity */}
           {selectedProjectId && (
@@ -1120,32 +676,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           />
 
           {/* Section 1h: Rejection Pattern Summary */}
-          {(() => {
-            const rps = digest?.rejection_pattern_summary;
-            if (!rps || rps.total_rejected === 0 || rps.top_notes.length === 0) return null;
-            return (
-              <section>
-                <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
-                  Human Rejection Patterns <span className="text-neutral-600 font-normal normal-case tracking-normal">· {rps.total_rejected} rejected</span>
-                </h2>
-                <div className="flex flex-col gap-1">
-                  {rps.top_notes.map((note, i) => (
-                    <div
-                      key={i}
-                      className="flex items-start gap-2 text-xs bg-neutral-900/50 border border-neutral-800/50 px-2 py-1.5 rounded"
-                    >
-                      <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-rose-500/10 text-rose-400 border border-rose-500/20 tabular-nums">
-                        ×{note.count}
-                      </span>
-                      <span className="flex-1 text-neutral-400 font-mono text-[10px] break-words" title={note.snippet}>
-                        {note.snippet.length > 160 ? note.snippet.slice(0, 160) + '…' : note.snippet}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            );
-          })()}
+          <RejectionPatternSummary digest={digest} />
 
           {/* Section 2: Direction Portfolio Health */}
           <DirectionPortfolioSection
@@ -1213,46 +744,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
         {/* Section 4: Recent Merge Timeline */}
         <div className="lg:col-span-1">
-          <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Recent Merges</h2>
-          {loading ? (
-            <div className="space-y-3"><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /></div>
-          ) : mergeEvents.length === 0 ? (
-            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No recent merges</div>
-          ) : (
-            <div className="relative pl-4 space-y-0">
-              {/* vertical line */}
-              <div className="absolute left-1.5 top-1 bottom-1 w-px bg-neutral-800" />
-              {mergeEvents.map(ev => {
-                const dotColor = (ev.task_type === 'fix' || ev.task_type === 'review') ? 'bg-amber-500' : 'bg-emerald-500';
-                const typeCls = TASK_TYPE_COLORS[ev.task_type ?? ''] ?? 'bg-neutral-500/20 text-neutral-400';
-                const dirLabel = ev.direction_text ? ev.direction_text.slice(0, 30) + (ev.direction_text.length > 30 ? '…' : '') : null;
-                return (
-                  <div key={ev.task_id} className="relative pb-3">
-                    <div className={`absolute -left-2.5 top-1.5 w-2 h-2 rounded-full ${dotColor} ring-2 ring-neutral-950`} />
-                    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
-                      <div className="flex items-start gap-2">
-                        <GitMerge className="w-3.5 h-3.5 text-neutral-500 mt-0.5 shrink-0" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs text-neutral-200 truncate">{ev.title}</p>
-                          {dirLabel && <p className="text-[9px] text-neutral-500 truncate mt-0.5">{dirLabel}</p>}
-                          <div className="flex items-center gap-2 mt-1 text-[10px] text-neutral-500">
-                            {ev.task_type && <span className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${typeCls}`}>{ev.task_type}</span>}
-                            <span>{timeAgo(ev.completed_at ?? '')}</span>
-                            {ev.duration_seconds != null && <span>{formatDurationSec(ev.duration_seconds)}</span>}
-                          </div>
-                        </div>
-                        {ev.pr_url && isSafeUrl(ev.pr_url) && (
-                          <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0" data-viewport-allow-small-target title="View PR on GitHub">
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
+          <RecentMergesTimeline mergeEvents={mergeEvents} loading={loading} />
 
           {/* Direction auto-pause/recovery observability */}
           <div className="mt-4">
@@ -1277,95 +769,3 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     </div>
   );
 }
-
-
-// ---------- anomaly throttle banner ----------
-
-function AnomalyThrottleBanner({ digest, onRestored }: { digest: DigestData | null; onRestored?: () => void }) {
-  const [restoring, setRestoring] = useState(false);
-  const [restoreError, setRestoreError] = useState<string | null>(null);
-  const adj = digest?.anomaly_adjustment;
-  if (!adj || !adj.active) return null;
-  const triggers = adj.trigger_anomalies ?? [];
-  const pre = adj.pre_adjustment_max_vms;
-  const post = adj.adjusted_max_vms;
-  const gatePre = adj.pre_adjustment_failure_gate;
-  const gateNow = adj.failure_gate_threshold;
-  const handleRestore = async () => {
-    setRestoring(true);
-    setRestoreError(null);
-    try {
-      const res = await apiFetch('/api/admin/anomaly-throttle/restore', { method: 'POST' });
-      if (!res.ok) {
-        setRestoreError(`Restore failed (${res.status})`);
-        return;
-      }
-      onRestored?.();
-    } catch {
-      setRestoreError('Restore failed');
-    } finally {
-      setRestoring(false);
-    }
-  };
-  return (
-    <section>
-      <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 flex items-start gap-2">
-        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-        <div className="flex-1 min-w-0">
-          <div className="text-xs font-semibold text-amber-300">
-            Pipeline auto-throttled
-            {adj.adjusted_at && (
-              <span className="ml-2 text-[10px] font-normal text-amber-400/70">
-                {timeAgo(adj.adjusted_at)}
-              </span>
-            )}
-          </div>
-          <div className="text-[11px] text-amber-200/80 mt-1 space-y-0.5">
-            {triggers.length > 0 && (
-              <div>
-                <span className="text-amber-400/60">Triggers: </span>
-                <span className="font-mono">{triggers.join(', ')}</span>
-              </div>
-            )}
-            {pre != null && post != null && (
-              <div>
-                <span className="text-amber-400/60">max_vms: </span>
-                <span className="font-mono">{pre} → {post}</span>
-              </div>
-            )}
-            {gatePre != null && gateNow != null && gatePre !== gateNow && (
-              <div>
-                <span className="text-amber-400/60">failure_gate: </span>
-                <span className="font-mono">{gatePre} → {gateNow}</span>
-              </div>
-            )}
-            {(adj.forced_restoration_count ?? 0) > 0 && (
-              <div className="text-amber-400/60">
-                Forced restorations: {adj.forced_restoration_count}
-                {adj.forced_restored_at && ` (last ${timeAgo(adj.forced_restored_at)})`}
-              </div>
-            )}
-          </div>
-          <div className="mt-2 flex items-center gap-2 flex-wrap">
-            {/* eslint-disable-next-line viewport/min-touch-target -- dense banner control, mirrors Reset Circuit Breaker affordance */}
-            <button
-              type="button"
-              onClick={handleRestore}
-              disabled={restoring}
-              className="text-[11px] font-medium px-2 py-1 rounded border border-amber-500/40 text-amber-200 hover:bg-amber-500/20 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {restoring ? 'Restoring…' : 'Clear throttle / Restore now'}
-            </button>
-            {restoreError && (
-              <span className="text-[11px] text-red-400">{restoreError}</span>
-            )}
-          </div>
-          <div className="text-[10px] text-amber-400/60 mt-1">
-            Otherwise auto-restores once the triggering anomalies clear — this is an early restore, not the only path.
-          </div>
-        </div>
-      </div>
-    </section>
-  );
-}
-
