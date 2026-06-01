@@ -1070,7 +1070,12 @@ def _external_api_subtype_from_message(combined: str) -> str:
     if any(
         kw in combined
         for kw in (
-            "401",
+            # Anchored "http 401" instead of bare "401" so benign lines that
+            # merely contain the digits 401 (timestamps, counts, ids) don't get
+            # routed to provider_auth. `combined` is lowercased so this also
+            # matches "HTTP 401". Genuine auth failures still carry
+            # "unauthorized"/"bad credentials"/"token …" below.
+            "http 401",
             "unauthorized",
             "bad credentials",
             "token expired",
@@ -1133,7 +1138,11 @@ def _external_api_subtype_from_message(combined: str) -> str:
         for kw in (
             "connection timed out",
             "name resolution failed",
-            "ssl",
+            # Anchored "ssl handshake failed" instead of bare "ssl" so benign
+            # SSL/TLS mentions (a module path containing "openssl", "ssl context
+            # reused", etc.) don't get routed to network_transient. Real TLS
+            # failures still carry this phrase or "certificate" below.
+            "ssl handshake failed",
             "certificate",
             "could not resolve hostname",
             "name or service not known",
@@ -2049,7 +2058,12 @@ def _classify_failure_class(
             "claude api",
             "connection timed out",
             "name resolution failed",
-            "ssl",
+            # Anchored: bare "ssl" matched benign log lines that merely mention
+            # SSL/TLS (e.g. "ssl context reused", a module path containing
+            # "openssl") and misrouted them to EXTERNAL_API. False positives grow
+            # with log volume, so require the actual failure phrase. `combined`
+            # is lowercased so this also matches "SSL handshake failed".
+            "ssl handshake failed",
             "certificate",
             "context_length_exceeded",
             "token limit exceeded",
@@ -2059,7 +2073,11 @@ def _classify_failure_class(
             "failed to create pull request",
             "rollup pr creation failed",
             "staging branch",
-            "401",
+            # Anchored: bare "401" matched any log line containing the digits 401
+            # (timestamps, byte counts, exit codes, ids) and misrouted them.
+            # Match the HTTP-status-anchored form; genuine auth failures still
+            # also carry "unauthorized"/"bad credentials"/"token …" below.
+            "http 401",
             "unauthorized",
             "bad credentials",
             "token expired",

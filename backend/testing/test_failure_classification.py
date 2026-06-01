@@ -712,6 +712,47 @@ class TestClassifyFailureExternalApi:
         )
 
 
+class TestClassifyFailureBenignSubstringNotMisclassified:
+    """Anchored "ssl"/"401" keywords: a benign log line that merely *contains*
+    the substring "ssl" or the digits "401" (and no genuine network/auth error
+    phrase) must NOT be misrouted to EXTERNAL_API. Before the keywords were
+    anchored ("ssl handshake failed" / "http 401"), these fell through to
+    EXTERNAL_API and the false-positive rate grew with log volume.
+    """
+
+    @pytest.mark.parametrize(
+        "msg",
+        [
+            # "ssl" appears only as an incidental mention, not a handshake error.
+            "AssertionError: reused cached ssl context but expected a fresh one",
+            "DEBUG openssl module loaded; verifying signature",
+            # "401" appears only as a count / identifier digit run.
+            "AssertionError: compiled 401 modules but expected 402",
+            "ValueError: record 401 missing required field",
+        ],
+    )
+    def test_benign_ssl_or_401_substring_not_external_api(self, msg):
+        result = classify_failure(_task(msg))
+        assert result != EXTERNAL_API, (
+            f"benign substring line was misrouted to EXTERNAL_API: {msg!r}"
+        )
+        # These are structurally error-shaped (AssertionError/ValueError) with no
+        # infra keyword, so they fall through to the CODE_ERROR default.
+        assert result == CODE_ERROR
+
+    def test_genuine_ssl_handshake_still_external_api(self):
+        # The anchored phrase must still match a real TLS handshake failure.
+        assert (
+            classify_failure(_task("SSL handshake failed to api.anthropic.com"))
+            == EXTERNAL_API
+        )
+
+    def test_genuine_http_401_still_external_api(self):
+        # The anchored "http 401" form (without the word "unauthorized") still
+        # routes a genuine auth failure to EXTERNAL_API.
+        assert classify_failure(_task("Request failed: HTTP 401")) == EXTERNAL_API
+
+
 class TestClassifyFailureMigration:
     @pytest.mark.parametrize(
         "msg",
@@ -1979,6 +2020,22 @@ class TestExternalApiSubtypeFromMessage:
 
     def test_empty_is_other(self):
         assert _external_api_subtype_from_message("") == EXTERNAL_API_SUBTYPE_OTHER
+
+    def test_benign_ssl_substring_not_network_transient(self):
+        # Anchored "ssl handshake failed" — an incidental "ssl" mention must not
+        # be routed to the network_transient subtype.
+        assert (
+            _external_api_subtype_from_message("reused cached ssl context")
+            == EXTERNAL_API_SUBTYPE_OTHER
+        )
+
+    def test_benign_401_substring_not_provider_auth(self):
+        # Anchored "http 401" — an incidental "401" digit run (count/id) must not
+        # be routed to the provider_auth subtype.
+        assert (
+            _external_api_subtype_from_message("compiled 401 modules ok")
+            == EXTERNAL_API_SUBTYPE_OTHER
+        )
 
 
 class TestClassifyExternalApiSubtype:

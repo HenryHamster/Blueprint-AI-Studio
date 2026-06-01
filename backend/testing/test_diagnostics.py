@@ -129,16 +129,36 @@ class TestClassifyStuckFailure:
             ), kw
 
     def test_external_api_keywords(self):
+        # NB: the "ssl"/"401" keywords are anchored ("ssl handshake failed" /
+        # "http 401") so a benign log line that merely *contains* the substring
+        # "ssl" or the digits "401" is no longer misrouted to EXTERNAL_API.
+        # Genuine TLS-handshake / HTTP-401 failures still classify here.
         for kw in [
             "api.github.com error",
             "api.anthropic.com down",
             "502 bad gateway",
             "503 service unavailable",
-            "ssl handshake",
+            "ssl handshake failed",
             "certificate expired",
+            "Request failed: HTTP 401",
         ]:
             assert (
                 _classify_stuck_failure(self._task_with_message(kw)) == "EXTERNAL_API"
+            ), kw
+
+    def test_benign_ssl_or_401_substring_not_external_api(self):
+        # Anchored "ssl handshake failed"/"http 401": a benign line that merely
+        # mentions SSL/TLS or contains the digits 401 (a count/id) must NOT be
+        # misrouted to EXTERNAL_API. _classify_stuck_failure maps the CODE_ERROR
+        # default to None, so an unclassified benign line returns None here.
+        for kw in [
+            "reused cached ssl context but expected a fresh one",
+            "openssl module loaded; verifying signature",
+            "compiled 401 modules but expected 402",
+            "record 401 missing required field",
+        ]:
+            assert (
+                _classify_stuck_failure(self._task_with_message(kw)) != "EXTERNAL_API"
             ), kw
 
     def test_overloaded_is_external_api(self):

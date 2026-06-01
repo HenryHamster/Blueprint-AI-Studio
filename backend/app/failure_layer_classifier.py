@@ -179,7 +179,16 @@ _VIEWPORT_PATTERNS: list[re.Pattern] = [
     re.compile(r"mobile.{0,20}width.{0,20}overflow", re.IGNORECASE),
 ]
 
-_VIEWPORT_FAILURE_CLASSES: frozenset[str] = frozenset(["VIEWPORT_REGRESSION"])
+# Both viewport failure classes belong to the VIEWPORT defense layer: rendering
+# regressions (VIEWPORT_REGRESSION) and coverage erosion (VIEWPORT_COVERAGE_DROP).
+# Values are upper-case to match the ``(failure_class or "").upper()`` normalization
+# at the call site in classify_layers (VIEWPORT_COVERAGE_DROP's canonical constant
+# in failure_classification.py is lowercase "viewport_coverage_drop"). Without
+# this, a coverage-drop failure class never tagged LAYER_VIEWPORT, leaving the
+# INFRA/relevant-class checks inconsistent with its sibling VIEWPORT_REGRESSION.
+_VIEWPORT_FAILURE_CLASSES: frozenset[str] = frozenset(
+    ["VIEWPORT_REGRESSION", "VIEWPORT_COVERAGE_DROP"]
+)
 
 _VIEWPORT_STAGE_KEYWORDS: list[str] = ["viewport"]
 

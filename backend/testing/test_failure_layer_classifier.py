@@ -189,6 +189,19 @@ class TestViewportLayer:
         result = classify_layers("VIEWPORT_REGRESSION", msg)
         assert LAYER_VIEWPORT in result
 
+    def test_failure_class_viewport_coverage_drop(self):
+        """VIEWPORT_COVERAGE_DROP is a viewport-layer failure class and must also
+        tag LAYER_VIEWPORT via _VIEWPORT_FAILURE_CLASSES — consistent with its
+        sibling VIEWPORT_REGRESSION. Uses a message with NO viewport text pattern
+        and a neutral stage so the failure-class membership set is what does the
+        routing (the constant's canonical value is lowercase
+        "viewport_coverage_drop"; classify_layers upper-cases failure_class).
+        """
+        result = classify_layers(
+            "viewport_coverage_drop", "merged PR removed 3 assertions"
+        )
+        assert LAYER_VIEWPORT in result
+
     def test_stage_viewport_routes_to_viewport(self):
         result = classify_layers("CODE_ERROR", "", stage="viewport")
         assert LAYER_VIEWPORT in result
