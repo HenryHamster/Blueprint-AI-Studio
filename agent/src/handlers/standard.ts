@@ -9,7 +9,8 @@ import {
 } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import {
-  getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
+  buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
@@ -258,7 +259,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const prTitlePrefixNote = prTitlePrefix
     ? `\n\nWhen you open the PR with ./pr open, start the title with ${prTitlePrefix}.`
     : '';
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
@@ -493,7 +494,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
-  const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig);
+  const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
+    codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
+  });
 
   statusRef.value = `Running ${getProviderRunner().displayName}...`;
   setCurrentPromptFingerprint(promptFingerprint);

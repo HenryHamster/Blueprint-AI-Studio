@@ -294,6 +294,72 @@ Common route families include project CRUD, settings, analytics, digest/reportin
 health, notifications/messages, users, onboarding, scope measurement, pool-account
 management, and operator/debug triggers. See the router modules for the exact paths.
 
+> **New to Blueprint?** For an end-to-end walkthrough of installing the GitHub
+> App on a target repository and creating + tuning a project, see
+> **[ONBOARDING.md](ONBOARDING.md)**.
+
+#### Project Onboarding
+
+**`POST /api/admin/projects/onboard`** — Create a project for a GitHub repo,
+auto-detect its build configuration, and seed branch defaults.
+(`backend/app/routers/admin_onboard.py`, requires admin; rate-limited 10/min.)
+
+Request body (`OnboardPayload`):
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `github_owner` | string | ✅ | GitHub org/user. Pattern `^[a-zA-Z0-9_.-]+$`. |
+| `github_repo` | string | ✅ | Repo name. Pattern `^[a-zA-Z0-9_.-]+$`. |
+| `name` | string | — | Display name. Defaults to `{owner}/{repo}`. |
+| `build_config_override` | object | — | Merged on top of auto-detected `BuildConfig` (override wins). |
+| `promotion_target` | string | — | Promotion/LTS branch. Defaults to the repo's default branch. |
+
+Server-derived fields (NOT operator input):
+
+- `integration_branch` and `promotion_target` default to the repo's **default
+  branch** (resolved via `get_repo_default_branch`).
+- `build_config` is **auto-detected** from the repo root + one subdirectory level.
+- `task_branch_namespace` is **slugified** from the repo name.
+- The three design-doc automation pipelines — `_auto_remediation`,
+  `_issue_implementation`, and `_auto_review` — are **seeded OFF**
+  (`enabled: false`).
+- `autonomous_enabled` is **not** part of that seeding: it is a boolean column
+  that defaults to `True` (`models.py`) and the onboard handler never sets it, so
+  an onboarded project has `autonomous_enabled=True`. Disable it explicitly via
+  `PATCH /projects/{project_id}/autonomous` if needed.
+
+Token resolution & errors: the handler resolves an installation token via
+`get_repo_installation_token(owner, repo)` (needs `GITHUB_APP_ID` /
+`GITHUB_PRIVATE_KEY` and the App installed on the repo). If no token is
+available it returns **`422 Unprocessable Entity`**
+(`"No installation token available — cannot detect default branch."`); a GitHub
+failure while resolving the default branch returns `502`.
+
+Response: `{ "project_id", "build_config", "default_branch" }`.
+
+#### Per-Project Branch & Build Config
+
+All under `/api/admin/projects/{project_id}` (`admin_project_config.py`).
+GET requires `member`; PATCH requires `owner`. Pass `null` to revert a field
+to its default. Each response includes `is_default`.
+
+- **`GET|PATCH /integration-branch`** — `{ "integration_branch": "<branch>"|null }`.
+  PATCH validates the branch name and confirms it exists on the remote (422 if not).
+- **`GET|PATCH /promotion-target`** — `{ "promotion_target": "<branch>"|null }`.
+- **`GET|PATCH /task-branch-namespace`** — single branch segment (no `/`).
+- **`GET|PATCH /task-branch-prefix`** — defaults to `{namespace}/`.
+- **`GET|PATCH /staging-branch-prefixes`** — list of prefixes (default `["research/", "plan/"]`).
+- **`PATCH /api/admin/projects/{project_id}`** (`ProjectUpdate`, owner-only for
+  `build_config`) — updates the full `build_config` blob, including
+  `stale_branch_prefixes`, `protected_branches`, and `enable_self_improvement`.
+  > **Note:** `approval_gate_config` (`infra_files` / `critical_files`) is **not**
+  > a field on `ProjectUpdate` and has no per-project write endpoint — see the
+  > known-limitation callout in [ONBOARDING.md](ONBOARDING.md).
+- **`GET|PATCH /auto-remediation`**, **`/issue-implementation`**, **`/auto-review`**
+  — automation pipelines (all seeded `enabled: false`).
+- **`PATCH /projects/{project_id}/autonomous`** — `{ "enabled": bool }` toggles
+  `autonomous_enabled`.
+
 ---
 
 ## Error Responses

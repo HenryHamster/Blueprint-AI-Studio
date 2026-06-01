@@ -1847,6 +1847,23 @@ describe('handleFix structural prompt invariants', () => {
     expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
     expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
   });
+
+  it('build_config fix task gets project-aware ./check guidance (no Blueprint stacks)', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [
+        { path: 'web', type: 'node', lint_cmd: 'eslint src', build_cmd: 'npm run build', test_cmd: 'npm test' },
+      ],
+    } as ReturnType<typeof resolveBuildConfig>);
+    await handleFix('task-fix-bc', FIX_PAYLOAD, FIX_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const p = capturedFixPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('./pr open');
+    expect(p).toContain('./done');
+    expect(p).not.toContain('scripts/test-backend.sh');
+    expect(p).not.toContain('backend ruff');
+    expect(p).not.toContain('agent tsc');
+    expect(p).toContain('npm run build');
+  });
 });
 
 describe('handleFix task-type-specific self-review focus blocks', () => {

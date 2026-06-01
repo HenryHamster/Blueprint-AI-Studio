@@ -2556,6 +2556,31 @@ describe('code-change handler structural prompt invariants', () => {
     expect(p).toContain('Use Grep/Glob for code search');
   });
 
+  it('build_config task gets project-aware ./check guidance (no Blueprint stacks, keeps lifecycle)', async () => {
+    // Non-Blueprint owner/repo (owner/repo) + a configured build_config → the
+    // ./check guidance must describe the project's commands, not Blueprint's.
+    const BC_TASK = {
+      ...TASK,
+      build_config: {
+        directories: [
+          { path: 'web', type: 'node', lint_cmd: 'eslint src', build_cmd: 'npm run build', test_cmd: 'npm test' },
+        ],
+      },
+    };
+    await handleCreate(TASK_ID, PAYLOAD, BC_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedPrompt();
+    // repo-agnostic lifecycle survives
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('./pr open');
+    expect(p).toContain('./done');
+    // Blueprint-only ./check stack identity is gone
+    expect(p).not.toContain('scripts/test-backend.sh');
+    expect(p).not.toContain('backend ruff');
+    expect(p).not.toContain('agent tsc');
+    // project's own configured commands are referenced
+    expect(p).toContain('npm run build');
+  });
+
   it('handleDocs prompt includes required code-change guidance blocks', async () => {
     await handleDocs(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const p = capturedPrompt();

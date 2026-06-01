@@ -16,7 +16,8 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT, shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
@@ -957,7 +958,7 @@ export async function handleFix(
     }
   }
   const parallelFixBlock = parallelFixInjected ? `\n\n${PARALLEL_FIX_GUIDANCE}` : '';
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${buildCodeChangeHelperGuidance({ buildConfig: fixBuildConfig, owner, repo })}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
@@ -1041,7 +1042,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
-  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget });
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget, codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: fixBuildConfig, owner, repo }) });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before the fix session starts so fast fix/rebase tasks still

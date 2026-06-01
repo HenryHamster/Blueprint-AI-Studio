@@ -9,6 +9,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 ### Getting Started
 - **[../README.md](../README.md)** — Project overview, quick start, architecture, and high-level description
 - **[../Deploy.md](../Deploy.md)** — Production deployment on GCP Cloud Run with Terraform and Packer
+- **[ONBOARDING.md](ONBOARDING.md)** — Onboard a new repository end to end (GitHub App install, the onboard endpoint and auto-derived fields, post-onboard branch/build tuning, and the `approval_gate_config` limitation)
 - **[../CLAUDE.md](../CLAUDE.md)** — Project coding standards, file restrictions, and development guidelines
 
 ### API & Data
@@ -92,6 +93,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 
 - **Launch Blueprint locally** → [Quick Start in ../README.md](../README.md#quick-start-local-mode)
 - **Deploy to production** → [Deploy.md](../Deploy.md)
+- **Onboard a new repository** → [ONBOARDING.md](ONBOARDING.md)
 - **Add a new API endpoint** → [DEVELOPMENT_GUIDE.md — Adding an API Endpoint](DEVELOPMENT_GUIDE.md#adding-a-new-api-endpoint)
 - **Modify the database schema** → [DEVELOPMENT_GUIDE.md — Modifying the Database Schema](DEVELOPMENT_GUIDE.md#modifying-the-database-schema)
 - **Create a new task handler** → [DEVELOPMENT_GUIDE.md — Adding a Task Handler](DEVELOPMENT_GUIDE.md#adding-a-new-task-handler) + [AGENT_HANDLERS.md](AGENT_HANDLERS.md)

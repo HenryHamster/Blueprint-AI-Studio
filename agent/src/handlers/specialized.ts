@@ -11,7 +11,8 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed, JsonExtractionError } from '../json-extract.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
   PARALLEL_AUDIT_GUIDANCE,
   getTaskTypeFocusBlock,
@@ -181,12 +182,14 @@ CRITICAL RULES:
   const migrateFocusBlock = getTaskTypeFocusBlock('migrate');
   const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
     + migratePrompt + migrateFirstTaskSection
-    + CODE_CHANGE_HELPER_GUIDANCE + migrateFocusBlock + PLAYBOOK_GUIDANCE
+    + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `
 
 ${DEFAULT_TOOL_GUIDANCE}`;
-  const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig);
+  const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig, {
+    codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: migrateBuildConfig, owner, repo }),
+  });
   setCurrentPromptFingerprint(migrateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: migrateFingerprint });
   // 2026-05-04: post-Claude commit/rebase/push/PR pipeline replaced with

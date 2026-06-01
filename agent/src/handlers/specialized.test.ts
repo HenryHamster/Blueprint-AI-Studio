@@ -1012,6 +1012,24 @@ describe('specialized handler structural prompt invariants', () => {
     expect(p).toContain('Use Grep/Glob for code search');                 // DEFAULT_TOOL_GUIDANCE
   });
 
+  it('build_config migrate task gets project-aware ./check guidance (no Blueprint stacks)', async () => {
+    vi.mocked(git).mockImplementation((a: string[]) => a[0] === 'rev-parse' ? 'abc' : '');
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [
+        { path: 'svc', type: 'python', lint_cmd: 'ruff check', build_cmd: 'python -m build', test_cmd: 'pytest -q' },
+      ],
+    } as ReturnType<typeof resolveBuildConfig>);
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'add col' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const p = capturedMigratePrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('./pr open');
+    expect(p).toContain('./done');
+    expect(p).not.toContain('scripts/test-backend.sh');
+    expect(p).not.toContain('backend ruff');
+    expect(p).not.toContain('agent tsc');
+    expect(p).toContain('python -m build');
+  });
+
   it.each([
     ['handleSecurityAudit', () => handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],
     ['handleSmoketest',     () => handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF())],

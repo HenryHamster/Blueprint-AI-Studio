@@ -51,7 +51,7 @@ export {
   detectLinterKind,
   buildScopedLintOneliner,
 } from './prompts/code-change-helpers.js';
-import { excludeAgentHelpers } from './prompts/code-change-helpers.js';
+import { excludeAgentHelpers, isBlueprintSelfRepo } from './prompts/code-change-helpers.js';
 export { excludeAgentHelpers };
 
 // ── Agent Permission Enforcement ────────────────────────────────────────
@@ -443,12 +443,20 @@ export function assembleFailureGuidanceBlocks(): string {
 export function computePromptFingerprint(
   taskType: string,
   buildConfig?: BuildConfig,
-  options?: { includeParallelFixGuidance?: boolean; promotionTarget?: string },
+  options?: { includeParallelFixGuidance?: boolean; promotionTarget?: string; codeChangeGuidanceVariant?: string },
 ): string {
   const hints = getTaskTypeHints(buildConfig, options?.promotionTarget);
   const taskHint = hints[taskType] ?? '';
   const sections = [taskHint, DEFAULT_TOOL_GUIDANCE, assembleFailureGuidanceBlocks()];
   if (options?.includeParallelFixGuidance) sections.push(PARALLEL_FIX_GUIDANCE);
+  // The code-change lifecycle/helper guidance now varies by project (self-repo
+  // vs. build_config-driven vs. generic no-config). Fold the chosen variant into
+  // the fingerprint so telemetry diverges when the emitted ./check prose diverges
+  // — without it, two tasks with identical task hints but different guidance would
+  // collide. Optional + appended-only, so existing fingerprints are unchanged.
+  if (options?.codeChangeGuidanceVariant) {
+    sections.push(`code-change-guidance:${options.codeChangeGuidanceVariant}`);
+  }
   return createHash('sha256').update(sections.join('\n\n')).digest('hex').slice(0, 12);
 }
 
@@ -754,14 +762,27 @@ export const DISALLOWED_BLIND_SPOT_EXAMPLES: readonly string[] = [
   "did not run viewport tests",
 ] as const;
 
-export const CODE_CHANGE_HELPER_GUIDANCE = `
+// The code-change lifecycle/helper guidance is assembled from three pieces:
+//   SHARED_LIFECYCLE_PREAMBLE  — repo-agnostic "## Task lifecycle" intro
+//   <check-intro>              — STACK-SPECIFIC ./check + ./check test bullets
+//   SHARED_LIFECYCLE_REMAINDER — repo-agnostic ./pr/./done/./fail/./blocked +
+//                                the self-review schema + scope-drift /
+//                                regression-risk / cross-system-contract checks
+// Only the middle <check-intro> describes what `./check` runs, which is the only
+// stack-specific part. buildCodeChangeHelperGuidance() picks the right intro for
+// the project (self-repo vs. build_config-driven vs. generic no-config), mirroring
+// the same three-way branch in prompts/check-helper.ts that generates ./check.
+const SHARED_LIFECYCLE_PREAMBLE = `
 ## Task lifecycle — you own it end-to-end
 
 This task ends only when YOU explicitly mark it done or failed. The wrapper
 does NOT auto-commit or auto-push your work. Use these helpers (already in
 the workspace, executable):
+`;
 
-- \`./check\` — runs lint/build for the stacks your changes touched
+// Blueprint self-repo ./check description — the exact wording shipped today,
+// preserved byte-for-byte (the 8 GB / OOM / scripts/test-backend.sh paragraph).
+const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks your changes touched
   (admin-ui eslint+viewport+build, agent tsc+eslint, backend ruff). Fast. Exits
   non-zero on failure with the actual error tail; fix and re-run until
   green. If your changes don't touch admin-ui/, agent/, or backend/,
@@ -781,7 +802,9 @@ the workspace, executable):
   suite and OOMs. Specific test files are fine with default Postgres:
   \`bash scripts/test-backend.sh testing/test_<module>.py\` fits in
   headroom (the memory guard auto-exempts single-file runs).
-- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
+`;
+
+const SHARED_LIFECYCLE_REMAINDER = `- \`./pr open --title "<title>" --body "<body>"\` — gates on \`./check\`,
   commits any pending changes, pushes to the work branch (force-with-lease
   retry built in), creates a PR (or pushes updates to an existing one for
   fix tasks) via the orchestrator endpoint. On success writes
@@ -1067,6 +1090,99 @@ If you see CRITICAL entries in \`reviewer_findings\` when you re-read the file
 before \`./done\`, triage them: fix what's valid, record false positives in
 \`blind_spots\`.
 `;
+
+/** Config-driven ./check description for a project that supplied a build_config
+ *  with per-directory commands. Describes the project's OWN configured
+ *  directories/lint/build/test commands — never Blueprint's admin-ui/agent/
+ *  backend stacks or scripts/test-backend.sh. Mirrors the per-directory blocks
+ *  emitted by buildConfigDrivenStackBlocks in prompts/check-helper.ts. */
+function buildConfigCheckIntro(buildConfig: BuildConfig): string {
+  const dirs = buildConfig.directories ?? [];
+  const dirParts = dirs.map(d => {
+    const path = d.path.replace(/\/$/, '');
+    const cmds = [d.lint_cmd, d.build_cmd].filter((c): c is string => !!c);
+    return cmds.length
+      ? `\`${path}/\` (${cmds.map(c => `\`${c}\``).join(', ')})`
+      : `\`${path}/\``;
+  });
+  const dirList = dirParts.length ? dirParts.join(', ') : 'the configured project directories';
+  const testParts = dirs
+    .filter(d => d.test_cmd)
+    .map(d => `\`${d.path.replace(/\/$/, '')}/\` (\`${d.test_cmd}\`)`);
+  const testList = testParts.length ? testParts.join(', ') : 'any configured test commands';
+  return `- \`./check\` — runs this project's configured lint/build commands for the
+  directories your changes touched: ${dirList}. Fast. Exits non-zero on
+  failure with the actual error tail; fix and re-run until green. If your
+  changes don't touch a configured directory, \`./check\` returns PASS
+  without running anything — that's expected for pure-docs tasks.
+- \`./check test\` — same plus this project's configured test commands
+  (${testList}). This local gate is a smoke check; CI runs the full suite
+  on the PR after \`./pr open\`.
+`;
+}
+
+/** Generic ./check description for a non-Blueprint repo that supplied no
+ *  build_config. Mirrors the no-op fallback in genericNoConfigStackBlock
+ *  (prompts/check-helper.ts): ./check runs no project-specific checks (the
+ *  Blueprint admin-ui/agent/backend commands would be wrong for an unknown
+ *  layout) and CI is the backstop. */
+function genericNoConfigCheckIntro(): string {
+  return `- \`./check\` — runs lint/build for the stacks your changes touched. This
+  project has no configured build_config and is not the Blueprint self-repo,
+  so \`./check\` runs no project-specific checks and returns PASS without
+  running anything — CI is the backstop. (To get scoped lint/build/test
+  gating, configure the project's build_config with per-directory
+  lint/build/test commands.)
+- \`./check test\` — behaves the same; no standalone local test pass is
+  configured here. CI runs the full suite on the PR after \`./pr open\`.
+`;
+}
+
+/** Discriminator for which ./check intro buildCodeChangeHelperGuidance emits.
+ *  Threaded into computePromptFingerprint so telemetry diverges when the prose
+ *  diverges. Mirrors the branch order in buildCodeChangeHelperGuidance. */
+export function codeChangeGuidanceVariant(opts: {
+  buildConfig?: BuildConfig;
+  owner: string;
+  repo: string;
+}): string {
+  if (opts.buildConfig?.directories?.length) return 'build-config';
+  if (isBlueprintSelfRepo(opts.owner, opts.repo)) return 'self-repo';
+  return 'generic';
+}
+
+/** Project-aware code-change lifecycle/helper guidance. The repo-agnostic
+ *  preamble + remainder (./pr/./done/./fail/./blocked, self-review schema,
+ *  scope-drift / regression-risk / cross-system-contract) are always identical;
+ *  only the ./check intro varies by project, following the same three-way branch
+ *  as prompts/check-helper.ts:
+ *    1. build_config with directories → describe the configured commands.
+ *    2. Blueprint self-repo, no build_config → today's wording byte-for-byte.
+ *    3. non-Blueprint repo, no build_config → generic no-op ./check fallback.
+ *  When buildConfig/owner/repo match the self-repo no-config case, the return
+ *  value equals CODE_CHANGE_HELPER_GUIDANCE byte-for-byte. */
+export function buildCodeChangeHelperGuidance(opts: {
+  buildConfig?: BuildConfig;
+  owner: string;
+  repo: string;
+}): string {
+  let checkIntro: string;
+  if (opts.buildConfig?.directories?.length) {
+    checkIntro = buildConfigCheckIntro(opts.buildConfig);
+  } else if (isBlueprintSelfRepo(opts.owner, opts.repo)) {
+    checkIntro = BLUEPRINT_CHECK_INTRO;
+  } else {
+    checkIntro = genericNoConfigCheckIntro();
+  }
+  return SHARED_LIFECYCLE_PREAMBLE + checkIntro + SHARED_LIFECYCLE_REMAINDER;
+}
+
+// Backward-compatible self-repo guidance constant — exactly the string shipped
+// today (preamble + Blueprint ./check intro + remainder). Still imported by the
+// handlers' structural tests and prompts/task-type-focus. New call sites should
+// prefer buildCodeChangeHelperGuidance({ buildConfig, owner, repo }).
+export const CODE_CHANGE_HELPER_GUIDANCE =
+  SHARED_LIFECYCLE_PREAMBLE + BLUEPRINT_CHECK_INTRO + SHARED_LIFECYCLE_REMAINDER;
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory

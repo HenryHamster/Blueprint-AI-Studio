@@ -45,6 +45,34 @@ class Project(SQLModel, table=True):
     tasks: List[Task]               # All tasks in this project
 ```
 
+**Branch & namespace fields (onboarding-relevant):**
+
+- `integration_branch` — per-project trunk for autonomous task spawning. `NULL`
+  falls back to `"main"`. Set at onboarding to the repo's default branch and
+  operator-managed thereafter via
+  `PATCH /api/admin/projects/{id}/integration-branch`.
+- `promotion_target` — per-project promotion/LTS branch with identical
+  `NULL → "main"` semantics. Set at onboarding (defaults to the default branch,
+  or the operator-supplied value) and tuned via `.../promotion-target`.
+- `task_branch_namespace` — **not a column**; it is a derived property that reads
+  `build_config["task_branch_namespace"]` and falls back to `"blueprint"`.
+  Onboarding slugifies it from the repo name; agent task branches are named
+  `{namespace}/{prefix}-{hex}`. Tuned via `.../task-branch-namespace`.
+
+**`approval_gate_config`** — shape `{"infra_files": [...], "critical_files": [...]}`.
+Read at PR time by `task_lifecycle_github_helpers._get_approval_gate_file_lists` to
+decide which changed files require human approval before merge. **When empty
+(the default), both sets are empty and every changed file skips the file-based
+approval gate.**
+
+> ⚠️ **No operator write path on non-self projects.** `approval_gate_config` is
+> not a field on `ProjectUpdate` and has no dedicated config endpoint, so it
+> cannot be set through the admin API. It is seeded **only for the self-repo**
+> (`is_self_repo = true`) by Alembic migration
+> `0120_seed_self_repo_approval_gate_config.py`. A non-self project therefore
+> falls back to empty approval-gate sets unless populated out-of-band. See
+> [ONBOARDING.md — Known limitation](ONBOARDING.md#4-known-limitation-no-operator-write-path-for-approval_gate_config).
+
 > Project membership is a separate `ProjectMember` table (no `members`
 > relationship on `Project`). There is no circuit-breaker column on the
 > model — failure-loop halting is handled by the pipeline-health and
