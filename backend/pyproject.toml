@@ -80,6 +80,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # debug log" guards — raising here would crash the caller's failure handling, which is
 # strictly worse than a conservative misclassification.
 "app/failure_classification.py" = ["BLE001"]
+# digest_precompute.py is a leader-only periodic worker that primes the digest
+# cache. BLE001 (broad except) and PERF203 (try/except inside a loop) are the
+# same intentional resilient-loop pattern as lifecycle.py/services.py: one hot
+# key's transient compute failure must be logged and skipped, not crash the
+# whole precompute tick or kill the background loop.
+"app/digest_precompute.py" = ["BLE001", "PERF203"]
 
 [tool.mypy]
 python_version = "3.11"

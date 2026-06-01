@@ -230,13 +230,18 @@ def override_get_current_user():
 
 @pytest.fixture(autouse=True)
 def reset_digest_cache():
-    """Clear the in-memory digest TTL cache between tests so a stale response
-    from one test's DB state isn't served to the next."""
+    """Clear the in-memory digest TTL cache and the precompute cache between
+    tests so a stale response from one test's DB state isn't served to the
+    next. The precompute cache is a module-level singleton primed by the
+    leader's background tick, so it must be reset alongside the TTL cache."""
     from app.digest_cache import _default_cache
+    from app.digest_precompute import get_precompute_cache
 
     _default_cache.clear()
+    get_precompute_cache().clear()
     yield
     _default_cache.clear()
+    get_precompute_cache().clear()
 
 
 @pytest.fixture(autouse=True)

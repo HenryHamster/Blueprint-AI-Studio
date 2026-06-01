@@ -1,5 +1,6 @@
 """Catch-up digest and pipeline health summary endpoints."""
 
+import time
 import uuid
 import logging
 from typing import Dict, Any, List, Optional
@@ -13,6 +14,11 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
+from app.digest_precompute import (
+    PRECOMPUTE_STALE_FALLBACK_SECONDS,
+    annotate_precompute_metadata,
+    get_precompute_cache,
+)
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 from app.models import (
     Task,
@@ -157,15 +163,63 @@ async def get_digest(
 ):
     """Return a catch-up digest of activity within the requested time window.
 
-    Wraps the compute path in a TTL cache with in-flight dedup so that a
-    stampede of concurrent admin UI polls doesn't re-execute the 5000-row
-    JSONB scan for each request. Cache key is (hours, project_id) — the
-    response does not vary per user. Default TTL 15s; tune in digest_cache.
+    Read path (Design-audit #1 fix): the heavy 5000-row JSONB scan is now run
+    on a leader-only background timer (``digest_precompute_service``) and the
+    result stored in a lightweight in-process cache. This endpoint first serves
+    that precomputed payload when it is fresh (within
+    ``PRECOMPUTE_STALE_FALLBACK_SECONDS``), so a normal admin poll is a cheap
+    dict read — no per-request 5000-row scan, the documented root of the
+    2026-05-29 pool-starvation hang.
+
+    Freshness invariant (multi-instance / non-leader correctness): only a
+    cache entry written by the background WORKER is served as
+    fresh-for-``PRECOMPUTE_STALE_FALLBACK_SECONDS`` (``worker_only=True``),
+    because only the leader's tick continuously refreshes it. On a NON-leader
+    instance the worker never runs, so there is no worker-written entry and we
+    deliberately fall through to the ``DigestCache`` path below — its 15s TTL
+    keeps non-leader freshness at the prior 15s, NOT the 5-minute fallback
+    window. (An earlier version primed the precompute cache opportunistically
+    from this on-demand compute; that one-shot, never-refreshed entry would
+    then be served as precomputed-for-300s on subsequent non-leader polls,
+    regressing freshness from 15s to 5 minutes — so we no longer prime it
+    here.)
+
+    Bounded fallback: when there is no fresh WORKER entry for this key (fresh
+    boot, non-leader instance, or a non-primed window such as a custom
+    ``hours``), fall back to the existing ``DigestCache`` (15s TTL + in-flight
+    dedup + serve-stale-on-failure) so at most one on-demand 5000-row scan runs
+    per key per TTL — the prior behavior, preserved as a safety net.
     """
+    precompute_cache = get_precompute_cache()
+    entry = precompute_cache.get_fresh(
+        hours,
+        project_id,
+        max_age_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS,
+        worker_only=True,
+    )
+    if entry is not None:
+        return annotate_precompute_metadata(
+            entry.result,
+            precomputed=True,
+            precomputed_at=entry.computed_wall_iso or None,
+            precompute_age_seconds=time.monotonic() - entry.computed_monotonic,
+        )
+
     cache_key = ("digest", hours, str(project_id) if project_id else None)
-    return await cache.get_or_compute(
+    result = await cache.get_or_compute(
         cache_key,
         lambda: _compute_digest(hours=hours, project_id=project_id, session=session),
+    )
+    # NOTE: deliberately do NOT prime the precompute cache here. The DigestCache
+    # already gives this on-demand path a 15s TTL + in-flight dedup; priming a
+    # non-worker entry would let a non-leader instance serve a never-refreshed
+    # payload as fresh-for-PRECOMPUTE_STALE_FALLBACK_SECONDS, regressing
+    # non-leader digest freshness from 15s to 5 minutes.
+    return annotate_precompute_metadata(
+        result,
+        precomputed=False,
+        precomputed_at=result.get("generated_at") or None,
+        precompute_age_seconds=0.0,
     )
 
 
