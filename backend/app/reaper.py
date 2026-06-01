@@ -5,6 +5,7 @@ import contextlib
 import logging
 import os
 import random
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict
@@ -295,6 +296,24 @@ async def _post_reaper_recovery_alert(probe_failures: int) -> None:
 # deferral queue needed). Override via runtime_config["reaper_max_orphans_per_cycle"].
 _REAPER_MAX_ORPHANS_PER_CYCLE_DEFAULT = 60
 
+# Per-cycle WALL-TIME budget (seconds) for the orphan-processing loop. The count
+# cap above bounds the NUMBER of orphans, but each orphan's serial GitHub/VM I/O
+# is variable (30-120s+ under API latency / retries), so a cap-sized batch of
+# slow orphans can still run the cycle far past the watchdog window. The intra-
+# cycle _mark_reaper_progress heartbeat keeps the watchdog from killing the
+# running cycle, but a wedged-slow cycle still starves the NEXT sweep (stale-
+# EVALUATING, retry_after, infra recovery, etc. all wait behind it — the
+# 2026-05-30 leader-loop saturation shape). So we also bound wall time: once the
+# loop has spent this long, stop processing new orphans and let the remainder
+# re-qualify next cycle via the Step-1 status scan (no separate deferral queue).
+# The orphan currently mid-flight always finishes (we check the budget BEFORE
+# starting each iteration, never mid-reap). Default 180s is comfortably under
+# REAPER_HANG_SECONDS (300s) so a single cycle's orphan loop cannot, on its own,
+# consume the whole watchdog window. Override via
+# runtime_config["reaper_orphan_loop_time_budget_seconds"] (0/negative = no
+# time budget, i.e. process every selected orphan — fail-safe if misconfigured).
+_REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT = 180.0
+
 # C3: per-cycle cap on the Step 3/4 stale-EVALUATING sweep. Each parent costs
 # either serial GitHub I/O (_check_and_trigger_rollup, Step 3) or a DB-heavy
 # requeue (_requeue_parent_task, Step 4). The previous unbounded SELECT could
@@ -356,6 +375,126 @@ def _select_orphans_for_cycle(tasks: list, cap: int) -> tuple[list, int]:
     if cap is None or cap <= 0 or len(ordered) <= cap:
         return ordered, 0
     return ordered[:cap], len(ordered) - cap
+
+
+def _classify_orphan(task, now: datetime, has_open_pr: bool) -> bool:
+    """Single source of truth for the orphan-detection state machine.
+
+    Returns ``True`` iff ``task`` (a PROVISIONING / IN_PROGRESS row that already
+    owns a vm_instance_id, or a degenerate other-status catch-all) is an orphan
+    that should be reaped, given the current clock and whether it has an open PR.
+
+    Previously this predicate was DUPLICATED verbatim between the Step-1 lock-free
+    scan (which collected ``task.id``) and the Step-2 post-lock re-verification
+    (which collected the locked ORM object). Two copies drifting out of sync would
+    silently change recovery outcomes, so both call sites now route through here.
+    Pure + side-effect-free (no logging, no queries) so it is unit-testable and so
+    the caller owns any per-site logging.
+
+    State machine (unchanged):
+      PROVISIONING:
+        - started_at > 15min ago                        → absolute provision ceiling
+        - last_heartbeat older than hb_cutoff            → claimed-then-silent (rare)
+        - vm_provisioned_at past preclaim cutoff + no hb → silent pre-claim death
+      IN_PROGRESS:
+        - last_heartbeat older than hb_cutoff            → agent crashed mid-run
+        - no hb, started_at older than hb_cutoff         → post-claim crash (defensive)
+        - no hb, no started_at, created >10min ago       → degenerate catch-all
+        - fresh hb but last_tool_use_at stale (+started)  → agent stalled (tool clock)
+        - fresh hb, no tool use ever, started stale, anthropic → agent stalled (Codex gate)
+      any other status: created >10min ago               → catch-all
+    """
+    ten_minutes_ago = now - timedelta(minutes=10)
+    fifteen_minutes_ago = now - timedelta(minutes=15)
+    hb_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=has_open_pr)
+
+    if task.status == TaskStatus.PROVISIONING:
+        if task.started_at and task.started_at < fifteen_minutes_ago:
+            return True  # absolute provisioning ceiling
+        if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
+            # Rare: agent claimed during PROVISIONING (shouldn't happen since
+            # claim_task also flips status to IN_PROGRESS), then went silent.
+            return True
+        if (  # noqa: SIM103 — keep the explanatory comment, don't inline
+            task.vm_provisioned_at
+            and task.vm_provisioned_at < _preclaim_stale_cutoff(task, now)
+            and task.last_heartbeat is None
+        ):
+            # Silent pre-claim death: VM was dispatched long enough ago
+            # (scope-aware: small 6min, medium 8min, large 10min) and the
+            # agent never claimed. Charge provision budget.
+            return True
+        return False
+
+    if task.status == TaskStatus.IN_PROGRESS:
+        if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
+            return True
+        if (
+            task.last_heartbeat is None
+            and task.started_at
+            and task.started_at < hb_cutoff
+        ):
+            # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
+            # (claim_task sets last_heartbeat at agent.py:312) but if we hit
+            # it, treat as a post-claim crash. Use scope-aware cutoff so
+            # large/high-effort tasks aren't reaped prematurely.
+            return True
+        if (
+            task.last_heartbeat is None
+            and task.started_at is None
+            and task.created_at < ten_minutes_ago
+        ):
+            # Fully-degenerate IN_PROGRESS row (no heartbeat, no started_at)
+            # that's been alive for >10 min — data corruption or a path that
+            # forgot to set started_at. Reap as a catch-all.
+            return True
+        if (
+            task.last_heartbeat
+            and task.last_heartbeat >= hb_cutoff
+            and task.last_tool_use_at is not None
+            and task.last_tool_use_at < _progress_stale_cutoff(task, now)
+            and (
+                task.started_at is None
+                or task.started_at < _progress_stale_cutoff(task, now)
+            )
+        ):
+            # Stalled-but-heartbeating: agent process is alive (fresh
+            # heartbeat) but has made no tool/LLM calls for longer than
+            # the scope-aware progress threshold. Indicates a hung LLM
+            # call, a spinning retry loop, or a wedged tool invocation.
+            #
+            # Cross-attempt stale-tool guard (8c8cf973 incident):
+            # last_tool_use_at carries forward across retries — if
+            # only this field is checked, every retry is born stale
+            # and reaped within seconds (8c8cf973 attempt 3 reaped
+            # 22s after starting because tool_use_at was 11min old
+            # from attempt 1). The started_at check ensures the
+            # current attempt has actually had time to call tools.
+            return True
+        if (  # noqa: SIM103 — keep the explanatory comment, don't inline
+            task.last_heartbeat
+            and task.last_heartbeat >= hb_cutoff
+            and task.last_tool_use_at is None
+            and task.started_at
+            and task.started_at < _progress_stale_cutoff(task, now)
+            and (task.context or {}).get("llm_provider") == "anthropic"
+        ):
+            # Stalled-but-heartbeating with zero tool calls ever.
+            # Provider-gated to anthropic only because the agent
+            # wrapper's outputMode='text' path (Codex/Gemini at
+            # agent/src/index.ts:3061,3119) never calls
+            # recordToolUse — only the claude-stream-json parser
+            # does. So last_tool_use_at IS NULL for every
+            # Codex/Gemini task by design, regardless of whether
+            # tools were called. Without this gate the watchdog
+            # reaps healthy non-anthropic work after 8 min.
+            # TODO: parse Codex --json events / Gemini events
+            # to populate tool_trace, then drop the gate.
+            return True
+        return False
+
+    # Any other status (degenerate row left in an active-scan status): catch-all.
+    return task.created_at < ten_minutes_ago
 
 
 _TRANSIENT_5XX_PATTERNS = frozenset(
@@ -843,97 +982,23 @@ async def reaper_service():
                     if not task.vm_instance_id:
                         continue
                     has_pr = task.id in tasks_with_pr
-                    hb_cutoff = _heartbeat_stale_cutoff(task, now, has_open_pr=has_pr)
-                    if task.status == TaskStatus.PROVISIONING:
-                        if task.started_at and task.started_at < fifteen_minutes_ago:
-                            orphaned_ids.append(
-                                task.id
-                            )  # absolute provisioning ceiling
-                            logger.warning(
-                                f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})"
-                            )
-                        elif task.last_heartbeat and task.last_heartbeat < hb_cutoff:
-                            # Rare: agent claimed during PROVISIONING (shouldn't happen since
-                            # claim_task also flips status to IN_PROGRESS), then went silent.
-                            orphaned_ids.append(task.id)
-                        elif (
-                            task.vm_provisioned_at
-                            and task.vm_provisioned_at
-                            < _preclaim_stale_cutoff(task, now)
-                            and task.last_heartbeat is None
-                        ):
-                            # Silent pre-claim death: VM was dispatched long enough ago
-                            # (scope-aware: small 6min, medium 8min, large 10min) and the
-                            # agent never claimed. Charge provision budget.
-                            orphaned_ids.append(task.id)
-                    elif task.status == TaskStatus.IN_PROGRESS:
-                        if task.last_heartbeat and task.last_heartbeat < hb_cutoff:
-                            orphaned_ids.append(task.id)
-                        elif (
-                            task.last_heartbeat is None
-                            and task.started_at
-                            and task.started_at < hb_cutoff
-                        ):
-                            # Defensive: IN_PROGRESS without any heartbeat shouldn't happen
-                            # (claim_task sets last_heartbeat at agent.py:312) but if we hit
-                            # it, treat as a post-claim crash. Use scope-aware cutoff so
-                            # large/high-effort tasks aren't reaped prematurely.
-                            orphaned_ids.append(task.id)
-                        elif (
-                            task.last_heartbeat is None
-                            and task.started_at is None
-                            and task.created_at < ten_minutes_ago
-                        ):
-                            # Fully-degenerate IN_PROGRESS row (no heartbeat, no started_at)
-                            # that's been alive for >10 min — data corruption or a path that
-                            # forgot to set started_at. Reap as a catch-all.
-                            orphaned_ids.append(task.id)
-                        elif (
-                            task.last_heartbeat
-                            and task.last_heartbeat >= hb_cutoff
-                            and task.last_tool_use_at is not None
-                            and task.last_tool_use_at
-                            < _progress_stale_cutoff(task, now)
-                            and (
-                                task.started_at is None
-                                or task.started_at < _progress_stale_cutoff(task, now)
-                            )
-                        ):
-                            # Stalled-but-heartbeating: agent process is alive (fresh
-                            # heartbeat) but has made no tool/LLM calls for longer than
-                            # the scope-aware progress threshold. Indicates a hung LLM
-                            # call, a spinning retry loop, or a wedged tool invocation.
-                            #
-                            # Cross-attempt stale-tool guard (8c8cf973 incident):
-                            # last_tool_use_at carries forward across retries — if
-                            # only this field is checked, every retry is born stale
-                            # and reaped within seconds (8c8cf973 attempt 3 reaped
-                            # 22s after starting because tool_use_at was 11min old
-                            # from attempt 1). The started_at check ensures the
-                            # current attempt has actually had time to call tools.
-                            orphaned_ids.append(task.id)
-                        elif (
-                            task.last_heartbeat
-                            and task.last_heartbeat >= hb_cutoff
-                            and task.last_tool_use_at is None
-                            and task.started_at
-                            and task.started_at < _progress_stale_cutoff(task, now)
-                            and (task.context or {}).get("llm_provider") == "anthropic"
-                        ):
-                            # Stalled-but-heartbeating with zero tool calls ever.
-                            # Provider-gated to anthropic only because the agent
-                            # wrapper's outputMode='text' path (Codex/Gemini at
-                            # agent/src/index.ts:3061,3119) never calls
-                            # recordToolUse — only the claude-stream-json parser
-                            # does. So last_tool_use_at IS NULL for every
-                            # Codex/Gemini task by design, regardless of whether
-                            # tools were called. Without this gate the watchdog
-                            # reaps healthy non-anthropic work after 8 min.
-                            # TODO: parse Codex --json events / Gemini events
-                            # to populate tool_trace, then drop the gate.
-                            orphaned_ids.append(task.id)
-                    elif task.created_at < ten_minutes_ago:
-                        orphaned_ids.append(task.id)
+                    # Single source of truth: _classify_orphan owns the full
+                    # state machine (see helper). Step 2's post-lock
+                    # re-verification calls the identical predicate, so the two
+                    # passes can never drift.
+                    if not _classify_orphan(task, now, has_open_pr=has_pr):
+                        continue
+                    orphaned_ids.append(task.id)
+                    # Step-1-only operator breadcrumb for the most common stuck
+                    # case (kept here so the helper stays side-effect-free).
+                    if (
+                        task.status == TaskStatus.PROVISIONING
+                        and task.started_at
+                        and task.started_at < fifteen_minutes_ago
+                    ):
+                        logger.warning(
+                            f"[REAPER] Task {task.id} stuck in PROVISIONING for >15min (started_at={task.started_at})"
+                        )
 
                 # Step 2: Lock ONLY orphaned rows (heartbeats on healthy tasks are never blocked)
                 # expire_all() nukes the identity map so step 2 MUST read fresh from DB.
@@ -1029,70 +1094,23 @@ async def reaper_service():
 
                     # Re-verify after acquiring lock (heartbeat may have arrived between step 1 and 2)
                     # expire_all() above ensures these objects have fresh DB values.
-                    # Mirrors the state machine above — same thresholds, same branching.
+                    # Uses the SAME _classify_orphan predicate as the Step-1 scan —
+                    # the previous verbatim in-code mirror is gone, so the two passes
+                    # cannot drift. ``now`` is refreshed because time passed during
+                    # lock acquisition (a heartbeat that arrived in that window makes
+                    # the task no longer stale).
                     now = _utcnow()  # Refresh now — time passed during lock acquisition
+                    # Keep the derived cutoffs consistent with the refreshed clock;
+                    # the downstream reap-reason classifier reads fifteen_minutes_ago.
                     ten_minutes_ago = now - timedelta(minutes=10)
                     fifteen_minutes_ago = now - timedelta(minutes=15)
-                    verified = []
-                    for t in orphaned_tasks:
-                        has_pr = t.id in tasks_with_pr
-                        hb_cutoff = _heartbeat_stale_cutoff(t, now, has_open_pr=has_pr)
-                        if t.status == TaskStatus.PROVISIONING:
-                            if t.started_at and t.started_at < fifteen_minutes_ago:  # noqa: SIM114
-                                verified.append(t)
-                            elif t.last_heartbeat and t.last_heartbeat < hb_cutoff:  # noqa: SIM114
-                                verified.append(t)
-                            elif (
-                                t.vm_provisioned_at
-                                and t.vm_provisioned_at < _preclaim_stale_cutoff(t, now)
-                                and t.last_heartbeat is None
-                            ):
-                                verified.append(t)
-                        elif t.status == TaskStatus.IN_PROGRESS:
-                            if t.last_heartbeat and t.last_heartbeat < hb_cutoff:  # noqa: SIM114
-                                verified.append(t)
-                            elif (  # noqa: SIM114
-                                t.last_heartbeat is None
-                                and t.started_at
-                                and t.started_at < hb_cutoff
-                            ):
-                                verified.append(t)
-                            elif (
-                                t.last_heartbeat is None
-                                and t.started_at is None
-                                and t.created_at < ten_minutes_ago
-                            ):
-                                verified.append(t)
-                            elif (
-                                t.last_heartbeat
-                                and t.last_heartbeat >= hb_cutoff
-                                and t.last_tool_use_at is not None
-                                and t.last_tool_use_at < _progress_stale_cutoff(t, now)
-                                and (
-                                    t.started_at is None
-                                    or t.started_at < _progress_stale_cutoff(t, now)
-                                )
-                            ):
-                                # Verification mirror; see step-1 cross-attempt
-                                # stale-tool guard (8c8cf973 incident).
-                                verified.append(t)
-                            elif (
-                                t.last_heartbeat
-                                and t.last_heartbeat >= hb_cutoff
-                                and t.last_tool_use_at is None
-                                and t.started_at
-                                and t.started_at < _progress_stale_cutoff(t, now)
-                                and (t.context or {}).get("llm_provider") == "anthropic"
-                            ):
-                                # Verification-loop mirror of step-1 guard.
-                                # Provider-gated to anthropic only because the
-                                # agent wrapper's outputMode='text' path
-                                # (Codex/Gemini) never calls recordToolUse, so
-                                # last_tool_use_at IS NULL by design. See
-                                # step-1 branch for the full rationale.
-                                verified.append(t)
-                        elif t.created_at < ten_minutes_ago:
-                            verified.append(t)
+                    verified = [
+                        t
+                        for t in orphaned_tasks
+                        if _classify_orphan(
+                            t, now, has_open_pr=(t.id in tasks_with_pr)
+                        )
+                    ]
                     orphaned_tasks = verified
 
                 # ── PER-CYCLE ORPHAN CAP + PRIORITY ORDERING ──────────────
@@ -1169,17 +1187,72 @@ async def reaper_service():
                 # starved agent heartbeats with 429s and triggered cascading false
                 # orphan detection on the next reaper cycle.
                 _deferred_parent_requeues: list[Task] = []
-                # Set False if the batched orphan-reap commit below hits an
-                # idempotency-key collision — gates the post-commit loops off so
-                # the rolled-back state isn't acted on (see the guard at commit).
+                # Gates the post-commit loops (parent-requeue / VM-delete / rollup).
+                # Orphans now commit PER ROW inside the loop, so a single bad row no
+                # longer rolls back the whole batch; this flag therefore stays True
+                # in the normal path. It is retained as the post-loop gate so a
+                # future failure mode that must skip the post-commit loops has a
+                # single switch, and so the post-loop trailing-commit failure path is
+                # explicit. The post-commit loops re-fetch fresh per-row state and are
+                # FAILED-gated, so deferred / uncommitted rows self-skip there.
                 _orphan_commit_ok = True
 
-                for task_id in _orphaned_task_ids:
+                # ── PER-CYCLE ORPHAN-LOOP WALL-TIME BUDGET ────────────────
+                # The count cap (_select_orphans_for_cycle) bounds how MANY orphans
+                # we take, but each orphan's serial GitHub/VM I/O is variable, so a
+                # cap-sized batch of slow orphans can still run this loop far past
+                # the watchdog window — starving the NEXT sweep even though the
+                # intra-cycle heartbeat keeps THIS cycle from being killed. Bound the
+                # wall time too: once the loop has spent its budget, stop taking new
+                # orphans and let the remainder re-qualify next cycle via the Step-1
+                # status scan. The orphan in flight always finishes (the check runs
+                # BEFORE each iteration, never mid-reap). A non-positive budget means
+                # "no time budget" (fail-safe if misconfigured). monotonic() is used
+                # so the deadline is immune to wall-clock jumps.
+                _orphan_loop_time_budget = float(
+                    _runtime_config.get(
+                        "reaper_orphan_loop_time_budget_seconds",
+                        _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT,
+                    )
+                )
+                _orphan_loop_started_monotonic = time.monotonic()
+                _orphan_loop_processed = 0
+                _orphan_loop_time_deferred = 0
+
+                for _orphan_loop_idx, task_id in enumerate(_orphaned_task_ids):
+                    # Stop taking NEW orphans once the wall-time budget is spent.
+                    # The remainder re-qualify next cycle via the Step-1 scan, so no
+                    # work is lost — only deferred. Skipped here BEFORE any I/O so an
+                    # in-flight reap is never interrupted.
+                    if (
+                        _orphan_loop_time_budget > 0
+                        and _orphan_loop_processed > 0
+                        and (time.monotonic() - _orphan_loop_started_monotonic)
+                        >= _orphan_loop_time_budget
+                    ):
+                        _orphan_loop_time_deferred = (
+                            len(_orphaned_task_ids) - _orphan_loop_idx
+                        )
+                        logger.warning(
+                            "[REAPER] Orphan-loop wall-time budget %.0fs reached "
+                            "after %d orphan(s) — deferring %d remaining to next "
+                            "cycle (they re-qualify via the Step-1 status scan).",
+                            _orphan_loop_time_budget,
+                            _orphan_loop_processed,
+                            _orphan_loop_time_deferred,
+                        )
+                        break
                     # Heartbeat per orphan: this loop is the dominant per-cycle
                     # cost (serial GitHub/VM I/O ~30-120s each), so a backlog can
                     # exceed REAPER_HANG_SECONDS. Marking progress here keeps the
                     # watchdog from killing a slow-but-progressing reap.
                     _mark_reaper_progress()
+                    _orphan_loop_processed += 1
+                    # Snapshot the deferred-requeue list length BEFORE this row's
+                    # mutations so a per-row rollback can discard only THIS row's
+                    # appended parent (truncating by index — never reading p.id on a
+                    # post-rollback-expired ORM object, which would MissingGreenlet).
+                    _dq_len_at_row_start = len(_deferred_parent_requeues)
                     try:
                         # Re-validate status before acting — task may have completed/been cancelled
                         # between the initial query and now
@@ -2491,16 +2564,59 @@ async def reaper_service():
                                 {"task_id": str(task.id), "status": TaskStatus.FAILED},
                             )
 
+                        # ── PER-ROW COMMIT ──────────────────────────────────
+                        # Previously the loop accumulated EVERY orphan's mutations
+                        # and flushed them in ONE batched commit after the loop. A
+                        # single IntegrityError there (e.g. a peer racing into
+                        # ux_task_active_idempotency_key) rolled back the WHOLE
+                        # batch — every other orphan's recovery work was discarded
+                        # and had to re-qualify next cycle. Committing per row makes
+                        # each orphan's recovery durable independently: one bad row
+                        # rolls back only itself (handled below), the rest stay
+                        # committed. The orphan-row FOR UPDATE lock was already
+                        # released before this loop (commit + expire_all above), so a
+                        # per-row commit here holds no extra locks across the I/O.
+                        await session.commit()
                     except Exception as _reap_exc:
-                        # Roll back partial mutations for this task. The next cycle
-                        # re-selects all tasks whose mutations were rolled back.
-                        # Pattern mirrors the per-project scan in lifecycle.py (~479-496).
+                        # Roll back partial mutations for THIS row only — earlier rows
+                        # were already committed per-row above, so they survive. The
+                        # next cycle re-selects this row (its mutations rolled back)
+                        # via the Step-1 scan. Pattern mirrors the per-project scan in
+                        # lifecycle.py (~479-496).
                         with contextlib.suppress(Exception):
                             await session.rollback()
-                        # Clear post-rollback state so the post-loop code doesn't act on
-                        # stale in-memory mutations from tasks processed before the crash.
-                        _deferred_parent_requeues.clear()
-                        _reaper_old_vms.clear()
+                        # Discard ONLY this row's deferred entries; earlier committed
+                        # rows keep their post-commit VM-delete / parent-requeue work.
+                        # task_id-keyed pop + index truncation avoid reading any
+                        # post-rollback-expired ORM attribute.
+                        _reaper_old_vms.pop(str(task_id), None)
+                        del _deferred_parent_requeues[_dq_len_at_row_start:]
+
+                        # Benign per-row idempotency collision: the requeue→QUEUED /
+                        # →EVALUATING mutation tried to enter
+                        # ux_task_active_idempotency_key while a peer already held the
+                        # key in an active status. The pre-query guard above catches
+                        # the common case; this is the narrow race window between that
+                        # SELECT and this per-row COMMIT. The active duplicate already
+                        # represents the work, so the reap is moot — skip THIS row
+                        # cleanly (no streak / quarantine) and let it re-qualify next
+                        # cycle if it doesn't resolve. This is NOT a poison-pill crash.
+                        if (
+                            isinstance(_reap_exc, IntegrityError)
+                            and "ux_task_active_idempotency_key" in str(_reap_exc)
+                        ):
+                            logger.warning(
+                                "[REAPER] Orphan reap of %s hit "
+                                "ux_task_active_idempotency_key on commit (a peer "
+                                "holds the key in an active status) — rolled back this "
+                                "row only; earlier rows stay committed; it re-qualifies "
+                                "next cycle via the Step-1 scan. Detail: %s",
+                                task_id,
+                                str(_reap_exc)[:300],
+                            )
+                            _orphan_reap_crash_streaks.pop(str(task_id), None)
+                            continue
+
                         logger.error(
                             "[REAPER] orphan reap raised for task %s — skipping: %s",
                             task_id,
@@ -2582,42 +2698,17 @@ async def reaper_service():
                         # task id).
                         _orphan_reap_crash_streaks.pop(str(task_id), None)
                 if orphaned_tasks:
-                    # Idempotency guard on the batched orphan-reap commit. The
-                    # requeue→QUEUED (rate-limit / agent-retry) and →EVALUATING
-                    # mutations above can collide on ux_task_active_idempotency_key
-                    # when a peer already created a duplicate holding that key in
-                    # an active status. Letting that IntegrityError escape aborts
-                    # this commit AND poisons the session (PendingRollbackError)
-                    # for every downstream sweep in the cycle. Because the commit
-                    # is batched, per-task attribution isn't possible here, so the
-                    # smallest safe move is: roll back, warn, and let next cycle
-                    # re-discover the still-active orphans via the Step-1 scan. The
-                    # active duplicate already represents the work, so the reap is
-                    # moot. We clear the post-commit deferred lists (the rollback
-                    # expired their ORM objects → reading attrs would MissingGreenlet)
-                    # so the post-commit loops no-op cleanly; FAILED-gated loops
-                    # also self-skip since the reaps didn't persist. Mirrors the
-                    # pre-query guard in reaper_infra_recovery.py (~270-338).
-                    try:
-                        await session.commit()
-                        _orphan_commit_ok = True
-                    except IntegrityError as _ie:
-                        _ie_msg = str(_ie)
-                        if "ux_task_active_idempotency_key" in _ie_msg:
-                            await session.rollback()
-                            _orphan_commit_ok = False
-                            _deferred_parent_requeues = []
-                            _reaper_old_vms = {}
-                            logger.warning(
-                                "[REAPER] Orphan-reap commit hit "
-                                "ux_task_active_idempotency_key (a peer already "
-                                "holds the key in an active status) — rolled back; "
-                                "still-active orphans re-qualify next cycle via the "
-                                "Step-1 scan. Detail: %s",
-                                _ie_msg[:300],
-                            )
-                        else:
-                            raise
+                    # Each orphan above already committed its OWN mutations per-row
+                    # (see the PER-ROW COMMIT block), so the batch-wide
+                    # ux_task_active_idempotency_key collision that used to roll back
+                    # the WHOLE loop here is gone — it's now isolated per row. This
+                    # trailing commit is a defensive flush of any residual session
+                    # state (it commits nothing if the last row already committed
+                    # cleanly). A residual IntegrityError can no longer originate from
+                    # the orphan reaps themselves, so let it surface (the outer
+                    # per-cycle handler classifies / circuit-breaks).
+                    await session.commit()
+                    _orphan_commit_ok = True
 
                 if orphaned_tasks and _orphan_commit_ok:
 

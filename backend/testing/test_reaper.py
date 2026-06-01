@@ -50,6 +50,8 @@ from app.reaper import (
     _mark_reaper_progress,
     _orphan_priority_key,
     _select_orphans_for_cycle,
+    _classify_orphan,
+    _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT,
     _ORPHAN_PRIORITY_RATE_LIMITED,
     _ORPHAN_PRIORITY_SPOT,
     _ORPHAN_PRIORITY_PROVISION,
@@ -5101,6 +5103,126 @@ def clean_crash_streaks():
 
 
 @pytest.mark.asyncio
+async def test_orphan_per_row_commit_idempotency_collision_isolated(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """FIX b: when ONE orphan's per-row commit raises the
+    ux_task_active_idempotency_key IntegrityError (the narrow race the pre-query
+    guard can't catch), only THAT row is rolled back and skipped — every other
+    orphan in the batch stays reaped+committed. Before per-row commit, the single
+    batched commit rolled back the WHOLE batch, discarding every sibling's
+    recovery work. The colliding row is skipped cleanly (no crash-streak /
+    quarantine) since it is a benign idempotency collision, and re-qualifies next
+    cycle."""
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
+
+    project = await _make_project(reaper_db)
+    # Two stale orphans; the "collider" will trip a genuine IntegrityError on its
+    # own per-row commit. The "good" sibling must survive committed regardless of
+    # processing order.
+    good = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-good-row",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    collider = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-collider-row",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(good)
+    reaper_db.add(collider)
+    await reaper_db.commit()
+    collider_id = collider.id
+
+    # Fail the per-row commit ONLY while the collider row is the dirty task. We
+    # inject a GENUINE flush-level IntegrityError (duplicate PK) first so the
+    # underlying DB transaction is really aborted — the way a racing
+    # ux_task_active_idempotency_key insert would — then raise the
+    # idempotency-shaped IntegrityError the reaper classifies. This makes the
+    # subsequent session.rollback() actually discard the collider's pending
+    # mutation (a no-op fake raise would leave the tx active and the trailing
+    # post-loop commit would wrongly persist it). All other commits (pre-loop,
+    # the good row, post-loop) pass through unchanged. Mirrors the real-poison
+    # pattern in test_step3_4_rollup_poison_rolled_back_for_later_steps.
+    from sqlalchemy import text as _text
+
+    real_commit = AsyncSession.commit
+    fired = {"n": 0}
+
+    async def patched_commit(self):
+        dirty_ids = {getattr(o, "id", None) for o in self.dirty}
+        if collider_id in dirty_ids and fired["n"] == 0:
+            fired["n"] += 1
+            proj_id = (
+                await self.execute(_text("SELECT id FROM project LIMIT 1"))
+            ).scalar()
+            dup = _uuid_mod.uuid4()
+            for _ in range(2):
+                self.add(
+                    Task(
+                        id=dup,
+                        project_id=proj_id,
+                        payloads=[{"type": "create"}],
+                        status=TaskStatus.QUEUED,
+                    )
+                )
+            with contextlib.suppress(_IntegrityError):
+                await self.flush()  # real duplicate-PK abort
+            raise _IntegrityError(
+                "INSERT ...",
+                {},
+                Exception(
+                    "duplicate key value violates unique constraint "
+                    '"ux_task_active_idempotency_key"'
+                ),
+            )
+        return await real_commit(self)
+
+    mocker.patch.object(AsyncSession, "commit", patched_commit)
+
+    import app.reaper as _reaper_mod
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(good)
+    await reaper_db.refresh(collider)
+
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "cycle must complete cleanly through the per-row collision"
+    )
+    # ── Core fix-(b) guarantee: one bad row does NOT discard the rest. ──
+    # The good sibling's reap is durably committed even though the collider's
+    # own per-row commit raised. Under the OLD batched commit, the single
+    # post-loop commit hit the collision and rolled back the WHOLE batch — the
+    # good sibling would still be IN_PROGRESS here.
+    assert good.status == TaskStatus.QUEUED, (
+        "the good orphan must stay reaped+committed despite the sibling's "
+        "per-row idempotency collision (per-row commit isolation)"
+    )
+    assert good.attempt_count == 1
+    assert fired["n"] == 1, "the injected per-row collision must have fired exactly once"
+    # The collision is a benign skip, NOT a terminal failure: the collider must
+    # not be FAILED/quarantined by the reaper (it re-qualifies next cycle).
+    assert collider.status != TaskStatus.FAILED, (
+        "a benign idempotency collision must not terminal-fail the orphan"
+    )
+    assert "Quarantined" not in (collider.latest_status_message or ""), (
+        "a benign idempotency collision must not trigger quarantine"
+    )
+    # ...and it must not accrue a poison-pill crash streak.
+    assert str(collider_id) not in clean_crash_streaks, (
+        "a clean idempotency-collision skip must not accrue a crash streak"
+    )
+
+
+@pytest.mark.asyncio
 async def test_orphan_crash_sibling_reaped_when_poison_throws(
     reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
 ):
@@ -5807,3 +5929,291 @@ def test_select_orphans_under_cap_returns_all():
     selected, deferred = _select_orphans_for_cycle(tasks, cap=60)
     assert deferred == 0
     assert len(selected) == 3
+
+
+# ── _classify_orphan (single-source-of-truth predicate, FIX a) ──────────────
+
+
+class _FakeClassifyTask:
+    """Minimal stand-in for a Task exposing only the columns _classify_orphan and
+    the cutoff helpers read. Lets the predicate be unit-tested without a DB."""
+
+    def __init__(
+        self,
+        *,
+        status,
+        started_at=None,
+        last_heartbeat=None,
+        vm_provisioned_at=None,
+        last_tool_use_at=None,
+        created_at=None,
+        context=None,
+        first_payload=None,
+    ):
+        self.status = status
+        self.started_at = started_at
+        self.last_heartbeat = last_heartbeat
+        self.vm_provisioned_at = vm_provisioned_at
+        self.last_tool_use_at = last_tool_use_at
+        # created_at defaults to "fresh" so the >10min catch-alls don't fire
+        # unless a test sets it explicitly.
+        self.created_at = created_at if created_at is not None else datetime.utcnow()
+        self.context = context or {}
+        self.first_payload = first_payload or {"type": "create"}
+
+
+def test_classify_orphan_provisioning_absolute_ceiling():
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=16)
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
+def test_classify_orphan_provisioning_just_inside_ceiling_not_orphan():
+    now = datetime.utcnow()
+    # 14min: under the 15min absolute ceiling, no heartbeat, no vm_provisioned_at.
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=14)
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_provisioning_silent_preclaim_death():
+    now = datetime.utcnow()
+    # vm dispatched 7min ago (past small-scope 6min preclaim cutoff), never claimed.
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=now - timedelta(minutes=7),
+        last_heartbeat=None,
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
+def test_classify_orphan_in_progress_heartbeat_stale():
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=10),  # past 5min small cutoff
+        started_at=now - timedelta(minutes=12),
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
+def test_classify_orphan_in_progress_fresh_heartbeat_not_orphan():
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),  # fresh
+        started_at=now - timedelta(minutes=2),
+        last_tool_use_at=now - timedelta(seconds=30),  # fresh tool use
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_open_pr_uses_90s_cutoff():
+    now = datetime.utcnow()
+    # 2min-stale heartbeat: NOT stale under the 5min default, but IS stale under
+    # the 90s open-PR cutoff. The has_open_pr flag must flip the verdict.
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(minutes=2),
+        started_at=now - timedelta(minutes=5),
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+    assert _classify_orphan(t, now, has_open_pr=True) is True
+
+
+def test_classify_orphan_stalled_but_heartbeating_anthropic_no_tool_use():
+    now = datetime.utcnow()
+    # Fresh heartbeat, zero tool calls ever, started 10min ago (past 8min small
+    # progress cutoff), anthropic provider → agent_stalled orphan.
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=None,
+        started_at=now - timedelta(minutes=10),
+        context={"llm_provider": "anthropic"},
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    # Same task on a non-anthropic provider is NOT reaped (Codex text-mode gate).
+    t.context = {"llm_provider": "codex"}
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_cross_attempt_stale_tool_guard():
+    now = datetime.utcnow()
+    # Fresh heartbeat, last_tool_use_at is 11min stale (carried across a retry),
+    # but the CURRENT attempt only started 1min ago — must NOT be reaped (the
+    # started_at clause guards the 8c8cf973 cross-attempt false-positive).
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=now - timedelta(minutes=11),
+        started_at=now - timedelta(minutes=1),
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_degenerate_in_progress_catch_all():
+    now = datetime.utcnow()
+    # No heartbeat, no started_at, created >10min ago → degenerate catch-all.
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=None,
+        created_at=now - timedelta(minutes=11),
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
+def test_classify_orphan_step1_and_step2_predicate_agree():
+    """FIX a regression guard: the helper IS the predicate both Step 1 and Step 2
+    call, so by construction they cannot drift. This asserts the helper returns a
+    plain bool across a representative matrix (the property the dedup relies on)."""
+    now = datetime.utcnow()
+    cases = [
+        _FakeClassifyTask(
+            status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=20)
+        ),
+        _FakeClassifyTask(
+            status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=3)
+        ),
+        _FakeClassifyTask(
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=now - timedelta(minutes=9),
+            started_at=now - timedelta(minutes=12),
+        ),
+        _FakeClassifyTask(
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=now - timedelta(seconds=10),
+            last_tool_use_at=now - timedelta(seconds=10),
+            started_at=now - timedelta(minutes=1),
+        ),
+    ]
+    for t in cases:
+        v1 = _classify_orphan(t, now, has_open_pr=False)
+        v2 = _classify_orphan(t, now, has_open_pr=False)
+        assert isinstance(v1, bool)
+        assert v1 == v2  # deterministic / pure
+
+
+# ── Per-cycle orphan-loop wall-time budget (FIX c) ──────────────────────────
+
+
+def test_orphan_loop_time_budget_default_under_watchdog():
+    """The default wall-time budget must be comfortably below REAPER_HANG_SECONDS
+    so one cycle's orphan loop cannot, on its own, consume the watchdog window."""
+    import app.reaper as _reaper_mod
+
+    assert _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT > 0
+    assert (
+        _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT < _reaper_mod.REAPER_HANG_SECONDS
+    ), "orphan-loop budget must be under the watchdog hang threshold"
+
+
+@pytest.mark.asyncio
+async def test_orphan_loop_time_budget_defers_remaining_orphans(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """FIX c: once the orphan loop's wall-time budget is spent, the remaining
+    orphans are DEFERRED (left untouched, re-qualify next cycle) rather than
+    blowing the cycle past the watchdog. We force monotonic() to jump past the
+    budget after the first orphan is processed and assert exactly one orphan is
+    reaped this cycle while the rest stay IN_PROGRESS."""
+    project = await _make_project(reaper_db)
+    # Three identical stale orphans — all qualify; only the first should be
+    # processed before the (simulated) budget is exhausted.
+    orphans = []
+    for i in range(3):
+        o = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"vm-budget-{i}",
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=0,
+            last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        )
+        orphans.append(o)
+        reaper_db.add(o)
+    await reaper_db.commit()
+
+    # Tighten the budget so the simulated clock trips it after the first orphan.
+    mocker.patch.dict(
+        _runtime_config, {"reaper_orphan_loop_time_budget_seconds": 5.0}, clear=False
+    )
+
+    # Monotonic clock that jumps +1000s on EVERY reading. The orphan loop reads
+    # it once at loop start and once per iteration (only when processed>0). With
+    # a 5s budget, the diff between loop-start and the first per-iteration check
+    # is always >= 1000 >> 5, so exactly the FIRST orphan is processed (its check
+    # is short-circuited by the processed>0 guard) and the rest are deferred.
+    # Stepping by a huge constant makes the test robust to any incidental
+    # monotonic() calls between loop start and the first budget check.
+    import app.reaper as _reaper_mod
+
+    clock = {"t": 0.0}
+
+    def fake_monotonic():
+        clock["t"] += 1000.0
+        return clock["t"]
+
+    mocker.patch.object(_reaper_mod.time, "monotonic", side_effect=fake_monotonic)
+
+    await _run_reaper_once()
+    for o in orphans:
+        await reaper_db.refresh(o)
+
+    reaped = [o for o in orphans if o.status == TaskStatus.QUEUED]
+    deferred = [o for o in orphans if o.status == TaskStatus.IN_PROGRESS]
+    assert len(reaped) == 1, (
+        "exactly one orphan should be reaped before the wall-time budget trips"
+    )
+    assert len(deferred) == 2, (
+        "the remaining orphans must be DEFERRED (untouched) to next cycle, not "
+        "reaped past the budget"
+    )
+    # Deferred orphans keep their attempt budget intact (no premature burn).
+    for o in deferred:
+        assert o.attempt_count == 0
+
+
+@pytest.mark.asyncio
+async def test_orphan_loop_no_time_budget_when_disabled_processes_all(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """A non-positive budget disables the wall-time gate (fail-safe): every
+    selected orphan is processed even though the simulated clock is far past any
+    positive budget."""
+    project = await _make_project(reaper_db)
+    orphans = []
+    for i in range(3):
+        o = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"vm-nobudget-{i}",
+            status=TaskStatus.IN_PROGRESS,
+            attempt_count=0,
+            last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        )
+        orphans.append(o)
+        reaper_db.add(o)
+    await reaper_db.commit()
+
+    mocker.patch.dict(
+        _runtime_config, {"reaper_orphan_loop_time_budget_seconds": 0}, clear=False
+    )
+
+    import app.reaper as _reaper_mod
+
+    # Clock is always far past any budget — but the budget is disabled, so the
+    # gate must never trip.
+    mocker.patch.object(_reaper_mod.time, "monotonic", return_value=10_000.0)
+
+    await _run_reaper_once()
+    for o in orphans:
+        await reaper_db.refresh(o)
+
+    assert all(o.status == TaskStatus.QUEUED for o in orphans), (
+        "with the budget disabled, all orphans must be reaped in one cycle"
+    )
