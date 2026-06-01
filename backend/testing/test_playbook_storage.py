@@ -1,6 +1,10 @@
+import uuid
 from datetime import timedelta
 
-from app.models import _utcnow
+import pytest
+
+from app.models import Task, TaskStatus, _utcnow
+from testing._playbook_test_helpers import _make_project
 
 
 def test_archive_playbook_entry_moves_entry_and_trims_archive(monkeypatch):
@@ -96,3 +100,88 @@ def test_is_auto_playbook_suppressed_respects_recent_tombstone():
         )
         is False
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anti-poisoning: finalize_pending_playbook_entries
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_finalize_pending_playbook_entries_drops_on_failure(db_session):
+    """A FAILED task's pending entries are removed so peers never see the lie."""
+    from app.playbook_learning import finalize_pending_playbook_entries
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    project.design_doc = {
+        "playbook/lie": {
+            "content": "X exists in foo.py",
+            "source_task_id": str(task.id),
+            "pending_source": str(task.id),
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+        },
+        "playbook/peer": {  # written by a different task — must NOT be touched
+            "content": "Real, finalised entry",
+            "source_task_id": str(uuid.uuid4()),
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 1,
+        },
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    n = await finalize_pending_playbook_entries(task, db_session, succeeded=False)
+    await db_session.flush()
+
+    assert n == 1
+    doc = project.design_doc
+    assert "playbook/lie" not in doc, "Failed task's pending entry must be removed"
+    assert "playbook/peer" in doc, "Other tasks' entries must be preserved"
+
+
+@pytest.mark.asyncio
+async def test_finalize_pending_playbook_entries_promotes_on_success(db_session):
+    """A COMPLETED task's pending entries lose pending_source and become visible."""
+    from app.playbook_learning import finalize_pending_playbook_entries
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    project.design_doc = {
+        "playbook/proven": {
+            "content": "Real finding from completed task",
+            "source_task_id": str(task.id),
+            "pending_source": str(task.id),
+            "updated_at": _utcnow().isoformat(),
+            "confirmed_count": 0,
+        },
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    n = await finalize_pending_playbook_entries(task, db_session, succeeded=True)
+    await db_session.flush()
+
+    assert n == 1
+    entry = project.design_doc["playbook/proven"]
+    assert "pending_source" not in entry, (
+        "Successful task's pending flag must be cleared"
+    )
+    assert entry["content"] == "Real finding from completed task"
