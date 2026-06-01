@@ -2225,6 +2225,110 @@ class AnomalyFingerprintState(SQLModel, table=True):
     )
 
 
+class Direction(SQLModel, table=True):
+    """First-class normalised row for a single autonomous-improvement direction.
+
+    P2 scale work (design-audit roadmap ``p2-direction-table``): historically
+    every direction lived inside the unbounded ``Project.directions`` JSONB blob,
+    so every per-direction mutation (research_history append, status flip, note
+    add, proposal expiry, ...) took the project-row lock and rewrote (and
+    TOAST-churned) the entire array. ~112 access sites contended on one global
+    per-project mutex, and the ``_expire_stale_proposals`` sweep bulk-locked
+    every autonomous project at once.
+
+    This table promotes each direction to its own row so a single-direction
+    mutation is a single-row write — no project-row lock, no whole-array
+    rewrite. The natural key is ``(project_id, direction_key)`` where
+    ``direction_key`` is the string ``id`` the rest of the system already uses
+    (e.g. ``"d-1a2b3c4d"``, ``"crosscutting"``).
+
+    Behaviour-preservation during the transition: the canonical write path
+    (``task_locking.with_directions_locked``) DUAL-WRITES — it still maintains
+    the ``Project.directions`` blob (so every existing read site is unchanged)
+    AND mirrors each touched direction into this table via
+    ``directions_repo.sync_directions``. The full direction dict round-trips in
+    the ``data`` JSONB column, so no field is lost; the promoted columns
+    (``status``, ``priority``, ``text``, timestamps) exist for indexed querying
+    and to let future read sites move off the blob one at a time. See
+    ``app.directions_repo`` for the accessor and the migration that backfills
+    this table from the existing blobs.
+    """
+
+    __tablename__ = "direction"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "direction_key",
+            name="ux_direction_project_key",
+        ),
+        # Hot path: list a project's directions, often filtered by status.
+        Index("ix_direction_project_status", "project_id", "status"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=False,
+        ),
+    )
+
+    # The string direction id used everywhere else in the codebase
+    # (``direction["id"]``). Free-form: agent-generated (``d-<hex>``),
+    # ``"crosscutting"``, or user/strategic ids. Unique per project.
+    direction_key: str = Field(sa_column=Column(String(128), nullable=False))
+
+    # Promoted lifecycle status: active | paused | proposed | rejected |
+    # expired | completed | retired | superseded. Stored as a free-form string
+    # (no DB check constraint) to match the blob's open vocabulary.
+    status: str = Field(
+        default="active",
+        sa_column=Column(String(32), nullable=False, server_default="active"),
+    )
+
+    # Promoted priority: high | medium | low (free-form; validated at ingest).
+    priority: str | None = Field(
+        default=None,
+        sa_column=Column(String(16), nullable=True),
+    )
+
+    # The complete direction dict (everything the blob held: research_history,
+    # history_aggregate, notes, research_context, recommended_mode_meta,
+    # diagnosis_* keys, recent_findings_evidence, ...). Source of truth for the
+    # row's full shape so behaviour is preserved across the cutover.
+    # NOTE: declared before the ``text`` field below — that field name shadows
+    # the module-level ``sqlalchemy.text`` within this class body, so the
+    # ``server_default=text(...)`` call must come first.
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+
+    # Promoted direction text (the human-readable steer). Nullable because
+    # synthetic/system directions may carry none.
+    text: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+
 class ReleaseVersion(SQLModel, table=True):
     """Release-version lifecycle record for automain → main promotion gating.
 

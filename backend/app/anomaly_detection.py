@@ -14,7 +14,6 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -1346,64 +1345,71 @@ async def anomaly_maintenance_sweep() -> dict:
 
 
 async def _expire_stale_proposals(session) -> int:
-    """Expire direction proposals older than 30 days across all projects."""
+    """Expire direction proposals older than 30 days across all projects.
+
+    P2 (p2-direction-table): previously this sweep did one bulk
+    ``SELECT ... FOR NO KEY UPDATE`` over every autonomous project at once,
+    which made it the dominant lock-timeout victim whenever any single project
+    row was held by the per-task hot path (incident 2026-05-29). It now reads
+    project IDs WITHOUT locking, then expires each project's stale proposals
+    one at a time under that single project's brief row lock via
+    ``with_directions_locked`` (which dual-writes the normalised ``direction``
+    table). A project whose row is currently held is skipped this run and its
+    proposals simply expire on the next idle-research cycle (~5 min) — a
+    stale-proposal cleanup tolerates the deferral, so the expiry is never
+    silently dropped, just deferred. No project-wide bulk lock is taken.
+    """
+    from app.task_locking import with_directions_locked
+
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
-    # Lock the project rows under the canonical FOR NO KEY UPDATE project-row
-    # lock (see task_locking.project_lock) so this cron's read-modify-write of
-    # project.directions can't lose an update racing a concurrent same-project
-    # completion: each row is read fresh under the lock and held until this
-    # transaction ends.
-    #
-    # skip_locked=True (was False): a project row currently held by a concurrent
-    # same-project completion is SKIPPED this run rather than waited on. Waiting
-    # (skip_locked=False) made this background sweep bulk-lock every autonomous
-    # project at once and block on the 5s lock_timeout whenever any row was held
-    # by the per-task hot path — flooding LockNotAvailableError ("canceling
-    # statement due to lock timeout") under load (incident 2026-05-29; the sweep
-    # was the dominant lock-timeout victim). A skipped project's 30-day-stale
-    # proposals simply expire on the next idle-research cycle (~5 min) — a
-    # stale-proposal cleanup tolerates the deferral, so we never silently drop
-    # the expiry, just defer it. The loop does no external I/O, so the hold on
-    # the rows it does acquire is brief.
-    projects = (
+    # Read candidate project IDs without any lock — a plain scalar select that
+    # never contends with the hot path. We re-read each project's directions
+    # fresh inside its own row lock below, so this snapshot can be stale.
+    project_ids = (
         (
             await session.execute(
-                select(Project)
-                .where(Project.autonomous_enabled.is_(True))
-                .with_for_update(skip_locked=True, key_share=True)
+                select(Project.id).where(Project.autonomous_enabled.is_(True))
             )
         )
         .scalars()
         .all()
     )
     total_expired = 0
-    for project in projects:
-        dirs = list(project.directions or [])
-        expired_count = 0
-        for d in dirs:
-            if (
-                d.get("status") == "proposed"
-                and (d.get("proposed_at") or d.get("added_at", "")) < cutoff
-            ):
-                d["status"] = "expired"
-                d["expired_at"] = _utcnow().isoformat()
-                expired_count += 1
-        if expired_count:
-            project.directions = dirs
-            flag_modified(project, "directions")
-            session.add(project)
-            total_expired += expired_count
+    for project_id in project_ids:
+        # Per-project counter captured via closure; the mutate_fn runs against
+        # the directions list freshly loaded inside the project's row lock.
+        expired_holder = {"count": 0}
+
+        def _expire(dirs: list, _holder=expired_holder) -> None:
+            now_iso = _utcnow().isoformat()
+            for d in dirs:
+                if (
+                    d.get("status") == "proposed"
+                    and (d.get("proposed_at") or d.get("added_at", "")) < cutoff
+                ):
+                    d["status"] = "expired"
+                    d["expired_at"] = now_iso
+                    _holder["count"] += 1
+
+        # skip_locked=True: a project row held by a concurrent same-project
+        # completion is skipped this run (deferred, never dropped). Only this
+        # one project's row is touched, so a busy project never blocks the
+        # sweep for the others.
+        applied = await with_directions_locked(
+            session, project_id, _expire, skip_locked=True
+        )
+        if applied and expired_holder["count"]:
+            await session.commit()  # releases this project's row lock
+            total_expired += expired_holder["count"]
             logger.info(
-                f"[DIRECTIONS] Expired {expired_count} stale proposals for project {project.id}"
+                f"[DIRECTIONS] Expired {expired_holder['count']} stale proposals "
+                f"for project {project_id}"
             )
-    if total_expired:
-        await session.commit()  # commit releases the project-row locks
-    else:
-        # Nothing changed, but the FOR-UPDATE select still took row locks;
-        # release them now rather than holding them for the rest of the
-        # idle-research cycle (which performs external I/O) until the session
-        # is closed.
-        await session.rollback()
+        else:
+            # Nothing changed (or row was held under skip_locked); release any
+            # transaction state before moving to the next project so we don't
+            # hold a connection/transaction open across the whole sweep.
+            await session.rollback()
     return total_expired
 
 

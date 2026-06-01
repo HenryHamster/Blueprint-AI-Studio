@@ -334,48 +334,59 @@ async def test_direction_co_firing_signals_both_persist():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _make_expire_session(projects: list):
-    """Build a mock AsyncSession whose execute returns the given projects."""
-    session = AsyncMock()
-    session.add = MagicMock()
-    session.commit = AsyncMock()
+async def _reload_directions(db_session, project_id) -> list:
+    """Re-read a project's directions blob fresh from the DB.
 
-    scalars = MagicMock()
-    scalars.all.return_value = projects
-    result = MagicMock()
-    result.scalars.return_value = scalars
-    session.execute = AsyncMock(return_value=result)
-    return session
+    Uses a populate_existing SELECT so the value is refreshed inside the async
+    context (avoids a sync lazy-load MissingGreenlet after the internal commit
+    expired the identity-map instance).
+    """
+    from sqlalchemy import select as _select
+    from app.models import Project
+
+    result = await db_session.execute(
+        _select(Project)
+        .where(Project.id == project_id)
+        .execution_options(populate_existing=True)
+    )
+    project = result.scalar_one()
+    return list(project.directions or [])
+
+
+# P2 (p2-direction-table): _expire_stale_proposals no longer bulk-locks every
+# project; it reads project IDs unlocked then expires each project's stale
+# proposals under that single project's row lock via with_directions_locked
+# (which also dual-writes the normalised ``direction`` table). These tests run
+# against the real DB session so they exercise that actual implementation
+# rather than over-specifying a now-stale "single bulk SELECT" shape.
 
 
 @pytest.mark.asyncio
-async def test_expire_no_autonomous_projects():
-    """No autonomous projects — returns 0 and does not commit."""
-    session = _make_expire_session(projects=[])
-    count = await _expire_stale_proposals(session)
+async def test_expire_no_autonomous_projects(db_session):
+    """No autonomous projects — returns 0."""
+    count = await _expire_stale_proposals(db_session)
     assert count == 0
-    session.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_expire_project_with_no_proposed_directions():
-    """Project with no proposed directions — returns 0."""
+async def test_expire_project_with_no_proposed_directions(db_session):
+    """Project with no proposed directions — returns 0, status unchanged."""
     project = make_project(
         autonomous_enabled=True,
         directions=[{"id": "d-1", "text": "x", "status": "active"}],
     )
-    session = _make_expire_session(projects=[project])
-    count = await _expire_stale_proposals(session)
+    db_session.add(project)
+    await db_session.commit()
+    count = await _expire_stale_proposals(db_session)
     assert count == 0
-    session.commit.assert_not_awaited()
-    assert project.directions[0]["status"] == "active"
+    dirs = await _reload_directions(db_session, project.id)
+    assert dirs[0]["status"] == "active"
 
 
 @pytest.mark.asyncio
-async def test_expire_recent_proposal_preserved():
+async def test_expire_recent_proposal_preserved(db_session):
     """Proposal under 30 days old is preserved unchanged."""
-    now = _utcnow()
-    recent_iso = (now - timedelta(days=5)).isoformat()
+    recent_iso = (_utcnow() - timedelta(days=5)).isoformat()
     project = make_project(
         autonomous_enabled=True,
         directions=[
@@ -387,19 +398,19 @@ async def test_expire_recent_proposal_preserved():
             }
         ],
     )
-    session = _make_expire_session(projects=[project])
-    count = await _expire_stale_proposals(session)
+    db_session.add(project)
+    await db_session.commit()
+    count = await _expire_stale_proposals(db_session)
     assert count == 0
-    assert project.directions[0]["status"] == "proposed"
-    assert "expired_at" not in project.directions[0]
-    session.commit.assert_not_awaited()
+    dirs = await _reload_directions(db_session, project.id)
+    assert dirs[0]["status"] == "proposed"
+    assert "expired_at" not in dirs[0]
 
 
 @pytest.mark.asyncio
-async def test_expire_old_proposal_marked_expired():
+async def test_expire_old_proposal_marked_expired(db_session):
     """Proposal over 30 days old is marked expired with timestamp."""
-    now = _utcnow()
-    old_iso = (now - timedelta(days=40)).isoformat()
+    old_iso = (_utcnow() - timedelta(days=40)).isoformat()
     project = make_project(
         autonomous_enabled=True,
         directions=[
@@ -411,19 +422,19 @@ async def test_expire_old_proposal_marked_expired():
             }
         ],
     )
-    session = _make_expire_session(projects=[project])
-    count = await _expire_stale_proposals(session)
+    db_session.add(project)
+    await db_session.commit()
+    count = await _expire_stale_proposals(db_session)
     assert count == 1
-    assert project.directions[0]["status"] == "expired"
-    assert "expired_at" in project.directions[0]
-    session.commit.assert_awaited_once()
+    dirs = await _reload_directions(db_session, project.id)
+    assert dirs[0]["status"] == "expired"
+    assert "expired_at" in dirs[0]
 
 
 @pytest.mark.asyncio
-async def test_expire_ignores_non_proposed_directions():
+async def test_expire_ignores_non_proposed_directions(db_session):
     """Active and already-expired directions are unaffected regardless of age."""
-    now = _utcnow()
-    old_iso = (now - timedelta(days=100)).isoformat()
+    old_iso = (_utcnow() - timedelta(days=100)).isoformat()
     project = make_project(
         autonomous_enabled=True,
         directions=[
@@ -436,20 +447,20 @@ async def test_expire_ignores_non_proposed_directions():
             },
         ],
     )
-    session = _make_expire_session(projects=[project])
-    count = await _expire_stale_proposals(session)
+    db_session.add(project)
+    await db_session.commit()
+    count = await _expire_stale_proposals(db_session)
     assert count == 0
-    assert project.directions[0]["status"] == "active"
-    assert project.directions[1]["status"] == "expired"
-    session.commit.assert_not_awaited()
+    dirs = await _reload_directions(db_session, project.id)
+    assert dirs[0]["status"] == "active"
+    assert dirs[1]["status"] == "expired"
 
 
 @pytest.mark.asyncio
-async def test_expire_multiple_projects_mixed():
+async def test_expire_multiple_projects_mixed(db_session):
     """Across multiple projects, only old proposals expire; count totals across projects."""
-    now = _utcnow()
-    old_iso = (now - timedelta(days=45)).isoformat()
-    recent_iso = (now - timedelta(days=3)).isoformat()
+    old_iso = (_utcnow() - timedelta(days=45)).isoformat()
+    recent_iso = (_utcnow() - timedelta(days=3)).isoformat()
 
     p1 = make_project(
         autonomous_enabled=True,
@@ -491,12 +502,15 @@ async def test_expire_multiple_projects_mixed():
             {"id": "d-p3", "text": "v", "status": "proposed", "proposed_at": recent_iso}
         ],
     )
-    session = _make_expire_session(projects=[p1, p2, p3])
-    count = await _expire_stale_proposals(session)
+    db_session.add_all([p1, p2, p3])
+    await db_session.commit()
+    count = await _expire_stale_proposals(db_session)
     assert count == 3
-    assert p1.directions[0]["status"] == "expired"
-    assert p1.directions[1]["status"] == "proposed"
-    assert p2.directions[0]["status"] == "expired"
-    assert p2.directions[1]["status"] == "expired"
-    assert p3.directions[0]["status"] == "proposed"
-    session.commit.assert_awaited_once()
+    d1 = await _reload_directions(db_session, p1.id)
+    d2 = await _reload_directions(db_session, p2.id)
+    d3 = await _reload_directions(db_session, p3.id)
+    assert d1[0]["status"] == "expired"
+    assert d1[1]["status"] == "proposed"
+    assert d2[0]["status"] == "expired"
+    assert d2[1]["status"] == "expired"
+    assert d3[0]["status"] == "proposed"

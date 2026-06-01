@@ -461,9 +461,28 @@ async def _with_project_locked_list_mutation(
             return False
         directions = list(project.directions or [])
         result = mutate_fn(directions)
-        project.directions = result if result is not None else directions
+        final = result if result is not None else directions
+        project.directions = final
         flag_modified(project, "directions")
         session.add(project)
+        # P2 (p2-direction-table): dual-write the normalised ``direction`` table
+        # so it stays consistent with the authoritative blob during the
+        # transition. Best-effort — a sync failure must never break the blob
+        # write (which is still the source of truth every read site uses).
+        try:
+            from app.directions_repo import sync_directions
+
+            await sync_directions(session, project_id, final)
+        # BLE001: intentional log-and-continue — the authoritative blob write
+        # above must never be broken by a dual-write sync failure (the blob
+        # remains the source of truth every read site uses).
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - defensive
+            logger.warning(
+                "[with_directions_locked] direction-table dual-write sync failed "
+                "for project %s (blob write unaffected): %s",
+                project_id,
+                exc,
+            )
     return True
 
 
