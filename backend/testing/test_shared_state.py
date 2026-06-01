@@ -35,20 +35,36 @@ def _task(
 
 
 class TestDeriveTaskBranch:
+    # namespace is a REQUIRED parameter (no silent "blueprint" default); these
+    # self-repo cases pass "blueprint" explicitly to preserve the asserted name.
     def test_unknown_type_falls_back_to_task_prefix(self):
         # The fallback prefix protects against future task types not in the map.
-        b = derive_task_branch("11111111-2222-3333-4444-555555555555", "novel-type")
+        b = derive_task_branch(
+            "11111111-2222-3333-4444-555555555555", "novel-type", "blueprint"
+        )
         assert b == "blueprint/task-11111111"
 
     def test_refactor_uses_refactor_prefix(self):
-        b = derive_task_branch("11111111-2222-3333-4444-555555555555", "refactor")
+        b = derive_task_branch(
+            "11111111-2222-3333-4444-555555555555", "refactor", "blueprint"
+        )
         assert b == "blueprint/refactor-11111111"
 
     def test_fix_uses_task_prefix(self):
         # Fix tasks reuse the parent branch in real runs, but if synthesized
         # they go under `task-` like create/qa per the agent's branch map.
-        b = derive_task_branch("11111111-2222-3333-4444-555555555555", "fix")
+        b = derive_task_branch(
+            "11111111-2222-3333-4444-555555555555", "fix", "blueprint"
+        )
         assert b == "blueprint/task-11111111"
+
+    def test_custom_namespace_replaces_blueprint_segment(self):
+        # A non-Blueprint repo threads its own namespace; the leading segment
+        # must reflect it, never silently fall back to "blueprint".
+        b = derive_task_branch(
+            "11111111-2222-3333-4444-555555555555", "refactor", "autoproj"
+        )
+        assert b == "autoproj/refactor-11111111"
 
     def test_prefix_map_covers_known_types(self):
         # Guard against accidental drift from agent/handlers -- these prefixes
@@ -58,6 +74,9 @@ class TestDeriveTaskBranch:
 
 
 class TestResolveTaskBranch:
+    # resolve_task_branch now takes a REQUIRED namespace, used only for the
+    # last-resort synthesis branch; the recorded-branch precedence cases pass
+    # "blueprint" but it is never read for them.
     def test_review_loop_branch_wins_over_payload_and_context(self):
         t = _task(
             payloads=[{"type": "fix", "branch": "blueprint/payload-branch"}],
@@ -66,21 +85,30 @@ class TestResolveTaskBranch:
                 "review_loop": {"branch": "blueprint/review-loop-branch"},
             },
         )
-        assert resolve_task_branch(t) == "blueprint/review-loop-branch"
+        assert resolve_task_branch(t, "blueprint") == "blueprint/review-loop-branch"
 
     def test_payload_branch_wins_over_context_when_review_loop_missing(self):
         t = _task(
             payloads=[{"type": "fix", "branch": "blueprint/payload-branch"}],
             context={"branch": "blueprint/ctx-branch"},
         )
-        assert resolve_task_branch(t) == "blueprint/payload-branch"
+        assert resolve_task_branch(t, "blueprint") == "blueprint/payload-branch"
 
     def test_context_branch_used_when_review_loop_and_payload_missing(self):
         t = _task(
             payloads=[{"type": "fix"}],
             context={"branch": "blueprint/ctx-branch"},
         )
-        assert resolve_task_branch(t) == "blueprint/ctx-branch"
+        assert resolve_task_branch(t, "blueprint") == "blueprint/ctx-branch"
+
+    def test_recorded_branch_ignores_namespace_arg(self):
+        # When the task carries a real branch, the namespace argument must not
+        # rewrite it -- it is only used for last-resort synthesis.
+        t = _task(
+            payloads=[{"type": "fix", "branch": "blueprint/payload-branch"}],
+            context={},
+        )
+        assert resolve_task_branch(t, "autoproj") == "blueprint/payload-branch"
 
     def test_review_loop_empty_branch_falls_through_to_payload(self):
         # An empty string or None in review_loop.branch must not block the
@@ -89,12 +117,12 @@ class TestResolveTaskBranch:
             payloads=[{"type": "fix", "branch": "blueprint/payload-branch"}],
             context={"review_loop": {"branch": None}},
         )
-        assert resolve_task_branch(t) == "blueprint/payload-branch"
+        assert resolve_task_branch(t, "blueprint") == "blueprint/payload-branch"
         t = _task(
             payloads=[{"type": "fix", "branch": "blueprint/payload-branch"}],
             context={"review_loop": {"branch": ""}},
         )
-        assert resolve_task_branch(t) == "blueprint/payload-branch"
+        assert resolve_task_branch(t, "blueprint") == "blueprint/payload-branch"
 
     def test_no_branch_anywhere_falls_back_to_derive(self):
         # The synthesized branch must use the task's payload type, not the
@@ -104,13 +132,23 @@ class TestResolveTaskBranch:
             payloads=[{"type": "refactor"}],
             context={},
         )
-        assert resolve_task_branch(t) == "blueprint/refactor-aabbccdd"
+        assert resolve_task_branch(t, "blueprint") == "blueprint/refactor-aabbccdd"
+
+    def test_synthesis_uses_passed_namespace(self):
+        # The last-resort synthesis must honor the caller's namespace, not the
+        # canonical "blueprint" segment.
+        t = _task(
+            task_id="aabbccdd-1111-2222-3333-444444444444",
+            payloads=[{"type": "refactor"}],
+            context={},
+        )
+        assert resolve_task_branch(t, "autoproj") == "autoproj/refactor-aabbccdd"
 
     def test_none_context_is_safe(self):
         t = _task(payloads=[{"type": "create"}], context=None)
         # No context, no payload branch -> derived.
-        expected = derive_task_branch(t.id, "create")
-        assert resolve_task_branch(t) == expected
+        expected = derive_task_branch(t.id, "create", "blueprint")
+        assert resolve_task_branch(t, "blueprint") == expected
 
     def test_fix_task_with_parent_branch_in_review_loop_returns_parent_branch(self):
         # Regression -- fix tasks reuse the parent's PR branch. The branch
@@ -122,7 +160,7 @@ class TestResolveTaskBranch:
             payloads=[{"type": "fix"}],
             context={"review_loop": {"branch": "blueprint/task-abc12345"}},
         )
-        out = resolve_task_branch(t)
+        out = resolve_task_branch(t, "blueprint")
         assert out == "blueprint/task-abc12345"
         # Critically: not the fix task's own synthesized branch.
         assert out != "blueprint/task-ffffffff"

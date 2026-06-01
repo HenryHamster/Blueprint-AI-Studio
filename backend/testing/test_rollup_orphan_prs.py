@@ -22,7 +22,9 @@ def test_branch_task_id_prefix_canonical_agent_branch():
     """The trailing 8-hex token of a {namespace}/{prefix}-{8hex} branch is the
     owning task's id-prefix — and matches what derive_task_branch produced."""
     task_id = "db668612-7bf4-41be-89e1-3d892be07273"
-    branch = derive_task_branch(task_id, "refactor")  # -> blueprint/refactor-db668612
+    branch = derive_task_branch(
+        task_id, "refactor", "blueprint"
+    )  # -> blueprint/refactor-db668612
     assert branch == "blueprint/refactor-db668612"
     assert _branch_task_id_prefix(branch) == "db668612"
 

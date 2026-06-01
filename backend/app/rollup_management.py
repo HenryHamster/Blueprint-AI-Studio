@@ -48,6 +48,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
+    get_project_task_branch_namespace as _get_project_task_branch_namespace,
 )
 from app.task_locking import with_directions_locked
 
@@ -1047,8 +1048,10 @@ async def _check_and_trigger_rollup(
                 # review_loop.branch or first_payload.branch — synthesizing
                 # blueprint/task-{fix_id} yields a name no agent ever pushed,
                 # so respawned reviews would fail at `git clone --branch`.
-                branch = resolve_task_branch(c)
                 project = await session.get(Project, c.project_id)
+                branch = resolve_task_branch(
+                    c, _get_project_task_branch_namespace(project)
+                )
                 base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
                 respawn_candidates.append(

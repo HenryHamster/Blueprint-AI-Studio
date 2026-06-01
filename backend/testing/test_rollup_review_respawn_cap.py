@@ -347,7 +347,9 @@ async def test_respawn_uses_task_type_branch_prefix(rollup_db, mocker):
     # _spawn_pipeline_task signature: (source_task, task_type, session,
     # pr_number, branch, base_branch, ...). branch is positional index 4.
     branch_passed = spawn_kwargs.get("branch") or spawn_args[4]
-    expected = derive_task_branch(child.id, "refactor")
+    # The test project carries no per-project namespace override, so the
+    # resolver falls through to the canonical "blueprint" namespace.
+    expected = derive_task_branch(child.id, "refactor", "blueprint")
     assert branch_passed == expected, (
         f"respawn cloned wrong branch: got {branch_passed!r}, expected {expected!r} "
         f"(must use child's task type, not hardcoded 'task-' prefix)"
@@ -424,7 +426,7 @@ async def test_respawn_prefers_review_loop_branch_over_synthesized(rollup_db, mo
     # Sanity: this is NOT what plain derivation would have produced.
     from app.shared_state import derive_task_branch as _derive
 
-    synthesized = _derive(child.id, "create")
+    synthesized = _derive(child.id, "create", "blueprint")
     assert branch_passed != synthesized
 
 

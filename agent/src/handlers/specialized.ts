@@ -4,7 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
   setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
-  resolveBaseBranch,
+  resolveBaseBranch, resolveTaskBranchNamespace,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -84,7 +84,7 @@ export async function handleMigrate(
   git(['config', 'user.email', migrateBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', migrateBuildConfig?.git_user_name || 'Blueprint Agent']);
 
-  const workBranch = deriveTaskBranch('migrate', taskId, migrateBuildConfig?.task_branch_namespace);
+  const workBranch = deriveTaskBranch('migrate', taskId, resolveTaskBranchNamespace(migrateBuildConfig));
   let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);

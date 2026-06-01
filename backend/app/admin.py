@@ -842,8 +842,10 @@ async def bulk_action_tasks(
                         if artifact and artifact.pr_url:
                             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                             task_payload = task.first_payload
-                            branch = _resolve_task_branch(task)
                             _project = await session.get(Project, task.project_id)
+                            branch = _resolve_task_branch(
+                                task, get_project_task_branch_namespace(_project)
+                            )
                             base_branch = task_payload.get(
                                 "base_branch"
                             ) or get_project_integration_branch(_project)
@@ -1620,8 +1622,8 @@ async def request_changes(
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
-    branch = _resolve_task_branch(task)
     _project = await session.get(Project, task.project_id)
+    branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
     base_branch = task_payload.get("base_branch") or get_project_integration_branch(
         _project
     )

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -356,28 +356,30 @@ describe('deriveTaskBranch', () => {
   const taskId = 'abcdef12-3456-7890-abcd-ef1234567890';
   const shortId = 'abcdef12'; // taskId.replace(/-/g,'').slice(0,8)
 
+  // namespace is a REQUIRED parameter (no silent "blueprint" default); the
+  // self-repo cases pass 'blueprint' explicitly to preserve the asserted name.
   it('maps refactor → refactor prefix', () => {
-    expect(deriveTaskBranch('refactor', taskId)).toBe(`blueprint/refactor-${shortId}`);
+    expect(deriveTaskBranch('refactor', taskId, 'blueprint')).toBe(`blueprint/refactor-${shortId}`);
   });
 
   it('maps docs → docs prefix', () => {
-    expect(deriveTaskBranch('docs', taskId)).toBe(`blueprint/docs-${shortId}`);
+    expect(deriveTaskBranch('docs', taskId, 'blueprint')).toBe(`blueprint/docs-${shortId}`);
   });
 
   it('maps deps → deps prefix', () => {
-    expect(deriveTaskBranch('deps', taskId)).toBe(`blueprint/deps-${shortId}`);
+    expect(deriveTaskBranch('deps', taskId, 'blueprint')).toBe(`blueprint/deps-${shortId}`);
   });
 
   it('maps migrate → migrate prefix', () => {
-    expect(deriveTaskBranch('migrate', taskId)).toBe(`blueprint/migrate-${shortId}`);
+    expect(deriveTaskBranch('migrate', taskId, 'blueprint')).toBe(`blueprint/migrate-${shortId}`);
   });
 
   it('defaults unknown types to task prefix', () => {
-    expect(deriveTaskBranch('create', taskId)).toBe(`blueprint/task-${shortId}`);
-    expect(deriveTaskBranch('qa', taskId)).toBe(`blueprint/task-${shortId}`);
-    expect(deriveTaskBranch('fix', taskId)).toBe(`blueprint/task-${shortId}`);
-    expect(deriveTaskBranch('review', taskId)).toBe(`blueprint/task-${shortId}`);
-    expect(deriveTaskBranch('', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('create', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('qa', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('fix', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('review', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
   });
 
   it('TASK_TYPE_BRANCH_PREFIX covers all explicitly-mapped types', () => {
@@ -392,15 +394,20 @@ describe('deriveTaskBranch', () => {
 
   it('uses first 8 hex chars of task UUID with dashes removed', () => {
     const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
-    expect(deriveTaskBranch('refactor', id)).toBe('blueprint/refactor-11223344');
+    expect(deriveTaskBranch('refactor', id, 'blueprint')).toBe('blueprint/refactor-11223344');
   });
 
-  it('accepts a per-project namespace argument', () => {
+  it('threads a per-project namespace into the leading segment', () => {
     const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
     expect(deriveTaskBranch('refactor', id, 'autoproj')).toBe('autoproj/refactor-11223344');
     expect(deriveTaskBranch('docs', id, 'bot')).toBe('bot/docs-11223344');
-    // Default still matches the Blueprint self-repo namespace byte-for-byte.
-    expect(deriveTaskBranch('refactor', id)).toBe('blueprint/refactor-11223344');
+  });
+
+  it('resolveTaskBranchNamespace returns the per-project override or the Blueprint default', () => {
+    expect(resolveTaskBranchNamespace({ task_branch_namespace: 'autoproj' })).toBe('autoproj');
+    expect(resolveTaskBranchNamespace({})).toBe('blueprint');
+    expect(resolveTaskBranchNamespace(null)).toBe('blueprint');
+    expect(resolveTaskBranchNamespace(undefined)).toBe('blueprint');
   });
 });
 

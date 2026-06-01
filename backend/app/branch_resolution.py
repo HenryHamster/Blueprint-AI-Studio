@@ -57,10 +57,12 @@ TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
 }
 
 
-# Default namespace (the "blueprint" segment of ``blueprint/{prefix}-{8hex}``).
-# Per-project overrides come from project.task_branch_namespace (see
-# get_project_task_branch_namespace below); a non-Blueprint install can ship
-# its own namespace by setting build_config.task_branch_namespace.
+# Canonical namespace for the Blueprint self-repo (the "blueprint" segment of
+# ``blueprint/{prefix}-{8hex}``).  This is NOT a silent default for
+# ``derive_task_branch`` — callers must pass the project's resolved namespace
+# explicitly (see :func:`get_project_task_branch_namespace`).  It survives only
+# as the terminal fallback inside ``get_project_task_branch_namespace`` and as
+# the value the namespace backfill writes for Blueprint self-repo projects.
 TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
 
 
@@ -70,15 +72,17 @@ _missing_project_branch_alerts: set[tuple[str, str]] = set()
 def derive_task_branch(
     task_id: Any,
     task_type: str | None,
-    namespace: str = TASK_BRANCH_NAMESPACE_DEFAULT,
+    namespace: str,
 ) -> str:
     """Derive an agent work branch name (``{namespace}/{prefix}-{8hex}``)
     from the task type and id, matching the agent's branch derivation.
 
-    ``namespace`` defaults to ``"blueprint"`` so call sites that pre-date the
-    per-project namespace work unchanged for the self-repo. Callers that have
-    a project in hand should resolve the namespace via
-    :func:`get_project_task_branch_namespace` and pass it through.
+    ``namespace`` is REQUIRED — there is no silent ``"blueprint"`` default, so
+    every call site for an arbitrary repo must thread through the project's
+    actual namespace (resolve it via
+    :func:`get_project_task_branch_namespace`).  Passing the wrong namespace
+    yields a branch name no agent ever pushed and strands downstream review /
+    fix respawns at ``git clone --branch``.
     """
     prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
     return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
@@ -126,17 +130,24 @@ def _signal_missing_project_branch(project, column_name: str, alert_title: str) 
         )
 
 
-def resolve_task_branch(task: Any) -> str:
+def resolve_task_branch(task: Any, namespace: str) -> str:
     """Return the branch a task's agent actually pushed to.
 
     Precedence:
       1. ``task.context["review_loop"]["branch"]`` — set by review/fix spawn
       2. ``task.first_payload["branch"]`` — set when an agent claims a task
       3. ``task.context["branch"]`` — legacy fallback
-      4. ``derive_task_branch(task.id, task_type)`` — last-resort synthesis
+      4. ``derive_task_branch(task.id, task_type, namespace)`` — last-resort
+         synthesis
+
+    ``namespace`` is REQUIRED and is used only for the last-resort synthesis
+    branch (4); callers should resolve it from the task's project via
+    :func:`get_project_task_branch_namespace`.  It no longer silently defaults
+    to ``"blueprint"`` so a non-Blueprint repo never synthesizes a branch under
+    the wrong namespace.
 
     Fix tasks reuse the parent's PR branch — synthesizing
-    ``blueprint/task-{fix_id}`` from a fix child's own id yields a name no
+    ``{namespace}/task-{fix_id}`` from a fix child's own id yields a name no
     agent ever pushed, breaking downstream review respawns that try to clone
     it. The first three sources carry the real branch; derivation is only
     safe when none of them are present (a freshly-spawned create/refactor
@@ -154,7 +165,7 @@ def resolve_task_branch(task: Any) -> str:
     branch = ctx.get("branch")
     if branch:
         return branch
-    return derive_task_branch(getattr(task, "id", None), payload.get("type"))
+    return derive_task_branch(getattr(task, "id", None), payload.get("type"), namespace)
 
 
 def get_project_integration_branch(project) -> str:

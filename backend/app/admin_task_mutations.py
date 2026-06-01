@@ -31,6 +31,7 @@ from app.models import (
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
     get_project_integration_branch,
+    get_project_task_branch_namespace,
     resolve_task_branch as _resolve_task_branch,
 )
 
@@ -458,11 +459,11 @@ async def _handle_task_pr_approval(
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
-    branch = _resolve_task_branch(task)
     _project = await session.get(Project, task.project_id)
-    base_branch = task_payload.get(
-        "base_branch"
-    ) or get_project_integration_branch(_project)
+    branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
+    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+        _project
+    )
 
     if ctx.get("touched_critical"):
         await _merge_critical_pr(

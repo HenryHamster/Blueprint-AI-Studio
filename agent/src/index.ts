@@ -1325,18 +1325,34 @@ export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
   migrate: 'migrate',
 };
 
-/** Default task-branch namespace — preserves Blueprint self-repo behavior. */
+/** Canonical task-branch namespace for the Blueprint self-repo.  This is NOT a
+ *  silent default for {@link deriveTaskBranch}; it is only the terminal
+ *  fallback callers apply when ``buildConfig.task_branch_namespace`` is absent
+ *  (mirrors the backend's ``get_project_task_branch_namespace`` resolver). */
 export const TASK_BRANCH_NAMESPACE_DEFAULT = 'blueprint';
+
+/** Resolve the per-project task-branch namespace from a build config.
+ *  Mirrors the backend ``get_project_task_branch_namespace``: use the
+ *  per-project ``task_branch_namespace`` when set, else the canonical
+ *  Blueprint default.  Callers thread the result into {@link deriveTaskBranch}
+ *  rather than relying on a hidden default. */
+export function resolveTaskBranchNamespace(
+  buildConfig: { task_branch_namespace?: string } | null | undefined,
+): string {
+  return buildConfig?.task_branch_namespace || TASK_BRANCH_NAMESPACE_DEFAULT;
+}
 
 /** Return the canonical git branch name for a task.
  *
- *  ``namespace`` defaults to ``"blueprint"`` so existing call sites stay
- *  byte-identical; the per-project namespace flows in from
- *  ``buildConfig.task_branch_namespace`` (mirrors the backend resolver). */
+ *  ``namespace`` is REQUIRED — there is no silent ``"blueprint"`` default, so
+ *  every call site for an arbitrary repo must thread through the project's
+ *  actual namespace (resolve it via {@link resolveTaskBranchNamespace} from
+ *  ``buildConfig.task_branch_namespace``).  Mirrors the backend
+ *  ``derive_task_branch``. */
 export function deriveTaskBranch(
   taskType: string,
   taskId: string,
-  namespace: string = TASK_BRANCH_NAMESPACE_DEFAULT,
+  namespace: string,
 ): string {
   const prefix = TASK_TYPE_BRANCH_PREFIX[taskType] ?? 'task';
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
@@ -1571,7 +1587,7 @@ export async function setupWorkspace(
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const namespace = buildConfig?.task_branch_namespace || TASK_BRANCH_NAMESPACE_DEFAULT;
+  const namespace = resolveTaskBranchNamespace(buildConfig);
   const workBranch = `${namespace}/${branchPrefix}-${shortId}`;
   // Clean up stale remote branch from previous attempt (requeue scenario).
   // CRITICAL: if the stale branch has an open PR, deleting it auto-closes the PR
