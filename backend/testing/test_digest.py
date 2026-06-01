@@ -7742,3 +7742,91 @@ async def test_warm_reuse_funnel_requires_auth(unauthenticated_client: AsyncClie
         f"/api/admin/projects/{fake_id}/warm-reuse-funnel"
     )
     assert response.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_narrative_states_convergence_verdict_when_signal_exists(
+    client: AsyncClient, db_session
+):
+    """When the window carries review/fix churn signal and one cause clearly
+    dominates the non-converged PR-chains, the digest narrative states a
+    plain-language churn verdict and names the quantified blocker."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # A plain failed task so the narrative bypasses the "All clear" early return
+    # and actually reaches the convergence-verdict block.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
+    # Two non-converged PR-chains (review_loop with churn_detections, never
+    # merged) → churn is the single dominant blocker across both chains.
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                created_at=curr,
+                context={"review_loop": {"iteration": 2, "churn_detections": 3}},
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    narrative = response.json()["narrative_summary"]
+
+    # Churn lands in today's trend bucket (older buckets are empty) so the
+    # verdict reads "rising", and churn dominates both non-converged chains.
+    assert (
+        "Review/fix churn is rising; the main blocker is churn "
+        "(2/2 non-converged PR chains)." in narrative
+    )
+
+
+@pytest.mark.asyncio
+async def test_narrative_suppresses_convergence_verdict_on_thin_window(
+    client: AsyncClient, db_session
+):
+    """A window with activity but no review/fix churn signal carries no
+    convergence verdict — the sentence is gated on signal sufficiency."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    curr = _curr_ts()
+    # Real activity (so the digest is non-empty) but no review_loop chains, so
+    # there is no churn signal to narrate.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "FAILED"}],
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=curr,
+            status_log=[{"t": curr.isoformat(), "status": "COMPLETED"}],
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    narrative = response.json()["narrative_summary"]
+
+    assert "Review/fix churn" not in narrative
+    assert "non-converged PR chains" not in narrative
