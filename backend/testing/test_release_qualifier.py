@@ -12076,3 +12076,28 @@ async def test_reconcile_promotion_failed_uses_project_promotion_target(
     assert "main" not in branch_sha_calls, (
         "Got unexpected 'main' branch call — should use per-project promotion_target"
     )
+
+
+def test_reaper_sweep_seam_reexported_from_release_qualifier():
+    """The reaper-sweep seam lives in app.release_qualifier_sweep but its public
+    symbols must stay importable/patchable as ``app.release_qualifier.<name>``.
+
+    Guards the split-and-re-export contract: the reaper imports
+    ``sweep_stuck_qualifications`` via release_qualifier, and tests patch the
+    constants / helpers as ``rq.*``. A future ``ruff --fix`` dropping a re-export
+    pin would silently break those callers — this test catches it.
+    """
+    from app import release_qualifier_sweep as rqs
+
+    for name in (
+        "sweep_stuck_qualifications",
+        "_force_finalize_timed_out_qualification",
+        "_force_finalize_sweep_crash_loop",
+        "_parse_started_at",
+        "_MAX_QUALIFICATION_DURATION_SECONDS",
+        "_MAX_SWEEP_CRASH_STREAK",
+    ):
+        assert hasattr(rq, name), f"release_qualifier must re-export {name}"
+        assert getattr(rq, name) is getattr(rqs, name), (
+            f"{name} re-export must be identical to the canonical impl"
+        )
