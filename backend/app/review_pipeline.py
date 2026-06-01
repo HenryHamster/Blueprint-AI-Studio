@@ -638,6 +638,14 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
     if isinstance(hard_cap, int) and hard_cap > 0:
         limit = min(limit, hard_cap)
 
+    # Issue-churn cap reduction: when churn is detected in a prior spawn,
+    # the reduced cap persists via _churn_cap_reduction so subsequent spawns
+    # respect the earlier reduction and converge sooner instead of always
+    # running to the full base cap.
+    churn_cap = ctx.get("_churn_cap_reduction")
+    if isinstance(churn_cap, int) and churn_cap > 0:
+        limit = min(limit, churn_cap)
+
     # Retry carry-forward: if a prior attempt of this task (before parent requeue
     # cloned it) already burned review iterations, subtract half of that usage
     # from the fresh cap so retries don't each get a full budget. Floor at 3 so
@@ -1844,6 +1852,8 @@ async def _spawn_pipeline_task(
     )
 
     churn_detections = int(source_loop.get("churn_detections", 0) or 0)
+    # Carry forward any prior churn cap reduction so it survives across iterations.
+    churn_cap_reduction: int | None = (source_task.context or {}).get("_churn_cap_reduction")
     # Stuck-cycle detection: if the same CRITICAL/MAJOR issues repeat across consecutive
     # iterations, escalate for manual review instead of consuming the full iteration budget.
     if task_type == "fix" and iteration >= 2 and len(new_review_history) >= 2:
@@ -2055,6 +2065,7 @@ async def _spawn_pipeline_task(
                     f"{per_chain_cap} → {reduced_cap}; injecting narrow-focus directive."
                 )
                 per_chain_cap = reduced_cap
+                churn_cap_reduction = reduced_cap
             else:
                 logger.warning(
                     f"[PIPELINE] Issue churn detected for PR #{pr_number} "
@@ -2294,6 +2305,10 @@ async def _spawn_pipeline_task(
         )
     if effective_hard_cap is not None:
         propagated_ctx["_scope_budget_hard_cap"] = effective_hard_cap
+    # Persist issue-churn cap reduction across iterations. Once churn is detected,
+    # the reduced cap is durable so subsequent spawns honor the earlier reduction.
+    if isinstance(churn_cap_reduction, int) and churn_cap_reduction > 0:
+        propagated_ctx["_churn_cap_reduction"] = churn_cap_reduction
     # Propagate diagnosis context from the original create task when the PR was
     # spawned by autonomous remediation. The reviewer uses these to verify the
     # fix targets the diagnosed root cause rather than doing a generic review.

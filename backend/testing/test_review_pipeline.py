@@ -5857,6 +5857,127 @@ async def test_second_churn_detection_uses_one_half_reduction(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_churn_cap_reduction_durable_across_spawns(db_session, mocker):
+    """When churn is detected, the reduced cap must persist across spawns via
+    _churn_cap_reduction so that subsequent spawns honor the earlier reduction
+    and _max_review_iterations returns the reduced cap instead of the base cap."""
+    from app.review_pipeline import _max_review_iterations
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Setup: build a review_history with 2 entries, each having 2 CRITICAL issues
+    # (distinct descriptions with low token overlap → evades stuck detection but is churn).
+    # Use completely different issue names to avoid Jaccard similarity matching.
+    prior_history = [
+        {
+            "iteration": 0,
+            "feedback": "f0",
+            "issues": [_issue("missing null check in function_alpha"), _issue("off by one in loop_beta")],
+        },
+        {
+            "iteration": 1,
+            "feedback": "f1",
+            "issues": [_issue("array bounds in handler_gamma"), _issue("type mismatch in parser_delta")],
+        },
+    ]
+    # First spawn: iteration 2, detects churn, reduces cap.
+    first_source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 704,
+                "branch": "b1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 704,
+                "branch": "b1",
+                "base_branch": "main",
+                "review_history": prior_history,
+            },
+        },
+    )
+    db_session.add(first_source_task)
+    await db_session.commit()
+    await db_session.refresh(first_source_task)
+
+    # First spawn: iteration 3 will detect churn (counts [2, 2, 2] → non-decreasing).
+    # medium scope baseline=12, iteration=3, remaining=9 → reduced_cap = 3 + 9//2 = 7.
+    first_result, _ = await _spawn_pipeline_task(
+        first_source_task,
+        "fix",
+        db_session,
+        pr_number=704,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Please fix.",
+        current_feedback="f2",
+        current_issues=[_issue("undefined reference in context_epsilon"), _issue("missing import in config_zeta")],
+    )
+
+    assert first_result is not None
+    first_ctx = first_result.context or {}
+    first_review_loop = first_ctx.get("review_loop", {})
+
+    # Verify: first spawn's context has the reduced cap stored.
+    assert first_review_loop.get("max_iterations") == 7
+    assert first_ctx.get("_churn_cap_reduction") == 7, (
+        "Churn cap reduction must be persisted to _churn_cap_reduction"
+    )
+
+    # Second spawn: use the first spawn's result as the source task.
+    # Iteration 4: reduce issue count to [2, 1] (decreasing) → no churn detected.
+    # The prior _churn_cap_reduction (7) must be respected in _max_review_iterations.
+    second_source_task = first_result
+    second_result, _ = await _spawn_pipeline_task(
+        second_source_task,
+        "fix",
+        db_session,
+        pr_number=704,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Further fix.",
+        current_feedback="f3",
+        current_issues=[_issue("race condition in thread_handler")],
+    )
+
+    assert second_result is not None
+    second_ctx = second_result.context or {}
+
+    # Verify: second spawn's _max_review_iterations honors the prior churn reduction.
+    # Without the fix, _max_review_iterations would return 12 (baseline for medium scope).
+    # With the fix, it must return 7 (the reduced cap from the first spawn).
+    computed_cap = _max_review_iterations(second_result)
+    assert computed_cap == 7, (
+        f"_max_review_iterations must honor persisted churn reduction: "
+        f"expected 7 (reduced cap), got {computed_cap}"
+    )
+
+    # Also verify: the persisted _churn_cap_reduction is carried forward.
+    assert second_ctx.get("_churn_cap_reduction") == 7
+
+
+@pytest.mark.asyncio
 async def test_mid_budget_injects_narrow_focus_without_cap_reduction(
     db_session, mocker
 ):
