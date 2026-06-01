@@ -589,12 +589,96 @@ runtime_config: Dict = {
     # runtime_config_json; persisted across restarts.
     "promotion_enabled": False,
     "smoketest_enabled": False,
+    # Release-qualifier promotion rubric — the composite-confidence THRESHOLD a
+    # candidate must clear to promote, plus the per-sub-score WEIGHTS. These are
+    # seeded once at module load from backend/promotion_policy.yaml (falling back
+    # to the hardcoded _DEFAULT_POLICY rubric in app.release_scoring) by
+    # _seed_promotion_policy() below, then made live + admin-tunable via the
+    # /api/admin/settings PATCH so calibrating the bar no longer needs a
+    # redeploy. release_qualifier._load_policy() reads these at decision time.
+    # The effective default stays the shipped 0.90 / 0.40-0.30-0.30 rubric.
+    "promotion_threshold": None,  # set by _seed_promotion_policy()
+    "promotion_weights": None,  # set by _seed_promotion_policy()
     # Broadcast alert safety cap — limits the number of projects receiving
     # orchestrator-wide broadcast alerts (errors, halts, rollbacks, recovery).
     # Global orchestrator safety cap, not per-project. Operator-tunable via
     # runtime_config_json; persisted across restarts.
     "project_broadcast_limit": 1000,
 }
+
+# Promotion-policy key set — the rubric controls that live in runtime_config.
+# Used both by the seed below and by _apply_settings validation.
+PROMOTION_POLICY_KEYS = ("promotion_threshold", "promotion_weights")
+_PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
+# backend/promotion_policy.yaml lives two parents up from this file
+# (backend/app/shared_state.py).
+_PROMOTION_POLICY_PATH = (
+    __import__("pathlib").Path(__file__).resolve().parent.parent
+    / "promotion_policy.yaml"
+)
+
+
+def _read_promotion_policy_file() -> dict | None:
+    """Read + validate backend/promotion_policy.yaml, or return None on any failure.
+
+    Mirrors release_qualifier._load_policy's parse + validation contract: the
+    file must parse to a mapping with a ``weights`` sub-mapping (audit /
+    test_erosion / smoketest, each float-coercible and summing to ~1.0) and a
+    float ``threshold``.  ANY failure (missing file, bad YAML, missing/non-numeric
+    keys, mis-weighted sum) returns None so the caller falls back to the hardcoded
+    _DEFAULT_POLICY rubric rather than honouring a broken file.  Never raises.
+    """
+    try:
+        import yaml
+
+        parsed = yaml.safe_load(_PROMOTION_POLICY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("promotion_policy.yaml did not parse to a mapping")
+        weights_raw = parsed.get("weights")
+        if not isinstance(weights_raw, dict):
+            raise ValueError("promotion_policy.yaml missing 'weights' mapping")
+        weights = {k: float(weights_raw[k]) for k in _PROMOTION_WEIGHT_KEYS}
+        threshold = float(parsed["threshold"])
+        weight_sum = sum(weights.values())
+        if abs(weight_sum - 1.0) > 0.01:
+            raise ValueError(
+                f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
+            )
+        return {"weights": weights, "threshold": threshold}
+    except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
+        logger.warning(
+            "[CONFIG] failed to seed promotion policy from promotion_policy.yaml "
+            "(%s); seeding from hardcoded defaults",
+            exc,
+        )
+        return None
+
+
+def _seed_promotion_policy() -> None:
+    """Seed runtime_config['promotion_threshold'/'promotion_weights'] once at load.
+
+    Reads backend/promotion_policy.yaml (via _read_promotion_policy_file); on any
+    failure falls back to the hardcoded _DEFAULT_POLICY rubric in
+    app.release_scoring.  Behaviour-preserving: the seeded values are exactly the
+    rubric the qualifier used before this lived in runtime_config.  A persisted
+    operator override in runtime_config_json wins later via
+    sync_runtime_config_from_state — this only sets the boot default.
+    """
+    # release_scoring is a pure module (logging + typing only) — safe to import
+    # at module load without a circular dependency.
+    from app.release_scoring import _DEFAULT_POLICY
+
+    policy = _read_promotion_policy_file()
+    if policy is None:
+        policy = {
+            "weights": dict(_DEFAULT_POLICY["weights"]),
+            "threshold": _DEFAULT_POLICY["threshold"],
+        }
+    runtime_config["promotion_threshold"] = float(policy["threshold"])
+    runtime_config["promotion_weights"] = dict(policy["weights"])
+
+
+_seed_promotion_policy()
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
 # matching a key below, the scope-specific budget overrides retry_budgets_by_class.
@@ -1262,6 +1346,21 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "smoketest_enabled",
                         bool(config_json["smoketest_enabled"]),
                     )
+                # Release-qualifier promotion rubric (admin-tunable, persisted).
+                # A None persisted value means "never overridden" — keep the
+                # boot-seeded YAML/default value rather than clobbering it.
+                if config_json.get("promotion_threshold") is not None:
+                    _set(
+                        "promotion_threshold",
+                        float(config_json["promotion_threshold"]),
+                    )
+                if config_json.get("promotion_weights") is not None:
+                    pw = config_json["promotion_weights"]
+                    if isinstance(pw, dict):
+                        _set(
+                            "promotion_weights",
+                            {k: float(v) for k, v in pw.items()},
+                        )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[CONFIG-SYNC] Could not sync runtime_config_json: {e}")
 

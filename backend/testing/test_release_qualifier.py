@@ -542,7 +542,19 @@ def _point_policy_at(mocker, tmp_path, content: str | None):
     the instance — instead the module attribute is swapped for a real Path that
     either holds ``content`` or does not exist (when ``content`` is None).  This
     exercises the genuine read_text + yaml.safe_load code path.
+
+    ``_load_policy`` now resolves the live runtime_config rubric FIRST (it is
+    seeded from the YAML at startup and is admin-tunable), so to exercise the
+    YAML-file tier these tests must clear that in-memory override.  The
+    runtime_config promotion values are temporarily set to None for the test.
     """
+    # Clear the live runtime_config rubric so _load_policy falls through to the
+    # YAML-file tier this helper is testing.
+    mocker.patch.dict(
+        rq._runtime_config,
+        {"promotion_threshold": None, "promotion_weights": None},
+        clear=False,
+    )
     target = tmp_path / "promotion_policy.yaml"
     if content is not None:
         target.write_text(content, encoding="utf-8")
@@ -552,8 +564,17 @@ def _point_policy_at(mocker, tmp_path, content: str | None):
 
 
 class TestLoadPolicy:
-    def test_parses_real_policy_file(self):
-        """The shipped promotion_policy.yaml parses to the documented values."""
+    def test_parses_real_policy_file(self, mocker):
+        """The shipped promotion_policy.yaml parses to the documented values.
+
+        Clears the live runtime_config rubric so the YAML-file tier is exercised
+        directly (the seeded runtime_config holds the same values, but this test
+        is specifically about the on-disk file)."""
+        mocker.patch.dict(
+            rq._runtime_config,
+            {"promotion_threshold": None, "promotion_weights": None},
+            clear=False,
+        )
         policy = rq._load_policy()
         assert set(policy.keys()) == {"weights", "threshold"}
         assert set(policy["weights"].keys()) == {
@@ -700,6 +721,77 @@ class TestLoadPolicy:
         policy = rq._load_policy()
         assert policy["weights"]["audit"] == pytest.approx(0.5)
         assert policy["threshold"] == pytest.approx(0.8)
+
+    def test_runtime_config_override_wins_over_yaml(self, mocker, tmp_path):
+        """The live runtime_config rubric takes precedence over the YAML file.
+
+        A calibrated threshold/weights set in runtime_config (via the admin
+        PATCH) must be what the gate reads, with no redeploy — even when the
+        on-disk file says something else."""
+        # File says 0.90 / default weights...
+        target = tmp_path / "promotion_policy.yaml"
+        target.write_text(
+            "weights:\n  audit: 0.40\n  test_erosion: 0.30\n"
+            "  smoketest: 0.30\nthreshold: 0.90\n",
+            encoding="utf-8",
+        )
+        mocker.patch.object(rq, "_POLICY_PATH", target)
+        # ...but runtime_config holds a calibrated 0.75 with custom weights.
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.75,
+                "promotion_weights": {
+                    "audit": 0.5,
+                    "test_erosion": 0.25,
+                    "smoketest": 0.25,
+                },
+            },
+            clear=False,
+        )
+        policy = rq._load_policy()
+        assert policy["threshold"] == pytest.approx(0.75)
+        assert policy["weights"]["audit"] == pytest.approx(0.5)
+
+    def test_runtime_config_falls_back_to_yaml_when_unset(self, mocker, tmp_path):
+        """When runtime_config has no rubric, _load_policy reads the YAML file."""
+        _point_policy_at(
+            mocker,
+            tmp_path,
+            "weights:\n  audit: 0.5\n  test_erosion: 0.25\n"
+            "  smoketest: 0.25\nthreshold: 0.8\n",
+        )
+        # _point_policy_at already cleared the runtime_config rubric.
+        policy = rq._load_policy()
+        assert policy["threshold"] == pytest.approx(0.8)
+
+    def test_runtime_config_malformed_weights_falls_back(self, mocker, tmp_path):
+        """A mis-weighted runtime_config rubric (sum != 1.0) is rejected and the
+        YAML/default tier is used instead — a bad in-memory value never reaches
+        the gate."""
+        target = tmp_path / "promotion_policy.yaml"
+        target.write_text(
+            "weights:\n  audit: 0.40\n  test_erosion: 0.30\n"
+            "  smoketest: 0.30\nthreshold: 0.88\n",
+            encoding="utf-8",
+        )
+        mocker.patch.object(rq, "_POLICY_PATH", target)
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.5,
+                # Sums to 0.3 — mis-weighted, must be rejected.
+                "promotion_weights": {
+                    "audit": 0.1,
+                    "test_erosion": 0.1,
+                    "smoketest": 0.1,
+                },
+            },
+            clear=False,
+        )
+        policy = rq._load_policy()
+        # Fell through to the YAML file, not the broken runtime_config value.
+        assert policy["threshold"] == pytest.approx(0.88)
 
 
 # ===========================================================================

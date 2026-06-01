@@ -2726,6 +2726,124 @@ class TestNotificationConfigSettings:
         await client.patch("/api/admin/settings", json={"promotion_enabled": False})
 
     @pytest.mark.asyncio
+    async def test_promotion_threshold_round_trip(self, client: AsyncClient):
+        """promotion_threshold is settable via PATCH, bounded to (0, 1], and
+        visible on GET — so calibrating the bar needs no redeploy."""
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("promotion_threshold")
+        try:
+            resp = await client.patch(
+                "/api/admin/settings", json={"promotion_threshold": 0.75}
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["promotion_threshold"] == pytest.approx(0.75)
+
+            # Out of range / non-numeric rejected.
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"promotion_threshold": 0}
+                )
+            ).status_code == 400
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"promotion_threshold": 1.5}
+                )
+            ).status_code == 400
+            assert (
+                await client.patch(
+                    "/api/admin/settings", json={"promotion_threshold": "high"}
+                )
+            ).status_code == 400
+        finally:
+            if original is not None:
+                await client.patch(
+                    "/api/admin/settings", json={"promotion_threshold": original}
+                )
+
+    @pytest.mark.asyncio
+    async def test_promotion_weights_round_trip_and_validation(
+        self, client: AsyncClient
+    ):
+        """promotion_weights accepts a 3-key set summing to ~1.0, rejects a
+        mis-weighted set / wrong keys, and is visible on GET."""
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("promotion_weights")
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={
+                    "promotion_weights": {
+                        "audit": 0.5,
+                        "test_erosion": 0.25,
+                        "smoketest": 0.25,
+                    }
+                },
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["promotion_weights"]["audit"] == pytest.approx(0.5)
+
+            # Sum != 1.0 rejected.
+            bad_sum = await client.patch(
+                "/api/admin/settings",
+                json={
+                    "promotion_weights": {
+                        "audit": 0.1,
+                        "test_erosion": 0.1,
+                        "smoketest": 0.1,
+                    }
+                },
+            )
+            assert bad_sum.status_code == 400
+            # Wrong key set rejected.
+            bad_keys = await client.patch(
+                "/api/admin/settings",
+                json={"promotion_weights": {"audit": 1.0}},
+            )
+            assert bad_keys.status_code == 400
+            # Non-dict rejected.
+            bad_type = await client.patch(
+                "/api/admin/settings", json={"promotion_weights": 0.4}
+            )
+            assert bad_type.status_code == 400
+        finally:
+            if original is not None:
+                await client.patch(
+                    "/api/admin/settings", json={"promotion_weights": original}
+                )
+
+    @pytest.mark.asyncio
+    async def test_unknown_settings_key_rejected(self, client: AsyncClient):
+        """An unknown/misspelled settings key is rejected with 400 (and logged)
+        rather than silently ignored — so a typo is detectable."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"promotion_treshold": 0.8}
+        )
+        assert resp.status_code == 400
+        assert "unknown" in resp.json()["error"]["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_known_key_alongside_unknown_key_rejects_whole_request(
+        self, client: AsyncClient
+    ):
+        """A valid key in the same payload as an unknown one does NOT get
+        applied — the whole request is rejected up front, so no half-applied
+        PATCH."""
+        from app.shared_state import runtime_config as _rc
+
+        before = _rc.get("max_retries")
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"max_retries": 7, "bogus_key": True},
+        )
+        assert resp.status_code == 400
+        # max_retries must NOT have been applied.
+        assert _rc.get("max_retries") == before
+
+    @pytest.mark.asyncio
     async def test_patch_next_role_poll_timeout_secs(self, client: AsyncClient):
         """next_role_poll_timeout_secs accepts ints in [30,600] and rejects out-of-range / non-numeric."""
         resp = await client.patch(

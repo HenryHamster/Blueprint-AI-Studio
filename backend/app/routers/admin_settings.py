@@ -33,6 +33,73 @@ from app.providers.registry import get_provider, list_providers
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
 
+# Every runtime-config key the PATCH /api/admin/settings handler (_apply_settings)
+# knows how to validate + apply. A payload key NOT in this set is a typo or a
+# stale field name — _apply_settings logs it as a WARNING and rejects the whole
+# request (400) rather than silently dropping it, so a misconfigured admin call
+# is detectable instead of vanishing. Keep this in sync with the `"<key>" in
+# payload` branches below; test_admin_settings asserts the round-trip.
+_KNOWN_SETTINGS_KEYS = frozenset(
+    {
+        "agent_prompt_suffixes",
+        "architecture_review_frequency",
+        "auto_archive_enabled",
+        "auto_archive_interval_minutes",
+        "auto_archive_max_terminal_tasks_per_project",
+        "auto_archive_terminal_after_days",
+        "autonomous_direction_cooldown_hours",
+        "autonomous_direction_cooldown_minutes",
+        "autonomous_periodic_tasks",
+        "autonomous_research_interval_minutes",
+        "category_routing",
+        "ci_backstop_timeout_minutes",
+        "cross_provider_fallback_enabled",
+        "daily_cost_ceiling_usd",
+        "drift_over_claim_consistency_threshold",
+        "drift_over_claim_min_claims",
+        "drift_stall_min_claims",
+        "evaluating_fail_hours",
+        "evaluating_pipeline_timeout_minutes",
+        "health_check_urls",
+        "max_active_directions",
+        "max_autonomous_tasks_per_hour",
+        "max_concurrent_auto_remediations",
+        "max_concurrent_vms",
+        "max_global_autonomous_tasks_per_hour",
+        "max_parallel_research_per_project",
+        "max_pipeline_slots",
+        "max_provision_retries",
+        "max_retries",
+        "max_rollup_retries",
+        "max_total_research_per_project",
+        "next_role_poll_timeout_secs",
+        "notification_config",
+        "productive_direction_cooldown_minutes",
+        "promotion_enabled",
+        "promotion_threshold",
+        "promotion_weights",
+        "provider_selection_mode",
+        "provider_settings_by_effort",
+        "provider_settings_defaults",
+        "provider_tier_model_map",
+        "require_approval_gates",
+        "reserved_slots_for_types",
+        "residual_audit_defer_escalation_threshold",
+        "residual_remediation_cooldown_hours",
+        "smoketest_enabled",
+        "strategic_max_interval_minutes",
+        "strategic_research_frequency",
+        "task_type_categories",
+        "task_type_model_preferences",
+        "task_type_provider_overrides",
+        "task_type_routing",
+        # Side-effect-only key: fires a test webhook, never stored.
+        "test_notification",
+        "warm_backlog_reuse_enabled",
+        "warm_continuity_enabled",
+    }
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -186,6 +253,8 @@ async def get_settings(
         ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
+        "promotion_threshold": _runtime_config.get("promotion_threshold"),
+        "promotion_weights": _runtime_config.get("promotion_weights"),
         "warm_continuity_enabled": bool(
             _runtime_config.get("warm_continuity_enabled", False)
         ),
@@ -330,6 +399,29 @@ async def _apply_settings(
     _config_snapshot = dict(_runtime_config)
     clear_pause_state = False
 
+    # Validate the payload keys BEFORE applying anything. An unknown/misspelled
+    # key was previously silently ignored — a typo like "promotion_treshold"
+    # would return 200 having changed nothing, with no signal to the operator.
+    # Log it as a WARNING and reject the whole request (400) so the
+    # misconfiguration is detectable. (Done up front so a bad key never leaves a
+    # half-applied multi-key PATCH.)
+    if isinstance(payload, dict):
+        unknown_keys = sorted(k for k in payload if k not in _KNOWN_SETTINGS_KEYS)
+        if unknown_keys:
+            logger.warning(
+                "[SETTINGS] rejected PATCH /api/admin/settings — unknown config "
+                "key(s) %s (not in the validated settings allowlist); rejecting "
+                "rather than silently ignoring",
+                unknown_keys,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown settings key(s): {unknown_keys}. "
+                    "Misspelled or stale field name; nothing was changed."
+                ),
+            )
+
     if "max_concurrent_vms" in payload:
         try:
             val = int(payload["max_concurrent_vms"])
@@ -428,6 +520,69 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "promotion_threshold" in payload:
+        try:
+            val = float(payload["promotion_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="promotion_threshold must be a number"
+            )
+        # The composite confidence is in [0, 1]; the threshold must live there
+        # too. A threshold of 0 promotes everything that clears the hard
+        # blockers and >1 can never be reached (gate stuck closed) — both are
+        # almost certainly operator error, so bound it to (0, 1].
+        if not (0.0 < val <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="promotion_threshold must be between 0.0 (exclusive) and 1.0",
+            )
+        _runtime_config["promotion_threshold"] = round(val, 4)
+    if "promotion_weights" in payload:
+        val = payload["promotion_weights"]
+        if not isinstance(val, dict):
+            raise HTTPException(
+                status_code=400, detail="promotion_weights must be a dict"
+            )
+        _PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
+        if set(val.keys()) != set(_PROMOTION_WEIGHT_KEYS):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "promotion_weights must have exactly the keys "
+                    f"{sorted(_PROMOTION_WEIGHT_KEYS)}"
+                ),
+            )
+        cleaned_weights: Dict[str, float] = {}
+        for wk in _PROMOTION_WEIGHT_KEYS:
+            try:
+                wv = float(val[wk])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"promotion_weights[{wk}] must be a number",
+                )
+            if wv < 0.0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"promotion_weights[{wk}] must be non-negative",
+                )
+            cleaned_weights[wk] = wv
+        # Weights decide what reaches production main: a sum != 1.0 either
+        # saturates confidence (gate effectively disabled) or makes it
+        # unreachable (gate stuck closed). Reject a mis-weighted set rather than
+        # silently honour it — same invariant release_qualifier._load_policy
+        # enforces on the YAML file.
+        weight_sum = sum(cleaned_weights.values())
+        if abs(weight_sum - 1.0) > 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"
+                ),
+            )
+        _runtime_config["promotion_weights"] = {
+            wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
+        }
     if "evaluating_fail_hours" in payload:
         try:
             val = int(payload["evaluating_fail_hours"])
@@ -1490,6 +1645,8 @@ async def _apply_settings(
                     "smoketest_enabled": bool(
                         _runtime_config.get("smoketest_enabled", False)
                     ),
+                    "promotion_threshold": _runtime_config.get("promotion_threshold"),
+                    "promotion_weights": _runtime_config.get("promotion_weights"),
                 }
             except AttributeError:
                 pass  # Column not yet added (rolling deploy, old schema)

@@ -181,19 +181,71 @@ logger = logging.getLogger(__name__)
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
 
 
-def _load_policy() -> dict[str, Any]:
-    """Read backend/promotion_policy.yaml; fall back to hardcoded defaults.
+def _policy_from_runtime_config() -> dict[str, Any] | None:
+    """Return the live promotion rubric from runtime_config, or None.
 
-    On ANY read or parse failure — missing file, unreadable, malformed YAML,
-    missing/non-numeric keys, PyYAML import failure — log a warning and return
-    a copy of ``_DEFAULT_POLICY``.  Never raises: a broken policy file must not
-    take down the qualifier (it would only fail-open the gate; the caller still
-    decides whether to act on the composite).
+    The threshold + weights are seeded into runtime_config from
+    promotion_policy.yaml at startup (shared_state._seed_promotion_policy) and
+    are admin-tunable via PATCH /api/admin/settings, so calibrating the
+    promotion bar no longer needs a redeploy.  This reads them at decision time.
+
+    Returns the validated ``{"weights": {...}, "threshold": float}`` shape when
+    runtime_config holds a usable rubric, else ``None`` so ``_load_policy``
+    falls back to re-reading the YAML file / hardcoded defaults.  Validates the
+    same invariants as the YAML loader (three float weights summing to ~1.0, a
+    float threshold) — a malformed in-memory value must never reach the gate.
+    """
+    try:
+        threshold_raw = _runtime_config.get("promotion_threshold")
+        weights_raw = _runtime_config.get("promotion_weights")
+        if threshold_raw is None or not isinstance(weights_raw, dict):
+            return None
+        weights = {
+            "audit": float(weights_raw["audit"]),
+            "test_erosion": float(weights_raw["test_erosion"]),
+            "smoketest": float(weights_raw["smoketest"]),
+        }
+        threshold = float(threshold_raw)
+        weight_sum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
+        if abs(weight_sum - 1.0) > 0.01:
+            raise ValueError(
+                f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
+            )
+        return {"weights": weights, "threshold": threshold}
+    except Exception as exc:  # noqa: BLE001 — fall back to the file/default on any failure
+        logger.warning(
+            "[RELEASE_QUALIFIER] runtime_config promotion rubric is unusable "
+            "(%s); falling back to promotion_policy.yaml / defaults",
+            exc,
+        )
+        return None
+
+
+def _load_policy() -> dict[str, Any]:
+    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+
+    Resolution order:
+      1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
+         live, admin-tunable rubric (seeded from the YAML at startup, then
+         operator-overridable via PATCH /api/admin/settings with no redeploy).
+      2. ``backend/promotion_policy.yaml`` — the on-disk file, when the
+         runtime_config values are absent/unusable (e.g. a unit test importing
+         the module without seeding).
+      3. The hardcoded ``_DEFAULT_POLICY`` rubric.
+
+    On ANY read or parse failure at the YAML tier — missing file, unreadable,
+    malformed YAML, missing/non-numeric keys, PyYAML import failure — log a
+    warning and return a copy of ``_DEFAULT_POLICY``.  Never raises: a broken
+    policy source must not take down the qualifier (it would only fail-open the
+    gate; the caller still decides whether to act on the composite).
 
     The returned dict always has the shape
     ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
        "threshold": float}`` with every value coerced to float.
     """
+    from_config = _policy_from_runtime_config()
+    if from_config is not None:
+        return from_config
     try:
         import yaml
 
