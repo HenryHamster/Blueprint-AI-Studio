@@ -48,8 +48,9 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-123',
       workBranch: 'blueprint/test-task-123',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      // Blueprint admin-ui/agent/backend blocks now apply only to the self-repo.
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
 
@@ -103,8 +104,8 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-123',
       workBranch: 'blueprint/test-task-123',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
 
@@ -132,8 +133,8 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-123',
       workBranch: 'blueprint/test-task-123',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
     const checkScript = capturedScripts['/tmp/workspace/check'];
@@ -210,8 +211,10 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-123',
       workBranch: 'blueprint/test-task-123',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      // The migration-chain guard lives in the Blueprint admin-ui/agent/backend
+      // blocks, which now apply only to the Blueprint self-repo.
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
     const checkScript = capturedScripts['/tmp/workspace/check'];
@@ -295,8 +298,9 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-promo',
       workBranch: 'blueprint/test-task-promo',
       baseBranch: 'production',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      // Backend test-gate lives in the Blueprint blocks (self-repo only).
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: false,
       promotionTarget: 'production',
     });
@@ -316,8 +320,9 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
       taskId: 'test-task-feat',
       workBranch: 'blueprint/test-task-feat',
       baseBranch: 'feature/xyz',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      // Backend test-gate condition lives in the Blueprint blocks (self-repo only).
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: false,
       promotionTarget: 'production',
     });
@@ -519,9 +524,27 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     expect(checkScript).not.toContain('npm run test:viewport');
   });
 
-  it('falls back to hardcoded Blueprint blocks when buildConfig is undefined', async () => {
+  it('emits the generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
+    // baseCfg is acme/other-repo — a foreign repo. With no build_config it must
+    // NOT inherit Blueprint's admin-ui/agent/backend checks; it gets the safe
+    // generic fallback so we don't run the wrong commands against an unknown layout.
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers({ ...baseCfg });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).toContain('no build_config configured for acme/other-repo');
+    expect(checkScript).not.toContain('if admin_ui_runtime_touched; then');
+    expect(checkScript).not.toContain('run "agent tsc"');
+    expect(checkScript).not.toContain('backend ruff (changed)');
+    expect(checkScript).not.toContain('npm run test:viewport');
+    // And the config-driven marker is absent.
+    expect(checkScript).not.toContain('Config-driven checks');
+  });
+
+  it('falls back to hardcoded Blueprint blocks when buildConfig is undefined ON THE SELF-REPO', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({ ...baseCfg, owner: 'HenryHamster', repo: 'BlueprintAIStudio' });
 
     const checkScript = capturedScripts['/tmp/workspace/check'];
     expect(checkScript).toBeDefined();
@@ -533,11 +556,20 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     expect(checkScript).not.toContain('Config-driven checks');
   });
 
-  it('falls back to hardcoded blocks when buildConfig has empty directories', async () => {
+  it('falls back to hardcoded Blueprint blocks when buildConfig has empty directories ON THE SELF-REPO', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({ ...baseCfg, owner: 'HenryHamster', repo: 'BlueprintAIStudio', buildConfig: { directories: [] } });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain('admin_ui_runtime_touched');
+    expect(checkScript).not.toContain('Config-driven checks');
+  });
+
+  it('emits the generic fallback when a foreign repo supplies buildConfig with empty directories', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers({ ...baseCfg, buildConfig: { directories: [] } });
     const checkScript = capturedScripts['/tmp/workspace/check'];
-    expect(checkScript).toContain('admin_ui_runtime_touched');
+    expect(checkScript).toContain('no build_config configured for acme/other-repo');
+    expect(checkScript).not.toContain('if admin_ui_runtime_touched; then');
     expect(checkScript).not.toContain('Config-driven checks');
   });
 

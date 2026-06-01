@@ -36,42 +36,82 @@ describe('writeCheckHelper — direct invocation', () => {
     });
   });
 
-  it('writes the ./check script directly when invoked through check-helper module', async () => {
+  it('writes the Blueprint admin-ui/agent/backend blocks for the self-repo when no buildConfig is supplied', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'check-direct-1',
       workBranch: 'blueprint/check-direct-1',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      // Blueprint self-repo coordinates — required for the hardcoded blocks now.
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
 
     const script = capturedScripts['/tmp/workspace/check'];
     expect(script).toBeDefined();
     expect(script).toMatch(/^#!\/bin\/bash/);
-    // Blueprint blocks are the default when no buildConfig is supplied.
-    expect(script).toContain('admin_ui_runtime_touched');
+    // Blueprint blocks are the default on the self-repo when no buildConfig is supplied.
+    expect(script).toContain('if admin_ui_runtime_touched; then');
     expect(script).toContain('touches agent/');
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
     expect(script).toContain('PASS — all checks green');
   });
 
-  it('generated ./check script passes `bash -n` syntax check', async () => {
+  it('emits a generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-direct-foreign',
+      workBranch: 'blueprint/check-direct-foreign',
+      baseBranch: 'main',
+      owner: 'some-org',
+      repo: 'some-other-repo',
+      testsOnMainBranch: true,
+    });
+
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    expect(script).toMatch(/^#!\/bin\/bash/);
+    // Generic fallback: no Blueprint-stack commands run against an unknown repo.
+    expect(script).toContain('no build_config configured for some-org/some-other-repo');
+    expect(script).not.toContain('if admin_ui_runtime_touched; then');
+    expect(script).not.toContain('run "agent tsc"');
+    expect(script).not.toContain('admin-ui playwright chromium');
+    // Still a valid check that reports PASS when nothing failed.
+    expect(script).toContain('PASS — all checks green');
+  });
+
+  it('generated ./check script passes `bash -n` syntax check (Blueprint self-repo path)', async () => {
     const { writeCheckHelper } = await import('./check-helper.js');
     writeCheckHelper({
       taskId: 'check-direct-2',
       workBranch: 'blueprint/check-direct-2',
       baseBranch: 'main',
-      owner: 'test-owner',
-      repo: 'test-repo',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
       testsOnMainBranch: true,
     });
     const script = capturedScripts['/tmp/workspace/check'];
     expect(script).toBeDefined();
     const { execSync } = await import('child_process');
     // Pipe through stdin so we don't need a writable fs (vi.mock('fs') is in effect).
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+
+  it('generic fallback ./check script passes `bash -n` syntax check', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'check-direct-foreign-2',
+      workBranch: 'blueprint/check-direct-foreign-2',
+      baseBranch: 'main',
+      owner: 'some-org',
+      repo: 'some-other-repo',
+      testsOnMainBranch: true,
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toBeDefined();
+    const { execSync } = await import('child_process');
     execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
   });
 

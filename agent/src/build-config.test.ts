@@ -335,4 +335,68 @@ describe('resolveBuildConfig', () => {
     };
     expect(resolveBuildConfig(task)?.staging_branch_prefixes).toBeUndefined();
   });
+
+  // ── migration config (de-hardcode the migrate handler's layout) ────────────
+  it('parses a full migration config, stripping trailing slashes', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'svc', type: 'python' }],
+        migration: {
+          versions_dir: 'svc/db/migrations/',
+          models_dir: 'svc/orm/',
+          alembic_cwd: 'svc/',
+          schema_revision_file: 'svc/config.py',
+          schema_revision_const: 'DB_REVISION',
+        },
+      },
+    };
+    expect(resolveBuildConfig(task)?.migration).toEqual({
+      versions_dir: 'svc/db/migrations',
+      models_dir: 'svc/orm',
+      alembic_cwd: 'svc',
+      schema_revision_file: 'svc/config.py',
+      schema_revision_const: 'DB_REVISION',
+    });
+  });
+
+  it('preserves an empty schema_revision_file as the explicit "no gate" signal', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'svc', type: 'python' }],
+        migration: { schema_revision_file: '' },
+      },
+    };
+    expect(resolveBuildConfig(task)?.migration).toEqual({ schema_revision_file: '' });
+  });
+
+  it('drops path-traversal / shell-unsafe migration path values', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'svc', type: 'python' }],
+        migration: {
+          versions_dir: '../escape',         // path traversal → dropped
+          models_dir: '/abs/models',          // absolute path → dropped
+          alembic_cwd: 'svc;rm -rf /',        // shell metachar → dropped
+          schema_revision_file: 'a$(id).py',  // shell metachar → dropped
+        },
+      },
+    };
+    // Every path-shaped field is rejected → no migration object survives.
+    expect(resolveBuildConfig(task)?.migration).toBeUndefined();
+  });
+
+  it('rejects a migration object whose only fields are all unsafe', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'svc', type: 'python' }],
+        migration: { versions_dir: 'a&&b', models_dir: 'x|y' },
+      },
+    };
+    expect(resolveBuildConfig(task)?.migration).toBeUndefined();
+  });
+
+  it('leaves migration undefined when the field is absent (Blueprint default path)', () => {
+    const task = { build_config: { directories: [{ path: 'backend', type: 'python' }] } };
+    expect(resolveBuildConfig(task)?.migration).toBeUndefined();
+  });
 });

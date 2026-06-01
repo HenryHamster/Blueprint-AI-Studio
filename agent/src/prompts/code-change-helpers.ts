@@ -9,6 +9,27 @@ import { writePrHelper } from './pr-helper.js';
 // Re-exported so callers importing writeCheckHelper from this module keep working.
 export { writeCheckHelper } from './check-helper.js';
 
+// ── Blueprint self-repo identity ────────────────────────────────────────────
+// Canonical coordinates of the Blueprint repo the pipeline self-improves on.
+// Used to gate Blueprint-stack-specific behavior (e.g. the hardcoded
+// admin-ui/agent/backend ./check blocks) so it applies ONLY to the self-repo,
+// not to an arbitrary onboarded target repo. Env-overridable for forks/tests.
+// (We intentionally do NOT key off project_metadata.is_self_repo — that flag is
+// being phased out; the repo coordinates are the durable signal.)
+export const BLUEPRINT_SELF_REPO = {
+  owner: process.env.BLUEPRINT_SELF_REPO_OWNER || 'HenryHamster',
+  repo: process.env.BLUEPRINT_SELF_REPO_NAME || 'BlueprintAIStudio',
+} as const;
+
+/** True when owner/repo identify the Blueprint self-repo (case-insensitive —
+ *  GitHub owner/repo names are case-insensitive). */
+export function isBlueprintSelfRepo(owner: string, repo: string): boolean {
+  return (
+    owner.toLowerCase() === BLUEPRINT_SELF_REPO.owner.toLowerCase() &&
+    repo.toLowerCase() === BLUEPRINT_SELF_REPO.repo.toLowerCase()
+  );
+}
+
 // ── Git exclude for agent helper scripts ────────────────────────────────────
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they

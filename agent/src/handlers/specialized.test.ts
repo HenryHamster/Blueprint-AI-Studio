@@ -121,11 +121,13 @@ import {
   handleInvestigate,
   handleMigrate,
   handleSelfAudit,
+  resolveMigrationLayout,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
   git, listOpenPullRequestsForBranch,
 } from '../index.js';
+import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -792,6 +794,111 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     ).rejects.toThrow(/No prompt found/);
     // No runCodeChangeTask call when prompt missing
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
+  });
+
+  // Isolate the core migrate step-list (steps 1-8) from the appended generic
+  // guidance blocks (CODE_CHANGE_HELPER_GUIDANCE, MIGRATE_TASK_FOCUS, etc.),
+  // which are not layout-derived and may mention Blueprint names independently.
+  function coreMigrateSteps(prompt: string): string {
+    const start = prompt.indexOf('Follow these steps precisely:');
+    const end = prompt.indexOf('CRITICAL RULES:');
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return prompt.slice(start, end);
+  }
+
+  it('derives non-Blueprint migration paths from build_config.migration', async () => {
+    // A second repo onboards the migrate handler with a different layout.
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python' }],
+      migration: {
+        versions_dir: 'svc/db/migrations',
+        models_dir: 'svc/orm',
+        alembic_cwd: 'svc',
+        schema_revision_file: 'svc/config.py',
+        schema_revision_const: 'DB_REVISION',
+      },
+    });
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const steps = coreMigrateSteps(capturedMigratePrompt());
+    // Project-specific layout flows through the step list.
+    expect(steps).toContain('svc/db/migrations/');
+    expect(steps).toContain('svc/orm/');
+    expect(steps).toContain('from the svc directory');
+    expect(steps).toContain('DB_REVISION');
+    expect(steps).toContain('svc/config.py');
+    // Blueprint-specific layout strings must NOT appear in the derived steps.
+    expect(steps).not.toContain('backend/alembic/versions/');
+    expect(steps).not.toContain('backend/app/main.py');
+    expect(steps).not.toContain('EXPECTED_SCHEMA_REVISION');
+  });
+
+  it('omits the schema-revision step when the project declares no gate (schema_revision_file: "")', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python' }],
+      migration: { schema_revision_file: '' },
+    });
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const steps = coreMigrateSteps(capturedMigratePrompt());
+    // The schema-revision step (step 4) drops out of the core step list.
+    expect(steps).not.toContain('EXPECTED_SCHEMA_REVISION');
+    expect(steps).not.toMatch(/Bump .* \(MANDATORY\)/);
+    // The migration workflow itself still runs.
+    expect(steps).toContain('alembic revision --autogenerate');
+  });
+});
+
+// ── resolveMigrationLayout — Blueprint default vs config-driven ──────────────
+describe('resolveMigrationLayout', () => {
+  it('returns the Blueprint defaults when no build_config is supplied', () => {
+    expect(resolveMigrationLayout(undefined)).toEqual({
+      versionsDir: 'backend/alembic/versions',
+      modelsDir: 'backend/app/models',
+      alembicCwd: 'backend',
+      schemaRevisionFile: 'backend/app/main.py',
+      schemaRevisionConst: 'EXPECTED_SCHEMA_REVISION',
+    });
+  });
+
+  it('derives defaults from the first configured python directory', () => {
+    expect(resolveMigrationLayout({ directories: [{ path: 'svc/', type: 'python' }] })).toEqual({
+      versionsDir: 'svc/alembic/versions',
+      modelsDir: 'svc/app/models',
+      alembicCwd: 'svc',
+      schemaRevisionFile: 'svc/app/main.py',
+      schemaRevisionConst: 'EXPECTED_SCHEMA_REVISION',
+    });
+  });
+
+  it('honors explicit migration overrides over the derived defaults', () => {
+    expect(resolveMigrationLayout({
+      directories: [{ path: 'svc', type: 'python' }],
+      migration: {
+        versions_dir: 'db/versions',
+        schema_revision_const: 'SCHEMA_REV',
+      },
+    })).toEqual({
+      versionsDir: 'db/versions',
+      modelsDir: 'svc/app/models',
+      alembicCwd: 'svc',
+      schemaRevisionFile: 'svc/app/main.py',
+      schemaRevisionConst: 'SCHEMA_REV',
+    });
+  });
+
+  it('treats an empty schema_revision_file as the explicit "no gate" signal', () => {
+    expect(resolveMigrationLayout({
+      directories: [{ path: 'svc', type: 'python' }],
+      migration: { schema_revision_file: '' },
+    }).schemaRevisionFile).toBe('');
   });
 });
 

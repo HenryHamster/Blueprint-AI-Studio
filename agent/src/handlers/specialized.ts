@@ -23,6 +23,36 @@ import { runCodeChangeTask } from './code-change.js';
 import { isParallelAuditEnabled, resolveCandidateSha } from './audits.js';
 export { resolveCandidateSha, handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 
+// ── Migration layout resolution ──────────────────────────────────────────────
+// Blueprint's database layout (`backend/alembic/versions/`, `app/models/`,
+// `app/main.py:EXPECTED_SCHEMA_REVISION`) is the DEFAULT. A second repo can
+// onboard the `migrate` handler by supplying build_config.migration overrides;
+// each unset field falls back to the Blueprint default derived from the first
+// configured python directory (or `backend` when no build_config). With no
+// overrides this returns exactly the values the prompt previously hardcoded.
+export interface ResolvedMigrationLayout {
+  versionsDir: string;      // no trailing slash
+  modelsDir: string;        // no trailing slash
+  alembicCwd: string;       // directory alembic commands run from
+  schemaRevisionFile: string; // '' means no schema-revision gate
+  schemaRevisionConst: string;
+}
+
+export function resolveMigrationLayout(buildConfig?: BuildConfig): ResolvedMigrationLayout {
+  const pythonDirs = (buildConfig?.directories ?? []).filter(d => d.type === 'python');
+  const pyDir = pythonDirs.length > 0 ? pythonDirs[0].path.replace(/\/$/, '') : 'backend';
+  const m = buildConfig?.migration;
+  return {
+    versionsDir: m?.versions_dir ?? `${pyDir}/alembic/versions`,
+    modelsDir: m?.models_dir ?? `${pyDir}/app/models`,
+    alembicCwd: m?.alembic_cwd ?? pyDir,
+    // schema_revision_file: '' is an explicit "no gate" signal; only an
+    // undefined override falls back to the Blueprint default.
+    schemaRevisionFile: m?.schema_revision_file ?? `${pyDir}/app/main.py`,
+    schemaRevisionConst: m?.schema_revision_const ?? 'EXPECTED_SCHEMA_REVISION',
+  };
+}
+
 // ── Handler: Migrate (Alembic/SQLAlchemy database migration workflow) ────────
 export async function handleMigrate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -81,10 +111,26 @@ export async function handleMigrate(
   git(['checkout', '-b', workBranch]);
   sendLog(ws, `Working branch: ${workBranch}\n`);
 
-  const migratePythonDirs = (migrateBuildConfig?.directories ?? []).filter(d => d.type === 'python');
-  const migratePyDir = migratePythonDirs.length > 0 ? migratePythonDirs[0].path.replace(/\/$/, '') : 'backend';
-  const alembicVersionsPath = `${migratePyDir}/alembic/versions/`;
-  const migrateModelsPath = `${migratePyDir}/app/models/`;
+  // Migration layout. Blueprint's `backend/alembic/versions/`, `app/models/`,
+  // and `app/main.py:EXPECTED_SCHEMA_REVISION` conventions are the DEFAULT, but
+  // a non-Blueprint project can override any of them via build_config.migration
+  // so the migrate handler works against a different layout. When the project
+  // supplies no overrides the emitted prompt is byte-for-byte identical to the
+  // prior hardcoded text.
+  const migrateLayout = resolveMigrationLayout(migrateBuildConfig);
+  const alembicVersionsPath = `${migrateLayout.versionsDir}/`;
+  const migrateModelsPath = `${migrateLayout.modelsDir}/`;
+
+  // Schema-revision step. Only emitted when the project declares a schema
+  // revision file (Blueprint: backend/app/main.py). A project with no
+  // schema-revision gate sets schema_revision_file to '' and the step (and
+  // its step number) drop out cleanly.
+  const hasSchemaRevisionGate = migrateLayout.schemaRevisionFile !== '';
+  const schemaRevisionStep = hasSchemaRevisionGate
+    ? `4. **Bump ${migrateLayout.schemaRevisionConst} (MANDATORY)**: Open \`${migrateLayout.schemaRevisionFile}\` and update the \`${migrateLayout.schemaRevisionConst}\` constant to match the revision string of the migration file you just generated (e.g. \`"0039"\` for \`0039_add_user_role.py\`). This is a hard gate — CI and startup checks will fail if the constant does not match the latest migration revision. Do NOT skip this step.
+
+`
+    : '';
 
   const migratePrompt = `You are a database migration agent specializing in Alembic and SQLAlchemy/SQLModel workflows.
 
@@ -96,13 +142,11 @@ Follow these steps precisely:
 
 2. **Make model changes**: Apply the requested SQLModel/SQLAlchemy model changes in the appropriate files (typically under \`${migrateModelsPath}\` or similar). Do NOT manually write migration files — autogenerate will handle that.
 
-3. **Generate migration**: Run \`alembic revision --autogenerate -m "description"\` from the backend directory (where alembic.ini lives). Use a concise, snake_case description that matches existing naming conventions.
+3. **Generate migration**: Run \`alembic revision --autogenerate -m "description"\` from the ${migrateLayout.alembicCwd} directory (where alembic.ini lives). Use a concise, snake_case description that matches existing naming conventions.
 
    IMPORTANT: Do NOT hand-edit the generated migration file unless autogenerate produced clearly incorrect output (e.g., dropped the wrong table, missed an index, used wrong column type). If you must edit, add a comment explaining why.
 
-4. **Bump EXPECTED_SCHEMA_REVISION (MANDATORY)**: Open \`${migratePyDir}/app/main.py\` and update the \`EXPECTED_SCHEMA_REVISION\` constant to match the revision string of the migration file you just generated (e.g. \`"0039"\` for \`0039_add_user_role.py\`). This is a hard gate — CI and startup checks will fail if the constant does not match the latest migration revision. Do NOT skip this step.
-
-5. **Review the generated migration**: Open and carefully read the generated file. Check for:
+${schemaRevisionStep}5. **Review the generated migration**: Open and carefully read the generated file. Check for:
    - Data loss risks (e.g., \`DROP COLUMN\`, \`DROP TABLE\`, type changes that truncate data)
    - Missing indexes on foreign keys or frequently-queried columns
    - Incorrect \`nullable\` settings

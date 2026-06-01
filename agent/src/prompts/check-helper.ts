@@ -5,6 +5,7 @@ import {
   buildScopedLintOneliner,
   detectLinterKind,
   validateCfgShellSafety,
+  isBlueprintSelfRepo,
   type CodeChangeHelperConfig,
 } from './code-change-helpers.js';
 
@@ -336,12 +337,23 @@ if touches backend/; then
   fi
 fi
 `;
-  // When the project supplies a build_config with directories, generate
-  // per-directory check blocks from it. Otherwise fall back to the hardcoded
-  // Blueprint blocks above (self-repo behavior is byte-for-byte unchanged).
-  const stackBlocks = cfg.buildConfig?.directories?.length
-    ? buildConfigDrivenStackBlocks(cfg.buildConfig)
-    : blueprintStackBlocks;
+  // Stack-block selection (ordered, most specific first):
+  //  1. build_config with directories  → config-driven per-directory blocks.
+  //  2. no build_config, Blueprint self-repo → the hardcoded admin-ui/agent/
+  //     backend blocks above (self-repo behavior is byte-for-byte unchanged).
+  //  3. no build_config, foreign repo  → a safe generic no-op fallback. We do
+  //     NOT run Blueprint's admin-ui/agent/backend commands against an arbitrary
+  //     target repo whose layout we don't know — that would fail spuriously or,
+  //     worse, lint/build the wrong tree. The agent is told to configure
+  //     build_config (or rely on CI) instead.
+  let stackBlocks: string;
+  if (cfg.buildConfig?.directories?.length) {
+    stackBlocks = buildConfigDrivenStackBlocks(cfg.buildConfig);
+  } else if (isBlueprintSelfRepo(cfg.owner, cfg.repo)) {
+    stackBlocks = blueprintStackBlocks;
+  } else {
+    stackBlocks = genericNoConfigStackBlock(cfg.owner, cfg.repo);
+  }
   const footer = `
 if [ \${#FAILED[@]} -eq 0 ]; then
   echo ""
@@ -355,6 +367,23 @@ fi
 `;
   const script = header + stackBlocks + footer;
   fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
+}
+
+/** Generic fallback ./check body for a non-Blueprint repo that supplied no
+ *  build_config. Emits no checks (the Blueprint-specific admin-ui/agent/backend
+ *  blocks would be wrong for an unknown layout) — it warns the agent that no
+ *  project check commands are configured and passes. owner/repo are validated
+ *  shell-safe by validateCfgShellSafety before this runs. */
+function genericNoConfigStackBlock(owner: string, repo: string): string {
+  return `
+# No build_config supplied and this is not the Blueprint self-repo
+# (${owner}/${repo}). The hardcoded admin-ui/agent/backend checks are
+# Blueprint-specific and would be wrong for an unknown repo layout, so ./check
+# runs no project checks here. To get scoped lint/build/test gating, configure
+# the project's build_config (directories + lint/build/test commands); CI
+# remains the backstop in the meantime.
+echo "[check] no build_config configured for ${owner}/${repo} — skipping project checks (CI is the backstop)"
+`;
 }
 
 // Returns the inner bash block for a directory's lint step. Recognized linters

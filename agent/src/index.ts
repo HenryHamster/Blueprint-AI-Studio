@@ -89,10 +89,20 @@ export class GracefulShutdownSignal {
 // Set once a non-transient heartbeat 4xx (reassignment/deauth) is observed.
 // Read by the heartbeat loop so any in-flight tick that has already passed the
 // classification gate does not keep firing after we have decided to shut down.
+//
+// WARM-VM ISOLATION: this is per-role state. On a warm VM (one process, many
+// sequential roles) it MUST start false for each new role — otherwise a future
+// code path that sets it without an immediate process.exit would leak the
+// "shutting down" signal into the next role and silently suppress its
+// heartbeats. Today the only setter (the heartbeat 4xx path) exits 5s later, so
+// the leak is latent, but the warm-handoff reset (resetPerRoleModuleState)
+// clears it unconditionally so the invariant holds regardless of future setters.
 let cancelRequested = false;
 function requestCancel(): void { cancelRequested = true; }
+function resetCancelRequested(): void { cancelRequested = false; }
 export function _isCancelRequestedForTesting(): boolean { return cancelRequested; }
 export function _resetCancelRequestedForTesting(): void { cancelRequested = false; }
+export function _setCancelRequestedForTesting(): void { requestCancel(); }
 
 // Crash-report task identity, decoupled from process.env.TASK_ID. The role
 // loop deliberately clears TASK_ID during the warm-poll window so a benign
@@ -126,7 +136,7 @@ export function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
 }
 
 // ── Build configuration (from project settings, passed via claim response) ───
-export type { DirectoryConfig } from './utils/test-runners.js';
+export type { DirectoryConfig, MigrationConfig } from './utils/test-runners.js';
 export type { BuildConfig };
 
 // ── Environment ─────────────────────────────────────────────────────────────
@@ -855,6 +865,43 @@ export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
     if (!seen.has(p)) { seen.add(p); ordered.push(p); }
   }
   return ordered;
+}
+
+// ── Per-role module-state isolation (warm-VM continuity) ─────────────────────
+//
+// On a warm VM a single agent process runs many sequential roles. EVERY piece
+// of module-level mutable state that scopes to "the current role" must be reset
+// here so a reused VM cannot leak state from the prior task into the next one.
+// The warm-handoff path in main() calls this exactly once per transition,
+// alongside resetForNextRole (which handles the filesystem/session side).
+//
+// Keep this the SINGLE source of truth for per-role state resets: when adding a
+// new module-level `let` that holds per-task state, reset it here rather than
+// re-adding an ad-hoc reset line at the call site. `flags` lets callers opt out
+// of resets they will perform with different values (e.g. the role loop sets
+// isWarmStart=true rather than the cold-start default false).
+interface ResetPerRoleModuleStateFlags {
+  /** Value to leave isWarmStart at (warm handoff sets true; tests use false). */
+  warmStart?: boolean;
+}
+export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}): void {
+  // Shutdown signal — must start false so a leaked "cancel" never suppresses
+  // the next role's heartbeats. See the cancelRequested declaration comment.
+  resetCancelRequested();
+  // Phase-0 telemetry: first-tool-use + warm-start marker.
+  firstToolUseAt = null;
+  isWarmStart = flags.warmStart ?? false;
+  roleClaimTimestamp = null;
+  handlerDurationSecsForPayload = null;
+  // Tool-trace ring buffer — without clearing, the next role's
+  // extractInvestigatedFiles() / heartbeat trace mixes in prior-role tool uses.
+  clearToolTrace();
+  // Prompt fingerprint attached to heartbeats.
+  setCurrentPromptFingerprint(null);
+  // `./check` synthesizer's monotonic iteration counter + started_at.
+  resetCheckSynthesizerState();
+  // Per-task LLM call/token telemetry (efficiency direction d-91d8dede).
+  resetLlmTelemetry();
 }
 
 // ── Heartbeat ───────────────────────────────────────────────────────────────
@@ -1735,11 +1782,11 @@ async function main() {
   // succeeds; on first boot the workspace is empty and we always cold-clone.
   delete process.env.BLUEPRINT_WARM_HANDOFF;
 
-  // Per-role telemetry reset on cold-start. Mirrors the role-loop's warm
-  // handoff reset so a stale value from a previous process incarnation
-  // (shouldn't happen, but defensive) cannot leak into the first role's
-  // status payload.
-  handlerDurationSecsForPayload = null;
+  // Per-role state reset on cold-start. Mirrors the role-loop's warm handoff
+  // (same single source of truth) so a stale value from a previous process
+  // incarnation (shouldn't happen, but defensive) cannot leak into the first
+  // role's status payload. warmStart:false — role 1 is a cold start.
+  resetPerRoleModuleState({ warmStart: false });
 
   // TASK_ID is baked into /etc/agent.env by the orchestrator's startup script
   // so we can post pre-claim failure heartbeats. The JWT also binds sub=task_id,
@@ -1992,26 +2039,13 @@ async function main() {
       // prepareWorkspaceForRole reuses the workspace (preserving caches)
       // instead of wiping + re-cloning.
       process.env.BLUEPRINT_WARM_HANDOFF = '1';
-      // Per-role telemetry reset. The next loop iteration's runRoleOnce
-      // will set roleClaimTimestamp after a successful re-claim.
-      isWarmStart = true;
-      firstToolUseAt = null;
-      roleClaimTimestamp = null;
-      handlerDurationSecsForPayload = null;
-      // Drain the tool-trace ring buffer so the next role's
-      // extractInvestigatedFiles() and heartbeat-attached trace start clean
-      // — without this, the next agent's heartbeat surfaces prior-role tool
-      // uses and the reaper's death-trace conflates two roles' work.
-      clearToolTrace();
-      setCurrentPromptFingerprint(null);
-      // Same rationale for the `./check` synthesizer's monotonic state:
-      // without a reset, the next role's synthesized iterations continue
-      // numbering from the prior role and carry a stale started_at.
-      resetCheckSynthesizerState();
-      // Per-task LLM telemetry must reset too (efficiency direction
-      // d-91d8dede) — without this, warm-VM continuity rolls the prior
-      // role's call/token totals into the next task's heartbeat payload.
-      resetLlmTelemetry();
+      // Reset ALL per-role module-level mutable state in one place so a reused
+      // warm VM cannot leak state from the prior task into this one (cancel
+      // signal, phase-0 telemetry, tool-trace, prompt fingerprint, ./check
+      // synthesizer counters, LLM call/token totals). warmStart:true marks this
+      // as a warm role; the next runRoleOnce sets roleClaimTimestamp after a
+      // successful re-claim. See resetPerRoleModuleState for the field list.
+      resetPerRoleModuleState({ warmStart: true });
     }
   } finally {
     // Workspace teardown happens once at process exit, not per-role —

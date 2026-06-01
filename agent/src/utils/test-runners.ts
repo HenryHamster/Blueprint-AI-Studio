@@ -12,6 +12,32 @@ export interface DirectoryConfig {
   build_cmd?: string;
   test_cmd?: string;
 }
+/** Project-specific Alembic/SQLModel migration layout. Lets a non-Blueprint
+ *  repo onboard the `migrate` handler without inheriting Blueprint's
+ *  `backend/alembic/versions/` + `backend/app/main.py:EXPECTED_SCHEMA_REVISION`
+ *  conventions. Every field is optional; unset fields fall back to the
+ *  Blueprint defaults (see ``resolveMigrationLayout`` in
+ *  ``agent/src/handlers/specialized.ts``) so the self-repo behaviour is
+ *  byte-for-byte unchanged. Mirrors ``project.build_config.migration`` on the
+ *  backend. */
+export interface MigrationConfig {
+  /** Directory holding alembic version files, relative to repo root.
+   *  Default: ``<pythonDir>/alembic/versions``. */
+  versions_dir?: string;
+  /** Directory (or file) holding the SQLModel/SQLAlchemy models.
+   *  Default: ``<pythonDir>/app/models``. */
+  models_dir?: string;
+  /** Working directory alembic commands run from (where alembic.ini lives).
+   *  Default: ``<pythonDir>``. */
+  alembic_cwd?: string;
+  /** File declaring the schema-revision constant the startup gate checks.
+   *  Default: ``<pythonDir>/app/main.py``. When empty, the schema-revision
+   *  step is omitted from the migrate prompt entirely. */
+  schema_revision_file?: string;
+  /** Name of the schema-revision constant to bump.
+   *  Default: ``EXPECTED_SCHEMA_REVISION``. */
+  schema_revision_const?: string;
+}
 export interface BuildConfig {
   language?: string;
   directories?: DirectoryConfig[];
@@ -20,6 +46,9 @@ export interface BuildConfig {
   git_user_email?: string;
   enable_fresh_reviewer?: boolean;
   enable_parallel_review?: boolean;
+  /** Project-specific migration layout (alembic versions dir, models dir,
+   *  schema-revision file/constant). Unset → Blueprint defaults. */
+  migration?: MigrationConfig;
   /** Namespace prefix for agent work branches (``{namespace}/{prefix}-{8hex}``).
    *  Defaults to ``"blueprint"`` so the self-repo's branch names are unchanged.
    *  Mirrors ``project.task_branch_namespace`` on the backend (resolved via

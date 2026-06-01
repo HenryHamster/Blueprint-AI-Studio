@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -564,6 +564,53 @@ describe('cancel flag (C7 reassignment shutdown signalling)', () => {
   it('defaults to false and is observable via the test hook', () => {
     _resetCancelRequestedForTesting();
     expect(_isCancelRequestedForTesting()).toBe(false);
+  });
+});
+
+// ── resetPerRoleModuleState — warm-VM per-role isolation ─────────────────────
+// Single source of truth that clears ALL per-role module-level mutable state so
+// a reused warm VM cannot leak a prior task's state into the next role.
+describe('resetPerRoleModuleState (warm-VM isolation)', () => {
+  afterEach(() => {
+    _resetCancelRequestedForTesting();
+    resetPerRoleModuleState({ warmStart: false });
+  });
+
+  it('clears the cancel shutdown signal so the next role can heartbeat', () => {
+    _setCancelRequestedForTesting();
+    expect(_isCancelRequestedForTesting()).toBe(true);
+    resetPerRoleModuleState();
+    expect(_isCancelRequestedForTesting()).toBe(false);
+  });
+
+  it('clears tool-trace, prompt fingerprint and LLM telemetry, and resets the warm-start flag', () => {
+    // Seed per-role state as if a prior role ran.
+    recordToolUse('Read', { file_path: '/tmp/workspace/foo.ts' });
+    setCurrentPromptFingerprint('prior-role-fp');
+    recordLlmCallStart();
+    recordLlmTokens(123, 45);
+    _setWarmStartForTesting(true);
+    expect(snapshotToolTrace().length).toBeGreaterThan(0);
+    expect(getCurrentPromptFingerprint()).toBe('prior-role-fp');
+    expect(getLlmTelemetry().llm_call_count).toBe(1);
+
+    // Warm handoff: reset with warmStart:true.
+    resetPerRoleModuleState({ warmStart: true });
+
+    expect(snapshotToolTrace().length).toBe(0);
+    expect(getCurrentPromptFingerprint()).toBeNull();
+    expect(getLlmTelemetry()).toEqual({
+      llm_call_count: 0,
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+    });
+    expect(_getWarmStartForTesting()).toBe(true);
+  });
+
+  it('defaults warmStart to false (cold-start semantics) when no flags are passed', () => {
+    _setWarmStartForTesting(true);
+    resetPerRoleModuleState();
+    expect(_getWarmStartForTesting()).toBe(false);
   });
 });
 
@@ -3418,6 +3465,7 @@ describe('drainJsonChunks within-chunk yielding', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
       drainYieldCount++;
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
     });
     emitData(Buffer.from(lines.join('\n') + '\n'));
@@ -3466,6 +3514,7 @@ describe('drainJsonChunks within-chunk yielding', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
       drainYieldCount++;
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument
       return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
     });
     emitData(Buffer.from(lines.join('\n') + '\n'));

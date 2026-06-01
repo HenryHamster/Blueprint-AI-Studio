@@ -3,7 +3,7 @@
 // the BuildConfig type defined in index.ts (directories, git identity, etc.).
 // Populated from task.build_config (a JSONB field on Project passed via claim).
 
-import type { BuildConfig, DirectoryConfig } from './index.js';
+import type { BuildConfig, DirectoryConfig, MigrationConfig } from './index.js';
 import { SHELL_CMD_RE } from './shell-safety.js';
 
 const VALID_TYPES = new Set(['python', 'node', 'go', 'rust']);
@@ -86,6 +86,43 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
       prefixes.push(p);
     }
     if (prefixes.length > 0) config.staging_branch_prefixes = prefixes;
+  }
+
+  // Project-specific migration layout (alembic versions dir, models dir,
+  // schema-revision file/constant). Each entry is path/identifier-shaped and
+  // gets interpolated into the migrate prompt, so apply the same
+  // path-traversal + shell-safety hygiene as directory paths; drop malformed
+  // values so a bad config falls back to the Blueprint default rather than
+  // injecting garbage. An empty schema_revision_file is preserved (it is the
+  // explicit "this repo has no schema-revision gate" signal).
+  if (raw.migration && typeof raw.migration === 'object' && !Array.isArray(raw.migration)) {
+    const m = raw.migration as Record<string, unknown>;
+    const migration: MigrationConfig = {};
+    const pathField = (v: unknown): string | undefined => {
+      if (typeof v !== 'string' || v === '') return undefined;
+      if (v.includes('..') || v.startsWith('/') || v.includes('\0')) return undefined;
+      if (!SHELL_CMD_RE.test(v)) return undefined;
+      return v.replace(/\/$/, '');
+    };
+    const versionsDir = pathField(m.versions_dir);
+    const modelsDir = pathField(m.models_dir);
+    const alembicCwd = pathField(m.alembic_cwd);
+    if (versionsDir !== undefined) migration.versions_dir = versionsDir;
+    if (modelsDir !== undefined) migration.models_dir = modelsDir;
+    if (alembicCwd !== undefined) migration.alembic_cwd = alembicCwd;
+    // schema_revision_file: '' is meaningful (no gate) but must still be safe.
+    if (typeof m.schema_revision_file === 'string') {
+      if (m.schema_revision_file === '') {
+        migration.schema_revision_file = '';
+      } else {
+        const sf = pathField(m.schema_revision_file);
+        if (sf !== undefined) migration.schema_revision_file = sf;
+      }
+    }
+    if (typeof m.schema_revision_const === 'string' && m.schema_revision_const !== '' && SHELL_CMD_RE.test(m.schema_revision_const)) {
+      migration.schema_revision_const = m.schema_revision_const;
+    }
+    if (Object.keys(migration).length > 0) config.migration = migration;
   }
 
   return config;
