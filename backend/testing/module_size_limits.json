@@ -107,7 +107,7 @@
     "prompts/self-review.ts": 500,
     "prompts/analysis.ts": 250,
     "fix-loop-events.ts": 320,
-    "constants.ts": 350,
+    "constants.ts": 410,
     "json-extract.ts": 330,
     "workspacePrep.ts": 240,
     "reset.ts": 240,

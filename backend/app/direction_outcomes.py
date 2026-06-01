@@ -25,6 +25,7 @@ from app.failure_classification import (
     classify_failure as _classify_failure,
     classify_failure_taxonomy as _classify_taxonomy,
 )
+from app.landed_signal import is_merged_completion
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
 from app.task_locking import with_design_doc_locked, with_directions_locked
@@ -297,7 +298,7 @@ async def _update_direction_research_outcomes(
     entry["prs_merged"] = sum(
         1
         for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
     )
     entry["prs_rejected"] = sum(
         1
@@ -307,7 +308,7 @@ async def _update_direction_research_outcomes(
     _merged_rows = [
         ct
         for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
     ]
     entry["autonomous_prs_merged"] = sum(
         1 for ct in _merged_rows if is_autonomous_merge(ct)
@@ -332,7 +333,7 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_merged"] = sum(
         1
         for ct in _prev_rows
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
     )
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
@@ -350,7 +351,7 @@ async def _update_direction_research_outcomes(
     entry["remediation_tasks_merged"] = sum(
         1
         for ct in _remediation_rows
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
     )
     entry["remediation_tasks_failed"] = sum(
         1 for ct in _remediation_rows if _counts_as_failure(ct)
@@ -359,8 +360,7 @@ async def _update_direction_research_outcomes(
     merged_files_lists = [
         (ct.context or {}).get("_pr_changed_files", [])
         for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED
-        and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
         and (ct.context or {}).get("_pr_changed_files")
     ]
     _tasks_created = entry.get("tasks_created", 0)
@@ -391,8 +391,7 @@ async def _update_direction_research_outcomes(
         (_to_naive_utc(ct.vm_stopped_at) - _to_naive_utc(ct.created_at)).total_seconds()
         / 3600
         for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED
-        and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
         and ct.vm_stopped_at is not None
         and ct.created_at is not None
     ]
@@ -435,8 +434,7 @@ async def _update_direction_research_outcomes(
     review_durations = []
     for ct in child_tasks_rows:
         if not (
-            ct.status == TaskStatus.COMPLETED
-            and (ct.context or {}).get("pr_merged")
+            is_merged_completion(ct)
             and ct.vm_stopped_at is not None
         ):
             continue
@@ -532,8 +530,7 @@ async def _update_direction_research_outcomes(
     sd_staging_only = sum(
         1
         for ct in child_tasks_rows
-        if ct.status == TaskStatus.COMPLETED
-        and (ct.context or {}).get("pr_merged")
+        if is_merged_completion(ct)
         and rollup_failed
     )
     entry["stage_dropout"] = {
@@ -555,8 +552,7 @@ async def _update_direction_research_outcomes(
         if task_type not in type_breakdown:
             type_breakdown[task_type] = {"created": 0, "merged": 0, "failed": 0}
         type_breakdown[task_type]["created"] += 1
-        ctx_t = ct.context or {}
-        if ct.status == TaskStatus.COMPLETED and ctx_t.get("pr_merged"):
+        if is_merged_completion(ct):
             type_breakdown[task_type]["merged"] += 1
         if _counts_as_failure(ct):
             type_breakdown[task_type]["failed"] += 1
@@ -620,11 +616,11 @@ async def _update_direction_research_outcomes(
                 effort_level, {"created": 0, "merged": 0, "failed": 0}
             )
             effort_bucket["created"] += 1
-            if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+            if is_merged_completion(ct):
                 effort_bucket["merged"] += 1
             if _counts_as_failure(ct):
                 effort_bucket["failed"] += 1
-        if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+        if is_merged_completion(ct):
             scope_breakdown[scope]["merged"] += 1
             changed_files_for_span = ctx_.get("_pr_changed_files") or []
             top_dirs = {
@@ -662,7 +658,7 @@ async def _update_direction_research_outcomes(
             )
         if ctx_.get("medium_exploration"):
             scope_breakdown[scope]["exploration_created"] += 1
-            if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+            if is_merged_completion(ct):
                 scope_breakdown[scope]["exploration_merged"] += 1
             if _counts_as_failure(ct):
                 scope_breakdown[scope]["exploration_failed"] += 1
@@ -684,7 +680,7 @@ async def _update_direction_research_outcomes(
                     key, {"attempted": 0, "merged": 0, "failed": 0}
                 )
                 bucket["attempted"] += 1
-                if ct.status == TaskStatus.COMPLETED and ctx_.get("pr_merged"):
+                if is_merged_completion(ct):
                     bucket["merged"] += 1
                 if _counts_as_failure(ct):
                     bucket["failed"] += 1
@@ -730,7 +726,7 @@ async def _update_direction_research_outcomes(
         if not isinstance(cs, (int, float)):
             continue
         scope2 = ctx2.get("scope", "unknown")
-        if ct.status == TaskStatus.COMPLETED and ctx2.get("pr_merged"):
+        if is_merged_completion(ct):
             cplx_merged_sum[scope2] = cplx_merged_sum.get(scope2, 0.0) + float(cs)
             cplx_merged_n[scope2] = cplx_merged_n.get(scope2, 0) + 1
         elif _counts_as_failure(ct):
@@ -767,7 +763,7 @@ async def _update_direction_research_outcomes(
         if not isinstance(pt, dict):
             continue
         scope_val = (ct.context or {}).get("scope")
-        if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged"):
+        if is_merged_completion(ct):
             pt_buckets["merged"].append(pt)
             if scope_val in ("small", "medium"):
                 pt_buckets.setdefault(f"merged_{scope_val}", []).append(pt)
@@ -829,8 +825,7 @@ async def _update_direction_research_outcomes(
             merged_ct = sum(
                 1
                 for st in sts
-                if st.status == TaskStatus.COMPLETED
-                and (st.context or {}).get("pr_merged")
+                if is_merged_completion(st)
             )
             failed_nc = sum(
                 1
@@ -913,7 +908,7 @@ async def _update_direction_research_outcomes(
         _sub_merged = sum(
             1
             for ct in _decomposed
-            if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_merged")
+            if is_merged_completion(ct)
         )
         _sub_total = len(_decomposed)
         entry["cochange_decomposition"] = {
@@ -968,9 +963,7 @@ async def _update_direction_research_outcomes(
                         new_established.append(item)
                 if moved:
                     parsed["established"] = new_established
-            elif ct.status == TaskStatus.COMPLETED and (ct.context or {}).get(
-                "pr_merged"
-            ):
+            elif is_merged_completion(ct):
                 # Promote (proposed) finding to (confirmed)
                 new_established = []
                 for item in parsed["established"]:

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.landed_signal import has_landed_signal, mark_unblocked_non_merge
 from app.models import (
     Task,
     Artifact,
@@ -104,7 +105,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     from app.routers.agent import get_github_token_for_task
     from app.github import get_pull_request
 
-    if (task.context or {}).get("pr_merged"):
+    if has_landed_signal(task):
         return True
 
     # Negative-result cache: when a batch of sibling children completes in
@@ -138,7 +139,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         # Treat as "done" so it doesn't block rollup.
         # Cache in context so partial-rollup path (which checks context.pr_merged directly)
         # doesn't see this task as "unmerged".
-        task.context = {**(task.context or {}), "pr_merged": True}
+        mark_unblocked_non_merge(task, reason="no_pr_artifact")
         return True
     if artifact and artifact.pr_url:
         # Shape-validate before parsing. Production incident 2026-05-06: a
@@ -184,8 +185,11 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 )
                 pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("merged"):
+                # A rollup child PR merges into the rollup *staging* branch, not
+                # the integration branch — so this is a non-merge unblock, not an
+                # integration landing.
                 # Update in-memory first so caller sees the change even if DB write fails
-                task.context = {**(task.context or {}), "pr_merged": True}
+                mark_unblocked_non_merge(task, reason="rollup_child_pr_merged_to_staging")
                 # Persist to DB in separate session (best-effort — may fail if caller
                 # holds FOR UPDATE lock on this row, but in-memory update is sufficient
                 # for the current rollup cycle)
@@ -193,10 +197,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     async with AsyncSessionLocal() as write_session:
                         db_task = await write_session.get(Task, task.id)
                         if db_task:
-                            db_task.context = {
-                                **(db_task.context or {}),
-                                "pr_merged": True,
-                            }
+                            mark_unblocked_non_merge(
+                                db_task, reason="rollup_child_pr_merged_to_staging"
+                            )
                             write_session.add(db_task)
                             await write_session.commit()
                 except Exception as write_err:
@@ -226,17 +229,16 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                         f"merging, but marked as a deliberate success-close (work "
                         f"landed elsewhere) — completing instead of failing"
                     )
-                    task.context = {**_ctx, "pr_merged": True}
+                    mark_unblocked_non_merge(task, reason="deliberate_success_close")
                     if task.status != TaskStatus.COMPLETED:
                         task.status = TaskStatus.COMPLETED
                     try:
                         async with AsyncSessionLocal() as write_session:
                             db_task = await write_session.get(Task, task.id)
                             if db_task:
-                                db_task.context = {
-                                    **(db_task.context or {}),
-                                    "pr_merged": True,
-                                }
+                                mark_unblocked_non_merge(
+                                    db_task, reason="deliberate_success_close"
+                                )
                                 if db_task.status != TaskStatus.COMPLETED:
                                     db_task.status = TaskStatus.COMPLETED
                                 write_session.add(db_task)
