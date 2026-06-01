@@ -1367,6 +1367,7 @@ async def update_agent_status(
                 failure_class = classification.failure_class
                 from app.failure_classification import (
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
+                    NO_PROGRESS_TIMEOUT,
                     persist_failure_category,
                 )
 
@@ -1390,8 +1391,13 @@ async def update_agent_status(
                         project_id=_project_id,
                     )
 
-                # Rate-limited or transient API failures: requeue instead of permanently failing
-                if failure_class in ("RATE_LIMIT", "EXTERNAL_API"):
+                # Rate-limited or transient API failures: requeue instead of permanently failing.
+                # NO_PROGRESS_TIMEOUT is an inferred (not confirmed) transient provider
+                # hang: requeue immediately and release the VM slot, but DO NOT block the
+                # account's model (the disable_account_model / blacklist branches below are
+                # gated on failure_class == "RATE_LIMIT", so a healthy account stays
+                # available). Like RATE_LIMIT it does not burn the retry budget.
+                if failure_class in ("RATE_LIMIT", "EXTERNAL_API", NO_PROGRESS_TIMEOUT):
                     acct_id = get_task_llm_account_id(task)
                     model = _extract_task_model(task)
                     if acct_id:

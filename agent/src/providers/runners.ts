@@ -152,11 +152,34 @@ export class RateLimitError extends Error {
   }
 }
 
+// Thrown when the llm-no-progress watchdog fires on a GENUINELY silent call
+// (no model deltas for >LLM_NO_PROGRESS_STALL_MS) but NO confirmed rate-limit
+// message matched (no RATE_LIMIT_PATTERNS hit). This is a transient provider
+// hang of unknown cause, NOT a confirmed account rate-limit: the orchestrator
+// must requeue the task (without burning retry) and leave the account AVAILABLE
+// rather than blocking its opus model. A confirmed rate-limit message still
+// throws RateLimitError (→ block + canonical cooldown), unchanged. Carries
+// failureCategory='no_progress_timeout' so the agent's catch block reports the
+// transient category instead of 'rate_limited'.
+export class NoProgressTimeoutError extends Error {
+  readonly failureCategory = 'no_progress_timeout' as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoProgressTimeoutError';
+  }
+}
+
 interface ClaudeOutputBlock { type: string; text?: string; name?: string; id?: string; input?: unknown }
 export interface ClaudeOutput {
   type: string;
   message?: { content: ClaudeOutputBlock[] };
   result?: string;
+  // Partial-message envelope emitted by `--include-partial-messages`. Carried on
+  // `{"type":"stream_event", ...}` lines; `event.type` is the incremental SSE
+  // event (e.g. "content_block_delta" with a text_delta / thinking_delta). Used
+  // ONLY as a liveness signal (reset the no-progress watchdog); never decoded for
+  // content, so the inner delta shape is intentionally left untyped.
+  event?: { type?: string } | null;
   // Present on events emitted by a sub-agent the parent spawned via the
   // Task/Agent/Workflow tool. A non-empty value marks a NESTED event: it is
   // legitimate in-flight sub-progress for the parent's still-running tool, NOT
@@ -336,7 +359,17 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
     credentialSummary: () => baseEnv.CLAUDE_CODE_OAUTH_TOKEN ? 'Using OAuth token for Claude Code auth' : 'Using ANTHROPIC_API_KEY as fallback auth',
     missingCredentials: () => (baseEnv.CLAUDE_CODE_OAUTH_TOKEN || baseEnv.ANTHROPIC_API_KEY) ? [] : ['CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY'],
     buildRunCommand: (_prompt, model, effort, disallowedTools) => {
-      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'];
+      // --include-partial-messages emits incremental `stream_event` lines
+      // (content_block_delta text / thinking_delta) DURING a model turn. Without
+      // it, a long opus turn produces NO stdout event until the COMPLETE
+      // assistant message, so `lastStreamEventAt` ages past LLM_NO_PROGRESS_STALL_MS
+      // even while the model is actively generating/thinking → false rate_limited
+      // requeue + account-model block (a self-inflicted cascade that mimics rate
+      // limiting). With partial messages, a slow-but-streaming call keeps the
+      // no-progress watchdog fresh (real instance-level progress signal), while a
+      // genuinely hung call — a real 429/529 the SDK retries silently, emitting
+      // ZERO model deltas — still goes stale and fires correctly.
+      const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages', '--dangerously-skip-permissions'];
       let effectiveEffort = effort;
       if (LLM_CLI_TRANSLATION) {
         args.push(...LLM_CLI_TRANSLATION.args);
@@ -749,7 +782,29 @@ echo ""
             // provider hang emits those too, so counting them would mask the very
             // hang the no-progress watchdog must catch.
             noteToolProgress(isNested);
-            if (objType === 'assistant') {
+            if (objType === 'stream_event') {
+              // Incremental partial-message delta from --include-partial-messages
+              // (content_block_delta text / thinking_delta). This is the
+              // instance-level "model is actively generating/thinking RIGHT NOW"
+              // signal: a slow-but-streaming opus turn (deep research/review on
+              // 1M-context + extended thinking) emits these continuously, so the
+              // no-progress watchdog stays fresh and the call rides to completion
+              // instead of being false-flagged as a 429 hang. A genuinely hung
+              // call (a real 429/529 the SDK retries silently) emits ZERO deltas,
+              // so lastStreamEventAt still goes stale and the watchdog fires
+              // correctly. Only top-level deltas count as model content progress;
+              // nested deltas (a sub-agent under a workflow tool) already counted
+              // as tool sub-progress via noteToolProgress(isNested) above and must
+              // not mask a genuine top-level provider hang. Act minimally (just the
+              // timer reset) and do NOT log every delta — --include-partial-messages
+              // multiplies event volume and per-delta logging would flood the WS.
+              if (!isNested) lastStreamEventAt = Date.now();
+              // Any delta (top-level OR nested) is genuine in-flight activity, so
+              // also count it as tool sub-progress when a tool is in flight —
+              // consistent with the lastToolProgressAt logic (#6979). noteToolProgress
+              // is a cheap no-op when no tool is in flight.
+              noteToolProgress(true);
+            } else if (objType === 'assistant') {
               // Only top-level assistant events count as model "content progress"
               // (the no-progress watchdog's content signal). Nested sub-agent
               // assistant events still count as tool sub-progress (noteToolProgress
@@ -1134,12 +1189,31 @@ echo ""
   if (flags.stalledMidStream) {
     throw new ClaudeTimeoutError(`${runner.displayName} mid-stream tool-use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result`);
   }
+  // Computed up here (before the no-progress branch) so the no-progress watchdog
+  // can consult it: only a CONFIRMED rate-limit message blocks the account.
+  const combined = stderrBuffer + allOutput.slice(-LOG_TAIL_BYTES);
+  const sawConfirmedRateLimit = matchesRateLimit(combined, runner.provider, runner.authMode);
+
   // Checked before providerKilledByOOM: the watchdog's own SIGTERM→SIGKILL can
-  // trip the SIGKILL-without-timeout OOM heuristic above, so this RateLimitError
-  // must win. RateLimitError → failureCategory 'rate_limited' → no retry-budget
-  // burn; the orchestrator holds/reroutes instead of failing the task.
+  // trip the SIGKILL-without-timeout OOM heuristic above, so this branch must win.
+  // The no-progress watchdog now fires ONLY on a genuinely silent call (with
+  // --include-partial-messages, a slow-but-streaming opus turn keeps emitting
+  // deltas and never trips it). Distinguish two cases:
+  //   • CONFIRMED rate-limit text present → RateLimitError → failureCategory
+  //     'rate_limited' → orchestrator blocks the account's model + applies the
+  //     canonical cooldown (UNCHANGED — real rate-limit handling preserved).
+  //   • NO confirmed rate-limit text → a transient provider hang of unknown cause.
+  //     The pipeline runs 6 Max-20x accounts and is NOT actually rate-limited, so
+  //     blocking the healthy account here is a self-inflicted cascade. Report a
+  //     transient 'no_progress_timeout' instead: the orchestrator requeues the
+  //     task (without burning retry) and leaves the account AVAILABLE. The hang is
+  //     still bounded (we SIGTERM'd + requeue), so it is never immortal.
   if (flags.llmNoProgressHang) {
-    throw new RateLimitError(`${runner.displayName} produced no model output for >${LLM_NO_PROGRESS_STALL_MS / 60000} min — provider hang/throttle (429/529 absorbed by SDK retry)`);
+    if (sawConfirmedRateLimit) {
+      const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
+      throw new RateLimitError(`${runner.displayName} produced no model output and hit a confirmed rate limit — ${snippet}`);
+    }
+    throw new NoProgressTimeoutError(`${runner.displayName} produced no model output (no stream deltas) for >${LLM_NO_PROGRESS_STALL_MS / 60000} min — transient provider hang, no confirmed rate-limit message`);
   }
   if (flags.providerKilledByOOM) {
     const err = new ClaudeTimeoutError(`EOOM: ${runner.displayName} received external SIGKILL before agent timeout; likely cgroup OOM`);
@@ -1147,8 +1221,7 @@ echo ""
     throw err;
   }
 
-  const combined = stderrBuffer + allOutput.slice(-LOG_TAIL_BYTES);
-  if (matchesRateLimit(combined, runner.provider, runner.authMode)) {
+  if (sawConfirmedRateLimit) {
     const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
     throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
   }
