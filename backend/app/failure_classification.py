@@ -640,6 +640,86 @@ def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -
         return False
 
 
+def _local_pool_view_sufficient(scope: dict) -> bool:
+    """Return True if the local in-memory pool can be trusted for a *scoped*
+    pool-wide rate-limit reclassification verdict.
+
+    Multi-instance hazard (design-audit ``failure-class-multiinstance``):
+    ``pool_wide_rate_limit_cooldown`` forms an "every eligible account is
+    blocked" verdict by reading process-local pool state (``_account_by_id`` /
+    ``_max_plan_pools``). Cooldowns are recorded into the in-memory pool by
+    whichever Cloud Run instance handled the rate-limited request, and a
+    cooldown another instance has since *cleared* (probe succeeded) lingers
+    stale in this instance's view. An instance classifying a failure may
+    therefore reach a True verdict from a view that does not actually contain —
+    or no longer faithfully represents — the candidate set the task was routed
+    to. That spuriously reclassifies a genuine CODE_ERROR as RATE_LIMIT.
+
+    Bounded gate (no migration, no new shared store): when the task has a
+    *resolvable dispatch scope* (a routed provider or the owning user_id), the
+    pool-wide verdict is only trustworthy if the local pool actually holds at
+    least one enabled account in that scope. A scoped verdict over a local view
+    that contains zero matching accounts cannot have inspected the real
+    candidate set — it reflects a partial cross-instance view, so decline to
+    reclassify and let the caller fall back to keyword classification (or to the
+    durable ``db_rl_override`` signal the authoritative reaper / agent_status
+    paths supply).
+
+    Scope-less correlation (no provider, no account — pre-assignment /
+    accountless silent death) is left untouched: there is no candidate set to
+    compare against, so the global verdict stands exactly as before. This keeps
+    the change behavior-preserving on a single instance — a single instance
+    loads every account wholesale, so a routed task's scope always resolves to
+    locally-present accounts (blocked or not), and the gate returns True.
+    """
+    try:
+        from app.max_plan_pool import (
+            _max_plan_pools,
+            _normalize_provider_name,
+        )
+        from app.models import LLMProviderName
+
+        providers = scope.get("providers")
+        user_id = scope.get("user_id")
+
+        # No resolvable scope → global/accountless correlation. There is no
+        # candidate set to validate the local view against, so preserve the
+        # existing global-verdict behavior (sufficiency is not assessable here).
+        if not providers and not user_id:
+            return True
+
+        accts = _max_plan_pools.get(user_id, []) if user_id else None
+        if accts is None:
+            # provider-scoped without a user_id → consider the whole local pool.
+            from app.max_plan_pool import _all_accounts
+
+            accts = _all_accounts()
+
+        if providers:
+            norm_providers = {
+                _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
+                for p in providers
+            }
+            accts = [
+                a
+                for a in accts
+                if (
+                    _normalize_provider_name(a.get("provider"))
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                in norm_providers
+            ]
+
+        # At least one enabled candidate must be visible locally for the scoped
+        # pool-wide verdict to reflect the real candidate set. (Disabled-but-
+        # rate-limited accounts still count as "visible" — they're exactly what
+        # the legitimate single-instance whole-pool-blocked path relies on.)
+        return any(a.get("enabled", True) for a in accts)
+    except Exception:
+        logger.debug("[FAILURE_CLASS] _local_pool_view_sufficient degraded to False")
+        return False
+
+
 def _pool_was_rate_limited(
     task: "Task | None" = None, at_time: "datetime | None" = None
 ) -> bool:
@@ -652,6 +732,13 @@ def _pool_was_rate_limited(
 
     Prevents accounts for unrelated users or providers from changing the verdict.
     Falls back to the global pool when task is None or context is missing.
+
+    Multi-instance safety: gated on ``_local_pool_view_sufficient`` so a partial
+    or stale process-local pool view cannot drive a spurious RATE_LIMIT
+    reclassification (design-audit ``failure-class-multiinstance``). When the
+    local pool has no in-scope candidates, returns False and the caller degrades
+    to keyword classification.
+
     Never raises — returns False with a debug log on any error.
     """
     try:
@@ -675,7 +762,19 @@ def _pool_was_rate_limited(
             logger.debug(
                 "[FAILURE_CLASS] pool_wide_rate_limit_cooldown: pool not fully blocked"
             )
-        return result
+            return False
+
+        # Gate the positive verdict on the local view being representative.
+        # A multi-instance deploy can show "all visible accounts blocked" from a
+        # partial local pool; only trust the verdict when in-scope candidates are
+        # actually present locally.
+        if not _local_pool_view_sufficient(scope):
+            logger.debug(
+                "[FAILURE_CLASS] pool_wide_rate_limit_cooldown verdict ignored: "
+                "local pool view insufficient (multi-instance partial view)"
+            )
+            return False
+        return True
     except Exception:
         logger.debug(
             "[FAILURE_CLASS] pool_wide_rate_limit_cooldown check degraded to False"

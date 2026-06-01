@@ -2724,9 +2724,7 @@ class TestPoolWideRateLimitCorrelation:
 
         def scoped_pool_check(at_time=None, *, providers=None, **_):
             # Only openai is exhausted; anthropic task should not see True.
-            if providers == ["anthropic"]:
-                return False
-            return True  # openai pool is exhausted
+            return providers != ["anthropic"]  # openai pool is exhausted
 
         monkeypatch.setattr(
             pool_mod, "pool_wide_rate_limit_cooldown", scoped_pool_check
@@ -2750,9 +2748,7 @@ class TestPoolWideRateLimitCorrelation:
 
         def scoped_pool_check(at_time=None, *, user_id=None, **_):
             # user-b is exhausted; user-a (task's owner) is not.
-            if user_id == "user-a":
-                return False
-            return True  # user-b pool exhausted
+            return user_id != "user-a"  # user-b pool exhausted
 
         monkeypatch.setattr(
             pool_mod, "pool_wide_rate_limit_cooldown", scoped_pool_check
@@ -2762,6 +2758,134 @@ class TestPoolWideRateLimitCorrelation:
             ctx={"failure_category": "incomplete", "llm_account_id": account_id},
         )
         assert classify_failure(task) == CODE_ERROR
+
+
+class TestMultiInstancePartialPoolView:
+    """Multi-instance safety (design-audit failure-class-multiinstance).
+
+    The pool-wide correlation reclassification reads PROCESS-LOCAL pool state.
+    On a multi-instance deploy the classifying instance may hold a partial /
+    stale view of the candidate set (a cooldown another instance has cleared
+    lingers locally, or the local pool simply doesn't contain the routed
+    scope's accounts). When the task has a resolvable dispatch scope but the
+    local pool holds zero matching accounts, a True pool-wide verdict was drawn
+    over a view that never inspected the real candidate set — so it must NOT
+    drive a RATE_LIMIT reclassification. The durable db_rl_override signal
+    (computed by the authoritative reaper / agent_status paths) remains the
+    cross-instance authority and still reclassifies.
+    """
+
+    def test_scoped_verdict_over_empty_local_pool_does_not_reclassify(
+        self, monkeypatch
+    ):
+        """Routed provider scope + pool_wide check True, but the local pool has
+        zero in-scope accounts (cross-instance partial view) → stays CODE_ERROR,
+        no spurious RATE_LIMIT reclassification."""
+        import app.max_plan_pool as pool_mod
+
+        # pool_wide_rate_limit_cooldown reports "fully blocked" from a partial
+        # local view; the local pool, however, contains no anthropic accounts.
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
+        )
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(pool_mod, "_max_plan_pools", {})
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_provider": "anthropic"}
+        )
+        assert classify_failure(task) == CODE_ERROR
+        assert "rate_limit_correlation_reclassified" not in task.context
+
+    def test_scoped_verdict_with_loaded_local_pool_still_reclassifies(
+        self, monkeypatch
+    ):
+        """Behavior-preserving on a single (fully-loaded) instance: same scope,
+        but the local pool actually holds an in-scope account → the pool-wide
+        verdict is trusted and the task reclassifies to RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
+        )
+        local_acct = {"id": "a1", "provider": "anthropic", "enabled": True}
+        monkeypatch.setattr(pool_mod, "_account_by_id", {"a1": local_acct})
+        monkeypatch.setattr(pool_mod, "_max_plan_pools", {None: [local_acct]})
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_provider": "anthropic"}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+        assert task.context.get("rate_limit_correlation_reclassified") is True
+
+    def test_db_rl_override_reclassifies_despite_insufficient_local_view(
+        self, monkeypatch
+    ):
+        """Cross-instance authority: even with a scoped task and an empty local
+        pool (insufficient view), a durable db_rl_override=True still drives
+        RATE_LIMIT — the gate only suppresses the unreliable LOCAL fast-path."""
+        import app.max_plan_pool as pool_mod
+
+        # Local fast-path would not fire (empty/partial view); only the durable
+        # DB signal should reclassify.
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
+        )
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(pool_mod, "_max_plan_pools", {})
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_provider": "anthropic"}
+        )
+        assert classify_failure(task, db_rl_override=True) == RATE_LIMIT
+
+    def test_accountless_global_verdict_unaffected_by_gate(self, monkeypatch):
+        """Scope-less (no provider, no account) pre-assignment death keeps the
+        global pool-wide verdict — the gate has no candidate set to validate and
+        must not change this legitimate single-instance path."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
+        )
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(pool_mod, "_max_plan_pools", {})
+
+        task = _task("", ctx={"failure_category": "incomplete"})
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_local_pool_view_sufficient_predicate(self, monkeypatch):
+        """Unit-level: predicate is True for no-scope and for a loaded in-scope
+        pool, False for a scoped task whose candidates are absent locally."""
+        import app.max_plan_pool as pool_mod
+        from app.failure_classification import _local_pool_view_sufficient
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(pool_mod, "_max_plan_pools", {})
+
+        # No scope → not assessable → treated as sufficient (preserve global path).
+        assert _local_pool_view_sufficient({"providers": None, "user_id": None}) is True
+
+        # Scoped but empty local pool → insufficient.
+        assert (
+            _local_pool_view_sufficient({"providers": ["anthropic"], "user_id": None})
+            is False
+        )
+
+        # Scoped with a matching enabled local account → sufficient.
+        acct = {"id": "a1", "provider": "anthropic", "enabled": True}
+        monkeypatch.setattr(pool_mod, "_account_by_id", {"a1": acct})
+        monkeypatch.setattr(pool_mod, "_max_plan_pools", {None: [acct]})
+        assert (
+            _local_pool_view_sufficient({"providers": ["anthropic"], "user_id": None})
+            is True
+        )
+
+        # Scoped to a different provider than the only local account → insufficient.
+        assert (
+            _local_pool_view_sufficient({"providers": ["openai"], "user_id": None})
+            is False
+        )
 
 
 class TestAtTimeFailureInstantCorrelation:
