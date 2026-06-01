@@ -339,6 +339,73 @@ async def test_eligibility_skips_dependency_and_file_conflict(db_session):
 
 
 @pytest.mark.asyncio
+async def test_dependency_ready_task_is_eligible_with_marker(db_session):
+    """A dependency-bearing task whose deps the orchestrator already resolved
+    (``context['_deps_satisfied']`` stamped) is warm-claimable, while an
+    otherwise-identical task WITHOUT the marker stays ineligible and still
+    fires the depends_on skip funnel."""
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="Dep Ready")
+    vm_id = "agent-vm-dep-ready"
+
+    # Dependency-bearing task, deps NOT yet resolved (no marker) -> skipped.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"scope": "small"},
+    )
+    wbr._scan_skipped_depends_on_events.clear()
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is False
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+    # The unsatisfied-dep skip funnel still fires for the unmarked task.
+    assert len(wbr._scan_skipped_depends_on_events) >= 1
+
+    # Same shape but deps resolved + stamped by the orchestrator -> eligible.
+    ready = await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"scope": "small", "_deps_satisfied": True},
+    )
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == ready.id
+
+
+@pytest.mark.asyncio
+async def test_dep_ready_task_still_respects_other_exclusions(db_session):
+    """The ``_deps_satisfied`` marker only lifts the dependency gate — a
+    dep-ready task pinned to a different VM or conflicting on files stays
+    ineligible exactly as a dependency-free task would."""
+    project = await _make_project(db_session, name="Dep Ready Exclusions")
+    vm_id = "agent-vm-mine"
+
+    # Dep-ready but pinned to another VM -> still excluded.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"_deps_satisfied": True, "warm_target_vm_id": "agent-vm-other"},
+    )
+    # Dep-ready but file-conflicting with an IN_PROGRESS task -> still excluded.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["src/app.py"]},
+    )
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"_deps_satisfied": True, "related_files": ["src/app.py"]},
+    )
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+
+
+@pytest.mark.asyncio
 async def test_eligibility_skips_other_vm_pin(db_session):
     """A task pinned to a different VM (chain pin) is not claimable as backlog
     by this VM."""

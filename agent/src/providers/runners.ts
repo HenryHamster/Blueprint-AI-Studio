@@ -458,13 +458,18 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // streaming nested sub-agent progress, so they get the larger
   // WORKFLOW_TOOL_STALL_TIMEOUT_MS silence budget instead of TOOL_USE_STALL_TIMEOUT_MS.
   let workflowToolInFlight = false;
-  // Timestamp of the last sub-progress signal for the in-flight tool: any
-  // stream-json event (top-level OR nested sub-agent event) seen while a tool is
-  // in flight. A legitimately long tool — a backend test run, a workflow/Task
-  // sub-agent fan-out — keeps this fresh by streaming SOMETHING, so the tool-use
-  // and no-progress watchdogs stay quiet. A genuinely hung tool emits nothing,
-  // so this goes stale and the watchdogs fire. Reset to lastToolUseAt on each
-  // new top-level tool_use; refreshed by every subsequent event under it.
+  // Timestamp of the last sub-progress signal for the in-flight tool. Refreshed
+  // by (a) any stream-json event (top-level OR nested sub-agent) seen while a
+  // tool is in flight, AND (b) — as a schema-independent backstop — ANY stdout
+  // chunk while a tool is in flight (see the child.stdout 'data' handler). A
+  // legitimately long tool — a backend test run, a workflow/Task sub-agent
+  // fan-out, or any future out-of-stream workflow that prints anything at all —
+  // keeps this fresh by emitting SOMETHING, so the tool-use stall watchdog stays
+  // quiet. A genuinely hung tool emits zero stdout, so this goes stale and the
+  // stall watchdog fires. Reset to lastToolUseAt on each new top-level tool_use.
+  // NOTE: the no-progress watchdog no longer consults this — it is suppressed
+  // outright while toolInFlight is true (the in-flight case is owned solely by
+  // the tool-use/workflow stall watchdog).
   let lastToolProgressAt: number | null = null;
   // Timestamp of the last model stream-json content event (assistant/result).
   // Drives the LLM-no-progress watchdog: a silent provider hang (429/529 the SDK
@@ -654,34 +659,46 @@ echo ""
     // the call ride to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry-
     // budget burn → terminal failure of a healthy task (incident 2026-05-29).
     let llmProgressWatchdog: NodeJS.Timeout | null = setInterval(() => {
-      // Dual-staleness gate (cluster C7). The original `!toolInFlight` gate is
-      // disabled forever if the `user`/item.completed result event that clears
-      // toolInFlight is ever lost — a stuck toolInFlight=true means a genuine
-      // provider hang that happens to follow a tool call never reports, and the
-      // call rides to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry
-      // burn (the exact failure #6865 was meant to prevent). Keying off
-      // staleness instead: fire when BOTH the content stream AND any in-flight
-      // tool activity are stale.
+      // Fire ONLY when the content stream is stale AND no tool is in flight.
       //
-      // Tool activity is measured by lastToolProgressAt — refreshed on EVERY
-      // stream-json event seen while a tool is in flight, including nested
-      // sub-agent events emitted by a workflow / Task fan-out. This is the fix
-      // for the false rate_limited requeue (incident: long workflow waits): a
-      // legitimately busy tool that keeps streaming sub-progress keeps this
-      // fresh, so the gate stays open even though the parent emits no top-level
-      // content events for >12 min. A genuine hang (including the C7 lost-result
-      // case, where NO further event of any kind arrives after the tool_use)
-      // lets lastToolProgressAt age past the window and the gate fires.
+      // The no-progress watchdog exists for ONE failure mode: a silent provider
+      // hang (429/529 the SDK retries internally) WHILE the SDK is mid-
+      // completion-request — which by definition happens with NO tool in flight.
+      // A tool in flight — especially a workflow/Task sub-agent fan-out — is the
+      // legitimate-long-wait case, and the parent's top-level stream is supposed
+      // to go quiet while the model is parked waiting on that tool's result.
+      //
+      // The earlier C7 dual-staleness gate ALSO required `lastToolProgressAt`
+      // (refreshed only on a recognized nested `parent_tool_use_id` sub-agent
+      // event) to be fresh. The live confirmation came back NEGATIVE: during a
+      // Task-tool wait the parent claude-code stdout does NOT surface nested
+      // sub-agent events the parser recognizes as progress — it surfaces nothing
+      // on the JSON channel or only bare top-level `system` keepalives (which we
+      // deliberately ignore). So lastToolProgressAt froze at tool-launch time,
+      // aged past LLM_NO_PROGRESS_STALL_MS, and this watchdog SIGTERMed a
+      // perfectly healthy reviewer → false no_progress_timeout (the ~15-min
+      // thrash loop #6979/#7031 chased). The Node wrapper already holds the
+      // authoritative bit — `toolInFlight` (set when a top-level tool_use is
+      // seen, cleared on its top-level tool-result `user`) — so we suppress the
+      // no-progress kill while it is true and hand the in-flight case entirely
+      // to the longer-budget tool-use/workflow stall watchdog above (keyed off
+      // lastToolProgressAt ?? lastToolUseAt, so a workflow that streams ANYTHING
+      // — including any raw stdout chunk, see the stdout 'data' handler — stays
+      // alive, while one that goes fully dark is killed at 30/45 min as a
+      // correctly-classified ClaudeTimeoutError, never a phantom rate_limit).
+      //
+      // A genuinely hung instance is still caught: (1) the raw-stdout stall
+      // watchdog SIGTERMs after CLAUDE_STREAM_STALL_MS of ZERO bytes regardless
+      // of tool state; (2) the tool-use/workflow stall watchdog owns the
+      // in-flight case; (3) the wall-clock killTimer is the final backstop. So
+      // disabling this kill while toolInFlight cannot mask a real hang.
       const contentStale = Date.now() - lastStreamEventAt > LLM_NO_PROGRESS_STALL_MS;
-      const lastToolActivity = lastToolProgressAt ?? lastToolUseAt;
-      const toolActivityStale =
-        lastToolActivity === null || Date.now() - lastToolActivity > LLM_NO_PROGRESS_STALL_MS;
       if (
+        !toolInFlight &&
         contentStale &&
-        toolActivityStale &&
         processGroupStillOwned()
       ) {
-        sendLog(ws, `\n[runtime] llm-no-progress: no model content event or tool activity for >${LLM_NO_PROGRESS_STALL_MS / 60000} min — likely a provider hang (429/529 absorbed by SDK retry). Sending SIGTERM; reporting rate_limited.\n`);
+        sendLog(ws, `\n[runtime] llm-no-progress: no model content event for >${LLM_NO_PROGRESS_STALL_MS / 60000} min with no tool in flight — likely a provider hang (429/529 absorbed by SDK retry). Sending SIGTERM; reporting rate_limited.\n`);
         flags.llmNoProgressHang = true;
         if (llmProgressWatchdog) { clearInterval(llmProgressWatchdog); llmProgressWatchdog = null; }
         const pid = originalPid;
@@ -1083,6 +1100,21 @@ echo ""
 
     child.stdout.on('data', (data: Buffer) => {
       resetStallWatchdog();
+      // Coarse wrapper-level liveness for the in-flight tool, independent of the
+      // stream-json event schema. The tool-use/workflow stall watchdog keys off
+      // lastToolProgressAt, which the JSON drain only refreshes on a recognized
+      // nested `parent_tool_use_id` sub-agent event. A Task-tool wait does not
+      // reliably surface those (live confirmation was negative), and any future
+      // out-of-stream workflow (a review backgrounded via Bash, a cloud-review
+      // poll) may print only plain text. So: while a tool is in flight, treat
+      // ANY stdout chunk — JSON sub-progress, a subagent log line, even non-JSON
+      // noise — as proof the in-flight tool is alive and refresh its clock. The
+      // in-flight tool is then bounded purely by going FULLY dark (no stdout at
+      // all) for its silence budget, which is exactly the genuinely-hung
+      // signature. The no-progress watchdog is unaffected (it is suppressed
+      // while toolInFlight) and a fresh top-level content event still resets
+      // lastStreamEventAt for it in the JSON drain.
+      if (toolInFlight) lastToolProgressAt = Date.now();
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (runCommand.outputMode === 'claude-stream-json') {

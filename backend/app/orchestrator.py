@@ -623,6 +623,39 @@ def _sync_task_payload_runtime_fields(
     return changed
 
 
+async def _persist_deps_satisfied(task: Task) -> None:
+    """Durably stamp the sticky ``_deps_satisfied`` readiness marker on a
+    dependency-bearing task whose dependencies the orchestrator has just
+    resolved as fully satisfied.
+
+    This marker is the contract between the orchestrator's authoritative,
+    GitHub-aware dependency / PR-merge resolution (``_check_candidate_task_deps``
+    returning ``"eligible"``) and the two warm-reuse hot paths — the
+    ``/next-role`` warm-backlog scan and the dispatch first-refusal hold. Both
+    treat a task carrying this marker as warm-claimable WITHOUT re-running dep
+    resolution at high frequency. It is stamped only after deps resolve eligible
+    (a failed dep cascade-cancels the dependent instead of stamping), so the
+    marker can never outlive an unsatisfied dependency.
+
+    Persisted in its own session (mirroring the dep-remap write) so the Step 3
+    dispatch re-read and the next-role scan both observe it, and mirrored onto
+    the in-memory ``task`` so the same-cycle dispatch sees it without a re-read.
+    Idempotent: a no-op when the marker is already present.
+    """
+    if (task.context or {}).get("_deps_satisfied"):
+        return
+    async with AsyncSessionLocal() as deps_session:
+        deps_task = await deps_session.get(Task, task.id)
+        if deps_task is not None:
+            deps_task.context = {
+                **(deps_task.context or {}),
+                "_deps_satisfied": True,
+            }
+            deps_session.add(deps_task)
+            await deps_session.commit()
+    task.context = {**(task.context or {}), "_deps_satisfied": True}
+
+
 from app.orchestrator_health import (
     _check_candidate_task_deps,
     get_confirmed_down_critical_deps,
@@ -1528,6 +1561,15 @@ async def orchestrator_worker():
                             f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed"
                         )
                     elif all_met:
+                        # Durably stamp the sticky readiness marker so the cheap
+                        # /next-role warm-backlog scan and the dispatch
+                        # first-refusal hold can treat this dependency-bearing
+                        # task as warm-claimable WITHOUT re-running the
+                        # (GitHub-aware) dependency / PR-merge resolution on the
+                        # hot path. Only reached on the all_met path — a failed
+                        # dependency cascade-cancels the dependent above, so the
+                        # marker can never outlive an unsatisfied dependency.
+                        await _persist_deps_satisfied(task)
                         eligible_ids.append(task.id)
                     else:
                         # Surface dependency-wait reason to UI
@@ -2172,16 +2214,23 @@ async def orchestrator_worker():
                     # if an idle warm VM is actively polling /next-role for this
                     # project, hold off cold-provisioning this eligible backlog task
                     # for a bounded window so the warm VM can claim it first. Scoped
-                    # to no-dependency, non-chain-pinned tasks — exactly the set
-                    # /next-role's backlog branch will claim — so dependency-bearing
-                    # or chain work is never starved. The atomic SKIP-LOCKED claim in
-                    # /next-role still guarantees no double-provision if both race;
-                    # this only biases the race toward reuse. The window auto-expires,
-                    # so a VM that dies mid-poll delays this task by at most that bound.
+                    # to non-chain-pinned tasks that the /next-role backlog branch
+                    # will actually claim: either no dependencies, or dependencies
+                    # the orchestrator already resolved and stamped
+                    # ``_deps_satisfied`` on above — exactly the warm-eligible set.
+                    # A task with still-unresolved deps carries no marker and is
+                    # never held (it cold-dispatches as before). The atomic
+                    # SKIP-LOCKED claim in /next-role still guarantees no
+                    # double-provision if both race; this only biases the race
+                    # toward reuse. The window auto-expires, so a VM that dies
+                    # mid-poll delays this task by at most that bound.
                     if (
                         _runtime_config.get("warm_backlog_reuse_enabled", False)
                         and not _warm_target_vm_id
-                        and not task.depends_on
+                        and (
+                            not task.depends_on
+                            or (task.context or {}).get("_deps_satisfied")
+                        )
                         and _shared_state.is_backlog_first_refusal_active(
                             str(task.project_id)
                         )
