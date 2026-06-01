@@ -8,9 +8,11 @@ convergence-rate formula, the created-before-window filter, and the empty window
 from datetime import timedelta
 from uuid import uuid4
 
+import pytest
+
 from app.digest_metrics import compute_outer_loop_convergence
 from app.models import TaskStatus
-from testing.factories import make_task, make_alert, _utcnow
+from testing.factories import make_task, make_alert, make_project, _utcnow
 
 
 def _task(project_id, *, review_loop=None, ctx_extra=None, created_at=None, status=TaskStatus.COMPLETED):
@@ -132,6 +134,70 @@ def test_cap_exhausted_and_repeat_fingerprint_outcomes():
     assert res["outcomes"]["rejected"] == 1
 
 
+def test_structured_terminal_outcome_marker_rolls_up():
+    pid = uuid4()
+    original = _task(
+        pid,
+        review_loop=None,
+        ctx_extra={
+            "review_loop_terminal_outcome": {
+                "kind": "stuck",
+                "reason": "stuck",
+                "pr_number": 77,
+                "iterations": 5,
+            }
+        },
+    )
+    orig_id = str(original.id)
+    tasks = [
+        original,
+        _task(pid, review_loop={"iteration": 1, "original_task_id": orig_id}),
+        _task(pid, review_loop={"iteration": 2, "original_task_id": orig_id}),
+    ]
+    res = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["terminal_outcome_histogram"]["stuck"] == 1
+    assert res["incidence_counts"]["stuck"] == 1
+    assert res["incidence_counts"]["overall_escalations"] == 1
+    assert res["incidence_rates"]["stuck"] == 1.0
+
+
+def test_later_merge_overrides_stale_structured_escalation_marker():
+    pid = uuid4()
+    original = _task(
+        pid,
+        review_loop=None,
+        ctx_extra={
+            "pr_merged": True,
+            "review_loop_terminal_outcome": {
+                "kind": "stuck",
+                "reason": "stuck",
+                "pr_number": 88,
+                "iterations": 4,
+            },
+        },
+    )
+    orig_id = str(original.id)
+    tasks = [
+        original,
+        _task(pid, review_loop={"iteration": 1, "original_task_id": orig_id}),
+        _task(pid, review_loop={"iteration": 2, "original_task_id": orig_id}),
+    ]
+    res = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=[],
+        window_start=_utcnow() - timedelta(hours=24),
+    )
+    assert res["outcomes"]["merged"] == 1
+    assert res["convergence_rate"] == 1.0
+    assert res["terminal_outcome_histogram"]["merged"] == 1
+    assert res["terminal_outcome_histogram"]["stuck"] == 0
+    assert res["incidence_counts"]["stuck"] == 0
+
+
 def test_escalation_reason_parsing_from_alerts():
     pid = uuid4()
     t_stuck = _task(pid, review_loop={"iteration": 5})
@@ -237,6 +303,45 @@ def test_terminal_outcome_read_from_chain_original_task():
     assert res["prs_with_review_loop"] == 1
     assert res["outcomes"]["merged"] == 1
     assert res["convergence_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_outer_loop_endpoint_hydrates_pre_window_original(client, db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.flush()
+
+    now = _utcnow()
+    original = _task(
+        project.id,
+        review_loop=None,
+        ctx_extra={"pr_merged": True},
+        created_at=now - timedelta(hours=48),
+    )
+    orig_id = str(original.id)
+    tasks = [
+        _task(
+            project.id,
+            review_loop={"iteration": 1, "original_task_id": orig_id},
+            created_at=now - timedelta(hours=1),
+        ),
+        _task(
+            project.id,
+            review_loop={"iteration": 2, "original_task_id": orig_id},
+            created_at=now - timedelta(minutes=30),
+        ),
+    ]
+    db_session.add(original)
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/outer-loop-convergence?hours=24&project_id={project.id}"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["outcomes"]["merged"] == 1
+    assert body["terminal_outcome_histogram"]["merged"] == 1
 
 
 def test_chain_churn_is_max_not_sum():

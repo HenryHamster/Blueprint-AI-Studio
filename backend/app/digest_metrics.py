@@ -570,6 +570,20 @@ _ESCALATION_LABEL_TO_REASON = {
     "dispute standoff": "standoff",
     "repeat-fingerprint halt": "repeat-fingerprint",
 }
+_TERMINAL_OUTCOME_KEY = "review_loop_terminal_outcome"
+_TERMINAL_OUTCOME_KEYS = frozenset(
+    {
+        "merged",
+        "rejected",
+        "cap_exhausted",
+        "stuck",
+        "standoff",
+        "repeat_fingerprint_halt",
+    }
+)
+_ESCALATION_OUTCOME_KEYS = frozenset(
+    {"stuck", "standoff", "repeat_fingerprint_halt"}
+)
 
 
 def _outer_loop_pct(values: List[int], p: int) -> Optional[int]:
@@ -598,6 +612,25 @@ def _outer_loop_chain_key(t: "Task") -> str:
     if pr is not None:
         return f"pr:{pr}"
     return f"task:{t.id}"
+
+
+def _outer_loop_terminal_outcome(t: "Task") -> Optional[str]:
+    """Return the structured or legacy terminal outcome for a task."""
+    ctx = t.context or {}
+    marker = ctx.get(_TERMINAL_OUTCOME_KEY)
+    if isinstance(marker, dict):
+        kind = marker.get("kind") or marker.get("outcome")
+        if kind == "repeat-fingerprint":
+            kind = "repeat_fingerprint_halt"
+        if kind in _TERMINAL_OUTCOME_KEYS:
+            return kind
+    if ctx.get("pr_merged") is True:
+        return "merged"
+    if (ctx or {}).get("failure_detail") == "review_cap_exhausted":
+        return "cap_exhausted"
+    if (ctx or {}).get("blocked_repeat_fingerprint"):
+        return "repeat_fingerprint_halt"
+    return None
 
 
 def compute_outer_loop_convergence(
@@ -652,6 +685,14 @@ def compute_outer_loop_convergence(
         key = _outer_loop_chain_key(t)
         chains[key].append(t)
         task_id_to_chain[t.id] = key
+        rl = (t.context or {}).get("review_loop") or {}
+        oid = rl.get("original_task_id")
+        if oid:
+            task_id_to_chain[oid] = key
+            try:
+                task_id_to_chain[uuid.UUID(str(oid))] = key
+            except Exception:
+                pass
 
     iterations: List[int] = []
     iteration_distribution = {"1": 0, "2": 0, "3": 0, "4+": 0}
@@ -662,6 +703,45 @@ def compute_outer_loop_convergence(
     rejected_chains: set = set()
     cap_exhausted = 0
     repeat_fingerprint_halt = 0
+    terminal_outcome_histogram: Dict[str, int] = {
+        "merged": 0,
+        "rejected": 0,
+        "cap_exhausted": 0,
+        "stuck": 0,
+        "standoff": 0,
+        "repeat_fingerprint_halt": 0,
+    }
+    stuck_pr_count = 0
+    standoff_pr_count = 0
+    repeat_fingerprint_pr_count = 0
+    overall_escalation_pr_count = 0
+    escalation_by_reason: Dict[str, int] = {
+        "stuck": 0,
+        "standoff": 0,
+        "repeat-fingerprint": 0,
+    }
+
+    alert_reasons_by_chain: Dict[str, set[str]] = defaultdict(set)
+    seen_task_reason: set[tuple[uuid.UUID | None, str]] = set()
+    escalated_task_ids: set = set()
+    escalated_chain_keys: set[str] = set()
+    for alert in escalation_alerts:
+        title = alert.title or ""
+        if not title.startswith(_ESCALATION_TITLE_PREFIX):
+            continue
+        if alert.task_id is not None:
+            escalated_task_ids.add(alert.task_id)
+        for label, reason in _ESCALATION_LABEL_TO_REASON.items():
+            if f"{_ESCALATION_TITLE_PREFIX}{label} " in title:
+                pair = (alert.task_id, reason)
+                if pair not in seen_task_reason:
+                    seen_task_reason.add(pair)
+                    escalation_by_reason[reason] += 1
+                    if alert.task_id is not None:
+                        alert_reasons_by_chain[
+                            task_id_to_chain.get(alert.task_id, f"task:{alert.task_id}")
+                        ].add(reason)
+                break
 
     for key, chain_tasks in chains.items():
         # Fold the chain-original task (looked up by original_task_id) into the
@@ -704,46 +784,62 @@ def compute_outer_loop_convergence(
         if chain_has_drift:
             drift_pr_count += 1
 
-        if any((t.context or {}).get("pr_merged") is True for t in outcome_tasks):
-            merged_chains.add(key)
-        elif any((t.context or {}).get("pr_rejected") is True for t in outcome_tasks):
-            rejected_chains.add(key)
-        if any(
+        has_merged = any((t.context or {}).get("pr_merged") is True for t in outcome_tasks)
+        has_cap_exhausted = any(
             (t.context or {}).get("failure_detail") == "review_cap_exhausted"
             for t in outcome_tasks
-        ):
-            cap_exhausted += 1
-        if any(
-            (t.context or {}).get("blocked_repeat_fingerprint") for t in outcome_tasks
-        ):
-            repeat_fingerprint_halt += 1
-
-    # Escalation Alerts → counts by reason + distinct escalated tasks. Dedupe on
-    # (task_id, reason) so multiple Alerts of the SAME reason on one task count
-    # once, keeping escalation_by_reason from over-counting vs. the distinct-task
-    # escalation_total. NOTE: a task that escalates for two DIFFERENT reasons
-    # still appears under each, so sum(by_reason) can exceed escalation_total by
-    # design (it is reason-occurrences, not tasks).
-    escalation_by_reason: Dict[str, int] = {
-        "stuck": 0,
-        "standoff": 0,
-        "repeat-fingerprint": 0,
-    }
-    escalated_task_ids: set = set()
-    seen_task_reason: set = set()
-    for alert in escalation_alerts:
-        title = alert.title or ""
-        if not title.startswith(_ESCALATION_TITLE_PREFIX):
-            continue
-        if alert.task_id is not None:
-            escalated_task_ids.add(alert.task_id)
-        for label, reason in _ESCALATION_LABEL_TO_REASON.items():
-            if f"{_ESCALATION_TITLE_PREFIX}{label} " in title:
-                pair = (alert.task_id, reason)
-                if pair not in seen_task_reason:
-                    seen_task_reason.add(pair)
-                    escalation_by_reason[reason] += 1
+        )
+        has_rejected = any(
+            (t.context or {}).get("pr_rejected") is True for t in outcome_tasks
+        )
+        structured_outcome = None
+        for t in outcome_tasks:
+            structured_outcome = _outer_loop_terminal_outcome(t)
+            if structured_outcome is not None:
                 break
+
+        # review_loop_terminal_outcome is a durable breadcrumb on the
+        # chain-original task, but later merge/reject paths do not clear it.
+        # Resolve the chain with definitive terminal states first so a stale
+        # escalation marker cannot mask an eventual convergence or rejection.
+        outcome = None
+        if has_merged:
+            outcome = "merged"
+        elif has_cap_exhausted:
+            outcome = "cap_exhausted"
+        elif has_rejected:
+            outcome = "rejected"
+        elif structured_outcome is not None:
+            outcome = structured_outcome
+        else:
+            chain_reasons = alert_reasons_by_chain.get(key, set())
+            if "standoff" in chain_reasons:
+                outcome = "standoff"
+            elif "stuck" in chain_reasons:
+                outcome = "stuck"
+            elif "repeat-fingerprint" in chain_reasons:
+                outcome = "repeat_fingerprint_halt"
+
+        if outcome in terminal_outcome_histogram:
+            terminal_outcome_histogram[outcome] += 1
+        if outcome == "merged":
+            merged_chains.add(key)
+        elif outcome == "rejected":
+            rejected_chains.add(key)
+        elif outcome == "cap_exhausted":
+            cap_exhausted += 1
+            rejected_chains.add(key)
+        elif outcome == "repeat_fingerprint_halt":
+            repeat_fingerprint_halt += 1
+        if outcome == "stuck":
+            stuck_pr_count += 1
+        if outcome == "standoff":
+            standoff_pr_count += 1
+        if outcome == "repeat_fingerprint_halt":
+            repeat_fingerprint_pr_count += 1
+        if outcome in _ESCALATION_OUTCOME_KEYS:
+            overall_escalation_pr_count += 1
+            escalated_chain_keys.add(key)
 
     # Outer-loops still escalated but not yet merged/rejected count as
     # non-convergence in the denominator (oscillating / stuck awaiting a human).
@@ -752,6 +848,7 @@ def compute_outer_loop_convergence(
     escalated_chains: set = set()
     for tid in escalated_task_ids:
         escalated_chains.add(task_id_to_chain.get(tid, f"task:{tid}"))
+    escalated_chains.update(escalated_chain_keys)
     escalated_unresolved = escalated_chains - merged_chains - rejected_chains
     decided = len(merged_chains) + len(rejected_chains) + len(escalated_unresolved)
     convergence_rate = round(len(merged_chains) / decided, 3) if decided else None
@@ -769,6 +866,29 @@ def compute_outer_loop_convergence(
             "rejected": len(rejected_chains),
             "cap_exhausted": cap_exhausted,
             "repeat_fingerprint_halt": repeat_fingerprint_halt,
+        },
+        "terminal_outcome_histogram": terminal_outcome_histogram,
+        "incidence_counts": {
+            "churn": churn_pr_count,
+            "stuck": stuck_pr_count,
+            "standoff": standoff_pr_count,
+            "repeat_fingerprint": repeat_fingerprint_pr_count,
+            "overall_escalations": overall_escalation_pr_count,
+        },
+        "incidence_rates": {
+            "churn": round(churn_pr_count / len(chains), 3) if chains else None,
+            "stuck": round(stuck_pr_count / len(chains), 3) if chains else None,
+            "standoff": round(standoff_pr_count / len(chains), 3) if chains else None,
+            "repeat_fingerprint": round(
+                repeat_fingerprint_pr_count / len(chains), 3
+            )
+            if chains
+            else None,
+            "overall_escalations": round(
+                overall_escalation_pr_count / len(chains), 3
+            )
+            if chains
+            else None,
         },
         "escalation_total": len(escalated_task_ids),
         "escalation_by_reason": escalation_by_reason,

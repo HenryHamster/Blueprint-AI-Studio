@@ -24,6 +24,43 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+_REVIEW_LOOP_TERMINAL_OUTCOME_KEY = "review_loop_terminal_outcome"
+
+
+def _set_review_loop_terminal_outcome(
+    task: Task,
+    *,
+    kind: str,
+    reason: str,
+    pr_number: int,
+    iterations: int,
+    scope: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Persist the chain-original terminal outcome in task.context.
+
+    This is purely a structured breadcrumb for downstream aggregation. It does
+    not change the existing alerting, gating, or close-comment behavior.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    ctx = dict(task.context or {})
+    terminal_outcome: dict[str, object] = {
+        "kind": kind,
+        "reason": reason,
+        "pr_number": pr_number,
+        "iterations": iterations,
+    }
+    if scope is not None:
+        terminal_outcome["scope"] = scope
+    if detail is not None:
+        terminal_outcome["detail"] = detail
+    terminal_outcome["recorded_at"] = _utcnow().isoformat()
+    ctx[_REVIEW_LOOP_TERMINAL_OUTCOME_KEY] = terminal_outcome
+    task.context = ctx
+    flag_modified(task, "context")
+
+
 _CHURN_NARROW_FOCUS_PREFIX = (
     "⚠️ ISSUE CHURN DETECTED: the prior {window} fix iterations resolved some "
     "issues but introduced new ones (CRITICAL+MAJOR counts: {counts}). "
@@ -142,7 +179,6 @@ async def _handle_cap_exhaustion(
     from app.routers.agent import get_github_token_for_task
     from app.routers.agent_status import record_task_result
     from app.shared_state import record_direction_result
-    from sqlalchemy.orm.attributes import flag_modified
 
     cap_label = "global" if scope == "global" else "per-chain"
     source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
@@ -196,7 +232,15 @@ async def _handle_cap_exhaustion(
         f"Auto-closed by Blueprint: review-fix cap exhausted after {iterations} iterations"
     )
     orig.context = ctx
-    flag_modified(orig, "context")
+    _set_review_loop_terminal_outcome(
+        orig,
+        kind="cap_exhausted",
+        reason="review_cap_exhausted",
+        pr_number=pr_number,
+        iterations=iterations,
+        scope=scope,
+        detail=cap_label,
+    )
     session.add(orig)
     try:
         await session.commit()

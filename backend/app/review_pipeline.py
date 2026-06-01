@@ -80,6 +80,7 @@ from app.review_loop_convergence import (
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
     _handle_cap_exhaustion,
     _is_pipeline_task_stale,
+    _set_review_loop_terminal_outcome,
 )
 
 logger = logging.getLogger(__name__)
@@ -1055,6 +1056,14 @@ async def _spawn_pipeline_task(
                                     f"(fp={fp_b}). Likely a precondition gap — manual "
                                     f"review or strategic-agent decision required."
                                 )
+                                _set_review_loop_terminal_outcome(
+                                    _orig,
+                                    kind="repeat_fingerprint_halt",
+                                    reason="repeat-fingerprint",
+                                    pr_number=pr_number,
+                                    iterations=len(same_type_failures),
+                                    detail=fp_b,
+                                )
                                 session.add(_orig)
                         except Exception as _orig_err:  # noqa: BLE001
                             logger.warning(
@@ -1447,6 +1456,14 @@ async def _spawn_pipeline_task(
                     stuck_orig.latest_status_message = (
                         f"Review-fix cycle appears stuck — same issues repeated across "
                         f"{iteration} iterations. Manual review required."
+                    )
+                    _set_review_loop_terminal_outcome(
+                        stuck_orig,
+                        kind="standoff" if is_standoff else "stuck",
+                        reason="standoff" if is_standoff else "stuck",
+                        pr_number=pr_number,
+                        iterations=iteration,
+                        detail=stuck_detail or None,
                     )
                     session.add(stuck_orig)
                     await session.commit()

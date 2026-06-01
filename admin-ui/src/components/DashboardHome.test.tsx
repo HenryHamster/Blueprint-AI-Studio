@@ -19,6 +19,7 @@ const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, capturedPro
     srMissed: null as Record<string, unknown> | null,
     srDisagreements: null as Record<string, unknown> | null,
     fixLoop: null as Record<string, unknown> | null,
+    outerLoop: null as Record<string, unknown> | null,
   },
 }));
 
@@ -820,6 +821,22 @@ describe('DashboardHome', () => {
 
       const cpProps = capturedProps.providerCostPanel ?? {};
       expect(cpProps.windowHours).toBe(48);
+    });
+
+    it('passes selectedProjectId, trendDays, and windowHours through to the outer-loop widget', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+      const user = userEvent.setup();
+
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+      await screen.findByText('All systems healthy');
+      await user.selectOptions(screen.getByRole('combobox'), '48');
+      await user.click(screen.getByRole('button', { name: '14d' }));
+
+      const outerProps = capturedProps.outerLoop ?? {};
+      expect(outerProps.projectId).toBe('proj1');
+      expect(outerProps.windowHours).toBe(48);
+      expect(outerProps.trendDays).toBe(14);
     });
 
     it('keeps stale project-scoped responses from overwriting the current dashboard context', async () => {

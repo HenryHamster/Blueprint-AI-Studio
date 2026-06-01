@@ -280,6 +280,37 @@ vi.mock('../api', () => ({
     },
     unpriced_combos: [],
   })),
+  // DashboardHome renders OuterReviewLoopConvergenceWidget, which imports these
+  // from '../api'. The complete mock must provide them or the browser-mode test
+  // file fails to load with "does not provide an export named ...".
+  fetchOuterLoopConvergence: vi.fn(async () => ({
+    window_hours: 24,
+    prs_with_review_loop: 12,
+    iteration_median: 2,
+    iteration_p95: 6,
+    iteration_distribution: { '1': 4, '2': 4, '3': 2, '4+': 2 },
+    churn_total: 5,
+    churn_pr_count: 3,
+    drift_pr_count: 2,
+    outcomes: { merged: 7, rejected: 3, cap_exhausted: 1, repeat_fingerprint_halt: 1 },
+    terminal_outcome_histogram: {
+      merged: 7,
+      rejected: 3,
+      cap_exhausted: 1,
+      stuck: 1,
+      standoff: 1,
+      repeat_fingerprint_halt: 1,
+    },
+    incidence_counts: { churn: 3, stuck: 1, standoff: 1, repeat_fingerprint: 1, overall_escalations: 4 },
+    incidence_rates: { churn: 0.25, stuck: 0.083, standoff: 0.083, repeat_fingerprint: 0.083, overall_escalations: 0.333 },
+    escalation_total: 4,
+    escalation_by_reason: { stuck: 2, standoff: 1, 'repeat-fingerprint': 1 },
+    convergence_rate: 0.58,
+  })),
+  fetchOuterLoopConvergenceTrend: vi.fn(async () => ({
+    days: 7,
+    buckets: [],
+  })),
 }));
 
 describe('DashboardHome — viewport regression', () => {

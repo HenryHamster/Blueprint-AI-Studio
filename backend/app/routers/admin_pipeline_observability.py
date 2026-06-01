@@ -537,6 +537,48 @@ async def _load_escalation_alerts(
     return rows
 
 
+async def _load_outer_loop_original_tasks(
+    session: AsyncSession,
+    tasks: List[Task],
+    *,
+    project_id: uuid.UUID | None,
+) -> Dict[str, Task]:
+    """Load chain-original tasks referenced by in-window review loops.
+
+    The aggregation window is based on the review-loop task timestamp, but the
+    chain-original task can predate that window. We hydrate those originals so
+    terminal outcomes stamped there remain visible to the reducer.
+    """
+    original_ids: set[str] = set()
+    for task in tasks:
+        rl = (task.context or {}).get("review_loop")
+        if isinstance(rl, dict):
+            oid = rl.get("original_task_id")
+            if isinstance(oid, str) and oid:
+                original_ids.add(oid)
+    if not original_ids:
+        return {}
+
+    stmt = (
+        select(Task)
+        .where(Task.id.in_([uuid.UUID(oid) for oid in original_ids]))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    originals = list((await session.execute(stmt)).scalars().all())
+    return {str(task.id): task for task in originals}
+
+
 @router.get("/outer-loop-convergence")
 async def get_outer_loop_convergence(
     hours: int = Query(24, ge=1, le=168),
@@ -586,12 +628,22 @@ async def get_outer_loop_convergence(
             hours,
             project_id,
         )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, tasks, project_id=project_id
+    )
     alerts = await _load_escalation_alerts(
         session, cutoff=cutoff, project_id=project_id
     )
 
     summary = compute_outer_loop_convergence(
-        all_tasks=tasks,
+        all_tasks=[
+            *tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in tasks}
+            ],
+        ],
         escalation_alerts=alerts,
         window_start=cutoff,
     )
@@ -644,6 +696,9 @@ async def get_outer_loop_convergence_trend(
             days,
             project_id,
         )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, tasks, project_id=project_id
+    )
     alerts = await _load_escalation_alerts(
         session, cutoff=cutoff, project_id=project_id
     )
@@ -664,8 +719,22 @@ async def get_outer_loop_convergence_trend(
         day_dt = _utcnow() - timedelta(days=i)
         day = day_dt.strftime("%Y-%m-%d")
         day_start = day_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_tasks = list(tasks_by_day.get(day, []))
+        day_task_ids = {str(task.id) for task in day_tasks}
+        day_original_ids = set()
+        for task in day_tasks:
+            rl = (task.context or {}).get("review_loop")
+            if isinstance(rl, dict):
+                oid = rl.get("original_task_id")
+                if isinstance(oid, str) and oid in original_tasks:
+                    day_original_ids.add(oid)
+        if day_original_ids:
+            for oid in day_original_ids:
+                original_task = original_tasks[oid]
+                if str(original_task.id) not in day_task_ids:
+                    day_tasks.append(original_task)
         summary = compute_outer_loop_convergence(
-            all_tasks=tasks_by_day.get(day, []),
+            all_tasks=day_tasks,
             escalation_alerts=alerts_by_day.get(day, []),
             window_start=day_start,
         )
@@ -676,6 +745,9 @@ async def get_outer_loop_convergence_trend(
                 "convergence_rate": summary["convergence_rate"],
                 "escalation_total": summary["escalation_total"],
                 "churn_total": summary["churn_total"],
+                "terminal_outcome_histogram": summary["terminal_outcome_histogram"],
+                "incidence_counts": summary["incidence_counts"],
+                "incidence_rates": summary["incidence_rates"],
             }
         )
 

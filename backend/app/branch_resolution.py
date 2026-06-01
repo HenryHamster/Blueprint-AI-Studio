@@ -173,7 +173,8 @@ def get_project_integration_branch(project) -> str:
 
     Fallback chain:
       1. project.integration_branch (per-project column, added by migration 0122+)
-      2. "main"
+      2. "automain" for self-repo projects (qualification trunk)
+      3. "main" for non-self-repo projects (promotion/release target)
 
     The deprecated runtime_config bridge was removed after the per-project
     column stabilized across the migration/backfill rollout.
@@ -184,6 +185,8 @@ def get_project_integration_branch(project) -> str:
     _signal_missing_project_branch(
         project, "integration_branch", "Missing integration_branch"
     )
+    if _is_blueprint_self_repo(project):
+        return "automain"
     return "main"
 
 

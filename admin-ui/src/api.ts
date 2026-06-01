@@ -192,6 +192,92 @@ export async function fetchResearchActionability(
   return res.json();
 }
 
+export interface OuterLoopOutcomeCounts {
+  merged?: number;
+  rejected?: number;
+  cap_exhausted?: number;
+  stuck?: number;
+  standoff?: number;
+  repeat_fingerprint_halt?: number;
+  [key: string]: number | undefined;
+}
+
+export interface OuterLoopIncidenceCounts {
+  churn?: number;
+  stuck?: number;
+  standoff?: number;
+  repeat_fingerprint?: number;
+  overall_escalations?: number;
+  [key: string]: number | undefined;
+}
+
+export interface OuterLoopIncidenceRates {
+  churn?: number | null;
+  stuck?: number | null;
+  standoff?: number | null;
+  repeat_fingerprint?: number | null;
+  overall_escalations?: number | null;
+  [key: string]: number | null | undefined;
+}
+
+export interface OuterLoopConvergenceSummary {
+  window_hours: number;
+  prs_with_review_loop: number;
+  iteration_median: number | null;
+  iteration_p95: number | null;
+  iteration_distribution: Record<string, number>;
+  churn_total: number;
+  churn_pr_count: number;
+  drift_pr_count: number;
+  outcomes: OuterLoopOutcomeCounts;
+  terminal_outcome_histogram?: OuterLoopOutcomeCounts;
+  incidence_counts?: OuterLoopIncidenceCounts;
+  incidence_rates?: OuterLoopIncidenceRates;
+  escalation_total: number;
+  escalation_by_reason: Record<string, number>;
+  convergence_rate: number | null;
+}
+
+export interface OuterLoopConvergenceTrendBucket {
+  date: string;
+  pr_count: number;
+  convergence_rate: number | null;
+  escalation_total: number;
+  churn_total: number;
+  terminal_outcome_histogram?: OuterLoopOutcomeCounts;
+  incidence_counts?: OuterLoopIncidenceCounts;
+  incidence_rates?: OuterLoopIncidenceRates;
+}
+
+export interface OuterLoopConvergenceTrendResponse {
+  days: number;
+  buckets: OuterLoopConvergenceTrendBucket[];
+}
+
+export async function fetchOuterLoopConvergence(
+  hours = 24,
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<OuterLoopConvergenceSummary> {
+  const params = new URLSearchParams({ hours: String(hours) });
+  if (projectId) params.set('project_id', projectId);
+  const res = await apiFetch(`/api/admin/outer-loop-convergence?${params.toString()}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch outer-loop convergence: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchOuterLoopConvergenceTrend(
+  days: 7 | 14 | 30,
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<OuterLoopConvergenceTrendResponse> {
+  const params = new URLSearchParams({ days: String(days) });
+  if (projectId) params.set('project_id', projectId);
+  const res = await apiFetch(`/api/admin/outer-loop-convergence-trend?${params.toString()}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch outer-loop convergence trend: ${res.status}`);
+  return res.json();
+}
+
 export interface SrMissedRetrospectivesResponse {
   items: SrMissedTask[];
   total: number;

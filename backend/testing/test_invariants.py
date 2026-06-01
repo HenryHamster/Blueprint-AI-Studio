@@ -821,6 +821,39 @@ class TestBaseBranchFallback:
         )
 
 
+# ── Self-repo branch resolution guard ──────────────────────────────────────
+
+
+class TestSelfRepoBranchResolution:
+    """Ensure self-repo projects resolve to correct integration branches."""
+
+    def test_self_repo_null_integration_branch_resolves_to_automain(self):
+        """A self-repo with NULL integration_branch must resolve to 'automain', not 'main'.
+
+        Blueprint's integration trunk is 'automain' (qualification branch).
+        The promotion/release target is 'main'. When integration_branch is unset,
+        the resolver must fall back to 'automain' for self-repos, not 'main'.
+        """
+        from app.branch_resolution import get_project_integration_branch
+
+        class _FakeSelfRepo:
+            integration_branch = None
+            is_self_repo = True
+
+        assert get_project_integration_branch(_FakeSelfRepo()) == "automain"
+
+    def test_non_self_repo_null_integration_branch_resolves_to_main(self):
+        """A non-self-repo with NULL integration_branch must resolve to 'main'."""
+        from app.branch_resolution import get_project_integration_branch
+
+        class _FakeProject:
+            integration_branch = None
+            is_self_repo = False
+            github_repo = "other-repo"
+
+        assert get_project_integration_branch(_FakeProject()) == "main"
+
+
 # ── Staging-branch prefix classification guard ────────────────────────────
 
 

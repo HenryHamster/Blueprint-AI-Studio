@@ -737,6 +737,9 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
         "Global cap must tag failure_detail=review_cap_exhausted so the rollup respawn "
         "loop can skip this child and the parent can finalize."
     )
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "cap_exhausted"
+    assert terminal_outcome.get("reason") == "review_cap_exhausted"
     assert (original_task.context or {}).get("pr_rejected") is True, (
         "Global cap must preempt the webhook by setting pr_rejected=True before closing the PR"
     )
@@ -856,6 +859,9 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
         assert (root.context or {}).get("failure_detail") == "review_cap_exhausted", (
             f"{label} cap must tag failure_detail=review_cap_exhausted"
         )
+        terminal_outcome = (root.context or {}).get("review_loop_terminal_outcome")
+        assert terminal_outcome and terminal_outcome.get("kind") == "cap_exhausted"
+        assert terminal_outcome.get("reason") == "review_cap_exhausted"
         assert root.requires_approval is True, (
             f"{label} cap must preserve requires_approval"
         )
@@ -8495,6 +8501,9 @@ async def test_stuck_cycle_escalation_alert_fires_with_gates_off(db_session, moc
     alerts = await _escalation_alerts(db_session, original_task.id)
     assert len(alerts) == 1
     assert "stuck cycle" in alerts[0].title
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "stuck"
+    assert terminal_outcome.get("reason") == "stuck"
 
 
 @pytest.mark.asyncio
@@ -8542,6 +8551,9 @@ async def test_standoff_creates_escalation_alert_with_standoff_reason(
     assert len(alerts) == 1
     assert "dispute standoff" in alerts[0].title
     assert "PR #404" in alerts[0].title
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "standoff"
+    assert terminal_outcome.get("reason") == "standoff"
 
 
 @pytest.mark.asyncio
@@ -8611,6 +8623,9 @@ async def test_repeat_fingerprint_creates_escalation_alert(db_session, mocker):
     assert len(alerts) == 1
     assert "repeat-fingerprint halt" in alerts[0].title
     assert "PR #905" in alerts[0].title
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "repeat_fingerprint_halt"
+    assert terminal_outcome.get("reason") == "repeat-fingerprint"
 
     # Re-entry (idempotent halt) must not create a second Alert.
     await _spawn_pipeline_task(

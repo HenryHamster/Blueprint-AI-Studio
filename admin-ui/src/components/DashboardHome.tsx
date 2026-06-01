@@ -599,6 +599,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                 <OuterReviewLoopConvergenceWidget
                   trendDays={fixLoopTrendDays}
                   projectId={selectedProjectId ?? undefined}
+                  windowHours={windowHours}
                 />
               </div>
             </div>
