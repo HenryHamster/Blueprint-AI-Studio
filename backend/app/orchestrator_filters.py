@@ -49,6 +49,73 @@ def _prod_files(files) -> set[str]:
     return {f for f in (files or []) if not _is_test_file(f)}
 
 
+def rollup_overlap_defers(
+    candidate_files: set[str], rollup_files
+) -> tuple[bool, set[str]]:
+    """Decide whether a candidate should be deferred for pending-rollup overlap.
+
+    The deferral threshold (shared single source of truth for
+    ``filter_rollup_conflicts``): defer only on *significant* overlap — 2+
+    files AND >= 50% of the candidate's files overlap the pending-rollup set.
+
+    Args:
+        candidate_files: the candidate task's production files (test files
+            already excluded via ``_prod_files``).
+        rollup_files: the pending-rollup file set (any iterable of paths; a
+            dict's keys are accepted directly).
+
+    Returns:
+        ``(should_defer, stale_overlap)`` — the boolean decision and the set of
+        overlapping files (for logging / status messages).
+    """
+    rollup_keys = rollup_files.keys() if hasattr(rollup_files, "keys") else rollup_files
+    stale_overlap = candidate_files & set(rollup_keys)
+    should_defer = (
+        len(stale_overlap) >= 2 and len(stale_overlap) >= len(candidate_files) * 0.5
+    )
+    return should_defer, stale_overlap
+
+
+def apply_pipeline_cap(
+    eligible_ids: list,
+    types_for_cap: dict,
+    pipeline_active: int,
+    max_pipeline_slots: int,
+) -> tuple[list, int]:
+    """Apply the review/fix pipeline-slot cap to an eligible-id list.
+
+    Pure single source of truth for the cap selection in ``cap_pipeline_slots``
+    (Step 2.9): non-pipeline tasks always pass; review/fix tasks are kept only
+    while the remaining budget (``max_pipeline_slots`` minus already-active
+    review/fix tasks) is not yet exhausted, otherwise deferred.
+
+    Args:
+        eligible_ids: candidate ids in dispatch order.
+        types_for_cap: mapping ``id -> task type string`` (missing/None types
+            are treated as non-pipeline and always kept).
+        pipeline_active: count of currently active review/fix tasks.
+        max_pipeline_slots: the configured pipeline-slot ceiling.
+
+    Returns:
+        ``(kept, deferred_count)`` — the retained ids (order preserved) and the
+        number of review/fix tasks deferred for budget exhaustion.
+    """
+    budget = max(0, max_pipeline_slots - pipeline_active)
+    kept: list = []
+    deferred = 0
+    pipeline_kept = 0
+    for tid in eligible_ids:
+        if types_for_cap.get(tid) in ("review", "fix"):
+            if pipeline_kept < budget:
+                pipeline_kept += 1
+                kept.append(tid)
+            else:
+                deferred += 1
+        else:
+            kept.append(tid)
+    return kept, deferred
+
+
 async def filter_file_conflicts(
     eligible_ids: list[uuid.UUID],
     candidate_tasks: list[Task],
@@ -229,10 +296,10 @@ async def filter_rollup_conflicts(
         if not cfiles:
             non_rollup_conflicting.append(eid)
             continue
-        stale_overlap = cfiles & project_rollup_files.keys()
-        # Only defer on significant overlap: 2+ files AND >= 50% of candidate's files
-        should_defer = (
-            len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+        # Only defer on significant overlap: 2+ files AND >= 50% of candidate's
+        # files. Shared with TestRollupDeferral via rollup_overlap_defers().
+        should_defer, stale_overlap = rollup_overlap_defers(
+            cfiles, project_rollup_files
         )
         if should_defer:
             blocking_title = project_rollup_files[next(iter(stale_overlap))]
@@ -796,22 +863,14 @@ async def cap_pipeline_slots(
             )
         )
     ).scalar() or 0
-    pipeline_budget = max(0, max_pipeline_slots - pipeline_active)
     types_for_cap = {
         t.id: ((t.first_payload or {}).get("type") or "") for t in candidate_tasks
     }
-    kept: list = []
-    deferred_pipeline = 0
-    pipeline_kept = 0
-    for tid in eligible_ids:
-        if types_for_cap.get(tid) in ("review", "fix"):
-            if pipeline_kept < pipeline_budget:
-                pipeline_kept += 1
-                kept.append(tid)
-            else:
-                deferred_pipeline += 1
-        else:
-            kept.append(tid)
+    # Shared cap selection (single source of truth, also exercised by
+    # TestPipelineSlotCap): keep review/fix only while budget remains.
+    kept, deferred_pipeline = apply_pipeline_cap(
+        eligible_ids, types_for_cap, pipeline_active, max_pipeline_slots
+    )
     if deferred_pipeline:
         logger.info(
             f"[ORCHESTRATOR] Pipeline-slot cap: deferred {deferred_pipeline} "

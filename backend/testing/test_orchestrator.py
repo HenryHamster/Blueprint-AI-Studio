@@ -1622,9 +1622,17 @@ class TestRollupDeferral:
 
     def _apply_rollup_filter(self, eligible_ids, candidate_map, pending_rollup_files):
         """
-        Pure re-implementation of the rollup-deferral filtering logic from
-        orchestrator_worker() step 2.6.  Returns (non_deferred_ids, deferred_ids).
+        Drive the rollup-deferral decision through the *production* predicate
+        ``orchestrator_filters.rollup_overlap_defers`` (the single source of
+        truth used by ``filter_rollup_conflicts`` step 2.6) rather than
+        re-implementing it here.  Returns (non_deferred_ids, deferred_ids).
+
+        The candidate-level guards mirror production's structure exactly: a
+        missing candidate or a candidate with no files passes through, matching
+        the early-continues in ``filter_rollup_conflicts``.
         """
+        from app.orchestrator_filters import rollup_overlap_defers
+
         non_deferred = []
         deferred = []
         for eid in eligible_ids:
@@ -1636,9 +1644,8 @@ class TestRollupDeferral:
             if not cfiles:
                 non_deferred.append(eid)
                 continue
-            stale_overlap = cfiles & pending_rollup_files.keys()
-            should_defer = (
-                len(stale_overlap) >= 2 and len(stale_overlap) >= len(cfiles) * 0.5
+            should_defer, _stale_overlap = rollup_overlap_defers(
+                cfiles, pending_rollup_files
             )
             if should_defer:
                 deferred.append(eid)
@@ -1847,11 +1854,43 @@ class TestHealthAwareDispatch:
         assert _health_score_task(task) == 0
 
     # ── Reordering logic tests ───────────────────────────────────────────────
+    #
+    # These exercise the *production* reorder (orchestrator_health.
+    # reorder_eligible_by_health, dispatch Step 2.8) rather than re-implementing
+    # its sort.  The production sort key is (P(success) confidence,
+    # _health_score_task) descending with a stable sort, so by injecting a
+    # constant predict_fn the confidence component is uniform and
+    # _health_score_task becomes the sole differentiator — isolating exactly the
+    # health-score ordering the originals meant to assert.  A single degradation
+    # signal (slots_available below 50% of max) is forced so the reorder
+    # activates; the confidence floor is set to 0 so nothing is dropped.
 
-    def test_reordering_places_small_scope_first(self):
-        """Sorted by _health_score_task, small-scope tasks appear before medium/large."""
-        from app.orchestrator import _health_score_task
+    @staticmethod
+    async def _reorder(ids, task_by_id, session):
+        """Run the production health-aware reorder with a uniform-confidence
+        predict_fn and a forced degradation signal (only the slots signal)."""
+        from app.orchestrator_health import reorder_eligible_by_health
 
+        candidate_tasks = [task_by_id[i] for i in ids]
+        runtime_config = {
+            "max_concurrent_vms": 10,
+            "dispatch_confidence_floor": 0.0,
+        }
+        zone_summary = {"available": 2, "total_zones": 2}  # no zone signal
+        return await reorder_eligible_by_health(
+            eligible_ids=list(ids),
+            candidate_tasks=candidate_tasks,
+            recent_results=[],  # no failure-rate signal
+            slots_available=0,  # < 50% of max → degradation signal
+            runtime_config=runtime_config,
+            zone_summary=zone_summary,
+            session=session,
+            predict_fn=lambda scope, direction, proj: 0.5,  # uniform confidence
+        )
+
+    @pytest.mark.asyncio
+    async def test_reordering_places_small_scope_first(self, db_session):
+        """small-scope tasks appear before medium/large after the production reorder."""
         tasks = [
             Task(payloads=[{"type": "create"}], context={"scope": "large"}),
             Task(payloads=[{"type": "create"}], context={"scope": "small"}),
@@ -1863,17 +1902,16 @@ class TestHealthAwareDispatch:
         task_by_id = {t.id: t for t in tasks}
         ids = [t.id for t in tasks]  # original order: large, small, medium
 
-        reordered = sorted(
-            ids, key=lambda tid: _health_score_task(task_by_id[tid]), reverse=True
-        )
+        reordered = await self._reorder(ids, task_by_id, db_session)
 
         # small (score=2) should come first, medium and large (score=0) follow
         assert task_by_id[reordered[0]].context["scope"] == "small"
 
-    def test_reordering_places_small_low_risk_before_small_high_risk(self):
+    @pytest.mark.asyncio
+    async def test_reordering_places_small_low_risk_before_small_high_risk(
+        self, db_session
+    ):
         """small+low-risk (score=3) ranks above small-only (score=2)."""
-        from app.orchestrator import _health_score_task
-
         t_small_low = Task(
             payloads=[{"type": "create"}], context={"scope": "small", "risk": "low"}
         )
@@ -1884,17 +1922,15 @@ class TestHealthAwareDispatch:
         task_by_id = {t.id: t for t in [t_small_only, t_small_low]}
         ids = [t_small_only.id, t_small_low.id]  # small-only first in original order
 
-        reordered = sorted(
-            ids, key=lambda tid: _health_score_task(task_by_id[tid]), reverse=True
-        )
+        reordered = await self._reorder(ids, task_by_id, db_session)
 
         assert reordered[0] == t_small_low.id, "small+low-risk should be first"
         assert reordered[1] == t_small_only.id
 
-    def test_reordering_is_stable_when_all_scores_equal(self):
-        """When all tasks have the same score, sorted() preserves relative order (stable sort)."""
-        from app.orchestrator import _health_score_task
-
+    @pytest.mark.asyncio
+    async def test_reordering_is_stable_when_all_scores_equal(self, db_session):
+        """When all tasks have the same score, the production reorder preserves
+        relative order (stable sort)."""
         tasks = [
             Task(payloads=[{"type": "create"}], context={"scope": "medium"}),
             Task(payloads=[{"type": "create"}], context={"scope": "medium"}),
@@ -1906,11 +1942,9 @@ class TestHealthAwareDispatch:
         task_by_id = {t.id: t for t in tasks}
         ids = [t.id for t in tasks]
 
-        reordered = sorted(
-            ids, key=lambda tid: _health_score_task(task_by_id[tid]), reverse=True
-        )
+        reordered = await self._reorder(ids, task_by_id, db_session)
 
-        # All scores are 0 — stable sort preserves original order
+        # All scores are 0 and confidence is uniform — stable sort preserves order
         assert reordered == ids
 
 
@@ -1921,21 +1955,15 @@ class TestPipelineSlotCap:
 
     @staticmethod
     def _apply_cap(eligible_ids, types_for_cap, pipeline_active, max_pipeline_slots):
-        # Mirrors the gate in orchestrator.py Step 2.9.
-        budget = max(0, max_pipeline_slots - pipeline_active)
-        kept: list = []
-        deferred = 0
-        pipeline_kept = 0
-        for tid in eligible_ids:
-            if types_for_cap.get(tid) in ("review", "fix"):
-                if pipeline_kept < budget:
-                    pipeline_kept += 1
-                    kept.append(tid)
-                else:
-                    deferred += 1
-            else:
-                kept.append(tid)
-        return kept, deferred
+        # Calls the production cap selection (Step 2.9 single source of truth)
+        # instead of re-implementing it; cap_pipeline_slots() is a thin async
+        # wrapper that computes pipeline_active/max_pipeline_slots/types and
+        # then delegates the kept/deferred decision to this same function.
+        from app.orchestrator_filters import apply_pipeline_cap
+
+        return apply_pipeline_cap(
+            eligible_ids, types_for_cap, pipeline_active, max_pipeline_slots
+        )
 
     def test_review_fix_deferred_when_budget_exhausted(self):
         eligible = ["c1", "r1", "rv1", "fx1", "rv2"]
