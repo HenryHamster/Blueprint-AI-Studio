@@ -11,7 +11,7 @@ import {
 } from '../index.js';
 import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
-import { runFreshReviewerPass } from './standard.js';
+import { runFreshReviewerPass, sensitivePathsFromMetadata } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT, shouldFanOutReview, shouldFanOutFix } from '../constants.js';
@@ -50,7 +50,8 @@ export type { AnnotatedIssue, AnnotatedEntry } from './review-fix-issue-dedup.js
 import type { DriftSignal } from './review-fix-history.js';
 import { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
 export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
-import { ALEMBIC_VERSIONS_DIR, detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import { resolveMigrationLayout } from './specialized.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
 
@@ -782,13 +783,20 @@ export async function handleFix(
   // migration revision chain. Run unconditionally so silent revision-number
   // collisions are surfaced to Claude alongside any textual conflicts.
   try {
+    // Resolve the per-project alembic versions directory (falls back to
+    // Blueprint's backend/alembic/versions when config is unset). The layout
+    // returns no trailing slash; the conflict-detection helpers expect a
+    // trailing-slash prefix, so normalize it here exactly as the migrate
+    // handler does for its own path filters.
+    const migrationLayout = resolveMigrationLayout(fixBuildConfig);
+    const versionsDir = `${migrationLayout.versionsDir}/`;
     const prFiles = git(['diff', '--name-only', `origin/${baseBranch}...HEAD`])
       .split('\n').map(s => s.trim()).filter(Boolean);
-    const baseFiles = git(['ls-tree', '-r', '--name-only', `origin/${baseBranch}`, ALEMBIC_VERSIONS_DIR])
+    const baseFiles = git(['ls-tree', '-r', '--name-only', `origin/${baseBranch}`, versionsDir])
       .split('\n').map(s => s.trim()).filter(Boolean);
-    const migrationConflict = detectMigrationConflict(prFiles, baseFiles);
+    const migrationConflict = detectMigrationConflict(prFiles, baseFiles, versionsDir);
     if (migrationConflict.detected) {
-      const guidance = buildMigrationConflictGuidance(migrationConflict);
+      const guidance = buildMigrationConflictGuidance(migrationConflict, versionsDir);
       enrichedPrompt = `${guidance}${enrichedPrompt}`;
       sendLog(ws, `Migration revision conflict detected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')}\n`);
     }
@@ -1086,6 +1094,8 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
       statusRef,
       model,
       task.project_context as Record<string, unknown> | undefined,
+      undefined, undefined, undefined, undefined,
+      sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined),
     );
   }
 }

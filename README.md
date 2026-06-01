@@ -7,7 +7,7 @@ Blueprint also supports autonomous research mode: the orchestrator can generate 
 ## Architecture
 
 ```
-Launcher UI (React)   Admin UI (React)
+Launcher UI (React, root Vite app)   Admin UI (React workspace)
         \                  /
          \                /
     Orchestrator (FastAPI / Cloud Run)
@@ -31,7 +31,7 @@ Agent VMs          Background workers
 
 - **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the WebSocket log stream.
 
-- **Launcher UI** (root `src/`) — Lightweight React frontend for creating new tasks and viewing progress. Runs on port 3000 in local dev.
+- **Launcher UI** (root `src/`) — Root Vite app for creating new tasks and viewing progress. Runs on port 3000 in local dev.
 
 - **Agent** (`agent/`) — TypeScript process that runs inside each VM. Claims its task, clones the repo, runs Claude Code with streaming output, handles the review-fix cycle, and creates a PR.
 
@@ -46,14 +46,17 @@ Local mode runs agents as subprocesses instead of GCP VMs. You still need the ba
 cp .env.example .env
 # Set at minimum: ANTHROPIC_API_KEY, ADMIN_API_KEY, LOCAL_MODE=true, DATABASE_URL
 
-# 2. Start backend + database
-docker-compose up -d
+# 2. Start PostgreSQL
+docker compose up -d db
 
-# 3. Run the backend API
+# If you prefer containerized backend instead of uvicorn, `docker compose up -d` starts both `db` and `app`.
+
+# 3. Install backend dependencies and run the API (separate terminal)
 cd backend
+pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8080
 
-# 4. Start UIs (launcher on :3000, admin on :3001)
+# 4. In another terminal, start the UIs (launcher on :3000, admin on :3001)
 npm install
 npm run dev
 
@@ -75,8 +78,13 @@ See [Deploy.md](Deploy.md) for full Cloud Run + GCP deployment instructions.
 |---|---|
 | `ANTHROPIC_API_KEY` | API key passed to agent VMs for Claude Code |
 | `ADMIN_API_KEY` | Shared key for admin UI authentication |
+| `AGENT_JWT_SECRET` | Secret used to sign short-lived agent JWTs |
+| `WS_TICKET_SECRET` | Secret used to mint WebSocket admission tickets |
 | `LOCAL_MODE` | `true` to run agents as local subprocesses |
 | `DATABASE_URL` | PostgreSQL connection string used by the backend |
+| `GITHUB_APP_ID` | GitHub App installation metadata used during auth flows |
+| `GITHUB_PRIVATE_KEY` | GitHub App private key used to sign installation tokens |
+| `GITHUB_WEBHOOK_SECRET` | Secret used to verify GitHub webhooks |
 | `GCP_PROJECT_ID` | GCP project for VM provisioning |
 | `ORCHESTRATOR_URL` | URL agents use to reach the orchestrator |
 | `MAX_CONCURRENT_VMS` | Maximum simultaneously running agent VMs (default 8) |
@@ -175,7 +183,7 @@ Key test invariants:
 
 ### Adding Features
 
-1. **Create a branch** from `main`
+1. **Create a branch** from the integration branch (typically `automain`)
 2. **Implement changes** following [CLAUDE.md](CLAUDE.md) patterns
 3. **Run tests** (`./check` or `bash scripts/test-backend.sh` — see CLAUDE.md for details)
 4. **Self-review** — check for correctness, security, test coverage

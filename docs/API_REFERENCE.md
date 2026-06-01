@@ -1,6 +1,8 @@
 # Blueprint API Reference
 
-This document describes all publicly exposed HTTP endpoints in the Blueprint orchestrator.
+This document describes the public HTTP surface exposed by the Blueprint orchestrator.
+Routes are grouped by router family; the implementation lives in `backend/app/main.py`
+and the router modules under `backend/app/routers/`.
 
 ## Authentication
 
@@ -36,6 +38,19 @@ Launch a new task on a repository.
 
 ---
 
+### `GET /api/projects`
+
+List projects visible to the authenticated user.
+
+**Query parameters:**
+- `status`: Optional project status filter
+- `limit`: Max projects to return (default 50)
+- `offset`: Pagination offset (default 0)
+
+**Response:** `{ "projects": [...], "pagination": { "limit": 50, "offset": 0, "count": 0 } }`
+
+---
+
 ### `GET /api/projects/{project_id}`
 
 Retrieve project details.
@@ -66,6 +81,18 @@ List all tasks in a project.
 - `offset`: Pagination offset (default 0)
 
 **Response:** `{ "tasks": [...], "total": int, "has_more": bool }`
+
+---
+
+### `POST /api/projects/{project_id}/cancel`
+
+Cancel a project and its active work.
+
+---
+
+### `GET /api/projects/{project_id}/status`
+
+Return the current project/task status summary used by the dashboard.
 
 ---
 
@@ -182,6 +209,12 @@ Extend the JWT expiry (renews for another 2 hours).
 
 ---
 
+### `POST /api/agent/credentials/rotate`
+
+Propagate a refreshed provider secret for the current task/account.
+
+---
+
 ### `POST /api/agent/artifacts/upload-url`
 
 Get a signed GCS URL to upload a file artifact.
@@ -204,120 +237,62 @@ Get a signed GCS URL to upload a file artifact.
 
 ---
 
+### `POST /api/agent/viewport/failure-screenshot-upload-url`
+
+Get a signed upload URL for viewport-failure screenshots.
+
+---
+
+### `POST /api/agent/vm-heartbeat`
+
+VM-scoped liveness for warm-VM continuity.
+
+---
+
+### `POST /api/agent/next-role`
+
+Warm-VM handoff endpoint that either claims a pinned task or exits with no work.
+
+---
+
 ## GitHub Proxy Endpoints
 
 Agent VMs use these to call GitHub APIs without storing credentials locally.
 
-### `POST /api/agent/github/pull-requests`
+### `/api/agent/github/*`
 
-Create a pull request.
+The agent GitHub proxy router exposes:
 
-**Request body:**
-```json
-{
-  "task_id": "uuid",
-  "title": "string",
-  "body": "string",
-  "head": "branch_name",
-  "base": "main|target_branch"
-}
-```
+- `GET /api/agent/github/token`
+- `GET /api/agent/github/check-runs`
+- `POST /api/agent/github/commit-status`
+- `POST /api/agent/github/pr-comment`
+- `POST /api/agent/github/pr-review-comment`
+- `POST /api/agent/github/pr-review`
+- `POST /api/agent/github/issues`
+- `GET /api/agent/github/issues`
+- `POST /api/agent/github/branches`
+- `POST /api/agent/github/pull-requests`
 
-**Response:** `{ "url": "https://github.com/owner/repo/pull/123", "number": 123 }`
+### `/api/github/*`
 
----
+The user GitHub OAuth/webhook router exposes:
 
-### `POST /api/agent/github/commit-status`
-
-Update commit status (pending, success, failure).
-
-**Request body:**
-```json
-{
-  "task_id": "uuid",
-  "sha": "commit_hash",
-  "state": "pending|success|failure|error",
-  "description": "string",
-  "context": "continuous-integration/task-name"
-}
-```
-
----
-
-### `POST /api/agent/github/pr-comment`
-
-Add a comment to a PR.
-
-**Request body:**
-```json
-{
-  "task_id": "uuid",
-  "pr_number": 123,
-  "body": "string"
-}
-```
-
----
+- `POST /api/github/pat`
+- `GET /api/github/oauth/authorize`
+- `GET /api/github/oauth/callback`
+- `POST /api/github/webhook`
 
 ## Admin API
 
 Access these via the admin UI (requires `ADMIN_API_KEY` or Firebase admin token).
 
-### `GET /api/admin/projects`
+### `/api/admin/*`
 
-List all projects with summary stats.
-
-**Query parameters:**
-- `limit`: Default 20
-- `offset`: Pagination offset
-
----
-
-### `POST /api/admin/directions`
-
-Create or update a strategic direction (autonomous research mode).
-
-**Request body:**
-```json
-{
-  "project_id": "uuid",
-  "title": "string",
-  "description": "string",
-  "mode": "active|paused|completed",
-  "priority": 0-100
-}
-```
-
----
-
-### `GET /api/admin/health`
-
-Orchestrator health check.
-
-**Response:**
-```json
-{
-  "status": "healthy|degraded|down",
-  "vm_count": 5,
-  "queued_tasks": 10,
-  "failed_tasks": 2,
-  "uptime_seconds": 86400,
-  "database": "connected|disconnected"
-}
-```
-
----
-
-### `GET /api/admin/analytics`
-
-Aggregated metrics across all projects.
-
-**Response includes:**
-- Total tasks by status and type
-- Success rate by task type
-- Average completion time
-- Failure distribution
-- Cost breakdown (on-demand vs. spot VMs)
+The admin surface is split across `admin.py` and `backend/app/routers/admin_*.py`.
+Common route families include project CRUD, settings, analytics, digest/reporting,
+health, notifications/messages, users, onboarding, scope measurement, pool-account
+management, and operator/debug triggers. See the router modules for the exact paths.
 
 ---
 
@@ -345,9 +320,11 @@ Common HTTP status codes:
 
 ## Rate Limiting
 
-- `/api/deploy`: 5 requests per minute per user
-- `/api/agent/*`: 100 requests per minute per task
-- `/api/admin/*`: 60 requests per minute
+Per-route limits are declared in the router code and vary by endpoint.
+Notable examples: `/api/deploy` (5/min), `/api/projects` (30/min),
+`/api/projects/{project_id}` and `/api/projects/{project_id}/tasks` (60/min),
+`/api/agent/claim` (200/min), `/api/agent/heartbeat` (600/min),
+`/api/agent/refresh-token` (120/min), and `/api/agent/credentials/rotate` (30/min).
 
 ---
 

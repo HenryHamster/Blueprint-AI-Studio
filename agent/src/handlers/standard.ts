@@ -25,6 +25,7 @@ import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrProm
 import {
   runFreshReviewerPass,
   loneCheckerCategoriesForTask,
+  sensitivePathsFromMetadata,
   getRegressingCategories,
   getThinningCategories,
   VIEWPORT_INFRA_SKIP_GUIDANCE,
@@ -33,6 +34,7 @@ import {
 export {
   runFreshReviewerPass,
   loneCheckerCategoriesForTask,
+  sensitivePathsFromMetadata,
   pickFreshReviewerEffort,
   extractSelfReviewJson,
   SR_SKIP_REASONS,
@@ -550,6 +552,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       statusRef,
       model,
       task.project_context as Record<string, unknown> | undefined,
+      undefined, undefined, undefined, undefined,
+      sensitivePathsFromMetadata(projectMeta),
     );
   }
 
@@ -565,6 +569,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const loneCheckerCats = loneCheckerCategoriesForTask(
       task.project_context as Record<string, unknown> | undefined,
       loneCheckerRelatedFiles,
+      buildConfig,
     );
     if (loneCheckerCats.length > 0) {
       sendLog(ws, `[FreshReview] Lone-checker categories detected (${loneCheckerCats.join(', ')}) — auto-triggering fresh-reviewer pass.\n`);
@@ -572,7 +577,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       await runFreshReviewerPass(
         taskId, taskTitle, rawPrompt, loneCheckerRelatedFiles, ws, statusRef, model,
         task.project_context as Record<string, unknown> | undefined,
-        false, true,
+        false, true, undefined, undefined,
+        sensitivePathsFromMetadata(projectMeta),
       );
     }
   }
@@ -607,7 +613,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         statusRef,
         model,
         task.project_context as Record<string, unknown> | undefined,
-        true,
+        true, undefined, undefined, undefined,
+        sensitivePathsFromMetadata(projectMeta),
       );
     }
   }
@@ -691,7 +698,7 @@ export async function handleCreate(
       if (mergeBase) fs.writeFileSync(`/tmp/base_commit_${taskId}`, mergeBase);
     } catch { /* ok */ }
     const title = strVal(task.title) || 'Operator-requested fresh review';
-    await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor);
+    await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor, sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined));
     return;
   }
 

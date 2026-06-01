@@ -9,7 +9,8 @@ Guide to `backend/app/` modules and their responsibilities.
 ### `main.py`
 
 FastAPI application entry point. Defines:
-- HTTP routes (admin, projects, agent, GitHub proxy)
+- Registers the router families under `backend/app/routers/` plus the dedicated
+  admin, agent-status, warm-continuity, and credential-rotation routers
 - WebSocket handlers for real-time log streaming
 - Request/response validation via Pydantic schemas
 - CORS, rate limiting, error handling middleware
@@ -208,10 +209,9 @@ Task type → handler mapping and validation.
 - Code changes: `create`, `refactor`, `fix`, `qa`
 - Review: `review`
 - Planning & research: `plan`, `research`, `strategic_review`, `design_doc_update`
-- Specialized: `security_audit`, `perf`, `debug`, `investigate`
+- Specialized: `security_audit`, `perf`, `debug`, `investigate`, `smoketest`, `migrate`
 - Docs: `docs`
-- Ops: `deps`, `migrate`, `smoketest`
-- System/diagnostic: `self_audit`, `release_audit`, `memo`
+- Ops/system: `deps`, `self_audit`, `release_audit`, `memo`
 
 Each type has a handler in `agent/src/handlers/`.
 
@@ -493,12 +493,16 @@ Distributed tracing setup (OpenTelemetry / Cloud Trace integration).
 
 ### `routers/projects.py`
 
-Project CRUD, deployment, WebSocket for logs.
+Project CRUD, deployment, cancellation, status, and WebSocket for logs.
 
 **Endpoints:**
 - `POST /api/deploy` — Launch task
+- `GET /api/projects` — List visible projects
 - `GET /api/projects/{id}` — Fetch project
 - `GET /api/projects/{id}/tasks` — List tasks
+- `POST /api/projects/{id}/ws-ticket` — Issue WebSocket ticket
+- `POST /api/projects/{id}/cancel` — Cancel project
+- `GET /api/projects/{id}/status` — Project status summary
 - `WebSocket /api/projects/{id}/ws` — Real-time logs
 
 ---
@@ -509,11 +513,68 @@ Agent VM endpoints.
 
 **Endpoints:**
 - `POST /api/agent/claim` — Task claim
-- `POST /api/agent/status` — Terminal status report
 - `POST /api/agent/heartbeat` — Keep-alive
-- `POST /api/agent/spawn-task` — Create child task
+- `POST /api/agent/spawn` — Create child task
 - `POST /api/agent/refresh-token` — JWT renewal
-- GitHub proxy: `POST /api/agent/github/*`
+- `POST /api/agent/artifacts/upload-url` — Signed artifact upload URL
+- `POST /api/agent/viewport/failure-screenshot-upload-url` — Signed viewport screenshot upload URL
+- `POST /api/agent/tasks/{original_task_id}/reviewer-merge` — Reviewer merge helper
+
+### `routers/agent_status.py`
+
+Terminal agent status updates and task result recording.
+
+**Endpoints:**
+- `POST /api/agent/status` — Terminal status report
+
+---
+
+### `routers/agent_warm_continuity.py`
+
+Warm-VM continuity for task chaining and backlog reuse.
+
+**Endpoints:**
+- `POST /api/agent/vm-heartbeat` — VM-scoped heartbeat
+- `POST /api/agent/next-role` — Warm handoff / backlog claim
+
+---
+
+### `routers/agent_credentials.py`
+
+Credential rotation for running agents.
+
+**Endpoints:**
+- `POST /api/agent/credentials/rotate` — Propagate refreshed provider secret
+
+---
+
+### `routers/agent_github.py`
+
+Agent-side GitHub API proxy.
+
+**Endpoints:**
+- `GET /api/agent/github/token`
+- `GET /api/agent/github/check-runs`
+- `POST /api/agent/github/commit-status`
+- `POST /api/agent/github/pr-comment`
+- `POST /api/agent/github/pr-review-comment`
+- `POST /api/agent/github/pr-review`
+- `POST /api/agent/github/issues`
+- `GET /api/agent/github/issues`
+- `POST /api/agent/github/branches`
+- `POST /api/agent/github/pull-requests`
+
+---
+
+### `routers/github.py`
+
+User GitHub OAuth flow and webhook ingestion.
+
+**Endpoints:**
+- `POST /api/github/pat`
+- `GET /api/github/oauth/authorize`
+- `GET /api/github/oauth/callback`
+- `POST /api/github/webhook`
 
 ---
 

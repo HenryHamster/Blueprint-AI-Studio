@@ -16,11 +16,12 @@ export type MigrationConflict = {
 export function detectMigrationConflict(
   prFiles: string[],
   baseBranchFiles: string[],
+  versionsDir: string = ALEMBIC_VERSIONS_DIR,
 ): MigrationConflict {
   const isMigration = (f: string) =>
-    f.startsWith(ALEMBIC_VERSIONS_DIR) && f.endsWith('.py') && !f.endsWith('__init__.py');
+    f.startsWith(versionsDir) && f.endsWith('.py') && !f.endsWith('__init__.py');
   const revNum = (f: string): number => {
-    const base = f.slice(ALEMBIC_VERSIONS_DIR.length);
+    const base = f.slice(versionsDir.length);
     const m = base.match(/^(\d+)_/);
     return m ? parseInt(m[1], 10) : -1;
   };
@@ -36,10 +37,13 @@ export function detectMigrationConflict(
   return { detected: baseNewMigrations.length > 0, prMigrations, baseNewMigrations };
 }
 
-export function buildMigrationConflictGuidance(c: MigrationConflict): string {
+export function buildMigrationConflictGuidance(
+  c: MigrationConflict,
+  versionsDir: string = ALEMBIC_VERSIONS_DIR,
+): string {
   if (!c.detected) return '';
   const latestBase = [...c.baseNewMigrations].sort().pop() || '';
-  const latestBaseBase = latestBase.slice(ALEMBIC_VERSIONS_DIR.length);
+  const latestBaseBase = latestBase.slice(versionsDir.length);
   const latestRevMatch = latestBaseBase.match(/^(\d+)_/);
   const latestRev = latestRevMatch ? latestRevMatch[1] : '';
   const latestRevNum = latestRev ? parseInt(latestRev, 10) : NaN;
@@ -48,11 +52,11 @@ export function buildMigrationConflictGuidance(c: MigrationConflict): string {
     ? String(latestRevNum + 1).padStart(padWidth, '0')
     : '';
   const prFile = c.prMigrations[0] || '';
-  const prBase = prFile.slice(ALEMBIC_VERSIONS_DIR.length);
+  const prBase = prFile.slice(versionsDir.length);
   const prDescMatch = prBase.match(/^\d+_(.+)\.py$/);
   const prDesc = prDescMatch ? prDescMatch[1] : '<description>';
   const renamedFile = nextRev
-    ? `${ALEMBIC_VERSIONS_DIR}${nextRev}_${prDesc}.py`
+    ? `${versionsDir}${nextRev}_${prDesc}.py`
     : '';
   const concrete = nextRev && latestRev;
   return (
@@ -60,7 +64,7 @@ export function buildMigrationConflictGuidance(c: MigrationConflict): string {
     `This PR adds alembic migration file(s):\n${c.prMigrations.map(f => `  - ${f}`).join('\n')}\n` +
     `But the base branch has gained migration file(s) with equal-or-higher revision numbers that this PR does not yet incorporate:\n` +
     `${c.baseNewMigrations.map(f => `  - ${f}`).join('\n')}\n\n` +
-    `Resolution steps (migrations are immutable once applied — do NOT edit existing files in backend/alembic/versions/):\n` +
+    `Resolution steps (migrations are immutable once applied — do NOT edit existing files in ${versionsDir}):\n` +
     (concrete
       ? `1. Latest base-branch migration is ${latestBase} (revision="${latestRev}"). Open it to confirm its \`revision\` string matches "${latestRev}".\n` +
         `2. Rename this PR's migration to ${renamedFile} and set \`revision = "${nextRev}"\` inside it.\n` +

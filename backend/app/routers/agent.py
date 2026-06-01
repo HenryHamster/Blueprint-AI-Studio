@@ -759,6 +759,7 @@ async def claim_task(
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
             "build_config": _build_cfg,
+            "approval_gate_config": project.approval_gate_config or {},
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
             "enable_parallel_fix": _build_cfg.get("enable_parallel_fix", False),

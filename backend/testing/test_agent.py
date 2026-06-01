@@ -849,6 +849,44 @@ async def test_agent_claim_project_metadata_empty_build_config(
     data = resp.json()
     assert "project_metadata" in data
     assert data["project_metadata"]["build_config"] == {}
+    # Unset approval_gate_config surfaces as an empty dict (does not break response).
+    assert data["project_metadata"]["approval_gate_config"] == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_surfaces_approval_gate_config(client: AsyncClient, db_session):
+    """A project's approval_gate_config is surfaced in project_metadata so the
+    agent's fresh-reviewer can derive per-project sensitive paths."""
+    project = Project(
+        name="Approval Gate Test",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="myapp",
+        approval_gate_config={
+            "infra_files": ["infra/deploy.tf"],
+            "critical_files": ["lib/payments/charge.py"],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-agc-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-agc-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    agc = resp.json()["project_metadata"]["approval_gate_config"]
+    assert agc["infra_files"] == ["infra/deploy.tf"]
+    assert agc["critical_files"] == ["lib/payments/charge.py"]
 
 
 @pytest.mark.asyncio

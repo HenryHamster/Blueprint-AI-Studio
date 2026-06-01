@@ -125,7 +125,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports under test ────────────────────────────────────────────────────────
-import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort } from './standard.js';
+import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort, sensitivePathsFromMetadata } from './standard.js';
 import { setupWorkspace, runClaudeCode } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
@@ -1513,6 +1513,78 @@ describe('pickFreshReviewerEffort', () => {
       changedFiles: ['src/utils.ts'],
     });
     expect(effort).toBe('medium');
+  });
+
+  // ── Per-project sensitive paths (approval_gate_config) ──────────────────────
+  it('escalates to "medium" on a configured non-Blueprint sensitive path', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['lib/payments/charge.rb', 'README.md'],
+      sensitivePaths: ['lib/payments', 'config/secrets'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('does NOT escalate when configured sensitivePaths omit the touched file', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      // backend/app/auth would escalate under the Blueprint default, but the
+      // project's configured sensitive set does not include it.
+      changedFiles: ['backend/app/auth.py'],
+      sensitivePaths: ['lib/payments', 'config/secrets'],
+    });
+    expect(effort).toBe('low');
+  });
+
+  it('falls back to Blueprint SENSITIVE_PATHS when sensitivePaths is unset', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/auth.py'],
+    });
+    expect(effort).toBe('medium');
+  });
+
+  it('falls back to Blueprint SENSITIVE_PATHS when sensitivePaths is empty', () => {
+    const effort = pickFreshReviewerEffort({
+      changedLineCount: 50,
+      changedFiles: ['backend/app/auth.py'],
+      sensitivePaths: [],
+    });
+    expect(effort).toBe('medium');
+  });
+});
+
+// ── sensitivePathsFromMetadata ──────────────────────────────────────────────
+describe('sensitivePathsFromMetadata', () => {
+  it('returns [] when project_metadata is undefined', () => {
+    expect(sensitivePathsFromMetadata(undefined)).toEqual([]);
+  });
+
+  it('returns [] when approval_gate_config is absent or empty', () => {
+    expect(sensitivePathsFromMetadata({})).toEqual([]);
+    expect(sensitivePathsFromMetadata({ approval_gate_config: {} })).toEqual([]);
+  });
+
+  it('unions infra_files and critical_files, deduplicating', () => {
+    const result = sensitivePathsFromMetadata({
+      approval_gate_config: {
+        infra_files: ['infra/deploy.tf', 'shared/config.py'],
+        critical_files: ['shared/config.py', 'lib/payments'],
+      },
+    });
+    expect(new Set(result)).toEqual(new Set(['infra/deploy.tf', 'shared/config.py', 'lib/payments']));
+  });
+
+  it('returns the single configured list when only one half is set', () => {
+    expect(sensitivePathsFromMetadata({ approval_gate_config: { critical_files: ['lib/payments'] } }))
+      .toEqual(['lib/payments']);
+  });
+
+  it('ignores non-string entries', () => {
+    const result = sensitivePathsFromMetadata({
+      approval_gate_config: { infra_files: ['ok/path.py', 42, null, ''] },
+    });
+    expect(result).toEqual(['ok/path.py']);
   });
 });
 
@@ -3140,6 +3212,70 @@ describe('loneCheckerCategoriesForTask', () => {
     const result = loneCheckerCategoriesForTask(ctx, ['admin-ui/src/components/Foo.tsx']);
     expect(result).toContain('type-safety');
     expect(result).toContain('correctness');
+    expect(result).not.toContain('documentation');
+  });
+
+  // ── Per-project risk surface from build_config.directories ──────────────────
+  it('derives risk surface from a non-Blueprint python directory prefix', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          'type-safety': { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const buildConfig = { directories: [{ path: 'service', type: 'python' }] };
+    const result = loneCheckerCategoriesForTask(ctx, ['service/handlers/charge.py'], buildConfig);
+    // python risk surface = security/regression_risk/correctness/error-handling (no type-safety)
+    expect(result).toContain('security');
+    expect(result).not.toContain('type-safety');
+    expect(result).not.toContain('documentation');
+  });
+
+  it('adds type-safety for a node directory prefix', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          'type-safety': { time_to_miss_detect_lone_checker: true },
+          security: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const buildConfig = { directories: [{ path: 'web', type: 'node' }] };
+    const result = loneCheckerCategoriesForTask(ctx, ['web/src/app.ts'], buildConfig);
+    expect(result).toContain('type-safety');
+    expect(result).toContain('security');
+    expect(result).not.toContain('documentation');
+  });
+
+  it('returns null risk surface (no filtering) when no configured directory matches', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const buildConfig = { directories: [{ path: 'service', type: 'python' }] };
+    // file is outside every configured directory → no risk surface → no filtering
+    const result = loneCheckerCategoriesForTask(ctx, ['unrelated/file.txt'], buildConfig);
+    expect(result).toContain('documentation');
+  });
+
+  it('falls back to the Blueprint layout map when buildConfig is unset', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: { time_to_miss_detect_lone_checker: true },
+          documentation: { time_to_miss_detect_lone_checker: true },
+        },
+      },
+    };
+    const result = loneCheckerCategoriesForTask(ctx, ['backend/app/foo.py']);
+    expect(result).toContain('security');
     expect(result).not.toContain('documentation');
   });
 });
