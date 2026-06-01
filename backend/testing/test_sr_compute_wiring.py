@@ -56,6 +56,142 @@ async def test_compute_sr_false_attestation_trends_called_on_claim(
 
 
 @pytest.mark.asyncio
+async def test_refresh_sr_catch_rate_computes_on_first_claim(
+    client: AsyncClient, db_session, mocker
+):
+    """The SR catch-rate trend is (re)computed on a claim when this instance
+    has no recent recompute recorded for the project (first sight)."""
+    import app.shared_state as _shared_state
+
+    project = Project(name="Debounce First Claim", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Isolate the per-process debounce map from any prior test/claim.
+    _shared_state.sr_catch_rate_last_refreshed.pop(str(project.id), None)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "description": "test"}],
+        vm_instance_id="debounce-vm-first",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    from app.auth import create_agent_token
+
+    token = create_agent_token(str(task.id), "debounce-vm-first")
+    headers = {"x-agent-token": token}
+
+    mock_fn = AsyncMock(return_value=None)
+    with patch("app.sr_analytics.compute_sr_catch_rate_trends", new=mock_fn):
+        resp = await client.post("/api/agent/claim", headers=headers)
+        assert resp.status_code == 200
+        mock_fn.assert_awaited_once()
+        call_kwargs = mock_fn.call_args.kwargs
+        assert call_kwargs["project_id"] == project.id
+        assert call_kwargs["session"] is not None
+        assert isinstance(call_kwargs["all_tasks"], list)
+
+    # A successful recompute must record the debounce marker.
+    assert str(project.id) in _shared_state.sr_catch_rate_last_refreshed
+
+
+@pytest.mark.asyncio
+async def test_refresh_sr_catch_rate_debounced_on_second_claim_within_window(
+    client: AsyncClient, db_session, mocker
+):
+    """Design-audit #2 (scale): the SR catch-rate recompute is a ~2000-row
+    JSONB scan + a project write-lock that previously ran on EVERY claim,
+    serializing claims per project at 100-200 VMs.
+
+    This asserts the debounce: a first claim computes the trend (one call into
+    the expensive ``compute_sr_catch_rate_trends``); a SECOND claim for the same
+    project within the debounce window SKIPS the recompute entirely — the
+    expensive function is not invoked a second time. The trend still updates,
+    just at a bounded cadence rather than on literally every claim.
+    """
+    import app.shared_state as _shared_state
+
+    project = Project(name="Debounce Second Claim", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Isolate the per-process debounce map and force a wide window so the second
+    # claim is unambiguously inside it.
+    _shared_state.sr_catch_rate_last_refreshed.pop(str(project.id), None)
+
+    # Two QUEUED tasks on the SAME vm + project: each claim picks one.
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "description": "one"}],
+        vm_instance_id="debounce-vm-window",
+    )
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "description": "two"}],
+        vm_instance_id="debounce-vm-window",
+    )
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    await db_session.refresh(task2)
+
+    from app.auth import create_agent_token
+
+    headers1 = {"x-agent-token": create_agent_token(str(task1.id), "debounce-vm-window")}
+    headers2 = {"x-agent-token": create_agent_token(str(task2.id), "debounce-vm-window")}
+
+    mock_fn = AsyncMock(return_value=None)
+    with (
+        patch("app.sr_analytics.compute_sr_catch_rate_trends", new=mock_fn),
+        patch.object(_shared_state, "SR_CATCH_RATE_DEBOUNCE_SECONDS", 3600),
+    ):
+        resp1 = await client.post("/api/agent/claim", headers=headers1)
+        assert resp1.status_code == 200
+        # First claim recomputes.
+        assert mock_fn.await_count == 1
+
+        resp2 = await client.post("/api/agent/claim", headers=headers2)
+        assert resp2.status_code == 200
+        # Second claim within the window is debounced: NO second recompute.
+        assert mock_fn.await_count == 1, (
+            "second claim within the debounce window must skip the expensive "
+            f"SR catch-rate recompute, got {mock_fn.await_count} total calls"
+        )
+
+
+@pytest.mark.asyncio
+async def test_should_refresh_sr_catch_rate_window_semantics():
+    """Unit-level guard for the debounce gate: first sight refreshes; a fresh
+    mark suppresses within the window; an aged mark re-enables refresh."""
+    from datetime import timedelta
+
+    import app.shared_state as _shared_state
+    from app.time_utils import _utcnow
+
+    pid = "debounce-unit-project"
+    _shared_state.sr_catch_rate_last_refreshed.pop(pid, None)
+
+    # First sight (no recorded refresh) → always refresh.
+    assert _shared_state.should_refresh_sr_catch_rate(pid, window_seconds=600) is True
+
+    # Just marked → within the window → skip.
+    _shared_state.mark_sr_catch_rate_refreshed(pid)
+    assert _shared_state.should_refresh_sr_catch_rate(pid, window_seconds=600) is False
+
+    # Marker older than the window → refresh again.
+    _shared_state.sr_catch_rate_last_refreshed[pid] = _utcnow() - timedelta(seconds=601)
+    assert _shared_state.should_refresh_sr_catch_rate(pid, window_seconds=600) is True
+
+    _shared_state.sr_catch_rate_last_refreshed.pop(pid, None)
+
+
+@pytest.mark.asyncio
 async def test_compute_sr_regression_risk_test_signal_trends_called_on_claim(
     client: AsyncClient, db_session, mocker
 ):

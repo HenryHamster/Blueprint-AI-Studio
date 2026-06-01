@@ -194,6 +194,7 @@ class TestSweepSummary:
             "merge_error_occurrences",
             "user_debug_spawn_times",
             "vm_last_heartbeat",
+            "sr_catch_rate_last_refreshed",
             "warm_pin_clear_events",
             "warm_backlog_first_refusal",
             "warm_backlog_reuse_failure_events",

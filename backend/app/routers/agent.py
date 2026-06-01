@@ -525,7 +525,21 @@ async def _refresh_sr_catch_rate(
     2000-row budget spans more calendar time on high-throughput projects.
     Postgres: ``has_key`` hits the GIN index on context; SQLite (standalone
     tests) omits the JSON filter and ``_stats_for_tasks`` skips non-SR rows.
+
+    Debounced: this recompute is a ~2000-row JSONB context scan + a project
+    write-lock, and it ran on EVERY claim — serializing claims per project at
+    100-200 VMs. We skip the recompute (the entire scan + the lock) when it
+    last ran within ``SR_CATCH_RATE_DEBOUNCE_SECONDS`` on this instance. The
+    trend still updates at a bounded cadence; the claim fast-path returns its
+    payload without waiting on the expensive recompute.
     """
+    if not _shared_state.should_refresh_sr_catch_rate(project_id):
+        logger.debug(
+            "[SR_CATCH_RATE] debounced refresh for project %s (recomputed recently)",
+            project_id,
+        )
+        return
+
     from app.sr_analytics import compute_sr_catch_rate_trends
 
     _sr_cutoff = _utcnow() - timedelta(days=28)
@@ -568,6 +582,9 @@ async def _refresh_sr_catch_rate(
         session=session,
         all_tasks=list(_sr_rows),
     )
+    # Mark the bounded-cadence debounce window AFTER a successful recompute so
+    # the next claim within the window skips the expensive scan + lock.
+    _shared_state.mark_sr_catch_rate_refreshed(project_id)
 
 
 @router.post("/claim")

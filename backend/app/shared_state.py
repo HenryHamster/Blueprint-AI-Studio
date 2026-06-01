@@ -1658,6 +1658,47 @@ def is_vm_alive(vm_instance_id: str, max_age_seconds: int = 90) -> bool:
     return (_utcnow() - last).total_seconds() <= max_age_seconds
 
 
+# --- SR catch-rate refresh debounce (scale: every-claim recompute) ---
+# Maps project_id (str) -> last datetime this instance recomputed the SR
+# catch-rate trend. The recompute is a ~2000-row JSONB context scan plus a
+# project-row write lock; it ran on EVERY agent claim, serializing claims
+# per project at 100-200 VMs. We debounce it to a bounded cadence: the trend
+# still updates regularly, just not on literally every claim. Per-instance is
+# fine — across instances the project-lock acquisition (skip_locked=True) drops
+# any concurrent in-flight recompute, so the DB is never serialized either.
+# Pruned by sweep_stale_in_memory_state.
+sr_catch_rate_last_refreshed: Dict[str, datetime] = {}
+
+# Default debounce window. Within this window of the last successful recompute
+# (on this instance), a claim skips the expensive refresh entirely.
+SR_CATCH_RATE_DEBOUNCE_SECONDS = 600  # 10 minutes
+
+
+def should_refresh_sr_catch_rate(
+    project_id, window_seconds: int = SR_CATCH_RATE_DEBOUNCE_SECONDS
+) -> bool:
+    """True iff the SR catch-rate trend has NOT been recomputed for this
+    project within ``window_seconds`` (on this instance).
+
+    Cheap, in-memory gate intended to run on the hot claim path BEFORE the
+    expensive 2000-row scan. Returns True on first sight of a project (no
+    recorded refresh) so the trend is always computed at least once.
+    """
+    last = sr_catch_rate_last_refreshed.get(str(project_id))
+    if last is None:
+        return True
+    return (_utcnow() - last).total_seconds() >= window_seconds
+
+
+def mark_sr_catch_rate_refreshed(project_id) -> None:
+    """Record that the SR catch-rate trend was just recomputed for a project.
+
+    Called after a successful refresh so subsequent claims within the
+    debounce window skip the recompute.
+    """
+    sr_catch_rate_last_refreshed[str(project_id)] = _utcnow()
+
+
 # --- Warm-pin clear-out tracking (Phase 2e observability) ---
 # Each entry: (timestamp, vm_id, reason). Reason is "deadline_expired" or
 # "vm_unresponsive". Sustained >5/hour means warm VMs are dying mid-poll
@@ -2365,6 +2406,16 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
         if last < vm_heartbeat_cutoff:
             del vm_last_heartbeat[vm_id]
             pruned["vm_last_heartbeat"] += 1
+
+    # SR catch-rate refresh debounce map: prune entries older than 1h. The
+    # debounce window is minutes, so any entry past 1h has long expired and
+    # only contributes to keyspace growth on a long-lived instance.
+    pruned["sr_catch_rate_last_refreshed"] = 0
+    sr_refresh_cutoff = now - timedelta(hours=1)
+    for pid, last in list(sr_catch_rate_last_refreshed.items()):
+        if last < sr_refresh_cutoff:
+            del sr_catch_rate_last_refreshed[pid]
+            pruned["sr_catch_rate_last_refreshed"] += 1
 
     # Warm-pin clear-out events: bounded deque (maxlen=200) auto-evicts;
     # this prune pass drops anything outside the 24h reporting window so

@@ -199,10 +199,14 @@ async def _compute_sr_catch_rate_trends_impl(
         current_finding_count < _MIN_SR_FINDINGS
         or previous_finding_count < _MIN_SR_FINDINGS
     ):
+        # skip_locked=True: a concurrent refresh holding the project row is
+        # already updating this marker — drop rather than serialize the claim.
+        # scalar_one_or_none() then yields None for both "no project" and
+        # "row held", and the existing not-None guard skips the write.
         proj_row = await session.execute(
             select(Project)
             .where(Project.id == project_id)
-            .with_for_update(skip_locked=False, key_share=True)
+            .with_for_update(skip_locked=True, key_share=True)
         )
         project = proj_row.scalar_one_or_none()
         if project is not None:
@@ -410,10 +414,15 @@ async def _compute_sr_catch_rate_trends_impl(
         if examples:
             categories[cat]["examples"] = examples
 
+    # skip_locked=True: if a concurrent refresh already holds the project row,
+    # skip this recompute's write rather than serialize the claim path behind
+    # it. scalar_one_or_none() returns None when the row is held (or absent),
+    # and the existing not-found guard below skips the write — the in-flight
+    # refresh produces the updated trend, so behavior is preserved.
     proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
+        .with_for_update(skip_locked=True, key_share=True)
     )
     project = proj_row.scalar_one_or_none()
     if not project:
