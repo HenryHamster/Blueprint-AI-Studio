@@ -1566,6 +1566,7 @@ async def _spawn_pipeline_task(
                         session.add(b)
                         # Surface to operator/strategic via requires_approval
                         # on the chain's original task — mirrors stuck-cycle.
+                        _orig = None
                         try:
                             _orig = await session.get(
                                 Task, uuid.UUID(resolved_original_id)
@@ -1608,6 +1609,29 @@ async def _spawn_pipeline_task(
                                 f"message for PR #{pr_number}: {_msg_err}",
                                 exc_info=True,
                             )
+                        # Durable operator Alert — fires regardless of approval
+                        # gates (mirrors the stuck-cycle path). Deduplicated by
+                        # (task_id, title) so re-entry does not spam the banner.
+                        if _orig is not None:
+                            try:
+                                from app.alert_dispatch import (
+                                    _maybe_create_escalation_alert,
+                                )
+
+                                await _maybe_create_escalation_alert(
+                                    _orig,
+                                    session,
+                                    pr_number=pr_number,
+                                    reason="repeat-fingerprint",
+                                    iteration=len(same_type_failures),
+                                )
+                            except Exception as _ae:  # noqa: BLE001
+                                logger.warning(
+                                    f"[PIPELINE] Failed to create escalation alert "
+                                    f"for repeat-fingerprint halt on PR #{pr_number}: "
+                                    f"{_ae}",
+                                    exc_info=True,
+                                )
                     _set_spawn_reason(source_task, SPAWN_REASON_BLOCKED_REPEAT)
                     session.add(source_task)
                     return (None, False)
@@ -1957,6 +1981,27 @@ async def _spawn_pipeline_task(
                     )
                     session.add(stuck_orig)
                     await session.commit()
+                    # Durable operator Alert — fires regardless of approval-gate
+                    # state (the requires_approval flag above is discretionary,
+                    # but the escalation must always surface in the banner).
+                    try:
+                        from app.alert_dispatch import (
+                            _maybe_create_escalation_alert,
+                        )
+
+                        await _maybe_create_escalation_alert(
+                            stuck_orig,
+                            session,
+                            pr_number=pr_number,
+                            reason="standoff" if is_standoff else "stuck",
+                            iteration=iteration,
+                        )
+                    except Exception as _ae:  # noqa: BLE001
+                        logger.warning(
+                            f"[PIPELINE] Failed to create escalation alert for "
+                            f"stuck cycle on PR #{pr_number}: {_ae}",
+                            exc_info=True,
+                        )
                     try:
                         import asyncio as _asyncio
                         from app.notification_dispatch import (

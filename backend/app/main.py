@@ -635,6 +635,7 @@ from app.alert_dispatch import (  # noqa: F401  re-exported for back-compat (cal
     _create_halted_recovery_alerts,
     _maybe_create_failure_alert,
     _maybe_create_circuit_breaker_alert,
+    _maybe_create_escalation_alert,
     _create_strategic_alert,
 )
 

@@ -351,6 +351,75 @@ async def _maybe_create_circuit_breaker_alert(
     await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
 
 
+# Human-readable labels for the review-fix early-escalation reasons. The reason
+# key is part of the deduplicated alert title, so keep these stable.
+_ESCALATION_REASON_LABELS = {
+    "stuck": "stuck cycle",
+    "standoff": "dispute standoff",
+    "repeat-fingerprint": "repeat-fingerprint halt",
+}
+
+
+async def _maybe_create_escalation_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    pr_number: "int | None",
+    reason: str,
+    iteration: int,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert for a review-fix early escalation.
+
+    Surfaces the three early-escalation outcomes that fire BEFORE the iteration
+    cap is hit — ``stuck`` (same blocking issues recur), ``standoff`` (the fix
+    agent disputed an issue and the reviewer re-raised it), and
+    ``repeat-fingerprint`` (identical failure signature across attempts) — in the
+    same Alerts banner as cap-exhaustion, *regardless* of whether manual approval
+    gates are enabled.
+
+    Deduplicated by ``(task_id, title)``. The title encodes the PR + reason but
+    NOT the iteration, so a re-entered escalation on the same PR does not spam the
+    banner; the iteration count lives in the message. ``task`` should be the
+    chain-original task so the alert is task-linked (renders a "View task" button
+    in the banner).
+    """
+    label = _ESCALATION_REASON_LABELS.get(reason, reason)
+    pr_label = f"PR #{pr_number}" if pr_number is not None else "PR"
+    title = f"Review-fix escalation: {label} on {pr_label}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=severity,
+        title=title,
+        message=(
+            f"{pr_label} escalated for human attention after {iteration} "
+            f"review-fix iteration(s): {label}. Manual review or strategic-agent "
+            f"decision required."
+        ),
+        task_id=task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

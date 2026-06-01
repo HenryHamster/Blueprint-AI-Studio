@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 
 from sqlalchemy import select
 
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
@@ -8236,3 +8236,270 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(
 
     assert refetched_parent.status == TaskStatus.COMPLETED
     assert (refetched_parent.context or {}).get("pr_merged") is True
+
+
+# ── Early-escalation operator Alerts ──────────────────────────────────────────
+#
+# The review-fix loop's three early-escalation outcomes (stuck cycle, standoff/
+# dispute, repeat-fingerprint halt) must each surface a deduplicated operator
+# Alert — the same place cap-exhaustion alerts appear — regardless of whether
+# manual approval gates are enabled. See alert_dispatch._maybe_create_escalation_alert.
+
+
+async def _escalation_alerts(db_session, task_id):
+    """Return undismissed review-fix escalation Alert rows tied to a task."""
+    rows = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.task_id == task_id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if r.title.startswith("Review-fix escalation:")]
+
+
+async def _build_stuck_scenario(db_session, *, pr_number, fix_agent_responses=None):
+    """Persist an original + source task primed to trip stuck-cycle detection."""
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    review_loop = {
+        "iteration": 1,
+        "original_task_id": str(original_task.id),
+        "pr_number": pr_number,
+        "branch": "b1",
+        "base_branch": "main",
+        "review_history": [
+            {
+                "iteration": 0,
+                "feedback": "prev feedback",
+                "issues": [_issue("null pointer dereference", "CRITICAL")],
+            },
+        ],
+    }
+    if fix_agent_responses is not None:
+        review_loop["fix_agent_responses"] = fix_agent_responses
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": pr_number,
+                "branch": "b1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"scope": "medium", "review_loop": review_loop},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    return original_task, source_task
+
+
+async def _trigger_stuck(db_session, source_task, original_task, pr_number):
+    return await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=pr_number,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still the same issue",
+        current_feedback="Still the same issue",
+        current_issues=[_issue("null pointer dereference", "CRITICAL")],
+    )
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_creates_escalation_alert(db_session, mocker):
+    """A stuck cycle fires a deduplicated WARNING Alert tied to the chain
+    original, identifying the PR + reason + iteration count."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    original_task, source_task = await _build_stuck_scenario(db_session, pr_number=401)
+    result, _ = await _trigger_stuck(db_session, source_task, original_task, 401)
+    assert result is None
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "stuck cycle" in alert.title
+    assert "PR #401" in alert.title
+    assert "1" in alert.message  # iteration count
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_escalation_alert_fires_with_gates_off(db_session, mocker):
+    """Even with require_approval_gates OFF, the durable Alert must still fire —
+    the whole point is surfacing the escalation without operator babysitting."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+
+    original_task, source_task = await _build_stuck_scenario(db_session, pr_number=402)
+    result, _ = await _trigger_stuck(db_session, source_task, original_task, 402)
+    assert result is None
+
+    await db_session.refresh(original_task)
+    # Gates off → no approval flag, but the Alert still surfaces.
+    assert original_task.requires_approval is not True
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    assert "stuck cycle" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_escalation_alert_deduplicated_on_reentry(db_session, mocker):
+    """Re-entering the same stuck escalation must NOT create a second Alert."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    original_task, source_task = await _build_stuck_scenario(db_session, pr_number=403)
+    await _trigger_stuck(db_session, source_task, original_task, 403)
+    await _trigger_stuck(db_session, source_task, original_task, 403)
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_standoff_creates_escalation_alert_with_standoff_reason(
+    db_session, mocker
+):
+    """A standoff (fix-agent rationale rejected, issue re-raised) fires an Alert
+    labelled with the 'dispute standoff' reason rather than plain 'stuck'."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    # A prior fix-agent response carrying an issue_id makes the repeated issue a
+    # standoff (dispute) rather than the agent simply not trying.
+    original_task, source_task = await _build_stuck_scenario(
+        db_session,
+        pr_number=404,
+        fix_agent_responses=[{"issue_id": "abc123", "rationale": "intended"}],
+    )
+    result, _ = await _trigger_stuck(db_session, source_task, original_task, 404)
+    assert result is None
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    assert "dispute standoff" in alerts[0].title
+    assert "PR #404" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_repeat_fingerprint_creates_escalation_alert(db_session, mocker):
+    """A repeat-fingerprint halt fires a WARNING Alert labelled 'repeat-fingerprint
+    halt', tied to the chain original, and deduplicated on re-entry."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    common_failure = (
+        "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
+    )
+    earlier_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 905,
+                "branch": "fix/905",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"review_loop": {"original_task_id": str(original_task.id)}},
+        latest_status_message=f"[2026-05-06T09:11:42] iter=2 vm=agent-vm-aaa {common_failure}",
+    )
+    most_recent_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 905,
+                "branch": "fix/905",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"review_loop": {"original_task_id": str(original_task.id)}},
+        latest_status_message=f"[2026-05-06T09:42:08] iter=3 vm=agent-vm-bbb {common_failure}",
+    )
+    await _persist(db_session, earlier_fix, most_recent_fix)
+
+    result, was_created = await _spawn_pipeline_task(
+        most_recent_fix,
+        "review",
+        db_session,
+        pr_number=905,
+        branch="fix/905",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert result is None and was_created is False
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    assert "repeat-fingerprint halt" in alerts[0].title
+    assert "PR #905" in alerts[0].title
+
+    # Re-entry (idempotent halt) must not create a second Alert.
+    await _spawn_pipeline_task(
+        most_recent_fix,
+        "review",
+        db_session,
+        pr_number=905,
+        branch="fix/905",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
