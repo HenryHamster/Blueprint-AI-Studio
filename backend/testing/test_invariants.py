@@ -1535,6 +1535,7 @@ class TestFailureClassificationInvariants:
             BLOCKED_PRECONDITION,
             EXTERNAL_API,
             INFRA_CLASSES,
+            NO_PROGRESS_TIMEOUT,
             PROVISION_FAILURE,
             RATE_LIMIT,
             REASSIGNED,
@@ -1553,6 +1554,7 @@ class TestFailureClassificationInvariants:
                 BLOCKED_PRECONDITION,
                 SCOPE_EMPTY,
                 REASSIGNED,
+                NO_PROGRESS_TIMEOUT,
             }
         ), (
             "INFRA_CLASSES membership changed — direction_outcomes and "

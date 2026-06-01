@@ -64,6 +64,7 @@ from app.failure_classification import (
     CODE_ERROR,
     EXTERNAL_API,
     MIGRATION_ERROR,
+    NO_PROGRESS_TIMEOUT,
     PROVISION_FAILURE,
     RATE_LIMIT,
     REASSIGNED,
@@ -89,6 +90,7 @@ _FAILURE_CLASS_LABELS = {
     BLOCKED_PRECONDITION: "Blocked — precondition",
     SCOPE_EMPTY: "Scope Empty",
     REASSIGNED: "Agent Reassigned",
+    NO_PROGRESS_TIMEOUT: "No-Progress Timeout",
 }
 
 

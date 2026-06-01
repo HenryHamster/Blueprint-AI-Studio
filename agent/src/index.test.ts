@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -1225,6 +1225,19 @@ describe('RateLimitError', () => {
   });
 });
 
+describe('NoProgressTimeoutError', () => {
+  it('carries the transient no_progress_timeout failureCategory and is distinct from RateLimitError', () => {
+    const err = new NoProgressTimeoutError('no model output for >15 min');
+    expect(err).toBeInstanceOf(NoProgressTimeoutError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(RateLimitError);
+    expect(err.name).toBe('NoProgressTimeoutError');
+    // The agent catch block reads .failureCategory for non-RateLimitError errors;
+    // 'no_progress_timeout' must NOT trigger the account-model block.
+    expect(err.failureCategory).toBe('no_progress_timeout');
+  });
+});
+
 describe('provider runner prompt transport', () => {
   it('uses stdin for OpenAI run commands instead of argv prompts', () => {
     const runner = getProviderRunner('openai', 'api_key');
@@ -1278,6 +1291,18 @@ describe('provider runner prompt transport', () => {
     const command = runner.buildValidationCommand('gemini-2.5-pro');
     expect(command).not.toBeNull();
     expect(defined(command).env.GEMINI_CLI_TRUST_WORKSPACE).toBe('true');
+  });
+
+  it('passes --include-partial-messages to the Claude run command so slow opus turns stream progress deltas', () => {
+    const runner = getProviderRunner('anthropic', 'oauth');
+    const command = runner.buildRunCommand('prompt body', 'claude-opus-4-8', 'high');
+    // The flag must accompany the streaming-json output mode — it only emits
+    // partial-message stream_event lines when stream-json is active.
+    expect(command.outputMode).toBe('claude-stream-json');
+    expect(command.args).toContain('--include-partial-messages');
+    expect(command.args).toContain('--output-format');
+    expect(command.args).toContain('stream-json');
+    expect(command.args).toContain('--verbose');
   });
 });
 
@@ -3616,7 +3641,7 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
     clearPidRegistry();
   });
 
-  it('fires SIGTERM + RateLimitError when a tool_use is followed by a hang and the result event is LOST (toolInFlight stuck true)', async () => {
+  it('fires SIGTERM + NoProgressTimeoutError when a tool_use is followed by a hang and the result event is LOST (toolInFlight stuck true)', async () => {
     const { child, handlers, emitStdout } = makeChild(7801);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
     const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
@@ -3640,11 +3665,16 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
 
     expect(killSpy).toHaveBeenCalledWith(-7801, 'SIGTERM');
 
-    // The watchdog reports the hang as a rate-limit (no retry-budget burn).
+    // No confirmed rate-limit text was ever emitted, so the hang is reported as a
+    // transient NoProgressTimeoutError (requeue without burning retry, account
+    // NOT blocked) rather than RateLimitError (which would block the account).
     child.exitCode = 143;
     child.signalCode = 'SIGTERM';
     handlers.close?.(143, 'SIGTERM');
-    await expect(promise).rejects.toBeInstanceOf(RateLimitError);
+    const rejection = await promise.catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(NoProgressTimeoutError);
+    expect(rejection).not.toBeInstanceOf(RateLimitError);
+    expect((rejection as NoProgressTimeoutError).failureCategory).toBe('no_progress_timeout');
 
     killSpy.mockRestore();
   });
@@ -3658,9 +3688,14 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
     await Promise.resolve();
 
     // Emit fresh tool_use events periodically — lastToolUseAt stays current, so
-    // the dual-staleness gate must NOT trip (a long legitimate tool run).
-    const STEP = LLM_NO_PROGRESS_STALL_MS - 120_000;
-    for (let i = 0; i < 3; i++) {
+    // the dual-staleness gate must NOT trip (a long legitimate tool run). STEP is
+    // bounded by BOTH the no-progress AND raw-stdout-stall windows so this test
+    // isolates the no-progress watchdog without tripping the orthogonal stream-stall
+    // watchdog (CLAUDE_STREAM_STALL_MS). Iterate enough to cumulatively exceed the
+    // no-progress window.
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
+    const iters = Math.ceil((LLM_NO_PROGRESS_STALL_MS + 120_000) / STEP) + 1;
+    for (let i = 0; i < iters; i++) {
       emitStdout(JSON.stringify({
         type: 'assistant',
         message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: `step ${i}` } }] },
@@ -3681,6 +3716,122 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
     // resolve() never runs and `await promise` hangs to the 5s test timeout.
     await vi.runAllTimersAsync();
     await promise.catch(() => undefined);
+    killSpy.mockRestore();
+  });
+
+  // A top-level partial-message delta from --include-partial-messages. Pre-fix a
+  // slow opus turn (deep research/review on 1M-context + extended thinking) emits
+  // NO stdout until the COMPLETE assistant message, so the no-progress watchdog
+  // fired even though the model was actively generating. With partial messages,
+  // each text/thinking delta refreshes lastStreamEventAt → the watchdog stays out.
+  const textDeltaEvent = () => JSON.stringify({
+    type: 'stream_event',
+    event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'tok' } },
+  });
+  const thinkingDeltaEvent = () => JSON.stringify({
+    type: 'stream_event',
+    event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '...' } },
+  });
+
+  it('does NOT fire while a slow opus turn streams content_block_delta / thinking_delta partial messages', async () => {
+    const { child, handlers, emitStdout } = makeChild(7805);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // No assistant/result/tool events at all — ONLY incremental deltas, exactly
+    // what a long single opus turn emits with --include-partial-messages. Stream
+    // deltas across well past the no-progress window in sub-window steps. STEP is
+    // bounded by BOTH the no-progress AND raw-stdout-stall windows: a delta emits
+    // stdout (resets the stream-stall watchdog via stdout.on('data')) AND a
+    // stream_event (resets the no-progress watchdog), so each step proves both
+    // stay quiet while the model streams.
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
+    const totalMs = LLM_NO_PROGRESS_STALL_MS + 5 * 60_000;
+    let remaining = totalMs;
+    let i = 0;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(i % 2 === 0 ? textDeltaEvent() : thinkingDeltaEvent());
+      remaining -= STEP;
+      i += 1;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+
+    // The model was streaming the whole time — no watchdog fired.
+    expect(killSpy).not.toHaveBeenCalledWith(-7805, 'SIGTERM');
+
+    emitStdout(JSON.stringify({ type: 'result', result: 'done' }));
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await vi.runAllTimersAsync();
+    const result = await promise;
+    expect(result.exitCode).toBe(0);
+    expect(killSpy).not.toHaveBeenCalledWith(-7805, 'SIGTERM');
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it('a NESTED partial-message delta does NOT reset the top-level no-progress watchdog', async () => {
+    const { child, handlers, emitStdout } = makeChild(7806);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Only NESTED deltas (parent_tool_use_id set) arrive — but no tool is in
+    // flight, so they count as neither content progress NOR tool sub-progress.
+    // The top-level stream is genuinely silent → the watchdog must still fire.
+    const nestedDelta = JSON.stringify({
+      type: 'stream_event',
+      parent_tool_use_id: 'toolu_sub',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } },
+    });
+    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    let remaining = LLM_NO_PROGRESS_STALL_MS + 120_000;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      // Keep the raw-stdout stall watchdog alive so we isolate the no-progress one.
+      emitStdout(nestedDelta);
+      remaining -= STEP;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+
+    expect(killSpy).toHaveBeenCalledWith(-7806, 'SIGTERM');
+
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+    const rejection = await promise.catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(NoProgressTimeoutError);
+    killSpy.mockRestore();
+  });
+
+  it('STILL throws RateLimitError (account block path) when a confirmed rate-limit message accompanies the silent hang', async () => {
+    const { child, handlers, emitStdout } = makeChild(7807);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // A genuinely silent hang that DID surface a confirmed rate-limit banner in
+    // stdout (a real 429). The no-progress watchdog fires, but because a confirmed
+    // RATE_LIMIT_PATTERNS message is present, the agent reports rate_limited so the
+    // orchestrator blocks the account + applies the canonical cooldown (UNCHANGED).
+    emitStdout('Claude AI usage limit reached');
+    await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
+
+    expect(killSpy).toHaveBeenCalledWith(-7807, 'SIGTERM');
+
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+    const rejection = await promise.catch((e: unknown) => e);
+    expect(rejection).toBeInstanceOf(RateLimitError);
+    expect(rejection).not.toBeInstanceOf(NoProgressTimeoutError);
     killSpy.mockRestore();
   });
 });
@@ -3798,9 +3949,11 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
 
     // Run the fan-out well past BOTH the no-progress window AND the ordinary
     // tool-use-stall window, streaming nested sub-agent progress in steps shorter
-    // than the no-progress window. Each nested event refreshes lastToolProgressAt.
+    // than every watchdog window (no-progress AND raw-stdout-stall). Each nested
+    // event refreshes lastToolProgressAt AND emits stdout, so neither watchdog
+    // false-fires while the workflow is legitimately busy.
     const totalMs = Math.max(LLM_NO_PROGRESS_STALL_MS, TOOL_USE_STALL_TIMEOUT_MS) + 5 * 60_000;
-    const STEP = LLM_NO_PROGRESS_STALL_MS - 120_000;
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
     let remaining = totalMs;
     let i = 0;
     while (remaining > STEP) {
@@ -3849,8 +4002,11 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
     emitStdout(JSON.stringify({ type: 'user', parent_tool_use_id: PARENT_ID }));
 
     // Advance past the no-progress window with only periodic nested progress.
-    const STEP = LLM_NO_PROGRESS_STALL_MS - 120_000;
-    for (let i = 0; i < 3; i++) {
+    // STEP is bounded by BOTH watchdog windows; iterate enough to cumulatively
+    // exceed the no-progress window so the test still proves what it claims.
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
+    const iters = Math.ceil((LLM_NO_PROGRESS_STALL_MS + 120_000) / STEP) + 1;
+    for (let i = 0; i < iters; i++) {
       await vi.advanceTimersByTimeAsync(STEP);
       emitStdout(nestedSubAgentEvent(PARENT_ID, i));
     }
