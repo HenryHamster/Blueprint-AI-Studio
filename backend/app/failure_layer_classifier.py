@@ -1,16 +1,23 @@
-"""Layer classifier for pipeline regression symptoms.
+"""Failure-layer classifier — pure-function fingerprint → layer-tag mapping.
+
+This is the slim survivor of the removed pipeline-regression apparatus's
+``regression_layer_classifier``. Only the pure, side-effect-free classification
+helpers that live consumers still use are kept:
+
+  * ``classify_layers`` — map a (failure_class, message, stage) fingerprint to a
+    subset of the six canonical layer tags. Used by ``sr_blind_spots`` to build
+    per-theme layer-distribution analytics on live self-review blind-spot data.
+  * ``parse_viewport_regression_class`` — parse a ``viewport_regression:`` class
+    string into component / assertion-type / width.
+  * ``ALL_LAYERS`` and the ``LAYER_*`` constants.
+
+The dispatcher-only aggregation/meta-prompt helpers (build_layer_meta_block,
+aggregate_targeted_layers, is_recurring_cross_layer_class,
+compute_layer_defense_counts, compute_untargeted_layers,
+compute_recovery_layer_mismatch, LAYER_DESCRIPTIONS, LAYER_DISPLAY_ORDER) were
+dropped with the apparatus — they had no surviving consumer.
 
 Pure-function module — no DB, no session, no side effects.
-Returns a subset of the six canonical layer tags based on fingerprint
-heuristics applied to failure_class, message text, and optional stage name.
-
-Layer tags:
-  CI_WORKFLOW   — .github/workflows/*.yml (triggers, path filters, jobs)
-  AGENT_VM      — infra/packer/agent.pkr.hcl (system libs, runtimes, sudoers)
-  AGENT_VERB    — agent/src/handlers/ (what gates fire, scope enforcement)
-  BASELINE_GATE — lint/test/typecheck baselines, scope rules, strictness
-  REVIEWER_PASS — fresh-reviewer pass, build-gate disagreement detection
-  VIEWPORT      — client-rendering / 375px viewport regressions in admin-ui components
 """
 
 from __future__ import annotations
@@ -180,49 +187,6 @@ _VIEWPORT_STAGE_KEYWORDS: list[str] = ["viewport"]
 # Layer descriptions (used by meta-investigation prompt builders)
 # ---------------------------------------------------------------------------
 
-LAYER_DESCRIPTIONS: dict[str, str] = {
-    LAYER_CI_WORKFLOW: ".github/workflows/*.yml — triggers, path filters, job definitions",
-    LAYER_AGENT_VM: "infra/packer/agent.pkr.hcl — system libs, runtimes, sudoers",
-    LAYER_AGENT_VERB: "agent/src/handlers/ — gate scope enforcement, handler invocations",
-    LAYER_BASELINE_GATE: "lint/typecheck baselines, scope rules, module size limits",
-    LAYER_REVIEWER_PASS: "fresh-reviewer pass, build-gate disagreement detection",
-    LAYER_VIEWPORT: "client-rendering / 375px viewport regressions in admin-ui components",
-}
-
-# Stable display order for meta-investigation prompts.
-LAYER_DISPLAY_ORDER: tuple[str, ...] = (
-    LAYER_CI_WORKFLOW,
-    LAYER_AGENT_VM,
-    LAYER_AGENT_VERB,
-    LAYER_BASELINE_GATE,
-    LAYER_REVIEWER_PASS,
-    LAYER_VIEWPORT,
-)
-
-
-def build_layer_meta_block(
-    targeted_layers: frozenset[str] | set[str] | None = None,
-) -> str:
-    """Return a formatted layer-catalog block for meta-investigation prompts.
-
-    Lists every canonical layer with its description and marks each as
-    'targeted' (already defended) or 'UNTARGETED' (candidate for next defense).
-    Callers should embed this block in the investigation prompt so investigators
-    know which layers to prioritise.
-    """
-    targeted = frozenset(targeted_layers or [])
-    lines: list[str] = ["Canonical defense layers:"]
-    for layer in LAYER_DISPLAY_ORDER:
-        status = "targeted" if layer in targeted else "UNTARGETED"
-        desc = LAYER_DESCRIPTIONS.get(layer, "")
-        lines.append(f"  {layer} [{status}]: {desc}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 
 def classify_layers(
     failure_class: str,
@@ -305,93 +269,6 @@ def classify_layers(
     return tags
 
 
-def aggregate_targeted_layers(entries: list[dict]) -> set[str]:
-    """Return the set of canonical layers targeted across all fix-log entries.
-
-    Accepts the ``fingerprint_to_fix_log`` list format.  Entries missing
-    ``layers_targeted`` or with an empty list contribute nothing to the union.
-    Unknown layer names (not in ``ALL_LAYERS``) are silently dropped.
-    """
-    targeted: set[str] = set()
-    for entry in entries or []:
-        if not isinstance(entry, dict):
-            continue
-        for layer in entry.get("layers_targeted") or []:
-            if isinstance(layer, str) and layer in ALL_LAYERS:
-                targeted.add(layer)
-    return targeted
-
-
-def is_recurring_cross_layer_class(
-    entries: list[dict],
-    min_cycles: int = 3,
-    min_layers: int = 2,
-) -> bool:
-    """Return True when fix-log history qualifies as a recurring cross-layer class.
-
-    A class qualifies when its combined fix-log entries span at least
-    ``min_cycles`` cycles AND collectively targeted at least ``min_layers``
-    distinct canonical layers.  Identifies regression classes where single-layer
-    fixes repeatedly fail to hold, signalling a shared root cause across layers.
-
-    Parameters
-    ----------
-    entries:
-        Combined ``fingerprint_to_fix_log`` entries across all
-        RegressionRemediationCase records for this regression class.
-    min_cycles:
-        Minimum number of fix cycles required.  Defaults to 3.
-    min_layers:
-        Minimum number of distinct canonical layers that must have been targeted.
-        Defaults to 2.
-    """
-    if not entries or len(entries) < min_cycles:
-        return False
-    return len(aggregate_targeted_layers(entries)) >= min_layers
-
-
-def compute_layer_defense_counts(fix_log: list[dict]) -> dict[str, int]:
-    """Per-canonical-layer fix counts across a list of fix-log entries.
-
-    Returns one entry per canonical layer in stable display order, including
-    layers with zero fixes, so callers can render a stable six-column table.
-    Unknown layer names in ``layers_targeted`` are silently ignored.
-    """
-    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
-    for entry in fix_log or []:
-        if not isinstance(entry, dict):
-            continue
-        for layer in entry.get("layers_targeted") or []:
-            if layer in counts:
-                counts[layer] += 1
-    return counts
-
-
-def compute_untargeted_layers(fix_log: list[dict]) -> list[str]:
-    """Return canonical layer names that have zero targeted fixes in fix_log.
-
-    Scans each entry's ``layers_targeted`` field (a list of layer name strings).
-    Entries missing the field, or with an empty list, contribute nothing to the
-    "targeted" set — they are treated as unclassified, not as targeting all layers.
-    Unknown layer names are silently ignored.
-
-    Returns a sorted list of layer names from ``ALL_LAYERS`` that appear in no
-    fix entry's ``layers_targeted``.  Returns all five layers when fix_log is
-    empty or no entry carries a ``layers_targeted`` field.
-    """
-    targeted: set[str] = set()
-    for entry in fix_log:
-        for layer in entry.get("layers_targeted") or []:
-            if layer in ALL_LAYERS:
-                targeted.add(layer)
-    return sorted(ALL_LAYERS - targeted)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def parse_viewport_regression_class(regression_class: str) -> dict[str, str | None]:
     """Parse a viewport_regression: class string into component, assertion type, and width.
 
@@ -422,47 +299,6 @@ def parse_viewport_regression_class(regression_class: str) -> dict[str, str | No
     else:
         component, assertion_type = left, None
     return {"component": component, "assertion_type": assertion_type, "width": width}
-
-
-def compute_recovery_layer_mismatch(
-    fix_log: list[dict] | None,
-    symptoms_by_layer: dict[str, Any] | None,
-    *,
-    evaluated_at: str,
-) -> dict[str, Any] | None:
-    """Return a mismatch record when the fix didn't cover all symptom layers.
-
-    Compares the union of ``layers_targeted`` across fix-log entries against
-    the canonical layer keys present in ``symptoms_by_layer``.  Returns None
-    when either side is empty or when all symptom layers were addressed.
-
-    Parameters
-    ----------
-    fix_log:
-        List of fix-log entry dicts (each may carry ``layers_targeted``).
-    symptoms_by_layer:
-        Per-layer observation dict populated by the dispatcher during the
-        case lifecycle.  Only keys that are canonical layer names (``ALL_LAYERS``)
-        are considered — unknown keys are silently ignored.
-    evaluated_at:
-        ISO-format timestamp string to stamp the returned record.
-    """
-    fix_layers = aggregate_targeted_layers(fix_log or [])
-    symptom_layers = {
-        k for k in (symptoms_by_layer or {}) if isinstance(k, str) and k in ALL_LAYERS
-    }
-    if not fix_layers or not symptom_layers:
-        return None
-    unaddressed = symptom_layers - fix_layers
-    if not unaddressed:
-        return None
-    return {
-        "type": "recovery_layer_mismatch",
-        "evaluated_at": evaluated_at,
-        "fix_layers": sorted(fix_layers),
-        "symptom_layers": sorted(symptom_layers),
-        "unaddressed_layers": sorted(unaddressed),
-    }
 
 
 def _matches_any(text: str, patterns: list[re.Pattern]) -> bool:

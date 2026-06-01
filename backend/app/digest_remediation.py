@@ -29,6 +29,47 @@ from app.time_utils import _to_naive_utc
 logger = logging.getLogger(__name__)
 
 
+# Structural-diagnosis keyword heuristics. Re-homed from the deleted
+# ``task_completion_investigation`` (the investigation-conversion funnel below is
+# the only surviving consumer). A diagnosis is "structural" when it points at a
+# direction/goal-level scope problem rather than a code-local defect.
+_STRUCTURAL_STRONG_KEYWORDS = (
+    "fundamentally misaligned",
+    "direction scope",
+    "direction is too broad",
+    "direction is too wide",
+    "narrow the direction",
+    "split the direction",
+    "rewrite the direction",
+)
+
+# Weaker keywords — scope-related language that only signals a structural
+# diagnosis when paired with a direction/goal-level context word. Without the
+# context gate, phrases like "validation scope too narrow" or "out of scope for
+# this module" get misclassified as structural.
+_STRUCTURAL_WEAK_KEYWORDS = (
+    "too broad",
+    "too wide",
+    "overly broad",
+    "scope too",
+    "misaligned",
+    "out of scope",
+    "narrow the scope",
+)
+
+_STRUCTURAL_CONTEXT_WORDS = ("direction", "goal", "vision")
+
+
+def _is_structural_diagnosis(root_cause: str, recommended_fix: str) -> bool:
+    """True when a diagnosis points at a direction/goal-level scope problem."""
+    blob = f"{root_cause}\n{recommended_fix}".lower()
+    if any(kw in blob for kw in _STRUCTURAL_STRONG_KEYWORDS):
+        return True
+    if not any(w in blob for w in _STRUCTURAL_CONTEXT_WORDS):
+        return False
+    return any(kw in blob for kw in _STRUCTURAL_WEAK_KEYWORDS)
+
+
 async def compute_remediation_and_patterns(
     *,
     session: AsyncSession,
@@ -291,7 +332,6 @@ async def compute_remediation_funnel(
     """
     from app.failure_classification import classify_failure as _classify_failure
     from app.routers.admin_analytics import _derive_completed_at
-    from app.task_completion import _is_structural_diagnosis
 
     # Query investigate + remediation tasks in-window regardless of status (the
     # main all_tasks query is terminal-only, so investigate tasks that are still

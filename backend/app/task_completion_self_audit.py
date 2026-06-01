@@ -33,11 +33,32 @@ from app.models import (
     SystemMaturity,
     Task,
 )
-from app.self_audit_dispatch import _record_auto_clear_note
 from app.task_locking import with_directions_locked
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> None:
+    """Append an explanatory note to a direction dict when its mode is auto-cleared.
+
+    Called by ``_maybe_auto_clear_direction_mode`` when a system's health has
+    recovered. Re-homed here from the deleted ``app.self_audit_dispatch`` (the
+    self-audit *dispatch* feeder was removed with the self-repair apparatus; the
+    auto-clear note lives with the self-audit *completion* handler instead).
+    """
+    notes = list(direction.get("notes") or [])
+    notes.append(
+        {
+            "text": (
+                f"Auto-cleared from '{cleared_from}': system health recovered "
+                f"({count} consecutive 'ship' maturity assessments)"
+            ),
+            "source": "auto_clear",
+            "created_at": _utcnow().isoformat(),
+        }
+    )
+    direction["notes"] = notes
 
 
 def _extract_json_array(text: str, *required_keys: str) -> Optional[str]:

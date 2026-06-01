@@ -32,7 +32,6 @@ from app.shared_state import (
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
-from app.autonomous_research_diagnosis import _spawn_direction_diagnosis  # noqa: F401 — re-export for backwards compat
 from app.direction_mode import (
     append_prompt_suffix,
     is_pause_mode,
@@ -62,15 +61,6 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
     """
     async with _get_spawn_lock(str(project.id)):
         return await _spawn_research_task_inner(project, session)
-
-
-# Re-export the self_audit helpers for backwards compat with callers /
-# tests that patch them under ``app.autonomous_research``.
-from app.self_audit_dispatch import (  # noqa: E402,F401 — re-export for backwards compat
-    _record_residual_audit_deferral,
-    _should_dispatch_self_audit,
-    _spawn_self_audit_task,
-)
 
 
 async def _fetch_direction_reasoning_memos(
@@ -628,30 +618,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             )
         return  # Don't spawn tactical research this cycle
 
-    # Mode-aware self_audit dispatch. Runs BEFORE strategic dispatch so a stale
-    # or high-drift project audits before the strategic agent reads stale state.
-    # Force_strategic preempts: when force_strategic is True (no purpose / no
-    # active dirs / all saturated) the project needs strategic spawn, not an
-    # audit, so we skip the audit decision entirely.
-    if not force_strategic:
-        try:
-            audit_decision = await _should_dispatch_self_audit(project, session)
-        except Exception:
-            logger.exception(
-                f"[SELF_AUDIT] decision failed for project {project.id}; "
-                "falling through to regular dispatch"
-            )
-            audit_decision = None
-        if audit_decision is not None:
-            try:
-                if await _spawn_self_audit_task(project, session, audit_decision):
-                    return  # Audit dispatched; skip tactical/strategic this tick.
-            except Exception:
-                logger.exception(
-                    f"[SELF_AUDIT] spawn failed for project {project.id}; "
-                    "falling through to regular dispatch"
-                )
-
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
     # never blocked by an active tactical research task.  The design_doc_update
     # and strategic_review use their own task types and run in parallel.
@@ -1078,21 +1044,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
         _mode = normalized_recommended_mode(chosen_direction)
-        if (
-            chosen_direction
-            and _mode == "audit"
-            and chosen_direction.get("system_id")
-            and await _spawn_self_audit_task(
-                project,
-                session,
-                {
-                    "focus_systems": [chosen_direction.get("system_id")],
-                    "max_systems": 1,
-                },
-            )
-        ):
-            continue
-
         # Build lightweight direction summaries — include compact history for
         # agent-side stats (aggregateDirectionStats, buildScopeCalibrationSignal).
         # Full histories are available via the API. This keeps the payload under
@@ -1665,17 +1616,13 @@ async def _check_autonomous_research(owner: str, repo: str):
 
 
 # ---------------------------------------------------------------------------
-# Failure-driven investigation & remediation spawners now live in
-# app.autonomous_research_investigations. Re-exported here so existing callers
+# Residual-fingerprint create-fix lane. Re-exported here so existing callers
 # and tests that do ``from app.autonomous_research import ...`` keep working.
+# The lane itself was re-homed to app.autonomous_research_residual when the
+# self-repair apparatus (autonomous_research_investigations) was deleted; the
+# residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_investigations import (  # noqa: E402,F401
-    _MAX_ACTIVE_INVESTIGATIONS_PER_DIRECTION,
-    _recent_investigation_exists,
-    _spawn_direction_hold_investigation,
-    _spawn_task_failure_investigation,
-    _spawn_review_convergence_investigation,
-    _infer_fingerprint_audit_system,
+from app.autonomous_research_residual import (
     _spawn_residual_fingerprint_remediation,
 )
 
@@ -1683,7 +1630,7 @@ from app.autonomous_research_investigations import (  # noqa: E402,F401
 
 async def _check_idle_research():
     """Periodic check: spawn research if projects are idle with active directions."""
-    from app.anomaly_detection import _expire_stale_proposals, _check_anomaly_proposals
+    from app.anomaly_detection import _expire_stale_proposals
 
     now = _utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
@@ -1757,15 +1704,9 @@ async def _check_idle_research():
                     for task_type in ("security_audit", "qa", "deps"):
                         await _spawn_periodic_task(project, task_type, session)
 
-                # Check persistent anomalies for direction proposals (regardless of VM slots)
-                await _check_anomaly_proposals(project, session)
-                # Auto-spawn investigation tasks for any directions placed on hold
-                await _spawn_direction_hold_investigation(project, session)
+                # Spawn the working residual-fingerprint create-fix lane for any
+                # recurring failure pattern that warrants a targeted fix.
                 await _spawn_residual_fingerprint_remediation(project, session)
                 await session.commit()
     except Exception as e:
         logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
-
-
-# _spawn_direction_diagnosis lives in app.autonomous_research_diagnosis and is
-# re-exported at the top of this module for backwards compatibility.

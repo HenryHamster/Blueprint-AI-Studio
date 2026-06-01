@@ -4,8 +4,10 @@ Extracted from ``routers/admin_digest.py``.  These are independent
 read-only endpoints that delegate to sibling modules — none of them are
 part of the catch-up digest itself.
 
-The sub-router is mounted by ``admin_digest`` so all public paths
-(e.g. ``/api/admin/regression-dispatcher/health``) remain unchanged.
+The sub-router is mounted by ``admin_digest`` so all surviving public paths
+(e.g. ``/api/admin/pipeline-regressions``) remain unchanged. The
+``/regression-dispatcher/*`` and ``/canonical-regression-layers`` routes were
+removed alongside the detect->investigate->fix regression apparatus.
 """
 
 from __future__ import annotations
@@ -29,8 +31,6 @@ from app.models import (
     AlertSeverity,
     MaxPlanAccount,
     Project,
-    RegressionCaseStatus,
-    RegressionRemediationCase,
     Task,
     TaskStatus,
     _utcnow,
@@ -39,7 +39,9 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
-# Matches the constant in admin_digest that pipeline-regressions reads.
+# Matches the Alert title written by the pipeline-alert scan
+# (``pipeline_alert_scan._run_signal_staleness_watchdog``), the re-homed source
+# of the "Signal staleness" WARNING alerts surfaced by ``/pipeline-regressions``.
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
 
 router = APIRouter()
@@ -625,8 +627,8 @@ async def get_pipeline_regressions(
     now = datetime.utcnow()
     regressions: List[Dict[str, Any]] = []
 
-    # SR catch-rate regression signals — regression_class uses the colon form the
-    # dispatcher actually persists (pipeline_regression_dispatcher.py:306).
+    # SR catch-rate regression signals — read from the sr_catch_rate_trends_alert
+    # design-doc flag (written by playbook-learning, not the removed dispatcher).
     sr_alert = doc.get("sr_catch_rate_trends_alert") or {}
     for cat in list(sr_alert.get("categories") or []):
         cat_data = (
@@ -645,7 +647,7 @@ async def get_pipeline_regressions(
             }
         )
 
-    # Fix-loop divergence regression signals — colon form per dispatcher line 394.
+    # Fix-loop divergence regression signals — read from design-doc flags.
     iso_year, iso_week, _ = now.isocalendar()
     if doc.get("fix_loop_divergence_alerted_window") == f"{iso_year}-W{iso_week:02d}":
         for reg in list(doc.get("fix_loop_divergence_regressions") or []):
@@ -740,294 +742,21 @@ async def get_pipeline_regressions(
             }
         )
 
-    # Viewport-regression cases — active RegressionRemediationCase rows whose
-    # regression_class starts with "viewport_regression:". Sourced from the durable
-    # table written by the pipeline_regression_dispatcher; no design_doc flags needed.
-    viewport_cutoff = now - timedelta(days=30)
-    viewport_rows = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase)
-                .where(
-                    RegressionRemediationCase.project_id == project_id,
-                    RegressionRemediationCase.regression_class.like(
-                        "viewport_regression:%"
-                    ),
-                    RegressionRemediationCase.status.in_(
-                        [
-                            RegressionCaseStatus.ACTIVE,
-                            RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
-                        ]
-                    ),
-                    RegressionRemediationCase.first_seen_at >= viewport_cutoff,
-                )
-                .order_by(RegressionRemediationCase.first_seen_at.desc())
-                .limit(10)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    for case in viewport_rows:
-        subkey = case.regression_class.split(":", 1)[-1]
-        regressions.append(
-            {
-                "signal_name": f"Viewport regression: {subkey}",
-                "regression_class": case.regression_class,
-                "detected_at": case.first_seen_at.isoformat()
-                if case.first_seen_at
-                else None,
-                "severity": "warning",
-                "current_rate": None,
-                "prior_rate": None,
-                "resolved": False,
-                "resolved_at": None,
-                "introducing_pr_number": getattr(case, "introducing_pr_number", None),
-                "introducing_commit_sha": getattr(case, "introducing_commit_sha", None),
-            }
-        )
-
-    # Enrich each regression with the status of any spawned investigation task.
-    # Includes both pipeline_regression_dispatcher tasks (SR/fix-loop classes) and
-    # crash_investigation tasks spawned by lifecycle._spawn_crash_investigations.
-    if regressions:
-        dispatcher_tasks = (
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        Task.project_id == project_id,
-                        Task.context["spawned_by"]
-                        .as_string()
-                        .in_(("pipeline_regression_dispatcher", "crash_investigation")),
-                        Task.created_at >= now - timedelta(hours=48),
-                    )
-                    .options(load_only(Task.id, Task.title, Task.status, Task.context))
-                    .order_by(Task.created_at.desc())
-                    .limit(50)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        by_class: Dict[str, Task] = {}
-        for t in dispatcher_tasks:
-            rc = (t.context or {}).get("regression_class")
-            if rc and rc not in by_class:
-                by_class[rc] = t
-        for r in regressions:
-            task = by_class.get(r["regression_class"])
-            if task is None:
-                r["spawned_task_id"] = None
-                r["spawned_task_status"] = None
-                r["spawned_task_title"] = None
-            else:
-                r["spawned_task_id"] = str(task.id)
-                r["spawned_task_status"] = (
-                    task.status.value
-                    if hasattr(task.status, "value")
-                    else str(task.status)
-                )
-                r["spawned_task_title"] = task.title
+    # The detect->investigate->fix regression apparatus has been removed: these
+    # signals are now surfaced purely for operator visibility (design-doc flags +
+    # the Alert table). No autonomous remediation task is spawned, so the prior
+    # ``spawned_task_*`` enrichment and the viewport-regression RegressionRemediationCase
+    # listing are gone. The fields are kept (as None) so the admin-ui contract is stable.
+    for r in regressions:
+        r["spawned_task_id"] = None
+        r["spawned_task_status"] = None
+        r["spawned_task_title"] = None
 
     return {
         "project_id": str(project_id),
         "regressions": regressions,
         "healthy": len(regressions) == 0,
     }
-
-
-@router.get("/regression-dispatcher/health")
-async def get_regression_dispatcher_health(
-    project_id: Optional[uuid.UUID] = Query(default=None),
-    window_hours: int = Query(default=24, ge=1, le=168),
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),  # noqa: ARG001
-) -> Dict[str, Any]:
-    """Dispatcher health and throughput summary for the last N hours.
-
-    Returns aggregate cycle counts, per-hour spawn sparkline, and per-class
-    last-spawn/cooldown info derived from the durable
-    ``DispatcherCycleRecord`` table and the ``RegressionRemediationCase``
-    table.  Works at all viewport widths and returns zero / empty arrays on
-    a cold start (empty table) — never raises — so the UI shows 'no data'
-    rather than crashing.
-    """
-    from app.dispatcher_read_api import get_dispatcher_cycle_records  # noqa: PLC0415
-    from app.regression_dispatcher_metrics import compute_mtti_p50_sec  # noqa: PLC0415
-
-    pid_str = str(project_id) if project_id else None
-    # ``window_hours`` is bounded to 168 above; pull a large enough page that
-    # the aggregates and sparkline both cover the full window.  Default tick
-    # interval is 60s → 168h * 60 = ~10080 rows worst case; we cap at 11000
-    # to cover the last week at 1-minute resolution without truncation.  The
-    # (project_id, cycle_started_at) index makes this read cheap.
-    cycles = await get_dispatcher_cycle_records(
-        session,
-        project_id=pid_str,
-        limit=11000,
-        window_hours=window_hours,
-    )
-
-    # Aggregate totals
-    total_cycles = len(cycles)
-    total_signals_evaluated = sum(r.get("signals_evaluated", 0) for r in cycles)
-    total_signals_tripped = sum(r.get("signals_tripped", 0) for r in cycles)
-    total_spawns = sum(r.get("spawns_emitted", 0) for r in cycles)
-    total_cooldown = sum(
-        r.get("rejections_by_reason", {}).get("cooldown", 0) for r in cycles
-    )
-    total_dedup = sum(r.get("rejections_by_reason", {}).get("dedup", 0) for r in cycles)
-    total_cap = sum(
-        r.get("rejections_by_reason", {}).get("system_cap", 0) for r in cycles
-    )
-    total_mi_suppressed = sum(
-        r.get("rejections_by_reason", {}).get("manual_intervention_suppressed", 0)
-        for r in cycles
-    )
-
-    # Compute mttd_p50_sec as mean of non-None values
-    mttd_values = [
-        r.get("mttd_p50_sec") for r in cycles if r.get("mttd_p50_sec") is not None
-    ]
-    mttd_p50_sec = sum(mttd_values) / len(mttd_values) if mttd_values else None
-
-    # Sum recovery counts across cycles
-    total_marginal_recoveries = sum(
-        r.get("marginal_recoveries_count", 0) for r in cycles
-    )
-    total_confirmed_recoveries = sum(
-        r.get("confirmed_recoveries_count", 0) for r in cycles
-    )
-
-    # Per-hour sparkline: count spawns_emitted in each 1-hour bucket
-    now = datetime.utcnow()
-    sparkline: List[Dict[str, Any]] = []
-    for h in range(window_hours - 1, -1, -1):
-        bucket_start = (now - timedelta(hours=h + 1)).isoformat()
-        bucket_end = (now - timedelta(hours=h)).isoformat()
-        bucket_spawns = sum(
-            r.get("spawns_emitted", 0)
-            for r in cycles
-            if bucket_start <= r.get("cycle_started_at", "") < bucket_end
-        )
-        bucket_cycles = sum(
-            1
-            for r in cycles
-            if bucket_start <= r.get("cycle_started_at", "") < bucket_end
-        )
-        sparkline.append(
-            {
-                "hour_start": bucket_start,
-                "spawns": bucket_spawns,
-                "cycles": bucket_cycles,
-            }
-        )
-
-    # Per-class info from DB: last seen_at, status, cooldown
-    where_clause = [RegressionRemediationCase.status != RegressionCaseStatus.CLOSED]
-    if project_id is not None:
-        where_clause.append(RegressionRemediationCase.project_id == project_id)
-    cases = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase)
-                .where(*where_clause)
-                .order_by(RegressionRemediationCase.last_seen_at.desc())
-                .limit(200)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    from app.pipeline_regression_dispatcher import _REGRESSION_COOLDOWN  # noqa: PLC0415
-
-    # Compute MTTI: query cases acknowledged within the window
-    cutoff = datetime.utcnow() - timedelta(hours=window_hours)
-    mtti_where = [
-        RegressionRemediationCase.operator_acknowledged_at >= cutoff,
-        RegressionRemediationCase.needs_manual_intervention_at.is_not(None),
-    ]
-    if project_id is not None:
-        mtti_where.append(RegressionRemediationCase.project_id == project_id)
-    acked_cases = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase).where(*mtti_where).limit(1000)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    mtti_p50_sec = compute_mtti_p50_sec(list(acked_cases))
-
-    per_class: List[Dict[str, Any]] = []
-    for case in cases:
-        last_seen = case.last_seen_at
-        cooldown_until: Optional[str] = None
-        if last_seen:
-            cooldown_end = last_seen + _REGRESSION_COOLDOWN
-            if cooldown_end > now:
-                cooldown_until = cooldown_end.isoformat()
-        per_class.append(
-            {
-                "project_id": str(case.project_id),
-                "regression_class": case.regression_class,
-                "status": case.status,
-                "last_seen_at": last_seen.isoformat() if last_seen else None,
-                "attempts": case.attempts,
-                "in_cooldown_until": cooldown_until,
-            }
-        )
-
-    return {
-        "window_hours": window_hours,
-        "aggregate": {
-            "cycles": total_cycles,
-            "signals_evaluated": total_signals_evaluated,
-            "signals_tripped": total_signals_tripped,
-            "spawns": total_spawns,
-            "mttd_p50_sec": mttd_p50_sec,
-            "mtti_p50_sec": mtti_p50_sec,
-            "recoveries": {
-                "marginal": total_marginal_recoveries,
-                "confirmed": total_confirmed_recoveries,
-            },
-            "rejections": {
-                "cooldown": total_cooldown,
-                "dedup": total_dedup,
-                "system_cap": total_cap,
-                "manual_intervention_suppressed": total_mi_suppressed,
-            },
-        },
-        "spawns_sparkline": sparkline,
-        "per_class": per_class,
-    }
-
-
-@router.get("/regression-dispatcher/mtta")
-async def get_regression_mtta(
-    project_id: Optional[uuid.UUID] = Query(default=None),
-    window_days: int = Query(default=30, ge=1, le=365),
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),  # noqa: ARG001
-) -> Dict[str, Any]:
-    """MTTA (Mean-Time-to-Auto-Fix) per regression class.
-
-    Returns p50/p90 lifecycle stage durations from historical cases and live
-    elapsed times for currently-active cases so operators can see 'is this
-    auto-fixing on schedule or has it stalled?'
-    """
-    from app.dispatcher_read_api import (  # noqa: PLC0415
-        get_regression_mtta_dashboard_data,
-    )
-
-    return await get_regression_mtta_dashboard_data(
-        session,
-        project_id=project_id,
-        window_days=window_days,
-    )
 
 
 @router.get("/projects/{project_id}/warm-reuse-funnel")
@@ -1058,52 +787,6 @@ async def get_warm_reuse_funnel(
         project_id, current_user["user_id"], session, min_role="viewer"
     )
     return get_reuse_funnel_snapshot(window_hours=window_hours)
-
-
-@router.get("/regression-dispatcher/escalation-outcomes")
-async def get_regression_escalation_outcomes(
-    project_id: Optional[uuid.UUID] = Query(default=None),
-    lookback_days: int = Query(default=30, ge=1, le=180),
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),  # noqa: ARG001
-) -> Dict[str, Any]:
-    """Aggregate case outcomes by escalation_reason bucket.
-
-    Groups RegressionRemediationCase rows into six buckets: four meta-escalation
-    reasons (escalated_cross_layer, escalated_layer_concentration,
-    escalated_cross_case_fingerprint, escalated_recurrence), one
-    compliance_followup bucket for cross-layer cases where a followup fix was
-    spawned and merged, and all_other.  Returns per-bucket merged_count,
-    retripped_within_30d_count, durable_resolution_rate, median_hold_days,
-    prevention_rate_30d, recurrences_observed, and in_flight_excluded_count.
-    Cross-layer cases with a compliance followup fix are re-bucketed into
-    compliance_followup so operators can compare the loop's lift against baseline.
-    """
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
-        compute_escalation_outcome_breakdown,
-    )
-
-    cutoff = datetime.utcnow() - timedelta(days=lookback_days)
-    where: List = [RegressionRemediationCase.first_seen_at >= cutoff]
-    if project_id is not None:
-        where.append(RegressionRemediationCase.project_id == project_id)
-
-    cases = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase)
-                .where(*where)
-                .order_by(RegressionRemediationCase.first_seen_at.desc())
-                .limit(2000)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    return compute_escalation_outcome_breakdown(
-        list(cases), lookback_days=lookback_days
-    )
 
 
 @router.get("/pipeline-efficiency")
@@ -1195,25 +878,4 @@ async def get_pipeline_efficiency(
         "computed_at": now.isoformat(),
         "window_24h": _augment(cur_24h, pri_24h),
         "window_7d": _augment(cur_7d, pri_7d),
-    }
-
-
-@router.get("/canonical-regression-layers")
-async def get_canonical_regression_layers(
-    current_user: dict = Depends(get_current_user),  # noqa: ARG001
-):
-    """Return the canonical regression layers with descriptions and display order."""
-    from app.regression_layer_classifier import (  # noqa: PLC0415
-        LAYER_DISPLAY_ORDER,
-        LAYER_DESCRIPTIONS,
-    )
-
-    return {
-        "layers": [
-            {
-                "name": layer,
-                "description": LAYER_DESCRIPTIONS.get(layer, ""),
-            }
-            for layer in LAYER_DISPLAY_ORDER
-        ]
     }

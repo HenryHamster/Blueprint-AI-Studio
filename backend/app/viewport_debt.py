@@ -12,18 +12,17 @@ caching, and response shape are unchanged.
 import asyncio
 import re as _re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path as _Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
 from app.auth import require_admin
 from app.database import get_session
-from app.models import Project, RegressionRemediationCase
+from app.models import Project
 
 router = APIRouter()
 
@@ -248,43 +247,18 @@ async def get_viewport_debt(
     untested_rows = [dict(r) for r in top_untested]
 
     if rows or untested_rows:
-        from app.regression_layer_classifier import (  # noqa: PLC0415
-            parse_viewport_regression_class,
-        )
-
-        cutoff = datetime.utcnow() - timedelta(days=30)
-        stmt = select(RegressionRemediationCase).where(
-            RegressionRemediationCase.project_id == project_id,
-            RegressionRemediationCase.regression_class.startswith(
-                "viewport_regression:"
-            ),
-            RegressionRemediationCase.first_seen_at >= cutoff,
-        )
-        vp_cases = (await session.execute(stmt)).scalars().all()
-
-        # Map component stem → case count and per-assertion-type breakdown
-        case_counts: Dict[str, int] = {}
-        case_breakdown: Dict[str, Dict[str, int]] = {}
-        for c in vp_cases:
-            parsed = parse_viewport_regression_class(c.regression_class)
-            comp = parsed.get("component")
-            if comp:
-                # Normalize component name to .tsx extension for consistent lookup
-                if not comp.endswith(".tsx"):
-                    comp = f"{comp}.tsx"
-                case_counts[comp] = case_counts.get(comp, 0) + 1
-                atype = parsed.get("assertion_type") or "unknown"
-                bd = case_breakdown.setdefault(comp, {})
-                bd[atype] = bd.get(atype, 0) + 1
-
+        # The per-component regression-case enrichment was sourced from
+        # RegressionRemediationCase rows written by the pipeline-regression
+        # dispatcher, which has been removed. No live writer remains, so the
+        # case-count/breakdown fields are kept as empty defaults to preserve
+        # the response shape; only the source_url annotation is still derived.
         project = await session.get(Project, project_id)
         gh_owner = project.github_owner if project else None
         gh_repo = project.github_repo if project else None
 
         for row in (*rows, *untested_rows):
-            stem_tsx = _Path(row["component"]).name  # e.g. "MessagesPanel.tsx"
-            row["regression_case_count"] = case_counts.get(stem_tsx, 0)
-            row["regression_case_breakdown"] = case_breakdown.get(stem_tsx, {})
+            row["regression_case_count"] = 0
+            row["regression_case_breakdown"] = {}
             if gh_owner and gh_repo:
                 row["source_url"] = (
                     f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"

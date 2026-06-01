@@ -21,7 +21,6 @@ from app.models import (
     Artifact,
     ArtifactType,
     _utcnow,
-    RegressionRemediationCase,
     StrategicCycle,
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
@@ -35,11 +34,8 @@ from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
     _compute_first_attempt_breakdowns,
     _compute_first_review_approval_breakdowns,
-    _compute_layer_coverage_by_class,  # noqa: F401  re-exported for external importers
-    _compute_regression_case_summary,  # noqa: F401  re-exported for external importers
     _compute_sr_disallowed_blind_spot_rate,
     _compute_sr_skip_rate,
-    _compute_symptom_layers_by_class,  # noqa: F401  re-exported for external importers
     _serialize_sr_catch_rate_trends,
     _stash_projected_task_fields,
     _task_prompt_fingerprint,  # noqa: F401  re-exported for external importers
@@ -91,14 +87,13 @@ router.include_router(_efficiency_snapshot_router)
 router.include_router(_pipeline_obs_router)
 router.include_router(_release_version_router)
 
-# Residual/regression-case CRUD endpoints relocated to app.regression_case_endpoints.
+# Residual-case CRUD endpoints relocated to app.residual_case_endpoints.
 # Re-exported here so existing call sites keep working.
-from app.regression_case_endpoints import (  # noqa: E402
-    router as _regression_case_router,
-    clear_regression_manual_intervention,  # noqa: F401  re-exported for external importers
+from app.residual_case_endpoints import (  # noqa: E402
+    router as _residual_case_router,
 )
 
-router.include_router(_regression_case_router)
+router.include_router(_residual_case_router)
 
 # Release version lifecycle endpoints relocated to app.routers.admin_release_version.
 # Re-exported here so existing call sites keep working.
@@ -128,7 +123,6 @@ from app.efficiency_snapshot import (  # noqa: E402, F401
     get_llm_cost_breakdown,
 )
 from app.routers.admin_pipeline_observability import (  # noqa: E402, F401
-    get_canonical_regression_layers,
     get_drift_snapshot,
     get_fix_loop_convergence,
     get_fix_loop_convergence_trend,
@@ -136,9 +130,6 @@ from app.routers.admin_pipeline_observability import (  # noqa: E402, F401
     get_pipeline_efficiency,
     get_pipeline_regressions,
     get_provider_cost_summary,
-    get_regression_dispatcher_health,
-    get_regression_escalation_outcomes,
-    get_regression_mtta,
     get_warm_reuse_funnel,
 )
 
@@ -893,24 +884,6 @@ async def _compute_digest(
                 "by_path": _by_path,
             }
 
-    # --- Prevention-rate 7d aggregate ---
-    avg_prevention_rate_7d: Optional[Dict[str, Any]] = None
-    if project_id:
-        from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
-            compute_avg_prevention_rate_7d,
-        )
-
-        _prev_cases = list(
-            (
-                await session.execute(
-                    select(RegressionRemediationCase).where(
-                        RegressionRemediationCase.project_id == project_id
-                    )
-                )
-            ).scalars()
-        )
-        avg_prevention_rate_7d = compute_avg_prevention_rate_7d(_prev_cases)
-
     # --- Prevention efficacy summary ---
     # Aggregate preventive-context outcomes across recent research_history
     # entries so operators can see whether proactive context injection actually
@@ -1247,7 +1220,6 @@ async def _compute_digest(
         "pipeline_filter_funnel": pipeline_filter_funnel or None,
         "scope_mismatch_summary": scope_mismatch_summary,
         "escalation_outcome_summary": escalation_outcome_summary,
-        "avg_prevention_rate_7d": avg_prevention_rate_7d,
         "prevention_efficacy": prevention_efficacy,
         "rejection_pattern_summary": rejection_pattern_summary,
         "retry_pattern_summary": retry_pattern_summary,

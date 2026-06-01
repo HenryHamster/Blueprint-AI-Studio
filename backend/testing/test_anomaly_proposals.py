@@ -1,4 +1,15 @@
-"""Standalone tests for persistent anomaly tracking and proposal generation.
+"""Standalone tests for persistent anomaly tracking and proposal expiry.
+
+These cover the surviving anomaly DETECTION + proposal-lifecycle helpers:
+
+  * ``_compute_research_anomalies`` — persists detected anomalies into
+    ``_shared_state.persistent_anomalies`` and ages out stale entries.
+  * ``_expire_stale_proposals`` — marks proposed directions older than the
+    retention window as expired.
+
+The anomaly→direction-proposal *feeder* (``_check_anomaly_proposals``) has been
+removed along with the self-repair apparatus, so its tests are gone. The
+detection bookkeeping and the proposed-direction schema/lifecycle remain.
 
 These tests do not require a database — all DB calls are mocked.
 Run with: bash scripts/test-backend.sh testing/test_anomaly_proposals.py --standalone
@@ -13,7 +24,6 @@ import pytest
 import app.shared_state as _shared_state
 from app.anomaly_detection import (
     _compute_research_anomalies,
-    _check_anomaly_proposals,
     _expire_stale_proposals,
 )
 from app.models import TaskStatus
@@ -49,27 +59,6 @@ def _make_session(tasks: list, project, all_tasks_72h: list | None = None):
     project_result.scalar_one_or_none.return_value = project
 
     session.execute = AsyncMock(side_effect=[tasks_result, all_result, project_result])
-    return session
-
-
-def _make_proposal_session(project=None):
-    """Build a mock AsyncSession for _check_anomaly_proposals.
-
-    _check_anomaly_proposals serializes its directions write through
-    with_directions_locked -> project_lock, which issues a SELECT FOR UPDATE
-    and re-loads the project row inside the lock. Wire session.execute to
-    return the in-memory `project` from scalar_one_or_none so the mutate
-    closure operates on (and the assertions can observe) that same object.
-    session.add / session.expire are synchronous in SQLAlchemy, so use
-    MagicMock to avoid un-awaited-coroutine warnings.
-    """
-    session = AsyncMock()
-    session.add = MagicMock()
-    session.expire = MagicMock()
-    if project is not None:
-        result = MagicMock()
-        result.scalar_one_or_none = MagicMock(return_value=project)
-        session.execute = AsyncMock(return_value=result)
     return session
 
 
@@ -195,273 +184,7 @@ async def test_recent_unseen_anomaly_not_expired():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _check_anomaly_proposals
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_proposal_created_after_3_occurrences():
-    """Anomaly with occurrence_count >= 3 generates a direction proposal."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "CODE_ERROR": {
-            "first_seen": (now - timedelta(hours=72)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 3,
-            "severity": "high",
-            "latest_details": "AttributeError in module X",
-        }
-    }
-
-    project = make_project(directions=[])
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    # Should have one proposed direction
-    assert len(project.directions) == 1
-    d = project.directions[0]
-    assert d["status"] == "proposed"
-    assert d["proposed_by"] == "ANOMALY_DETECTOR"
-    assert "CODE_ERROR" in d["text"]
-    assert d["priority"] == "high"
-
-    # Occurrence count should be reset
-    assert (
-        _shared_state.persistent_anomalies[proj_key]["CODE_ERROR"]["occurrence_count"]
-        == 0
-    )
-
-
-@pytest.mark.asyncio
-async def test_no_proposal_below_3_occurrences():
-    """Anomaly with occurrence_count < 3 does not generate a proposal."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "CODE_ERROR": {
-            "first_seen": (now - timedelta(hours=24)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 2,
-            "severity": "medium",
-            "latest_details": "Some error",
-        }
-    }
-
-    project = make_project(directions=[])
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    assert len(project.directions) == 0
-
-
-@pytest.mark.asyncio
-async def test_max_one_proposal_per_cycle():
-    """Only 1 anomaly-driven proposal is created per call, even with multiple eligible anomalies."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "CODE_ERROR": {
-            "first_seen": (now - timedelta(hours=72)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 5,
-            "severity": "high",
-            "latest_details": "Error A",
-        },
-        "PROVISION_FAILURE": {
-            "first_seen": (now - timedelta(hours=48)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 4,
-            "severity": "medium",
-            "latest_details": "Error B",
-        },
-    }
-
-    project = make_project(directions=[])
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    # Only 1 proposal created (capped at 1 per cycle)
-    assert len(project.directions) == 1
-
-
-@pytest.mark.asyncio
-async def test_proposal_respects_10_pending_cap():
-    """No proposal created when 10 pending proposals already exist."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "CODE_ERROR": {
-            "first_seen": (now - timedelta(hours=72)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 5,
-            "severity": "high",
-            "latest_details": "Error details",
-        }
-    }
-
-    # Create 10 existing proposed directions
-    existing = [
-        {"id": f"d-cap{i:05d}", "text": f"Existing proposal {i}", "status": "proposed"}
-        for i in range(10)
-    ]
-    project = make_project(directions=existing)
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    # Should still be 10 (no new proposal added)
-    assert len(project.directions) == 10
-
-
-@pytest.mark.asyncio
-async def test_duplicate_proposal_skipped():
-    """Anomaly proposal overlapping with existing direction is skipped."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "CODE_ERROR": {
-            "first_seen": (now - timedelta(hours=72)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 3,
-            "severity": "high",
-            "latest_details": "AttributeError in module X",
-        }
-    }
-
-    # Existing direction that overlaps with the proposal text
-    existing = [
-        {
-            "id": "d-existing1",
-            "text": "Investigate and reduce CODE_ERROR task failures in the pipeline",
-            "status": "active",
-        }
-    ]
-    project = make_project(directions=existing)
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    # No new proposal added (duplicate detected)
-    assert len(project.directions) == 1
-
-
-@pytest.mark.asyncio
-async def test_proposal_has_correct_fields():
-    """Verify the structure of a generated anomaly proposal."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "PROVISION_FAILURE": {
-            "first_seen": (now - timedelta(hours=96)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 4,
-            "severity": "medium",
-            "latest_details": "VM startup timeout",
-        }
-    }
-
-    project = make_project(directions=[])
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    d = project.directions[0]
-    assert d["id"].startswith("d-")
-    assert d["status"] == "proposed"
-    assert d["proposed_by"] == "ANOMALY_DETECTOR"
-    assert "PROVISION_FAILURE" in d["text"]
-    assert d["priority"] == "medium"
-    assert "proposed_at" in d
-    assert "proposal_rationale" in d
-    assert "4 times" in d["proposal_rationale"]
-    assert d["paths"] == []
-
-
-@pytest.mark.asyncio
-async def test_no_anomalies_no_proposals():
-    """Empty persistent_anomalies dict produces no proposals."""
-    project_id = uuid.uuid4()
-    project = make_project(directions=[])
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    assert len(project.directions) == 0
-
-
-@pytest.mark.asyncio
-async def test_end_to_end_3_cycles_generates_proposal():
-    """Simulate 3 detection cycles of the same anomaly, then verify a proposal is created."""
-    now = _utcnow()
-    project_id = uuid.uuid4()
-    project = make_project(directions=[])
-
-    tasks = [
-        make_task(
-            project_id=project_id,
-            status=TaskStatus.FAILED,
-            latest_status_message="failed to provision vm",
-            created_at=now - timedelta(hours=5 + i),
-        )
-        for i in range(5)
-    ]
-
-    # Simulate 3 detection cycles
-    for _ in range(3):
-        session = _make_session(tasks=tasks, project=project)
-        await _compute_research_anomalies(project_id, session)
-
-    proj_key = str(project_id)
-    assert (
-        _shared_state.persistent_anomalies[proj_key]["PROVISION_FAILURE"][
-            "occurrence_count"
-        ]
-        == 3
-    )
-
-    # Now check for proposals
-    project.id = project_id
-    session = _make_proposal_session(project)
-    await _check_anomaly_proposals(project, session)
-
-    assert len(project.directions) == 1
-    assert project.directions[0]["proposed_by"] == "ANOMALY_DETECTOR"
-    assert "PROVISION_FAILURE" in project.directions[0]["text"]
-
-    # Occurrence count reset after proposal
-    assert (
-        _shared_state.persistent_anomalies[proj_key]["PROVISION_FAILURE"][
-            "occurrence_count"
-        ]
-        == 0
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Direction-level anomaly tracking and proposals
+# Direction-level anomaly tracking
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -515,44 +238,6 @@ async def test_direction_anomalies_tracked_with_unique_keys():
     assert "Direction" not in anomalies
     assert "Direction_d-aaa00001" not in anomalies
     assert "Direction_d-bbb00002" not in anomalies
-
-
-@pytest.mark.asyncio
-async def test_direction_anomaly_proposal_after_3_occurrences():
-    """Direction-level anomaly with occurrence_count >= 3 generates a proposal."""
-    project_id = uuid.uuid4()
-    proj_key = str(project_id)
-    now = _utcnow()
-
-    _shared_state.persistent_anomalies[proj_key] = {
-        "Direction_d-test0001_merge_decline": {
-            "first_seen": (now - timedelta(hours=72)).isoformat(),
-            "last_seen": now.isoformat(),
-            "occurrence_count": 3,
-            "severity": "medium",
-            "latest_details": 'Direction "Improve test coverage" (id: d-test0001) has seen a consistent decline',
-        }
-    }
-
-    project = make_project(directions=[])
-    project.id = project_id
-    session = _make_proposal_session(project)
-
-    await _check_anomaly_proposals(project, session)
-
-    assert len(project.directions) == 1
-    d = project.directions[0]
-    assert d["status"] == "proposed"
-    assert d["proposed_by"] == "ANOMALY_DETECTOR"
-    # The proposal path keys off the ``Direction_`` prefix, which still matches
-    # the new per-signal keys.
-    assert "Direction_d-test0001_merge_decline" in d["text"]
-    assert (
-        _shared_state.persistent_anomalies[proj_key][
-            "Direction_d-test0001_merge_decline"
-        ]["occurrence_count"]
-        == 0
-    )
 
 
 @pytest.mark.asyncio

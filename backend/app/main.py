@@ -29,8 +29,6 @@ from app.models import (
     DeploymentStatus,
     Alert,
     AlertSeverity,
-    RegressionRemediationCase,
-    RegressionCaseStatus,
 )
 from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
 from app.auth import get_current_user
@@ -77,7 +75,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0129"
+EXPECTED_SCHEMA_REVISION = "0130"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -1640,42 +1638,6 @@ async def health_detailed(
     ph_snapshot = _shared_state.get_pipeline_health_snapshot()
     ph_status = "degraded" if ph_snapshot["alerts_active"] else "ok"
     components["pipeline_health"] = dict(ph_snapshot, status=ph_status)
-
-    # --- Viewport Debt ---
-    _vp_open = [
-        RegressionCaseStatus.ACTIVE,
-        RegressionCaseStatus.REMEDIATING,
-        RegressionCaseStatus.MERGED,
-    ]
-    try:
-        _vp_total = (
-            await session.execute(
-                select(func.count())
-                .select_from(RegressionRemediationCase)
-                .where(
-                    RegressionRemediationCase.regression_class.like("VIEWPORT:%"),
-                    RegressionRemediationCase.status.in_(_vp_open),
-                )
-            )
-        ).scalar() or 0
-        _vp_attributed = (
-            await session.execute(
-                select(func.count())
-                .select_from(RegressionRemediationCase)
-                .where(
-                    RegressionRemediationCase.regression_class.like("VIEWPORT:%"),
-                    RegressionRemediationCase.status.in_(_vp_open),
-                    RegressionRemediationCase.introducing_pr_number.isnot(None),
-                )
-            )
-        ).scalar() or 0
-    except Exception:
-        _vp_total = _vp_attributed = 0
-    components["viewport_debt"] = {
-        "status": "ok" if _vp_total == 0 else "degraded",
-        "open_cases": _vp_total,
-        "attributed_cases": _vp_attributed,
-    }
 
     # --- Overall Status ---
     statuses = [

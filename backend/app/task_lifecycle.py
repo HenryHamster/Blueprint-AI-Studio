@@ -31,7 +31,6 @@ from app.models import (
     Alert,
     AlertSeverity,
     ProjectStatus,
-    RegressionRemediationCase,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import (
@@ -272,347 +271,6 @@ async def _increment_research_spawn_count(
     return new_count
 
 
-async def _spawn_ci_auto_remediation_followup(
-    task: Task,
-    session: AsyncSession,
-) -> bool:
-    """Spawn an investigate task after a CI auto-remediation task fails.
-
-    CI auto-remediation tasks lack a direction_id, so the standard
-    code-defect investigation gate skips them. This trigger fires per
-    failed auto-fix and dedups by (project, ci_failure_branch, fingerprint)
-    over a 24h window to avoid runaway loops on flapping checks.
-    Returns True when an investigation is spawned.
-    """
-    from datetime import timedelta
-    from app.main import _utcnow
-
-    ctx = task.context or {}
-    _ci_project = (
-        await session.get(Project, task.project_id) if task.project_id else None
-    )
-    if not _ci_project:
-        logger.warning(
-            "[AUTO-REMEDIATION] _spawn_ci_auto_remediation_followup: "
-            "project not found for task %s (project_id=%s) — aborting follow-up spawn",
-            task.id,
-            task.project_id,
-        )
-        return False
-    _promotion_target = _shared_state.get_project_promotion_target(_ci_project)
-    branch = ctx.get("ci_failure_branch") or _promotion_target
-    fingerprint = ctx.get("_previous_error_fingerprint") or ""
-    failed_checks = ctx.get("ci_failure_checks") or []
-    failure_type = ctx.get("ci_failure_type") or "(unknown)"
-    failed_prompt = (task.first_payload or {}).get("prompt", "") or ""
-    error_summary = (task.latest_status_message or "")[:400]
-
-    cutoff = _utcnow() - timedelta(hours=24)
-    dedup_q = select(Task.id).where(
-        Task.project_id == task.project_id,
-        Task.created_at >= cutoff,
-        Task.payloads[0]["type"].as_string() == "investigate",
-        Task.context["spawned_by"].as_string() == "ci_auto_remediation_failure",
-        Task.context["ci_failure_branch"].as_string() == str(branch),
-    )
-    if fingerprint:
-        dedup_q = dedup_q.where(
-            Task.context["_previous_error_fingerprint"].as_string() == str(fingerprint)
-        )
-    if (await session.execute(dedup_q.limit(1))).first() is not None:
-        logger.info(
-            f"[AUTO-REMEDIATION] Skip follow-up investigation for {task.id}: "
-            f"recent investigation exists for branch={branch} fingerprint={fingerprint[:40]}"
-        )
-        return False
-
-    if isinstance(failed_checks, (list, tuple)):
-        checks_str = ", ".join(str(c) for c in failed_checks)[:300]
-    else:
-        checks_str = str(failed_checks)[:300]
-    prompt_lines = [
-        f"A CI auto-remediation task on branch '{branch}' failed to fix the "
-        f"underlying CI failure. Diagnose why the auto-fix could not resolve it.",
-        "",
-        f"Failure type: {failure_type}",
-        f"Failed checks: {checks_str or '(none captured)'}",
-        f"Error summary: {error_summary or '(no message)'}",
-    ]
-    if fingerprint:
-        prompt_lines.append(f"Error fingerprint: {fingerprint}")
-    if failed_prompt:
-        prompt_lines.extend(
-            [
-                "",
-                f"Approach the auto-fix attempted (truncated):\n{failed_prompt[:1500]}",
-            ]
-        )
-    prompt_lines.append(
-        "\nProduce the structured diagnosis JSON report so a targeted "
-        "remediation can be spawned. Consider whether the failure is "
-        "infrastructure-related, a flaky check, or a deeper code defect "
-        "that the original auto-fix prompt mis-scoped."
-    )
-    inv_payload = validate_internal_payload(
-        {
-            "type": "investigate",
-            "prompt": "\n".join(prompt_lines)[:20000],
-            "base_branch": _shared_state.get_project_integration_branch(_ci_project),
-        },
-        "task_lifecycle:ci_auto_remediation_followup",
-    )
-    inv_ctx = {
-        "spawned_by": "ci_auto_remediation_failure",
-        "source_task_id": str(task.id),
-        "ci_failure_branch": str(branch),
-        "ci_failure_type": failure_type,
-    }
-    if fingerprint:
-        inv_ctx["_previous_error_fingerprint"] = str(fingerprint)
-        inv_ctx["failure_fingerprints"] = [str(fingerprint)]
-    new_task = Task(
-        project_id=task.project_id,
-        title=f"Investigate CI auto-fix failure on {branch}"[:120],
-        description=(
-            f"Auto-spawned after CI auto-remediation task {str(task.id)[:8]} failed"
-        )[:500],
-        payloads=[inv_payload],
-        context=inv_ctx,
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-    )
-    session.add(new_task)
-    session.add(
-        TaskHistory(
-            task_id=new_task.id,
-            action="SPAWNED",
-            details={
-                "spawned_by": "CI_AUTO_REMEDIATION_FAILURE",
-                "source_task_id": str(task.id),
-                "ci_failure_branch": str(branch),
-            },
-        )
-    )
-    logger.info(
-        f"[AUTO-REMEDIATION] Spawned follow-up investigation {new_task.id} "
-        f"for failed auto-fix {task.id} (branch={branch}, "
-        f"fingerprint={fingerprint[:40] if fingerprint else 'none'})"
-    )
-    return True
-
-
-async def _regression_class_for_task(task: Task, session: AsyncSession) -> str | None:
-    """Return the regression_class associated with a task, checking the parent chain.
-
-    Fix tasks spawned by the investigate→fix chain carry diagnosis_task_id in
-    their context pointing to the investigate task, which holds regression_class.
-    This one-level lookup closes the wiring gap so close-loop handlers work for
-    both the investigate task itself and any downstream fix task it spawned.
-    """
-    ctx = task.context or {}
-    rc = ctx.get("regression_class")
-    if rc:
-        return rc
-    diag_id_str = ctx.get("diagnosis_task_id")
-    if not diag_id_str:
-        return None
-    try:
-        parent = await session.get(Task, uuid.UUID(str(diag_id_str)))
-    except Exception:
-        return None
-    return (parent.context or {}).get("regression_class") if parent else None
-
-
-async def _close_loop_regression_case_on_merge(
-    task: Task, pr_number: int, session: AsyncSession
-) -> None:
-    """Advance a RegressionRemediationCase to MERGED when its remediation PR merges."""
-    regression_class = await _regression_class_for_task(task, session)
-    if not regression_class:
-        return
-    result = await session.execute(
-        select(RegressionRemediationCase).where(
-            RegressionRemediationCase.project_id == task.project_id,
-            RegressionRemediationCase.regression_class == regression_class,
-        )
-    )
-    case = result.scalar_one_or_none()
-    if case is None:
-        return
-    snapshot = (task.context or {}).get("signal_snapshot") or {}
-    if not snapshot:
-        # Fall back to spawn-time snapshot; run_recovery_once requires a
-        # non-empty snapshot to evaluate the MERGED→CLOSED transition.
-        snapshot = dict(case.signal_snapshot_at_spawn or {})
-    ctx = task.context or {}
-    spawn_was_cross_layer = bool(ctx.get("cross_layer"))
-    spawn_layers_enumerated = list(ctx.get("cross_layer_layers") or [])
-
-    # Classify layers from PR changed files synchronously at merge time so
-    # the compliance watchdog has layers_targeted immediately rather than
-    # waiting for the async backfill (which can lag hours or fail silently).
-    # Falls back gracefully; _backfill_layers_targeted_once remains as a net.
-    layers_targeted: list[str] | None = None
-    if spawn_was_cross_layer:
-        try:
-            from app.github import get_pr_files, get_repo_installation_token
-            from app.models import Project
-            from app.regression_layer_backfill import _classify_layers_from_paths
-
-            project = await session.get(Project, task.project_id)
-            if project and project.github_owner and project.github_repo:
-                token = await get_repo_installation_token(
-                    project.github_owner, project.github_repo
-                )
-                if token:
-                    files = await get_pr_files(
-                        token,
-                        project.github_owner,
-                        project.github_repo,
-                        pr_number,
-                        project_id=str(task.project_id),
-                    )
-                    paths = [
-                        str(f.get("filename") or "")
-                        for f in files
-                        if isinstance(f, dict)
-                    ]
-                    layers_targeted = _classify_layers_from_paths(paths)
-        except Exception as exc:
-            logger.warning(
-                "[REGRESSION-CASE] Synchronous layer classification failed for "
-                "PR #%s project=%s: %s — backfill will retry",
-                pr_number,
-                task.project_id,
-                exc,
-            )
-
-    # Verify the PR's merge commit is reachable from the integration branch before
-    # advancing the case.  A PR merged only into a rollup staging branch has NOT
-    # landed on the integration branch — advancing the case would suppress re-spawning
-    # while the regression is still live.  Fail-safe (skip) on INDETERMINATE (None) as
-    # well as a definitive False; only a confirmed True (ancestor) proceeds.  Exception
-    # in the outer try/except is still fail-open (credentials unavailable, etc.) because
-    # the ancestry helper was unreachable, not because it returned a negative signal.
-    try:
-        from app.github import (
-            get_pull_request as _get_pull_request,
-            get_repo_installation_token as _get_installation_token,
-            is_ancestor_of as _is_ancestor_of,
-        )
-        from app.models import Project as _Project
-
-        _anc_project = await session.get(_Project, task.project_id)
-        if _anc_project and _anc_project.github_owner and _anc_project.github_repo:
-            _anc_token = await _get_installation_token(
-                _anc_project.github_owner, _anc_project.github_repo
-            )
-            if _anc_token:
-                _pr_data = await _get_pull_request(
-                    _anc_token,
-                    _anc_project.github_owner,
-                    _anc_project.github_repo,
-                    pr_number,
-                    project_id=str(task.project_id),
-                )
-                _merge_sha = (_pr_data or {}).get("merge_commit_sha")
-                if _merge_sha:
-                    _integration_branch = _shared_state.get_project_integration_branch(
-                        _anc_project
-                    )
-                    _is_anc = await _is_ancestor_of(
-                        _anc_token,
-                        _anc_project.github_owner,
-                        _anc_project.github_repo,
-                        _merge_sha,
-                        _integration_branch,
-                        project_id=str(task.project_id),
-                    )
-                    if _is_anc is not True:
-                        logger.info(
-                            "[REGRESSION-CASE] Skipping mark_merged for PR #%s "
-                            "project=%s: merge commit %s not confirmed ancestor of %s "
-                            "(result=%s — indeterminate treated as not landed)",
-                            pr_number,
-                            task.project_id,
-                            _merge_sha,
-                            _integration_branch,
-                            _is_anc,
-                        )
-                        return
-    except Exception as _exc_anc:
-        logger.warning(
-            "[REGRESSION-CASE] Ancestry check skipped for PR #%s project=%s: %s — proceeding",
-            pr_number,
-            task.project_id,
-            _exc_anc,
-        )
-
-    case.mark_merged(
-        pr_number,
-        snapshot,
-        layers_targeted=layers_targeted,
-        spawn_was_cross_layer=spawn_was_cross_layer,
-        spawn_layers_enumerated=spawn_layers_enumerated
-        if spawn_was_cross_layer
-        else None,
-    )
-
-    # Persist recommended_unmodifiable_layers from task context into the
-    # fix-log entry so compliance accounting can credit documented
-    # unmodifiable layers (e.g. CI_WORKFLOW) toward the >=2-layer mandate.
-    if spawn_was_cross_layer:
-        recommended_unmod = [
-            layer
-            for layer in (ctx.get("recommended_unmodifiable_layers") or [])
-            if isinstance(layer, str)
-        ]
-        if recommended_unmod:
-            log = list(case.fingerprint_to_fix_log or [])
-            if (
-                log
-                and isinstance(log[-1], dict)
-                and log[-1].get("fix_pr_number") == pr_number
-            ):
-                log[-1]["recommended_unmodifiable_layers"] = recommended_unmod
-                case.fingerprint_to_fix_log = log
-
-    session.add(case)
-
-
-async def _close_loop_regression_case_on_failure(
-    task: Task, session: AsyncSession
-) -> None:
-    """Re-arm or escalate a RegressionRemediationCase when its remediation task fails."""
-    regression_class = await _regression_class_for_task(task, session)
-    if not regression_class:
-        return
-    result = await session.execute(
-        select(RegressionRemediationCase).where(
-            RegressionRemediationCase.project_id == task.project_id,
-            RegressionRemediationCase.regression_class == regression_class,
-        )
-    )
-    case = result.scalar_one_or_none()
-    if case is None:
-        return
-    try:
-        case.last_failure_class = classify_failure(
-            task, at_time=task.last_heartbeat or task.started_at
-        )
-    except Exception as exc:
-        logger.warning(
-            "classify_failure raised while capturing last_failure_class for case %s: %s",
-            case.id,
-            exc,
-        )
-    if task.latest_status_message:
-        case.last_failure_summary = task.latest_status_message[:500]
-    case.re_arm()
-    session.add(case)
-
-
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -644,12 +302,9 @@ async def _process_post_commit(
         _handle_security_audit_completion,
         _handle_perf_completion,
         _handle_self_audit_completion,
-        _handle_investigation_completion,
         _handle_memo_completion,
         _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
-        _handle_investigation_terminal_failure,
-        _record_regression_signal_if_matching,
     )
     from app.strategic_completion import (
         _handle_strategic_completion,
@@ -876,42 +531,6 @@ async def _process_post_commit(
                         "[AUTO-REMEDIATION] Failed to post failure result message: %s",
                         _ar_exc,
                     )
-
-                # Spawn a follow-up investigation for the failed CI auto-fix.
-                # The standard _spawn_task_failure_investigation path requires a
-                # direction_id, which CI auto-remediation tasks lack — so trigger
-                # the investigation directly here, deduped by branch+fingerprint
-                # over a 24h window so a flapping check doesn't spawn N copies.
-                try:
-                    await _spawn_ci_auto_remediation_followup(task, session)
-                except Exception as _ci_inv_exc:
-                    logger.error(
-                        f"[AUTO-REMEDIATION] Failed to spawn follow-up investigation for {task.id}: {_ci_inv_exc!r}",
-                        exc_info=True,
-                    )
-
-            # Task-level CODE_ERROR investigation trigger: when a directed task
-            # exhausts retries with a code_defect failure, spawn an investigate
-            # task to diagnose the specific failure pattern. Direction-hold path
-            # only fires after 3 consecutive failures on a direction; this fires
-            # per-task so one-off recurring defects still get diagnosed.
-            try:
-                from app.autonomous_research import _spawn_task_failure_investigation
-
-                await _spawn_task_failure_investigation(task, session)
-            except Exception as _inv_exc:
-                logger.error(
-                    f"[INVESTIGATION] Failed to evaluate task-level trigger for {task.id}: {_inv_exc!r}",
-                    exc_info=True,
-                )
-
-            # Close-loop: re-arm the RegressionRemediationCase when its fix task fails.
-            try:
-                await _close_loop_regression_case_on_failure(task, session)
-            except Exception as _rc_fail_exc:
-                logger.warning(
-                    f"[REGRESSION-CASE] Failed to re-arm case on task failure {task.id}: {_rc_fail_exc!r}"
-                )
 
             # FAILED memo recovery: when a memo task fails with any of the recoverable
             # failure categories, the agent may have emitted a valid memo JSON inside an
@@ -1300,14 +919,6 @@ async def _process_post_commit(
                                     logger.warning(
                                         f"[DIAGNOSIS] Failed to record remediation outcome on merge for task {task.id}: {_rr_exc!r}"
                                     )
-                            try:
-                                await _close_loop_regression_case_on_merge(
-                                    task, pr_number, session
-                                )
-                            except Exception as _rc_merge_exc:
-                                logger.warning(
-                                    f"[REGRESSION-CASE] Failed to advance case on auto-merge for task {task.id}: {_rc_merge_exc!r}"
-                                )
                             await session.commit()
                             await _cleanup_branches(task, session)
                             logger.info(
@@ -2598,15 +2209,6 @@ async def _process_post_commit(
                                                 "[REVIEW_PLAYBOOK] Failed to extract review feedback: %s",
                                                 _rp_exc,
                                             )
-                                        # Close-loop: advance the RegressionRemediationCase to MERGED.
-                                        try:
-                                            await _close_loop_regression_case_on_merge(
-                                                orig, pr_number, session
-                                            )
-                                        except Exception as _rc_merge_exc:
-                                            logger.warning(
-                                                f"[REGRESSION-CASE] Failed to advance case on review-merge for task {orig.id}: {_rc_merge_exc!r}"
-                                            )
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
@@ -3778,9 +3380,6 @@ async def _process_post_commit(
                 elif task_type == "memo":
                     memo_logs = payload.logs or task.latest_status_message or ""
                     await _handle_memo_completion(task, memo_logs, session)
-
-                elif payload.artifact_type == ArtifactType.INVESTIGATION_REPORT:
-                    await _handle_investigation_completion(task, payload, session)
             except Exception as handler_exc:
                 logger.error(
                     f"[STATUS] Completion handler failed for {task_type} task {task.id}: {handler_exc!r}",
@@ -3933,27 +3532,21 @@ async def _process_post_commit(
                 with contextlib.suppress(Exception):
                     await session.rollback()
 
-        # C1: each terminal-record helper does its own session writes (and
-        # _record_remediation_if_terminal can call _record_remediation_outcome /
-        # spawn a follow-up that commits). They are independent operations on the
-        # shared post-commit session: a raise in one must not leave the session
-        # in PendingRollback for the next one or for the final commit below. Run
-        # each behind a rollback-on-failure guard so the chain is poison-free.
-        for _terminal_helper in (
-            _record_remediation_if_terminal,
-            _record_regression_signal_if_matching,
-            _handle_investigation_terminal_failure,
-        ):
-            try:
-                await _terminal_helper(task, payload.status, session)
-            except Exception as _helper_exc:  # noqa: PERF203 — per-helper rollback isolation in a fixed 3-item chain
-                logger.error(
-                    f"[LIFECYCLE] Terminal-record helper {_terminal_helper.__name__} "
-                    f"failed for task {task.id}: {_helper_exc!r}",
-                    exc_info=True,
-                )
-                with contextlib.suppress(Exception):
-                    await session.rollback()
+        # C1: the terminal-record helper does its own session writes (it calls
+        # _record_remediation_outcome which commits). It is an independent
+        # operation on the shared post-commit session: a raise must not leave the
+        # session in PendingRollback for the final commit below. Run it behind a
+        # rollback-on-failure guard so the chain is poison-free.
+        try:
+            await _record_remediation_if_terminal(task, payload.status, session)
+        except Exception as _helper_exc:
+            logger.error(
+                f"[LIFECYCLE] Terminal-record helper _record_remediation_if_terminal "
+                f"failed for task {task.id}: {_helper_exc!r}",
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
 
         # Release-qualifier finalization — fires from EVERY terminal path
         # (COMPLETED / FAILED / CANCELLED) for BOTH a release_audit task and a

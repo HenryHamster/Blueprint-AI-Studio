@@ -10,8 +10,7 @@ orchestrator re-exports each extracted symbol so existing
 tests, background tests, pipeline-reliability tests) keep working.
 
 This tripwire enforces two halves of the facade contract for each
-EXTRACTED_SYMBOLS entry, mirroring
-``test_pipeline_regression_dispatcher_modularity.py``:
+EXTRACTED_SYMBOLS entry:
 
   1. The symbol is NOT defined at module top-level inside
      ``orchestrator.py`` (no ``def`` / ``async def`` / ``class`` /

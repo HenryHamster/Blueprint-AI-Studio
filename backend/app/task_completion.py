@@ -242,6 +242,10 @@ def _stamp_remediation_spawn_on_direction(
         direction["last_remediation_fingerprint"] = str(fingerprint)
 
 
+# Cap on the per-direction remediation-outcome history list length.
+_REMEDIATION_HISTORY_MAX = 5
+
+
 async def _record_remediation_outcome(
     task: Task,
     *,
@@ -642,9 +646,9 @@ async def _record_remediation_if_terminal(
 ) -> None:
     """Stamp remediation outcome on the linked direction when a diagnosis-spawned task terminates.
 
-    On a failed/cancelled remediation, additionally attempt to spawn a
-    follow-up investigation so the pipeline does not have to wait for the
-    48h auto-recovery cycle to revisit the root cause.
+    Records the merged/failed outcome on the targeted direction (and falls back
+    to project-level tracking when no direction linkage survives) so the
+    direction-result ladder sees terminal remediation outcomes.
     """
     if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         return
@@ -681,8 +685,6 @@ async def _record_remediation_if_terminal(
             merged=(status == TaskStatus.COMPLETED),
             session=session,
         )
-        if recorded and status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-            await _maybe_spawn_followup_investigation(task, session)
         if not recorded:
             # Fall back to project-level tracking whenever the direction lookup
             # failed (either no direction_id at all on an auto_remediation, or
@@ -699,9 +701,6 @@ async def _record_remediation_if_terminal(
         logger.warning(
             f"[DIAGNOSIS] Failed to record remediation outcome for task {task.id}: {exc!r}"
         )
-
-
-# Follow-up / investigation completion helpers moved to task_completion_investigation.
 
 
 # ---------------------------------------------------------------------------
@@ -1846,42 +1845,6 @@ from app.task_completion_self_audit import (  # noqa: E402,F401
     _maybe_auto_clear_direction_mode,
     _normalize_self_audit_finding,
     _parse_self_audit_findings,
-)
-from app.task_completion_investigation import (  # noqa: E402,F401
-    _DIAGNOSIS_FLAGS_CLEARED_KEYS,
-    _DIVERGENCE_STOPWORDS,
-    _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT,
-    _FOLLOWUP_INVESTIGATION_DECAY_DAYS,
-    _REGRESSION_FALSE_POSITIVE_MEMO_DEDUP_DAYS,
-    _REMEDIATION_HISTORY_MAX,
-    _STRUCTURAL_CONTEXT_WORDS,
-    _STRUCTURAL_STRONG_KEYWORDS,
-    _STRUCTURAL_WEAK_KEYWORDS,
-    _active_followup_timestamps,
-    _append_followup_dedup_note,
-    _calculate_remediation_scope,
-    _clear_direction_diagnosis_flag,
-    _compute_diagnosis_divergence,
-    _extract_partial_diagnosis,
-    _find_sibling_fingerprint_investigation,
-    _followup_history_all_failed,
-    _handle_investigation_completion,
-    _handle_investigation_terminal_failure,
-    _is_structural_diagnosis,
-    _jaccard,
-    _mark_regression_case_false_positive,
-    _maybe_escalate_diagnosis_divergence,
-    _maybe_escalate_exhausted_followups,
-    _maybe_spawn_followup_investigation,
-    _maybe_spawn_low_confidence_followup,
-    _maybe_spawn_reinvestigation_after_failure,
-    _normalize_path_for_divergence,
-    _project_active_followup_count,
-    _recent_followup_investigation_exists,
-    _record_regression_signal_if_matching,
-    _spawn_investigation_remediation,
-    _spawn_regression_false_positive_memo,
-    _tokenize_for_divergence,
 )
 
 

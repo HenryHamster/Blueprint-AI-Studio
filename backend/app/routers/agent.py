@@ -2828,7 +2828,7 @@ async def claim_task(
     # across >=2 consecutive 7-day windows. Shape: project_context.persistent_blind_spots
     if task_type in ("create", "fix", "refactor", "migrate") and project_for_playbook:
         try:
-            from app.dispatcher_read_api import (
+            from app.sr_blind_spots import (
                 get_sr_persistent_blind_spot_hint,
             )
 

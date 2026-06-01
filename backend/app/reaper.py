@@ -583,6 +583,101 @@ from app.reaper_sweeps import (
     sweep_routine_message_retention,
 )
 
+# Zero-cycle starvation: a project that should be running the strategic loop but
+# has produced NO StrategicCycle row in this window emits a deduped
+# ``strategic_cycle_stall`` WARNING Alert. Distinct from the in-progress-but-stuck
+# detection handled by ``sweep_stalled_strategic_cycles`` — this catches the
+# strategic engine never spawning a cycle at all (the deleted regression-dispatcher
+# ``strategic_cycle_stall`` signal used to surface this; it is now a plain Alert).
+_STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS = 24
+_STRATEGIC_CYCLE_STALL_ALERT_TITLE = "Strategic engine starved: no cycle in window"
+
+
+async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
+    """Emit a deduped strategic_cycle_stall Alert for autonomous projects with no
+    recent StrategicCycle row at all. Returns the number of alerts created."""
+    from app.models import Alert, AlertSeverity, Project, StrategicCycle
+
+    starvation_hours = int(
+        _runtime_config.get(
+            "strategic_cycle_starvation_hours",
+            _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS,
+        )
+        or _STRATEGIC_CYCLE_STARVATION_DEFAULT_HOURS
+    )
+    cutoff = now - timedelta(hours=starvation_hours)
+
+    project_rows = (
+        (
+            await session.execute(
+                select(Project.id, Project.created_at).where(
+                    Project.autonomous_enabled.is_(True)
+                )
+            )
+        )
+        .all()
+    )
+    created = 0
+    for project_id, project_created_at in project_rows:
+        # New projects have not had time to establish a cadence — skip until the
+        # project itself is older than the starvation window.
+        if project_created_at is not None:
+            pc = project_created_at
+            if pc.tzinfo is not None:
+                pc = pc.replace(tzinfo=None)
+            if pc > cutoff:
+                continue
+
+        recent_cycle = (
+            await session.execute(
+                select(StrategicCycle.id)
+                .where(
+                    StrategicCycle.project_id == project_id,
+                    StrategicCycle.phase1_started_at >= cutoff,
+                )
+                .limit(1)
+            )
+        ).first()
+        if recent_cycle is not None:
+            continue
+
+        # Dedup: one open WARNING alert per project for this title.
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == _STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is not None:
+            continue
+
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=_STRATEGIC_CYCLE_STALL_ALERT_TITLE,
+                message=(
+                    f"No strategic cycle has started in the last {starvation_hours}h "
+                    "for this autonomous project — the strategic engine appears "
+                    "starved (zero cycles, not merely stalled mid-cycle). Review the "
+                    "strategic loop scheduler and recent orchestrator logs."
+                )[:1000],
+            )
+        )
+        created += 1
+    if created:
+        await session.commit()
+    return created
+
 
 async def reaper_service():
     """
@@ -3089,7 +3184,10 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 7: Stalled strategic-cycle reaper.
+                # Step 7: Stalled strategic-cycle reaper. Also detects zero-cycle
+                # starvation (autonomous project with no recent StrategicCycle row
+                # at all) and emits the strategic_cycle_stall Alert here — no
+                # separate emitter (operator decision).
                 _mark_reaper_progress()
                 try:
                     await sweep_stalled_strategic_cycles(
@@ -3099,6 +3197,15 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Stalled-cycle sweep error: {e}", exc_info=True
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                try:
+                    await _sweep_strategic_cycle_starvation(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Strategic-cycle starvation sweep error: {e}",
+                        exc_info=True,
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

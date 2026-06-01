@@ -8,7 +8,6 @@ from app.models import (
     CYCLE_META_MEMOS_CITED,
     MaxPlanAccount,
     Project,
-    RegressionRemediationCase,
     StrategicCycle,
     Task,
     get_task_total_vm_cost_usd_or_none,
@@ -68,64 +67,8 @@ def test_memo_stats_coerces_to_int():
     assert stats[CYCLE_META_MEMOS_CITED] == 1
 
 
-# ---------------------------------------------------------------------------
-# RegressionRemediationCase — per-episode investigate anchor
-# ---------------------------------------------------------------------------
 
 _T0 = datetime(2026, 1, 1, 12, 0, 0)
-
-
-def _make_regression_case(investigate_spawned_at=None, fix_log=None):
-    return RegressionRemediationCase(
-        id=str(uuid.uuid4()),
-        project_id=_PROJECT_ID,
-        regression_class="test_class",
-        first_seen_at=_T0,
-        investigate_spawned_at=investigate_spawned_at,
-        fingerprint_to_fix_log=fix_log or [],
-    )
-
-
-def test_current_episode_investigate_start_returns_none_when_no_anchor():
-    case = _make_regression_case(investigate_spawned_at=None, fix_log=[])
-    assert case._current_episode_investigate_start() is None
-
-
-def test_current_episode_investigate_start_first_episode():
-    inv = _T0 + timedelta(minutes=5)
-    case = _make_regression_case(investigate_spawned_at=inv)
-    assert case._current_episode_investigate_start() == inv
-
-
-def test_current_episode_investigate_start_advances_after_recovery():
-    inv = _T0 + timedelta(minutes=5)
-    recovered = _T0 + timedelta(hours=2)
-    case = _make_regression_case(
-        investigate_spawned_at=inv,
-        fix_log=[
-            {
-                "fingerprint": "test_class",
-                "fix_pr_number": 1,
-                "merged_at": (_T0 + timedelta(hours=1)).isoformat(),
-            },
-            {
-                "fingerprint": "test_class",
-                "recovered_at": recovered.isoformat(),
-                "post_merge_value": 0.1,
-            },
-        ],
-    )
-    # After a recovery the anchor should be the recovered_at, not the original investigate_spawned_at
-    assert case._current_episode_investigate_start() == recovered
-
-
-def test_mark_merged_records_episode_investigate_started_at_first_episode():
-    inv = _T0 + timedelta(minutes=5)
-    case = _make_regression_case(investigate_spawned_at=inv)
-    case.mark_merged(pr_number=42, signal_snapshot={"value": 0.9})
-    entry = case.fingerprint_to_fix_log[-1]
-    assert "episode_investigate_started_at" in entry
-    assert datetime.fromisoformat(entry["episode_investigate_started_at"]) == inv
 
 
 # ---------------------------------------------------------------------------
@@ -233,66 +176,6 @@ def test_is_in_rate_limit_cooldown_quota_exhausted_uses_24h():
     )
 
 
-def test_mark_merged_records_episode_investigate_started_at_re_armed():
-    inv = _T0 + timedelta(minutes=5)
-    recovered = _T0 + timedelta(hours=2)
-    case = _make_regression_case(
-        investigate_spawned_at=inv,
-        fix_log=[
-            {
-                "fingerprint": "test_class",
-                "fix_pr_number": 1,
-                "merged_at": (_T0 + timedelta(hours=1)).isoformat(),
-            },
-            {
-                "fingerprint": "test_class",
-                "recovered_at": recovered.isoformat(),
-                "post_merge_value": 0.1,
-            },
-        ],
-    )
-    case.mark_merged(pr_number=99, signal_snapshot={"value": 0.8})
-    entry = case.fingerprint_to_fix_log[-1]
-    # Second episode should anchor on recovered_at, not the original investigate_spawned_at
-    assert datetime.fromisoformat(entry["episode_investigate_started_at"]) == recovered
-
-
-# ---------------------------------------------------------------------------
-# RegressionRemediationCase.mark_merged — merge_sha ancestry audit trail
-# ---------------------------------------------------------------------------
-
-
-def test_mark_merged_stores_fix_merge_sha_when_provided():
-    """fix_merge_sha is recorded in the fix-log entry when a merge commit SHA is given."""
-    case = _make_regression_case(investigate_spawned_at=_T0)
-    case.mark_merged(
-        pr_number=42, signal_snapshot={"value": 0.9}, merge_sha="abc123def456"
-    )
-    entry = case.fingerprint_to_fix_log[-1]
-    assert entry.get("fix_merge_sha") == "abc123def456"
-
-
-def test_mark_merged_omits_fix_merge_sha_when_not_provided():
-    """fix_merge_sha key is absent from the fix-log entry when no SHA is passed (backward compat)."""
-    case = _make_regression_case(investigate_spawned_at=_T0)
-    case.mark_merged(pr_number=42, signal_snapshot={"value": 0.9})
-    entry = case.fingerprint_to_fix_log[-1]
-    assert "fix_merge_sha" not in entry
-
-
-def test_mark_merged_fix_merge_sha_coexists_with_other_fields():
-    """fix_merge_sha is stored alongside layers_targeted and episode anchor without conflict."""
-    case = _make_regression_case(investigate_spawned_at=_T0)
-    case.mark_merged(
-        pr_number=55,
-        signal_snapshot={"value": 0.7},
-        layers_targeted=["PROMPTS", "TESTS"],
-        merge_sha="deadbeef1234",
-    )
-    entry = case.fingerprint_to_fix_log[-1]
-    assert entry.get("fix_merge_sha") == "deadbeef1234"
-    assert entry.get("layers_targeted") == ["PROMPTS", "TESTS"]
-    assert "episode_investigate_started_at" in entry
 
 
 # task_branch_prefix (project-level branch namespace)

@@ -197,7 +197,7 @@ async def _scan_blind_spot_counts(
     result = await session.execute(stmt)
     all_tasks = result.scalars().all()
 
-    from app.regression_layer_classifier import classify_layers
+    from app.failure_layer_classifier import classify_layers
 
     theme_data: Dict[str, dict] = {}
     for t in all_tasks:
@@ -1036,7 +1036,7 @@ def classify_theme_example_layers(examples: list) -> list:
     separately lets callers record per-example layer observations in
     ``symptoms_by_layer`` independently from the signal-level observation.
     """
-    from app.regression_layer_classifier import classify_layers
+    from app.failure_layer_classifier import classify_layers
 
     layers: set = set()
     for ex in examples or []:
@@ -1291,3 +1291,33 @@ async def aggregate_sr_reviewer_disagreements_envelope(
     return _shape_reviewer_disagreement_envelope(
         direction_counts, days=days, limit=limit
     )
+
+
+async def get_sr_persistent_blind_spot_hint(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    days: int = 14,
+) -> dict[str, Any] | None:
+    """Return the persistent SR blind-spot hint for agent task-context injection.
+
+    Re-homed from the deleted ``dispatcher_read_api`` (the only surviving
+    consumer is the agent task-context injector). Reads recent COMPLETED tasks
+    and delegates the windowed analysis to ``compute_persistent_sr_blind_spot_hint``.
+    """
+    now = _utcnow()
+    tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.created_at >= now - timedelta(days=days),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    result = compute_persistent_sr_blind_spot_hint(tasks, now=now)
+    return result if result.get("categories") else None

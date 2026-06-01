@@ -1,4 +1,4 @@
-"""Tests for the self_audit task end-to-end:
+"""Tests for the operator-initiated self_audit completion path:
 
 1. ``_handle_self_audit_completion`` ingest path — SELF_AUDIT_REPORT logs
    produce SystemMaturity rows, idempotent re-ingest, malformed entries are
@@ -6,6 +6,11 @@
 2. ``_normalize_self_audit_finding`` — pure-function validator behavior.
 3. ``POST /api/admin/projects/{project_id}/self-audit`` — enqueues a Task with
    the right payload type and forwards focus_systems / max_systems.
+
+The autonomous self-audit *dispatch* feeder (``self_audit_dispatch``) was
+removed with the self-repair apparatus; its tests are gone. The operator
+trigger (admin endpoint) and the result-ingest / auto-mode-recover handler
+(``app.task_completion``) remain.
 """
 
 import json
@@ -13,7 +18,6 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -22,7 +26,6 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.self_audit_dispatch import _should_dispatch_self_audit
 from app.task_completion import (
     _handle_self_audit_completion,
     _normalize_self_audit_finding,
@@ -595,121 +598,6 @@ class TestSelfAuditAdminEndpoint:
         assert resp.status_code == 404
 
 
-# ── Dispatch decision — direction.recommended_mode ─────────────────────────
-
-
-class TestShouldDispatchDirectionMode:
-    """_should_dispatch_self_audit honours direction.recommended_mode.
-
-    Each test seeds a project with a single direction that carries a specific
-    recommended_mode, then asserts that the dispatch function produces the
-    expected result (candidate vs. skip).
-    """
-
-    @pytest.mark.asyncio
-    async def test_pause_direction_is_excluded_from_dispatch(self, db_session):
-        """A direction with mode='pause' must not produce audit candidates."""
-        project = await _seed_project_with_member(db_session)
-        project.directions = [{"system_id": "sys-paused", "recommended_mode": "pause"}]
-        flag_modified(project, "directions")
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        result = await _should_dispatch_self_audit(project, db_session)
-        # All directions are paused → direction_system_ids is empty → None
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_audit_direction_forces_fresh_system_into_candidates(
-        self, db_session
-    ):
-        """mode='audit' must trigger dispatch even when SystemMaturity row is fresh."""
-        project = await _seed_project_with_member(db_session)
-        project.directions = [{"system_id": "sys-audit", "recommended_mode": "audit"}]
-        flag_modified(project, "directions")
-        # Fresh row that would normally pass the staleness check — should be overridden.
-        fresh = SystemMaturity(
-            project_id=project.id,
-            system_id="sys-audit",
-            score=85,
-            recommended_mode="ship",
-        )
-        db_session.add(project)
-        db_session.add(fresh)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        result = await _should_dispatch_self_audit(project, db_session)
-        assert result is not None
-        assert "sys-audit" in (result.get("focus_systems") or [])
-
-    @pytest.mark.asyncio
-    async def test_fundamentals_direction_forces_fresh_system_into_candidates(
-        self, db_session
-    ):
-        """mode='fundamentals' must trigger dispatch even when SystemMaturity row is fresh."""
-        project = await _seed_project_with_member(db_session)
-        project.directions = [
-            {"system_id": "sys-fund", "recommended_mode": "fundamentals"}
-        ]
-        flag_modified(project, "directions")
-        fresh = SystemMaturity(
-            project_id=project.id,
-            system_id="sys-fund",
-            score=70,
-            recommended_mode="ship",
-        )
-        db_session.add(project)
-        db_session.add(fresh)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        result = await _should_dispatch_self_audit(project, db_session)
-        assert result is not None
-        assert "sys-fund" in (result.get("focus_systems") or [])
-
-    @pytest.mark.asyncio
-    async def test_ship_direction_with_fresh_row_is_not_a_candidate(self, db_session):
-        """mode='ship' must not change existing behaviour: fresh row → no dispatch."""
-        project = await _seed_project_with_member(db_session)
-        project.directions = [{"system_id": "sys-ship", "recommended_mode": "ship"}]
-        flag_modified(project, "directions")
-        fresh = SystemMaturity(
-            project_id=project.id,
-            system_id="sys-ship",
-            score=90,
-            recommended_mode="ship",
-        )
-        db_session.add(project)
-        db_session.add(fresh)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        result = await _should_dispatch_self_audit(project, db_session)
-        assert result is None
-
-    @pytest.mark.asyncio
-    async def test_unset_mode_with_fresh_row_is_not_a_candidate(self, db_session):
-        """No recommended_mode on direction must not change existing behaviour."""
-        project = await _seed_project_with_member(db_session)
-        project.directions = [{"system_id": "sys-unset"}]
-        flag_modified(project, "directions")
-        fresh = SystemMaturity(
-            project_id=project.id,
-            system_id="sys-unset",
-            score=88,
-            recommended_mode="ship",
-        )
-        db_session.add(project)
-        db_session.add(fresh)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        result = await _should_dispatch_self_audit(project, db_session)
-        assert result is None
-
-
 # ── Auto-clear mode on recovery ────────────────────────────────────────────
 
 
@@ -895,234 +783,3 @@ class TestAutoModeRecover:
 
         await db_session.refresh(project)
         assert project.directions[0]["recommended_mode"] == "audit"
-
-
-# ── Audit-deferral escalation ──────────────────────────────────────────────
-
-
-class TestRecordResidualAuditDeferralEscalation:
-    """_record_residual_audit_deferral fires the escalation message exactly
-    when audit_defer_count first reaches the threshold (== not >=)."""
-
-    @pytest.mark.asyncio
-    async def test_escalation_fires_at_threshold(self, db_session):
-        from unittest.mock import AsyncMock, patch
-        from app.models import ResidualRemediationCase, ResidualCaseStatus
-        from app.self_audit_dispatch import _record_residual_audit_deferral
-        from app.notification_dispatch import _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
-
-        project = await _seed_project_with_member(db_session)
-        fp = "fp-esc-threshold"
-        case = ResidualRemediationCase(
-            project_id=project.id,
-            fingerprint=fp,
-            status=ResidualCaseStatus.ACTIVE,
-            audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD - 1,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        with patch(
-            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
-            new_callable=AsyncMock,
-        ) as mock_esc:
-            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-x")
-
-        mock_esc.assert_awaited_once()
-        call_kwargs = mock_esc.call_args.kwargs
-        assert call_kwargs["defer_count"] == _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
-        assert call_kwargs["fingerprint"] == fp
-
-    @pytest.mark.asyncio
-    async def test_escalation_not_fired_below_threshold(self, db_session):
-        from unittest.mock import AsyncMock, patch
-        from app.models import ResidualRemediationCase, ResidualCaseStatus
-        from app.self_audit_dispatch import _record_residual_audit_deferral
-
-        project = await _seed_project_with_member(db_session)
-        fp = "fp-esc-below"
-        case = ResidualRemediationCase(
-            project_id=project.id,
-            fingerprint=fp,
-            status=ResidualCaseStatus.ACTIVE,
-            audit_defer_count=1,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        with patch(
-            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
-            new_callable=AsyncMock,
-        ) as mock_esc:
-            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-y")
-
-        mock_esc.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_escalation_not_fired_above_threshold(self, db_session):
-        """One-shot guard: count already at threshold → next increment skips alert."""
-        from unittest.mock import AsyncMock, patch
-        from app.models import ResidualRemediationCase, ResidualCaseStatus
-        from app.self_audit_dispatch import _record_residual_audit_deferral
-        from app.notification_dispatch import _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
-
-        project = await _seed_project_with_member(db_session)
-        fp = "fp-esc-above"
-        case = ResidualRemediationCase(
-            project_id=project.id,
-            fingerprint=fp,
-            status=ResidualCaseStatus.ACTIVE,
-            audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        with patch(
-            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
-            new_callable=AsyncMock,
-        ) as mock_esc:
-            await _record_residual_audit_deferral(db_session, project.id, fp, "sys-z")
-
-        mock_esc.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_escalation_re_fires_after_streak_reset(self, db_session):
-        """Streak reset (simulating a successful fix spawn) enables re-escalation
-        on the next deferral cycle — the one-shot guard resets with the counter."""
-        from unittest.mock import AsyncMock, patch
-        from app.models import ResidualRemediationCase, ResidualCaseStatus
-        from app.self_audit_dispatch import _record_residual_audit_deferral
-        from app.notification_dispatch import _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD
-
-        project = await _seed_project_with_member(db_session)
-        fp = "fp-esc-refire"
-        case = ResidualRemediationCase(
-            project_id=project.id,
-            fingerprint=fp,
-            status=ResidualCaseStatus.ACTIVE,
-            audit_defer_count=_RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD - 1,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        with patch(
-            "app.notification_dispatch.post_residual_fix_audit_deferred_escalation_message",
-            new_callable=AsyncMock,
-        ) as mock_esc:
-            # First streak reaches threshold → escalation fires once.
-            await _record_residual_audit_deferral(
-                db_session, project.id, fp, "sys-refire-a"
-            )
-            assert mock_esc.await_count == 1
-
-            # Simulate the streak reset that post_residual_fix_spawned_message
-            # performs when a fix is successfully spawned.
-            await db_session.refresh(case)
-            case.audit_defer_count = _RESIDUAL_AUDIT_DEFER_ESCALATION_THRESHOLD - 1
-            db_session.add(case)
-            await db_session.commit()
-
-            # Second streak reaches threshold → escalation fires again.
-            await _record_residual_audit_deferral(
-                db_session, project.id, fp, "sys-refire-b"
-            )
-            assert mock_esc.await_count == 2
-
-
-# ── Drift-triggered dispatch context ───────────────────────────────────────
-
-
-class TestDriftTriggeredDispatch:
-    """Drift signals are embedded as drift_context in the dispatched task.
-
-    When _should_dispatch_self_audit finds over-claimed or stalled systems,
-    the returned dict must carry drift_context keyed by system_id.
-    When _spawn_self_audit_task consumes that payload, the created task's
-    context must carry the same drift_context so the agent can reconcile
-    claims vs shipped work explicitly.
-    """
-
-    @pytest.mark.asyncio
-    async def test_dispatch_result_includes_drift_context_for_over_claim_system(
-        self, db_session
-    ):
-        """_should_dispatch_self_audit returns drift_context when system has over_claim_flag."""
-        from unittest.mock import patch, AsyncMock
-
-        project = await _seed_project_with_member(db_session)
-        project.directions = [{"id": "d-drift", "system_id": "sys-drifted"}]
-        from sqlalchemy.orm.attributes import flag_modified
-
-        flag_modified(project, "directions")
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        drift_sig = {
-            "claimed_changes_count": 5,
-            "actually_merged_prs": 0,
-            "claim_shipped_consistency": 0.0,
-            "over_claim_flag": True,
-            "stalled_despite_churn_flag": True,
-        }
-        fake_drift = {
-            "by_direction": {},
-            "by_system": {"sys-drifted": drift_sig},
-        }
-
-        with patch(
-            "app.drift_detection.compute_direction_drift",
-            new=AsyncMock(return_value=fake_drift),
-        ):
-            result = await _should_dispatch_self_audit(project, db_session)
-
-        assert result is not None
-        assert "sys-drifted" in (result.get("focus_systems") or [])
-        drift_ctx = result.get("drift_context") or {}
-        assert "sys-drifted" in drift_ctx
-        sig = drift_ctx["sys-drifted"]
-        assert sig["over_claim_flag"] is True
-        assert sig["claimed_changes_count"] == 5
-        assert sig["actually_merged_prs"] == 0
-
-    @pytest.mark.asyncio
-    async def test_spawned_task_context_carries_drift_context(self, db_session):
-        """_spawn_self_audit_task embeds drift_context from audit_payload into task.context."""
-        from app.self_audit_dispatch import _spawn_self_audit_task
-        from app.models import Task
-        from sqlmodel import select
-
-        project = await _seed_project_with_member(db_session)
-
-        drift_ctx = {
-            "sys-drifted": {
-                "claimed_changes_count": 4,
-                "actually_merged_prs": 0,
-                "claim_shipped_consistency": 0.0,
-                "over_claim_flag": True,
-                "stalled_despite_churn_flag": False,
-            }
-        }
-        audit_payload = {
-            "focus_systems": ["sys-drifted"],
-            "max_systems": 3,
-            "drift_context": drift_ctx,
-        }
-
-        spawned = await _spawn_self_audit_task(project, db_session, audit_payload)
-        assert spawned is True
-
-        tasks = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.project_id == project.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(tasks) == 1
-        task_context = tasks[0].context or {}
-        assert "drift_context" in task_context
-        assert "sys-drifted" in task_context["drift_context"]
-        assert task_context["drift_context"]["sys-drifted"]["over_claim_flag"] is True

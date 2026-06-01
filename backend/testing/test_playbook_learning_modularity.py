@@ -160,11 +160,10 @@ class TestExtractedSymbolsImportableFromPlaybookLearning:
     """Tripwire — extracted symbols must remain importable via the facade.
 
     External callers (admin_digest, agent.py, autonomous_research,
-    pipeline_regression_dispatcher, research_completion, digest_metrics,
-    the playbook-learning test files, alerts tests, pipeline-integration
-    tests) historically import these symbols from ``app.playbook_learning``
-    and many still do. Removing the re-export import would silently break
-    those call sites.
+    research_completion, digest_metrics, the playbook-learning test files,
+    alerts tests, pipeline-integration tests) historically import these
+    symbols from ``app.playbook_learning`` and many still do. Removing the
+    re-export import would silently break those call sites.
     """
 
     @pytest.mark.parametrize(

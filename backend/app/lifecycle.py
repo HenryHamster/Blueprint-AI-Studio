@@ -7,16 +7,13 @@ import asyncio
 import ctypes
 import logging
 import os
-import uuid
 import warnings
 from contextlib import asynccontextmanager
-from datetime import timedelta
-from typing import Dict
+from datetime import datetime, timedelta
+from typing import Dict, List
 
-from sqlalchemy import cast as _cast
 from sqlalchemy import func as _func
 from sqlalchemy import text as _text
-from sqlalchemy.dialects.postgresql import JSONB as _JSONB
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -26,207 +23,135 @@ from app.models import (
     Alert,
     AlertSeverity,
     Project,
-    RegressionCaseStatus,
-    RegressionRemediationCase,
-    Task,
-    TaskHistory,
-    TaskStatus,
 )
-from app.payload_schemas import validate_internal_payload
 from app.time_utils import _utcnow
 
 # Session-scoped advisory lock ID for background-leader election.
 # Stored as signed int64 (PostgreSQL bigint) via two's-complement conversion.
 _BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
 
+# Background-service crash-episode escalation. When a single named background
+# service crashes >= _BACKGROUND_CRASH_EPISODE_THRESHOLD times inside
+# _BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS it is a crash *episode* (a flapping
+# loop, not a one-off blip). The monitor emits a deduped ERROR Alert for the
+# episode — operator visibility only. This replaced the removed
+# ``_spawn_crash_investigations`` apparatus: no autonomous investigate task is
+# spawned. The threshold is kept >= the reaper's per-task quarantine streak
+# limit so a single poison-pill task is quarantined before its repeated reaper
+# crashes can trip an episode (see test_orphan_streak_limit_at_most_episode_threshold).
+_BACKGROUND_CRASH_EPISODE_THRESHOLD: int = 3
+_BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS: int = 600
+
 logger = logging.getLogger("blueprint")
 
-# Maximum crash episodes within the 10-minute episode window before spawning a
-# crash-investigation task for the service. Must be >= _ORPHAN_REAP_CRASH_STREAK_LIMIT
-# in reaper.py so a per-task quarantine fires BEFORE service-level investigations
-# are triggered — isolated reap failures should not appear here at all.
-_BACKGROUND_CRASH_EPISODE_THRESHOLD: int = 3
 
+def _record_crash_and_count(
+    crash_timestamps: Dict[str, List[datetime]],
+    name: str,
+    now_ts: datetime,
+    window_seconds: int = _BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS,
+) -> int:
+    """Append ``now_ts`` to the per-service crash window and prune stale entries.
 
-async def _spawn_crash_investigations(
-    *,
-    service_name: str,
-    cause_str: str,
-    exc: BaseException | None,
-    crash_count: int,
-    inflight: Dict[str, str],
-) -> None:
-    """Spawn one investigate task per project when a service hits the crash-episode threshold.
+    Mutates ``crash_timestamps[name]`` in place: the new crash is recorded and
+    any timestamp older than ``window_seconds`` is dropped, so a slow trickle of
+    unrelated restarts never accumulates into a false episode. Returns the count
+    of crashes remaining inside the rolling window (i.e. the value the caller
+    compares against ``_BACKGROUND_CRASH_EPISODE_THRESHOLD``).
 
-    Deduplicates via the in-memory `inflight` dict (cleared on stability reset) and a
-    DB containment query so a process restart doesn't double-spawn. At most one
-    in-flight crash investigation per (service, project) is kept alive.
+    Pure bookkeeping — no DB, no I/O. Shared by ``_monitor_background_tasks`` and
+    its unit tests so both exercise the same window logic.
     """
-    exc_type = type(exc).__name__ if exc is not None else "CancelledError"
+    cutoff = now_ts - timedelta(seconds=window_seconds)
+    ts_list = crash_timestamps.setdefault(name, [])
+    ts_list.append(now_ts)
+    crash_timestamps[name] = [ts for ts in ts_list if ts >= cutoff]
+    return len(crash_timestamps[name])
 
-    reaper_stats_str = ""
-    if service_name == "reaper":
-        try:
-            from app.reaper import get_reaper_stats
 
-            stats = get_reaper_stats()
-            reaper_stats_str = (
-                f"\nReaper telemetry: cycles_completed={stats['cycles_completed_total']}, "
-                f"last_cycle_age={stats['last_cycle_age_seconds']:.1f}s"
-            )
-        except Exception:
-            pass
+async def _emit_crash_episode_alert(
+    session_factory,
+    name: str,
+    crash_count: int,
+    window_seconds: int = _BACKGROUND_CRASH_EPISODE_WINDOW_SECONDS,
+) -> int:
+    """Emit ONE deduped ``AlertSeverity.ERROR`` crash-episode Alert per project.
 
-    prompt = (
-        f"The background service '{service_name}' has crashed {crash_count} times "
-        f"in the last 10 minutes.\n"
-        f"Exception type: {exc_type}\n"
-        f"Exception message: {cause_str[:500]}"
-        f"{reaper_stats_str}\n\n"
-        f"Diagnose the root cause of these repeated crashes. Examine the service's "
-        f"source code (backend/app/{service_name}.py or related files) and recent "
-        f"commits to that area. If the crash cannot be reproduced from a code read "
-        f"alone, still produce a structured diagnosis JSON with 'confidence': 'low' "
-        f"and 'recommended_fix': 'manual escalation required — operator review needed'. "
-        f"Output a JSON object with keys: summary, root_cause, recommended_fix, "
-        f"severity, confidence, affected_files."
-    )
-
-    regression_class = f"background_service_crash:{service_name}"
-    active_statuses = (
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-    )
-    spawned_count = 0
-    async with AsyncSessionLocal() as session:
-        projects = (await session.execute(select(Project))).scalars().all()
-
-        for project in projects:
-            project_id = project.id
-            pid_str = str(project_id)
-            if pid_str in inflight:
-                continue
-            # DB dedup: skip if an active crash investigation already exists for this service+project
-            existing = (
-                await session.execute(
-                    select(Task.id).where(
-                        Task.project_id == project_id,
-                        Task.status.in_(active_statuses),
-                        Task.context.op("@>")(
-                            _cast(
-                                {
-                                    "spawned_by": "crash_investigation",
-                                    "service_name": service_name,
-                                },
-                                _JSONB,
-                            )
-                        ),
-                    )
-                )
-            ).first()
-            if existing:
-                inflight[pid_str] = str(existing[0])
-                continue
-
-            # Suppress re-spawn when the case is already awaiting manual intervention.
-            existing_case = (
+    Operator-visibility only — this is the survivor of the removed
+    ``_spawn_crash_investigations`` apparatus, so it spawns no investigate Task.
+    Existing undismissed alerts with the same title are skipped (dedup). Returns
+    the number of Alert rows actually created (0 when every project already had
+    an open episode alert), which keeps the path directly unit-testable.
+    """
+    episode_title = f"Background service crash episode: {name}"
+    created = 0
+    async with session_factory() as ep_session:
+        ep_project_ids = (
+            (await ep_session.execute(select(Project.id))).scalars().all()
+        )
+        for project_id in ep_project_ids:
+            existing_ep = (
                 (
-                    await session.execute(
-                        select(RegressionRemediationCase).where(
-                            RegressionRemediationCase.project_id == project_id,
-                            RegressionRemediationCase.regression_class
-                            == regression_class,
+                    await ep_session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.title == episode_title,
+                            Alert.dismissed_at.is_(None),
                         )
                     )
                 )
                 .scalars()
                 .first()
             )
-            if (
-                existing_case is not None
-                and existing_case.status
-                == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
-            ):
+            if existing_ep:
                 continue
-
-            payload = validate_internal_payload(
-                {
-                    "type": "investigate",
-                    "prompt": prompt,
-                    "base_branch": _shared_state.get_project_integration_branch(
-                        project
+            ep_session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=episode_title,
+                    message=(
+                        f"Background service '{name}' crashed "
+                        f"{crash_count} times in the "
+                        f"last {window_seconds // 60} "
+                        "minutes — this is a crash episode (flapping), "
+                        "not a one-off blip. Auto-restart with backoff is "
+                        "still running; investigate the root cause."
                     ),
-                },
-                "lifecycle:crash_investigation",
-            )
-            new_task = Task(
-                project_id=project_id,
-                title=f"Investigate repeated crash: {service_name} service",
-                description=(
-                    f"Service '{service_name}' crashed {crash_count} times in 10 min. "
-                    f"Exception: {exc_type}"
-                )[:500],
-                payloads=[payload],
-                context={
-                    "spawned_by": "crash_investigation",
-                    "service_name": service_name,
-                    "regression_class": regression_class,
-                    "exception_type": exc_type,
-                    "exception_message": cause_str[:500],
-                    "diagnosis_trigger": "background_service_crash",
-                    "crash_count": crash_count,
-                },
-                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                status=TaskStatus.QUEUED,
-                created_by="ORCHESTRATOR",
-            )
-            session.add(new_task)
-            session.add(
-                TaskHistory(
-                    task_id=new_task.id,
-                    action="SPAWNED",
-                    details={
-                        "spawned_by": "CRASH_INVESTIGATION",
-                        "service_name": service_name,
-                        "crash_count": crash_count,
-                    },
                 )
             )
-            await session.flush()
-            signal_snapshot = {
-                "service_name": service_name,
-                "crash_count": crash_count,
-                "exception_type": exc_type,
-                "captured_at": _utcnow().isoformat(),
-            }
-            if existing_case is None:
-                session.add(
-                    RegressionRemediationCase.create_for_spawn(
-                        project_id=project_id,
-                        regression_class=regression_class,
-                        signal_snapshot=signal_snapshot,
-                        task_id=new_task.id,
-                    )
-                )
-            else:
-                existing_case.record_spawn(signal_snapshot, new_task.id)
-                session.add(existing_case)
-            inflight[pid_str] = str(new_task.id)
-            spawned_count += 1
-            logger.info(
-                "[MONITOR] Spawned crash investigation for service '%s' "
-                "(project=%s, crashes=%d, task=%s)",
-                service_name,
-                pid_str,
-                crash_count,
-                new_task.id,
-            )
+            created += 1
+        await ep_session.commit()
+    return created
 
-        if spawned_count:
-            await session.commit()
 
+def _evaluate_reaper_stall(
+    *,
+    is_halted: bool,
+    last_progress: datetime | None,
+    now: datetime,
+    stall_threshold: float,
+) -> tuple[bool, str | None]:
+    """Decide whether the reaper watchdog should cancel the reaper task.
+
+    Mirrors the probe in ``_monitor_background_tasks``: a HALTED reaper is never
+    cancelled (module-level halt state persists across asyncio.Task restarts, so
+    re-spawning only yields another halted reaper). A non-halted reaper is
+    cancelled only when its freshest progress heartbeat is older than
+    ``stall_threshold`` seconds. Returns ``(should_cancel, reason)``.
+
+    Pure decision logic — no asyncio, no module-global reads — so it can be unit
+    tested directly and reused by the live probe.
+    """
+    if is_halted:
+        return False, None
+    if last_progress is None:
+        # Never recorded progress yet — give the fresh reaper time to start.
+        return False, None
+    age = (now - last_progress).total_seconds()
+    if age > stall_threshold:
+        return True, f"no progress heartbeat in {int(age)}s"
+    return False, None
 
 async def _seed_initial_admin():
     """Seed the AllowedUser table with an initial admin if empty."""
@@ -577,85 +502,14 @@ async def lifespan(app):
     # Start Auto-Archive Service (archives terminal tasks older than N days)
     auto_archive_task = asyncio.create_task(auto_archive_service())
 
-    # Start the Regression Recovery Scan (closes or re-arms MERGED cases)
-    async def _regression_recovery_scan_service():
-        """Periodic leader-only scan: re-evaluates MERGED regression cases."""
-        from app.regression_recovery_watchdog import run_recovery_once
+    # Start the Pipeline-Alert Scan (deterministic operator-Alert emitters).
+    # Replaces the deleted detect->investigate->fix regression apparatus: every
+    # surviving signal (signal-staleness, sr_catch_rate targets, lone-checker,
+    # agent-VM resource cluster, pipeline success-rate cliff) is now emitted as a
+    # deduped WARNING Alert for an operator — no autonomous remediation is spawned.
+    from app.pipeline_alert_scan import pipeline_alert_scan_service
 
-        _SCAN_INTERVAL = 300  # 5 minutes
-        while True:
-            await asyncio.sleep(_SCAN_INTERVAL)
-            try:
-                async with AsyncSessionLocal() as scan_session:
-                    project_ids = (
-                        (await scan_session.execute(select(Project.id))).scalars().all()
-                    )
-                    for project_id in project_ids:
-                        try:
-                            changed = await run_recovery_once(scan_session, project_id)
-                            if changed:
-                                logger.info(
-                                    "[RECOVERY_SCAN] project=%s changed=%d",
-                                    project_id,
-                                    changed,
-                                )
-                        except Exception as proj_exc:
-                            await scan_session.rollback()
-                            logger.warning(
-                                "[RECOVERY_SCAN] project=%s error=%s",
-                                project_id,
-                                proj_exc,
-                            )
-            except asyncio.CancelledError:
-                raise
-            except Exception as scan_exc:
-                logger.error("[RECOVERY_SCAN] scan error: %s", scan_exc, exc_info=True)
-
-    regression_recovery_task = asyncio.create_task(_regression_recovery_scan_service())
-
-    # Start the Regression Watchdog (escalates stale ACTIVE/MERGED cases to NEEDS_MANUAL_INTERVENTION)
-    async def _regression_watchdog_scan_service():
-        """Periodic leader-only scan: escalates stale ACTIVE/MERGED regression cases.
-
-        ACTIVE thresholds run in 24h and MERGED in 6h, so a 30-minute cadence is
-        more than enough to catch staleness without burning DB cycles.
-        """
-        from app.regression_recovery_watchdog import run_watchdog_once
-
-        _SCAN_INTERVAL = 1800  # 30 minutes
-        while True:
-            await asyncio.sleep(_SCAN_INTERVAL)
-            try:
-                async with AsyncSessionLocal() as scan_session:
-                    project_ids = (
-                        (await scan_session.execute(select(Project.id))).scalars().all()
-                    )
-                    for project_id in project_ids:
-                        try:
-                            escalated = await run_watchdog_once(
-                                scan_session, project_id
-                            )
-                            if escalated:
-                                logger.info(
-                                    "[REGRESSION_WATCHDOG] project=%s escalated=%d",
-                                    project_id,
-                                    escalated,
-                                )
-                        except Exception as proj_exc:
-                            await scan_session.rollback()
-                            logger.warning(
-                                "[REGRESSION_WATCHDOG] project=%s error=%s",
-                                project_id,
-                                proj_exc,
-                            )
-            except asyncio.CancelledError:
-                raise
-            except Exception as scan_exc:
-                logger.error(
-                    "[REGRESSION_WATCHDOG] scan error: %s", scan_exc, exc_info=True
-                )
-
-    regression_watchdog_task = asyncio.create_task(_regression_watchdog_scan_service())
+    pipeline_alert_scan_task = asyncio.create_task(pipeline_alert_scan_service())
 
     # Start the Efficiency Snapshot service (daily per-project axis snapshots).
     async def _efficiency_snapshot_service():
@@ -817,94 +671,6 @@ async def lifespan(app):
 
     evaluating_timeout_task = asyncio.create_task(_evaluating_timeout_service())
 
-    # ── Cluster C3: regression dispatcher + watchdog alarms as their own task ──
-    # Previously this ran INLINE at the top of every orchestrator_worker cycle
-    # (60s gate). It iterates per autonomous project, evaluating regression
-    # signals and running watchdog alarms — work that scales with project count
-    # and previously timed/blocked the leader's dispatch cycle. Extracting it
-    # mirrors the reaper/regression-recovery pattern: own schedule, own per-tick
-    # timeout, own supervisor restart. Cadence preserved at 60s.
-    async def _regression_dispatch_service():
-        """Leader-only pipeline-regression dispatcher + watchdog alarms (C3).
-
-        Enumerates autonomous projects, runs watchdog alarms once, then the
-        per-project regression dispatcher — each on its own fresh session so a
-        single project's failure can't poison the rest. Bounded by a per-tick
-        asyncio.timeout.
-        """
-        from app.regression_recovery_watchdog import (
-            run_dispatcher_watchdog_alarms as _run_watchdog_alarms,
-        )
-        from app.pipeline_regression_dispatcher import (
-            run_once as _run_regression_dispatcher,
-        )
-
-        _SCAN_INTERVAL = 60
-        _TICK_BUDGET = 55
-        while True:
-            await asyncio.sleep(_SCAN_INTERVAL)
-            try:
-                async with asyncio.timeout(_TICK_BUDGET):
-                    # Pull IDs only on a throwaway session (no Project ORM rows
-                    # in any identity map — run_once does its own session.get
-                    # and a cached partial Project would trigger a sync lazy-load
-                    # that poisons the connection). Fresh session per project
-                    # also isolates failures.
-                    try:
-                        async with AsyncSessionLocal() as _rd_id_session:
-                            _project_ids = (
-                                (
-                                    await _rd_id_session.execute(
-                                        select(Project.id).where(
-                                            Project.autonomous_enabled.is_(True)
-                                        )
-                                    )
-                                )
-                                .scalars()
-                                .all()
-                            )
-                    except Exception:
-                        logger.exception(
-                            "[REGRESSION_DISPATCHER] project enumeration failed"
-                        )
-                        _project_ids = []
-                    # Watchdog alarms run BEFORE run_once so staleness fires even
-                    # when run_once hangs or raises on the subsequent project loop.
-                    try:
-                        async with AsyncSessionLocal() as _wa_session:
-                            await _run_watchdog_alarms(
-                                _wa_session, list(_project_ids)
-                            )
-                    except Exception:
-                        logger.exception(
-                            "[REGRESSION_DISPATCHER] watchdog alarms failed"
-                        )
-                    for _pid in _project_ids:
-                        try:
-                            async with AsyncSessionLocal() as _rd_session:
-                                await _run_regression_dispatcher(_rd_session, _pid)
-                        except Exception:
-                            logger.exception(
-                                "[REGRESSION_DISPATCHER] run_once failed for project %s",
-                                _pid,
-                            )
-            except asyncio.CancelledError:
-                raise
-            except TimeoutError:
-                # Expected, recoverable control flow (not a crash): the next tick
-                # retries; each project runs on its own isolated session.
-                logger.warning(
-                    "[REGRESSION_DISPATCHER] tick exceeded %ds budget — abandoning "
-                    "this tick; next tick retries",
-                    _TICK_BUDGET,
-                )
-            except Exception as svc_exc:
-                logger.error(
-                    "[REGRESSION_DISPATCHER] tick error: %s", svc_exc, exc_info=True
-                )
-
-    regression_dispatch_task = asyncio.create_task(_regression_dispatch_service())
-
     # Start the Orchestrator Worker background task
     orchestrator_task = asyncio.create_task(orchestrator_worker())
 
@@ -969,12 +735,10 @@ async def lifespan(app):
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
     _bg_tasks["auto_archive"] = auto_archive_task
-    _bg_tasks["regression_recovery_scan"] = regression_recovery_task
-    _bg_tasks["regression_watchdog_scan"] = regression_watchdog_task
+    _bg_tasks["pipeline_alert_scan"] = pipeline_alert_scan_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["evaluating_timeout"] = evaluating_timeout_task
-    _bg_tasks["regression_dispatch"] = regression_dispatch_task
     _bg_tasks["config_sync"] = config_sync_task
     _bg_tasks["jwt_revocation"] = jwt_revocation_task
     _bg_tasks["event_fanout"] = event_fanout_task
@@ -987,16 +751,13 @@ async def lifespan(app):
     async def _monitor_background_tasks():
         tasks = _bg_tasks
         restart_state: Dict[str, Dict] = {}  # name -> {attempts, last_restart}
+        # name -> [crash datetime, ...] within the episode window, used to detect
+        # a crash *episode* (flapping service) and escalate to a deduped ERROR Alert.
+        crash_timestamps: Dict[str, list] = {}
         # When the watchdog cancels a hung task, it stashes the reason here so the
         # death-detection branch below can include it in the alert/log instead of
         # the useless "Exception: None" that a bare cancellation produces.
         cancel_reasons: Dict[str, str] = {}
-        # Crash-episode tracking: timestamps of recent crashes per service, and
-        # in-flight investigation task IDs per (service, project_id).
-        crash_timestamps: Dict[str, list] = {}  # name -> [datetime, ...]
-        _inflight_crash_investigations: Dict[
-            str, Dict[str, str]
-        ] = {}  # name -> {pid_str: task_id_str}
         task_factories = {
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
@@ -1005,12 +766,10 @@ async def lifespan(app):
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
             "auto_archive": auto_archive_service,
-            "regression_recovery_scan": _regression_recovery_scan_service,
-            "regression_watchdog_scan": _regression_watchdog_scan_service,
+            "pipeline_alert_scan": pipeline_alert_scan_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
             "evaluating_timeout": _evaluating_timeout_service,
-            "regression_dispatch": _regression_dispatch_service,
             "config_sync": runtime_config_sync_service,
             "jwt_revocation": jwt_revocation_service,
             "event_fanout": event_fanout_service,
@@ -1073,29 +832,25 @@ async def lifespan(app):
 
                     reaper_task = tasks.get("reaper")
                     if reaper_task is not None and not reaper_task.done():
-                        if _is_reaper_halted():
-                            pass  # halted intentionally — do not cancel; operator reset required
-                        else:
-                            _reaper_last = _reaper_progress or _reaper_last_cycle
-                            if _reaper_last is not None:
-                                reaper_age = (
-                                    _utcnow() - _reaper_last
-                                ).total_seconds()
-                                if reaper_age > _reaper_stall_threshold:
-                                    reaper_reason = (
-                                        f"no progress heartbeat in {int(reaper_age)}s"
-                                    )
-                                    logger.error(
-                                        "[MONITOR] Reaper appears hung — %s. "
-                                        "Cancelling task so restart path re-spawns it.",
-                                        reaper_reason,
-                                    )
-                                    cancel_reasons["reaper"] = (
-                                        f"watchdog cancelled: {reaper_reason}"
-                                    )
-                                    reaper_task.cancel()
-                            # else: never recorded progress or completed a cycle yet
-                            # — give the freshly-spawned reaper time to start.
+                        should_cancel, reaper_reason = _evaluate_reaper_stall(
+                            is_halted=_is_reaper_halted(),
+                            last_progress=_reaper_progress or _reaper_last_cycle,
+                            now=_utcnow(),
+                            stall_threshold=_reaper_stall_threshold,
+                        )
+                        if should_cancel:
+                            logger.error(
+                                "[MONITOR] Reaper appears hung — %s. "
+                                "Cancelling task so restart path re-spawns it.",
+                                reaper_reason,
+                            )
+                            cancel_reasons["reaper"] = (
+                                f"watchdog cancelled: {reaper_reason}"
+                            )
+                            reaper_task.cancel()
+                        # else: halted intentionally (operator reset required), or
+                        # never recorded progress yet (give the fresh reaper time),
+                        # or progressing within threshold — leave it running.
                 except Exception as reaper_wd_exc:
                     logger.warning(
                         "[MONITOR] Reaper watchdog check failed: %s", reaper_wd_exc
@@ -1116,7 +871,7 @@ async def lifespan(app):
                         logger.error(
                             f"[MONITOR] Background task '{name}' DIED! Cause: {cause_str}"
                         )
-                        asyncio.create_task(
+                        asyncio.create_task(  # noqa: RUF006 — fire-and-forget crash webhook; the monitor loop outlives it
                             _send_webhook_notification(
                                 "SERVICE_CRASHED",
                                 f"Background service crashed: {name}",
@@ -1160,35 +915,29 @@ async def lifespan(app):
                                 f"[MONITOR] Failed to create crash alert: {alert_exc}"
                             )
 
-                        # Track crash timestamp and check episode threshold.
-                        now_ts = _utcnow()
-                        ts_list = crash_timestamps.setdefault(name, [])
-                        ts_list.append(now_ts)
-                        # Prune timestamps outside the 10-minute episode window
-                        cutoff = now_ts - timedelta(seconds=600)
-                        crash_timestamps[name] = [ts for ts in ts_list if ts >= cutoff]
-                        # Spawn an investigate task when 3+ crashes occur in 10 min
-                        if (
-                            len(crash_timestamps[name])
-                            >= _BACKGROUND_CRASH_EPISODE_THRESHOLD
-                        ):
-                            inflight = _inflight_crash_investigations.setdefault(
-                                name, {}
+                        # Crash-episode escalation: track per-service crash
+                        # timestamps over a rolling window and, when the count
+                        # reaches the episode threshold, emit ONE deduped ERROR
+                        # Alert per episode (operator visibility only — no
+                        # autonomous investigate task is spawned; that apparatus
+                        # was removed). The window is pruned each crash so a slow
+                        # trickle of unrelated restarts never accumulates into a
+                        # false episode.
+                        try:
+                            crash_count = _record_crash_and_count(
+                                crash_timestamps, name, _utcnow()
                             )
-                            try:
-                                await _spawn_crash_investigations(
-                                    service_name=name,
-                                    cause_str=cause_str,
-                                    exc=exc,
-                                    crash_count=len(crash_timestamps[name]),
-                                    inflight=inflight,
+                            if crash_count >= _BACKGROUND_CRASH_EPISODE_THRESHOLD:
+                                await _emit_crash_episode_alert(
+                                    AsyncSessionLocal, name, crash_count
                                 )
-                            except Exception as ci_exc:
-                                logger.warning(
-                                    "[MONITOR] Failed to spawn crash investigations for '%s': %s",
-                                    name,
-                                    ci_exc,
-                                )
+                                # Reset so the next escalation requires a fresh
+                                # episode rather than re-firing every crash.
+                                crash_timestamps[name] = []
+                        except Exception as _ep_exc:
+                            logger.warning(
+                                f"[MONITOR] Failed crash-episode escalation for {name}: {_ep_exc}"
+                            )
 
                         factory = task_factories.get(name)
                         # Always restart cancelled tasks too — the watchdog
@@ -1210,8 +959,11 @@ async def lifespan(app):
                                 and (now - state["last_restart"]).total_seconds() > 300
                             ):
                                 state["attempts"] = 0
+                                # Stable run clears the crash-episode window too —
+                                # a service that ran clean for 5+ min is no longer
+                                # in an episode, so stale crash timestamps must not
+                                # carry over into a future false escalation.
                                 crash_timestamps.pop(name, None)
-                                _inflight_crash_investigations.pop(name, None)
                             backoff = min(
                                 2 ** state["attempts"], 300
                             )  # 1s, 2s, 4s, ... cap 5min
@@ -1265,8 +1017,7 @@ async def lifespan(app):
         secret_recon_task,
         stale_branch_task,
         auto_archive_task,
-        regression_recovery_task,
-        regression_watchdog_task,
+        pipeline_alert_scan_task,
         branch_reconciliation_task,
         orchestrator_task,
         config_sync_task,
@@ -1295,5 +1046,8 @@ async def lifespan(app):
     if leader_session is not None:
         try:
             await leader_session.aclose()
-        except Exception:
-            pass
+        except Exception as _close_exc:
+            logger.warning(
+                "[LIFESPAN] Failed to close leader session on shutdown: %s",
+                _close_exc,
+            )

@@ -63,9 +63,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
     "app.digest_metrics": (
         "_CPM_RETIREMENT_MULTIPLIER",
         "_compute_edges_considered_metrics",
-        "_compute_layer_coverage_by_class",
-        "_compute_regression_case_summary",
-        "_compute_symptom_layers_by_class",
         "compute_anomaly_adjustment_summary",
         "compute_digest_trend_history",
         "compute_direction_progress",
@@ -81,7 +78,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "compute_review_cap_exhaustion_summary",
     ),
     "app.routers.admin_pipeline_observability": (
-        "get_canonical_regression_layers",
         "get_drift_snapshot",
         "get_fix_loop_convergence",
         "get_fix_loop_convergence_trend",
@@ -89,9 +85,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "get_pipeline_efficiency",
         "get_pipeline_regressions",
         "get_provider_cost_summary",
-        "get_regression_dispatcher_health",
-        "get_regression_escalation_outcomes",
-        "get_regression_mtta",
         "get_warm_reuse_funnel",
     ),
     "app.anomaly_detection": ("get_anomaly_tracker_snapshot",),
@@ -99,7 +92,6 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "get_efficiency_axes",
         "get_llm_cost_breakdown",
     ),
-    "app.regression_case_endpoints": ("clear_regression_manual_intervention",),
     "app.routers.admin_release_version": (
         "_MAX_RETIREMENT_CRITIQUES",
         "_SetVersionPhaseBody",
@@ -446,12 +438,8 @@ _PIPELINE_OBS_ENDPOINTS = (
     "get_fix_loop_convergence_trend",
     "get_fix_loop_diverged_tasks",
     "get_pipeline_regressions",
-    "get_regression_dispatcher_health",
-    "get_regression_mtta",
     "get_warm_reuse_funnel",
-    "get_regression_escalation_outcomes",
     "get_pipeline_efficiency",
-    "get_canonical_regression_layers",
 )
 
 

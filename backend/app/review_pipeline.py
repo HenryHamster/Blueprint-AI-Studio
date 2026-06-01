@@ -774,39 +774,12 @@ async def _handle_cap_exhaustion(
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}"
         )
-    investigation_id: str | None = None
-    try:
-        from app.autonomous_research import _spawn_review_convergence_investigation
-
-        _inv = await _spawn_review_convergence_investigation(
-            orig,
-            session,
-            pr_number=pr_number,
-            iterations=iterations,
-            detail=cap_label,
-            trigger="review_cap_exhausted",
-        )
-        if _inv is not None:
-            investigation_id = str(_inv)
-            await session.commit()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"[PIPELINE] Cap-exhaustion: convergence investigation spawn failed for PR #{pr_number}: {e}",
-            exc_info=True,
-        )
-
     try:
         gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
         try:
             fingerprint = ((orig.context or {}).get("failure_fingerprints") or [None])[
                 0
             ]
-            investigation_note = (
-                f"A convergence investigation has been queued (task `{investigation_id[:8]}`) "
-                f"to diagnose why this PR could not converge. Reopen after the investigation completes."
-                if investigation_id
-                else "No investigation was spawned (no direction attached or a recent one already covers this). Manual review required."
-            )
             fingerprint_note = (
                 f"\n\nFailure fingerprint: `{fingerprint}`" if fingerprint else ""
             )
@@ -816,7 +789,7 @@ async def _handle_cap_exhaustion(
                 repo,
                 pr_number,
                 f"Auto-closed: review-fix cap reached ({iterations} iterations, {cap_label}). "
-                f"{investigation_note}{fingerprint_note}",
+                f"Manual review required.{fingerprint_note}",
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(
@@ -2007,26 +1980,6 @@ async def _spawn_pipeline_task(
                     except Exception as _ne:  # noqa: BLE001
                         logger.warning(
                             f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {_ne}"
-                        )
-                    try:
-                        from app.autonomous_research import (
-                            _spawn_review_convergence_investigation,
-                        )
-
-                        if await _spawn_review_convergence_investigation(
-                            stuck_orig,
-                            session,
-                            pr_number=pr_number,
-                            iterations=iteration,
-                            detail=stuck_detail,
-                            trigger="review_stuck_cycle",
-                            review_history=new_review_history,
-                        ):
-                            await session.commit()
-                    except Exception as _ie:  # noqa: BLE001
-                        logger.warning(
-                            f"[PIPELINE] Stuck-cycle convergence investigation spawn failed for PR #{pr_number}: {_ie}",
-                            exc_info=True,
                         )
             except Exception as e:  # noqa: BLE001
                 logger.warning(

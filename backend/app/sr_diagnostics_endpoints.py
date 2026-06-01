@@ -1360,13 +1360,16 @@ async def get_sr_catch_rate_health(
         project_id, current_user["user_id"], session, "viewer"
     )
 
-    # Function-local import to avoid a circular import with the dispatcher.
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+    # Function-local import to avoid a circular import. The signal-staleness
+    # windows + ISO parser were re-homed to the pipeline alert-scan service
+    # when the regression dispatcher was removed; this endpoint and the alert
+    # system share the same thresholds so their status semantics agree.
+    from app.pipeline_alert_scan import (  # noqa: PLC0415
         _SIGNAL_STALENESS_WINDOWS,
         _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW,
         _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW,
+        _parse_iso_timestamp,
     )
-    from app.dispatcher_formatters import _parse_iso_timestamp  # noqa: PLC0415
 
     now = _utcnow()
     general_window = _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"]

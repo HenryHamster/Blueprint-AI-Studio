@@ -13,12 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.failure_classification import classify_failure, classify_failure_taxonomy
 from app.models import Project, Task, TaskStatus
 from app.payload_schemas import validate_internal_payload
 from app.shared_state import (
-    get_circuit_breaker,
-    get_project_integration_branch,
     runtime_config as _runtime_config,
 )
 from app.strategic_completion import _is_code_failure_pause_reason
@@ -36,10 +33,6 @@ _REMEDIATION_MONITOR_EXPIRY_DAYS = 7
 # Max time an investigation task may hold diagnosis_in_progress before flags are considered stale.
 # Investigations typically finish in minutes; 4h is a safety ceiling to recover from reaped/timed-out tasks.
 _DIAGNOSIS_STALE_HOURS = 4
-
-# Max re-spawns after a stalled diagnosis, per pause event. After this many stalls the direction
-# escalates to an operator alert instead of silently clearing flags.
-_DIAGNOSIS_STALL_MAX_RETRIES = 2
 
 # Recent failed tasks to scan when computing the dominant error fingerprint
 _FINGERPRINT_SAMPLE_SIZE = 10
@@ -216,272 +209,6 @@ async def _compute_direction_error_fingerprint(
         if count > best_count:
             best_fp, best_count = fp, count
     return best_fp if best_count >= _FINGERPRINT_MIN_RECURRENCE else None
-
-
-async def _spawn_direction_diagnosis(
-    project: Project,
-    direction: dict,
-    pause_reason: str,
-    session: AsyncSession,
-) -> bool:
-    """Spawn an investigate task for a code-failure auto-pause.
-
-    Guards: pause-reason type (Rule 3/4 only), auto-retire threshold, circuit
-    breaker state, per-direction 24h dedup, cross-direction 24h fingerprint
-    dedup. On spawn, marks the direction with diagnosis_in_progress=True and
-    returns True.
-    """
-    if not _is_code_failure_pause_reason(pause_reason):
-        return False
-    if direction.get("code_failure_pause_count", 0) >= _MAX_AUTO_PAUSE_CYCLES:
-        return False
-    breaker_state = get_circuit_breaker(str(project.id)).get("state")
-    if breaker_state == "OPEN":
-        logger.warning(
-            f"[DIAGNOSIS] Skipping diagnosis spawn for project={project.id} "
-            f"direction={direction.get('id')} — circuit breaker state={breaker_state}"
-        )
-        return False
-    direction_id = direction.get("id")
-    if not direction_id:
-        return False
-    from app.autonomous_research import _recent_investigation_exists
-
-    if await _recent_investigation_exists(project.id, str(direction_id), session):
-        return False
-    cutoff = _utcnow() - timedelta(hours=24)
-    # Compute fingerprint up front so it can be (1) used to dedup against
-    # recent investigations on sibling directions sharing the same root cause
-    # and (2) stamped on the new task's context so future dedup queries match.
-    fingerprint = direction.get("error_fingerprint")
-    try:
-        if not fingerprint:
-            fingerprint = await _compute_direction_error_fingerprint(
-                project.id,
-                str(direction_id),
-                session,
-            )
-    except Exception as _fp_exc:
-        logger.warning(
-            f"[DIAGNOSIS] Failed to compute error fingerprint for {direction_id}: {_fp_exc!r}"
-        )
-        fingerprint = None
-    if fingerprint:
-        shared = (
-            await session.execute(
-                select(Task.id)
-                .where(
-                    Task.project_id == project.id,
-                    Task.created_at >= cutoff,
-                    Task.payloads[0]["type"].as_string() == "investigate",
-                    Task.context["diagnosis_fingerprint"].as_string()
-                    == str(fingerprint),
-                )
-                .limit(1)
-            )
-        ).first()
-        if shared is not None:
-            existing_task_id = str(shared[0])
-            from app.strategic_constants import (
-                STRATEGIC_NOTES_HISTORY_MAX,
-                STRATEGIC_RATIONALE_MAX,
-            )
-
-            note_text = (
-                f"Skipped duplicate investigation: shares error fingerprint "
-                f"{str(fingerprint)[:80]} with existing investigate task {existing_task_id}."
-            )[:STRATEGIC_RATIONALE_MAX]
-            notes = list(direction.get("notes") or [])
-            notes.append(
-                {
-                    "text": note_text,
-                    "added_at": _utcnow().isoformat(),
-                    "source": "diagnosis_dedup",
-                    "shared_investigation_task_id": existing_task_id,
-                }
-            )
-            direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
-            logger.info(
-                f"[DIAGNOSIS] Skipping spawn for {direction_id}: shares fingerprint "
-                f"{str(fingerprint)[:40]} with investigation {existing_task_id}"
-            )
-            return False
-    history = direction.get("research_history") or []
-    recent_lines = (
-        "\n".join(
-            f"- created={e.get('tasks_created', 0)} failed={e.get('tasks_failed', 0)} "
-            f"infra_failed={e.get('tasks_failed_infra', 0)} merged={e.get('prs_merged', 0)}"
-            for e in history[-5:]
-        )
-        or "- (no research history)"
-    )
-    recent_failures = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project.id,
-                    Task.status == TaskStatus.FAILED,
-                    Task.context["direction_id"].as_string() == str(direction_id),
-                )
-                .order_by(Task.created_at.desc())
-                .limit(3)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    failure_lines = (
-        "\n".join(
-            f"- {(t.latest_status_message or '(no message)').strip()[:200]}"
-            for t in recent_failures
-        )
-        or "- (no recent failed tasks)"
-    )
-    prior_diagnosis = (direction.get("diagnosis_summary") or "").strip()
-    # Cross-direction shared-fingerprint detection. If the same fingerprint
-    # already appears on other auto-paused directions, annotate the diagnosis
-    # so the agent investigates a systemic root cause rather than a
-    # direction-specific scope/code issue.
-    shared_directions: list[dict] = []
-    if fingerprint:
-        for other in project.directions or []:
-            if other.get("id") == direction_id:
-                continue
-            if other.get("status") != "paused" or not other.get("auto_paused"):
-                continue
-            if other.get("error_fingerprint") == fingerprint:
-                shared_directions.append(
-                    {
-                        "id": other.get("id"),
-                        "text": (other.get("text") or "")[:80],
-                    }
-                )
-    extras = ""
-    if fingerprint:
-        extras += f"Dominant error fingerprint: {fingerprint[:200]}\n"
-    if shared_directions:
-        sibling_lines = "\n".join(
-            f"  - {d['id']}: {d['text']}" if d.get("text") else f"  - {d['id']}"
-            for d in shared_directions
-        )
-        extras += (
-            f"Shared error pattern: same fingerprint also appears on "
-            f"{len(shared_directions)} other auto-paused direction(s):\n"
-            f"{sibling_lines}\n"
-            f"This suggests a SYSTEMIC root cause rather than a direction-specific "
-            f"issue — investigate cross-cutting infrastructure or framework code, "
-            f"not just files specific to this direction.\n"
-        )
-        logger.info(
-            f"[DIAGNOSIS] Cross-direction systemic pattern for {direction_id}: "
-            f"fingerprint {str(fingerprint)[:40]} shared with "
-            f"{len(shared_directions)} other direction(s)"
-        )
-    if prior_diagnosis:
-        extras += f"Prior diagnosis summary: {prior_diagnosis[:400]}\n"
-    rem_attempts = int(direction.get("remediation_attempts") or 0)
-    if rem_attempts:
-        last_rem_result = direction.get("last_remediation_result") or "(unknown)"
-        last_rem_at = direction.get("last_remediation_at") or "(unknown)"
-        last_rem_task = direction.get("last_remediation_task_id") or "(unknown)"
-        last_rem_fp = direction.get("last_remediation_fingerprint") or "(unknown)"
-        extras += (
-            f"Prior remediation attempts: {rem_attempts} "
-            f"(last result: {last_rem_result}, at: {last_rem_at}, "
-            f"task: {last_rem_task}, fingerprint: {str(last_rem_fp)[:200]})\n"
-        )
-        if last_rem_result == "failed":
-            last_rem_class = direction.get("last_remediation_failure_class")
-            last_rem_error = direction.get("last_remediation_error_summary")
-            if last_rem_class or last_rem_error:
-                extras += (
-                    f"Last remediation failed with "
-                    f"{last_rem_class or '(unknown class)'}: "
-                    f"{(last_rem_error or '(no error summary)')[:200]}\n"
-                )
-            # Load the prior remediation task so the investigation sees what
-            # approach was tried (title/description), not just what it errored on.
-            rem_task = None
-            if direction.get("last_remediation_task_id"):
-                try:
-                    rem_task = await session.get(
-                        Task,
-                        uuid.UUID(str(direction["last_remediation_task_id"])),
-                    )
-                except (ValueError, TypeError):
-                    rem_task = None
-            if rem_task:
-                extras += (
-                    f"Prior remediation approach:\n"
-                    f"  title: {(rem_task.title or '')[:200]}\n"
-                    f"  description: {(rem_task.description or '')[:500]}\n"
-                )
-            extras += (
-                "The previous remediation attempt failed. Your investigation "
-                "should determine whether the prior diagnosis was incorrect, "
-                "incomplete, or whether the fix approach was wrong. Do not "
-                "recommend the same approach unless you have evidence it was "
-                "implemented incorrectly.\n"
-            )
-        extras += (
-            "Avoid proposing a fix targeting the same fingerprint that already "
-            "failed; prior attempts did not resolve the recurring pattern.\n"
-        )
-    prompt = (
-        f"A research direction was auto-paused for repeated code failures.\n\n"
-        f"Direction: {direction.get('text', '')[:200]}\n"
-        f"Pause reason: {pause_reason}\n"
-        f"Auto-pause count: {direction.get('auto_pause_count', 0)}\n"
-        f"{extras}\n"
-        f"Recent cycles (tasks_created / failed / infra_failed / merged):\n{recent_lines}\n\n"
-        f"Recent failed task messages (truncated):\n{failure_lines}\n\n"
-        f"Investigate why tasks spawned for this direction keep failing. "
-        f"Identify the root cause (direction scope, code complexity, systemic "
-        f"architectural issue), affected files, and a recommended fix."
-    )
-    payload = validate_internal_payload(
-        {
-            "type": "investigate",
-            "prompt": prompt,
-            "base_branch": get_project_integration_branch(project),
-        },
-        "direction_lifecycle:auto_pause_diagnosis",
-    )
-    task_context = {
-        "direction_id": str(direction_id),
-        "pause_reason": pause_reason,
-        "diagnosis_trigger": "direction_auto_pause",
-    }
-    if fingerprint:
-        task_context["diagnosis_fingerprint"] = str(fingerprint)
-    if shared_directions:
-        task_context["shared_fingerprint_directions"] = shared_directions
-    if recent_failures:
-        first_failure = recent_failures[0]
-        task_context["last_failure_class"] = classify_failure(first_failure)
-        task_context["failure_taxonomy"] = classify_failure_taxonomy(first_failure)
-    new_task = Task(
-        project_id=project.id,
-        title=f"Investigate direction auto-pause: {(direction.get('text') or '')[:60]}",
-        description=f"Auto-pause reason: {pause_reason}"[:500],
-        payloads=[payload],
-        context=task_context,
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        priority=70,
-    )
-    session.add(new_task)
-    direction["diagnosis_in_progress"] = True
-    direction["diagnosis_started_at"] = _utcnow().isoformat()
-    direction["diagnosis_task_id"] = str(new_task.id)
-    direction["diagnosis_pause_reason"] = pause_reason
-    logger.info(
-        f"[DIAGNOSIS] Spawned investigate task {new_task.id} for auto-paused "
-        f"direction {direction_id} ({pause_reason[:60]})"
-    )
-    return True
 
 
 async def _process_direction_lifecycle(
@@ -789,61 +516,30 @@ async def _process_direction_lifecycle_locked(
                 d.pop("diagnosis_task_id", None)
                 d["diagnosis_completed_at"] = _utcnow().isoformat()
                 directions_modified = True
-                retry_count = d.get("diagnosis_stall_retry_count", 0)
-                if retry_count < _DIAGNOSIS_STALL_MAX_RETRIES:
-                    stall_reason = (
-                        d.get("diagnosis_pause_reason")
-                        or "code failure auto-pause (prior investigation timed out)"
-                    )
-                    retry_ctx = {
-                        "is_retry": True,
-                        "retry_attempt": retry_count + 1,
-                        "prior_task_id": prior_task_id,
-                        "prior_started_at": started_at,
-                        "why_cleared": (
-                            "prior diagnosis task timed out or was reaped without "
-                            "producing a finding"
+                # The auto-diagnosis re-spawn lane was removed with the
+                # detect->investigate->fix apparatus strip. Surface the stalled
+                # diagnosis as a deterministic operator Alert instead so the
+                # signal (a direction whose investigation never produced a
+                # finding) is preserved for manual follow-up.
+                from app.models import Alert, AlertSeverity
+
+                session.add(
+                    Alert(
+                        project_id=project.id,
+                        severity=AlertSeverity.WARNING,
+                        title="Direction diagnosis stalled",
+                        message=(
+                            f"Direction '{(d.get('text') or '')[:80]}' ({did}) had a "
+                            f"diagnosis investigation time out without producing a "
+                            f"finding (prior task {prior_task_id}). Manual "
+                            f"investigation required."
                         ),
-                    }
-                    try:
-                        from app.autonomous_research import (
-                            _spawn_direction_diagnosis as _spawn_diagnosis_research,
-                        )
-
-                        if await _spawn_diagnosis_research(
-                            project, d, stall_reason, session, retry_context=retry_ctx
-                        ):
-                            d["diagnosis_stall_retry_count"] = retry_count + 1
-                            d["diagnosis_spawned_at"] = _utcnow().isoformat()
-                            logger.info(
-                                f"[DIAGNOSIS] Re-spawned stalled diagnosis for {did} "
-                                f"(retry {retry_count + 1}/{_DIAGNOSIS_STALL_MAX_RETRIES})"
-                            )
-                    except Exception as _retry_exc:
-                        logger.warning(
-                            f"[DIAGNOSIS] Failed to re-spawn stalled diagnosis for {did}: "
-                            f"{_retry_exc}"
-                        )
-                else:
-                    from app.models import Alert, AlertSeverity
-
-                    session.add(
-                        Alert(
-                            project_id=project.id,
-                            severity=AlertSeverity.WARNING,
-                            title="Direction diagnosis stall: max retries exceeded",
-                            message=(
-                                f"Direction '{(d.get('text') or '')[:80]}' ({did}) had "
-                                f"{retry_count} diagnosis attempts time out without "
-                                f"producing a finding. Manual investigation required."
-                            ),
-                        )
                     )
-                    logger.warning(
-                        f"[DIAGNOSIS] Max diagnosis stall retries "
-                        f"({_DIAGNOSIS_STALL_MAX_RETRIES}) exceeded for {did}; "
-                        f"escalating to operator alert"
-                    )
+                )
+                logger.warning(
+                    f"[DIAGNOSIS] Stalled diagnosis for {did}; "
+                    f"escalating to operator alert"
+                )
         # If a remediation monitor has expired while the direction stayed active,
         # the fix held — drop the monitor and clear any lingering manual-intervention
         # alert so the UI stops showing a permanent red banner after recovery.
@@ -1172,21 +868,6 @@ async def _process_direction_lifecycle_locked(
                 logger.warning(
                     f"[NOTIFY] Failed to post direction pause notification: {_notify_exc}"
                 )
-            try:
-                if _is_code_failure_pause_reason(pause_reason):
-                    await _spawn_direction_diagnosis(project, d, pause_reason, session)
-                elif not (pause_reason or "").startswith("Budget exceeded:"):
-                    from app.autonomous_research_diagnosis import (
-                        _spawn_unproductive_diagnosis,
-                    )
-
-                    await _spawn_unproductive_diagnosis(
-                        project, d, pause_reason, session
-                    )
-            except Exception as _e:
-                logger.warning(
-                    f"[DIAGNOSIS] Failed to spawn investigate task for {did}: {_e}"
-                )
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
             code_pause_count = d.get("code_failure_pause_count", 0)
             if code_pause_count >= MAX_AUTO_PAUSE_CYCLES:
@@ -1232,33 +913,10 @@ async def _process_direction_lifecycle_locked(
                         f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                     )
                 directions_modified = True
-            else:
-                # Spawn diagnosis research so the agent can investigate the failure
-                # pattern before the 48h cooldown elapses — skipped on auto-retire
-                # since a retired direction is terminal and has no future cycles.
-                #
-                # IMPORTANT: this is the AUTONOMOUS_RESEARCH version (research task,
-                # `research_mode=diagnosis`), NOT the local code-failure investigate
-                # variant defined at the top of this module. The two functions share
-                # the name `_spawn_direction_diagnosis` but spawn different task
-                # types (research vs investigate). 2026-05-03: a ruff --fix sweep
-                # removed the function-local import as F823 (shadowing) without
-                # noticing the override was load-bearing. Alias it locally to a
-                # different name to dodge F823 and keep the override clear.
-                try:
-                    from app.autonomous_research import (
-                        _spawn_direction_diagnosis as _spawn_diagnosis_research,
-                    )
-
-                    if await _spawn_diagnosis_research(
-                        project, d, pause_reason, session
-                    ):
-                        d["diagnosis_spawned_at"] = _utcnow().isoformat()
-                        directions_modified = True
-                except Exception as _e:
-                    logger.warning(
-                        f"[DIAGNOSIS] Failed to spawn diagnosis research for {did}: {_e}"
-                    )
+            # The auto-paused direction's diagnosis-research spawn was removed
+            # with the detect->investigate->fix apparatus strip. The pause itself
+            # (and its operator notification, posted above) is the preserved
+            # signal; the strategic agent / operator decides any follow-up.
             continue
         # Positive completion detection — mark for user review but don't pause
         completion_suggestion = _check_direction_completion(d)
