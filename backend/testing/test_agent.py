@@ -6223,6 +6223,75 @@ async def test_failed_with_open_pr_spawn_failure_keeps_recovery_marker(
 
 
 @pytest.mark.asyncio
+async def test_failed_pool_served_task_feeds_pool_breaker(
+    client: AsyncClient, db_session, mocker
+):
+    """A FAILED task that was served by the warm pool feeds the pool-claim
+    circuit breaker.
+
+    Regression guard: the agent-reported FAILED path keys the breaker feed on
+    the exact origin stamped by the pool dispatch path. That stamp is
+    WARM_POOL_ORIGIN ("warm_pool", warm_pool.py / agent_warm_continuity.py),
+    NOT the literal "pool". A mismatch makes the feed dead code so the
+    breaker's primary trip mode (a bad pool image silently failing a stream of
+    tasks) can never fire. This test stamps the REAL origin and asserts the
+    failure is recorded.
+    """
+    import app.shared_state as ss
+    from app.warm_pool import WARM_POOL_ORIGIN
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="Pool Breaker Feed", user_id="test-user-pool-breaker")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-pool-breaker",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        # Stamp the warm-claim origin exactly as the pool dispatch path does.
+        context={"_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ss.warm_pool_claim_failure_events.clear()
+    try:
+        token = create_agent_token(str(task.id), "agent-vm-pool-breaker")
+        resp = await client.post(
+            "/api/agent/status",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "status": "FAILED",
+                "failure_category": "fatal",
+                "logs": "boom",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        # The pool-served FAILED task must have fed the pool-claim breaker.
+        assert ss.count_recent_pool_claim_failures() == 1, (
+            "FAILED task stamped warm_claim_origin=WARM_POOL_ORIGIN must record a "
+            "pool-claim failure — the breaker feed is keyed on the wrong literal"
+        )
+    finally:
+        ss.warm_pool_claim_failure_events.clear()
+
+
+@pytest.mark.asyncio
 async def test_failed_with_merged_pr_marks_completed(
     client: AsyncClient, db_session, mocker
 ):

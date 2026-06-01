@@ -3,7 +3,26 @@
 // the dominant miss patterns observed per task type in sr_catch_rate_trends.
 // Handlers compose these into the prompt via getTaskTypeFocusBlock(taskType).
 
-export const MIGRATE_TASK_FOCUS = `
+// Builds the migrate-task self-review focus block. Defaults reproduce
+// Blueprint's own layout byte-for-byte (`backend/app/main.py` /
+// `EXPECTED_SCHEMA_REVISION`) so existing content tests stay valid. Callers on
+// a non-self repo pass that repo's resolved schema-revision file/constant; a
+// repo with NO schema-revision gate passes `schemaRevisionFile: ''`, which
+// drops step 3 entirely so no Blueprint file is ever named. Plain string params
+// (not the ResolvedMigrationLayout type) keep this prompts module free of a
+// task-type-focus → specialized → prompt → task-type-focus import cycle.
+export function buildMigrateTaskFocus(opts?: {
+  schemaRevisionFile?: string;
+  schemaRevisionConst?: string;
+}): string {
+  const schemaRevisionFile = opts?.schemaRevisionFile ?? 'backend/app/main.py';
+  const schemaRevisionConst = opts?.schemaRevisionConst ?? 'EXPECTED_SCHEMA_REVISION';
+  const schemaRevisionStep = schemaRevisionFile === ''
+    ? ''
+    : `3. **${schemaRevisionConst}** — if \`${schemaRevisionFile}\` declares this constant,
+   bump it to match the new alembic head or the invariant test will fail.
+`;
+  return `
 ## Self-review focus: migrate tasks
 
 Migrate tasks carry the highest regression_risk because schema or data changes
@@ -15,9 +34,10 @@ ripple into existing tests. Apply these additional checks before \`./done\`:
 2. **Affected tests** — scan for tests that exercise the changed models or tables.
    Name them explicitly; record them in the \`regression_risk\` issue field even
    when they still pass (e.g. \`"issue": "affected_tests: [test_foo, test_bar] — all still pass"\`).
-3. **EXPECTED_SCHEMA_REVISION** — if \`backend/app/main.py\` declares this constant,
-   bump it to match the new alembic head or the invariant test will fail.
-`;
+${schemaRevisionStep}`;
+}
+
+export const MIGRATE_TASK_FOCUS = buildMigrateTaskFocus();
 
 export const REFACTOR_TASK_FOCUS = `
 ## Self-review focus: refactor tasks
@@ -148,9 +168,16 @@ Apply these additional checks before \`./done\`:
 
 // Returns the task-type-specific self-review focus block to append after
 // CODE_CHANGE_HELPER_GUIDANCE. Returns '' for task types without a custom block.
-export function getTaskTypeFocusBlock(taskType: string): string {
+// For migrate tasks, an optional `opts` lets callers thread their project's
+// resolved schema-revision file/constant through so a non-self repo sees its
+// own paths (and a repo with no gate omits the step). Without opts the block
+// falls back to Blueprint's defaults.
+export function getTaskTypeFocusBlock(
+  taskType: string,
+  opts?: { schemaRevisionFile?: string; schemaRevisionConst?: string },
+): string {
   switch (taskType) {
-    case 'migrate': return MIGRATE_TASK_FOCUS;
+    case 'migrate': return opts ? buildMigrateTaskFocus(opts) : MIGRATE_TASK_FOCUS;
     case 'refactor': return REFACTOR_TASK_FOCUS;
     case 'qa': return QA_TASK_FOCUS;
     case 'create': return CREATE_TASK_FOCUS;

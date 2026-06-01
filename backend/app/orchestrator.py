@@ -687,6 +687,20 @@ async def orchestrator_worker():
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
     )
+    from app.warm_pool import (
+        is_warm_pool_enabled,
+        mark_pool_vm_retiring,
+        try_pool_dispatch,
+    )
+
+    # Pool dispatch funnel: record into the warm_backlog_reuse counters that the
+    # operator panel (admin_health._get_pool_metrics → get_pool_funnel_snapshot)
+    # actually displays, so the surfaced pool_metrics.funnel reflects real
+    # dispatch activity instead of staying permanently zero.
+    from app.warm_backlog_reuse import (
+        record_pool_cold_dispatch,
+        record_pool_lease_hit,
+    )
     from app.alert_dispatch import (
         _maybe_create_failure_alert,
         _create_orchestrator_error_alerts,
@@ -789,7 +803,7 @@ async def orchestrator_worker():
                                 f"[ORCHESTRATOR] Runtime config drift corrected: {_changed_keys}"
                             )
             except TimeoutError:
-                logger.error(
+                logger.exception(
                     "[ORCHESTRATOR] Timed out (30s) acquiring session / reading DeploymentState — "
                     "likely DB pool contention or row-level lock from a stale transaction. "
                     "Skipping this cycle."
@@ -999,10 +1013,31 @@ async def orchestrator_worker():
                 active_count = len(active_tasks_result)
                 # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
                 actual_vm_count = await _get_actual_gcp_vm_count()
-                effective_count = max(active_count, actual_vm_count)
-                if actual_vm_count > active_count + 2:
+                # Warm-pool slot accounting: a pre-provisioned idle pool VM is a
+                # real agent-vm-* instance, so _get_actual_gcp_vm_count() and the
+                # GCP cleanup count BOTH include it. Charging it against the
+                # dispatch budget would starve real queued tasks. Exclude the
+                # non-task-bound pool members (PROVISIONING/IDLE) from the GCP
+                # cross-check — they live in a dedicated pool budget
+                # (warm_pool_max_vms, enforced by the maintainer), NOT the dispatch
+                # budget. LEASED pool members run a task and are already counted in
+                # active_count, so they must NOT be subtracted.
+                from app.warm_pool import count_idle_pool_vms, is_warm_pool_enabled
+
+                # Only subtract idle pool inventory when the pool is enabled. When
+                # disabled the maintainer/idle-sweep early-return and never clear
+                # PoolVm rows, but the generic GCP cleanup still deletes the
+                # underlying VMs — so stale IDLE rows would over-subtract here,
+                # inflating slots_available past max_concurrent_vms. Gate it off.
+                idle_pool_count = (
+                    await count_idle_pool_vms(session) if is_warm_pool_enabled() else 0
+                )
+                gcp_dispatch_vms = max(0, actual_vm_count - idle_pool_count)
+                effective_count = max(active_count, gcp_dispatch_vms)
+                if gcp_dispatch_vms > active_count + 2:
                     logger.warning(
-                        f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}) > DB active count ({active_count}) "
+                        f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}, "
+                        f"{idle_pool_count} idle-pool) > DB active count ({active_count}) "
                         f"— possible orphans, using GCP count for slot calculation"
                     )
                 slots_available = max(
@@ -1730,8 +1765,10 @@ async def orchestrator_worker():
                                     Task.id.in_(all_dep_ids_broad)
                                 )
                             )
-                            for dep_id, dep_status in broad_dep_rows.all():
-                                broad_dep_status[dep_id] = dep_status
+                            broad_dep_status = {
+                                dep_id: dep_status
+                                for dep_id, dep_status in broad_dep_rows.all()
+                            }
 
                         broad_classified = _classify_stuck_tasks(
                             broad_stuck,
@@ -2133,6 +2170,10 @@ async def orchestrator_worker():
                     #       through to provision (cold path).
                     _warm_ctx = task.context or {}
                     _warm_target_vm_id = _warm_ctx.get("warm_target_vm_id")
+                    # A pool pin (warm_pool dispatch hook) reuses the warm_target_vm_id
+                    # machinery but is gated on the warm-pool flag/breaker, not
+                    # warm-continuity, and releases its leased PoolVm row on clear.
+                    _is_pool_pin = bool(_warm_ctx.get("warm_pool_pin"))
                     if _warm_target_vm_id:
                         _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
                         _warm_expired = False
@@ -2151,7 +2192,14 @@ async def orchestrator_worker():
                         else:
                             _warm_expired = True
 
-                        _cb_suppressed = _shared_state.is_warm_continuity_suppressed()
+                        if _is_pool_pin:
+                            _cb_suppressed = (
+                                not is_warm_pool_enabled()
+                            ) or _shared_state.is_warm_pool_suppressed()
+                        else:
+                            _cb_suppressed = (
+                                _shared_state.is_warm_continuity_suppressed()
+                            )
                         if (
                             not _warm_expired
                             and not _cb_suppressed
@@ -2177,6 +2225,7 @@ async def orchestrator_worker():
                                 "warm_target_vm_id",
                                 "warm_target_pr",
                                 "warm_handoff_deadline",
+                                "warm_pool_pin",
                             )
                         }
                         task.context = _new_ctx
@@ -2189,6 +2238,23 @@ async def orchestrator_worker():
                             _clear_reason = "deadline_expired"
                         else:
                             _clear_reason = "vm_unresponsive"
+                        # A pool pin we give up on releases its leased PoolVm row
+                        # (retired so it is never re-leased — it failed to serve
+                        # the pinned task in time / is unresponsive). Pool clears
+                        # feed the pool breaker, NOT the warm-continuity pin-clear
+                        # metric, so the two breakers stay independent.
+                        if _is_pool_pin:
+                            await mark_pool_vm_retiring(session, _warm_target_vm_id)
+                            if _clear_reason != "circuit_breaker":
+                                _shared_state.record_pool_claim_failure(_clear_reason)
+                            # _pin_task_to_pool_vm stamped this retiring member's
+                            # vm_instance_id onto the task. Reset it so the cold
+                            # fall-through below mints a FRESH agent-vm- id instead
+                            # of re-creating a GCP instance named after the VM we
+                            # just scheduled for teardown (name collision racing the
+                            # reaper's delete). Chain pins leave vm_instance_id None
+                            # so they are unaffected; only pool pins set it.
+                            task.vm_instance_id = None
                         # Phase 2e observability: track clear-out rate so we
                         # can detect warm-VM instability. Sustained >5/hour
                         # means the warm chain is failing more than expected.
@@ -2200,7 +2266,7 @@ async def orchestrator_worker():
                         # events to avoid a feedback loop that deepens suppression.
                         _pending_warm_pin_clear: tuple[str, str] | None = (
                             None
-                            if _clear_reason == "circuit_breaker"
+                            if (_clear_reason == "circuit_breaker" or _is_pool_pin)
                             else (_warm_target_vm_id, _clear_reason)
                         )
                         logger.info(
@@ -2210,49 +2276,12 @@ async def orchestrator_worker():
                     else:
                         _pending_warm_pin_clear = None
 
-                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
-                    # if an idle warm VM is actively polling /next-role for this
-                    # project, hold off cold-provisioning this eligible backlog task
-                    # for a bounded window so the warm VM can claim it first. Scoped
-                    # to non-chain-pinned tasks that the /next-role backlog branch
-                    # will actually claim: either no dependencies, or dependencies
-                    # the orchestrator already resolved and stamped
-                    # ``_deps_satisfied`` on above — exactly the warm-eligible set.
-                    # A task with still-unresolved deps carries no marker and is
-                    # never held (it cold-dispatches as before). The atomic
-                    # SKIP-LOCKED claim in /next-role still guarantees no
-                    # double-provision if both race; this only biases the race
-                    # toward reuse. The window auto-expires, so a VM that dies
-                    # mid-poll delays this task by at most that bound.
-                    if (
-                        _runtime_config.get("warm_backlog_reuse_enabled", False)
-                        and not _warm_target_vm_id
-                        and (
-                            not task.depends_on
-                            or (task.context or {}).get("_deps_satisfied")
-                        )
-                        and _shared_state.is_backlog_first_refusal_active(
-                            str(task.project_id)
-                        )
-                    ):
-                        logger.info(
-                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
-                            f"cold-provision of task {task.id} (project {task.project_id}) "
-                            f"— idle warm VM has first claim"
-                        )
-                        await session.rollback()
-                        continue
-
-                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery
-                    # OR set to None for warm-pinned tasks whose pin was just cleared).
-                    if not task.vm_instance_id:
-                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    logger.info(
-                        f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})"
-                    )
-
-                    # Resolve the task's LLM runtime identity and select an eligible account.
-                    # Two sources feed the effective blacklist:
+                    # Resolve the task's LLM runtime identity and select an eligible
+                    # account BEFORE consulting the warm pool, so the pool lease gate
+                    # enforces the SAME compatibility the cold path would (provider
+                    # preference, category/quality routing, account availability, and
+                    # the rate-limit blacklist). Two sources feed the effective
+                    # blacklist:
                     #  - blacklisted_accounts: pruneable (rate-limit recovers → reusable)
                     #  - provision_failed_accounts: sticky (silent pre-claim deaths stay
                     #    unavailable for this task — prune logic below would otherwise
@@ -2308,6 +2337,114 @@ async def orchestrator_worker():
                         runtime_config=_runtime_config,
                         blacklist=_effective_blacklist,
                     )
+
+                    # Warm-pool dispatch hook (efficiency direction d-5fd69fe1):
+                    # BEFORE cold-provisioning, consult the pre-provisioned idle
+                    # pool. If a compatible, same-tenant IDLE member is free, lease
+                    # it atomically (FOR UPDATE SKIP LOCKED) and pin this task to
+                    # it, then skip cold provisioning entirely — the member's agent
+                    # claims the task warm via /next-role (origin "warm_pool"),
+                    # converting a cold dispatch into a warm-start claim. Inert when
+                    # warm_pool_enabled is off. Scoped to fresh, non-pinned,
+                    # no-dependency tasks (a task already carrying a warm pin is
+                    # handled by the skip-provision branch above). The required
+                    # identity passed in is the RESOLVED selection (runtime_selection)
+                    # — honoring provider preference, category/quality routing AND the
+                    # rate-limit blacklist — NOT the task's raw context, so a member
+                    # pinned to a blacklisted account or a non-routed model is never
+                    # leased. Skipped entirely when no runtime identity resolves
+                    # (runtime_selection is None — the cold path's no-account handling
+                    # takes over). On no lease, fall through to the existing cold path
+                    # and count it as a cold dispatch.
+                    if (
+                        not _warm_target_vm_id
+                        and not task.depends_on
+                        and is_warm_pool_enabled()
+                        and runtime_selection is not None
+                    ):
+                        _leased_member = await try_pool_dispatch(
+                            session,
+                            task,
+                            required_provider=runtime_selection.provider,
+                            required_model=runtime_selection.model or task_model,
+                            required_account=(
+                                runtime_selection.account.get("id")
+                                if runtime_selection.account
+                                else None
+                            ),
+                            excluded_account_ids=_effective_blacklist,
+                        )
+                        if _leased_member is not None:
+                            try:
+                                await session.commit()
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to commit warm-pool lease "
+                                    f"for task {task.id}; falling back to cold provision"
+                                )
+                                _shared_state.record_pool_claim_failure("commit_error")
+                                await session.rollback()
+                                # session.rollback() expires every session-bound
+                                # instance (independent of expire_on_commit=False),
+                                # so the fall-through reads of this task below
+                                # (task.depends_on/project_id/vm_instance_id) would
+                                # trigger a sync lazy-load -> MissingGreenlet and
+                                # abort the whole cycle (the hazard documented at
+                                # the top of this loop). The lease was rolled back,
+                                # so the task is still QUEUED — retry it cleanly
+                                # next cycle, exactly like every other rollback
+                                # site in this loop.
+                                continue
+                            else:
+                                record_pool_lease_hit()
+                                logger.info(
+                                    f"[ORCHESTRATOR] Warm-pool dispatch: task {task.id} "
+                                    f"leased pool VM {_leased_member.vm_instance_id} "
+                                    "(skipping cold provision)"
+                                )
+                                continue
+
+                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
+                    # if an idle warm VM is actively polling /next-role for this
+                    # project, hold off cold-provisioning this eligible backlog task
+                    # for a bounded window so the warm VM can claim it first. Scoped
+                    # to non-chain-pinned tasks that the /next-role backlog branch
+                    # will actually claim: either no dependencies, or dependencies
+                    # the orchestrator already resolved and stamped
+                    # ``_deps_satisfied`` on above — exactly the warm-eligible set.
+                    # A task with still-unresolved deps carries no marker and is
+                    # never held (it cold-dispatches as before). The atomic
+                    # SKIP-LOCKED claim in /next-role still guarantees no
+                    # double-provision if both race; this only biases the race
+                    # toward reuse. The window auto-expires, so a VM that dies
+                    # mid-poll delays this task by at most that bound.
+                    if (
+                        _runtime_config.get("warm_backlog_reuse_enabled", False)
+                        and not _warm_target_vm_id
+                        and (
+                            not task.depends_on
+                            or (task.context or {}).get("_deps_satisfied")
+                        )
+                        and _shared_state.is_backlog_first_refusal_active(
+                            str(task.project_id)
+                        )
+                    ):
+                        logger.info(
+                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
+                            f"cold-provision of task {task.id} (project {task.project_id}) "
+                            f"— idle warm VM has first claim"
+                        )
+                        await session.rollback()
+                        continue
+
+                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery
+                    # OR set to None for warm-pinned tasks whose pin was just cleared).
+                    if not task.vm_instance_id:
+                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    logger.info(
+                        f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})"
+                    )
+
                     runtime_secret = None
                     claude_config_json = None
                     account_id = None
@@ -2616,6 +2753,12 @@ async def orchestrator_worker():
                                 *_pending_warm_pin_clear
                             )
                             _pending_warm_pin_clear = None
+                        # Pool-hit-vs-cold-dispatch funnel: this task was cold-
+                        # provisioned (no compatible pool member was leased above).
+                        # Recorded only when the pool feature is on so the funnel
+                        # denominator reflects the period the pool was actually live.
+                        if is_warm_pool_enabled():
+                            record_pool_cold_dispatch()
                     except Exception as e:
                         import traceback
 
@@ -4357,14 +4500,26 @@ async def orchestrator_worker():
                                     if ci_task.project_id
                                     else None
                                 )
-                                if _ci_proj is not None and _ci_proj.is_staging_branch(
-                                    _ci_base_ref
+                                # A *definitive* no_checks proceeds to the
+                                # mergeability-gated merge when the PR targets an
+                                # internal staging branch (research/plan, CI
+                                # path-filtered by design) OR the project declares
+                                # it has no CI (build_config.requires_ci_checks=
+                                # False) — otherwise (CI-gated repo, checks merely
+                                # not registered yet) keep polling. See
+                                # Project.proceed_on_no_checks.
+                                if _ci_proj is not None and ci_resolution.proceed_on_no_checks(
+                                    _ci_proj, _ci_base_ref
                                 ):
+                                    _ci_reason = (
+                                        f"targets internal staging branch '{_ci_base_ref}'"
+                                        if _ci_proj.is_staging_branch(_ci_base_ref)
+                                        else "the project declares no CI (requires_ci_checks=False)"
+                                    )
                                     logger.info(
-                                        f"[CI] PR #{ci_pr_number} targets internal "
-                                        f"staging branch '{_ci_base_ref}' with 0 "
-                                        f"check-runs (CI not applicable) — treating "
-                                        f"as passed so the rollup can proceed"
+                                        f"[CI] PR #{ci_pr_number} has 0 check-runs and "
+                                        f"{_ci_reason} — treating as passed so the "
+                                        f"merge can proceed"
                                     )
                                     ci_result = {
                                         "status": "completed",

@@ -284,6 +284,33 @@ def count_recent_backlog_reuse_failures(window_seconds: int = 3600) -> int:
     return sum(1 for ts, _ in warm_backlog_reuse_failure_events if ts >= cutoff)
 
 
+# --- Warm-pool claim circuit breaker (efficiency direction d-5fd69fe1) ---
+# Each entry: (timestamp, reason). A pool lease that errors (lease/finalize
+# exception, a leased VM found to be in-flight-deleting) or a pool-served claim
+# that ends in a FAILED task appends here. Sustained failures — the classic
+# "a bad pool image silently fails a stream of tasks" mode — auto-suppress the
+# pool for a bounded cooldown (see shared_state.is_warm_pool_suppressed) so the
+# maintainer stops replenishing and the orchestrator dispatch hook stops leasing
+# (falling back to cold provisioning) until the rate normalises. Bounded deque;
+# pruned by sweep_stale_in_memory_state.
+warm_pool_claim_failure_events: deque = deque(maxlen=200)
+
+
+def record_pool_claim_failure(reason: str = "lease_error") -> None:
+    """Record a warm-pool claim failure event.
+
+    Called from the orchestrator dispatch hook (lease error / doomed VM) and the
+    /next-role pool finalize-error path. Feeds the pool circuit breaker.
+    """
+    warm_pool_claim_failure_events.append((_utcnow(), reason))
+
+
+def count_recent_pool_claim_failures(window_seconds: int = 3600) -> int:
+    """Count warm-pool claim failure events in the trailing window."""
+    cutoff = _utcnow() - timedelta(seconds=window_seconds)
+    return sum(1 for ts, _ in warm_pool_claim_failure_events if ts >= cutoff)
+
+
 # --- Warm backlog-reuse first-refusal (efficiency direction d-91d8dede) ---
 # project_id (str) -> first-refusal deadline (naive UTC). While a project has
 # an unexpired entry, the orchestrator's cold-dispatch loop holds off

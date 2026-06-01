@@ -450,31 +450,7 @@ async def provision_agent_vm(
     # so vm_reuse_rate has a real signal to aggregate.
     if payload_uri:
         validate_payload_uri(payload_uri)
-    # Block provisioning if image family is invalid. Retry validation periodically
-    # so a transient startup failure doesn't permanently disable provisioning.
-    global _image_family_valid, _image_family_last_check
-    if _image_family_valid is False and not LOCAL_MODE:
-        now = time.time()
-        if now - _image_family_last_check >= _IMAGE_FAMILY_RECHECK_INTERVAL:
-            try:
-                _validate_image_family()
-                _image_family_valid = True
-                _image_family_last_check = now
-                logger.info(
-                    "[COMPUTE] Image family re-validation succeeded — provisioning re-enabled"
-                )
-            except Exception:
-                _image_family_last_check = now
-                logger.exception("[COMPUTE] Image family re-validation still failing")
-                raise RuntimeError(
-                    f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
-                    f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
-                )
-        else:
-            raise RuntimeError(
-                f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
-                f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
-            )
+    _ensure_image_family_valid()
     if LOCAL_MODE:
         return await _provision_local(
             vm_instance_id,
@@ -506,6 +482,175 @@ async def provision_agent_vm(
         provider_settings=provider_settings,
         provisioning_model=provisioning_model,
     )
+
+
+def _ensure_image_family_valid() -> None:
+    """Block provisioning when the agent VM image family is invalid.
+
+    Retries validation periodically so a transient startup failure doesn't
+    permanently disable provisioning. Raises RuntimeError while invalid. Shared
+    by the task-bound (provision_agent_vm) and taskless (provision_pool_vm)
+    entrypoints. No-op in LOCAL_MODE.
+    """
+    global _image_family_valid, _image_family_last_check
+    if _image_family_valid is False and not LOCAL_MODE:
+        now = time.time()
+        if now - _image_family_last_check >= _IMAGE_FAMILY_RECHECK_INTERVAL:
+            try:
+                _validate_image_family()
+                _image_family_valid = True
+                _image_family_last_check = now
+                logger.info(
+                    "[COMPUTE] Image family re-validation succeeded — provisioning re-enabled"
+                )
+            except Exception:
+                _image_family_last_check = now
+                logger.exception("[COMPUTE] Image family re-validation still failing")
+                raise RuntimeError(
+                    f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
+                    f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL}s."
+                )
+        else:
+            raise RuntimeError(
+                f"VM provisioning disabled: image family '{AGENT_IMAGE_FAMILY}' "
+                f"failed validation. Next retry in {_IMAGE_FAMILY_RECHECK_INTERVAL - (now - _image_family_last_check):.0f}s."
+            )
+
+
+async def provision_pool_vm(
+    session,
+    vm_instance_id: str,
+    project_id: uuid.UUID,
+    *,
+    account_id: str | None = None,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    agent_image_fingerprint: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
+    provisioning_model: str | None = None,
+) -> str | None:
+    """Boot a TASKLESS, credentialed warm-pool VM and register it in PoolVm.
+
+    The VM is pinned to ``account_id`` / ``provider`` / ``auth_mode`` / ``model``
+    (baked into its boot secret manifest) but carries NO task. It boots poll-first
+    (BLUEPRINT_POOL_MODE) and authenticates with a VM-scoped token. On success a
+    :class:`app.models.PoolVm` row is added to ``session`` (the caller commits) and the
+    ``vm_instance_id`` is returned; returns ``None`` (no row registered) when the GCP
+    provision fails without raising, so the caller must NOT commit on a None return.
+
+    INFRASTRUCTURE ONLY — gated by ``warm_pool_enabled`` (default False); raises
+    RuntimeError when the pool is disabled so the path is inert in production
+    until the maintainer + dispatch hook (sibling tasks) land. Mirrors
+    provision_agent_vm's image-family validation and provider/account plumbing.
+    """
+    from app.warm_pool import is_warm_pool_enabled, register_pool_vm
+    from app.models import PoolVmState
+
+    if not is_warm_pool_enabled():
+        raise RuntimeError(
+            "warm_pool_enabled is False — pool VM provisioning is disabled"
+        )
+
+    _ensure_image_family_valid()
+
+    project_id_str = str(project_id)
+
+    if LOCAL_MODE:
+        # No GCP VM in local mode; register the member so the registry is
+        # exercisable end-to-end without a cloud provisioner. Nothing dispatches
+        # to it yet (infra only).
+        await register_pool_vm(
+            session,
+            vm_instance_id=vm_instance_id,
+            project_id=project_id,
+            account_id=account_id,
+            provider=provider,
+            auth_mode=auth_mode,
+            model=model,
+            agent_image_fingerprint=agent_image_fingerprint,
+            state=PoolVmState.PROVISIONING,
+        )
+        logger.info(f"[WARM-POOL] LOCAL_MODE pool VM registered (no boot): {vm_instance_id}")
+        return vm_instance_id
+
+    from app.compute_manifest import build_taskless_agent_secret_manifest
+    from app.compute_startup_script import build_pool_agent_startup_script
+
+    # Build the taskless manifest (VM-scoped token, no TASK_ID, pinned creds)
+    # and store it in Secret Manager — same store path as the task-bound flow.
+    manifest = build_taskless_agent_secret_manifest(
+        vm_instance_id=vm_instance_id,
+        project_id=project_id_str,
+        oauth_token=oauth_token,
+        claude_config_json=claude_config_json,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        execution_mode=execution_mode,
+        provider_metadata=provider_metadata,
+        provider_settings=provider_settings,
+    )
+    secret_version_name = await asyncio.to_thread(
+        _store_agent_secret,
+        vm_instance_id,
+        json.dumps(manifest, separators=(",", ":")),
+    )
+
+    startup_script = build_pool_agent_startup_script(
+        vm_instance_id=vm_instance_id,
+        secret_version_name=secret_version_name,
+        orchestrator_url=ORCHESTRATOR_URL,
+        materialize_manifest_b64=_MATERIALIZE_MANIFEST_B64,
+    )
+
+    success = await _provision_gcp(
+        vm_instance_id,
+        None,  # taskless
+        secret_version_name=secret_version_name,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        execution_mode=execution_mode,
+        provider_metadata=provider_metadata,
+        provider_settings=provider_settings,
+        provisioning_model=provisioning_model,
+        startup_script_override=startup_script,
+    )
+    if not success:
+        # _provision_gcp returns False WITHOUT raising on its normal failure paths
+        # (provision-capacity reached, 420s boot timeout/CancelledError, caught
+        # exception) and deletes the staged agent secret on each. Committing a
+        # PROVISIONING PoolVm row here would register a PHANTOM member whose secret
+        # is already gone and which can never reach IDLE (only the zombie reaper
+        # would eventually clean it up). Mirror provision_agent_vm's success gate
+        # and bail; the maintainer simply retries next tick.
+        logger.warning(
+            "[WARM-POOL] _provision_gcp did not boot pool VM %s (project %s) — "
+            "skipping registry insert (secret already cleaned up by provisioner)",
+            vm_instance_id,
+            project_id,
+        )
+        return None
+
+    # Register the freshly-booted member. It starts PROVISIONING; the agent's
+    # first ready signal / the maintainer (sibling task) transitions it to IDLE.
+    await register_pool_vm(
+        session,
+        vm_instance_id=vm_instance_id,
+        project_id=project_id,
+        account_id=account_id,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        agent_image_fingerprint=agent_image_fingerprint,
+        state=PoolVmState.PROVISIONING,
+    )
+    return vm_instance_id
 
 
 _last_provision_error: _OrderedDict = _OrderedDict()
@@ -1044,7 +1189,7 @@ async def reconcile_orphaned_secrets(active_vm_ids: set[str]) -> dict:
 
 async def _provision_gcp(
     vm_instance_id: str,
-    task_id: uuid.UUID,
+    task_id: uuid.UUID | None,
     payload_uri: str | None = None,
     oauth_token: str | None = None,
     claude_config_json: str | None = None,
@@ -1057,12 +1202,20 @@ async def _provision_gcp(
     provider_metadata: dict | None = None,
     provider_settings: dict | None = None,
     provisioning_model: str | None = None,
+    startup_script_override: str | None = None,
 ):
+    """Provision a GCP VM. When ``startup_script_override`` is provided it is used
+    verbatim as the instance startup-script (the taskless warm-pool path passes
+    a pre-built pool script + a pre-stored secret), and ``task_id`` may be None.
+    """
     from google.cloud import compute_v1
 
-    logger.info(f"Starting provisioning for VM: {vm_instance_id} (Task: {task_id})")
+    logger.info(
+        f"Starting provisioning for VM: {vm_instance_id} "
+        f"(Task: {task_id if task_id is not None else 'pool'})"
+    )
 
-    if secret_version_name is None:
+    if secret_version_name is None and task_id is not None:
         # Secret was not pre-computed by the caller — build and store it now.
         # (Callers that run upload_json_payload concurrently pass secret_version_name
         # from prepare_and_store_agent_secret to avoid this sequential fallback.)
@@ -1087,15 +1240,20 @@ async def _provision_gcp(
         base64.b64encode(payload_uri.encode()).decode() if payload_uri else ""
     )
 
-    from app.compute_startup_script import build_agent_startup_script
+    if startup_script_override is not None:
+        # Taskless warm-pool path: the caller (provision_pool_vm) supplies a
+        # pre-built pool startup script that beacons via VM-scoped /vm-heartbeat.
+        startup_script = startup_script_override
+    else:
+        from app.compute_startup_script import build_agent_startup_script
 
-    startup_script = build_agent_startup_script(
-        task_id=str(task_id),
-        secret_version_name=secret_version_name,
-        payload_uri_b64=payload_uri_b64,
-        orchestrator_url=ORCHESTRATOR_URL,
-        materialize_manifest_b64=_MATERIALIZE_MANIFEST_B64,
-    )
+        startup_script = build_agent_startup_script(
+            task_id=str(task_id),
+            secret_version_name=secret_version_name,
+            payload_uri_b64=payload_uri_b64,
+            orchestrator_url=ORCHESTRATOR_URL,
+            materialize_manifest_b64=_MATERIALIZE_MANIFEST_B64,
+        )
 
     instance_config = compute_v1.Instance()
     instance_config.name = vm_instance_id

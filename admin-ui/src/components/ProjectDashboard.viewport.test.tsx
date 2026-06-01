@@ -5,9 +5,28 @@ import { ProjectDashboard } from './ProjectDashboard';
 import type { Project } from '../types/project';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
-}));
+// Spread the real module so statically-imported named exports
+// (e.g. validateApprovalGatePath, pulled in by ProjectApprovalGateSection)
+// still resolve under browser-mode ESM linking, then override only the
+// network-touching functions. Returning a bare object literal omits those
+// exports and makes the browser-mode (vite) suite fail to link the module.
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  return {
+    ...actual,
+    apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+    fetchApprovalGateConfig: vi.fn(async () => ({
+      project_id: 'proj-1',
+      approval_gate_config: { infra_files: [], critical_files: [] },
+      is_default: true,
+    })),
+    updateApprovalGateConfig: vi.fn(async (projectId: string, config: { infra_files: string[]; critical_files: string[] }) => ({
+      project_id: projectId,
+      approval_gate_config: config,
+      is_default: config.infra_files.length === 0 && config.critical_files.length === 0,
+    })),
+  };
+});
 
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
@@ -73,9 +92,10 @@ describe('ProjectDashboard — viewport regression', () => {
     // true because page.viewport(375) constrains body width.
     const escapeHatch = host?.querySelector('[data-viewport-allow-overflow]') as HTMLElement | null;
     expect(escapeHatch).not.toBeNull();
-    const parent = escapeHatch!.parentElement;
+    const parent = escapeHatch.parentElement;
     expect(parent).not.toBeNull();
-    const rect = parent!.getBoundingClientRect();
+    if (!parent) throw new Error('missing parent');
+    const rect = parent.getBoundingClientRect();
     expect(rect.right).toBeLessThanOrEqual(388); // 375px + 12px host padding + 1px tolerance
 
     localStorage.removeItem('projectDashboardCollapsed');
@@ -145,7 +165,7 @@ describe('ProjectDashboard — viewport regression', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
 
     const projects = [
-      makeProject({ id: 'p1', name: 'Platform', status: 'active' }),
+      makeProject({ id: 'p1', name: 'Platform', status: 'active', my_role: 'owner' }),
     ];
 
     await expectMinTouchTargetAt(375, async () => {
@@ -162,10 +182,15 @@ describe('ProjectDashboard — viewport regression', () => {
             selectedProjectId="p1"
             onSelectProject={() => {}}
             onToggleMembers={() => {}}
+            onOpenSetupGuide={() => {}}
           />,
         );
       });
       expect(host?.querySelector('button[title="Project Members"]')).not.toBeNull();
+      await act(async () => {
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+      });
+      expect(host?.textContent).toContain('Approval-Gate Files');
     }, { selector: 'button[title="Project Members"]' });
 
     localStorage.removeItem('projectDashboardCollapsed');

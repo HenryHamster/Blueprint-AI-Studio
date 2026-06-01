@@ -81,6 +81,31 @@ export interface SpawnPinFunnelSnapshot {
   skipped_total: number;
 }
 
+export interface PoolFunnelSnapshot {
+  window_hours: number;
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  lease_miss_by_reason: Record<string, number>;
+  lease_miss_total: number;
+}
+
+// Warm-pool sizing + idle-cost + dispatch-funnel snapshot. All fields optional
+// for backward compatibility: an older backend that predates the pool metrics
+// returns no `pool_metrics` block (or {}) and the panel renders without it.
+export interface PoolMetrics {
+  enabled?: boolean;
+  target_size?: number;
+  idle_ttl_secs?: number;
+  current_size?: number;
+  idle_count?: number;
+  projected_idle_cost_usd?: number;
+  settled_idle_cost_usd?: number;
+  live_idle_cost_usd?: number;
+  funnel?: PoolFunnelSnapshot;
+}
+
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
   warm_pin_metrics: {
@@ -99,4 +124,6 @@ export interface WarmVmStateResponse {
   chain_continuity_funnel?: ChainContinuityFunnelSnapshot;
   spawn_pin_funnel?: SpawnPinFunnelSnapshot;
   backlog_reuse_funnel?: BacklogReuseFunnelSnapshot;
+  // Optional for backward compatibility (older backend omits it entirely).
+  pool_metrics?: PoolMetrics;
 }

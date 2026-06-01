@@ -1837,13 +1837,26 @@ async def update_agent_status(
         if not _teardown_deferred:
             fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
-        # Backlog-reuse circuit breaker: if this FAILED task was originally
-        # claimed via the warm-backlog path, record a failure event so the
-        # circuit breaker can suppress backlog reuse if failures accumulate.
+        # Backlog-reuse / warm-pool circuit breakers: if this FAILED task was
+        # originally claimed via a warm path, record a failure event so the
+        # matching circuit breaker can suppress that path if failures accumulate
+        # (the classic "a bad image silently fails a stream of tasks" mode).
         if payload.status == TaskStatus.FAILED:
+            from app.warm_pool import WARM_POOL_ORIGIN
+
             _timing_ctx = (task.context or {}).get("_timing", {})
-            if _timing_ctx.get("warm_claim_origin") == "backlog_reuse":
+            _claim_origin = _timing_ctx.get("warm_claim_origin")
+            if _claim_origin == "backlog_reuse":
                 _shared_state.record_backlog_reuse_failure("task_failed")
+            elif _claim_origin == WARM_POOL_ORIGIN:
+                # A warm-pool member served this task and it FAILED — feed the
+                # pool-claim breaker so the maintainer stops replenishing (and
+                # dispatch stops leasing) while a bad pool image is in rotation.
+                # The pool dispatch path stamps WARM_POOL_ORIGIN ("warm_pool"),
+                # NOT "pool" — compare against the canonical constant so this
+                # feed cannot silently drift out of sync with the stamp site
+                # (agent_warm_continuity._finalize_warm_claim, origin=WARM_POOL_ORIGIN).
+                _shared_state.record_pool_claim_failure("task_failed")
 
         # Open-PR handoff: if a previous attempt already pushed a branch and
         # opened a PR, retrying from scratch will collide with the agent's

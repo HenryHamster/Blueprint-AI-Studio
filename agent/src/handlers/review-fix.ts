@@ -797,7 +797,10 @@ export async function handleFix(
       .split('\n').map(s => s.trim()).filter(Boolean);
     const migrationConflict = detectMigrationConflict(prFiles, baseFiles, versionsDir);
     if (migrationConflict.detected) {
-      const guidance = buildMigrationConflictGuidance(migrationConflict, versionsDir);
+      const guidance = buildMigrationConflictGuidance(
+        migrationConflict, versionsDir,
+        migrationLayout.schemaRevisionFile, migrationLayout.schemaRevisionConst,
+      );
       enrichedPrompt = `${guidance}${enrichedPrompt}`;
       sendLog(ws, `Migration revision conflict detected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')}\n`);
     }

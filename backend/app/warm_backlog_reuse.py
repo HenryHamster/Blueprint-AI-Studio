@@ -230,6 +230,13 @@ async def _eligible_backlog_ids(
         if pinned_vm and pinned_vm != vm_instance_id:
             skipped_pinned_vm += 1
             continue
+        # A warm-pool pin is owned exclusively by the warm-pool dispatch path
+        # (claimed via the /next-role pool branch, origin "warm_pool"). Backlog
+        # reuse must never claim it — that would mis-attribute the lift and
+        # bypass the pool's lease accounting — even when it is pinned to THIS VM.
+        if ctx.get("warm_pool_pin"):
+            skipped_pinned_vm += 1
+            continue
         if in_progress_files:
             cfiles = _prod_files(ctx.get("related_files", []))
             if cfiles & in_progress_files:
@@ -487,6 +494,68 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         "grace_ceiling_releases": sum(
             1 for ts in _grace_ceiling_release_events if ts >= cutoff
         ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Warm-POOL dispatch funnel observability counters (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# Pool-hit-vs-cold-dispatch funnel for the pre-provisioned VM pool. Mirrors the
+# backlog-reuse funnel above: bounded rolling deques of UTC timestamps (plus a
+# (datetime, reason) tuple for the multi-reason lease-miss stage), maxlen=500 to
+# bound memory on a long-lived process. The dispatch hook (sibling task) calls
+# these as it decides between leasing an IDLE pool member (a "hit") and
+# cold-provisioning a fresh VM (a "cold dispatch"); get_pool_funnel_snapshot
+# rolls them up for the operator panel.
+
+_pool_lease_hit_events: deque = deque(maxlen=500)
+_pool_cold_dispatch_events: deque = deque(maxlen=500)
+_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason)
+
+
+def record_pool_lease_hit() -> None:
+    """A queued task was served warm by leasing an IDLE pool member."""
+    _pool_lease_hit_events.append(_utcnow())
+
+
+def record_pool_cold_dispatch() -> None:
+    """A queued task cold-provisioned a VM (pool disabled, empty, or no match)."""
+    _pool_cold_dispatch_events.append(_utcnow())
+
+
+def record_pool_lease_miss(reason: str) -> None:
+    """The pool was consulted but no member could be leased.
+
+    reason should be one of: "no_idle_member" (pool empty / all leased),
+    "no_compatible_member" (idle members exist but identity/tenant mismatch),
+    "disabled" (warm_pool_enabled off), "lost_lease_race" (a peer dispatcher
+    won the SKIP-LOCKED row).
+    """
+    _pool_lease_miss_events.append((_utcnow(), reason))
+
+
+def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
+    """Return rolling funnel counts for the warm-pool dispatch path.
+
+    All counts cover the trailing ``window_hours`` (default 24h). ``pool_hit_rate``
+    is hits / (hits + cold dispatches), or None when no dispatch was recorded.
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    miss_by_reason: dict = {}
+    for ts, reason in _pool_lease_miss_events:
+        if ts >= cutoff:
+            miss_by_reason[reason] = miss_by_reason.get(reason, 0) + 1
+    hits = sum(1 for ts in _pool_lease_hit_events if ts >= cutoff)
+    cold = sum(1 for ts in _pool_cold_dispatch_events if ts >= cutoff)
+    total = hits + cold
+    return {
+        "window_hours": window_hours,
+        "pool_lease_hits": hits,
+        "cold_dispatches": cold,
+        "total_dispatches": total,
+        "pool_hit_rate": round(hits / total, 4) if total else None,
+        "lease_miss_by_reason": miss_by_reason,
+        "lease_miss_total": sum(miss_by_reason.values()),
     }
 
 

@@ -27,8 +27,9 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 # shared_state.py uses datetime.utcnow() at module level (can't import _utcnow due to circular dep)
-# E402: thin facade — domain re-export imports are placed AFTER the module logger
-# (circular-dependency / load-order), the same intentional pattern as main.py/orchestrator.py.
+# E402: it is a thin facade that re-exports symbols from the extracted domain modules via
+# deferred mid-module imports (circular-dependency / load-order) — the same intentional
+# pattern already exempted for main.py / orchestrator.py above.
 "app/shared_state.py" = ["DTZ", "E402"]
 # Test files use convenience patterns (broad except, datetime.utcnow, etc.)
 "testing/*" = ["DTZ", "BLE", "B"]
@@ -49,6 +50,8 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # recovery). Every except Exception is the intentional "log and continue — never crash
 # the background loop" pattern; narrowing risks missing an exception type and killing
 # the worker, which is strictly worse than logging an unexpected error.
+# E402: re-exports stale_branch_cleanup helpers from app.branch_cleanup via a
+# deferred mid-module import (load-order) — same intentional pattern as main.py.
 "app/services.py" = ["BLE001", "E402"]
 # recovery_sweeps.py was extracted from services.py and holds the three
 # leader-cycle recovery sweeps (EVALUATING-timeout, post-commit-pending, orphan
@@ -95,6 +98,10 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # `from app.routers.agent import get_github_token_for_task` call sites working).
 # Same intentional re-export-via-deferred-import pattern as main.py/orchestrator.py.
 "app/routers/agent.py" = ["E402"]
+# reaper.py imports app.reaper_sweeps mid-module (after the sweep-helper
+# definitions it complements) — a deferred load-order import, the same
+# intentional E402 pattern as main.py / orchestrator.py above.
+"app/reaper.py" = ["E402"]
 # admin_analytics.py is read-only analytics/reporting endpoints. except blocks are
 # defensive fallbacks (Cloud Logging, zone health) to show partial data instead of 500.
 "app/routers/admin_analytics.py" = ["BLE001"]
@@ -120,6 +127,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # key's transient compute failure must be logged and skipped, not crash the
 # whole precompute tick or kill the background loop.
 "app/digest_precompute.py" = ["BLE001", "PERF203"]
+# warm_pool_maintainer.py is the leader-only warm-pool reconcile worker + the
+# idle-reaper sweep. Its broad-except guards are the same intentional
+# log-and-continue resilient-loop pattern as services.py / lifecycle.py — a
+# single project's reconcile / a single member's teardown must be logged and
+# skipped, never crash the maintainer tick or the reaper cycle.
+"app/warm_pool_maintainer.py" = ["BLE001"]
 
 [tool.mypy]
 python_version = "3.11"

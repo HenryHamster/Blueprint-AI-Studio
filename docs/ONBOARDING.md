@@ -198,6 +198,90 @@ infra/critical paths that should require approval.
 
 ---
 
+## 5. The release model — how a change reaches production
+
+Once a project is onboarded and the pipelines are on, Blueprint moves a change
+through **two distinct gates** on the way to your release branch. Both gates are
+defined in terms of the project's *configured* branches — the
+**integration branch** and the **promotion target** you set in section 3 — so
+the model is identical for any repo regardless of what those branches are named.
+
+> **Concrete example (Blueprint's own self-repo):** integration branch is
+> `automain`, promotion target is `main`. Everywhere below that says
+> "integration branch" / "promotion target", read `automain` / `main` for the
+> self-repo. For your repo, substitute the values you configured via
+> `PATCH /integration-branch` and `PATCH /promotion-target`.
+
+### Gate 1 — the two-flag merge gate (PR → integration branch)
+
+Every agent does its work on a task branch (`{namespace}/{prefix}-{hex}`) and
+opens a PR **targeting the integration branch**. That PR merges only when **both**
+independent gates have opened on the task's review loop
+(`backend/app/ci_completion.py`):
+
+- **`ci_passed`** — CI reported success for the PR's head commit.
+- **`review_approved`** — a review task signed off on the change.
+
+Whichever flag is set *second* triggers the merge. Neither alone is sufficient:
+a green CI run with no approval will not merge, and an approval with red/pending
+CI will not merge. (For changes that touch paths in `approval_gate_config`, human
+approval is additionally required before merge — see section 4.) The result is
+that the integration branch only ever accumulates work that has passed both CI
+and review.
+
+### Gate 2 — the qualify → promote release gate (integration branch → promotion target)
+
+Merging to the integration branch does **not** ship to production. Promotion of
+accumulated integration-branch work to the **promotion target** is governed by
+the **release qualifier** (`backend/app/release_qualifier.py`), which scores the
+integration branch HEAD and only promotes when a composite **confidence** score
+clears a configured **threshold**.
+
+Blueprint tracks this with a `ReleaseVersion` record per project (a "version" is
+the span of the integration branch between two promotions). A version moves
+through phases:
+
+- **`build`** — normal feature work landing on the integration branch.
+- **`stabilize`** — work-mix shifts to audit / cleanup / hardening ahead of a
+  qualification run.
+- **qualify** — the heavy gate runs (once per version): the qualifier computes a
+  composite confidence from sub-scores (release audit, test-erosion, smoketest)
+  and writes an immutable `QualificationVerdict` row. Hard blockers (e.g. a
+  deleted test file) force confidence to `0.0`.
+- **promote** — when confidence clears the threshold **and** promotion is enabled
+  (`runtime_config["promotion_enabled"]`), the candidate is promoted to the
+  promotion target and the next version opens.
+
+> Until `promotion_enabled` is turned on, qualification runs **dark**: a passing
+> candidate records a `dry_run` verdict instead of actually promoting. This lets
+> you calibrate the threshold against a real track record before handing the
+> qualifier the promotion lever.
+
+### Observing and triggering the release lifecycle
+
+Operators drive and inspect this from the release admin endpoints (all under
+`/api/admin/projects/{project_id}`; see
+[API_REFERENCE.md — Release Version Lifecycle](API_REFERENCE.md#release-version-lifecycle)):
+
+- **`GET /version-lifecycle`** — the current open version (phase, qualification
+  attempts, merged-task count, last verdict), recent closed versions, and whether
+  `promotion_enabled` is on. Start here to see where a project sits.
+- **`POST /version-phase`** — move the open version to `build` or `stabilize`.
+- **`POST /qualify`** (`admin_operator_triggers.py`) — run the qualifier now
+  against the open version instead of waiting for the strategic agent's
+  conservative stall threshold. Combined with `version-phase`, this lets you
+  advance to `stabilize` and produce a (dry-run) `QualificationVerdict`
+  end-to-end on demand.
+- **`GET /qualification-verdicts`** — the durable per-verdict history (confidence,
+  sub-scores, blocker, would-promote).
+- **`GET /audit-findings`** — the release-audit findings behind a verdict, so a
+  low score is explainable.
+
+See [DATA_MODELS.md — Release Lifecycle Models](DATA_MODELS.md#release-lifecycle-models)
+for the `ReleaseVersion` and `QualificationVerdict` schemas.
+
+---
+
 ## Quick checklist
 
 1. Install the platform GitHub App on the target repo (Contents/PRs/Statuses/Issues/Checks).
@@ -215,6 +299,10 @@ infra/critical paths that should require approval.
 7. Set `approval_gate_config` (`infra_files` / `critical_files`) via
    `PATCH /api/admin/projects/{project_id}/approval-gate-config` if your repo has
    sensitive paths that should require human approval before merge.
+8. Understand the release model (section 5): PRs merge to the integration branch
+   only when CI **and** review both pass, and integration-branch work promotes to
+   the promotion target only when the release qualifier's confidence clears its
+   threshold. Watch it via `GET /api/admin/projects/{project_id}/version-lifecycle`.
 
 See also: [API_REFERENCE.md — Project Onboarding](API_REFERENCE.md#project-onboarding)
 and [DATA_MODELS.md — Project](DATA_MODELS.md#project).

@@ -122,7 +122,7 @@ These handlers clone the repo, run Claude Code, and optionally create a PR.
 **Workflow:**
 1. Clone repo
 2. Claude generates documentation (README, docstrings, API docs)
-3. No PR creation — docs usually checked in directly
+3. Run the normal code-change loop for docs work (checks, then PR creation with a `docs:` title prefix)
 4. Report artifact type: `RESEARCH_FINDINGS` or custom
 
 ---

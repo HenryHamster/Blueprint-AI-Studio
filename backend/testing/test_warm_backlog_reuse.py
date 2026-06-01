@@ -20,7 +20,7 @@ import time
 import pytest
 from httpx import AsyncClient
 
-from app.auth import create_agent_token, verify_agent_jwt
+from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.efficiency_snapshot import (
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
@@ -169,6 +169,36 @@ async def test_backlog_reuse_config_gate_off_is_unchanged(
             headers={"x-agent-token": token},
         )
         assert resp.status_code == 204
+
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.QUEUED
+        assert backlog.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_pool_vm_scoped_token_excluded_from_backlog_reuse(
+    client: AsyncClient, db_session, mocker
+):
+    """An IDLE pool VM (VM-scoped token, no warm_pool_pin task) must NOT claim a
+    backlog task via the credential-agnostic backlog-reuse branch — that branch
+    bypasses the pool's account/provider/model lease gate. It gets 204 and the
+    backlog task stays QUEUED; only the orchestrator's strict pool lease may hand
+    a pool VM work."""
+    _patch_broadcast(mocker)
+    with _FlagGuard(backlog=True):
+        project = await _make_project(db_session, name="Pool Token Excluded")
+        vm_id = "agent-vm-pool-token"
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        # VM-scoped (taskless) token — what a freshly-booted pool VM carries.
+        token = create_vm_scoped_token(vm_id, str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 204, resp.text
 
         db_session.expire(backlog)
         await db_session.refresh(backlog)

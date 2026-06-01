@@ -212,6 +212,114 @@ class TaskHistory(SQLModel, table=True):
 
 ---
 
+## Release Lifecycle Models
+
+These two models back the **qualify → promote release gate** that promotes work
+from a project's **integration branch** to its **promotion target** (the
+`integration_branch` / `promotion_target` fields on `Project`). They are
+repo-agnostic: a "version" is simply the span of the integration branch between
+two promotions. For Blueprint's own self-repo, the integration branch is
+`automain` and the promotion target is `main`; for an onboarded repo, substitute
+the branches you configured. See
+[ONBOARDING.md — The release model](ONBOARDING.md#5-the-release-model--how-a-change-reaches-production)
+for the operator-facing walkthrough.
+
+### ReleaseVersion
+
+One row per release "version" — the window of integration-branch work between
+two promotions. The strategic layer (and operator endpoints) drive its phase
+transitions; the release qualifier writes its qualification results.
+
+```python
+class ReleaseVersion(SQLModel, table=True):
+    id: UUID
+    project_id: UUID               # FK to Project (indexed)
+    version_number: int = 1        # Monotonically increasing per project (1-based)
+    phase: str = "build"           # build | stabilize (durable phases)
+    status: str = "open"           # open | promoted | abandoned
+    goal: str | None               # Snapshot of the version's intent when opened
+
+    opened_at: DateTime            # When this version opened
+    phase_changed_at: DateTime | None  # Stamped on build ↔ stabilize transitions
+    promoted_at: DateTime | None   # Stamped when status → "promoted"
+
+    base_sha: str | None           # Integration-branch HEAD when the version opened
+    promoted_sha: str | None       # Integration-branch HEAD at successful promotion
+
+    last_qualification: Dict | None    # Latest qualify result (OVERWRITTEN each run)
+    qualification_attempts: int = 0    # Total qualification runs on this version
+    phase_reasoning: str | None        # Strategic agent's reasoning for the phase
+
+    created_at: DateTime
+    updated_at: DateTime
+```
+
+**Lifecycle phases** (the version's place in the release pipeline):
+
+- **`build`** — normal feature work landing on the integration branch via the
+  two-flag merge gate.
+- **`stabilize`** — work-mix shifts to audit / cleanup / hardening before a
+  qualification run.
+- **qualify** and **promote** are *transient orchestrator operations*, not durable
+  `phase` values: a qualify run is reflected by `qualification_attempts` /
+  `last_qualification`, and a successful promotion is reflected by
+  `status="promoted"` + `promoted_at` + `promoted_sha`, after which the next
+  version opens.
+
+> Invariants: at most one row per project has `status="open"` at a time, and
+> `(project_id, version_number)` is unique.  `last_qualification` holds only the
+> **latest** run's result — the durable per-verdict history lives in
+> `QualificationVerdict` below.  (The model also carries several
+> `*_alerted_*` deduplication-anchor columns used by the calcification /
+> build-stall / stabilize-stall / promotion-readiness sweeps — see
+> `backend/app/models.py` for the full list.)
+
+### QualificationVerdict
+
+Immutable, append-only history of release-qualifier outcomes — **one row per
+finalized qualification run**, never overwritten. Because
+`ReleaseVersion.last_qualification` is overwritten on every run, this table is
+what lets the dry-run track record be retained and aggregated into a
+promotion-readiness recommendation (`release_qualifier.compute_promotion_readiness`).
+Writes are best-effort and never roll back a qualification or promotion.
+
+```python
+class QualificationVerdict(SQLModel, table=True):
+    id: UUID
+    project_id: UUID               # FK to Project (indexed)
+    release_version_id: UUID       # FK to ReleaseVersion (indexed)
+    candidate_sha: str | None      # Integration-branch HEAD SHA that was scored
+
+    confidence: float = 0.0        # Composite promotion confidence in [0, 1]
+    sub_scores: Dict | None        # Per-dimension: {audit, test_erosion, smoketest}
+    blocker: str | None            # Hard-blocker code, or NULL when none fired
+    audit_missing_reason: str | None   # Why the audit sub-score was unscoreable
+
+    would_promote: bool = False    # Did the candidate clear the threshold?
+    promotion_enabled: bool = False    # runtime_config["promotion_enabled"] at scoring
+    terminal_status: str = ""      # dry_run | not_promoted | promoted | promotion_failed
+    threshold: float | None        # The promotion threshold in force at scoring
+
+    started_at: DateTime | None    # When the qualification started
+    finalized_at: DateTime | None  # When it finalized
+    created_at: DateTime
+```
+
+**Terminal outcomes** (`terminal_status`):
+
+- **`dry_run`** — candidate would have promoted (or was scored) while
+  `promotion_enabled` was False; no actual promotion happened. This is the normal
+  outcome during the calibration window.
+- **`not_promoted`** — confidence did not clear the threshold (or a blocker fired).
+- **`promoted`** — confidence cleared the threshold with promotion enabled, and the
+  integration branch was promoted to the promotion target.
+- **`promotion_failed`** — promotion was attempted but the merge/promotion failed.
+
+Operators read this history via
+`GET /api/admin/projects/{project_id}/qualification-verdicts`.
+
+---
+
 ## Enums
 
 ### TaskStatus

@@ -7,7 +7,11 @@ import type {
   IssueImplementationConfigUpdate,
   AutoReviewConfig,
 } from '../types/project';
-import { API_BASE_URL, authHeaders, authGet } from '../api';
+import {
+  API_BASE_URL,
+  authHeaders,
+  authGet,
+} from '../api';
 
 /**
  * Project-scoped configuration domain: the per-project config blocks that
@@ -258,6 +262,11 @@ export function useProjectConfig(
       throw new Error('Failed to save promotion target');
     }
   };
+
+  // Approval-gate config (infra_files / critical_files) is owned and fetched by
+  // ProjectDashboard.tsx via the api.ts client functions, so it intentionally
+  // does NOT live in this hook — adding it here duplicated the per-project fetch
+  // on every project switch for a value no consumer of this hook reads.
 
   return {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,

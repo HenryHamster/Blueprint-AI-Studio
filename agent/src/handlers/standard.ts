@@ -832,6 +832,8 @@ Steps:
 4. Focus on accuracy — only document what actually exists in the code. Do not invent features or describe things that don't exist.
 5. Do NOT change any production code. Only modify documentation files (README, docs/, etc.) and add/update docstrings within existing source files.
 
+This task follows the standard code-change loop: make the docs changes, run the repo's checks, and open a PR with a docs-prefixed title when the work is complete.
+
 Be thorough but precise. Every statement in the documentation must reflect the actual code.`,
     commitPrefix: 'docs',
     prTitlePrefix: 'docs:',

@@ -133,6 +133,19 @@ async def gcp_cleanup_service():
                 )
                 active_vm_ids = (await session.execute(stmt)).scalars().all()
                 active_vm_ids = [vid for vid in active_vm_ids if vid]
+                # Spare live warm-pool members: a pre-provisioned idle pool VM has
+                # NO Task row, so without this it would be deleted within minutes.
+                # RETIRING members are excluded (get_live_pool_vm_ids) so genuinely
+                # orphaned/retiring pool VMs are still reclaimed. Gated on the
+                # feature flag: when warm_pool_enabled is off BOTH pool reapers
+                # (maintainer + idle sweep) are inert, so exempting members here
+                # would leak them (and their billed GCP VMs) forever. With the gate
+                # off, this generic cleanup reclaims the now-unmanaged members.
+                from app.warm_pool import pool_vm_cleanup_exemptions
+
+                active_vm_ids = list(
+                    set(active_vm_ids) | await pool_vm_cleanup_exemptions(session)
+                )
 
                 # Run cleanup with hard timeout (2 minutes)
                 try:
@@ -304,6 +317,15 @@ async def secret_reconciliation_service():
                 )
                 active_vm_ids = (await session.execute(stmt)).scalars().all()
                 active_vm_ids = {vid for vid in active_vm_ids if vid}
+                # Spare the pre-staged secrets of live warm-pool members — their
+                # boot manifest was stored ahead of any task. RETIRING members are
+                # excluded so truly orphaned pool secrets are still reclaimed.
+                # Gated on the feature flag for the same reason as the GCP cleanup
+                # above: with warm_pool_enabled off no pool reaper retires members,
+                # so exempting their secrets would leak them indefinitely.
+                from app.warm_pool import pool_vm_cleanup_exemptions
+
+                active_vm_ids |= await pool_vm_cleanup_exemptions(session)
 
             recon_result = await asyncio.wait_for(
                 reconcile_orphaned_secrets(active_vm_ids), timeout=120

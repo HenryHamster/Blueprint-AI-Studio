@@ -774,6 +774,52 @@ GitHub issue integration: when an issue receives a trigger label (default: `auto
 
 ## Advanced Modules
 
+### Branch & Release Model
+
+#### `branch_resolution.py`
+
+Per-project branch/namespace resolution and agent work-branch naming (split out of
+`shared_state.py`). This is the single source of truth for **which branch a task
+targets**, so the merge/promotion gates never hardcode `automain`/`main` — they
+resolve through these helpers instead.
+
+**Branch model:** Agent PRs target a project's *integration branch* (the
+qualification trunk, `"automain"` for Blueprint's self-repo, the GitHub default
+branch for an onboarded external repo). Promotion lands on the *promotion target*
+(`"main"`). When the two coincide, the long-term-support (LTS) release model is
+inactive and the project is "single-branch".
+
+**Key functions:**
+- `get_project_integration_branch(project)` — Integration/qualification branch.
+  Fallback chain: `project.integration_branch` column → `"automain"` (self-repo)
+  → `"main"`. Fails *safe* (never raises) so it is callable from read endpoints,
+  recovery loops, and hot paths; it stages an operator signal when the column is
+  unset.
+- `get_project_promotion_target(project)` — Promotion/release branch.
+  `project.promotion_target` column → `"main"`.
+- `is_single_branch_project(project)` — Canonical "LTS model inactive" predicate:
+  `True` when integration branch == promotion target. The release machinery keys
+  several short-circuits on this (`release_promotion.promote`,
+  `hotfix_backmerge`, `release_reconciliation`).
+- `get_project_task_branch_namespace(project)` — Branch namespace
+  (`build_config['task_branch_namespace']` → global default `"blueprint"`).
+- `derive_task_branch(...)` / `resolve_task_branch(task, namespace)` — Synthesize
+  or look up the agent work branch (`{namespace}/{prefix}-{8hex}`).
+  `resolve_task_branch` prefers the branch the agent actually pushed
+  (`context["review_loop"]["branch"]` → `first_payload["branch"]` →
+  `context["branch"]`) and only synthesizes a name as a last resort.
+- `get_project_pr_title_prefix(project)` / `ensure_project_pr_title_prefix(...)` —
+  Read and idempotently apply a project's configured PR title prefix.
+- `backfill_branch_columns(session, project_id=None)` — Startup backfill that
+  populates NULL `integration_branch` / `promotion_target` from GitHub defaults;
+  only writes still-NULL columns, so it is safe to re-run.
+
+`InvalidProjectBranchConfiguration` is raised when a project's integration branch
+would route work directly to the promotion target — a gate-bypass guard enforced
+at the merge/rollup boundary.
+
+---
+
 ### Release Qualification & Promotion
 
 #### `release_qualifier.py`
@@ -1003,5 +1049,6 @@ Test files mirror source structure:
 | task_lifecycle.py | State machine | models |
 | github.py | GitHub API client | httpx, async |
 | autonomous_research.py | Research task spawning | task_lifecycle, strategic_spawning |
+| branch_resolution.py | Per-project branch/promotion resolution | models |
 | failure_classification.py | Error categorization | — |
 | reaper.py | Heartbeat timeout handler | task_lifecycle, compute |

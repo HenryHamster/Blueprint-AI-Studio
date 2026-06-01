@@ -4,6 +4,24 @@ import { ProjectDashboard } from './ProjectDashboard';
 import type { Project } from '../types/project';
 import type { Task } from './TaskCard';
 
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  const approvalGateData = {
+    project_id: 'proj-1',
+    approval_gate_config: { infra_files: [], critical_files: [] },
+    is_default: true,
+  };
+  return {
+    ...actual,
+    fetchApprovalGateConfig: vi.fn(async () => approvalGateData),
+    updateApprovalGateConfig: vi.fn(async (projectId: string, config: { infra_files: string[]; critical_files: string[] }) => ({
+      project_id: projectId,
+      approval_gate_config: config,
+      is_default: config.infra_files.length === 0 && config.critical_files.length === 0,
+    })),
+  };
+});
+
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: 'proj-1',
