@@ -201,6 +201,14 @@ class UserIntegration(SQLModel, table=True):
 
 
 class Project(SQLModel, table=True):
+    """Repository-scoped container for tasks, strategic state, and build config.
+
+    The onboarding flow seeds ``build_config`` with detected defaults and a
+    per-repo task-branch namespace. Subsequent admin PATCHes and re-detects are
+    expected to preserve operator-owned overrides such as branch naming,
+    cleanup prefixes, PR-title prefixes, and self-improvement flags.
+    """
+
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
     # Firebase UID of the project owner. Intentionally NOT a FK to
@@ -278,7 +286,8 @@ class Project(SQLModel, table=True):
     # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
     # Set True when github_owner/github_repo matches Blueprint's own repo
     is_self_repo: bool = Field(default=False)
-    # Build configuration: directories, commands, git identity for the agent
+    # Build configuration: onboarding seeds repo-derived defaults here, and
+    # admin PATCH / re-detect preserves operator-owned branch/cleanup overrides.
     build_config: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
@@ -312,14 +321,15 @@ class Project(SQLModel, table=True):
     # Per-project trunk branch for autonomous task spawning.
     # NULL means "fall back to 'main'".
     # Blueprint's own repo uses 'automain'; most other projects use 'main'.
-    # See shared_state.get_project_integration_branch.
+    # Admin onboarding does not seed this column; it is set separately and
+    # preserved across project config edits.
     integration_branch: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
     )
     # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
     # identical semantics to integration_branch.
-    # See shared_state.get_project_promotion_target.
+    # Like integration_branch, this is operator-managed and preserved once set.
     promotion_target: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
@@ -327,6 +337,7 @@ class Project(SQLModel, table=True):
 
     @property
     def enable_self_improvement(self) -> bool:
+        """True when build_config explicitly enables self-improvement mode."""
         return bool((self.build_config or {}).get("enable_self_improvement", False))
 
     @property
@@ -334,8 +345,10 @@ class Project(SQLModel, table=True):
         """Namespace prefix for agent task branches (``{namespace}/{prefix}-{8hex}``).
 
         Reads from ``build_config.task_branch_namespace`` if set; otherwise
-        returns Blueprint's default (``"blueprint"``). A non-Blueprint install
-        can ship its own namespace (e.g. ``"autoproj"``) by setting this in
+        returns Blueprint's default (``"blueprint"``). Onboarding seeds this
+        value from the repo name, and later PATCH/re-detect flows preserve it
+        unless an operator explicitly changes it. A non-Blueprint install can
+        ship its own namespace (e.g. ``"autoproj"``) by setting this in
         build_config, and the canonical resolver lives in
         ``shared_state.get_project_task_branch_namespace``.
         """
@@ -350,6 +363,7 @@ class Project(SQLModel, table=True):
 
         Reads from ``build_config.staging_branch_prefixes`` if set; otherwise
         returns Blueprint's conventional pair (``research/``, ``plan/``).
+        Admin re-detect preserves this list when already configured.
         """
         configured = (self.build_config or {}).get("staging_branch_prefixes")
         if configured is not None:
@@ -392,7 +406,8 @@ class Project(SQLModel, table=True):
         Reads from build_config.stale_branch_prefixes if set; otherwise returns
         the project's task-branch namespace alongside the project's staging
         branch prefixes. An empty list in build_config disables cleanup for this
-        project.
+        project, and admin PATCH/re-detect preserve the explicit empty-list
+        opt-out.
         """
         configured = (self.build_config or {}).get("stale_branch_prefixes")
         if configured is not None:
@@ -406,7 +421,8 @@ class Project(SQLModel, table=True):
         Reads from build_config.protected_branches if set; otherwise returns
         the default set (main, master, develop, dev). Always includes the
         project's integration_branch and promotion_target so misconfiguration
-        cannot delete trunk branches.
+        cannot delete trunk branches. Admin re-detect preserves any operator
+        override already stored in build_config.
         """
         from app.services import _DEFAULT_PROTECTED_BRANCHES
         from app.shared_state import (
@@ -431,7 +447,9 @@ class Project(SQLModel, table=True):
         By default this tracks ``task_branch_namespace`` so a project that
         overrides only the namespace (e.g. ``'autoproj'``) gets the matching
         prefix (``'autoproj/'``) automatically — keeping cleanup loops in
-        sync with the project's actual branch naming.
+        sync with the project's actual branch naming. Onboarding seeds the
+        namespace; later config saves preserve it unless the operator changes
+        the value explicitly.
 
         Precedence: an explicit ``build_config.task_branch_prefix`` wins
         (legacy escape hatch so any project pinned to the older key keeps

@@ -1,3 +1,12 @@
+"""Admin project read/write endpoints for post-onboarding project config.
+
+This router exposes the operator-facing project surface after onboarding:
+list/view endpoints, owner-gated PATCH for project config, and a re-detect
+endpoint that refreshes repo-derived defaults while preserving explicit
+operator overrides for branch naming, cleanup prefixes, Git identity, and
+self-improvement flags.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,7 +42,11 @@ router = APIRouter(
 
 
 def _redact_build_config(build_config: dict, role: str) -> dict:
-    """Return build_config with env_vars omitted for non-owner callers."""
+    """Return build_config with env_vars omitted for non-owner callers.
+
+    Owners see the full config because they are responsible for Git identity
+    and environment overrides; members get a redacted copy.
+    """
     if role == "owner":
         return build_config
     result = dict(build_config)
@@ -50,6 +63,7 @@ async def get_all_projects(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """List the caller's projects with lightweight columns and redacted config."""
     # Select only lightweight columns — large JSONB (directions, vision, design_doc,
     # problem_model, self_reflection_log, running_update) are excluded here and
     # available via GET /api/admin/projects/{project_id}.
@@ -196,6 +210,13 @@ async def update_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """Apply operator updates while preserving project-owned branch metadata.
+
+    Owner-only fields are gated separately. Build-config updates merge onto the
+    stored config so branch namespaces, task prefixes, staging prefixes, stale
+    prefixes, protected branches, and enable_self_improvement survive normal
+    save cycles unless the caller explicitly replaces them.
+    """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
@@ -314,8 +335,7 @@ async def update_project(
         try:
             existing_bc = project.build_config or {}
             incoming = dict(payload.build_config)
-            # Preserve task-branch naming when incoming clears them — operators
-            # configure these once and expect them to survive normal config saves.
+            # Preserve operator-owned branch naming on round-trips.
             for _field in (
                 "task_branch_namespace",
                 "task_branch_prefix",
@@ -324,8 +344,7 @@ async def update_project(
                 if not incoming.get(_field) and existing_bc.get(_field):
                     incoming[_field] = existing_bc[_field]
             # Preserve per-project branch config using key-absence semantics:
-            # an explicit empty list [] means "disable" and must not be lost,
-            # so we check key presence rather than falsiness.
+            # an explicit empty list [] means "disable" and must not be lost.
             for _field in (
                 "staging_branch_prefixes",
                 "stale_branch_prefixes",
@@ -409,6 +428,12 @@ async def detect_project_build_config(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """Re-run repo detection and preserve operator-owned overrides.
+
+    This refreshes repo-derived commands/metadata from GitHub, then re-applies
+    stored Git identity, branch namespace/prefixes, stale/protected branch
+    lists, and enable_self_improvement before validating the final config.
+    """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
@@ -447,8 +472,9 @@ async def detect_project_build_config(
         detected["enable_parallel_review"] = existing["enable_parallel_review"]
     if "enable_parallel_fix" in existing:
         detected["enable_parallel_fix"] = existing["enable_parallel_fix"]
-    # Per-project branch/PR naming overrides are user-set and not detectable from repo contents;
-    # preserve them across re-detect so an operator does not silently lose them.
+    # Per-project branch/PR naming overrides are user-set and not detectable
+    # from repo contents; preserve them across re-detect so operators do not
+    # lose deliberate customization.
     if "task_branch_namespace" in existing:
         detected["task_branch_namespace"] = existing["task_branch_namespace"]
     if "task_branch_prefix" in existing:

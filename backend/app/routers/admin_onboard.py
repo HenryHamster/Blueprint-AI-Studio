@@ -1,4 +1,10 @@
-"""Project onboarding endpoint with build config auto-detection."""
+"""Project onboarding endpoint with build config auto-detection.
+
+The onboarding flow creates the project row, assigns owner membership, tries
+to infer build commands from the GitHub repository root, seeds a stable
+task-branch namespace, and then validates the merged configuration against the
+BuildConfig schema before saving it.
+"""
 
 import logging
 import re
@@ -38,7 +44,13 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
 
 
 async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, Any]:
-    """Auto-detect build configuration by inspecting the repo's root files via GitHub API."""
+    """Auto-detect build configuration by inspecting the repo's root files.
+
+    The detector is intentionally shallow: it looks at the repository root and
+    one level of subdirectories to seed directory-specific install/lint/build
+    commands, then returns a BuildConfig-shaped dict that onboarding can merge
+    with operator overrides.
+    """
     from app.github import _github_request
 
     headers = {
@@ -191,7 +203,17 @@ async def onboard_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Create a new project with auto-detected build configuration from the GitHub repo."""
+    """Create a new project, seed membership, and persist detected build config.
+
+    Flow:
+    1. Create the Project row in DEPLOYING state.
+    2. Add the caller as owner via ProjectMember.
+    3. Attempt GitHub-based build-config detection.
+    4. Seed ``task_branch_namespace`` from the repo name when missing.
+    5. Apply any caller-provided build_config_override on top of detection.
+    6. Validate against ``BuildConfig`` and store the validated shape when
+       possible, or the raw detected dict if validation fails.
+    """
 
     # Create project record
     project_name = payload.name or f"{payload.github_owner}/{payload.github_repo}"
@@ -236,13 +258,16 @@ async def onboard_project(
             exc_info=True,
         )
 
-    # Seed per-project task-branch namespace (override may overwrite this below)
+    # Seed per-project task-branch namespace. Operator overrides can still
+    # replace it, but later project PATCH/re-detect flows intentionally preserve
+    # the stored value once it exists.
     build_config.setdefault(
         "task_branch_namespace",
         _derive_task_branch_namespace(payload.github_repo),
     )
 
-    # Merge override on top of detected config (validate shape)
+    # Merge caller-supplied overrides on top of detected config so explicit
+    # onboarding input wins over repo heuristics.
     if payload.build_config_override:
         build_config.update(payload.build_config_override)
 

@@ -26,7 +26,7 @@ FastAPI application entry point. Defines:
 TASK_PRIORITY_MAP = {"high": 100, "medium": 50, "low": 0}
 ```
 
-**Schema revision:** Always matches the latest Alembic migration (currently `0125`).
+**Schema revision:** Always matches the latest Alembic migration (currently `0131`).
 
 ---
 
@@ -43,11 +43,11 @@ SQLModel data models (ORM) for all database tables. ~2600 lines covering:
 **Enums:**
 - `TaskStatus` — QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, COMPLETED, FAILED, CANCELLED
 - `ProjectStatus` — DRAFT, DEPLOYING, COMPLETED, FAILED, CANCELLED
-- `ArtifactType` — 12 types (GIT_COMMIT, PULL_REQUEST, ERROR_LOG, RESEARCH_FINDINGS, etc.)
+- `ArtifactType` — 13 types (GIT_COMMIT, PULL_REQUEST, ERROR_LOG, RESEARCH_FINDINGS, etc.)
 
 **Auth & integration:**
 - `AllowedUser` — Access control
-- `UserIntegration` — OAuth tokens (GitHub, Anthropic, etc.) with encryption
+- `UserIntegration` — Per-user GitHub credentials (App installation ID or fine-grained PAT)
 
 **Strategic research mode:**
 - `Direction` state management (stored as JSONB in `Project.directions`)
@@ -499,7 +499,7 @@ Project CRUD, deployment, WebSocket for logs.
 - `POST /api/deploy` — Launch task
 - `GET /api/projects/{id}` — Fetch project
 - `GET /api/projects/{id}/tasks` — List tasks
-- `WebSocket /api/projects/{id}/logs` — Real-time logs
+- `WebSocket /api/projects/{id}/ws` — Real-time logs
 
 ---
 

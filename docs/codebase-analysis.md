@@ -82,7 +82,7 @@ Agent VMs ↔ Orchestrator (short-lived JWT)
 
 ```
 Orchestrator → Admin UI (real-time log streaming)
-  WS /ws/logs/{project_id}?ticket=<signed_1min_JWT>
+  WS /api/projects/{project_id}/ws?ws_ticket=<signed_ticket>
   Messages: {task_id, logs, task_status, metrics}
   Secrets are redacted before broadcast.
 

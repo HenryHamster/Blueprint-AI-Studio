@@ -69,13 +69,13 @@ List all tasks in a project.
 
 ---
 
-### `WebSocket /api/projects/{project_id}/logs`
+### `WebSocket /api/projects/{project_id}/ws`
 
 Stream live task logs via WebSocket. Requires a `ws_ticket` query parameter obtained from `POST /api/projects/{project_id}/ws-ticket`.
 
 **Connection flow:**
 1. `POST /api/projects/{project_id}/ws-ticket` → get `{"ticket": "string", "expires_at": "ISO8601"}`
-2. Connect to `ws://orchestrator/api/projects/{project_id}/logs?ws_ticket=<ticket>`
+2. Connect to `ws://orchestrator/api/projects/{project_id}/ws?ws_ticket=<ticket>`
 3. Receive JSON messages: `{"task_id": "uuid", "log": "string", "timestamp": "ISO8601"}`
 
 ---
@@ -139,8 +139,10 @@ Keep-alive signal (sent every 60s). Prevents VM reaper from terminating the inst
 ```json
 {
   "task_id": "uuid",
-  "status": "IN_PROGRESS",
-  "logs_tail": "string | null"
+  "status_message": "string | null",
+  "metrics": { "rss_mb": 0.0, "disk_free_mb": 0.0, "...": "see HeartbeatMetrics" },
+  "tool_trace": [ { "t": "ISO8601", "tool": "string", "input_preview": "string" } ],
+  "prompt_fingerprint": "12-hex | null"
 }
 ```
 
@@ -148,7 +150,7 @@ Keep-alive signal (sent every 60s). Prevents VM reaper from terminating the inst
 
 ---
 
-### `POST /api/agent/spawn-task`
+### `POST /api/agent/spawn`
 
 Create a subtask (child task spawned by the agent during its work).
 
@@ -180,13 +182,17 @@ Extend the JWT expiry (renews for another 2 hours).
 
 ---
 
-### `GET /api/agent/upload-url`
+### `POST /api/agent/artifacts/upload-url`
 
 Get a signed GCS URL to upload a file artifact.
 
-**Query parameters:**
-- `task_id`: UUID
-- `filename`: Name of file to upload
+**Request body:**
+```json
+{
+  "task_id": "uuid",
+  "filename": "string"
+}
+```
 
 **Response:**
 ```json
@@ -202,7 +208,7 @@ Get a signed GCS URL to upload a file artifact.
 
 Agent VMs use these to call GitHub APIs without storing credentials locally.
 
-### `POST /api/agent/github/create-pr`
+### `POST /api/agent/github/pull-requests`
 
 Create a pull request.
 

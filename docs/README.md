@@ -147,7 +147,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 5. New directions generated → [BACKEND_MODULES.md — direction_lifecycle.py](BACKEND_MODULES.md#direction_lifecyclepy)
 
 **Real-time Features**
-1. Log streaming → [API_REFERENCE.md — WebSocket](API_REFERENCE.md#websocket-api-projectsproject_idlogs)
+1. Log streaming → [API_REFERENCE.md — WebSocket](API_REFERENCE.md#websocket-apiprojectsproject_idws)
 2. Backend broadcast → [BACKEND_MODULES.md — broadcast.py](BACKEND_MODULES.md#broadcastpy)
 3. Frontend WebSocket hook → [FRONTEND_COMPONENTS.md — useWebSocket](FRONTEND_COMPONENTS.md#usewebsocket)
 4. Component display → [FRONTEND_COMPONENTS.md — TaskDetailDrawer](FRONTEND_COMPONENTS.md#taskdetaildrawer)
@@ -183,7 +183,7 @@ QUEUED → PROVISIONING → IN_PROGRESS → EVALUATING? → COMPLETED/FAILED/CAN
 See [DATA_MODELS.md — TaskStatus](DATA_MODELS.md#taskstatus) and [BACKEND_MODULES.md — task_lifecycle.py](BACKEND_MODULES.md#task_lifecyclepy).
 
 ### Task Types
-17 types: create, review, fix, plan, research, docs, security_audit, qa, deps, migrate, smoketest, refactor, debug, perf, investigate, design_doc_update, strategic_review, memo, release_audit.
+20 types: create, review, fix, plan, research, docs, security_audit, qa, deps, migrate, smoketest, refactor, debug, perf, investigate, design_doc_update, strategic_review, self_audit, release_audit, memo.
 
 See [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for each handler implementation.
 
@@ -245,5 +245,5 @@ For questions or issues:
 
 ---
 
-**Last updated:** 2026-05-23  
-**Current schema revision:** 0114 (see [../backend/app/main.py](../backend/app/main.py))
+**Last updated:** 2026-06-01  
+**Current schema revision:** 0131 (see [../backend/app/main.py](../backend/app/main.py))
