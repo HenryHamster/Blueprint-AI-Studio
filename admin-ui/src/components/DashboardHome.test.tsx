@@ -43,6 +43,10 @@ vi.mock('./RecentErrorsWidget', () => ({
   RecentErrorsWidget: () => <div data-testid="recent-errors-widget">RecentErrorsWidget</div>,
 }));
 
+vi.mock('./WarmReuseVsCostTrend', () => ({
+  WarmReuseVsCostTrend: () => <div data-testid="warm-reuse-vs-cost-trend">WarmReuseVsCostTrend</div>,
+}));
+
 vi.mock('./TaskDurationWidget', () => ({
   TaskDurationWidget: () => <div data-testid="task-duration-widget">TaskDurationWidget</div>,
 }));

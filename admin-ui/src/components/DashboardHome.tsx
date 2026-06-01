@@ -38,6 +38,7 @@ import { TAXONOMY_ORDER } from './dashboardConstants';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import { SystemStatusCard } from './SystemStatusCard';
 import { PipelineEfficiencyPanel } from './PipelineEfficiencyPanel';
+import { WarmReuseVsCostTrend } from './WarmReuseVsCostTrend';
 import { FailureClassPill } from './FailureClassPill';
 import { SystemHealthCard, type HealthOverviewResponse } from './SystemHealthCard';
 import { AnomalyThrottleBanner } from './AnomalyThrottleBanner';
@@ -524,6 +525,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
+
+      {/* Warm-reuse vs cost-per-merged-PR trend (baseline reference line) */}
+      <WarmReuseVsCostTrend projectId={selectedProjectId} />
 
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />

@@ -223,6 +223,32 @@ vi.mock('../api', () => ({
     evicted_findings: [],
   })),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
+  fetchEfficiencyAxes: vi.fn(async () => ({
+    axes: {
+      vm_reuse_rate: {
+        current: 42,
+        baseline: 18,
+        drift_pct: 133.3,
+        history: [
+          { captured_at: '2026-05-01T00:00:00', value: 20 },
+          { captured_at: '2026-05-02T00:00:00', value: 30 },
+          { captured_at: '2026-05-03T00:00:00', value: 42 },
+        ],
+      },
+      cost_per_merged_pr: {
+        current: 3.1,
+        baseline: 3.0,
+        drift_pct: 3.3,
+        history: [
+          { captured_at: '2026-05-01T00:00:00', value: 3.2 },
+          { captured_at: '2026-05-02T00:00:00', value: 3.0 },
+          { captured_at: '2026-05-03T00:00:00', value: 3.1 },
+        ],
+      },
+    },
+    baseline_captured_at: '2026-04-24T00:00:00',
+    last_snapshot_at: '2026-05-03T00:00:00',
+  })),
   onboardProject: vi.fn(async () => ({})),
   setVersionPhase: vi.fn(async () => ({
     version_number: 42,
