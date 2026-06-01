@@ -26,7 +26,21 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Enum definitions and constants
   - Database indexes and schema versioning
 
+- **[PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md)** — Task payload reference
+  - Payload structure for all 20 task types
+  - Field validation rules and constraints
+  - Complete examples for each task type
+  - How to extend payloads
+
 ### Architecture & Implementation
+
+- **[TASK_LIFECYCLE.md](TASK_LIFECYCLE.md)** — Task state machine and lifecycle
+  - Complete status flow diagram
+  - State transitions and callbacks
+  - Parent-child task relationships
+  - Task locking and concurrency
+  - Warm VM reuse architecture
+  - Circuit breaker mechanism
 
 - **[BACKEND_MODULES.md](BACKEND_MODULES.md)** — Backend Python modules reference
   - Core infrastructure (main.py, models.py, database.py)
@@ -55,7 +69,17 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Styling guide (Tailwind CSS)
   - Testing patterns (viewport + unit tests)
 
-### Development
+### Development & Debugging
+
+- **[DEBUG_GUIDE.md](DEBUG_GUIDE.md)** — Debugging failed tasks and troubleshooting
+  - Understanding failure categories
+  - Viewing and interpreting task logs
+  - Diagnosing common failures (clone, build, test, lint, timeout)
+  - Using the admin UI to debug
+  - GCP VM inspection
+  - Circuit breaker recovery
+  - Performance profiling
+  - Frequently asked questions
 
 - **[DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md)** — Hands-on development guide
   - Local environment setup
@@ -97,6 +121,9 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 - **Launch Blueprint locally** → [Quick Start in ../README.md](../README.md#quick-start-local-mode)
 - **Deploy to production** → [Deploy.md](../Deploy.md)
 - **Onboard a new repository** → [ONBOARDING.md](ONBOARDING.md)
+- **Understand task lifecycle** → [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md)
+- **Debug a failed task** → [DEBUG_GUIDE.md](DEBUG_GUIDE.md)
+- **Configure a task with custom payload** → [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md)
 - **Add a new API endpoint** → [DEVELOPMENT_GUIDE.md — Adding an API Endpoint](DEVELOPMENT_GUIDE.md#adding-a-new-api-endpoint)
 - **Modify the database schema** → [DEVELOPMENT_GUIDE.md — Modifying the Database Schema](DEVELOPMENT_GUIDE.md#modifying-the-database-schema)
 - **Create a new task handler** → [DEVELOPMENT_GUIDE.md — Adding a Task Handler](DEVELOPMENT_GUIDE.md#adding-a-new-task-handler) + [AGENT_HANDLERS.md](AGENT_HANDLERS.md)
@@ -185,12 +212,12 @@ When adding new features, update documentation:
 ```
 QUEUED → PROVISIONING → IN_PROGRESS → EVALUATING? → COMPLETED/FAILED/CANCELLED
 ```
-See [DATA_MODELS.md — TaskStatus](DATA_MODELS.md#taskstatus) and [BACKEND_MODULES.md — task_lifecycle.py](BACKEND_MODULES.md#task_lifecyclepy).
+See [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md) for complete lifecycle details, [DATA_MODELS.md — TaskStatus](DATA_MODELS.md#taskstatus) for enum definition, and [BACKEND_MODULES.md — task_lifecycle.py](BACKEND_MODULES.md#task_lifecyclepy) for implementation.
 
 ### Task Types
 20 types: create, review, fix, plan, research, docs, security_audit, qa, deps, migrate, smoketest, refactor, debug, perf, investigate, design_doc_update, strategic_review, self_audit, release_audit, memo.
 
-See [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for each handler implementation.
+See [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) for payload configuration for each type, and [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for handler implementation.
 
 ### Autonomous Research Cycle
 ```
