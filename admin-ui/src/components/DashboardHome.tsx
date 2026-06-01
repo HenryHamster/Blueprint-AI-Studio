@@ -11,6 +11,7 @@ import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
 import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget';
 import { FixLoopConvergenceWidget } from './FixLoopConvergenceWidget';
+import { OuterReviewLoopConvergenceWidget } from './OuterReviewLoopConvergenceWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
@@ -590,6 +591,12 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                 projectId={selectedProjectId ?? undefined}
                 onViewTask={handleViewTaskById}
               />
+              <div className="mt-3">
+                <OuterReviewLoopConvergenceWidget
+                  trendDays={fixLoopTrendDays}
+                  projectId={selectedProjectId ?? undefined}
+                />
+              </div>
             </div>
           )}
 

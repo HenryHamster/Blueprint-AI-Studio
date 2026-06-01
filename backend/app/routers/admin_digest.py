@@ -53,6 +53,7 @@ from app.digest_metrics import (
     _CPM_RETIREMENT_MULTIPLIER,  # noqa: F401  re-exported for external importers
     compute_migration_health,  # noqa: F401  re-exported for external importers
     compute_narrative_summary,
+    compute_outer_loop_convergence,  # noqa: F401  re-exported for external importers
     compute_recurring_error_clusters,
     compute_rejection_pattern_summary,  # noqa: F401  re-exported for external importers
     compute_remediation_and_patterns,  # noqa: F401  re-exported for external importers
@@ -133,6 +134,8 @@ from app.routers.admin_pipeline_observability import (  # noqa: E402, F401
     get_fix_loop_convergence,
     get_fix_loop_convergence_trend,
     get_fix_loop_diverged_tasks,
+    get_outer_loop_convergence,
+    get_outer_loop_convergence_trend,
     get_pipeline_efficiency,
     get_pipeline_regressions,
     get_provider_cost_summary,

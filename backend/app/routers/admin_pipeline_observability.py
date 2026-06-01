@@ -494,6 +494,195 @@ async def get_fix_loop_convergence_trend(
 
 
 # ---------------------------------------------------------------------------
+# Outer review<->fix loop convergence (PR-level cycle, not inner lint/test/check)
+# ---------------------------------------------------------------------------
+
+_OUTER_LOOP_ESCALATION_PREFIX = "Review-fix escalation: "
+
+# Query caps for the outer-loop endpoints. When a window can exceed these the
+# aggregate silently under-counts, so each call site logs on overflow (project
+# playbook: "no silent caps").
+_OUTER_LOOP_TASK_CAP = 5000
+_OUTER_LOOP_TREND_TASK_CAP = 10_000
+_OUTER_LOOP_ALERT_CAP = 5000
+
+
+async def _load_escalation_alerts(
+    session: AsyncSession,
+    *,
+    cutoff: datetime,
+    project_id: uuid.UUID | None,
+) -> List[Alert]:
+    """Load review-fix early-escalation Alerts created since ``cutoff``."""
+    alert_stmt = (
+        select(Alert)
+        .where(
+            Alert.created_at >= cutoff,
+            Alert.title.like(f"{_OUTER_LOOP_ESCALATION_PREFIX}%"),
+        )
+        .options(load_only(Alert.id, Alert.title, Alert.task_id, Alert.created_at))
+        .limit(5000)
+    )
+    if project_id is not None:
+        alert_stmt = alert_stmt.where(Alert.project_id == project_id)
+    rows = list((await session.execute(alert_stmt)).scalars().all())
+    if len(rows) >= _OUTER_LOOP_ALERT_CAP:
+        logger.warning(
+            "[OUTER-LOOP] escalation-alert query hit the %d-row cap (project=%s, "
+            "cutoff=%s); convergence aggregate may under-count escalations",
+            _OUTER_LOOP_ALERT_CAP,
+            project_id,
+            cutoff.isoformat(),
+        )
+    return rows
+
+
+@router.get("/outer-loop-convergence")
+async def get_outer_loop_convergence(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate OUTER review<->fix PR-cycle convergence health for a window.
+
+    Sources the per-PR ``review_loop`` state and the early-escalation operator
+    Alerts (does NOT change the convergence control logic). Returns the
+    cycles-to-merge distribution, churn/drift totals, terminal-outcome counts,
+    escalation-reason histogram, and the overall convergence rate. Suitable for
+    the outer-loop convergence dashboard widget.
+    """
+    from app.digest_metrics import compute_outer_loop_convergence  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(hours=hours)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+        .order_by(Task.created_at.desc())
+        .limit(_OUTER_LOOP_TASK_CAP)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    tasks = list((await session.execute(stmt)).scalars().all())
+    if len(tasks) >= _OUTER_LOOP_TASK_CAP:
+        logger.warning(
+            "[OUTER-LOOP] task query hit the %d-row cap (hours=%d, project=%s); "
+            "convergence aggregate may under-count PR-chains in this window",
+            _OUTER_LOOP_TASK_CAP,
+            hours,
+            project_id,
+        )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+
+    summary = compute_outer_loop_convergence(
+        all_tasks=tasks,
+        escalation_alerts=alerts,
+        window_start=cutoff,
+    )
+    return {"window_hours": hours, **summary}
+
+
+@router.get("/outer-loop-convergence-trend")
+async def get_outer_loop_convergence_trend(
+    days: int = Query(7, ge=1, le=30),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Per-day buckets of outer review<->fix loop convergence over ``days``.
+
+    Each bucket carries the per-day convergence rate, escalation total, and
+    churn total so the widget can trend whether issue-churn is becoming rare and
+    work is converging (merging) rather than oscillating.
+    """
+    from app.digest_metrics import compute_outer_loop_convergence  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(days=days)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+        .limit(_OUTER_LOOP_TREND_TASK_CAP)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    tasks = list((await session.execute(stmt)).scalars().all())
+    if len(tasks) >= _OUTER_LOOP_TREND_TASK_CAP:
+        logger.warning(
+            "[OUTER-LOOP] trend task query hit the %d-row cap (days=%d, project=%s); "
+            "per-day convergence buckets may under-count PR-chains",
+            _OUTER_LOOP_TREND_TASK_CAP,
+            days,
+            project_id,
+        )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+
+    # Bucket tasks and alerts by their creation day, then aggregate each day
+    # through the same pure helper the point-in-time endpoint uses.
+    tasks_by_day: Dict[str, List[Task]] = defaultdict(list)
+    for t in tasks:
+        if t.created_at is not None:
+            tasks_by_day[t.created_at.strftime("%Y-%m-%d")].append(t)
+    alerts_by_day: Dict[str, List[Alert]] = defaultdict(list)
+    for a in alerts:
+        if a.created_at is not None:
+            alerts_by_day[a.created_at.strftime("%Y-%m-%d")].append(a)
+
+    buckets = []
+    for i in range(days - 1, -1, -1):
+        day_dt = _utcnow() - timedelta(days=i)
+        day = day_dt.strftime("%Y-%m-%d")
+        day_start = day_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        summary = compute_outer_loop_convergence(
+            all_tasks=tasks_by_day.get(day, []),
+            escalation_alerts=alerts_by_day.get(day, []),
+            window_start=day_start,
+        )
+        buckets.append(
+            {
+                "date": day,
+                "pr_count": summary["prs_with_review_loop"],
+                "convergence_rate": summary["convergence_rate"],
+                "escalation_total": summary["escalation_total"],
+                "churn_total": summary["churn_total"],
+            }
+        )
+
+    return {"days": days, "buckets": buckets}
+
+
+# ---------------------------------------------------------------------------
 # Fix-loop diverged-task drill-down endpoint
 # ---------------------------------------------------------------------------
 

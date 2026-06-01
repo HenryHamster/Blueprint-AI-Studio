@@ -136,6 +136,13 @@ vi.mock('./FixLoopConvergenceWidget', () => ({
   },
 }));
 
+vi.mock('./OuterReviewLoopConvergenceWidget', () => ({
+  OuterReviewLoopConvergenceWidget: (props: Record<string, unknown>) => {
+    capturedProps.outerLoop = props;
+    return <div data-testid="outer-loop-convergence-widget">OuterReviewLoopConvergenceWidget</div>;
+  },
+}));
+
 function jsonResponse(data: unknown): Response {
   return {
     ok: true,
