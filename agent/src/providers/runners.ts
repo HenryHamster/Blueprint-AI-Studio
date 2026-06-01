@@ -8,6 +8,7 @@ import {
   CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS, LOG_TAIL_BYTES,
   MAX_CLAUDE_CHECK_INVOCATIONS, MAX_OUTPUT_BYTES,
   PROCESS_KILL_GRACE_MS, STDERR_TAIL_BYTES, TOOL_USE_STALL_TIMEOUT_MS,
+  WORKFLOW_TOOL_STALL_TIMEOUT_MS, isWorkflowToolName,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS, claudeTimeoutForEffort,
 } from '../constants.js';
 import {
@@ -156,6 +157,11 @@ export interface ClaudeOutput {
   type: string;
   message?: { content: ClaudeOutputBlock[] };
   result?: string;
+  // Present on events emitted by a sub-agent the parent spawned via the
+  // Task/Agent/Workflow tool. A non-empty value marks a NESTED event: it is
+  // legitimate in-flight sub-progress for the parent's still-running tool, NOT
+  // a top-level model turn and NOT a tool-result that clears the parent's tool.
+  parent_tool_use_id?: string | null;
 }
 
 export interface RunnerCommand {
@@ -414,11 +420,33 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   const flags: { timedOut: boolean; providerKilledByOOM: boolean; stalledMidStream: boolean; llmNoProgressHang: boolean } = { timedOut: false, providerKilledByOOM: false, stalledMidStream: false, llmNoProgressHang: false };
   let lastToolUseAt: number | null = null;
   let toolInFlight = false;
+  // True while the in-flight top-level tool is a workflow / sub-agent fan-out
+  // (Task/Agent/Workflow). Such tools legitimately run for a long time while
+  // streaming nested sub-agent progress, so they get the larger
+  // WORKFLOW_TOOL_STALL_TIMEOUT_MS silence budget instead of TOOL_USE_STALL_TIMEOUT_MS.
+  let workflowToolInFlight = false;
+  // Timestamp of the last sub-progress signal for the in-flight tool: any
+  // stream-json event (top-level OR nested sub-agent event) seen while a tool is
+  // in flight. A legitimately long tool — a backend test run, a workflow/Task
+  // sub-agent fan-out — keeps this fresh by streaming SOMETHING, so the tool-use
+  // and no-progress watchdogs stay quiet. A genuinely hung tool emits nothing,
+  // so this goes stale and the watchdogs fire. Reset to lastToolUseAt on each
+  // new top-level tool_use; refreshed by every subsequent event under it.
+  let lastToolProgressAt: number | null = null;
   // Timestamp of the last model stream-json content event (assistant/result).
   // Drives the LLM-no-progress watchdog: a silent provider hang (429/529 the SDK
   // retries internally) emits non-content stdout but no content events, so this
   // goes stale while CLAUDE_STREAM_STALL_MS (raw stdout) keeps resetting.
   let lastStreamEventAt = Date.now();
+  // Record that the in-flight tool produced genuine sub-progress. Cheap no-op
+  // when no tool is in flight. IMPORTANT: a bare top-level `system` event is SDK
+  // keepalive noise that a 429/529 provider-hang ALSO emits (the exact signal
+  // the no-progress watchdog must still catch), so callers pass isProgress=false
+  // for those. Real work — a nested sub-agent event from a workflow/Task fan-out,
+  // or a top-level content/tool event — passes isProgress=true.
+  const noteToolProgress = (isProgress: boolean) => {
+    if (isProgress && toolInFlight) lastToolProgressAt = Date.now();
+  };
   let lastCheckOutputOffset = -1;
   let codexTurnCompleted = false;
 
@@ -551,14 +579,26 @@ echo ""
       }
     }, timeoutMs);
 
+    // Tool-use stall watchdog. Fires only when a tool has been in flight AND has
+    // produced NO sub-progress (no stream-json event of any kind under it) for
+    // longer than its silence budget. Keying off lastToolProgressAt (refreshed
+    // by every event, including nested sub-agent events) rather than
+    // lastToolUseAt (set once at tool start) means a legitimately long tool that
+    // keeps streaming — a backend test run, a workflow/Task sub-agent fan-out —
+    // is never false-killed; only a tool that goes truly silent times out.
+    // Workflow/fan-out tools get the larger WORKFLOW_TOOL_STALL_TIMEOUT_MS budget.
     let stallWatchdogTimer: NodeJS.Timeout | null = setInterval(() => {
+      const stallBudget = workflowToolInFlight
+        ? WORKFLOW_TOOL_STALL_TIMEOUT_MS
+        : TOOL_USE_STALL_TIMEOUT_MS;
+      const lastActivity = lastToolProgressAt ?? lastToolUseAt;
       if (
         toolInFlight &&
-        lastToolUseAt !== null &&
-        Date.now() - lastToolUseAt > TOOL_USE_STALL_TIMEOUT_MS &&
+        lastActivity !== null &&
+        Date.now() - lastActivity > stallBudget &&
         processGroupStillOwned()
       ) {
-        sendLog(ws, `\n[runtime] tool_use stall: tool in-flight for >${TOOL_USE_STALL_TIMEOUT_MS / 60000} min without result — sending SIGTERM\n`);
+        sendLog(ws, `\n[runtime] tool_use stall: ${workflowToolInFlight ? 'workflow ' : ''}tool in-flight with no sub-progress for >${stallBudget / 60000} min — sending SIGTERM\n`);
         flags.stalledMidStream = true;
         if (stallWatchdogTimer) { clearInterval(stallWatchdogTimer); stallWatchdogTimer = null; }
         const pid = originalPid;
@@ -588,13 +628,21 @@ echo ""
       // call rides to the 45-min wall-clock timeout → AGENT_TIMEOUT → retry
       // burn (the exact failure #6865 was meant to prevent). Keying off
       // staleness instead: fire when BOTH the content stream AND any in-flight
-      // tool activity are stale. A legitimately long tool keeps lastToolUseAt
-      // fresh (its result event would too, but even a lost result no longer
-      // wedges us — once lastToolUseAt itself ages past the window with no new
-      // content, the run is genuinely stuck and we report it).
+      // tool activity are stale.
+      //
+      // Tool activity is measured by lastToolProgressAt — refreshed on EVERY
+      // stream-json event seen while a tool is in flight, including nested
+      // sub-agent events emitted by a workflow / Task fan-out. This is the fix
+      // for the false rate_limited requeue (incident: long workflow waits): a
+      // legitimately busy tool that keeps streaming sub-progress keeps this
+      // fresh, so the gate stays open even though the parent emits no top-level
+      // content events for >12 min. A genuine hang (including the C7 lost-result
+      // case, where NO further event of any kind arrives after the tool_use)
+      // lets lastToolProgressAt age past the window and the gate fires.
       const contentStale = Date.now() - lastStreamEventAt > LLM_NO_PROGRESS_STALL_MS;
+      const lastToolActivity = lastToolProgressAt ?? lastToolUseAt;
       const toolActivityStale =
-        lastToolUseAt === null || Date.now() - lastToolUseAt > LLM_NO_PROGRESS_STALL_MS;
+        lastToolActivity === null || Date.now() - lastToolActivity > LLM_NO_PROGRESS_STALL_MS;
       if (
         contentStale &&
         toolActivityStale &&
@@ -688,8 +736,25 @@ echo ""
             }
             linesSinceYield += 1;
             const objType = obj.type || '';
+            // A nested event is one emitted by a sub-agent the parent spawned via
+            // the Task/Agent/Workflow tool. It is NOT a top-level model turn and
+            // its tool-result `user` event must NOT clear the parent's toolInFlight.
+            const isNested = obj.parent_tool_use_id != null && obj.parent_tool_use_id !== '';
+            // Genuine sub-progress for the in-flight tool = a NESTED sub-agent
+            // event (a workflow/Task fan-out actively streaming its sub-agents'
+            // work). Top-level events are handled by the two orthogonal clocks
+            // below: content events refresh lastStreamEventAt (no-progress
+            // watchdog), a fresh top-level tool_use resets lastToolProgressAt
+            // explicitly. Bare `system` keepalives count as neither — a 429/529
+            // provider hang emits those too, so counting them would mask the very
+            // hang the no-progress watchdog must catch.
+            noteToolProgress(isNested);
             if (objType === 'assistant') {
-              lastStreamEventAt = Date.now();  // model is producing — reset no-progress watchdog
+              // Only top-level assistant events count as model "content progress"
+              // (the no-progress watchdog's content signal). Nested sub-agent
+              // assistant events still count as tool sub-progress (noteToolProgress
+              // above) but must not mask a genuine top-level provider hang.
+              if (!isNested) lastStreamEventAt = Date.now();
               if (obj.message?.content) {
                 for (const block of obj.message.content) {
                   if (block.type === 'text') {
@@ -699,8 +764,15 @@ echo ""
                     sendLog(ws, `[tool: ${strVal(block.name)}] ${JSON.stringify(block.input).slice(0, 200)}\n`);
                     statusRef.value = `Using tool: ${strVal(block.name)}`;
                     recordToolUse(strVal(block.name), block.input);
-                    toolInFlight = true;
-                    lastToolUseAt = Date.now();
+                    // A nested tool_use belongs to a sub-agent under an already
+                    // in-flight workflow tool — it refreshes progress (above) but
+                    // does not replace the parent's in-flight tracking.
+                    if (!isNested) {
+                      toolInFlight = true;
+                      workflowToolInFlight = isWorkflowToolName(strVal(block.name));
+                      lastToolUseAt = Date.now();
+                      lastToolProgressAt = Date.now();
+                    }
                     if (enableCheckWatchdog && strVal(block.name) === 'Bash') {
                       const inputPreview = JSON.stringify(block.input ?? {}).slice(0, 200);
                       if (isCheckInvocation(inputPreview)) {
@@ -711,7 +783,10 @@ echo ""
                 }
               }
             } else if (objType === 'result') {
-              lastStreamEventAt = Date.now();  // terminal model event — reset no-progress watchdog
+              // Only a top-level result is the model's terminal turn. A nested
+              // result (a sub-agent finishing under a workflow tool) is just more
+              // sub-progress and must not arm the result-grace exit timer.
+              if (!isNested) lastStreamEventAt = Date.now();  // terminal model event — reset no-progress watchdog
               lastResultText = (obj as { result?: string }).result ?? '';
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
@@ -720,7 +795,7 @@ echo ""
                 const outputTokens = Number(usage.output_tokens ?? 0);
                 recordLlmTokens(inputTokens, outputTokens);
               }
-              if (resultGraceTimer === null && processGroupStillOwned()) {
+              if (!isNested && resultGraceTimer === null && processGroupStillOwned()) {
                 resultGraceTimer = setTimeout(() => {
                   if (!processGroupStillOwned()) return;
                   sendLog(
@@ -743,8 +818,15 @@ echo ""
               sendLog(ws, errLine);
               stderrBuffer = appendBoundedTail(stderrBuffer, errLine, STDERR_TAIL_BYTES);
             } else if (objType === 'system' || objType === 'user') {
-              if (objType === 'user') {
+              // A nested `user` event is a sub-agent's tool-result under a still-
+              // running workflow tool; it must NOT clear the parent's toolInFlight
+              // (doing so would re-expose the parent to a false no-progress fire
+              // while the workflow keeps running). Only a top-level tool-result
+              // closes the parent's in-flight tool.
+              if (objType === 'user' && !isNested) {
                 toolInFlight = false;
+                workflowToolInFlight = false;
+                lastToolProgressAt = null;
                 if (enableCheckWatchdog && lastCheckOutputOffset >= 0) {
                   const slice = allOutput.slice(lastCheckOutputOffset);
                   recordCheckOutcome(!/\[check\].*FAILED/.test(slice));
@@ -849,6 +931,10 @@ echo ""
             }
             linesSinceYield += 1;
             const eventType = typeof obj.type === 'string' ? obj.type : '';
+            // Codex items are one-shot (started → completed in sequence) with no
+            // nested sub-agent stream, so tool sub-progress is tracked explicitly
+            // at item.started (lastToolProgressAt set there); there is no separate
+            // sub-progress signal to fold in here.
             if (eventType === 'thread.started') {
               const tid = typeof obj.thread_id === 'string' ? obj.thread_id : '';
               sendLog(ws, `[codex] thread.started ${tid}\n`);
@@ -892,7 +978,9 @@ echo ""
                   statusRef.value = `Using tool: ${toolName}`;
                   recordToolUse(toolName, item ?? {});
                   toolInFlight = true;
+                  workflowToolInFlight = isWorkflowToolName(toolName);
                   lastToolUseAt = Date.now();
+                  lastToolProgressAt = Date.now();
                   if (
                     enableCheckWatchdog
                     && toolName === 'Bash'
@@ -902,6 +990,8 @@ echo ""
                   }
                 } else {
                   toolInFlight = false;
+                  workflowToolInFlight = false;
+                  lastToolProgressAt = null;
                   const status = item && typeof item.status === 'string' ? item.status : '';
                   sendLog(ws, `[tool: ${toolName}] ${status}\n`);
                 }

@@ -266,9 +266,41 @@ export function shouldFanOutFix(
 export const MEDIUM_ANALYSIS_PLAN_FILE_LIMIT = 10;
 
 // Mid-stream stall detection: if a tool_use event is in-flight for longer
-// than this without a corresponding tool-result (user) event, the subprocess
-// is considered stalled and will be SIGTERMed.
+// than this WITHOUT EMITTING ANY SUB-PROGRESS (no further stream-json event of
+// any kind under it — including nested sub-agent assistant/tool/result events),
+// the subprocess is considered stalled and will be SIGTERMed. The watchdog
+// resets on any sub-progress event, so this budget is "max silence within a
+// single tool call", not "max total tool duration" — a legitimately long tool
+// (a backend test run, a workflow/Task sub-agent fan-out) that keeps streaming
+// stays alive indefinitely; only a tool that goes truly silent times out.
 export const TOOL_USE_STALL_TIMEOUT_MS = 30 * 60_000;
+
+// Tools that fan out into long-running sub-agents / sub-workflows (the built-in
+// Claude Code Task/Agent/Workflow tool and any future custom workflow tool an
+// agent authors) legitimately run far longer than an ordinary tool call while
+// streaming sub-agent progress events. Their in-flight silence budget is the
+// larger of TOOL_USE_STALL_TIMEOUT_MS and this value so a deep fan-out is never
+// false-killed mid-flight. Still bounded so a genuinely hung workflow that
+// stops emitting sub-progress is eventually caught. Env-overridable for tuning.
+export const WORKFLOW_TOOL_STALL_TIMEOUT_MS =
+  Number(process.env.WORKFLOW_TOOL_STALL_TIMEOUT_MS) || 45 * 60_000;
+
+// Tool names (lowercased) that spawn long-running sub-agents / sub-workflows.
+// Matched case-insensitively as either an exact name or a substring so future
+// MCP-namespaced or custom workflow tools (e.g. "mcp__workflow__run") are
+// covered without an allowlist edit. Used to grant the longer in-flight silence
+// budget above and to treat their nested sub-agent events as legitimate progress.
+export const WORKFLOW_TOOL_NAME_PATTERNS: readonly string[] = [
+  'task',
+  'agent',
+  'workflow',
+] as const;
+
+export function isWorkflowToolName(name: string | undefined): boolean {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return WORKFLOW_TOOL_NAME_PATTERNS.some(p => lower === p || lower.includes(p));
+}
 
 // Claude Code runner
 export const CLAUDE_TIMEOUT_MS = 45 * 60 * 1000;
