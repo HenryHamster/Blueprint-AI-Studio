@@ -167,7 +167,9 @@ class TestBackfillBranchColumns:
         # use SimpleNamespace stand-ins which lack the _sa_instance_state slot
         # the real call needs.  We only care that the attribute on the project
         # was updated, not that SA's dirty-tracking observed it.
-        with patch("app.shared_state.flag_modified") as m:
+        # backfill_branch_columns now lives in app.branch_resolution (shared_state
+        # re-exports it); patch the real definition site.
+        with patch("app.branch_resolution.flag_modified") as m:
             yield m
 
     @pytest.mark.asyncio
@@ -397,9 +399,9 @@ class TestProjectBranchResolvers:
 
         with (
             patch(
-                "app.shared_state.object_session", return_value=session
+                "app.branch_resolution.object_session", return_value=session
             ) as mock_session,
-            patch("app.shared_state.logger.warning") as mock_warning,
+            patch("app.branch_resolution.logger.warning") as mock_warning,
         ):
             assert _shared_state.get_project_integration_branch(project) == "develop"
             assert _shared_state.get_project_promotion_target(project) == "release"
@@ -413,8 +415,8 @@ class TestProjectBranchResolvers:
         session = MagicMock()
 
         with (
-            patch("app.shared_state.object_session", return_value=session),
-            patch("app.shared_state.logger.warning") as mock_warning,
+            patch("app.branch_resolution.object_session", return_value=session),
+            patch("app.branch_resolution.logger.warning") as mock_warning,
         ):
             assert _shared_state.get_project_integration_branch(project) == "main"
             assert _shared_state.get_project_integration_branch(project) == "main"

@@ -38,7 +38,9 @@ def _make_session(projects):
 class TestBackfillTaskBranchNamespace:
     @pytest.fixture(autouse=True)
     def _stub_flag_modified(self):
-        with patch("app.shared_state.flag_modified") as m:
+        # backfill_task_branch_namespace now lives in app.branch_resolution
+        # (shared_state re-exports it); patch the real definition site.
+        with patch("app.branch_resolution.flag_modified") as m:
             yield m
 
     @pytest.mark.asyncio
