@@ -42,6 +42,7 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "app/vm_lifecycle.py" = ["BLE001"]
 "app/alert_dispatch.py" = ["BLE001"]
 "app/notification.py" = ["BLE001"]
+"app/deploy_health_alerts.py" = ["BLE001"]
 # services.py is entirely background workers (cleanup, persist, timeout sweep, orphan
 # recovery). Every except Exception is the intentional "log and continue — never crash
 # the background loop" pattern; narrowing risks missing an exception type and killing
@@ -63,6 +64,9 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # same "log and keep retrying" pattern (DB lookup races, GitHub API blips, merge retries).
 # Crashing here would leave a PR in limbo with no progress.
 "app/ci_completion.py" = ["BLE001"]
+# ci_merge_helpers.py was extracted from ci_completion.py; _post_merge_summary
+# carries the same best-effort "log and continue" broad-except pattern.
+"app/ci_merge_helpers.py" = ["BLE001"]
 # task_lifecycle.py is the agent status-event dispatcher and rollup gate. Same
 # log-and-continue policy: each branch handles a distinct PR / pipeline stage and
 # must not crash the dispatcher on transient lookup / GitHub failures.

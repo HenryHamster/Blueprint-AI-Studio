@@ -1862,7 +1862,9 @@ async def test_orchestrator_persist_zone_health_round_trips_recent_auto_resumes(
     mock_session_ctx = MagicMock()
     mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
-    mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
+    mocker.patch(
+        "app.state_persistence.AsyncSessionLocal", return_value=mock_session_ctx
+    )
     mocker.patch(
         "app.deploy_health._get_deploy_state_for_update",
         AsyncMock(return_value=mock_state),
@@ -1905,7 +1907,9 @@ async def test_orchestrator_persist_zone_health_round_trips_last_resume_was_forc
     mock_session_ctx = MagicMock()
     mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
-    mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
+    mocker.patch(
+        "app.state_persistence.AsyncSessionLocal", return_value=mock_session_ctx
+    )
     mocker.patch(
         "app.deploy_health._get_deploy_state_for_update",
         AsyncMock(return_value=mock_state),
@@ -2052,7 +2056,9 @@ async def test_orchestrator_persist_zone_health_round_trips_consecutive_force_re
     mock_session_ctx = MagicMock()
     mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_ctx.__aexit__ = AsyncMock(return_value=None)
-    mocker.patch("app.orchestrator.AsyncSessionLocal", return_value=mock_session_ctx)
+    mocker.patch(
+        "app.state_persistence.AsyncSessionLocal", return_value=mock_session_ctx
+    )
     mocker.patch(
         "app.deploy_health._get_deploy_state_for_update",
         AsyncMock(return_value=mock_state),
