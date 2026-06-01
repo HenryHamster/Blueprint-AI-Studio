@@ -220,7 +220,7 @@ def integration_server(bare_git_repo):
 
     patches = [
         patch("app.routers.agent.get_github_token_for_task", _gh_token_mock),
-        patch("app.main.broadcast_to_project", _broadcast_mock),
+        patch("app.broadcast.broadcast_to_project", _broadcast_mock),
         patch("app.routers.agent_github.create_pull_request", _create_pr_mock),
     ]
     for p in patches:

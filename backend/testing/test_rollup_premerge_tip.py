@@ -36,7 +36,7 @@ def _mock_clean_premerge_deps(mocker, *, head_sha, base_tip_sha):
     head differs from base tip (commits ahead of base -- the normal case)
     AND ``mergeable_state="clean"`` (not "behind")."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -151,7 +151,7 @@ async def test_failed_merge_with_clean_state_does_not_trigger_update_branch(
     flow continues to the non-conflict deferral branch.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,

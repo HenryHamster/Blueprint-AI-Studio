@@ -1946,10 +1946,10 @@ async def _run_reaper_preguard_body(db_session, mocker, bind):
     from unittest.mock import AsyncMock
 
     _vm_deleted = mocker.patch(
-        "app.main._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
     )
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
@@ -2025,7 +2025,7 @@ async def test_rollup_releases_parent_lock_around_review_respawn_spawn(
     from app.rollup_management import _check_and_trigger_rollup
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 from sqlmodel import select as sql_select
 
 from app.models import Alert, AlertSeverity, Task, TaskStatus
-from app.main import (
+from app.alert_dispatch import (
     _maybe_create_failure_alert,
     _maybe_create_circuit_breaker_alert,
 )
@@ -57,7 +57,7 @@ class TestFailureAlert:
 
     @pytest.mark.asyncio
     async def test_creates_error_alert_for_failed_task(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -82,7 +82,7 @@ class TestFailureAlert:
 
     @pytest.mark.asyncio
     async def test_smoketest_tasks_are_excluded(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -105,7 +105,7 @@ class TestFailureAlert:
 
     @pytest.mark.asyncio
     async def test_retry_tasks_are_excluded(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -130,7 +130,7 @@ class TestFailureAlert:
     async def test_deduplication_skips_if_undismissed_alert_exists(
         self, db_session, mocker
     ):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -154,7 +154,7 @@ class TestFailureAlert:
 
     @pytest.mark.asyncio
     async def test_error_snippet_included_in_message(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -174,7 +174,7 @@ class TestFailureAlert:
 
     @pytest.mark.asyncio
     async def test_default_message_when_no_snippet(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -196,7 +196,7 @@ class TestFailureAlert:
     async def test_task_failed_dispatch_payload_is_enriched(self, db_session, mocker):
         import asyncio
 
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         dispatch_mock = mocker.patch(
             "app.notification_dispatch.dispatch_external_notification",
             new_callable=AsyncMock,
@@ -238,7 +238,7 @@ class TestFailureAlert:
 
     @pytest.mark.asyncio
     async def test_broadcasts_alert_created_event(self, db_session, mocker):
-        mock_bc = mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mock_bc = mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -268,7 +268,7 @@ class TestCircuitBreakerAlert:
 
     @pytest.mark.asyncio
     async def test_creates_warning_alert_with_reason(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -291,7 +291,7 @@ class TestCircuitBreakerAlert:
     async def test_deduplication_skips_if_undismissed_alert_exists(
         self, db_session, mocker
     ):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -322,7 +322,7 @@ class TestCircuitBreakerAlert:
 
     @pytest.mark.asyncio
     async def test_new_alert_created_after_dismissal(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -366,7 +366,7 @@ class TestCircuitBreakerAlert:
 
     @pytest.mark.asyncio
     async def test_different_projects_get_separate_alerts(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         p1 = make_project(name="Project A")
         p2 = make_project(name="Project B")
         db_session.add(p1)
@@ -397,7 +397,7 @@ class TestAutoPauseAlerts:
 
     @pytest.mark.asyncio
     async def test_creates_warning_alert_per_project(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         p1 = make_project(name="Project A")
         p2 = make_project(name="Project B")
         db_session.add(p1)
@@ -420,7 +420,7 @@ class TestAutoPauseAlerts:
 
     @pytest.mark.asyncio
     async def test_failed_deps_listed_in_message(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -437,7 +437,7 @@ class TestAutoPauseAlerts:
 
     @pytest.mark.asyncio
     async def test_deduplication_per_project(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -457,7 +457,7 @@ class TestAutoPauseAlerts:
 
     @pytest.mark.asyncio
     async def test_no_projects_creates_no_alerts(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
 
         await _create_auto_pause_alerts(db_session, ["gcp"])
         await db_session.commit()
@@ -478,7 +478,7 @@ class TestAutoResumeAlerts:
     async def test_creates_info_alert_and_dismisses_pause_warnings(
         self, db_session, mocker
     ):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -523,7 +523,7 @@ class TestAutoResumeAlerts:
     async def test_resume_without_prior_pause_still_creates_info_alert(
         self, db_session, mocker
     ):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -541,7 +541,7 @@ class TestAutoResumeAlerts:
     @pytest.mark.asyncio
     async def test_dismisses_multiple_pause_warnings(self, db_session, mocker):
         """If somehow multiple pause warnings exist, all should be dismissed."""
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -584,7 +584,7 @@ class TestAutoResumeAlerts:
 
     @pytest.mark.asyncio
     async def test_resume_across_multiple_projects(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         p1 = make_project(name="Project A")
         p2 = make_project(name="Project B")
         db_session.add(p1)
@@ -632,7 +632,7 @@ class TestAlertDeduplication:
     @pytest.mark.asyncio
     async def test_circuit_breaker_full_lifecycle(self, db_session, mocker):
         """Create -> dedup -> dismiss -> create again."""
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -678,7 +678,7 @@ class TestAlertDeduplication:
         self, db_session, mocker
     ):
         """Dismissed failure alert should not block a new one for the same task."""
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -710,7 +710,7 @@ class TestAlertDeduplication:
 
     @pytest.mark.asyncio
     async def test_auto_pause_dedup_allows_new_after_dismiss(self, db_session, mocker):
-        mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)
         await db_session.commit()
@@ -760,7 +760,7 @@ class TestForcedResumeExternalNotifications:
     ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
         webhook_mock = mocker.patch(
-            "app.main._send_webhook_notification", new_callable=AsyncMock
+            "app.notification._send_webhook_notification", new_callable=AsyncMock
         )
         dispatch_mock = mocker.patch(
             "app.notification_dispatch.dispatch_external_notification",
@@ -799,7 +799,7 @@ class TestForcedResumeExternalNotifications:
     ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
         webhook_mock = mocker.patch(
-            "app.main._send_webhook_notification", new_callable=AsyncMock
+            "app.notification._send_webhook_notification", new_callable=AsyncMock
         )
         dispatch_mock = mocker.patch(
             "app.notification_dispatch.dispatch_external_notification",
@@ -822,7 +822,7 @@ class TestFlappingResumeExternalNotifications:
     ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
         webhook_mock = mocker.patch(
-            "app.main._send_webhook_notification", new_callable=AsyncMock
+            "app.notification._send_webhook_notification", new_callable=AsyncMock
         )
         dispatch_mock = mocker.patch(
             "app.notification_dispatch.dispatch_external_notification",
@@ -853,7 +853,7 @@ class TestFlappingResumeExternalNotifications:
     ):
         mocker.patch("app.deploy_health.broadcast_to_project", new_callable=AsyncMock)
         webhook_mock = mocker.patch(
-            "app.main._send_webhook_notification", new_callable=AsyncMock
+            "app.notification._send_webhook_notification", new_callable=AsyncMock
         )
         dispatch_mock = mocker.patch(
             "app.notification_dispatch.dispatch_external_notification",

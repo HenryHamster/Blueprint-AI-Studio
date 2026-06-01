@@ -1336,7 +1336,7 @@ def _active_dir(**kwargs):
 class TestCheckDirectionStarvation:
     @pytest.mark.asyncio
     async def test_no_gaps_resets_counter(self, strat_fail_db, mocker):
-        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
         # 3 active product directions, not saturated → no gaps
         project = Project(
             name="P",
@@ -1363,7 +1363,7 @@ class TestCheckDirectionStarvation:
 
     @pytest.mark.asyncio
     async def test_dirs_created_resets_counter(self, strat_fail_db, mocker):
-        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
         project = Project(
             name="P",
             user_id="u1",
@@ -1387,7 +1387,7 @@ class TestCheckDirectionStarvation:
     @pytest.mark.asyncio
     async def test_below_minimum_increments_counter(self, strat_fail_db, mocker):
         alert_mock = mocker.patch(
-            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
         )
         project = Project(
             name="P",
@@ -1412,7 +1412,7 @@ class TestCheckDirectionStarvation:
         self, strat_fail_db, mocker
     ):
         alert_mock = mocker.patch(
-            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
         )
         project = Project(
             name="P",
@@ -1436,7 +1436,7 @@ class TestCheckDirectionStarvation:
         self, strat_fail_db, mocker
     ):
         alert_mock = mocker.patch(
-            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
         )
         # Active directions but NONE are product → gap_type=NO_PRODUCT_DIRECTIONS
         project = Project(
@@ -1475,7 +1475,7 @@ class TestCheckDirectionStarvation:
     async def test_level_5_below_minimum_fallback_no_category(
         self, strat_fail_db, mocker
     ):
-        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
         # 1 active product direction; product_count > 0 but active_count < 3
         project = Project(
             name="P",
@@ -1497,7 +1497,7 @@ class TestCheckDirectionStarvation:
 
     @pytest.mark.asyncio
     async def test_level_5_all_saturated_fallback(self, strat_fail_db, mocker):
-        mocker.patch("app.main._create_strategic_alert", new=mocker.AsyncMock())
+        mocker.patch("app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock())
         # 3 active product directions, all saturated → gap_type=ALL_SATURATED
         project = Project(
             name="P",
@@ -1523,7 +1523,7 @@ class TestCheckDirectionStarvation:
     @pytest.mark.asyncio
     async def test_level_5_cap_reached_skips_creation(self, strat_fail_db, mocker):
         alert_mock = mocker.patch(
-            "app.main._create_strategic_alert", new=mocker.AsyncMock()
+            "app.alert_dispatch._create_strategic_alert", new=mocker.AsyncMock()
         )
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
@@ -1800,7 +1800,7 @@ async def test_strategic_completion_persists_recommended_mode_on_create(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -1867,7 +1867,7 @@ async def test_strategic_completion_persists_recommended_mode_on_update(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -1932,7 +1932,7 @@ async def test_strategic_update_persists_success_evidence_and_retirement_conditi
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-upd-ctx",
@@ -1998,7 +1998,7 @@ async def test_strategic_update_persists_implementation_constraints(db_session, 
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-upd-ic",
@@ -2064,7 +2064,7 @@ async def test_strategic_update_clears_context_fields_when_none(db_session, mock
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-upd-clr",
@@ -2133,7 +2133,7 @@ async def test_strategic_update_caps_context_fields_at_500(db_session, mocker):
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-upd-cap",
@@ -2199,7 +2199,7 @@ async def test_strategic_completion_drops_invalid_recommended_mode(db_session, m
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -2264,7 +2264,7 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_create(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -2325,7 +2325,7 @@ async def test_strategic_completion_pause_mode_auto_pauses_on_update(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -2388,7 +2388,7 @@ async def test_strategic_completion_non_pause_modes_preserve_active_status(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -2520,7 +2520,7 @@ async def test_direction_create_persists_structured_fields(db_session, mocker):
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="SF",
@@ -2582,7 +2582,7 @@ async def test_direction_create_rejected_when_success_evidence_missing(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="SF2",
@@ -2794,7 +2794,7 @@ async def test_retirement_critiques_persisted_via_context_injection(db_session, 
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="RC-API",
@@ -2859,7 +2859,7 @@ async def test_memo_citations_persisted_in_cycle_metadata(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="Memo-Cite",
@@ -2926,7 +2926,7 @@ async def test_retirement_critiques_persisted_via_fallback_path(db_session, mock
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="RC-FB",
@@ -2986,7 +2986,7 @@ async def test_no_eligible_sentinel_stored_without_error(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="RC-NE",
@@ -3039,7 +3039,7 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="DR1",
@@ -3099,7 +3099,7 @@ async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="DR2",
@@ -3156,7 +3156,7 @@ async def test_dedup_overlap_creates_advisory_fallback(db_session, mocker):
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     existing_dir = {
         "id": "d-existing1",
@@ -3228,7 +3228,7 @@ async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="DR4",
@@ -3304,7 +3304,7 @@ async def test_semantic_dedup_creates_advisory_paraphrased_active_direction_fall
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     existing_dir = {
         "id": "d-active1",
@@ -3373,7 +3373,7 @@ async def test_semantic_dedup_allows_3word_overlap_retired_direction_fallback(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     retired_dir = {
         "id": "d-ret1",
@@ -3438,7 +3438,7 @@ async def test_semantic_dedup_creates_advisory_4word_overlap_retired_direction_f
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     retired_dir = {
         "id": "d-ret2",
@@ -3508,7 +3508,7 @@ async def test_replace_retired_direction_creates_advisory_fallback(db_session, m
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     retired_dir = {
         "id": "d-ret3",
@@ -3578,7 +3578,7 @@ async def test_active_direction_overlap_creates_advisory_fallback(db_session, mo
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     active_dir = {
         "id": "d-active2",
@@ -3646,7 +3646,7 @@ async def test_semantic_dedup_allows_distinct_direction_fallback(db_session, moc
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     existing_dir = {
         "id": "d-existing2",
@@ -4024,7 +4024,7 @@ async def test_set_evidence_progress_end_to_end_persists_on_direction(
     from app.auth import create_agent_token
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     task = await _make_strategic_task(
         db_session,
@@ -4082,7 +4082,7 @@ async def test_strategic_completion_fallback_superseded_update_persists_supersed
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="SUP-FB",
@@ -4156,7 +4156,7 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="SUP-FB2",
@@ -5073,7 +5073,7 @@ async def test_strategic_completion_appends_routine_digest_to_running_update(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -5140,7 +5140,7 @@ async def test_version_phase_decision_flows_end_to_end(client, db_session, mocke
     from app import release_version as rv
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="VPD-E2E",
@@ -5370,7 +5370,7 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     from app import release_version as rv
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
     # The real qualifier resolves GitHub credentials and spawns child tasks.
     # Stub it: the seam under test is "qualify_request reaches run_qualification",
     # not the qualifier internals (those are tested in test_release_qualifier).
@@ -5485,7 +5485,7 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
     from app import release_version as rv
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
     run_qualification = mocker.patch(
         "app.release_qualifier.run_qualification",
         new_callable=AsyncMock,
@@ -6360,7 +6360,7 @@ async def test_memo_available_and_cited_counts_persisted(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="MemoCount",
@@ -6429,7 +6429,7 @@ async def test_memos_cited_zero_when_no_context_key(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="MemoCitedZero",
@@ -6495,7 +6495,7 @@ async def test_memos_cited_filters_to_available_only(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="MemoFilter",
@@ -6566,7 +6566,7 @@ async def test_spawn_retirement_memo_api_path(db_session, mocker):
     )
     from sqlmodel import select
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     direction_id = "d-retire-api"
     rationale_text = "Direction accomplished its goals"
@@ -6658,7 +6658,7 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
     from sqlmodel import select
     import json
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     direction_id = "d-retire-fb"
     direction = {
@@ -6751,7 +6751,7 @@ async def test_retirement_memo_dedup_guard(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from sqlmodel import select
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     direction_id = "d-retire-dedup"
     direction = {
@@ -6844,7 +6844,7 @@ async def test_retire_op_sets_retired_status_and_appears_in_summary(db_session, 
     from app.strategic_completion import _handle_strategic_completion
     from app.strategic_analysis import _build_retired_directions_summary
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     direction_id = "d-retire-status-fix"
     direction = {
@@ -7162,7 +7162,7 @@ async def test_strategic_update_text_resets_outcome_detection_state(db_session, 
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-cr-text",
@@ -7220,7 +7220,7 @@ async def test_strategic_update_paths_resets_outcome_detection_state(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-cr-paths",
@@ -7278,7 +7278,7 @@ async def test_strategic_update_success_evidence_resets_outcome_detection_state(
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-cr-se",
@@ -7341,7 +7341,7 @@ async def test_strategic_update_retirement_condition_resets_outcome_detection_st
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P-cr-rc",

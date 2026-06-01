@@ -825,7 +825,7 @@ async def _ensure_branch(
         ``_capture_branch_creation_snapshot`` — content fields only.
     """
     # Deferred import to avoid circular dependency
-    from app.main import _maybe_create_failure_alert  # noqa: PLC0415
+    from app.alert_dispatch import _maybe_create_failure_alert  # noqa: PLC0415
 
     # Round 4 W1: capture snapshot BEFORE the release-commit so the
     # snapshot reflects the pre-commit content, not the post-commit
@@ -1871,7 +1871,7 @@ async def _handle_design_doc_completion(
     """
     # Deferred imports to avoid circular dependency
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
-    from app.main import _create_strategic_alert  # noqa: PLC0415
+    from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
     from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
 
     if project is None:

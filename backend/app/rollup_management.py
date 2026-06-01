@@ -176,7 +176,7 @@ async def _dispatch_rollup_approval_alert(
     notified instead of discovering the stall later.
     """
     import asyncio as _asyncio
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.notification_dispatch import dispatch_external_notification
 
     try:
@@ -238,7 +238,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     Uses its own session for DB writes to avoid polluting the caller's session state.
     The passed session is only used for reads (artifact lookup).
     """
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.routers.agent import get_github_token_for_task
     from app.github import get_pull_request
 
@@ -656,7 +656,8 @@ async def _check_and_trigger_rollup(
     heartbeat fresh instead of silently consuming the whole cycle budget on one
     fan-heavy parent. Defaults to a no-op for the request-path callers.
     """
-    from app.main import _maybe_create_failure_alert, _utcnow
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.time_utils import _utcnow
     from app.broadcast import broadcast_to_project
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection

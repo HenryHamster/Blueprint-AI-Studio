@@ -127,7 +127,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     Tests an agent updating task status and creating an artifact.
     Also verifies that completing the last task completes the project.
     """
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
     project = Project(name="Agent Status Test", user_id="test-user-123")
     db_session.add(project)
@@ -168,7 +168,7 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
 async def test_agent_status_update_persists_runtime_identity(
     client: AsyncClient, db_session, mocker
 ):
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     now = datetime.utcnow()
 
     project = Project(name="Agent Runtime Identity Test", user_id="test-user-123")
@@ -660,7 +660,7 @@ async def test_agent_status_complete_with_artifacts_creates_artifact_record(
     trigger a session.commit() followed by a lazy attribute access that would fail in
     the SQLite async test environment (MissingGreenlet).
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
 
     project = Project(name="Artifact Creation Test", user_id="test-user-123")
     db_session.add(project)
@@ -946,7 +946,7 @@ async def test_agent_status_already_completed_returns_200_idempotent(
     Tests that completing a task that is already in a terminal state (COMPLETED)
     returns 200 rather than 409, demonstrating idempotent behavior for agent retries.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
 
     project = Project(name="Idempotent Complete Test", user_id="test-user-123")
     db_session.add(project)
@@ -5698,8 +5698,8 @@ async def test_external_api_requeue_sets_exponential_backoff(
     - 3rd retry: ~16 min delay (2^3 * 120 = 960s)
     - After 5 retries, task is not requeued (budget exhausted)
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Backoff Test", user_id="test-user-backoff")
@@ -5793,8 +5793,8 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(
     must fail immediately without consuming any retry budget. Requeuing only wastes 30+ minutes
     of exponential backoff before the task permanently fails with the same error.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     # _process_post_commit opens a separate session and does FOR UPDATE on the
     # task, racing with the test's session and producing PostCommitLocked
@@ -5871,8 +5871,8 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(
 async def test_external_api_provider_model_config_falls_back_without_backoff(
     requested_model, client: AsyncClient, db_session, mocker
 ):
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch(
         "app.routers.agent_status.release_max_plan_account",
         new_callable=mocker.AsyncMock,
@@ -5946,8 +5946,8 @@ async def test_external_api_provider_model_config_falls_back_without_backoff(
 async def test_external_api_provider_model_config_without_fallback_does_not_requeue(
     client: AsyncClient, db_session, mocker
 ):
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=mocker.AsyncMock
     )
@@ -6017,7 +6017,7 @@ async def test_external_api_provider_model_config_without_fallback_does_not_requ
 async def test_failed_with_open_pr_hands_off_to_review(
     client: AsyncClient, db_session, mocker
 ):
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
     )
@@ -6110,7 +6110,7 @@ async def test_failed_with_open_pr_spawn_failure_keeps_recovery_marker(
     parents) and to the marker-gated sweep — stranded until the 6h/48h backstop.
     Would FAIL pre-fix: `_pr_state_check_pending` would be absent.
     """
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
     )
@@ -6189,7 +6189,7 @@ async def test_failed_with_merged_pr_marks_completed(
     client: AsyncClient, db_session, mocker
 ):
     """PR merged out-of-band before agent reported FAILED → COMPLETED, not retry."""
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
     )
@@ -6251,7 +6251,7 @@ async def test_failed_with_closed_unmerged_pr_marks_terminal_failed(
     client: AsyncClient, db_session, mocker
 ):
     """PR closed without merging → terminal FAILED with closure marker; no retry."""
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
     )
@@ -6317,7 +6317,7 @@ async def test_failed_without_pr_artifact_uses_normal_retry(
 
     Guards against the open-PR handoff over-reaching and breaking unrelated retries.
     """
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
     )
@@ -6973,7 +6973,7 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
     confirmed_count is incremented for entries applicable to that task type.
     Entries not applicable to the task type are NOT incremented.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
     project = Project(name="Playbook Confirm Test", user_id="test-user-confirm")
     project.design_doc = {
@@ -7030,7 +7030,7 @@ async def test_playbook_confirmed_count_not_incremented_on_retry_success(
     When a task completes after retries (attempt_count >= 2), confirmed_count
     is NOT incremented — only first-attempt successes count as confirmation.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
     project = Project(name="Playbook No Confirm Retry", user_id="test-user-no-confirm")
     project.design_doc = {
@@ -7078,7 +7078,7 @@ async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
     in recent_outcomes is flipped to True and effectiveness_score is computed.
     Entries not shown to this task do not get their recent_outcomes updated.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
     project = Project(name="Outcomes Flip Test", user_id="test-user-outcomes")
     project.design_doc = {
@@ -7610,8 +7610,8 @@ async def test_rate_limit_requeue_clears_terminated_cache(
     """
     from app.routers.agent import _terminated_task_ids
 
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Rate Limit Requeue Test", user_id="test-user-rl-cache")
@@ -7673,8 +7673,8 @@ async def test_completed_terminal_populates_terminated_cache(
     """
     from app.routers.agent import _terminated_task_ids
 
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Terminal Cache Test", user_id="test-user-terminal-cache")
@@ -7733,8 +7733,8 @@ async def test_rate_limit_requeue_allows_subsequent_claim(
     """
     from app.routers.agent import _terminated_task_ids
 
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Rate Limit E2E Test", user_id="test-user-rl-e2e")
@@ -7802,8 +7802,8 @@ async def test_file_change_details_stored_in_task_context(
     it to the retry clone as _previous_file_change_details."""
     from app.routers.agent import _terminated_task_ids
 
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
 
     project = Project(name="File Change Details Test", user_id="test-user-fcd")
     db_session.add(project)
@@ -7859,8 +7859,8 @@ async def test_scope_gate_triggered_stored_in_task_context(
     analysis-phase overflow from post-implementation overflow."""
     from app.routers.agent import _terminated_task_ids
 
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
 
     project = Project(name="Scope Gate Test", user_id="test-user-sg")
     db_session.add(project)
@@ -7910,8 +7910,8 @@ async def test_agent_status_pr_artifact_stores_enriched_context(
     """COMPLETED+PULL_REQUEST status with diff_summary, self_review_outcome, and
     test_failure_summary stores them in task context as _pr_diff_summary,
     _self_review_outcome, and _test_failure_summary respectively."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Enriched Context PR Test", user_id="test-user-enriched-pr")
@@ -7990,8 +7990,8 @@ async def test_agent_status_malformed_pr_url_returns_400(
 ):
     """POSTing a PULL_REQUEST artifact with a malformed pr_url (e.g. a /commit/<sha>
     URL) must return HTTP 400 and must NOT persist an Artifact row."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Malformed PR URL Test", user_id="test-user-malformed-pr")
@@ -8055,8 +8055,8 @@ async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure
 ):
     """FAILED+ERROR_LOG status with diff_summary and test_failure_summary stores them
     in task context as _pr_diff_summary and _test_failure_summary."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(
@@ -8434,8 +8434,8 @@ async def test_smoketest_startup_failure_spawns_plan_task_priority_90(
     client: AsyncClient, db_session, mocker
 ):
     """SMOKETEST_RESULT with a startup-suite failure spawns a plan task at priority 90."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-startup")
@@ -8483,8 +8483,8 @@ async def test_smoketest_curated_failure_spawns_plan_task_priority_70(
     client: AsyncClient, db_session, mocker
 ):
     """SMOKETEST_RESULT with a curated-suite failure (startup ok) spawns plan task at priority 70."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-curated")
@@ -8532,8 +8532,8 @@ async def test_smoketest_main_failure_post_cutover_spawns_hotfix(
     """Post-cutover (integration_branch=automain), a base_branch=main smoketest
     failure is a post-promotion production failure: the spawned plan task is a
     hotfix at priority >= 90 even when only the curated suite failed."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     _, task = await _setup_smoketest_task(
@@ -8592,8 +8592,8 @@ async def test_smoketest_post_promotion_detection_uses_promotion_target_config(
     on base_branch='stable' should be treated as a post-promotion production failure
     (hotfix, priority >= 90) even though neither 'automain' nor 'main' appear.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     _, task = await _setup_smoketest_task(
@@ -8664,8 +8664,8 @@ async def test_smoketest_passing_does_not_spawn_plan_task(
     client: AsyncClient, db_session, mocker
 ):
     """SMOKETEST_RESULT with passed=true (no failures) does not spawn any child task."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-ok")
@@ -8699,8 +8699,8 @@ async def test_smoketest_passing_does_not_spawn_plan_task(
 @pytest.mark.asyncio
 async def test_smoketest_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
     """SMOKETEST_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     import json as _json
     _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-dict")
@@ -8721,8 +8721,8 @@ async def test_debug_result_high_confidence_spawns_fix_task(
     client: AsyncClient, db_session, mocker
 ):
     """DEBUG_RESULT with confidence='high' and fix_prompt spawns a create-type fix task."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Debug High", user_id="test-user-debug-high")
@@ -8778,8 +8778,8 @@ async def test_debug_result_low_confidence_does_not_spawn_fix_task(
     client: AsyncClient, db_session, mocker
 ):
     """DEBUG_RESULT with confidence='low' records plan_output but does not spawn a fix task."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="Debug Low", user_id="test-user-debug-low")
@@ -8833,8 +8833,8 @@ async def test_debug_result_skips_fix_spawn_if_requeue_already_replaced(
 ):
     """DEBUG_RESULT high-confidence does NOT spawn Fix: when the failed task was
     already CANCELLED+replaced by _requeue_parent_task (preventing duplicate work)."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     import json as _json
@@ -8910,8 +8910,8 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(
 ):
     """When Fix: task is spawned, _debug_fix_spawned_task_id is written on the failed
     task's context so _requeue_parent_task can detect the debug-fix path and skip cloning."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     import json as _json
@@ -8990,8 +8990,8 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(
 @pytest.mark.asyncio
 async def test_debug_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
     """DEBUG_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     import json as _json
     project = Project(name="Debug Dict", user_id="test-user-debug-dict2")
@@ -9636,7 +9636,7 @@ async def test_next_role_refuses_warm_claim_on_doomed_vm(
     delete by 41456ba8's agent_completion 9s earlier; SIGTERM landed
     ~50s later as the GCP delete completed."""
     from datetime import datetime, timedelta
-    from app.main import _orchestrator_deleted_vms
+    from app.vm_lifecycle import _orchestrator_deleted_vms
     import time
 
     project = Project(name="Next-Role Doomed-VM", user_id="test-user-doomed")
@@ -10607,7 +10607,7 @@ async def test_fire_and_forget_vm_delete_records_marker_synchronously():
     background coroutine running doesn't misclassify the orchestrator
     action as spot preemption."""
     import asyncio
-    from app.main import (
+    from app.vm_lifecycle import (
         fire_and_forget_vm_delete,
         _orchestrator_deleted_vms,
         _background_vm_deletes,
@@ -10623,16 +10623,18 @@ async def test_fire_and_forget_vm_delete_records_marker_synchronously():
     # awaiting them raises "future belongs to a different loop".
     pre_existing_tasks = set(_background_vm_deletes)
 
-    import app.main as main_mod
+    # fire_and_forget_vm_delete resolves _ensure_vm_deleted in its own
+    # (vm_lifecycle) module namespace, so the stub must be installed there.
+    import app.vm_lifecycle as vm_lifecycle_mod
 
-    real_ensure = main_mod._ensure_vm_deleted
+    real_ensure = vm_lifecycle_mod._ensure_vm_deleted
     fired = asyncio.Event()
 
     async def _stub(*args, **kwargs):
         fired.set()
         return True
 
-    main_mod._ensure_vm_deleted = _stub  # type: ignore[assignment]
+    vm_lifecycle_mod._ensure_vm_deleted = _stub  # type: ignore[assignment]
     try:
         fire_and_forget_vm_delete(vm_id, reason="test_marker_sync")
         # Synchronously, before yielding to the event loop, the marker
@@ -10643,7 +10645,7 @@ async def test_fire_and_forget_vm_delete_records_marker_synchronously():
         # And the background coroutine must eventually run.
         await asyncio.wait_for(fired.wait(), timeout=2.0)
     finally:
-        main_mod._ensure_vm_deleted = real_ensure
+        vm_lifecycle_mod._ensure_vm_deleted = real_ensure
         new_tasks = [
             t for t in _background_vm_deletes - pre_existing_tasks if not t.done()
         ]
@@ -10659,13 +10661,15 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
     is the load-bearing property the lock-window-break depends on."""
     import asyncio
     import time
-    from app.main import fire_and_forget_vm_delete, _background_vm_deletes
+    from app.vm_lifecycle import fire_and_forget_vm_delete, _background_vm_deletes
 
     pre_existing_tasks = set(_background_vm_deletes)
 
-    import app.main as main_mod
+    # fire_and_forget_vm_delete resolves _ensure_vm_deleted in its own
+    # (vm_lifecycle) module namespace, so the stub must be installed there.
+    import app.vm_lifecycle as vm_lifecycle_mod
 
-    real_ensure = main_mod._ensure_vm_deleted
+    real_ensure = vm_lifecycle_mod._ensure_vm_deleted
 
     async def _slow_delete(*args, **kwargs):
         # Simulate GCP delete latency. If fire_and_forget were
@@ -10673,7 +10677,7 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
         await asyncio.sleep(2.0)
         return True
 
-    main_mod._ensure_vm_deleted = _slow_delete  # type: ignore[assignment]
+    vm_lifecycle_mod._ensure_vm_deleted = _slow_delete  # type: ignore[assignment]
     try:
         vm_id = f"agent-vm-test-noblock-{uuid.uuid4().hex[:8]}"
         t0 = time.monotonic()
@@ -10685,7 +10689,7 @@ async def test_fire_and_forget_vm_delete_does_not_block_caller():
             f"expected <100ms — would defeat the lock-window-break"
         )
     finally:
-        main_mod._ensure_vm_deleted = real_ensure
+        vm_lifecycle_mod._ensure_vm_deleted = real_ensure
         # Cancel rather than await — the slow sleep would block test
         # teardown for 2s and we already proved the property we cared
         # about (synchronous return).
@@ -10703,7 +10707,7 @@ async def test_fire_and_forget_vm_delete_no_op_on_empty_vm_id():
     """Defensive: a None or empty vm_id must not schedule a background
     task (would crash on the first await inside _ensure_vm_deleted, but
     the marker write would still leak an empty-string key)."""
-    from app.main import (
+    from app.vm_lifecycle import (
         fire_and_forget_vm_delete,
         _orchestrator_deleted_vms,
         _background_vm_deletes,
@@ -12115,9 +12119,9 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     from app import release_version as _rv
     from app.models import ReleaseVersion, Artifact, ArtifactType
 
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.main.fire_and_forget_vm_delete", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     # Finalize re-resolves CI for the candidate commit rather than trusting the
     # spawn-time ci_green snapshot; with no GitHub credentials in this test that
@@ -12636,7 +12640,7 @@ async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(db_session, m
     import json as _json
     from app.task_completion import _handle_plan_completion
 
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Hotfix-Plan", user_id="hotfix-user")
@@ -12709,7 +12713,7 @@ async def test_non_hotfix_plan_subtasks_do_not_carry_hotfix(db_session, mocker):
     import json as _json
     from app.task_completion import _handle_plan_completion
 
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Normal-Plan", user_id="hotfix-user")
@@ -13060,7 +13064,7 @@ async def test_generic_failure_with_rate_limited_account_requeues_free(
         }
     }
     mocker.patch.object(pool_mod, "_account_by_id", fake_pool)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(name="RL Account Corr Test", user_id="test-user-rl-corr-001")
@@ -13124,7 +13128,7 @@ async def test_generic_failure_with_healthy_account_burns_retry(
         }
     }
     mocker.patch.object(pool_mod, "_account_by_id", fake_pool)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     project = Project(
@@ -13181,7 +13185,7 @@ async def test_generic_accountless_failure_uses_scoped_db_pool_rl_check(
     agent_status.py must pass through the task's routed provider/model when
     no account ID is present.
     """
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     pool_wide_mock = mocker.patch(
         "app.routers.agent_status.db_pool_wide_rate_limit_cooldown",
@@ -13254,8 +13258,8 @@ async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation
     at_time is not None. If the call site omits at_time, the side_effect returns
     False → CODE_ERROR → budget reduction in compute_effective_max_requeues.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
     def _rl_only_at_failure_time(task, at_time=None):

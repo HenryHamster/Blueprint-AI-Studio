@@ -134,7 +134,7 @@ async def test_merge_retry_succeeds_on_second_attempt_poll(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     sleep_mock = mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
 
@@ -176,7 +176,7 @@ async def test_merge_retry_all_attempts_fail_poll(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -229,7 +229,7 @@ async def test_merge_retry_uses_exponential_backoff_delays(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     sleep_mock = mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -272,7 +272,7 @@ async def test_merge_no_retry_for_webhook_source(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     sleep_mock = mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -324,7 +324,7 @@ async def test_merge_conflict_skips_retries_and_spawns_fix(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     sleep_mock = mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -375,7 +375,7 @@ async def test_mergeable_state_behind_calls_update_branch(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -424,7 +424,7 @@ async def test_update_branch_failure_increments_counter(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -480,7 +480,7 @@ async def test_update_branch_failure_threshold_spawns_fix(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -539,7 +539,7 @@ async def test_update_branch_threshold_scales_with_merge_budget(db_session, mock
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -604,7 +604,7 @@ async def test_update_branch_success_resets_counter(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -656,7 +656,7 @@ async def test_mergeable_state_dirty_spawns_fix(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -719,7 +719,7 @@ async def test_rule_block_keywords_trigger_escalation(db_session, mocker, rule_m
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -767,7 +767,7 @@ async def test_rule_block_does_not_escalate_when_gates_off(db_session, mocker):
     Companion to test_rule_block_keywords_trigger_escalation (gates on)."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -819,7 +819,7 @@ async def test_merge_failure_counter_increments(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -879,7 +879,7 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -939,7 +939,7 @@ async def test_merge_failure_escalation_dedups_until_hard_cap(db_session, mocker
         _attempt_merge_with_retry_and_escalation,
     )
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -999,7 +999,7 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1059,7 +1059,7 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
         _attempt_merge_with_retry_and_escalation,
     )
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1134,7 +1134,7 @@ async def test_merge_failure_hard_cap_records_deploy_monitoring_result(
     from app.routers.agent_status import _recorded_task_ids
     from app.shared_state import deploy_monitoring, direction_failure_streaks
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1201,7 +1201,7 @@ async def test_already_merged_pr_completes_task(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1246,7 +1246,7 @@ async def test_closed_not_merged_no_marker_defers_not_completes(db_session, mock
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1288,7 +1288,7 @@ async def test_closed_not_merged_pending_reopen_defers(db_session, mocker):
     own mergeability-reset window — defer (return False), do not complete."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1325,7 +1325,7 @@ async def test_closed_not_merged_with_success_marker_completes(db_session, mocke
     PR) and completes the task."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1371,7 +1371,7 @@ async def test_mergeable_state_blocked_escalates_without_keywords(db_session, mo
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1414,7 +1414,7 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1477,7 +1477,7 @@ async def test_mergeable_state_clean_no_existing_fix_does_not_spawn_rebase(
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1525,7 +1525,7 @@ async def test_mergeable_state_unknown_falls_back_to_keywords(db_session, mocker
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1574,7 +1574,7 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1636,7 +1636,7 @@ async def test_orig_task_evaluating_without_ci_waiting_completes(db_session, moc
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1694,7 +1694,7 @@ async def test_orig_task_with_ci_waiting_stays_evaluating(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1752,7 +1752,7 @@ async def test_merge_success_without_orig_id(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch(
         "app.github.merge_pull_request",
@@ -1801,7 +1801,7 @@ async def test_orig_pr_merged_write_failure_does_not_poison_caller_session(
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
     # Make ONLY the dedicated orig-session fail. The caller's ``db_session`` uses
@@ -1855,7 +1855,7 @@ async def test_ci_wait_started_resets_when_checks_restart(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1898,7 +1898,7 @@ async def test_merge_repeated_identical_error_triggers_early_exit(db_session, mo
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1953,7 +1953,7 @@ async def test_merge_deterministic_error_triggers_early_exit_on_first_occurrence
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -1997,7 +1997,7 @@ async def test_merge_different_errors_do_not_trigger_early_exit(db_session, mock
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2064,7 +2064,7 @@ async def test_cross_pr_merge_pattern_pauses_retries_and_alerts(db_session, mock
     from app.shared_state import merge_error_occurrences
 
     merge_error_occurrences.clear()
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task", return_value=(None, None)
     )
@@ -2118,7 +2118,7 @@ async def test_cross_pr_merge_pattern_alert_dedups_on_second_hit(db_session, moc
     from app.ci_completion import _normalize_merge_error
 
     merge_error_occurrences.clear()
-    alert_mock = mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    alert_mock = mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.review_pipeline._spawn_pipeline_task", return_value=(None, None))
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
@@ -2198,7 +2198,7 @@ async def test_suppress_warm_handoff_update_branch_escalation(db_session, mocker
     pass suppress_warm_handoff=True."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2255,7 +2255,7 @@ async def test_suppress_warm_handoff_merge_conflict(db_session, mocker):
     mergeable_state='dirty') must pass suppress_warm_handoff=True."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2309,7 +2309,7 @@ async def test_merge_conflict_uses_pr_head_ref_on_drift(db_session, mocker, capl
 
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2377,7 +2377,7 @@ async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
     pass suppress_warm_handoff=True."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2433,7 +2433,7 @@ async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
     spawn path at line 804 fires."""
     from app.ci_completion import handle_ci_completion
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     fake_fix = type("FT", (), {"id": uuid.uuid4()})()
@@ -2513,7 +2513,7 @@ async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
 
     from app.ci_completion import handle_ci_completion
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     bcast = mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     fake_fix = type("FT", (), {"id": uuid.uuid4()})()
@@ -2601,7 +2601,7 @@ async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     """
     from app.ci_completion import handle_ci_completion
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     fake_fix = type("FT", (), {"id": uuid.uuid4()})()
@@ -2697,7 +2697,7 @@ async def test_handle_ci_completion_uses_project_integration_branch(db_session, 
     """
     from app.ci_completion import handle_ci_completion
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
 
@@ -2744,7 +2744,7 @@ async def test_merge_conflict_spawn_uses_project_integration_branch(db_session, 
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2797,7 +2797,7 @@ async def test_behind_skipped_when_pr_is_not_behind(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2867,7 +2867,7 @@ async def test_in_progress_reset_cap_honored(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
@@ -2923,7 +2923,7 @@ async def test_in_progress_reset_increments_under_cap(db_session, mocker):
     """
     from app.ci_completion import _attempt_merge_with_retry_and_escalation
 
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(

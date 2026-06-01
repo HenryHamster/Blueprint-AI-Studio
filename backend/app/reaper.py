@@ -834,10 +834,8 @@ async def reaper_service():
         _extract_task_model,
         release_max_plan_account,
     )
-    from app.main import (
-        _ensure_vm_deleted,
-        _maybe_create_failure_alert,
-    )
+    from app.vm_lifecycle import _ensure_vm_deleted
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.routers.agent_status import record_task_result
     from app.broadcast import broadcast_to_project
     from app.task_lifecycle import _requeue_parent_task
@@ -1539,7 +1537,7 @@ async def reaper_service():
                                     # but whose status POST 500'd during a cutover.
                                     # Fix: consult the orchestrator-initiated-delete tracker. If the
                                     # VM was deleted by us within the last 30min, it's NOT a preemption.
-                                    from app.main import (
+                                    from app.vm_lifecycle import (
                                         is_orchestrator_initiated_delete,
                                     )
 

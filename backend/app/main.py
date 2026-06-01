@@ -22,15 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
-    Project,
     Task,
     TaskStatus,
     DeploymentState,
     DeploymentStatus,
-    Alert,
-    AlertSeverity,
 )
-from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
+from app.compute import provision_agent_vm  # noqa: F401  (re-exported for test patches; see main.py:108 docstring)
 from app.auth import get_current_user
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
@@ -67,7 +64,6 @@ from app.shared_state import runtime_config as _runtime_config
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
 from app.time_utils import _utcnow
-from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -81,68 +77,28 @@ EXPECTED_SCHEMA_REVISION = "0130"
 # Maps priority string labels to integer values stored on Task.priority.
 TASK_PRIORITY_MAP: Dict[str, int] = {"high": 100, "medium": 50, "low": 0}
 
-# GCP VM count cache — updated by cleanup service, used by orchestrator concurrency check
-_last_gcp_vm_count: int = 0
-_last_gcp_vm_check: float = 0.0
-_GCP_VM_CHECK_INTERVAL: float = 120.0  # Seconds between GCP VM count refreshes
-
-# Orchestrator-initiated VM-delete tracker. Reaper consults this to distinguish
-# "VM DELETED because orchestrator told it to" from "VM DELETED because GCP
-# preempted it." Without this, the reaper sees vm_status=DELETED on a SPOT VM
-# and bumps spot_preemption_count, treating an orchestrator-completed task as
-# a preemption — observed in production 2026-05-04 when status POST 500'd
-# during cutover but agent_completion still deleted the VM (reaper later
-# misclassified the orphan).
-# Key: vm_instance_id (str). Value: (unix_ts, reason). TTL = 30min — pruned
-# lazily on read. In-memory only (Cloud Run = single instance per region for
-# this service); restart loses entries but the misclassification window then
-# closes with the worker.
-_orchestrator_deleted_vms: Dict[str, tuple[float, str]] = {}
-_ORCHESTRATOR_DELETE_TTL: float = 1800.0  # 30 minutes
-# Hard cap so a write-faster-than-read pattern (e.g. reaper paused while
-# many deletes happen) cannot grow this dict unboundedly. At ~80 bytes/entry
-# this caps memory at ~400 KB. Pruning is by oldest-first when over the cap,
-# preserving the most-recently-deleted entries that the reaper is most
-# likely to consult next.
-_ORCHESTRATOR_DELETE_MAX_ENTRIES: int = 5000
-
-
-def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
-    """Return (True, reason) if `vm_id` was deleted by the orchestrator
-    within the last _ORCHESTRATOR_DELETE_TTL seconds.
-
-    Side-effect: prunes expired entries on every call AND enforces the size
-    cap. Module-level state so the reaper can import it without a circular
-    dep on `_ensure_vm_deleted`.
-    """
-    now = time.time()
-    expired = [
-        k
-        for k, (ts, _) in _orchestrator_deleted_vms.items()
-        if now - ts > _ORCHESTRATOR_DELETE_TTL
-    ]
-    for k in expired:
-        _orchestrator_deleted_vms.pop(k, None)
-    # Hard-cap eviction: oldest entries first. Defensive — if the dict still
-    # has more than the cap after TTL pruning, we drop the oldest until it
-    # fits. Logged so operators see the eviction and can investigate why
-    # writes outpaced reads.
-    if len(_orchestrator_deleted_vms) > _ORCHESTRATOR_DELETE_MAX_ENTRIES:
-        sorted_by_ts = sorted(
-            _orchestrator_deleted_vms.items(), key=lambda kv: kv[1][0]
-        )
-        excess = len(_orchestrator_deleted_vms) - _ORCHESTRATOR_DELETE_MAX_ENTRIES
-        for k, _ in sorted_by_ts[:excess]:
-            _orchestrator_deleted_vms.pop(k, None)
-        logger.warning(
-            "[VM TRACK] _orchestrator_deleted_vms exceeded %d entries — evicted %d oldest",
-            _ORCHESTRATOR_DELETE_MAX_ENTRIES,
-            excess,
-        )
-    entry = _orchestrator_deleted_vms.get(vm_id)
-    if entry is None:
-        return False, None
-    return True, entry[1]
+# --- VM teardown lifecycle (extracted to app.vm_lifecycle) ---
+# The GCP VM-count cache, the orchestrator-initiated VM-delete tracker, and the
+# VM-teardown helpers were extracted to app.vm_lifecycle (P5 service-locator
+# decomposition) so the orchestrator/reaper/routers can import them without a
+# deferred `from app.main import ...` round-trip through the FastAPI app
+# entrypoint. Re-exported here for backward compatibility — callers may still
+# `from app.main import _ensure_vm_deleted` and tests may still reference the
+# names below, but new code should import from app.vm_lifecycle directly.
+# The module itself is imported as _vm_lifecycle so the endpoints below read
+# the live, rebound counters via `_vm_lifecycle._last_gcp_vm_count` (a
+# `from ... import` binding would go stale when _ensure_vm_deleted rebinds the
+# module global).
+from app import vm_lifecycle as _vm_lifecycle
+from app.vm_lifecycle import (  # noqa: F401  re-exported for back-compat (callers + tests patch app.main.X)
+    is_orchestrator_initiated_delete,
+    _ensure_vm_deleted,
+    fire_and_forget_vm_delete,
+    schedule_deferred_backlog_teardown,
+    _get_actual_gcp_vm_count,
+    _orchestrator_deleted_vms,
+    _background_vm_deletes,
+)
 
 
 # --- Max Plan Account Pool ---
@@ -170,219 +126,6 @@ from app.max_plan_pool import (  # noqa: F401
 # Current revision from Cloud Run (set on startup)
 _current_revision: str = os.getenv("K_REVISION", "local-dev")
 _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
-
-
-async def _ensure_vm_deleted(
-    task_or_vm_id, *, reason: str = "terminal_transition"
-) -> bool:
-    """Guarantee VM deletion for any terminal state transition.
-
-    Accepts either a Task object or a raw vm_instance_id string.
-    Retries up to 3 times with exponential backoff.
-    Returns True if deletion succeeded or was unnecessary.
-    """
-    global _last_gcp_vm_count
-
-    if isinstance(task_or_vm_id, Task):
-        vm_id = task_or_vm_id.vm_instance_id
-        task_id = str(task_or_vm_id.id)
-    else:
-        vm_id = task_or_vm_id
-        task_id = "unknown"
-
-    if not vm_id:
-        return True  # No VM to delete
-
-    logger.info(f"[VM CLEANUP] Deleting VM {vm_id} (task={task_id}, reason={reason})")
-    # Record the orchestrator-initiated delete BEFORE attempting the GCP
-    # call. Even if the call fails partway and the VM ends up in TERMINATED
-    # rather than DELETED, the marker still tells the reaper this was an
-    # orchestrator action — preventing a spot_preemption misclassification
-    # if the VM is later cleaned up by another path.
-    _orchestrator_deleted_vms[vm_id] = (time.time(), reason)
-
-    for attempt in range(3):
-        try:
-            result = await delete_agent_vm(vm_id)
-            if result:
-                logger.info(f"[VM CLEANUP] Deleted VM {vm_id}")
-                if _last_gcp_vm_count > 0:
-                    _last_gcp_vm_count -= 1
-                    logger.info(
-                        f"[VM CLEANUP] Decremented cached VM count to {_last_gcp_vm_count}"
-                    )
-                return True
-            else:
-                logger.warning(
-                    f"[VM CLEANUP] delete_agent_vm returned False for {vm_id} (attempt {attempt + 1}/3)"
-                )
-        except Exception as e:
-            logger.error(
-                f"[VM CLEANUP] Failed to delete VM {vm_id} (attempt {attempt + 1}/3): {e}",
-                exc_info=True,
-            )
-
-        if attempt < 2:
-            await asyncio.sleep(2**attempt)  # 1s, 2s backoff
-
-    logger.error(
-        f"[VM CLEANUP] FAILED to delete VM {vm_id} after 3 attempts — will rely on cleanup sweep"
-    )
-    return False
-
-
-# Strong references for fire-and-forget VM-delete tasks. asyncio.create_task
-# returns a weak handle — without holding a reference here, GC may collect
-# the coroutine mid-flight and the GCP delete is silently dropped.
-_background_vm_deletes: set[asyncio.Task] = set()
-
-
-def fire_and_forget_vm_delete(
-    task_or_vm_id, *, reason: str = "terminal_transition"
-) -> None:
-    """Schedule _ensure_vm_deleted in the background; release the caller's
-    row lock immediately.
-
-    Use from terminal-status request handlers (e.g. /api/agent/status). The
-    awaited form blocks the FOR UPDATE row lock for 60-90s during GCP I/O,
-    causing concurrent agent POSTs on the same row to receive 429 and
-    risking a lost-COMPLETED-commit if Cloud Run terminates the request
-    mid-block. Production incident 2026-05-05 task 04605f9d: agent posted
-    APPROVE verdict, handler held lock through GCP delete, retry got 429,
-    status update never committed, reaper swept work that had already
-    succeeded and re-ran the entire review.
-
-    The orchestrator-deleted marker is recorded synchronously by
-    _ensure_vm_deleted (line above) before its first await, so the reaper
-    sees the orchestrator's intent immediately even if the background
-    delete is delayed by event-loop pressure. Cleanup-sweep is the safety
-    net if the background task is dropped (Cloud Run shutdown mid-flight).
-    """
-    if isinstance(task_or_vm_id, Task):
-        vm_id = task_or_vm_id.vm_instance_id
-    else:
-        vm_id = task_or_vm_id
-    if not vm_id:
-        return
-    # Record marker synchronously before scheduling. _ensure_vm_deleted
-    # also writes this on its first non-await line, but writing here too
-    # closes the window where Cloud Run terminates the worker between
-    # create_task() and the event loop picking up the coroutine — a peer
-    # observing vm_status=DELETED during that window would otherwise
-    # misclassify the orchestrator action as spot-preemption.
-    _orchestrator_deleted_vms[vm_id] = (time.time(), reason)
-    bg = asyncio.create_task(_ensure_vm_deleted(vm_id, reason=reason))
-    _background_vm_deletes.add(bg)
-    bg.add_done_callback(_background_vm_deletes.discard)
-
-
-async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
-    """Hold a just-idle VM's teardown briefly so it can claim backlog work.
-
-    Backlog reuse (efficiency direction d-91d8dede): when a COMPLETED task's
-    VM has eligible QUEUED backlog work in its project, this defers teardown
-    by runtime_config['warm_backlog_teardown_defer_secs'] (read fresh per call)
-    so the agent's /next-role poll can claim that work and run it warm. After
-    the window, the VM is deleted iff it never claimed anything.
-
-    Crucially this does NOT pre-record the orchestrator-deleted marker (unlike
-    fire_and_forget_vm_delete): that marker makes is_orchestrator_initiated_delete
-    return True, and the /next-role doomed-VM guard would then refuse the VM's
-    own warm claim. The marker is only written if/when we actually delete.
-    """
-    from app.warm_backlog_reuse import _teardown_defer_secs
-
-    await asyncio.sleep(_teardown_defer_secs())
-    try:
-        async with AsyncSessionLocal() as s:
-            claimed = (
-                await s.execute(
-                    select(Task.id)
-                    .where(
-                        Task.vm_instance_id == vm_id,
-                        Task.status.in_(
-                            [
-                                TaskStatus.PROVISIONING,
-                                TaskStatus.IN_PROGRESS,
-                                TaskStatus.EVALUATING,
-                            ]
-                        ),
-                    )
-                    .limit(1)
-                )
-            ).first()
-    except Exception:
-        # If the re-check query fails, fall through to teardown — never leak a
-        # VM by assuming it was reused.
-        logger.exception(
-            "[BACKLOG-REUSE] Deferred-teardown re-check failed for VM %s — "
-            "tearing down",
-            vm_id,
-        )
-        claimed = None
-    if claimed is not None:
-        logger.info(
-            "[BACKLOG-REUSE] VM %s claimed backlog work during defer window — "
-            "skipping teardown",
-            vm_id,
-        )
-        return
-    logger.info(
-        "[BACKLOG-REUSE] VM %s claimed nothing within defer window — tearing down",
-        vm_id,
-    )
-    await _ensure_vm_deleted(vm_id, reason=reason)
-
-
-def schedule_deferred_backlog_teardown(
-    vm_id: str, *, reason: str = "agent_completion"
-) -> None:
-    """Fire-and-forget the deferred-teardown coroutine (see above)."""
-    if not vm_id:
-        return
-    bg = asyncio.create_task(_deferred_backlog_teardown(vm_id, reason))
-    _background_vm_deletes.add(bg)
-    bg.add_done_callback(_background_vm_deletes.discard)
-
-
-async def _get_actual_gcp_vm_count() -> int:
-    """Count actual agent-vm-* instances across all GCP zones.
-    Cached for _GCP_VM_CHECK_INTERVAL seconds to avoid API spam.
-    Updated passively by the cleanup service, with active refresh as fallback."""
-    global _last_gcp_vm_count, _last_gcp_vm_check
-
-    now = time.time()
-    if now - _last_gcp_vm_check < _GCP_VM_CHECK_INTERVAL:
-        return _last_gcp_vm_count
-
-    from app.compute import FALLBACK_ZONES, _list_vms_in_zone, LOCAL_MODE
-
-    if LOCAL_MODE:
-        from app.compute import _local_processes
-
-        _last_gcp_vm_count = len(_local_processes)
-        _last_gcp_vm_check = now
-        return _last_gcp_vm_count
-
-    try:
-        unique_zones = list({z for z, _ in FALLBACK_ZONES})
-        zone_tasks = [
-            asyncio.to_thread(_list_vms_in_zone, zone) for zone in unique_zones
-        ]
-        zone_results = await asyncio.wait_for(
-            asyncio.gather(*zone_tasks, return_exceptions=True),
-            timeout=10,  # Short timeout — cache is usually fresh from cleanup service
-        )
-        total = 0
-        for zr in zone_results:
-            if isinstance(zr, list):
-                total += len(zr)
-        _last_gcp_vm_count = total
-        _last_gcp_vm_check = now
-        return total
-    except Exception as e:
-        logger.warning(f"[GCP] Failed to count VMs: {e}")
-        return _last_gcp_vm_count  # Return stale count on failure
 
 
 # Webhook dedup state moved to app.routers.github
@@ -875,373 +618,25 @@ async def _init_deployment_state():
         )
 
 
-async def _send_webhook_notification(event_type: str, title: str, details: str) -> None:
-    """Fire-and-forget webhook notification for critical pipeline events."""
-    url = os.getenv("PIPELINE_WEBHOOK_URL")
-    if not url:
-        return
-    import httpx
-
-    payload = {
-        "event_type": event_type,
-        "title": title,
-        "details": details,
-        "timestamp": _utcnow().isoformat(),
-    }
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code >= 400:
-                logger.warning(f"[WEBHOOK] POST returned {resp.status_code}")
-    except Exception as e:
-        logger.warning(f"[WEBHOOK] Failed to send notification: {e}")
-
-
-def _get_broadcast_limit(design_doc: "dict | None" = None) -> int:
-    """Return the broadcast limit for a project, falling back to the global default.
-
-    Per-project override: store ``_broadcast_limit`` in project.design_doc.
-    Set to 0 to opt a project out of system-wide broadcast alerts.
-    """
-    per_project = (design_doc or {}).get("_broadcast_limit")
-    if per_project is not None:
-        return int(per_project)
-    return _runtime_config.get("project_broadcast_limit", 1000)
-
-
-async def _create_orchestrator_error_alerts(
-    session: AsyncSession, consecutive_errors: int
-) -> None:
-    """Create ERROR alerts on all projects when the orchestrator hits repeated errors (deduplicated)."""
-    title = "Orchestrator error loop"
-    msg = (
-        f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
-        "The pipeline may be stalled. Check logs for details."
-    )
-    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
-    rows = (
-        await session.execute(
-            select(Project.id, Project.design_doc).limit(global_limit)
-        )
-    ).all()
-    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
-    if len(rows) == global_limit:
-        logger.warning(
-            "_create_orchestrator_error_alerts: project_ids capped at %d",
-            global_limit,
-        )
-    existing_rows = (
-        (
-            await session.execute(
-                select(Alert.project_id).where(
-                    Alert.project_id.in_(project_ids),
-                    Alert.task_id.is_(None),
-                    Alert.severity == AlertSeverity.ERROR,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title == title,
-                )
-            )
-        ).all()
-        if project_ids
-        else []
-    )
-    projects_with_alert = {row[0] for row in existing_rows}
-    for pid in project_ids:
-        if pid in projects_with_alert:
-            continue
-        alert = Alert(
-            project_id=pid,
-            severity=AlertSeverity.ERROR,
-            title=title,
-            message=msg,
-        )
-        session.add(alert)
-        await broadcast_to_project(
-            str(pid),
-            "alert_created",
-            {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
-        )
-
-
-async def _create_halted_alerts(
-    session: AsyncSession,
-    rollback_count: int,
-    last_known_good: str,
-    halted_at: "datetime",
-) -> None:
-    """Create ERROR alerts on all projects when deployment enters HALTED state."""
-    title = f"Deployment HALTED — {rollback_count} consecutive rollbacks, manual intervention required"
-    msg = (
-        f"Deployment halted after {rollback_count} consecutive rollbacks. "
-        f"Last known good revision: {last_known_good or 'unknown'}. "
-        f"Halted at: {halted_at.isoformat()}. "
-        "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
-    )
-    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
-    rows = (
-        await session.execute(
-            select(Project.id, Project.design_doc).limit(global_limit)
-        )
-    ).all()
-    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
-    if len(rows) == global_limit:
-        logger.warning("_create_halted_alerts: project_ids capped at %d", global_limit)
-    for pid in project_ids:
-        alert = Alert(
-            project_id=pid,
-            severity=AlertSeverity.ERROR,
-            title=title,
-            message=msg,
-        )
-        session.add(alert)
-        await broadcast_to_project(
-            str(pid),
-            "alert_created",
-            {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
-        )
-    await _send_webhook_notification("PIPELINE_HALTED", title, msg)
-
-
-async def _create_rollback_alerts(
-    session: AsyncSession, rolled_back_from: str, rolled_back_to: str
-) -> None:
-    """Create WARNING alerts on all projects when an automatic rollback is detected.
-    Deduplicates: skips if an undismissed rollback alert already exists for a project."""
-    title = "Automatic rollback detected — revision reverted to last known good"
-    msg = (
-        f"Deployment automatically rolled back from {rolled_back_from[:8]} "
-        f"to {rolled_back_to[:8]}."
-    )
-    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
-    rows = (
-        await session.execute(
-            select(Project.id, Project.design_doc).limit(global_limit)
-        )
-    ).all()
-    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
-    if len(rows) == global_limit:
-        logger.warning(
-            "_create_rollback_alerts: project_ids capped at %d",
-            global_limit,
-        )
-    existing_rows = (
-        (
-            await session.execute(
-                select(Alert.project_id).where(
-                    Alert.project_id.in_(project_ids),
-                    Alert.task_id.is_(None),
-                    Alert.dismissed_at.is_(None),
-                    Alert.title.contains("Automatic rollback"),
-                )
-            )
-        ).all()
-        if project_ids
-        else []
-    )
-    projects_with_alert = {row[0] for row in existing_rows}
-    for pid in project_ids:
-        if pid in projects_with_alert:
-            continue
-        alert = Alert(
-            project_id=pid,
-            severity=AlertSeverity.WARNING,
-            title=title,
-            message=msg,
-        )
-        session.add(alert)
-        await broadcast_to_project(
-            str(pid),
-            "alert_created",
-            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
-        )
-
-
-async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
-    """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
-    recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
-    now = _utcnow()
-    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
-    rows = (
-        await session.execute(
-            select(Project.id, Project.design_doc).limit(global_limit)
-        )
-    ).all()
-    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
-    if len(rows) == global_limit:
-        logger.warning(
-            "_create_halted_recovery_alerts: project_ids capped at %d",
-            global_limit,
-        )
-    # Single batched query for all undismissed HALTED ERROR alerts across all projects
-    halted_alerts = (
-        (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id.in_(project_ids),
-                    Alert.severity == AlertSeverity.ERROR,
-                    Alert.dismissed_at.is_(None),
-                    Alert.title.contains("HALTED"),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    halted_by_project: dict = {}
-    for h in halted_alerts:
-        halted_by_project.setdefault(h.project_id, []).append(h)
-    for pid in project_ids:
-        # Dismiss existing HALTED ERROR alerts for this project
-        for h in halted_by_project.get(pid, []):
-            h.dismissed_at = now
-            session.add(h)
-        # Create INFO recovery alert
-        alert = Alert(
-            project_id=pid,
-            severity=AlertSeverity.INFO,
-            title=recovery_title,
-            message=recovery_title,
-        )
-        session.add(alert)
-        await broadcast_to_project(
-            str(pid),
-            "alert_created",
-            {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
-        )
-
-
-async def _maybe_create_failure_alert(
-    task: "Task",
-    session: AsyncSession,
-    error_snippet: str | None = None,
-) -> None:
-    """Create an ERROR alert for a task failure unless it's a smoketest or retry task.
-    Deduplicates: skips if an undismissed alert already exists for this task."""
-    task_type = (task.first_payload).get("type", "")
-    if task_type == "smoketest":
-        return
-    if (task.context or {}).get("is_retry") is True:
-        return
-    existing = await session.execute(
-        select(Alert).where(Alert.task_id == task.id, Alert.dismissed_at.is_(None))
-    )
-    if existing.scalars().first() is not None:
-        return
-    alert = Alert(
-        project_id=task.project_id,
-        severity=AlertSeverity.ERROR,
-        title=f"Task failed: {task.title or str(task.id)[:8]}",
-        message=f"Task type: {task_type}. {error_snippet or 'See task logs for details.'}",
-        task_id=task.id,
-    )
-    session.add(alert)
-    await broadcast_to_project(
-        str(task.project_id),
-        "alert_created",
-        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
-    )
-    try:
-        from app.notification_dispatch import dispatch_external_notification
-        from app.failure_classification import (
-            classify_failure,
-            classify_failure_taxonomy,
-        )
-        import asyncio as _asyncio
-
-        ctx = task.context or {}
-        payload = task.first_payload or {}
-        direction_text = (
-            ctx.get("direction_text") or payload.get("direction_text") or ""
-        )
-        pr_url = (
-            ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
-        )
-        _asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
-            dispatch_external_notification(
-                task.project_id,
-                "TASK_FAILED",
-                {
-                    "task_id": str(task.id),
-                    "task_title": task.title or str(task.id)[:8],
-                    "task_type": task_type,
-                    "error_snippet": error_snippet or "",
-                    "failure_class": classify_failure(task),
-                    "taxonomy": classify_failure_taxonomy(task),
-                    "direction_id": ctx.get("direction_id") or "",
-                    "direction_text": direction_text[:200],
-                    "scope": ctx.get("scope") or payload.get("scope") or "",
-                    "pr_url": pr_url,
-                    "attempt_count": int(task.attempt_count or 0),
-                },
-            )
-        )
-    except Exception as _ne:
-        logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
-
-
-async def _maybe_create_circuit_breaker_alert(
-    project_id: "uuid.UUID",
-    session: AsyncSession,
-    reason: str,
-) -> None:
-    """Create a WARNING alert when the circuit breaker opens for a project.
-    Deduplicates: skips if an undismissed circuit-breaker alert already exists."""
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.task_id.is_(None),
-            Alert.severity == AlertSeverity.WARNING,
-            Alert.dismissed_at.is_(None),
-            Alert.title == "Circuit breaker opened: autonomous tasks paused",
-        )
-    )
-    if existing.scalars().first() is not None:
-        return
-    alert = Alert(
-        project_id=project_id,
-        severity=AlertSeverity.WARNING,
-        title="Circuit breaker opened: autonomous tasks paused",
-        message=reason,
-    )
-    session.add(alert)
-    await broadcast_to_project(
-        str(project_id),
-        "alert_created",
-        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
-    )
-    await _send_webhook_notification("CIRCUIT_BREAKER_OPEN", alert.title, alert.message)
-
-
-async def _create_strategic_alert(
-    project_id: "uuid.UUID",
-    session: AsyncSession,
-    message: str,
-) -> None:
-    """Create a WARNING alert for strategic cycle failures. Deduplicates by title."""
-    title = "Strategic cycle issue"
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.severity == AlertSeverity.WARNING,
-            Alert.dismissed_at.is_(None),
-            Alert.title == title,
-        )
-    )
-    if existing.scalars().first():
-        return  # Don't spam duplicate alerts
-    alert = Alert(
-        project_id=project_id,
-        severity=AlertSeverity.WARNING,
-        title=title,
-        message=message[:1000],
-    )
-    session.add(alert)
-    await session.commit()
-    await broadcast_to_project(
-        str(project_id),
-        "alert_created",
-        {"alert_id": str(alert.id), "severity": "WARNING", "title": title},
-    )
+# --- Webhook notification + alert dispatch (extracted) ---
+# _send_webhook_notification moved to app.notification; the alert-creation
+# helpers (_get_broadcast_limit, the _create_*_alert family, the
+# _maybe_create_*_alert family) moved to app.alert_dispatch (P5 service-locator
+# decomposition) so the orchestrator/reaper/completion handlers/routers import
+# them directly instead of via a deferred `from app.main import ...`. Both are
+# re-exported here for backward compatibility — _init_deployment_state below
+# and tests still reference these names through app.main.
+from app.notification import _send_webhook_notification  # noqa: F401  re-exported for back-compat
+from app.alert_dispatch import (  # noqa: F401  re-exported for back-compat (callers + tests patch app.main.X)
+    _get_broadcast_limit,
+    _create_orchestrator_error_alerts,
+    _create_halted_alerts,
+    _create_rollback_alerts,
+    _create_halted_recovery_alerts,
+    _maybe_create_failure_alert,
+    _maybe_create_circuit_breaker_alert,
+    _create_strategic_alert,
+)
 
 
 app = FastAPI(
@@ -1408,9 +803,9 @@ async def debug_orchestrator(
         "queued_tasks": queued,
         "active_tasks": active,
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
-        "actual_gcp_vm_count": _last_gcp_vm_count,
-        "gcp_vm_count_age_seconds": int(time.time() - _last_gcp_vm_check)
-        if _last_gcp_vm_check
+        "actual_gcp_vm_count": _vm_lifecycle._last_gcp_vm_count,
+        "gcp_vm_count_age_seconds": int(time.time() - _vm_lifecycle._last_gcp_vm_check)
+        if _vm_lifecycle._last_gcp_vm_check
         else None,
         "pool_size": pool_snapshot["size"],
         "available_count": pool_snapshot["available"],
@@ -1926,7 +1321,7 @@ async def prometheus_metrics(request: Request):
         gauge(
             "blueprint_orchestrator_deleted_vms_size",
             "Number of entries in the orchestrator-initiated VM delete tracker",
-            len(_orchestrator_deleted_vms),
+            len(_vm_lifecycle._orchestrator_deleted_vms),
         )
 
     # Reaper liveness — counter increments only on a fully-successful cycle.

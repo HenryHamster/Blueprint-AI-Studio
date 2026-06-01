@@ -337,7 +337,7 @@ async def test_handle_strategic_completion_cited_memo_sets_ever_cited(db_session
 
     # 4. Call the completion handler (mock side-effect helpers)
     with (
-        patch("app.main._create_strategic_alert", new_callable=AsyncMock),
+        patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock),
         patch(
             "app.research_completion.query_findings_index",
             new_callable=AsyncMock,

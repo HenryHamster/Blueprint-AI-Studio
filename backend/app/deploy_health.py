@@ -638,7 +638,7 @@ def _build_rate_limit_details() -> "dict | None":
 
 async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) -> None:
     """Create WARNING alerts on all projects when the pipeline auto-pauses due to external dep failures."""
-    from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+    from app.notification import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
 
     title = "Pipeline auto-paused: external dependencies down"
     dispatch_health = _shared_state.external_health.get("dispatch_health", {}) or {}
@@ -733,7 +733,7 @@ async def _create_forced_resume_alerts(
     only goes up to ERROR (no CRITICAL enum value), so escalation is carried by the
     title, not a severity bump.
     """
-    from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+    from app.notification import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
 
     pause_title = "Pipeline auto-paused: external dependencies down"
     escalated = consecutive_force_resumes >= _FORCE_RESUME_ESCALATION_THRESHOLD
@@ -862,7 +862,7 @@ async def _create_auto_resume_alerts(
             },
         )
     if flapping:
-        from app.main import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
+        from app.notification import _send_webhook_notification  # noqa: PLC0415 — deferred to avoid circular import
 
         # Surface the actual root cause: which dep is flapping, and how
         # often. Without this the FLAPPING_RESUME alert was a vague

@@ -1164,7 +1164,7 @@ async def test_pr_merge_negative_cache_skips_refetch(mocker):
         return_value={"merged": False, "state": "open"},
     )
     mocker.patch(
-        "app.main._maybe_create_failure_alert",
+        "app.alert_dispatch._maybe_create_failure_alert",
         new_callable=_AM,
         return_value=None,
     )

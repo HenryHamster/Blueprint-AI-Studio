@@ -112,8 +112,8 @@ async def orch_db(mocker):
 
     # Patch app.main functions imported lazily by orchestrator_worker()
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.main._get_actual_gcp_vm_count", return_value=0)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
     mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
     mocker.patch("app.main.select_max_plan_account", new_callable=AsyncMock)
     mocker.patch("app.main.release_max_plan_account", new_callable=AsyncMock)
@@ -126,10 +126,10 @@ async def orch_db(mocker):
     mocker.patch("app.deploy_health._check_pause_mode", new_callable=AsyncMock)
     mocker.patch("app.autonomous_research._check_idle_research", new_callable=AsyncMock)
     mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
-    mocker.patch("app.main._create_orchestrator_error_alerts", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock)
     mocker.patch("app.orchestrator._persist_zone_health", new_callable=AsyncMock)
     mocker.patch("app.main._extract_task_model", return_value=None)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     # Advance periodic timers so they don't trigger on the first cycle
     now = _naive_utcnow()
@@ -212,7 +212,7 @@ async def test_orchestrator_backoff_escalates_on_consecutive_errors(mocker):
     mocker.patch("app.autonomous_research._check_idle_research", new_callable=AsyncMock)
     mocker.patch("app.orchestrator._persist_zone_health", new_callable=AsyncMock)
     mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
-    mocker.patch("app.main._create_orchestrator_error_alerts", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock)
 
     _orch_module._last_pool_refresh = _naive_utcnow()
     _orch_module._last_zone_health_persist = _naive_utcnow()
@@ -258,7 +258,7 @@ async def test_evaluating_timeout_cascades_cancel_to_children(eval_db, mocker):
     """When a parent EVALUATING task times out (>6h), all non-terminal children
     must be set to CANCELLED with an appropriate status message."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     # Pin the backstop to 6h for this test (production default is 48h while
     # silent-death stabilizes; tests still validate the 6h boundary behavior).
     from app.shared_state import runtime_config as _rc
@@ -435,7 +435,7 @@ async def test_stale_provision_failure_creates_alert(orch_db, mocker):
 
     # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     await _run_one_cycle(mocker)
 
@@ -497,7 +497,7 @@ async def test_stale_provisioning_captures_serial_before_vm_delete(orch_db, mock
     )
     # _ensure_vm_deleted is already patched by orch_db fixture; grab its mock
     # so we can assert call ordering relative to capture.
-    delete_mock = mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    delete_mock = mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
 
     await _run_one_cycle(mocker)
 
@@ -649,7 +649,7 @@ async def test_ci_polling_deleted_pr_creates_alert(orch_db, mocker):
 
     # Re-patch alert so we can assert on it (overrides the fixture's no-op mock)
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     await _run_one_cycle(mocker)
 
@@ -711,7 +711,7 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
     )
 
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     await _run_one_cycle(mocker)
 
@@ -793,7 +793,7 @@ async def test_ci_polling_pending_reopen_retry_escalates(orch_db, mocker):
         "app.github.reopen_pull_request", new_callable=AsyncMock, return_value=False
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     # Run cycle 1 — counter = 1, no alert yet
@@ -1142,7 +1142,7 @@ async def test_ci_polling_non_dirty_state_tracks_deferral_and_alerts(orch_db, mo
         },
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     from sqlmodel import select as _select
@@ -1250,7 +1250,7 @@ async def test_ci_polling_unrecognized_state_uses_lower_threshold(orch_db, mocke
         },
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     from sqlmodel import select as _select
@@ -1434,7 +1434,7 @@ async def test_ci_polling_behind_update_branch_failure_defers_without_fix_spawn(
         "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     await _run_one_cycle(mocker)
@@ -1518,7 +1518,7 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
         new=AsyncMock(return_value=(SimpleNamespace(id="fix-task-7"), True)),
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     # Sweep 1 — counter=1, defers under budget
@@ -1681,7 +1681,7 @@ async def test_ci_polling_behind_skips_update_when_pr_is_not_behind(
         "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     await _run_one_cycle(mocker)
@@ -1764,7 +1764,7 @@ async def test_ci_polling_behind_no_new_commits_clears_counter(orch_db, mocker):
         "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     await _run_one_cycle(mocker)
@@ -2291,8 +2291,8 @@ async def test_ci_waiting_backstop_timeout_fails_stuck_task(eval_db, mocker):
     and has been EVALUATING for >30 minutes.  The backstop must catch it.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = Project(name="CI Backstop Test", user_id="user1")
     eval_db.add(project)
@@ -2343,8 +2343,8 @@ async def test_ci_waiting_under_backstop_threshold_not_failed(eval_db, mocker):
     be failed by _check_evaluating_timeouts() — normal CI timeout handles it.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = Project(name="CI Backstop Under Test", user_id="user1")
     eval_db.add(project)
@@ -2389,8 +2389,8 @@ async def test_backstop_message_accurate_when_ci_wait_started_present(eval_db, m
     reason (e.g. 'CI did not complete within backstop window').
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = Project(name="Backstop Message Test", user_id="user1")
     eval_db.add(project)
@@ -2620,7 +2620,7 @@ async def test_ci_polling_mergeable_null_reopen_cap_stops_retrying(orch_db, mock
         "app.github.reopen_pull_request", new_callable=AsyncMock, return_value=True
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     await _run_one_cycle(mocker)

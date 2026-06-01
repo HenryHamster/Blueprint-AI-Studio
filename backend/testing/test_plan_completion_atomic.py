@@ -25,7 +25,7 @@ from testing.factories import make_project, make_task
 
 @pytest.fixture
 def _quiet_mocks(mocker):
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.plan_completion.broadcast_to_project", new_callable=AsyncMock)
 
 

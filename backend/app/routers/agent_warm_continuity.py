@@ -276,7 +276,7 @@ async def next_role(
     # mid-task with [FATAL:SIGTERM] (production 2026-05-05 task cfd73cec
     # on VM agent-vm-c44258...). The marker is recorded synchronously
     # before scheduling so it is always observable here.
-    from app.main import is_orchestrator_initiated_delete
+    from app.vm_lifecycle import is_orchestrator_initiated_delete
 
     _is_doomed, _delete_reason = is_orchestrator_initiated_delete(req.vm_instance_id)
     if _is_doomed:

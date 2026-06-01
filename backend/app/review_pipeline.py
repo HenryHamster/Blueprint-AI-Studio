@@ -676,7 +676,7 @@ async def _handle_cap_exhaustion(
     human-readable messages.
     """
     from app.failure_classification import CODE_ERROR, persist_failure_category
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.github import close_pull_request, create_pr_comment
     from app.routers.agent import get_github_token_for_task
     from app.routers.agent_status import record_task_result

@@ -655,7 +655,7 @@ async def bulk_action_tasks(
 
                 # Delete old VM after commit, same as modify_task
                 if old_vm:
-                    from app.main import _ensure_vm_deleted
+                    from app.vm_lifecycle import _ensure_vm_deleted
 
                     await _ensure_vm_deleted(old_vm, reason="admin_requeue")
 
@@ -1013,7 +1013,7 @@ async def bulk_action_tasks(
 
                 # Delete VM immediately (no graceful sleep for bulk operations)
                 if task.vm_instance_id:
-                    from app.main import _ensure_vm_deleted
+                    from app.vm_lifecycle import _ensure_vm_deleted
 
                     await _ensure_vm_deleted(task, reason="admin_bulk_cancel")
                     acct_id = (task.context or {}).get("max_plan_account_id")
@@ -1023,7 +1023,7 @@ async def bulk_action_tasks(
                         await release_max_plan_account(acct_id)
 
                 # Cascade cancellation to active children
-                from app.main import _ensure_vm_deleted as _cancel_vm
+                from app.vm_lifecycle import _ensure_vm_deleted as _cancel_vm
                 from app.max_plan_pool import (
                     release_max_plan_account as _cancel_release,
                 )

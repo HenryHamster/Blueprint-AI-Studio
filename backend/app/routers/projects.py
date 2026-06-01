@@ -814,7 +814,7 @@ async def cancel_project(
     """
     Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
     """
-    from app.main import _ensure_vm_deleted  # noqa: PLC0415
+    from app.vm_lifecycle import _ensure_vm_deleted  # noqa: PLC0415
     from app.admin import _get_user_project_with_role  # noqa: PLC0415
 
     project = await _get_user_project_with_role(

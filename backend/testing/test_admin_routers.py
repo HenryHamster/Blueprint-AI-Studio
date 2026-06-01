@@ -1227,7 +1227,7 @@ class TestDeleteProject:
         self, client: AsyncClient, db_session, mocker
     ):
         """Force-delete cancels active tasks and removes the project."""
-        mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+        mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=None)
         project = await _make_project(db_session)
         db_session.add(
             Task(
@@ -1247,7 +1247,7 @@ class TestDeleteProject:
         self, client: AsyncClient, db_session, mocker
     ):
         """Force-delete fires terminal callbacks so cancelled task IDs enter the deny-list."""
-        mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+        mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=None)
         project = await _make_project(db_session)
         task = Task(
             project_id=project.id,
@@ -3306,7 +3306,7 @@ class TestRepairStateFailureCategory:
         from datetime import datetime, timedelta
         from unittest.mock import AsyncMock
 
-        mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+        mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
 
         project = Project(name="Repair Test", user_id="test-user-123")
         db_session.add(project)

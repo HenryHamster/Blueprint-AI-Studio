@@ -88,7 +88,7 @@ async def test_full_review_fix_cycle(client: AsyncClient, db_session, mocker):
        Verify the fix task is COMPLETED and a new review task is spawned
        with an incremented iteration counter.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
@@ -292,7 +292,7 @@ async def test_create_task_spawns_review_on_pr_completion(
     client: AsyncClient, db_session, mocker
 ):
     """create task COMPLETED with PULL_REQUEST artifact → review task spawned."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
@@ -367,7 +367,7 @@ async def test_review_request_changes_empty_pr_closes_rollup_instead_of_spawning
     flattened onto base during a prior fix cycle), we must NOT spawn another fix
     (there's nothing to fix) — instead close the PR and mark the rollup parent
     COMPLETED. This is the "empty rollup orphan" guard."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
@@ -486,7 +486,7 @@ async def test_review_request_changes_api_error_does_not_close_pr(
     non-200 errors as []."""
     from fastapi import HTTPException
 
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
@@ -595,7 +595,7 @@ async def test_review_request_changes_spawns_fix(
     client: AsyncClient, db_session, mocker
 ):
     """review task COMPLETED with REQUEST_CHANGES verdict → fix task spawned."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -672,7 +672,7 @@ async def test_fix_task_spawns_review_on_completion(
     client: AsyncClient, db_session, mocker
 ):
     """fix task COMPLETED → new review task spawned with iteration+1."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -745,7 +745,7 @@ async def test_review_minor_only_verdict_marks_fix_skip_rereview(
     """First-pass REQUEST_CHANGES where every blocking issue is minor → the
     spawned fix carries review_loop.skip_rereview_minor_only so its completion
     handler can skip the follow-up re-review."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -816,7 +816,7 @@ async def test_review_with_major_issue_does_not_mark_skip_rereview(
 ):
     """A REQUEST_CHANGES verdict containing a major issue must NOT mark the
     spawned fix skip_rereview_minor_only — the re-review is still needed."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -887,7 +887,7 @@ async def test_fix_task_minor_only_skips_rereview(
 ):
     """A fix task carrying skip_rereview_minor_only COMPLETED → no re-review is
     spawned; the task parks in EVALUATING/ci_waiting so CI gates the merge."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -965,7 +965,7 @@ async def test_review_approve_does_not_spawn_fix(
     spawned. The merge attempt fails gracefully (no GitHub integration) but
     the review is still marked COMPLETED.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1044,7 +1044,7 @@ async def test_status_completed_idempotency_no_duplicate_fix(
     must be idempotent — only one fix task should be spawned, and the second
     call should return 'already_terminal'.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1131,7 +1131,7 @@ async def test_verdict_parsed_from_logs_when_no_verdict_json(
     verdict from the logs field. REQUEST_CHANGES in the logs should still
     trigger a fix task spawn.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1208,7 +1208,7 @@ async def test_pipeline_duplicate_guard_blocks_second_review(
     review task for PR #42 already exists and belongs to the same chain, a
     fix completion must not spawn a second review.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1340,7 +1340,7 @@ async def test_review_fix_cap_blocks_new_fix_on_iteration_limit(
     Keep completed pipeline tasks at 1 (just this review itself after it finishes)
     so the global cap (pr_iterations >= cap) does not fire first.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1438,7 +1438,7 @@ async def test_review_fix_cap_ci_failure_lower_limit(
     A review task at iteration=8 with fix_reason='ci_failure' should trigger
     the per-chain cap when attempting to spawn iteration=9, because 9 > 8.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1535,7 +1535,7 @@ async def test_review_fix_cap_sets_status_message(
     mention 'iteration' and 'manual review' so operators know why the pipeline
     stalled.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1627,7 +1627,7 @@ async def test_stuck_cycle_detected_marks_original_and_returns_no_fix(
     with task_type="fix" at iteration=2. new_review_history will have 2 entries
     with matching CRITICAL issues → stuck-cycle detection fires.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -1752,7 +1752,7 @@ async def test_stuck_cycle_detected_without_explicit_original_task_id(
     setting requires_approval anywhere), which was the bug introduced by
     recomputing stuck_orig_id with an incomplete fallback chain.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -2075,7 +2075,7 @@ async def test_ci_merge_rule_block_escalates_immediately(db_session, mocker):
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="Rule Block Test", user_id="test-user-123")
     db_session.add(project)
@@ -2163,7 +2163,7 @@ async def test_ci_fail_fix_suppressed_uses_generic_message(db_session, mocker):
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
@@ -2243,7 +2243,7 @@ async def test_ci_passed_without_review_approved_does_not_merge(db_session, mock
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
         return_value={"merged": True},
@@ -2313,7 +2313,7 @@ async def test_ci_passed_with_review_approved_merges(db_session, mocker):
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
@@ -2377,7 +2377,7 @@ async def test_ci_passed_legacy_verdict_still_merges(db_session, mocker):
     from app.ci_completion import handle_ci_completion
 
     mocker.patch("app.broadcast.broadcast_to_project")
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
     mocker.patch("app.github.create_pr_comment", return_value=None)
     merge_mock = mocker.patch(
         "app.github.merge_pull_request",
@@ -2475,7 +2475,7 @@ async def test_rollup_review_approval_writes_review_approved_on_parent(
     This test covers the path where ci_passed is NOT yet set, so the handoff
     just records the flag on the parent.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch(
@@ -2781,7 +2781,7 @@ async def test_dedup_cross_type_fix_cancels_stale_review(
     """Fix requested while review is in flight on the same chain → cancel the
     review and permit the fresh fix. A review scoped to a pre-conflict /
     pre-CI-failure snapshot produces stale verdicts; the fix must take over."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -2878,7 +2878,7 @@ async def test_dedup_same_type_stale_task_superseded(
     and superseded by the new spawn. Prior behaviour returned the corpse as a
     dedup hit, blocking the caller until the 30-min CI backstop timed out
     (root cause of the FAILED-but-CI-passed tasks on PRs #1705/#1688/#1676)."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -2970,7 +2970,7 @@ async def test_dedup_review_deferred_while_fix_active(
     (return (None, False)). Reviewing pre-fix code is wasteful and the fix
     will change the diff the reviewer looks at. Ensures no silent substitution
     in the opposite direction from the cross-type fix test above."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -3075,7 +3075,7 @@ async def test_rollup_sources_cross_chain_dedup_on_shared_pr(
     must see F as same-type active and return (F, False) rather than
     greenlighting a duplicate spawn.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
 
@@ -3155,7 +3155,7 @@ async def test_non_rollup_sources_preserve_chain_based_dedup(
     fix is running on chain A, a non-rollup source on chain B must NOT dedup
     against it (they're unrelated — different PRs normally, but if PR numbers
     happen to match for some reason, chain isolation is the safety net)."""
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch("app.main.provision_agent_vm", return_value=True)
     mocker.patch("app.broadcast.broadcast_to_project")
     mocker.patch("app.review_pipeline.broadcast_to_project")

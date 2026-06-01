@@ -34,6 +34,14 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
 # E402: Deferred imports for circular dependency / module load order (lines 113, 202, 2035, 2042, 2174)
 "app/main.py" = ["BLE001", "B904", "E402"]
+# vm_lifecycle.py / alert_dispatch.py / notification.py were extracted verbatim
+# from main.py (P5 service-locator decomposition). They keep main.py's
+# intentional broad-except guards: VM-teardown / GCP-count / webhook-post and
+# the TASK_FAILED notification dispatch are all "log and continue — never crash
+# the caller or leak a VM" paths, exactly as documented for main.py above.
+"app/vm_lifecycle.py" = ["BLE001"]
+"app/alert_dispatch.py" = ["BLE001"]
+"app/notification.py" = ["BLE001"]
 # services.py is entirely background workers (cleanup, persist, timeout sweep, orphan
 # recovery). Every except Exception is the intentional "log and continue — never crash
 # the background loop" pattern; narrowing risks missing an exception type and killing

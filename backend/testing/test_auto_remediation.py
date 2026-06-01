@@ -166,7 +166,7 @@ async def test_happy_path_spawns_task(db_session: AsyncSession):
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ) as mock_msg,
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -223,7 +223,7 @@ async def test_task_context_includes_error_fingerprint(db_session: AsyncSession)
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -609,7 +609,7 @@ async def test_completed_tasks_dont_count_concurrent(db_session: AsyncSession):
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI"],
@@ -1037,7 +1037,7 @@ async def test_skip_when_no_ci_context(db_session: AsyncSession):
         patch(
             "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
         ) as mock_ctx,
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         # Return the "no useful context" sentinel values
         mock_ctx.return_value = (
@@ -1085,7 +1085,7 @@ async def test_suspended_branch_auto_recovers_after_cooldown(db_session: AsyncSe
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -1299,7 +1299,7 @@ async def test_suspended_branch_permanently_blocked_after_max_attempts(
             "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
         ) as mock_ctx,
         patch(
-            "app.main._send_webhook_notification", new_callable=AsyncMock
+            "app.notification._send_webhook_notification", new_callable=AsyncMock
         ) as mock_webhook,
     ):
         mock_ctx.return_value = (
@@ -1339,7 +1339,7 @@ async def test_non_suspended_branch_spawns_normally(db_session: AsyncSession):
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -1397,7 +1397,7 @@ async def test_per_fingerprint_cap_blocks_repeat_spawn(db_session: AsyncSession)
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -1435,7 +1435,7 @@ async def test_full_ci_remediation_cycle_spawn_to_trackable_outcome(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -1521,7 +1521,7 @@ async def test_remediation_spawn_to_feedback_clears_escalation_state(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -1981,7 +1981,7 @@ async def test_prior_investigation_propagates_diagnosis_context(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI"],
@@ -2177,7 +2177,7 @@ async def test_regression_detection_injects_context_and_prompt(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
         patch(
             "app.auto_remediation.get_repo_installation_token",
             new_callable=AsyncMock,
@@ -2248,7 +2248,7 @@ async def test_regression_of_confirmed_when_fix_is_ancestor(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
         patch(
             "app.auto_remediation.get_repo_installation_token",
             new_callable=AsyncMock,
@@ -2318,7 +2318,7 @@ async def test_regression_of_cleared_when_fix_not_ancestor(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
         patch(
             "app.auto_remediation.get_repo_installation_token",
             new_callable=AsyncMock,
@@ -2388,7 +2388,7 @@ async def test_regression_of_cleared_when_ancestry_indeterminate(
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
         patch(
             "app.auto_remediation.get_repo_installation_token",
             new_callable=AsyncMock,
@@ -2579,7 +2579,7 @@ async def test_spawn_direction_stamp_uses_directions_lock(db_session: AsyncSessi
         patch(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
-        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch("app.notification._send_webhook_notification", new_callable=AsyncMock),
     ):
         mock_ctx.return_value = (
             ["CI"],

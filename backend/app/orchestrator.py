@@ -618,9 +618,11 @@ async def orchestrator_worker():
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
-    from app.main import (
+    from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
+    )
+    from app.alert_dispatch import (
         _maybe_create_failure_alert,
         _create_orchestrator_error_alerts,
     )

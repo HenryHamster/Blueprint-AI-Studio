@@ -2026,7 +2026,7 @@ async def repair_state(
 
             # Clean up VM
             if t.vm_instance_id:
-                from app.main import _ensure_vm_deleted
+                from app.vm_lifecycle import _ensure_vm_deleted
 
                 await _ensure_vm_deleted(t, reason="admin_repair")
 
@@ -2106,7 +2106,8 @@ async def repair_state(
         repairs.append(f"Cleared orphaned parent ref on {t.id}")
 
     # 4. Circuit breakers stuck in HALF_OPEN with a deleted/non-existent test task
-    from app.main import _maybe_create_circuit_breaker_alert, _utcnow as _main_utcnow
+    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
+    from app.time_utils import _utcnow as _main_utcnow
 
     for proj_id, breaker in list(_circuit_breakers.items()):
         if breaker.get("state") != "HALF_OPEN":

@@ -2986,7 +2986,7 @@ async def test_strategic_batch_create_respects_cap(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
     from app.shared_state import runtime_config as _runtime_config
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     # Seed runtime config cap to 3 to make the test fast
     original_cap = _runtime_config.get("max_active_directions")
@@ -4068,7 +4068,7 @@ async def test_strategic_api_reject_direction_creates_tombstone(db_session, mock
     from app.routers.agent import verify_agent_token
 
     mocker.patch("app.main.provision_agent_vm", return_value=None)
-    mocker.patch("app.main._ensure_vm_deleted", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=True)
 
     existing_dirs = [
         {

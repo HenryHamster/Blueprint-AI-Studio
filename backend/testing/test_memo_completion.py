@@ -279,7 +279,7 @@ def test_artifact_type_memo_exists():
 async def test_memo_status_endpoint_creates_exactly_one_artifact(
     client: AsyncClient, db_session, mocker
 ):
-    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
     mocker.patch(
         "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
     )

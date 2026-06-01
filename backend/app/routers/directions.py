@@ -386,7 +386,7 @@ async def remove_direction(
 
     # Delete VMs for cancelled tasks (after commit)
     for vm_id in vm_ids_to_delete:
-        from app.main import _ensure_vm_deleted
+        from app.vm_lifecycle import _ensure_vm_deleted
 
         await _ensure_vm_deleted(vm_id, reason="direction_removed")
 

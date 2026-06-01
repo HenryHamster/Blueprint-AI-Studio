@@ -327,7 +327,7 @@ def mock_provision_vm(mocker):
 
 @pytest.fixture
 def mock_delete_vm(mocker):
-    return mocker.patch("app.main.delete_agent_vm", return_value=None)
+    return mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
 
 
 @pytest.fixture

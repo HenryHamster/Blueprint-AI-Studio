@@ -106,7 +106,7 @@ class TestReaperService:
         A task whose last heartbeat is >5 min old AND has reached max_retries
         must be marked FAILED and its VM deleted.
         """
-        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -146,7 +146,7 @@ class TestReaperService:
         A task whose last heartbeat is within the 5-minute window must
         be left alone by the reaper.
         """
-        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -187,7 +187,7 @@ class TestReaperService:
         must be requeued (status=QUEUED) with incremented attempt_count,
         NOT marked FAILED.
         """
-        mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -227,7 +227,7 @@ class TestReaperService:
         Logical/parent tasks that have no VM assigned (vm_instance_id=None)
         must be skipped — the reaper only acts on tasks with real VMs.
         """
-        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -275,7 +275,7 @@ class TestReaperService:
         even if two reaper instances select the same task, the second one
         detects the status change during re-validation and does nothing.
         """
-        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         StopLoop = self._stop_after_one_cycle(mocker)
 
@@ -343,7 +343,7 @@ class TestReaperService:
         A task that is already FAILED must never be picked up — this is the
         database-level guarantee that prevents double-reaping after the first pass.
         """
-        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -384,7 +384,7 @@ class TestReaperService:
         as a pre-claim failure and charged against provision_failures,
         NOT against attempt_count.
         """
-        mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -435,7 +435,7 @@ class TestReaperService:
         clock-separation guarantee: once an agent claims, provision budget is
         out of scope for any further reap on this attempt.
         """
-        mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -481,7 +481,7 @@ class TestReaperService:
         no heartbeat yet must NOT be reaped — the agent is still within its
         boot + auth + claim budget.
         """
-        mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=None)
+        mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
         mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
         mocker.patch("app.reaper.AsyncSessionLocal", _FakeSessionFactory(db_session))
         StopLoop = self._stop_after_one_cycle(mocker)
@@ -2391,8 +2391,8 @@ class TestWarmVMSkipProvision:
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-            mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-            mocker.patch("app.main._get_actual_gcp_vm_count", return_value=0)
+            mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+            mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
             mocker.patch("app.main.load_max_plan_pool", new_callable=AsyncMock)
             mocker.patch("app.main.recheck_disabled_accounts", new_callable=AsyncMock)
             mocker.patch("app.routers.agent_status.record_task_result")
@@ -2408,12 +2408,12 @@ class TestWarmVMSkipProvision:
             )
             mocker.patch("app.services._recover_orphaned_tasks", new_callable=AsyncMock)
             mocker.patch(
-                "app.main._create_orchestrator_error_alerts", new_callable=AsyncMock
+                "app.alert_dispatch._create_orchestrator_error_alerts", new_callable=AsyncMock
             )
             mocker.patch(
                 "app.orchestrator._persist_zone_health", new_callable=AsyncMock
             )
-            mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+            mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
             now = self._naive_utcnow()
             _orch_module._last_pool_refresh = now

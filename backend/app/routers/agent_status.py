@@ -1246,8 +1246,8 @@ async def update_agent_status(
     # 4. External VM Termination
     # If the task is finished or failed, immediately kill the VM to save costs
     from app.failure_classification import classify_failure
-    from app.main import _ensure_vm_deleted
-    from app.main import _maybe_create_circuit_breaker_alert
+    from app.vm_lifecycle import _ensure_vm_deleted
+    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
 
     if payload.status in [TaskStatus.COMPLETED, TaskStatus.FAILED]:
         # Record result for deployment monitoring and update Prometheus counters
@@ -1776,7 +1776,7 @@ async def update_agent_status(
         # review re-executed on retry. The orchestrator-deleted marker is
         # recorded synchronously inside _ensure_vm_deleted before its first
         # await, so the reaper sees the orchestrator action immediately.
-        from app.main import fire_and_forget_vm_delete
+        from app.vm_lifecycle import fire_and_forget_vm_delete
 
         # Backlog reuse (efficiency direction d-91d8dede): a COMPLETED task's
         # agent re-enters its /next-role poll loop, so if backlog reuse is
@@ -1795,7 +1795,7 @@ async def update_agent_status(
                 from app.warm_backlog_reuse import has_eligible_backlog_task
 
                 if await has_eligible_backlog_task(session, task.project_id, old_vm_id):
-                    from app.main import schedule_deferred_backlog_teardown
+                    from app.vm_lifecycle import schedule_deferred_backlog_teardown
                     from app.warm_backlog_reuse import (
                         record_teardown_defer,
                         record_vm_with_eligible_backlog,
@@ -2287,7 +2287,7 @@ async def update_agent_status(
                                 f"[AGENT_STATUS] record_task_outcome failed for {_acct_id_outcome}: {_outcome_err}"
                             )
                 try:
-                    from app.main import _maybe_create_failure_alert
+                    from app.alert_dispatch import _maybe_create_failure_alert
 
                     await _maybe_create_failure_alert(
                         task,

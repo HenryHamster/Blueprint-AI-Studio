@@ -173,7 +173,7 @@ async def test_at_cap_escalates_parent_and_does_not_respawn(rollup_db, mocker):
     NOT spawn another review — the parent is escalated to requires_approval."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     # PR is genuinely not merged so the child stays in the unmerged list.
     mocker.patch(
@@ -224,7 +224,7 @@ async def test_at_cap_with_gates_off_skips_child_instead_of_escalating(
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch(
         "app.rollup_management._verify_pr_merged",
@@ -268,7 +268,7 @@ async def test_below_cap_increments_counter_by_one_on_real_spawn(rollup_db, mock
     """Below the cap, a real respawn (was_spawned=True) increments the child's
     _review_respawn_count by exactly 1 and leaves the parent un-escalated."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._verify_pr_merged",
         new=AsyncMock(return_value=False),
@@ -313,7 +313,7 @@ async def test_respawn_uses_task_type_branch_prefix(rollup_db, mocker):
     for refactor-type children. The respawn must derive the branch from the
     child's task type via shared_state.derive_task_branch, not synthesize."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._verify_pr_merged",
         new=AsyncMock(return_value=False),
@@ -373,7 +373,7 @@ async def test_respawn_prefers_review_loop_branch_over_synthesized(rollup_db, mo
     precedence is observable.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._verify_pr_merged",
         new=AsyncMock(return_value=False),
@@ -437,7 +437,7 @@ async def test_dedup_hit_does_not_increment_counter(rollup_db, mocker):
     respawn counter must NOT advance. Otherwise a dedup-stable PR would
     still burn through the cap and false-escalate."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._verify_pr_merged",
         new=AsyncMock(return_value=False),

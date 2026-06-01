@@ -554,7 +554,7 @@ async def delete_project_admin(
     if active_tasks and force:
         # Force: bulk-cancel all active tasks (covers rows beyond the 1000-row
         # load window), then delete VMs for the loaded subset.
-        from app.main import _ensure_vm_deleted
+        from app.vm_lifecycle import _ensure_vm_deleted
 
         # Fetch all affected task IDs before the bulk UPDATE so we can fire
         # terminal callbacks after commit — the bulk UPDATE bypasses the ORM

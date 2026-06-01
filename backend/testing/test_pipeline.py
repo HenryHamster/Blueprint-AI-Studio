@@ -1525,7 +1525,7 @@ async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, 
     mock_requeue = mocker.patch(
         "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = Project(name="All Failed Limit Exhausted Test", user_id="user1")
     rollup_db.add(project)
@@ -1895,7 +1895,7 @@ async def test_dispatch_rollup_approval_alert_creates_alert(rollup_db, mocker):
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Helper Test", user_id="user1")
     rollup_db.add(project)
@@ -1939,7 +1939,7 @@ async def test_dispatch_rollup_approval_alert_enriched_payload(rollup_db, mocker
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
 
     project = Project(name="Enriched", user_id="user1")
     rollup_db.add(project)
@@ -1991,7 +1991,7 @@ async def test_rollup_retry_exhaustion_creates_failure_alert(rollup_db, mocker):
         side_effect=ValueError("permanent rollup creation failure"),
     )
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -2064,7 +2064,7 @@ async def test_rollup_merge_deferred_counter_increments_and_escalates(
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mock_approval_dispatch = mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
@@ -2123,7 +2123,7 @@ async def test_rollup_merge_deferred_counter_resets_on_state_change(rollup_db, m
     so transient flapping does not accidentally escalate."""
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
     )
@@ -2167,7 +2167,7 @@ async def test_rollup_merge_total_deferrals_catches_state_flapping(rollup_db, mo
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mock_approval_dispatch = mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
@@ -2242,7 +2242,7 @@ async def test_rollup_merge_time_based_escalation(rollup_db, mocker):
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mock_approval_dispatch = mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
@@ -2322,7 +2322,7 @@ async def test_rollup_merge_unrecognized_state_escalates(rollup_db, mocker):
     }  # unrecognized — not in blocked/unstable/unknown/dirty
     _patch_deferred_counter_mocks(mocker, state)
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mock_approval_dispatch = mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
@@ -2382,7 +2382,7 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     path still runs so a genuinely stuck PR escalates normally."""
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
     )
@@ -2430,7 +2430,7 @@ async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker)
     state = {"state": "blocked"}
     _patch_deferred_counter_mocks(mocker, state)
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
@@ -2507,7 +2507,7 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
         new_callable=AsyncMock,
         return_value={"merged": True, "sha": "deadbeef"},
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
     )
@@ -2772,7 +2772,7 @@ async def test_rollup_behind_update_branch_failure_defers_without_fix_spawn(
         new=AsyncMock(return_value=(None, None)),
     )
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -2815,7 +2815,7 @@ async def test_rollup_behind_update_branch_exhausted_spawns_fix_with_alert(
         new=AsyncMock(return_value=(MagicMock(id="fix-1"), None)),
     )
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
 
@@ -2854,7 +2854,7 @@ async def test_rollup_behind_update_branch_success_clears_retry_counter(
         "app.rollup_management._spawn_pipeline_task",
         new=AsyncMock(return_value=(None, None)),
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
         rollup_db, target_branch="research/parent-xyz"
@@ -2962,7 +2962,7 @@ async def test_rollup_premerge_no_new_commits_clears_counter(rollup_db, mocker):
         new=AsyncMock(return_value=(None, None)),
     )
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     _, parent, child = await _make_rollup_parent_with_completed_child(
@@ -3077,7 +3077,7 @@ async def _make_strategic_task(session, project, context=None, vision_rev=0):
 @pytest.mark.asyncio
 async def test_strategic_completion_vision_set_flag_is_success(strategic_db, mocker):
     """A task with _strategic_vision_set=True should be treated as success (no failure increment)."""
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 1})
     strategic_db.add(project)
@@ -3108,7 +3108,7 @@ async def test_strategic_completion_api_path_records_directions_created(
     from app.models import StrategicCycle as _SC
     from app.time_utils import _utcnow as _ut
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     cycle_id = "cycle-test-001"
     project = Project(
@@ -3163,7 +3163,7 @@ async def test_strategic_completion_create_direction_only_is_not_success(
 ):
     """A task that called create_direction but NOT set_vision should NOT be treated as success."""
     alert_mock = mocker.patch(
-        "app.main._create_strategic_alert", new_callable=AsyncMock
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
 
     project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 1})
@@ -3188,7 +3188,7 @@ async def test_strategic_completion_vision_rev_increase_is_success(
     strategic_db, mocker
 ):
     """When vision_rev increased since task spawn, treat as success even without the flag."""
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     # Project vision is at rev 2, task was spawned at rev 1 → rev increased
     project = Project(name="P", user_id="u1", vision={"purpose": "test", "revision": 2})
@@ -3217,7 +3217,7 @@ async def test_strategic_completion_dirs_created_triggers_api_path(
     from app.models import StrategicCycle as _SC
     from app.time_utils import _utcnow as _ut
 
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     # Cycle ids must fit the column (String(36)). Use the same shape spawning uses.
     cycle_id = sc.new_cycle_id()
@@ -3266,7 +3266,7 @@ async def test_strategic_completion_no_api_no_logs_increments_failures(
 ):
     """No API calls and unparseable logs should increment _strategic_failures."""
     alert_mock = mocker.patch(
-        "app.main._create_strategic_alert", new_callable=AsyncMock
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
 
     project = Project(
@@ -3370,7 +3370,7 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
 @pytest.mark.asyncio
 async def test_starvation_increments_on_zero_dirs_with_gap(strategic_db, mocker):
     """First cycle with 0 dirs_created and active_count < 3 increments starvation counter to 1."""
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -3402,7 +3402,7 @@ async def test_starvation_triggers_alert_and_override_after_two_cycles(
 ):
     """Two consecutive cycles with 0 dirs and active_count < 3 triggers alert and sets override."""
     alert_mock = mocker.patch(
-        "app.main._create_strategic_alert", new_callable=AsyncMock
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
 
     # Start with starvation_count=1 (simulating previous cycle)
@@ -3436,7 +3436,7 @@ async def test_starvation_triggers_alert_and_override_after_two_cycles(
 @pytest.mark.asyncio
 async def test_starvation_counter_resets_on_direction_creation(strategic_db, mocker):
     """When dirs_created > 0, starvation counter and frequency override are cleared."""
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -3469,7 +3469,7 @@ async def test_starvation_counter_resets_on_direction_creation(strategic_db, moc
 @pytest.mark.asyncio
 async def test_starvation_no_gap_no_increment(strategic_db, mocker):
     """With 3+ active directions including a product one, no gap exists — counter not incremented."""
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
         name="P",
@@ -3504,7 +3504,7 @@ async def test_starvation_auto_creates_direction_after_five_cycles(
 ):
     """After 5 consecutive empty cycles with no product direction, auto-creates a product direction."""
     alert_mock = mocker.patch(
-        "app.main._create_strategic_alert", new_callable=AsyncMock
+        "app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock
     )
 
     # Start with starvation_count=4 (simulating 4 previous cycles)
@@ -3554,7 +3554,7 @@ async def test_starvation_auto_creates_direction_after_five_cycles(
 @pytest.mark.asyncio
 async def test_starvation_auto_create_respects_direction_cap(strategic_db, mocker):
     """Auto-creation does NOT exceed max_active_directions when cap is reached."""
-    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.strategic_completion._runtime_config", {"max_active_directions": 2}
     )
@@ -4414,51 +4414,51 @@ class TestEnsureVmDeletedCountDecrement:
 
     @pytest.mark.asyncio
     async def test_decrements_count_on_success(self, mocker):
-        import app.main as main_module
+        import app.vm_lifecycle as vm_lifecycle
 
-        main_module._last_gcp_vm_count = 3
+        vm_lifecycle._last_gcp_vm_count = 3
         mocker.patch(
-            "app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True
+            "app.vm_lifecycle.delete_agent_vm", new_callable=AsyncMock, return_value=True
         )
 
-        from app.main import _ensure_vm_deleted
+        from app.vm_lifecycle import _ensure_vm_deleted
 
         result = await _ensure_vm_deleted("vm-test-123", reason="test")
 
         assert result is True
-        assert main_module._last_gcp_vm_count == 2
+        assert vm_lifecycle._last_gcp_vm_count == 2
 
     @pytest.mark.asyncio
     async def test_does_not_go_below_zero(self, mocker):
-        import app.main as main_module
+        import app.vm_lifecycle as vm_lifecycle
 
-        main_module._last_gcp_vm_count = 0
+        vm_lifecycle._last_gcp_vm_count = 0
         mocker.patch(
-            "app.main.delete_agent_vm", new_callable=AsyncMock, return_value=True
+            "app.vm_lifecycle.delete_agent_vm", new_callable=AsyncMock, return_value=True
         )
 
-        from app.main import _ensure_vm_deleted
+        from app.vm_lifecycle import _ensure_vm_deleted
 
         result = await _ensure_vm_deleted("vm-test-456", reason="test")
 
         assert result is True
-        assert main_module._last_gcp_vm_count == 0
+        assert vm_lifecycle._last_gcp_vm_count == 0
 
     @pytest.mark.asyncio
     async def test_no_decrement_on_failure(self, mocker):
-        import app.main as main_module
+        import app.vm_lifecycle as vm_lifecycle
 
-        main_module._last_gcp_vm_count = 3
+        vm_lifecycle._last_gcp_vm_count = 3
         mocker.patch(
-            "app.main.delete_agent_vm", new_callable=AsyncMock, return_value=False
+            "app.vm_lifecycle.delete_agent_vm", new_callable=AsyncMock, return_value=False
         )
 
-        from app.main import _ensure_vm_deleted
+        from app.vm_lifecycle import _ensure_vm_deleted
 
         result = await _ensure_vm_deleted("vm-test-789", reason="test")
 
         assert result is False
-        assert main_module._last_gcp_vm_count == 3
+        assert vm_lifecycle._last_gcp_vm_count == 3
 
 
 # ── Review verdict: binary-only invariant ───────────────────────────────────

@@ -148,10 +148,10 @@ async def gcp_cleanup_service():
                         )
                     # Cache total GCP VM count for orchestrator concurrency check
                     if hasattr(cleanup_result, "total_gcp_vms"):
-                        import app.main as _app_main
+                        import app.vm_lifecycle as _vm_lifecycle
 
-                        _app_main._last_gcp_vm_count = cleanup_result.total_gcp_vms
-                        _app_main._last_gcp_vm_check = time.time()
+                        _vm_lifecycle._last_gcp_vm_count = cleanup_result.total_gcp_vms
+                        _vm_lifecycle._last_gcp_vm_check = time.time()
                 except asyncio.TimeoutError:
                     logger.exception("[GCP CLEANUP] Cycle timed out after 120s")
 
@@ -945,7 +945,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
     asyncio.timeout + _monitor_background_tasks supervision). Defaults to a
     no-op for direct callers / tests that don't supply one.
     """
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.rollup_management import _check_and_trigger_rollup
     from app.shared_state import runtime_config as _runtime_config
 
@@ -1659,7 +1659,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         .scalars()
                         .all()
                     )
-                    from app.main import _ensure_vm_deleted
+                    from app.vm_lifecycle import _ensure_vm_deleted
                     from app.max_plan_pool import release_max_plan_account
 
                     non_terminal_children = [
@@ -1886,7 +1886,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     )
 
                     # Cascade-cancel non-terminal children
-                    from app.main import _ensure_vm_deleted
+                    from app.vm_lifecycle import _ensure_vm_deleted
                     from app.max_plan_pool import release_max_plan_account
 
                     non_terminal_children = [

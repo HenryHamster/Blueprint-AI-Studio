@@ -107,7 +107,7 @@ async def test_merge_primitive_refuses_when_requires_approval_and_gates_on(
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
     project = Project(name="C5 gate-on", user_id="u1")
@@ -144,7 +144,7 @@ async def test_merge_primitive_proceeds_when_requires_approval_but_gates_off(
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch(
         "app.ci_completion._post_merge_summary",
@@ -181,7 +181,7 @@ async def test_merge_primitive_merges_normally_when_no_gate(
         new_callable=AsyncMock,
         return_value={"merged": True},
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
     project = Project(name="C5 no-gate", user_id="u1")

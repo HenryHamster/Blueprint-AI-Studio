@@ -129,7 +129,7 @@ async def _fetch_direction_reasoning_memos(
 
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
-    from app.main import _maybe_create_circuit_breaker_alert
+    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -1358,7 +1358,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
 async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncSession):
     """Spawn a periodic non-research task (qa, security_audit, deps) if its schedule is due."""
-    from app.main import _maybe_create_circuit_breaker_alert
+    from app.alert_dispatch import _maybe_create_circuit_breaker_alert
     from sqlalchemy import func
 
     # Guard: task_type must be a known type

@@ -232,7 +232,7 @@ def _post_pipeline_alert(category: str, count: int, threshold: int) -> None:
         },
     )
     try:
-        from app.main import _send_webhook_notification
+        from app.notification import _send_webhook_notification
 
         # Detached task — webhook is fire-and-forget by design.
         # asyncio.get_running_loop() raises RuntimeError outside an event loop;

@@ -108,7 +108,7 @@ async def test_reaper_service(reaper_db, mocker):
     We mock asyncio.sleep to break the infinite loop after one iteration.
     """
     _common_reaper_mocks(mocker)
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     # Disable infra-recovery resurrection so the task stays FAILED for this assertion
     mocker.patch("app.reaper.any_zone_available", return_value=False)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
@@ -147,7 +147,7 @@ async def test_reaper_retry_path(reaper_db, mocker):
     when the reaper detects a heartbeat timeout.
     """
     _common_reaper_mocks(mocker)
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
 
     project = Project(name="Reaper Retry Test", user_id="user1")
@@ -236,7 +236,7 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
     when the reaper detects a heartbeat timeout.
     """
     _common_reaper_mocks(mocker)
-    mock_delete = mocker.patch("app.main.delete_agent_vm", return_value=True)
+    mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     # Disable infra-recovery resurrection so the task stays FAILED for this assertion
     mocker.patch("app.reaper.any_zone_available", return_value=False)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
@@ -829,7 +829,7 @@ async def _make_parent_child(
 @pytest.mark.asyncio
 async def test_requeue_agent_timeout_injects_scope_guidance(requeue_db, mocker):
     """AGENT_TIMEOUT retries receive scope reduction guidance in prompt_suffix."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -861,7 +861,7 @@ async def test_requeue_code_error_test_failure_injects_test_guidance(
     requeue_db, mocker
 ):
     """CODE_ERROR with test keywords in status message injects test-fixing guidance."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -893,7 +893,7 @@ async def test_requeue_code_error_lint_failure_injects_lint_guidance(
     requeue_db, mocker
 ):
     """CODE_ERROR with lint keywords injects lint-fixing guidance."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -923,7 +923,7 @@ async def test_requeue_code_error_lint_failure_injects_lint_guidance(
 @pytest.mark.asyncio
 async def test_requeue_large_scope_second_timeout_downgrades_scope(requeue_db, mocker):
     """Large-scope task on 2nd+ AGENT_TIMEOUT attempt gets scope downgraded to medium."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -954,7 +954,7 @@ async def test_requeue_large_scope_second_timeout_downgrades_scope(requeue_db, m
 @pytest.mark.asyncio
 async def test_requeue_large_scope_first_timeout_no_scope_downgrade(requeue_db, mocker):
     """Large-scope task on 1st AGENT_TIMEOUT does NOT get scope downgraded."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -986,7 +986,7 @@ async def test_requeue_large_scope_first_timeout_no_scope_downgrade(requeue_db, 
 @pytest.mark.asyncio
 async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
     """Non-timeout, non-code-error failures (e.g. RATE_LIMIT) do not inject scope guidance."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1020,7 +1020,7 @@ async def test_requeue_rate_limit_no_scope_guidance(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_sets_retry_context_fields(requeue_db, mocker):
     """clone_ctx contains _attempt_number incremented, _previous_error, and _previous_failure_class."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1056,7 +1056,7 @@ async def test_requeue_sets_retry_context_fields(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_propagates_pr_artifacts_to_retry_context(requeue_db, mocker):
     """clone_ctx contains _previous_pr_url and _previous_changed_files from the failed child's context."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     pr_url = "https://github.com/org/repo/pull/42"
     changed_files = ["src/foo.py", "src/bar.py"]
@@ -1106,7 +1106,7 @@ async def test_requeue_propagates_file_change_details_to_retry_context(
     requeue_db, mocker
 ):
     """clone_ctx contains _previous_file_change_details from the failed child's context."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     file_change_details = [
         {"file": "backend/app/models.py", "additions": 45, "deletions": 12},
@@ -1145,7 +1145,7 @@ async def test_requeue_propagates_file_change_details_to_retry_context(
 @pytest.mark.asyncio
 async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
     """If child context has no _pr_url/_pr_changed_files, retry clone omits the _previous_* fields."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1179,7 +1179,7 @@ async def test_requeue_no_pr_artifacts_when_child_has_none(requeue_db, mocker):
 async def test_requeue_propagates_enriched_step_context(requeue_db, mocker):
     """clone_ctx propagates _previous_diff_summary, _previous_test_failure_summary,
     and _previous_self_review_outcome from the failed child's context."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     diff_summary = [
         {
@@ -1240,7 +1240,7 @@ async def test_requeue_propagates_enriched_step_context(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_omits_enriched_step_context_when_absent(requeue_db, mocker):
     """If child context has no enriched step fields, retry clone omits the _previous_ enriched fields."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1334,7 +1334,7 @@ async def _make_parent_with_children(session, children_specs, parent_context=Non
 @pytest.mark.asyncio
 async def test_requeue_count_limit_boundary_succeeds(requeue_db, mocker):
     """Parent with _requeue_count=2 (one below MAX_PARENT_REQUEUES=3) still requeues."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1358,7 +1358,7 @@ async def test_requeue_count_limit_boundary_succeeds(requeue_db, mocker):
 async def test_requeue_count_limit_at_limit_fails_permanently(requeue_db, mocker):
     """Parent with _requeue_count=3 (at MAX_PARENT_REQUEUES) is set to FAILED and alert fired."""
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
 
     parent, _child = await _make_parent_child(
@@ -1397,7 +1397,7 @@ async def test_requeue_count_limit_at_limit_fails_permanently(requeue_db, mocker
 @pytest.mark.asyncio
 async def test_requeue_cancelled_parent_returns_zero(requeue_db, mocker):
     """CANCELLED parent returns 0 immediately without creating any clones."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1429,7 +1429,7 @@ async def test_requeue_cancelled_parent_returns_zero(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_dependency_remapping(requeue_db, mocker):
     """Pass 2: deps on other failed children remapped to clone IDs; COMPLETED sibling dep preserved."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     # child_A: FAILED (no deps)
     # child_B: FAILED, depends on child_A (FAILED) and child_C (COMPLETED)
@@ -1485,7 +1485,7 @@ async def test_requeue_dependency_remapping(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_cycle_detection_clears_all_depends_on(requeue_db, mocker):
     """Pass 3: circular deps in cloned subgraph are all cleared to prevent deadlock."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     # child_A depends on child_B and child_B depends on child_A — mutual cycle
     parent, _children = await _make_parent_with_children(
@@ -1528,7 +1528,7 @@ async def test_requeue_cycle_detection_clears_all_depends_on(requeue_db, mocker)
 @pytest.mark.asyncio
 async def test_requeue_strips_max_plan_account_id(requeue_db, mocker):
     """Clone context must not carry over max_plan_account_id from the failed child."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1560,7 +1560,7 @@ async def test_requeue_strips_max_plan_account_id(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_clone_strips_provision_state(requeue_db, mocker):
     """Clone context must not carry over provision retry state from the failed child."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1603,7 +1603,7 @@ async def test_requeue_clone_strips_provision_state(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_requeue_refreshes_base_branch_from_plan_branch(requeue_db, mocker):
     """Clone payload uses parent's plan_branch as base_branch, replacing the stale child value."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1637,7 +1637,7 @@ async def test_requeue_refreshes_base_branch_from_plan_branch(requeue_db, mocker
 @pytest.mark.asyncio
 async def test_requeue_refreshes_base_branch_from_research_branch(requeue_db, mocker):
     """Clone payload uses parent's research_branch as base_branch when plan_branch is absent."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, _child = await _make_parent_child(
         requeue_db,
@@ -1673,8 +1673,8 @@ async def test_requeue_refreshes_base_branch_from_research_branch(requeue_db, mo
 
 def _common_reaper_mocks(mocker):
     """Patch external dependencies required by all reaper tests."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.routers.agent_status.record_task_result")
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
@@ -2324,7 +2324,7 @@ async def _noop_verify_pr_merged(task, session):
 @pytest.mark.asyncio
 async def test_requeue_stores_replaced_by_task_id(requeue_db, mocker):
     """_requeue_parent_task sets _replaced_by_task_id on the cancelled child pointing to the clone."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     parent, child = await _make_parent_child(
         requeue_db,
@@ -2361,7 +2361,7 @@ async def test_check_deps_requeue_cancelled_not_cascade_cancelled(requeue_db, mo
     When a dep is CANCELLED but has _replaced_by_task_id pointing to a QUEUED clone,
     _check_candidate_task_deps must return 'waiting', not 'cascade_cancel'.
     """
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="Dep Test", user_id="u1")
     requeue_db.add(project)
@@ -2415,7 +2415,7 @@ async def test_check_deps_requeue_cancelled_not_cascade_cancelled(requeue_db, mo
 @pytest.mark.asyncio
 async def test_check_deps_remap_to_clone(requeue_db, mocker):
     """(b) External task's depends_on is remapped to the clone ID after resolution."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="Remap Test", user_id="u1")
     requeue_db.add(project)
@@ -2470,7 +2470,7 @@ async def test_check_deps_remap_to_clone(requeue_db, mocker):
 @pytest.mark.asyncio
 async def test_check_deps_truly_cancelled_triggers_cascade(requeue_db, mocker):
     """(c) Truly cancelled deps (no _replaced_by_task_id) return 'cascade_cancel'."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="Cascade Test", user_id="u1")
     requeue_db.add(project)
@@ -2514,7 +2514,7 @@ async def test_check_deps_truly_cancelled_triggers_cascade(requeue_db, mocker):
 async def test_check_deps_failed_dep_triggers_cascade(requeue_db, mocker):
     """A genuine FAILED dep (CODE_ERROR etc. — not a SCOPE_EMPTY clean
     exit) must trigger cascade cancellation."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="Failed Dep Test", user_id="u1")
     requeue_db.add(project)
@@ -2559,7 +2559,7 @@ async def test_check_deps_cross_base_unmerged_does_not_block(requeue_db, mocker)
     propagation, only serialization. Loosened 2026-05-28 for cross-rollup
     parallelism (file-overlap conflicts are still guarded by the dispatch
     filters)."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     async def _verify_not_merged(task, session):
         return False  # PR still open / unmerged
@@ -2604,7 +2604,7 @@ async def test_check_deps_same_base_unmerged_still_waits(requeue_db, mocker):
     blocks — the dep's merge lands in the dependent's base, so the wait actually
     propagates the result. (Guards against the cross-base loosening leaking into
     same-base deps.)"""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     async def _verify_not_merged(task, session):
         return False
@@ -2647,7 +2647,7 @@ async def test_check_deps_same_base_unmerged_still_waits(requeue_db, mocker):
 async def test_check_deps_cross_base_failed_still_cascades(requeue_db, mocker):
     """Loosening the cross-base *wait* must not drop failure safety: a genuinely
     FAILED dep cascade-cancels the dependent regardless of base branch."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="CrossBase Failed Dep Test", user_id="u1")
     requeue_db.add(project)
@@ -2696,7 +2696,7 @@ async def test_check_deps_scope_empty_dep_not_cascade(requeue_db, mocker):
     because cluster 3/4 exited SCOPE_EMPTY. _check_candidate_task_deps must
     treat a SCOPE_EMPTY dep as a satisfied, non-blocking dependency →
     'eligible', not 'cascade_cancel'."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="ScopeEmpty Dep Test", user_id="u1")
     requeue_db.add(project)
@@ -2743,7 +2743,7 @@ async def test_check_deps_scope_empty_plus_real_failure_still_cascades(
 ):
     """The SCOPE_EMPTY carve-out is narrow: a genuine FAILED dep alongside
     a SCOPE_EMPTY one still triggers cascade cancellation."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="ScopeEmpty Mixed Test", user_id="u1")
     requeue_db.add(project)
@@ -2801,7 +2801,7 @@ async def test_check_deps_scope_empty_plus_real_failure_still_cascades(
 async def test_check_deps_legacy_failed_scope_empty_dep_not_cascade(requeue_db, mocker):
     """Legacy rows: a SCOPE_EMPTY dep stored as FAILED (pre-dating the
     CANCELLED relabel) must also be treated as satisfied, not cascade."""
-    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
     project = Project(name="Legacy ScopeEmpty Test", user_id="u1")
     requeue_db.add(project)
@@ -3121,8 +3121,8 @@ async def test_reaper_parent_rescue_calls_requeue_before_failing(reaper_db, mock
 
 def _common_infra_recovery_mocks(mocker):
     """Mocks needed for infra-recovery sweep tests (no active/orphaned tasks)."""
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
@@ -3644,8 +3644,8 @@ async def test_reaper_queued_age_alert_fired(reaper_db, mocker):
     Reaper Step 6: tasks sitting in QUEUED for longer than the threshold get
     an INFO alert created and queued_age_alert_fired set in context.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.shared_state.runtime_config",
@@ -3712,8 +3712,8 @@ async def test_reaper_queued_age_alert_not_repeated(reaper_db, mocker):
     Reaper Step 6: tasks that already have queued_age_alert_fired=True do NOT
     get a second alert on the next reaper cycle.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
@@ -3765,8 +3765,8 @@ async def test_reaper_queued_age_alert_includes_requires_approval(reaper_db, moc
     Reaper Step 6: tasks with requires_approval=True are NOT skipped — they get
     an alert with an approval-specific cause so they aren't invisible forever.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
@@ -3822,8 +3822,8 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
     Reaper Step 6: a QUEUED task with an active future retry_after should be
     diagnosed as blocked by rate-limit retry delay, not the generic fallback.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
@@ -3879,8 +3879,8 @@ async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
     Reaper Step 6: a task already at tier 1 (INFO) that ages past the tier 2
     threshold (3× base) re-alerts at WARNING with a rising tier value.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
     mocker.patch(
         "app.reaper._runtime_config",
@@ -3998,8 +3998,8 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
     Without this sweep, a malformed or runaway value silently blocks dispatch
     forever since the orchestrator skips tasks where retry_after > now.
     """
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )

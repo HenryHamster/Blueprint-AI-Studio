@@ -417,7 +417,7 @@ async def test_handle_design_doc_completion_defers_on_lock_contention(
 
     # Stub _create_strategic_alert so we observe the deferred-mutation alert
     create_alert = AsyncMock()
-    mocker.patch("app.main._create_strategic_alert", new=create_alert)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new=create_alert)
 
     # Phase C3: the bounded-retry sleep now lives in task_locking, not
     # task_completion. Patch the canonical site so retries don't slow
@@ -489,7 +489,7 @@ async def test_handle_strategic_completion_defers_on_lock_contention(
     await db_session.refresh(task)
 
     create_alert = AsyncMock()
-    mocker.patch("app.main._create_strategic_alert", new=create_alert)
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new=create_alert)
 
     # Phase C3: the bounded-retry sleep now lives in task_locking, not
     # strategic_completion. Patch the canonical site so retries don't

@@ -497,7 +497,7 @@ class TestLogFileOverlaps:
 def _patch_ensure_branch_deps(mocker):
     """Patch asyncio.sleep and failure-alert plumbing for _ensure_branch tests."""
     mocker.patch("app.task_completion.asyncio.sleep", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch("app.routers.agent_status.record_task_result")
 
 
@@ -700,7 +700,7 @@ class TestEnsureBranch:
             side_effect=RuntimeError("should not reach"),
         )
         alert = mocker.patch(
-            "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+            "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
         )
 
         result = await _ensure_branch(task, "plan/xyz", "main", "PLAN", db_session)
@@ -2047,7 +2047,7 @@ class TestPlanSubtaskScopeAwareEffort:
         return json.dumps({"subtasks": subtasks})
 
     async def _setup_plan_task(self, db_session, mocker, parent_effort="medium"):
-        mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+        mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
         mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
         project = make_project()
         db_session.add(project)

@@ -354,10 +354,10 @@ def stop_after_one_cycle(mocker):
 def reaper_side_effects(mocker):
     """Neutralize the side-effecting deferred imports used by reaper_service."""
     mocker.patch(
-        "app.main._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
     )
-    mocker.patch("app.main.delete_agent_vm", return_value=True)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
@@ -2831,7 +2831,7 @@ async def test_terminal_failure_non_provision_finalization(
     failure path: status → FAILED, failure_category persisted, alert invoked,
     broadcast sent, and the status message carries class + retry count."""
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     broadcast_mock = mocker.patch(
         "app.broadcast.broadcast_to_project", new_callable=AsyncMock
@@ -2912,7 +2912,7 @@ async def test_terminal_failure_before_budget_exhausted_not_failed(
     (QUEUED) instead of finalizing. Ensures the terminal test above isolates
     the budget-exhaustion branch rather than always-failing behavior."""
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 

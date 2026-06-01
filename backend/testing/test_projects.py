@@ -98,7 +98,7 @@ class TestCancelProjectRoleGuard:
                 "app.routers.projects.broadcast_to_project",
                 new_callable=AsyncMock,
             ),
-            patch("app.main._ensure_vm_deleted", new_callable=AsyncMock),
+            patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock),
         ):
             resp = await client.post(f"/api/projects/{project.id}/cancel")
         assert resp.status_code == 200

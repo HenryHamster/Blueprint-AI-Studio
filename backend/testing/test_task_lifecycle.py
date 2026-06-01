@@ -85,7 +85,7 @@ async def tl_db(mocker):
     # Suppress broadcast calls
     mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
     # Suppress failure alert creation (deferred import from app.main)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     async with _Session() as session:
         yield session, _Session

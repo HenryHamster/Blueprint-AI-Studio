@@ -55,7 +55,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
     Remaps depends_on from old (cancelled) IDs to new (cloned) IDs.
     Leaves COMPLETED, CANCELLED, and active (QUEUED/IN_PROGRESS) children untouched.
     Sets parent back to EVALUATING — no VM needed."""
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     # Deferred imports so test patches on app.task_lifecycle.* apply
     from app.task_lifecycle import broadcast_to_project, classify_failure
 

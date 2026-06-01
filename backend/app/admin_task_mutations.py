@@ -59,7 +59,7 @@ async def _terminal_cleanup_bg(
     Scheduled via BackgroundTasks so the request handler returns immediately
     after status writes commit, avoiding DB connection-pool starvation.
     """
-    from app.main import _ensure_vm_deleted
+    from app.vm_lifecycle import _ensure_vm_deleted
     from app.max_plan_pool import release_max_plan_account
 
     if parent_vm_id:
@@ -749,7 +749,7 @@ async def _commit_and_broadcast(
 
     old_vm = changes.pop("_old_vm_to_delete", None)
     if old_vm:
-        from app.main import _ensure_vm_deleted
+        from app.vm_lifecycle import _ensure_vm_deleted
 
         await _ensure_vm_deleted(old_vm, reason="admin_requeue")
 

@@ -240,7 +240,7 @@ async def test_evaluating_hard_timeout_broadcasts_terminal_literals_when_expired
             session.expire(k)
         session.expire(task)
 
-    mocker.patch("app.main._maybe_create_failure_alert", side_effect=_expire_alert)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", side_effect=_expire_alert)
 
     project = Project(name="Hard Timeout Expired Bcast", user_id="user1")
     eval_db.add(project)
@@ -1646,7 +1646,7 @@ async def test_evaluating_hard_timeout_defers_with_recoverable_failed_child(
     cancelling it would destroy salvageable work. Regression for incident
     2026-04-29 (PRs #3450/#3408 + parents c30701d3/ddd987fc)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
@@ -1709,7 +1709,7 @@ async def test_evaluating_hard_timeout_kills_when_failed_child_is_code_error(
     """A FAILED child with CODE_ERROR (not infra-recoverable) must NOT trigger
     the defer path — the existing 6h kill path runs as before."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
@@ -1768,7 +1768,7 @@ async def test_evaluating_defer_window_exhausted_kills(eval_db, mocker):
     children must eventually fall through to the kill path — the defer is
     bounded so a truly stuck operator-intervention case still terminates."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     from app.shared_state import runtime_config as _rc
 
     mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
@@ -1927,8 +1927,8 @@ async def test_ci_backstop_does_not_clobber_concurrently_resolved_row(eval_db, m
     loop just wrote.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     from app import services as _services
 

@@ -623,7 +623,7 @@ async def test_bulk_action_retry_requeues_tasks(
     client: AsyncClient, db_session, mocker
 ):
     """Bulk retry sets status=QUEUED, assigns new vm_instance_id, and creates TaskHistory."""
-    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=None)
 
     project = await _make_project_with_member(db_session)
     task1 = await _make_task(db_session, project, TaskStatus.FAILED)
@@ -678,7 +678,7 @@ async def test_bulk_action_approve_clears_approval_flag(
 @pytest.mark.asyncio
 async def test_bulk_action_partial_errors(client: AsyncClient, db_session, mocker):
     """Invalid task IDs in the batch produce per-task errors without failing the whole request."""
-    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=None)
 
     project = await _make_project_with_member(db_session)
     valid_task = await _make_task(db_session, project, TaskStatus.FAILED)
@@ -704,7 +704,7 @@ async def test_bulk_action_cancel_sets_cancelled(
     client: AsyncClient, db_session, mocker
 ):
     """Bulk cancel sets status=CANCELLED and creates TaskHistory."""
-    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=None)
     mocker.patch("app.max_plan_pool.release_max_plan_account", return_value=None)
 
     project = await _make_project_with_member(db_session)
@@ -730,7 +730,7 @@ async def test_bulk_action_cancel_skips_terminal_tasks(
     client: AsyncClient, db_session, mocker
 ):
     """Bulk cancel returns error for already-terminal tasks."""
-    mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", return_value=None)
 
     project = await _make_project_with_member(db_session)
     task = await _make_task(db_session, project, TaskStatus.COMPLETED)

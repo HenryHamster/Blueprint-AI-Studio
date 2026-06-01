@@ -1087,7 +1087,7 @@ async def strategic_operation(
         for vm_id in vm_ids_to_delete:
             # Lazy import avoids a circular dependency: main.py includes this
             # router, and _ensure_vm_deleted is defined in main.py.
-            from app.main import _ensure_vm_deleted as _main_ensure_vm_deleted
+            from app.vm_lifecycle import _ensure_vm_deleted as _main_ensure_vm_deleted
             await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
         logger.info(
             f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"

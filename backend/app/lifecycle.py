@@ -212,8 +212,8 @@ async def lifespan(app):
     from app.main import (
         _verify_schema_version,
         _init_deployment_state,
-        _send_webhook_notification,
     )
+    from app.notification import _send_webhook_notification
     from app.reaper import reaper_service
     from app.services import (
         account_availability_refresh_service,

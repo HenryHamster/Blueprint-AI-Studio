@@ -4,9 +4,11 @@ Extracted from main.py to reduce its size.  Contains the core task state
 machine: _process_post_commit, _check_and_trigger_rollup, _spawn_pipeline_task,
 and supporting functions.
 
-All deferred imports from ``app.main`` are intentional — they avoid circular
-imports (task_lifecycle is imported BY main) and preserve test-patchability
-(tests mock via ``app.main.<name>``).
+Deferred imports of the extracted helpers (``_maybe_create_failure_alert`` from
+``app.alert_dispatch``, ``_utcnow`` from ``app.time_utils``) are intentional —
+they avoid circular imports (task_lifecycle is imported BY main) and preserve
+test-patchability (tests mock via the helper's home module, e.g.
+``app.alert_dispatch._maybe_create_failure_alert``).
 """
 
 import asyncio
@@ -293,7 +295,7 @@ async def _process_post_commit(
     status endpoint while making GitHub API calls (which can hang 15-120s).
     _session_factory is injectable for tests (defaults to AsyncSessionLocal).
     """
-    from app.main import _utcnow
+    from app.time_utils import _utcnow
     from app.broadcast import broadcast_to_project  # noqa: F811
     from app.routers.agent import get_github_token_for_task
     from app.security import scan_pr_for_injection
@@ -2531,7 +2533,7 @@ async def _process_post_commit(
                                         pr_number,
                                     )
                                     try:
-                                        from app.main import (
+                                        from app.alert_dispatch import (
                                             _maybe_create_failure_alert,
                                         )
 

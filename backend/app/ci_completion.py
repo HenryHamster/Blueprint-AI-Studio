@@ -307,7 +307,7 @@ async def _attempt_merge_with_retry_and_escalation(
         ci_passed) — heartbeat-only mutations don't touch those fields.
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.models import Project
     from app.shared_state import get_project_integration_branch
     from app.shared_state import runtime_config as _rt_cfg
@@ -1406,7 +1406,7 @@ async def handle_ci_completion(
     """
     from app.review_pipeline import _spawn_pipeline_task
     from app.github import create_pr_comment
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.broadcast import broadcast_to_project
     from app.models import Project
     from app.shared_state import get_project_integration_branch

@@ -336,7 +336,7 @@ async def test_requeue_carries_forward_prior_review_iterations(db_session, mocke
     _prior_review_iterations_consumed, and the clone's cap reflects the deduction."""
     from app.task_lifecycle import _requeue_parent_task
 
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
     parent = make_task(
@@ -651,7 +651,7 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
         new_callable=AsyncMock,
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -770,7 +770,7 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -881,7 +881,7 @@ async def test_cap_exhaustion_skips_approval_when_gates_disabled(db_session, moc
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1159,7 +1159,7 @@ async def test_code_error_failed_tasks_do_count_toward_global_cap(db_session, mo
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
 
@@ -1275,7 +1275,7 @@ async def test_per_chain_cap_blocks_spawn_and_marks_original(db_session, mocker)
         new_callable=AsyncMock,
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -1382,7 +1382,7 @@ async def test_cap_exhaustion_records_task_and_direction_result(db_session, mock
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1474,7 +1474,7 @@ async def test_cap_exhaustion_records_remediation_failure_on_direction(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1561,7 +1561,7 @@ async def test_cap_exhaustion_idempotent(db_session, mocker):
         new_callable=AsyncMock,
     )
     alert_mock = mocker.patch(
-        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",

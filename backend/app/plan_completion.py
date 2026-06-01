@@ -143,7 +143,7 @@ def _inject_file_overlap_deps(subtasks: List[Dict], label: str = "PLAN") -> None
 
 async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     """Parse plan output and create child tasks with dependency tracking."""
-    from app.main import _maybe_create_failure_alert
+    from app.alert_dispatch import _maybe_create_failure_alert
     from app.task_completion import _ensure_branch
 
     project = await session.get(Project, task.project_id)

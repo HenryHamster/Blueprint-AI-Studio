@@ -125,7 +125,7 @@ async def test_eval_timeout_row_cap_and_heartbeat(db, mocker):
     from app.services import _check_evaluating_timeouts
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     orch_heartbeat = mocker.patch("app.orchestrator._mark_orchestrator_progress")
     # Shrink the cap so the test is cheap and deterministic.
     mocker.patch.object(services, "_EVAL_TIMEOUT_MAX_PER_CYCLE", 3)
@@ -174,7 +174,7 @@ async def test_eval_timeout_hung_github_call_does_not_block_other_rows(db, mocke
     from app.services import _check_evaluating_timeouts
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     # Tiny ceiling so the test runs fast.
     mocker.patch.object(services, "_GH_CALL_TIMEOUT_S", 0.05)
 
@@ -352,7 +352,7 @@ async def test_rollup_progress_cb_fires_per_completed_child(db, mocker):
     from app.rollup_management import _check_and_trigger_rollup
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     # _verify_pr_merged is the per-child GitHub call — stub it so the loop runs
     # without touching the network (returns True = "merged/done").
     mocker.patch(

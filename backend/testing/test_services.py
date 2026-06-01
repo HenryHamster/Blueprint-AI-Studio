@@ -947,12 +947,12 @@ async def test_gcp_cleanup_updates_vm_count_cache(gcp_db, mocker):
         "app.services.asyncio.sleep", AsyncMock(side_effect=asyncio.CancelledError)
     )
 
-    import app.main as _app_main
+    import app.vm_lifecycle as _vm_lifecycle
 
     await gcp_cleanup_service()
 
-    assert _app_main._last_gcp_vm_count == 5
-    assert hasattr(_app_main, "_last_gcp_vm_check")
+    assert _vm_lifecycle._last_gcp_vm_count == 5
+    assert hasattr(_vm_lifecycle, "_last_gcp_vm_check")
 
 
 @pytest.mark.asyncio

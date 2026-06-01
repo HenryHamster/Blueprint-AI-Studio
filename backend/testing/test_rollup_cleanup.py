@@ -889,7 +889,7 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     )
     mocker.patch("app.routers.agent_status.record_task_result")
     mock_alert = mocker.patch(
-        "app.main._maybe_create_failure_alert",
+        "app.alert_dispatch._maybe_create_failure_alert",
         new_callable=AsyncMock,
     )
 
@@ -968,7 +968,7 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
     CODE_ERROR > AGENT_TIMEOUT > infra classes.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     # Prevent GitHub token fetch (not needed for this path)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
@@ -1022,7 +1022,7 @@ async def test_all_children_failed_parent_persists_failure_category(cleanup_db, 
 async def test_all_children_failed_with_only_infra_failures(cleanup_db, mocker):
     """When all failed children have infra categories, the parent keeps that category."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1066,7 +1066,7 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     """A rollup PR with 0 additions + 0 deletions is closed immediately:
     parent goes COMPLETED, staging branch deleted, no review task spawned."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1157,7 +1157,7 @@ async def test_unverified_pr_size_defers_instead_of_spawning_review(cleanup_db, 
     lines_changed=999 → review spawned on potentially-empty PRs → ~15
     VM-hours/day wasted per the audit."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1226,7 +1226,7 @@ async def test_marker_commit_failure_rescues_pr_number(cleanup_db, mocker):
     retry cycle's crash-recovery check resumes the existing PR rather than
     creating a duplicate orphan."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1330,7 +1330,7 @@ async def test_marker_commit_failure_skips_rescue_when_db_already_has_marker(
     succeeded or a prior cycle wrote it), the rescue path must NOT overwrite
     it — the existing value is authoritative."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1424,7 +1424,7 @@ async def test_parent_mutated_during_pr_creation_runs_rescue_and_returns(
     ``parent.context`` and the rollup ``github_webhook`` returned 500.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1536,7 +1536,7 @@ async def test_target_branch_404_fails_parent(cleanup_db, mocker):
     transitions to FAILED with a rollup-PR-creation-failed message (the 404
     raises a non-transient exception that the outer handler converts to FAILED)."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1589,7 +1589,7 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(
     the work already landed on the target branch. Parent transitions to
     COMPLETED with a 'no actionable changes' message."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1644,7 +1644,7 @@ async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker)
     parent transitions to CANCELLED with a message noting all subtasks
     were cancelled. No rollup PR is created."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -1735,7 +1735,7 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
       3. mergeable_state refetch after failed merge (line ~966)
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2045,7 +2045,7 @@ async def test_requeue_called_when_below_limit_with_mixed_children(cleanup_db, m
     """When some children failed and _requeue_count < MAX_PARENT_REQUEUES (3),
     _requeue_parent_task is invoked instead of proceeding to partial rollup."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2099,7 +2099,7 @@ async def test_partial_rollup_proceeds_when_requeue_limit_exhausted(cleanup_db, 
     while others failed, the rollup proceeds with the merged subset only —
     create_pull_request is invoked and _requeue_parent_task is NOT called."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2172,7 +2172,7 @@ async def test_parent_failure_stamps_deploy_monitoring(cleanup_db, mocker):
     task_results deque AND in the per-direction streak (when direction_id set)
     so anomaly detection and direction-hold logic can see the failure."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2237,7 +2237,7 @@ async def test_parent_failure_after_pr_verification_stamps_deploy_monitoring(
     to FAILED so completed_count drops to zero, the parent is marked FAILED in
     the all_done branch. That terminal path must also reach deploy_monitoring."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2307,7 +2307,7 @@ def _mock_high_risk_gate_deps(mocker, *, get_pull_request_responses):
     create_pull_request is skipped and control reaches the gate at line 846.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.rollup_management._dispatch_rollup_approval_alert",
         new_callable=AsyncMock,
@@ -2497,7 +2497,7 @@ async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mock
     from app.rollup_management import _check_and_trigger_rollup
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,

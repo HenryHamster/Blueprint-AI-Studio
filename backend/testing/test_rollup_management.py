@@ -38,7 +38,7 @@ def _mock_automerge_deps(mocker, *, pr_files, diff, merge_merged=True):
     re-chain fix was routed.
     """
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -406,7 +406,7 @@ async def test_empty_diff_directions_note_survives_concurrent_write(cleanup_db, 
     with_directions_locked which reloads the directions list under the lock,
     so both notes survive."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -585,9 +585,9 @@ async def test_empty_diff_note_uses_directions_lock(cleanup_db, mocker):
     )
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
-        "app.main._utcnow",
+        "app.time_utils._utcnow",
         return_value=__import__("datetime").datetime(
             2026, 1, 1, tzinfo=__import__("datetime").timezone.utc
         ),
@@ -688,7 +688,7 @@ def _mock_rollup_resume_closed_pr(mocker, *, merged=False):
     branch with a closed-not-merged existing rollup PR. ``create_pull_request``
     is mocked so the duplicate-PR side effect is observable."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,

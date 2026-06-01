@@ -195,7 +195,7 @@ async def _handle_main_branch_ci_failure_inner(
             meta = (config.get("suspension_metadata") or {}).get(head_branch) or {}
             if int(meta.get("recovery_attempts", 0) or 0) >= MAX_AUTO_RECOVERY_ATTEMPTS:
                 try:
-                    from app.main import _send_webhook_notification
+                    from app.notification import _send_webhook_notification
                     import asyncio
 
                     asyncio.ensure_future(
@@ -351,7 +351,7 @@ async def _handle_main_branch_ci_failure_inner(
             head_sha[:8],
         )
         try:
-            from app.main import _send_webhook_notification
+            from app.notification import _send_webhook_notification
             import asyncio
 
             asyncio.ensure_future(
@@ -425,7 +425,7 @@ async def _handle_main_branch_ci_failure_inner(
                 fingerprint[:16],
             )
             try:
-                from app.main import _send_webhook_notification
+                from app.notification import _send_webhook_notification
                 import asyncio
 
                 asyncio.ensure_future(
@@ -629,7 +629,7 @@ async def _handle_main_branch_ci_failure_inner(
         logger.warning("[AUTO-REMEDIATION] Failed to post event message: %s", exc)
 
     try:
-        from app.main import _send_webhook_notification
+        from app.notification import _send_webhook_notification
         import asyncio
 
         asyncio.ensure_future(

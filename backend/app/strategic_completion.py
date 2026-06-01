@@ -1495,7 +1495,7 @@ async def _check_direction_starvation(
 
     Resets both counter and override when dirs_created > 0 (starvation resolved).
     """
-    from app.main import _create_strategic_alert
+    from app.alert_dispatch import _create_strategic_alert
 
     directions = project.directions or []
     active_count = sum(1 for d in directions if d.get("status") == "active")
@@ -1742,7 +1742,7 @@ async def _handle_strategic_completion(
     cheap re-read).
     """
     # Deferred imports to avoid circular dependency
-    from app.main import _create_strategic_alert
+    from app.alert_dispatch import _create_strategic_alert
 
     # Phase C3: track whether the caller pre-acquired the project lock so
     # the legacy fallback path below can reuse it instead of re-acquiring.
