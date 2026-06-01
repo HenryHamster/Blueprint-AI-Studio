@@ -8,6 +8,7 @@ import type { TaskType } from './TaskCard';
 import { DirectionProgressSection } from './DirectionProgressSection';
 import type { DirectionProgress } from './DirectionProgressSection';
 import { ErrorBoundary } from './ErrorBoundary';
+import { assertDigestContract, type DigestData as DigestDataBase } from '../types/digest';
 import {
   loadDismissed,
   saveDismissed,
@@ -17,332 +18,22 @@ import {
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
 import { sortDesc } from './catchupAnalytics';
 import { CompletionRow, SkeletonRow } from './catchupRows';
-import type { SrTrendData } from './SrTrendBreakdown';
 import { CatchUpReviewQualitySection } from './CatchUpReviewQualitySection';
 import { RecentFailureGroupsSection } from './RecentFailureGroupsSection';
 import { CatchUpNeedsAttentionSection } from './CatchUpNeedsAttentionSection';
-import type { NeedsAttentionItem } from './CatchUpNeedsAttentionSection';
 import { CatchUpCostDiagnosticsSection } from './CatchUpCostDiagnosticsSection';
 import { CatchUpRemediationPipelineSection } from './CatchUpRemediationPipelineSection';
 import { CatchUpFailureSignalsSection } from './CatchUpFailureSignalsSection';
 import { CatchUpInProgressSection } from './CatchUpInProgressSection';
 import { CatchUpOperationalMetricsSection } from './CatchUpOperationalMetricsSection';
-import type { ActiveTask } from './CatchUpInProgressSection';
 import type { Project } from '../types/project';
 
-interface RecentFailure {
-  task_id: string;
-  title: string;
-  failed_at: string | null;
-  error_snippet: string | null;
-  waiting_hours?: number;
-  attempt_count?: number;
-  timeout_subtype?: string | null;
-  direction_id?: string | null;
-  direction_text?: string | null;
-  task_type?: string;
-  failure_class?: string | null;
-  scope?: string | null;
-}
-
-interface FailureGroupTask {
-  task_id: string;
-  title: string;
-  error_snippet: string | null;
-  attempt_count: number;
-  waiting_hours?: number;
-  taxonomy?: string;
-  timeout_subtype?: string | null;
-  failure_stage?: string | null;
-  direction_id?: string | null;
-  direction_text?: string | null;
-}
-
-interface FailureGroup {
-  failure_class: string;
-  label: string;
-  count: number;
-  tasks: FailureGroupTask[];
-}
-
-interface DigestData {
-  window_hours: number;
-  generated_at: string;
-  completed_count: number;
-  failed_count: number;
-  pending_approval_count: number;
-  research_cycles: number;
-  prs_opened: number;
-  active_count: number;
-  running_count: number;
-  queued_count: number;
-  active_tasks: ActiveTask[];
-  needs_attention: NeedsAttentionItem[];
-  recent_failures: RecentFailure[];
-  failure_groups?: FailureGroup[];
-  recent_completions: RecentCompletion[];
-  success_rate?: number | null;
-  narrative_summary?: string;
-  direction_progress?: DirectionProgress[];
-  prev_completed_count?: number;
-  prev_failed_count?: number;
-  prev_success_rate?: number | null;
-  completed_delta?: number;
-  failed_delta?: number;
-  success_rate_delta?: number | null;
-  trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: {period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_taxonomy?: Record<string, number>; failed_by_class?: Record<string, number>; first_attempt_success_rate?: number | null; period_cost_usd?: number | null}[];
-  failure_taxonomy_distribution?: {
-    categories: Record<string, { count: number; percentage: number }>;
-    total_failures: number;
-    dominant_category: string | null;
-  } | null;
-  scope_mismatch_summary?: {
-    total_calibrated: number;
-    calibrated_success_rate: number | null;
-    by_original_scope: Record<string, { total: number; completed: number; failed: number }>;
-    top_directions: {
-      direction_id: string;
-      direction_text: string;
-      calibrated_count: number;
-      total_tasks: number;
-      calibration_rate: number;
-    }[];
-  } | null;
-  failure_stage_distribution?: {
-    stages: Record<string, number>;
-    total_classified: number;
-    dominant_stage: string | null;
-  } | null;
-  cost_by_failure_class?: Record<string, number> | null;
-  scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
-  prev_scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
-  total_failed_cost_usd?: number | null;
-  retry_overhead_cost_usd?: number | null;
-  retry_waste_by_direction?: { direction_id: string; direction_text: string; retry_cost_usd: number; retry_task_count: number }[] | null;
-  retry_task_count?: number | null;
-  avg_retries_before_failure?: number | null;
-  retry_success_count?: number | null;
-  retry_wasted_rate?: number | null;
-  retry_recovery_cost_usd?: number | null;
-  resurrection_outcome_summary?: {
-    total: number;
-    completed: number;
-    failed_again: number;
-    success_rate: number | null;
-  } | null;
-  migration_health?: {
-    current_schema_revision: string | null;
-    migration_tasks_in_window: number;
-    migration_tasks_succeeded: number;
-    migration_tasks_failed: number;
-    migration_errors_in_window: number;
-    auto_generated_migrations: number;
-  } | null;
-  prevention_efficacy?: {
-    preventive_tasks_created: number;
-    preventive_tasks_merged: number;
-    preventive_tasks_failed: number;
-    preventive_merge_rate: number | null;
-    overall_merge_rate: number | null;
-    assessment: 'positive' | 'negative' | 'neutral' | 'no_data';
-  } | null;
-  release_qualifier_infra_metrics?: {
-    qualifier_runs_total: number;
-    release_infra_failure_total: number;
-    audit_report_missing_count: number;
-    audit_report_parseable_but_unscoreable_count: number;
-    smoketest_report_missing_count: number;
-    release_infra_failure_streak_max: number;
-  } | null;
-  total_merge_retries_saved?: number | null;
-  merge_early_exit_count?: number | null;
-  total_estimated_cost_usd?: number | null;
-  spot_cost_usd?: number | null;
-  on_demand_cost_usd?: number | null;
-  provisioning_overhead_usd?: number | null;
-  daily_cost_usd?: number | null;
-  daily_cost_ceiling_usd?: number | null;
-  rejection_pattern_summary?: {
-    total_rejected: number;
-    top_notes: { snippet: string; count: number }[];
-  } | null;
-  retry_pattern_summary?: {
-    total_multi_attempt_failures: number;
-    repeat_class_count: number;
-    top_patterns: { sequence: string; count: number }[];
-  } | null;
-  recurring_error_clusters?: {
-    fingerprint: string;
-    count: number;
-    error_snippet: string;
-    direction_ids: string[];
-    task_types: string[];
-    first_task_id: string;
-  }[] | null;
-  early_warnings?: {
-    failure_class: string;
-    rate_progression: number[];
-    affected_direction_count: number;
-    suggested_action?: string | null;
-    severity?: string | null;
-  }[] | null;
-  recurring_patterns?: {
-    fingerprint: string;
-    occurrence_count: number;
-    first_seen?: string | null;
-    last_seen?: string | null;
-    severity?: string | null;
-    example_message?: string | null;
-    affected_direction_count: number;
-    remediation_status: 'fix_verified' | 'fix_shipped' | 'investigating' | 'unaddressed';
-    proactive?: boolean;
-  }[] | null;
-  review_cap_exhaustion_summary?: {
-    count: number;
-    avg_iterations: number | null;
-    total_cost_usd: number;
-    avg_cost_usd: number | null;
-    top_directions: { direction_id: string; count: number }[];
-  } | null;
-  analysis_overflow_summary?: {
-    total_count: number;
-    by_scope: Record<string, number>;
-    cost_usd: number;
-  } | null;
-  provision_waste_cost_usd?: number | null;
-  provision_waste_by_direction?: {
-    direction_id: string;
-    direction_text: string;
-    provision_cost_usd: number;
-    provision_task_count: number;
-  }[] | null;
-  provisioning_overhead_pct?: number | null;
-  retry_success_rate_by_class?: Record<string, { merged: number; failed: number; success_rate: number }> | null;
-  escalation_outcome_summary?: {
-    total_attempted: number;
-    total_merged: number;
-    total_failed: number;
-    overall_success_rate: number | null;
-    by_path: Record<string, { attempted: number; merged: number; failed: number; success_rate: number | null }>;
-  } | null;
-  self_review_effectiveness?: {
-    with_self_review_approval_rate: number | null;
-    without_self_review_approval_rate: number | null;
-    clean_verdict_approval_rate: number | null;
-    fixed_verdict_approval_rate: number | null;
-    sample_size: number;
-  } | null;
-  self_review_prediction_accuracy?: {
-    prediction_hit_rate: number | null;
-    miss_rate: number | null;
-    false_alarm_rate: number | null;
-    sample_size: number;
-  } | null;
-  self_review_prediction_accuracy_trends?: SrTrendData | null;
-  self_review_skip_rate?: {
-    overall_rate: number;
-    skipped_count: number;
-    sample_size: number;
-    by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
-  } | null;
-  first_review_approval_rate?: {
-    overall: number | null;
-    sample_size: number;
-    by_type?: Record<string, number> | null;
-    by_scope?: Record<string, number> | null;
-    with_playbook?: number | null;
-    without_playbook?: number | null;
-    with_measurements?: number | null;
-    without_measurements?: number | null;
-  } | null;
-  review_accuracy?: {
-    total_reviews: number;
-    overrides: number;
-    dismissals: number;
-    misses: number;
-    total_approvals: number;
-    precision: number | null;
-    recall: number | null;
-  } | null;
-  first_attempt_success_rate?: {
-    overall: number | null;
-    with_playbook: number | null;
-    without_playbook: number | null;
-    with_arch_context: number | null;
-    without_arch_context: number | null;
-    sample_size: number;
-    first_attempt_by_review_category?: Record<string, number> | null;
-    trend?: string | null;
-    by_type?: Record<string, number> | null;
-    by_scope?: Record<string, number> | null;
-  } | null;
-  pipeline_acceptance_rate?: number | null;
-  pipeline_conversion_rate?: number | null;
-  overall_product_ratio?: number | null;
-  overall_type_distribution?: Record<string, number> | null;
-  pipeline_filter_funnel?: Record<string, number> | null;
-  latest_cycle?: {
-    cycle_id?: string | null;
-    started_at?: string | null;
-    completed_at?: string | null;
-    outcome?: string | null;
-    directions_created?: number | null;
-    directions_retired?: number | null;
-    vision_updated?: boolean | null;
-    summary_text?: string | null;
-    memos_available?: number | null;
-    memos_cited?: number | null;
-  } | null;
-  memo_pathway_exits?: number | null;
-  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
-  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
-  remediation_funnel?: {
-    investigations_spawned: number;
-    investigations_completed: number;
-    investigations_with_diagnosis: number;
-    remediations_spawned: number;
-    remediations_merged: number;
-    remediations_failed: number;
-    fixes_held?: number;
-    avg_time_to_remediation_hours: number | null;
-    active_investigations: number;
-    investigations_by_confidence?: Record<string, number>;
-    failed_remediations_by_class?: Record<string, number>;
-    merged_remediations_by_trigger_class?: Record<string, number>;
-    cumulative_merged_by_trigger_class?: Record<string, number>;
-    ci_auto_remediation?: {
-      spawned: number;
-      merged: number;
-      failed: number;
-      by_ci_failure_type?: Record<string, { spawned: number; merged: number; failed: number }>;
-    };
-    remediation_success_by_confidence?: Record<string, { merged: number; failed: number }>;
-    recent_investigations?: Array<{
-      task_id: string;
-      direction_id?: string | null;
-      summary?: string | null;
-      confidence?: string | null;
-      severity?: string | null;
-      completed_at?: string | null;
-    }>;
-    active_investigations_detail?: Array<{
-      task_id: string;
-      direction_id?: string | null;
-      elapsed_hours?: number | null;
-    }>;
-    diagnosis_drop_off_by_reason?: Record<string, number>;
-  } | null;
-  median_cost_per_merged_pr?: number | null;
-  fresh_reviewer_effectiveness?: {
-    fresh_reviewer_sample_size: number;
-    fresh_reviewer_first_attempt_approval_rate: number | null;
-    baseline_first_attempt_approval_rate: number | null;
-    per_category_hit_rate: Record<string, number>;
-    reviewer_finding_added_value: Record<string, number>;
-    prediction_sample_size: number;
-  } | null;
-}
+// DigestData (and FailureGroup / RecentCompletion / RecentFailure) are the
+// canonical `/api/admin/digest` types, now hoisted to ../types/digest and shared
+// with DashboardHome (single source of truth). DigestData is generic in the
+// `direction_progress` element type; CatchUp feeds DirectionProgressSection's
+// `DirectionProgress`, so it instantiates the canonical type with that.
+type DigestData = DigestDataBase<DirectionProgress>;
 
 async function fetchCatchUpLastSeen(projectId: string): Promise<number | null> {
   try {
@@ -456,12 +147,17 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       if (selectedProjectId) params.set('project_id', selectedProjectId);
       const res = await apiFetch(`/api/admin/digest?${params}`);
       if (res.ok) {
-        const data: DigestData = await res.json();
-        setDigest(data);
-        if (selectedProjectId) {
-          try {
-            localStorage.setItem(`blueprint-admin:lastDigest:${selectedProjectId}`, JSON.stringify(data));
-          } catch { /* storage full */ }
+        const data: unknown = await res.json();
+        // Validate against the shared contract before rendering/caching so a
+        // backend rename or removal surfaces as "no data" rather than a silent
+        // partial render (mirrors DashboardHome's guard — same digest payload).
+        if (assertDigestContract<DirectionProgress>(data)) {
+          setDigest(data);
+          if (selectedProjectId) {
+            try {
+              localStorage.setItem(`blueprint-admin:lastDigest:${selectedProjectId}`, JSON.stringify(data));
+            } catch { /* storage full */ }
+          }
         }
       }
     } catch {

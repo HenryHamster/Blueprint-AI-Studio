@@ -28,7 +28,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { type SrMissedTask, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { type SrMissedTask, type DirectionSrEntry } from './SrTrendBreakdown';
 import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
 import { SrDiagnosticsStack, type BlindSpotsData, type DirectionSrBreakdownData } from './SrDiagnosticsStack';
 import {
@@ -48,6 +48,14 @@ import { ViewportDebtPanel } from './ViewportDebtPanel';
 import { SystemStatusCard } from './SystemStatusCard';
 import type { Task } from '../types/task';
 import type { Project } from '../types/project';
+import { assertDigestContract, type DigestData as DigestDataBase, type FailureGroup } from '../types/digest';
+
+// Dashboard reads DirectionPortfolioSection's `DirectionProgress` shape off
+// `direction_progress`, so it instantiates the generic canonical type with it.
+// Re-exported (along with FailureGroup) for dependents — SystemStatusCard and
+// DashboardMetricCards — that import these from this module.
+export type DigestData = DigestDataBase<DirectionProgress>;
+export type { FailureGroup };
 
 // ---------- local types ----------
 
@@ -66,15 +74,6 @@ interface HealthOverviewResponse {
   actionable_issues: HealthOverviewIssue[];
 }
 
-interface FailureGroupTask {
-  task_id: string;
-  title: string;
-  error_snippet?: string;
-  attempt_count?: number;
-  taxonomy?: string;
-  timeout_subtype?: string | null;
-}
-
 const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
   heartbeat_lost: 'heartbeat lost',
   oom: 'OOM',
@@ -85,256 +84,11 @@ const TIMEOUT_SUBTYPE_LABELS: Record<string, string> = {
   unknown: 'unknown',
 };
 
-export interface FailureGroup {
-  failure_class: string;
-  label: string;
-  count: number;
-  tasks: FailureGroupTask[];
-}
-
-interface RecentCompletion {
-  task_id: string;
-  title: string;
-  completed_at: string | null;
-  pr_url: string | null;
-  task_type: string;
-  direction_id?: string | null;
-  direction_text?: string | null;
-  duration_seconds?: number | null;
-}
-
-interface LatestCycle {
-  cycle_id: string;
-  started_at: string;
-  completed_at: string | null;
-  outcome: string;
-  directions_created: number;
-  directions_retired: number;
-  vision_updated: boolean;
-  summary_text?: string | null;
-  memos_available?: number | null;
-  memos_cited?: number | null;
-}
-
-export interface DigestData {
-  failed_count: number;
-  success_rate?: number | null;
-  trend?: 'improving' | 'declining' | 'stable';
-  trend_history?: { period_end: string; success_rate: number | null; completed: number; failed: number; failed_by_class?: Record<string, number>; failed_by_taxonomy?: Record<string, number>; period_cost_usd?: number | null }[];
-  total_estimated_cost_usd?: number | null;
-  daily_cost_usd?: number | null;
-  daily_cost_ceiling_usd?: number | null;
-  direction_progress?: DirectionProgress[];
-  pending_approval_count: number;
-  overall_product_ratio?: number | null;
-  failure_groups?: FailureGroup[];
-  recent_completions?: RecentCompletion[];
-  narrative_summary?: string | null;
-  latest_cycle?: LatestCycle | null;
-  completed_count?: number;
-  pipeline_conversion_rate?: number | null;
-  pipeline_acceptance_rate?: number | null;
-  scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
-  prev_scope_conversion_rates?: Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }> | null;
-  cost_by_failure_class?: Record<string, number> | null;
-  total_failed_cost_usd?: number | null;
-  failure_taxonomy_distribution?: {
-    categories: Record<string, { count: number; percentage: number }>;
-    total_failures: number;
-    dominant_category: string | null;
-  } | null;
-  failure_stage_distribution?: {
-    stages: Record<string, number>;
-    total_classified: number;
-    dominant_stage: string | null;
-  } | null;
-  pipeline_filter_funnel?: Record<string, number> | null;
-  remediation_funnel?: {
-    investigations_spawned?: number;
-    investigations_completed?: number;
-    investigations_with_diagnosis?: number;
-    remediations_spawned?: number;
-    remediations_merged?: number;
-    remediations_failed?: number;
-    avg_time_to_remediation_hours?: number | null;
-    active_investigations?: number;
-    investigations_by_confidence?: Record<string, number> | null;
-    failed_remediations_by_class?: Record<string, number> | null;
-    merged_remediations_by_trigger_class?: Record<string, number> | null;
-    investigations_spawned_by_class?: Record<string, number> | null;
-    investigations_completed_by_class?: Record<string, number> | null;
-    remediations_spawned_by_class?: Record<string, number> | null;
-    remediation_success_by_confidence?: Record<string, { merged: number; failed: number }> | null;
-    diagnosis_drop_off_by_reason?: Record<string, number> | null;
-    residual_remediation_funnel?: {
-      open_cases_by_error_class?: {
-        error_class: string;
-        count: number;
-        most_recent_at: string | null;
-        cases: {
-          fingerprint: string;
-          status: string;
-          hit_count: number;
-          last_seen_at: string | null;
-          last_spawned_at?: string | null;
-          sample_message?: string | null;
-          consecutive_failure_count?: number | null;
-        }[];
-      }[];
-    } | null;
-  } | null;
-  recurring_patterns?: {
-    fingerprint: string;
-    occurrence_count: number;
-    severity?: string | null;
-    example_message?: string | null;
-    affected_direction_count: number;
-    affected_directions?: { direction_id: string; direction_text: string }[];
-    remediation_status: 'fix_verified' | 'fix_shipped' | 'investigating' | 'unaddressed';
-    proactive?: boolean;
-  }[] | null;
-  investigation_conversion?: {
-    total_completed?: number;
-    parseable?: number;
-    unparseable?: number;
-    structural?: number;
-    low_confidence?: number;
-    actionable?: number;
-    remediation_spawned?: number;
-  } | null;
-  anomaly_adjustment?: {
-    active: boolean;
-    adjusted_at?: string | null;
-    trigger_anomalies?: string[];
-    pre_adjustment_max_vms?: number | null;
-    adjusted_max_vms?: number | null;
-    failure_gate_threshold?: number | null;
-    pre_adjustment_failure_gate?: number | null;
-    forced_restoration_count?: number;
-    forced_restored_at?: string | null;
-  } | null;
-  first_attempt_success_rate?: {
-    overall?: number | null;
-    trend?: string | null;
-    sample_size?: number | null;
-    first_attempt_by_review_category?: Record<string, number> | null;
-    [key: string]: unknown;
-  } | null;
-  self_review_effectiveness?: {
-    with_self_review_approval_rate?: number | null;
-    without_self_review_approval_rate?: number | null;
-    clean_verdict_approval_rate?: number | null;
-    fixed_verdict_approval_rate?: number | null;
-    sample_size?: number | null;
-    sr_fixed_count?: number | null;
-    sr_clean_count?: number | null;
-  } | null;
-  review_accuracy?: {
-    total_reviews?: number | null;
-    overrides?: number | null;
-    dismissals?: number | null;
-    misses?: number | null;
-    total_approvals?: number | null;
-    precision?: number | null;
-    recall?: number | null;
-  } | null;
-  self_review_prediction_accuracy?: {
-    prediction_hit_rate?: number | null;
-    miss_rate?: number | null;
-    false_alarm_rate?: number | null;
-    sample_size?: number | null;
-    self_flagged_shipped_unfixed_task_count?: number | null;
-    self_flagged_shipped_unfixed_task_rate?: number | null;
-  } | null;
-  self_review_prediction_accuracy_trends?: SrTrendWithFixIterations | null;
-  sr_regression_risk_test_signal_trends?: {
-    computed_at?: string | null;
-    bucket_mode?: string | null;
-    trend?: string | null;
-    miss_by_test_signal_rate_delta?: number | null;
-    current?: {
-      miss_by_test_signal_rate?: number | null;
-      numerator?: number | null;
-      denominator?: number | null;
-      sample_size?: number | null;
-    } | null;
-    previous?: {
-      miss_by_test_signal_rate?: number | null;
-      numerator?: number | null;
-      denominator?: number | null;
-      sample_size?: number | null;
-    } | null;
-  } | null;
-  self_review_skip_rate?: {
-    overall_rate: number;
-    skipped_count: number;
-    sample_size: number;
-    by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
-  } | null;
-  sr_disallowed_blind_spot_rate?: {
-    overall_rate: number;
-    violation_count: number;
-    sample_size: number;
-    by_task_type: Record<string, { rate: number; violation_count: number; sample_size: number }>;
-  } | null;
-  fresh_reviewer_effectiveness?: {
-    fresh_reviewer_sample_size: number;
-    fresh_reviewer_first_attempt_approval_rate: number | null;
-    baseline_first_attempt_approval_rate: number | null;
-    per_category_hit_rate: Record<string, number>;
-    reviewer_finding_added_value: Record<string, number>;
-    prediction_sample_size: number;
-  } | null;
-  edges_trend?: EdgesTrend | null;
-  sr_false_attestation_trends?: {
-    computed_at?: string | null;
-    bucket_mode?: string | null;
-    per_category?: Record<string, {
-      false_attestation_rate?: number | null;
-      previous_false_attestation_rate?: number | null;
-      delta?: number | null;
-      trend?: string | null;
-      ci_confirmed?: number | null;
-      false_attested?: number | null;
-      ci_data_missing?: number | null;
-    }> | null;
-  } | null;
-  median_cost_per_merged_pr?: number | null;
-  prediction_calibration_factor?: number | null;
-  prediction_calibration_note?: string | null;
-  prediction_calibration_sample_count?: number | null;
-  rejection_pattern_summary?: {
-    total_rejected: number;
-    top_notes: { snippet: string; count: number }[];
-  } | null;
-  tasks_truncated?: boolean;
-  memo_pathway_exits?: number | null;
-  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
-  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
-}
-
 // SrFixIterationBucket and SrTrendWithFixIterations are defined and exported from ReviewQualitySection
 export type { SrFixIterationBucket, SrTrendWithFixIterations };
 
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
 export type { DirectionSrEntry };
-
-/**
- * Type guard for the /api/admin/digest response. Checks the fields the
- * dashboard requires so any backend rename or removal is caught at fetch
- * time rather than silently rendering stale or missing data.
- */
-function assertDigestContract(data: unknown): data is DigestData {
-  if (typeof data !== 'object' || data === null) return false;
-  const d = data as Record<string, unknown>;
-  return (
-    typeof d.failed_count === 'number' &&
-    typeof d.pending_approval_count === 'number' &&
-    Array.isArray(d.direction_progress) &&
-    Array.isArray(d.recent_completions) &&
-    Array.isArray(d.failure_groups)
-  );
-}
 
 const TAXONOMY_STROKE: Record<string, string> = {
   scope_related: '#22d3ee',
@@ -770,7 +524,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           const res = await apiFetch(url);
           if (res.ok && requestId === dashboardRequestIdRef.current) {
             const data = await res.json();
-            if (requestId === dashboardRequestIdRef.current && assertDigestContract(data)) {
+            if (requestId === dashboardRequestIdRef.current && assertDigestContract<DirectionProgress>(data)) {
               setDigest(data);
               digestOk = true;
             } else if (requestId === dashboardRequestIdRef.current) {
@@ -936,12 +690,17 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
   // Initial + polling
   useEffect(() => {
-    const requestId = ++dashboardRequestIdRef.current;
     openPRsRequestIdRef.current += 1;
     versionLifecycleRequestIdRef.current += 1;
     resetProjectScopedState();
-    void fetchData(requestId);
-    const id = setInterval(() => void fetchData(requestId), 30_000);
+    void fetchData(++dashboardRequestIdRef.current);
+    // Each tick starts a fresh "latest" request by reading the CURRENT id from
+    // the ref (via increment) rather than a stale id captured at effect-setup
+    // time. Capturing the id in the closure froze polling after any manual
+    // refetch (which bumps the ref): fetchData's `requestId === ref.current`
+    // guards then permanently failed and the dashboard silently stopped
+    // applying poll responses.
+    const id = setInterval(() => void fetchData(++dashboardRequestIdRef.current), 30_000);
     return () => clearInterval(id);
   }, [fetchData, resetProjectScopedState]);
 

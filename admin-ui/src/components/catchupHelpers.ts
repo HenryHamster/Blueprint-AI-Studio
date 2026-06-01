@@ -28,18 +28,10 @@ export const RATE_LIMIT_KIND_LABELS: Record<string, string> = {
   unknown: 'unknown',
 };
 
-export interface RecentCompletion {
-  task_id: string;
-  title: string;
-  completed_at: string | null;
-  pr_url: string | null;
-  task_type: string;
-  direction_id?: string | null;
-  direction_text?: string | null;
-  scope?: string | null;
-  duration_seconds?: number | null;
-  review_iterations?: number | null;
-}
+// RecentCompletion is the canonical digest type, hoisted to ../types/digest.
+// Re-exported here so existing importers (catchupRows, CatchUpPanel, tests)
+// keep resolving it from this module — single source of truth, no divergence.
+export type { RecentCompletion } from '../types/digest';
 
 export type TimeWindow = 'last_visit' | '6h' | '24h' | '7d';
 

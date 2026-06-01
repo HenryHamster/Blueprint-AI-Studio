@@ -1,0 +1,535 @@
+// Canonical shape of the `/api/admin/digest` response.
+//
+// Previously DashboardHome.tsx and CatchUpPanel.tsx each declared their own
+// `DigestData` / `FailureGroup` / `RecentCompletion` interfaces plus (in the
+// dashboard's case) the `assertDigestContract` guard. Because both render the
+// SAME backend payload, that was a two-place-edit divergence trap: a backend
+// rename had to be mirrored by hand in both files, and drift was silent.
+//
+// This module is the single source of truth. `DigestData` is the UNION of every
+// field either consumer reads, with per-field types chosen so the same object is
+// assignable to BOTH consumers' (and their child sections') prop contracts:
+//   - review sub-objects (self_review_*, review_accuracy, first_*_rate,
+//     fresh_reviewer_effectiveness) use the STRICTER (required-sample_size) shape
+//     CatchUpReviewQualitySection demands, plus the dashboard's extra optional
+//     fields — strict objects are assignable to the dashboard's looser props.
+//   - `self_review_prediction_accuracy_trends` uses the richer
+//     SrTrendWithFixIterations (a subtype of SrTrendData), assignable wherever
+//     either is expected.
+//
+// `direction_progress` is the one field whose ELEMENT type genuinely diverges:
+// DashboardHome feeds DirectionPortfolioSection's `DirectionProgress` while
+// CatchUpPanel feeds DirectionProgressSection's structurally-incompatible
+// `DirectionProgress`. `DigestData` is therefore generic in that element type so
+// each consumer keeps its own strict typing without an unsafe widen/downcast.
+
+import type { EdgesTrend } from '../components/SrTrendBreakdown';
+import type { SrTrendWithFixIterations } from '../components/ReviewQualitySection';
+import type { ActiveTask } from '../components/CatchUpInProgressSection';
+import type { NeedsAttentionItem } from '../components/CatchUpNeedsAttentionSection';
+
+export interface FailureGroupTask {
+  task_id: string;
+  title: string;
+  // Required to match the backend payload and the stricter CatchUp consumers
+  // (RecentFailureGroupsSection / CatchUpCostDiagnosticsSection). Strict fields
+  // remain assignable to the dashboard's looser optional-chained reads.
+  error_snippet: string | null;
+  attempt_count: number;
+  waiting_hours?: number;
+  taxonomy?: string;
+  timeout_subtype?: string | null;
+  failure_stage?: string | null;
+  direction_id?: string | null;
+  direction_text?: string | null;
+}
+
+export interface FailureGroup {
+  failure_class: string;
+  label: string;
+  count: number;
+  tasks: FailureGroupTask[];
+}
+
+export interface RecentCompletion {
+  task_id: string;
+  title: string;
+  completed_at: string | null;
+  pr_url: string | null;
+  task_type: string;
+  direction_id?: string | null;
+  direction_text?: string | null;
+  scope?: string | null;
+  duration_seconds?: number | null;
+  review_iterations?: number | null;
+}
+
+interface LatestCycle {
+  cycle_id?: string | null;
+  // Required (non-null) so `completed_at ?? started_at` stays `string` for
+  // timeAgo() in SystemStatusCard — matches the backend (a cycle always has a
+  // start time) and the dashboard's prior shape.
+  started_at: string;
+  completed_at?: string | null;
+  outcome?: string | null;
+  directions_created?: number | null;
+  directions_retired?: number | null;
+  vision_updated?: boolean | null;
+  summary_text?: string | null;
+  memos_available?: number | null;
+  memos_cited?: number | null;
+}
+
+export interface RecentFailure {
+  task_id: string;
+  title: string;
+  failed_at: string | null;
+  error_snippet: string | null;
+  waiting_hours?: number;
+  attempt_count?: number;
+  timeout_subtype?: string | null;
+  direction_id?: string | null;
+  direction_text?: string | null;
+  task_type?: string;
+  failure_class?: string | null;
+  scope?: string | null;
+}
+
+type ScopeConversionRates = Record<string, { created: number; merged: number; calibrated_in?: number; calibrated_out?: number }>;
+
+/**
+ * Canonical `/api/admin/digest` response shape, generic in the
+ * `direction_progress` element type (see module header).
+ *
+ * `DP` defaults to `unknown` so consumers that never read `direction_progress`
+ * (e.g. SystemStatusCard) can use the bare `DigestData`.
+ */
+export interface DigestData<DP = unknown> {
+  // ----- core contract (validated by assertDigestContract) -----
+  failed_count: number;
+  pending_approval_count: number;
+  direction_progress?: DP[];
+  recent_completions?: RecentCompletion[];
+  failure_groups?: FailureGroup[];
+
+  // ----- catch-up window metadata -----
+  // Counts are required (number) — the backend always emits them and CatchUp
+  // reads them directly (no `?? 0`). The dashboard reads completed_count via
+  // `?? 0`, which a required field satisfies harmlessly.
+  window_hours?: number;
+  generated_at?: string;
+  active_count: number;
+  running_count: number;
+  queued_count: number;
+  research_cycles: number;
+  prs_opened: number;
+  active_tasks?: ActiveTask[];
+  needs_attention?: NeedsAttentionItem[];
+  recent_failures?: RecentFailure[];
+
+  // ----- headline metrics -----
+  completed_count: number;
+  success_rate?: number | null;
+  trend?: 'improving' | 'declining' | 'stable';
+  trend_history?: {
+    period_end: string;
+    success_rate: number | null;
+    completed: number;
+    failed: number;
+    failed_by_class?: Record<string, number>;
+    failed_by_taxonomy?: Record<string, number>;
+    first_attempt_success_rate?: number | null;
+    period_cost_usd?: number | null;
+  }[];
+  overall_product_ratio?: number | null;
+  pipeline_conversion_rate?: number | null;
+  pipeline_acceptance_rate?: number | null;
+  overall_type_distribution?: Record<string, number> | null;
+  narrative_summary?: string | null;
+  latest_cycle?: LatestCycle | null;
+
+  // ----- period deltas (catch-up) -----
+  prev_completed_count?: number;
+  prev_failed_count?: number;
+  prev_success_rate?: number | null;
+  completed_delta?: number;
+  failed_delta?: number;
+  success_rate_delta?: number | null;
+
+  // ----- cost -----
+  total_estimated_cost_usd?: number | null;
+  daily_cost_usd?: number | null;
+  daily_cost_ceiling_usd?: number | null;
+  spot_cost_usd?: number | null;
+  on_demand_cost_usd?: number | null;
+  provisioning_overhead_usd?: number | null;
+  provisioning_overhead_pct?: number | null;
+  cost_by_failure_class?: Record<string, number> | null;
+  total_failed_cost_usd?: number | null;
+  median_cost_per_merged_pr?: number | null;
+
+  // ----- scope conversion -----
+  scope_conversion_rates?: ScopeConversionRates | null;
+  prev_scope_conversion_rates?: ScopeConversionRates | null;
+  scope_mismatch_summary?: {
+    total_calibrated: number;
+    calibrated_success_rate: number | null;
+    by_original_scope: Record<string, { total: number; completed: number; failed: number }>;
+    top_directions: {
+      direction_id: string;
+      direction_text: string;
+      calibrated_count: number;
+      total_tasks: number;
+      calibration_rate: number;
+    }[];
+  } | null;
+
+  // ----- failure distributions -----
+  failure_taxonomy_distribution?: {
+    categories: Record<string, { count: number; percentage: number }>;
+    total_failures: number;
+    dominant_category: string | null;
+  } | null;
+  failure_stage_distribution?: {
+    stages: Record<string, number>;
+    total_classified: number;
+    dominant_stage: string | null;
+  } | null;
+  pipeline_filter_funnel?: Record<string, number> | null;
+
+  // ----- retry / resurrection (catch-up) -----
+  retry_overhead_cost_usd?: number | null;
+  retry_waste_by_direction?: { direction_id: string; direction_text: string; retry_cost_usd: number; retry_task_count: number }[] | null;
+  retry_task_count?: number | null;
+  avg_retries_before_failure?: number | null;
+  retry_success_count?: number | null;
+  retry_wasted_rate?: number | null;
+  retry_recovery_cost_usd?: number | null;
+  retry_success_rate_by_class?: Record<string, { merged: number; failed: number; success_rate: number }> | null;
+  retry_pattern_summary?: {
+    total_multi_attempt_failures: number;
+    repeat_class_count: number;
+    top_patterns: { sequence: string; count: number }[];
+  } | null;
+  resurrection_outcome_summary?: {
+    total: number;
+    completed: number;
+    failed_again: number;
+    success_rate: number | null;
+  } | null;
+
+  // ----- operational health (catch-up) -----
+  migration_health?: {
+    current_schema_revision: string | null;
+    migration_tasks_in_window: number;
+    migration_tasks_succeeded: number;
+    migration_tasks_failed: number;
+    migration_errors_in_window: number;
+    auto_generated_migrations: number;
+  } | null;
+  prevention_efficacy?: {
+    preventive_tasks_created: number;
+    preventive_tasks_merged: number;
+    preventive_tasks_failed: number;
+    preventive_merge_rate: number | null;
+    overall_merge_rate: number | null;
+    assessment: 'positive' | 'negative' | 'neutral' | 'no_data';
+  } | null;
+  release_qualifier_infra_metrics?: {
+    qualifier_runs_total: number;
+    release_infra_failure_total: number;
+    audit_report_missing_count: number;
+    audit_report_parseable_but_unscoreable_count: number;
+    smoketest_report_missing_count: number;
+    release_infra_failure_streak_max: number;
+  } | null;
+  total_merge_retries_saved?: number | null;
+  merge_early_exit_count?: number | null;
+  review_cap_exhaustion_summary?: {
+    count: number;
+    avg_iterations: number | null;
+    total_cost_usd: number;
+    avg_cost_usd: number | null;
+    top_directions: { direction_id: string; count: number }[];
+  } | null;
+  analysis_overflow_summary?: {
+    total_count: number;
+    by_scope: Record<string, number>;
+    cost_usd: number;
+  } | null;
+  provision_waste_cost_usd?: number | null;
+  provision_waste_by_direction?: {
+    direction_id: string;
+    direction_text: string;
+    provision_cost_usd: number;
+    provision_task_count: number;
+  }[] | null;
+  escalation_outcome_summary?: {
+    total_attempted: number;
+    total_merged: number;
+    total_failed: number;
+    overall_success_rate: number | null;
+    by_path: Record<string, { attempted: number; merged: number; failed: number; success_rate: number | null }>;
+  } | null;
+
+  // ----- failure signals (catch-up) -----
+  recurring_error_clusters?: {
+    fingerprint: string;
+    count: number;
+    error_snippet: string;
+    direction_ids: string[];
+    task_types: string[];
+    first_task_id: string;
+  }[] | null;
+  early_warnings?: {
+    failure_class: string;
+    rate_progression: number[];
+    affected_direction_count: number;
+    suggested_action?: string | null;
+    severity?: string | null;
+  }[] | null;
+  recurring_patterns?: {
+    fingerprint: string;
+    occurrence_count: number;
+    first_seen?: string | null;
+    last_seen?: string | null;
+    severity?: string | null;
+    example_message?: string | null;
+    affected_direction_count: number;
+    affected_directions?: { direction_id: string; direction_text: string }[];
+    remediation_status: 'fix_verified' | 'fix_shipped' | 'investigating' | 'unaddressed';
+    proactive?: boolean;
+  }[] | null;
+
+  // ----- remediation funnel -----
+  // Core counts are required to match the backend payload and the stricter
+  // CatchUpRemediationPipelineSection (RemediationFunnelSlice) prop; required
+  // is assignable to the dashboard's looser RemediationFunnelSection prop.
+  remediation_funnel?: {
+    investigations_spawned: number;
+    investigations_completed: number;
+    investigations_with_diagnosis: number;
+    remediations_spawned: number;
+    remediations_merged: number;
+    remediations_failed: number;
+    fixes_held?: number;
+    avg_time_to_remediation_hours: number | null;
+    active_investigations: number;
+    // No `| null` on fields that also appear in CatchUp's RemediationFunnelSlice
+    // (which omits null) so the whole funnel stays assignable to that prop.
+    investigations_by_confidence?: Record<string, number>;
+    failed_remediations_by_class?: Record<string, number> | null;
+    merged_remediations_by_trigger_class?: Record<string, number> | null;
+    cumulative_merged_by_trigger_class?: Record<string, number> | null;
+    investigations_spawned_by_class?: Record<string, number> | null;
+    investigations_completed_by_class?: Record<string, number> | null;
+    remediations_spawned_by_class?: Record<string, number> | null;
+    ci_auto_remediation?: {
+      spawned: number;
+      merged: number;
+      failed: number;
+      by_ci_failure_type?: Record<string, { spawned: number; merged: number; failed: number }>;
+    };
+    remediation_success_by_confidence?: Record<string, { merged: number; failed: number }>;
+    recent_investigations?: Array<{
+      task_id: string;
+      direction_id?: string | null;
+      summary?: string | null;
+      confidence?: string | null;
+      severity?: string | null;
+      completed_at?: string | null;
+    }>;
+    active_investigations_detail?: Array<{
+      task_id: string;
+      direction_id?: string | null;
+      elapsed_hours?: number | null;
+    }>;
+    diagnosis_drop_off_by_reason?: Record<string, number> | null;
+    residual_remediation_funnel?: {
+      open_cases_by_error_class?: {
+        error_class: string;
+        count: number;
+        most_recent_at: string | null;
+        cases: {
+          fingerprint: string;
+          status: string;
+          hit_count: number;
+          last_seen_at: string | null;
+          last_spawned_at?: string | null;
+          sample_message?: string | null;
+          consecutive_failure_count?: number | null;
+        }[];
+      }[];
+    } | null;
+  } | null;
+  investigation_conversion?: {
+    total_completed?: number;
+    parseable?: number;
+    unparseable?: number;
+    structural?: number;
+    low_confidence?: number;
+    actionable?: number;
+    remediation_spawned?: number;
+  } | null;
+
+  // ----- anomaly throttle (dashboard) -----
+  anomaly_adjustment?: {
+    active: boolean;
+    adjusted_at?: string | null;
+    trigger_anomalies?: string[];
+    pre_adjustment_max_vms?: number | null;
+    adjusted_max_vms?: number | null;
+    failure_gate_threshold?: number | null;
+    pre_adjustment_failure_gate?: number | null;
+    forced_restoration_count?: number;
+    forced_restored_at?: string | null;
+  } | null;
+
+  // ----- review quality -----
+  // Required-sample_size shape so the object is assignable to BOTH the strict
+  // CatchUpReviewQualitySection props and the dashboard's looser ReviewQualityDigest.
+  first_attempt_success_rate?: {
+    // Required (number | null) to match CatchUp's comparison helpers, which take
+    // `number | null` (no undefined). The dashboard only reads the optional
+    // first_attempt_by_review_category, so requiring these siblings is harmless.
+    overall: number | null;
+    sample_size: number;
+    with_playbook: number | null;
+    without_playbook: number | null;
+    with_arch_context: number | null;
+    without_arch_context: number | null;
+    with_measurements?: number | null;
+    without_measurements?: number | null;
+    first_attempt_by_review_category?: Record<string, number> | null;
+    trend?: string | null;
+    by_type?: Record<string, number> | null;
+    by_scope?: Record<string, number> | null;
+  } | null;
+  first_review_approval_rate?: {
+    overall: number | null;
+    sample_size: number;
+    by_type?: Record<string, number> | null;
+    by_scope?: Record<string, number> | null;
+    with_playbook?: number | null;
+    without_playbook?: number | null;
+    with_measurements?: number | null;
+    without_measurements?: number | null;
+  } | null;
+  self_review_effectiveness?: {
+    with_self_review_approval_rate: number | null;
+    without_self_review_approval_rate: number | null;
+    clean_verdict_approval_rate: number | null;
+    fixed_verdict_approval_rate: number | null;
+    sample_size: number;
+    sr_fixed_count?: number | null;
+    sr_clean_count?: number | null;
+  } | null;
+  self_review_prediction_accuracy?: {
+    prediction_hit_rate: number | null;
+    miss_rate: number | null;
+    false_alarm_rate: number | null;
+    sample_size: number;
+    self_flagged_shipped_unfixed_task_count?: number | null;
+    self_flagged_shipped_unfixed_task_rate?: number | null;
+  } | null;
+  self_review_prediction_accuracy_trends?: SrTrendWithFixIterations | null;
+  sr_regression_risk_test_signal_trends?: {
+    computed_at?: string | null;
+    bucket_mode?: string | null;
+    trend?: string | null;
+    miss_by_test_signal_rate_delta?: number | null;
+    current?: {
+      miss_by_test_signal_rate?: number | null;
+      numerator?: number | null;
+      denominator?: number | null;
+      sample_size?: number | null;
+    } | null;
+    previous?: {
+      miss_by_test_signal_rate?: number | null;
+      numerator?: number | null;
+      denominator?: number | null;
+      sample_size?: number | null;
+    } | null;
+  } | null;
+  self_review_skip_rate?: {
+    overall_rate: number;
+    skipped_count: number;
+    sample_size: number;
+    by_task_type: Record<string, { rate: number; skipped_count: number; sample_size: number }>;
+  } | null;
+  sr_disallowed_blind_spot_rate?: {
+    overall_rate: number;
+    violation_count: number;
+    sample_size: number;
+    by_task_type: Record<string, { rate: number; violation_count: number; sample_size: number }>;
+  } | null;
+  review_accuracy?: {
+    total_reviews: number;
+    overrides: number;
+    dismissals: number;
+    misses: number;
+    total_approvals: number;
+    precision: number | null;
+    recall: number | null;
+  } | null;
+  fresh_reviewer_effectiveness?: {
+    fresh_reviewer_sample_size: number;
+    fresh_reviewer_first_attempt_approval_rate: number | null;
+    baseline_first_attempt_approval_rate: number | null;
+    per_category_hit_rate: Record<string, number>;
+    reviewer_finding_added_value: Record<string, number>;
+    prediction_sample_size: number;
+  } | null;
+  edges_trend?: EdgesTrend | null;
+  sr_false_attestation_trends?: {
+    computed_at?: string | null;
+    bucket_mode?: string | null;
+    per_category?: Record<string, {
+      false_attestation_rate?: number | null;
+      previous_false_attestation_rate?: number | null;
+      delta?: number | null;
+      trend?: string | null;
+      ci_confirmed?: number | null;
+      false_attested?: number | null;
+      ci_data_missing?: number | null;
+    }> | null;
+  } | null;
+
+  // ----- prediction calibration (dashboard) -----
+  prediction_calibration_factor?: number | null;
+  prediction_calibration_note?: string | null;
+  prediction_calibration_sample_count?: number | null;
+
+  // ----- human rejection patterns -----
+  rejection_pattern_summary?: {
+    total_rejected: number;
+    top_notes: { snippet: string; count: number }[];
+  } | null;
+
+  // ----- memo pathway -----
+  tasks_truncated?: boolean;
+  memo_pathway_exits?: number | null;
+  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
+  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
+}
+
+/**
+ * Type guard for the `/api/admin/digest` response. Checks the fields the
+ * dashboard requires so any backend rename or removal is caught at fetch time
+ * rather than silently rendering stale or missing data.
+ *
+ * Generic in the `direction_progress` element type so callers can narrow to
+ * their own `DigestData<DP>` without a cast; the runtime check only validates
+ * that `direction_progress` is an array.
+ */
+export function assertDigestContract<DP = unknown>(data: unknown): data is DigestData<DP> {
+  if (typeof data !== 'object' || data === null) return false;
+  const d = data as Record<string, unknown>;
+  return (
+    typeof d.failed_count === 'number' &&
+    typeof d.pending_approval_count === 'number' &&
+    Array.isArray(d.direction_progress) &&
+    Array.isArray(d.recent_completions) &&
+    Array.isArray(d.failure_groups)
+  );
+}

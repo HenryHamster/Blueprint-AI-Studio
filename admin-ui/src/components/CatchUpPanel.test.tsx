@@ -25,6 +25,9 @@ vi.mock('../api', async () => {
           needs_attention: [],
           recent_failures: [],
           recent_completions: [],
+          // Required by the shared assertDigestContract guard (backend always emits these arrays).
+          direction_progress: [],
+          failure_groups: [],
         }), { status: 200 });
       }
       return new Response('{}', { status: 200 });
@@ -92,6 +95,9 @@ describe('CatchUpPanel', () => {
       needs_attention: [],
       recent_failures: [],
       recent_completions: [],
+      // Required by the shared assertDigestContract guard (backend always emits these arrays).
+      direction_progress: [],
+      failure_groups: [],
       migration_health: {
         current_schema_revision: '0096',
         migration_tasks_in_window: 2,
