@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.landed_signal import has_landed_signal, mark_unblocked_non_merge
+from app.landed_signal import has_merge_unblock_signal, mark_unblocked_non_merge
 from app.models import (
     Task,
     Artifact,
@@ -105,7 +105,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     from app.routers.agent import get_github_token_for_task
     from app.github import get_pull_request
 
-    if has_landed_signal(task):
+    if has_merge_unblock_signal(task):
         return True
 
     # Negative-result cache: when a batch of sibling children completes in

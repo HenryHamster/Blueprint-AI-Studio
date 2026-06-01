@@ -56,8 +56,9 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
     _clear_rollup_transient_state,
 )
 from app.landed_signal import (
+    has_merge_unblock_signal,
     has_landed_signal,
-    is_merged_completion,
+    is_unblocked_completion,
     mark_landed_on_integration,
     mark_unblocked_non_merge,
 )
@@ -483,11 +484,11 @@ async def _check_and_trigger_rollup(
             c
             for c in children
             if c.status == TaskStatus.COMPLETED
-            and not has_landed_signal(c)
+            and not has_merge_unblock_signal(c)
             and not c.requires_approval
         ]
         failed = [c for c in children if c.status == TaskStatus.FAILED]
-        completed_merged = [c for c in children if is_merged_completion(c)]
+        completed_merged = [c for c in children if is_unblocked_completion(c)]
 
         if unmerged:
             # Some completed but PRs not yet merged.

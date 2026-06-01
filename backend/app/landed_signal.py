@@ -1,4 +1,4 @@
-"""Canonical "landed on the integration branch" signal.
+"""Canonical integration-landing and rollup-unblock signals.
 
 Historically a single ``task.context["pr_merged"]`` flag did two distinct jobs:
 
@@ -13,11 +13,10 @@ read a flag that overcounts, and forced strategic code to reconstruct the
 "really on the integration branch" answer with GitHub ancestry heuristics.
 
 This module gives those two jobs *named, separate* entry points that every
-writer funnels through, plus one canonical reader and one canonical
-"completed-and-merged" predicate. Both writers still persist the same
-underlying ``pr_merged`` field, so behavior is unchanged — but the call sites
-now declare which meaning they intend, which is the seam a later change can use
-to diverge the two signals without re-touching every site.
+writer funnels through, plus canonical readers for each meaning. The legacy
+``pr_merged`` field remains the rollup-unblock / merge-equivalent bit, while
+``landed_on_integration`` is the explicit "this work actually landed on the
+integration branch" signal used by analytics.
 """
 
 import logging
@@ -29,15 +28,32 @@ logger = logging.getLogger(__name__)
 # The context key both meanings currently share. Centralised here so the field
 # name lives in exactly one place.
 LANDED_SIGNAL_KEY = "pr_merged"
+LANDED_ON_INTEGRATION_KEY = "landed_on_integration"
+NON_MERGE_UNBLOCK_REASON_KEY = "_non_merge_unblock_reason"
+
+
+def has_merge_unblock_signal(task: Task) -> bool:
+    """Canonical read of the rollup-unblock / merge-equivalent signal."""
+    return (task.context or {}).get(LANDED_SIGNAL_KEY) is True
 
 
 def has_landed_signal(task: Task) -> bool:
-    """Canonical read of the landed signal.
+    """Canonical read of the integration-branch landing signal.
 
-    Mirrors the historical truthiness check ``(task.context or {}).get("pr_merged")``
-    exactly — tolerant of a missing/None context.
+    New writes stamp ``landed_on_integration`` explicitly. Legacy rows that
+    predate the split fall back to ``pr_merged is True`` unless they carry the
+    explicit non-merge marker introduced by :func:`mark_unblocked_non_merge`.
     """
-    return bool((task.context or {}).get(LANDED_SIGNAL_KEY))
+    ctx = task.context or {}
+    landed = ctx.get(LANDED_ON_INTEGRATION_KEY)
+    if landed is True:
+        return True
+    if landed is False:
+        return False
+    return (
+        ctx.get(LANDED_SIGNAL_KEY) is True
+        and NON_MERGE_UNBLOCK_REASON_KEY not in ctx
+    )
 
 
 def is_merged_completion(task: Task) -> bool:
@@ -51,6 +67,11 @@ def is_merged_completion(task: Task) -> bool:
     return task.status == TaskStatus.COMPLETED and has_landed_signal(task)
 
 
+def is_unblocked_completion(task: Task) -> bool:
+    """True when a completed task should no longer block rollup convergence."""
+    return task.status == TaskStatus.COMPLETED and has_merge_unblock_signal(task)
+
+
 def mark_landed_on_integration(task: Task) -> None:
     """Stamp the landed signal for a PR that merged onto the integration branch.
 
@@ -58,7 +79,13 @@ def mark_landed_on_integration(task: Task) -> None:
     that need the integration-vs-promotion-target guard should use
     :func:`apply_merged_landed_signal` instead, which routes through here.
     """
-    task.context = {**(task.context or {}), LANDED_SIGNAL_KEY: True}
+    ctx = {
+        **(task.context or {}),
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: True,
+    }
+    ctx.pop(NON_MERGE_UNBLOCK_REASON_KEY, None)
+    task.context = ctx
 
 
 def mark_unblocked_non_merge(task: Task, *, reason: str) -> None:
@@ -67,15 +94,20 @@ def mark_unblocked_non_merge(task: Task, *, reason: str) -> None:
     Used for staging-only rollup children, no-PR / no-op completions, and
     deliberate success-closes where the work landed elsewhere. These never
     landed on the integration branch but must still unblock dependents and
-    rollup convergence. Shares the ``pr_merged`` field today (behavior is
-    unchanged); the explicit, named call site is the seam for separating it.
+    rollup convergence, so they keep ``pr_merged=True`` while explicitly
+    recording ``landed_on_integration=False``.
     """
     logger.debug(
         "[LANDED] non-merge unblock for task %s: %s",
         getattr(task, "id", None),
         reason,
     )
-    task.context = {**(task.context or {}), LANDED_SIGNAL_KEY: True}
+    task.context = {
+        **(task.context or {}),
+        LANDED_SIGNAL_KEY: True,
+        LANDED_ON_INTEGRATION_KEY: False,
+        NON_MERGE_UNBLOCK_REASON_KEY: reason,
+    }
 
 
 def apply_merged_landed_signal(

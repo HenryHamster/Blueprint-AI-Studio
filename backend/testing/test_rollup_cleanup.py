@@ -748,12 +748,12 @@ async def _make_artifact(session, task_id, pr_url):
 
 @pytest.mark.asyncio
 async def test_verify_pr_merged_context_cache_hit(cleanup_db, mocker):
-    """If task.context already has pr_merged=True, returns True without any API call."""
+    """The unblock bit short-circuits even when the task did not land on integration."""
     project = await _make_project(cleanup_db)
     task = await _make_task(
         cleanup_db,
         project.id,
-        context={"pr_merged": True},
+        context={"pr_merged": True, "landed_on_integration": False},
     )
 
     mock_get_pr = mocker.patch("app.github.get_pull_request", new_callable=AsyncMock)
@@ -776,12 +776,13 @@ async def test_verify_pr_merged_no_artifact(cleanup_db, mocker):
 
     assert result is True
     assert task.context.get("pr_merged") is True
+    assert task.context.get("landed_on_integration") is False
     mock_get_pr.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
-    """GitHub API says merged=True → returns True, updates task.context."""
+    """Rollup-child PR merges unblock the task without marking an integration landing."""
     project = await _make_project(cleanup_db)
     task = await _make_task(cleanup_db, project.id, context={})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/42")
@@ -803,6 +804,7 @@ async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
 
     assert result is True
     assert task.context.get("pr_merged") is True
+    assert task.context.get("landed_on_integration") is False
 
 
 @pytest.mark.asyncio
