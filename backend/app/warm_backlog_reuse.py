@@ -28,6 +28,75 @@ from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
 
+
+def _norm(value) -> Optional[str]:
+    """Lowercased, stripped string, or None for empty/non-string values."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def _task_pinned_providers(task_provider, ctx) -> set[str]:
+    """Provider set a backlog task is constrained to (empty == unconstrained).
+
+    Combines the recorded ``Task.provider`` column (what a re-queued task last
+    ran on) with an explicit per-task ``context['provider_preference']`` pin.
+    An empty set means the task is provider-fungible, so any boot account may
+    run it warm.
+    """
+    constrained: set[str] = set()
+    recorded = _norm(task_provider)
+    if recorded:
+        constrained.add(recorded)
+    pref = ctx.get("provider_preference")
+    if isinstance(pref, str):
+        p = _norm(pref)
+        if p:
+            constrained.add(p)
+    elif isinstance(pref, list):
+        for item in pref:
+            p = _norm(item)
+            if p:
+                constrained.add(p)
+    return constrained
+
+
+def _vm_boot_incompatible(
+    vm_boot, task_provider, task_account_id, task_model, ctx
+) -> bool:
+    """True iff a backlog task is pinned/recorded to provider/account/model
+    material incompatible with the reusing VM's frozen boot manifest.
+
+    A reused VM runs every role on the LLM provider/account/model baked into
+    its boot manifest — the warm claim only mints a fresh JWT and never
+    re-materializes credentials. So a task whose resolved/pinned provider,
+    account, or model differs from the boot identity would silently run on the
+    wrong account; such tasks must cold-dispatch instead of being warm-claimed.
+
+    Deliberately a NO-OP (returns False) when ``vm_boot`` is absent or its
+    provider is unknown, and for single-provider/single-account projects where
+    tasks carry no divergent constraint — so those (dominant) projects keep
+    warm-reusing exactly as before. This is the cheap pre-check the poll path
+    needs: it never runs full per-candidate account selection.
+    """
+    if not vm_boot:
+        return False
+    vm_provider = _norm(vm_boot.get("provider"))
+    if vm_provider is None:
+        return False
+    constrained = _task_pinned_providers(task_provider, ctx)
+    if constrained and vm_provider not in constrained:
+        return True
+    vm_account = _norm(vm_boot.get("account_id"))
+    task_account = _norm(task_account_id)
+    if vm_account and task_account and task_account != vm_account:
+        return True
+    vm_model = _norm(vm_boot.get("model"))
+    task_model_n = _norm(task_model)
+    if vm_model and task_model_n and task_model_n != vm_model:
+        return True
+    return False
+
 # Bounded window (seconds) for which a COMPLETED task's VM teardown is held so
 # the agent can poll /api/agent/next-role and claim backlog work before the VM
 # is torn down. Sized to comfortably exceed the agent's poll cadence (5s) plus
@@ -144,6 +213,7 @@ async def _eligible_backlog_ids(
     vm_instance_id: str,
     *,
     in_progress_files: Optional[set[str]] = None,
+    vm_boot: Optional[dict] = None,
 ) -> list[uuid.UUID]:
     """QUEUED task ids in *project_id* an idle VM may claim, priority-ordered.
 
@@ -160,6 +230,11 @@ async def _eligible_backlog_ids(
         unresolved carries no marker and continues to cold-dispatch as before.
       - not pinned to a *different* VM via ``warm_target_vm_id`` (a pin to
         this VM is the chain path's job; a pin elsewhere must not be stolen)
+      - provider/account/model compatible with the reusing VM's boot manifest
+        when ``vm_boot`` is supplied (see ``_vm_boot_incompatible``); a task
+        pinned/recorded to a different provider cold-dispatches instead of
+        running on the wrong frozen account. Omitting ``vm_boot`` disables the
+        guard, and it is a no-op for single-provider projects either way.
       - no related_files overlap with an IN_PROGRESS task in the same project
 
     Any task type is runnable by any agent VM (the workspace is re-cloned per
@@ -179,6 +254,9 @@ async def _eligible_backlog_ids(
                 Task.id,
                 Task.depends_on,
                 Task.context,
+                Task.provider,
+                Task.account_id,
+                Task.model,
             )
             .where(
                 Task.status == TaskStatus.QUEUED,
@@ -215,8 +293,9 @@ async def _eligible_backlog_ids(
     skipped_depends_on = 0
     skipped_pinned_vm = 0
     skipped_file_conflict = 0
+    skipped_provider_mismatch = 0
 
-    for task_id, depends_on, ctx in rows:
+    for task_id, depends_on, ctx, t_provider, t_account_id, t_model in rows:
         ctx = ctx or {}
         # Dependency-bearing tasks are claimable warm ONLY once the
         # orchestrator's authoritative dep resolution has marked them ready
@@ -229,6 +308,9 @@ async def _eligible_backlog_ids(
         pinned_vm = ctx.get("warm_target_vm_id")
         if pinned_vm and pinned_vm != vm_instance_id:
             skipped_pinned_vm += 1
+            continue
+        if _vm_boot_incompatible(vm_boot, t_provider, t_account_id, t_model, ctx):
+            skipped_provider_mismatch += 1
             continue
         if in_progress_files:
             cfiles = _prod_files(ctx.get("related_files", []))
@@ -245,13 +327,16 @@ async def _eligible_backlog_ids(
         record_scan_skipped_pinned_vm()
     if skipped_file_conflict > 0:
         record_scan_skipped_file_conflict()
+    if skipped_provider_mismatch > 0:
+        record_scan_skipped_provider_mismatch()
     if saturated:
         record_scan_saturated()
 
     logger.debug(
         "[BACKLOG-REUSE] scan project_id=%s vm_instance_id=%s "
         "rows_fetched=%d rows_eligible=%d saturated=%s "
-        "skipped_depends_on=%d skipped_pinned_vm=%d skipped_file_conflict=%d",
+        "skipped_depends_on=%d skipped_pinned_vm=%d skipped_file_conflict=%d "
+        "skipped_provider_mismatch=%d",
         project_id,
         vm_instance_id,
         rows_fetched,
@@ -260,6 +345,7 @@ async def _eligible_backlog_ids(
         skipped_depends_on,
         skipped_pinned_vm,
         skipped_file_conflict,
+        skipped_provider_mismatch,
     )
 
     return eligible
@@ -271,6 +357,7 @@ async def has_eligible_backlog_task(
     vm_instance_id: str,
     *,
     in_progress_files: Optional[set[str]] = None,
+    vm_boot: Optional[dict] = None,
 ) -> bool:
     """True iff *project_id* has at least one backlog task this VM could claim.
 
@@ -279,10 +366,16 @@ async def has_eligible_backlog_task(
 
     Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
     set (see ``_eligible_backlog_ids``) when this gate is paired with a claim.
+    Pass ``vm_boot`` to enforce provider/account/model compatibility with the
+    reusing VM's boot manifest (see ``_vm_boot_incompatible``).
     """
     return bool(
         await _eligible_backlog_ids(
-            session, project_id, vm_instance_id, in_progress_files=in_progress_files
+            session,
+            project_id,
+            vm_instance_id,
+            in_progress_files=in_progress_files,
+            vm_boot=vm_boot,
         )
     )
 
@@ -293,6 +386,7 @@ async def select_backlog_reuse_candidate(
     vm_instance_id: str,
     *,
     in_progress_files: Optional[set[str]] = None,
+    vm_boot: Optional[dict] = None,
 ) -> Optional[Task]:
     """Atomically lock the next claimable backlog task for an idle VM, or None.
 
@@ -307,7 +401,10 @@ async def select_backlog_reuse_candidate(
 
     Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
     set (see ``_eligible_backlog_ids``) when this claim follows an eligibility
-    gate in the same flow, so the file-conflict scan is not run twice.
+    gate in the same flow, so the file-conflict scan is not run twice. Pass
+    ``vm_boot`` to enforce provider/account/model compatibility with the
+    reusing VM's boot manifest (see ``_vm_boot_incompatible``); incompatible
+    tasks are excluded from the candidate set and cold-dispatch as before.
 
     Records the funnel skip reason for the two None-returning cases, which the
     caller cannot distinguish on its own: ``no_eligible`` when no backlog task
@@ -315,7 +412,11 @@ async def select_backlog_reuse_candidate(
     claimer won the SKIP-LOCKED row.
     """
     eligible = await _eligible_backlog_ids(
-        session, project_id, vm_instance_id, in_progress_files=in_progress_files
+        session,
+        project_id,
+        vm_instance_id,
+        in_progress_files=in_progress_files,
+        vm_boot=vm_boot,
     )
     if not eligible:
         record_claim_skipped("no_eligible")
@@ -361,6 +462,7 @@ _claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
 _scan_skipped_depends_on_events: deque = deque(maxlen=500)
 _scan_skipped_pinned_vm_events: deque = deque(maxlen=500)
 _scan_skipped_file_conflict_events: deque = deque(maxlen=500)
+_scan_skipped_provider_mismatch_events: deque = deque(maxlen=500)
 _scan_saturated_events: deque = deque(maxlen=500)
 
 # Grace-window (activity-gated teardown hold) stage events. Each entry is a
@@ -385,6 +487,12 @@ def record_scan_skipped_pinned_vm() -> None:
 def record_scan_skipped_file_conflict() -> None:
     """Stage A: an eligibility scan skipped >=1 candidate via related_files conflict."""
     _scan_skipped_file_conflict_events.append(_utcnow())
+
+
+def record_scan_skipped_provider_mismatch() -> None:
+    """Stage A: an eligibility scan skipped >=1 candidate whose pinned/recorded
+    provider/account/model is incompatible with the reusing VM's boot manifest."""
+    _scan_skipped_provider_mismatch_events.append(_utcnow())
 
 
 def record_scan_saturated() -> None:
@@ -474,6 +582,9 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         ),
         "scan_polls_with_file_conflict_skip": sum(
             1 for ts in _scan_skipped_file_conflict_events if ts >= cutoff
+        ),
+        "scan_polls_with_provider_mismatch_skip": sum(
+            1 for ts in _scan_skipped_provider_mismatch_events if ts >= cutoff
         ),
         "scan_polls_saturated": sum(
             1 for ts in _scan_saturated_events if ts >= cutoff

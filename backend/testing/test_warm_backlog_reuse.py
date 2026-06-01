@@ -419,6 +419,133 @@ async def test_eligibility_skips_other_vm_pin(db_session):
     assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
 
 
+# ---------------------------------------------------------------------------
+# Provider-aware backlog reuse (a reused VM is locked to its boot manifest's
+# provider/account/model — never warm-claim a task pinned/recorded elsewhere)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_mismatch_task_is_ineligible(db_session):
+    """A task recorded to a different provider than the reusing VM's boot
+    account is excluded and fires the provider-mismatch scan funnel; a task on
+    the matching provider remains claimable."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Provider Mismatch")
+        vm_id = "agent-vm-provider"
+        vm_boot = {"provider": "anthropic"}
+
+        # Recorded to gemini -> incompatible with an anthropic-booted VM.
+        await _make_backlog_task(db_session, project.id, provider="gemini")
+        # Explicitly pinned to gemini via context -> also incompatible.
+        await _make_backlog_task(
+            db_session, project.id, context={"provider_preference": ["gemini"]}
+        )
+
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is False
+        )
+        assert (
+            await select_backlog_reuse_candidate(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is None
+        )
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_provider_mismatch_skip"] >= 1
+
+        # A matching-provider candidate is claimable on the same VM.
+        match = await _make_backlog_task(db_session, project.id, provider="anthropic")
+        picked = await select_backlog_reuse_candidate(
+            db_session, project.id, vm_id, vm_boot=vm_boot
+        )
+        assert picked is not None and picked.id == match.id
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_single_provider_project_still_warm_reuses(db_session):
+    """REGRESSION: the provider guard is a no-op for single-provider projects.
+
+    Even with ``vm_boot`` supplied, a task carrying no divergent constraint
+    (no recorded provider, or one matching the boot account) stays claimable so
+    single-provider projects keep warm-reusing exactly as before."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Single Provider")
+        vm_id = "agent-vm-single"
+        vm_boot = {"provider": "anthropic", "account_id": "acct-1", "model": "opus"}
+
+        # Fresh task with no recorded/pinned provider — fungible.
+        await _make_backlog_task(db_session, project.id)
+        # Task recorded to the same provider/account/model as the boot manifest.
+        await _make_backlog_task(
+            db_session,
+            project.id,
+            provider="anthropic",
+            account_id="acct-1",
+            model="opus",
+        )
+
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is True
+        )
+        assert (
+            await select_backlog_reuse_candidate(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is not None
+        )
+        # No task was provider-skipped — the guard stayed inert.
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_provider_mismatch_skip"] == 0
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_provider_guard_noop_when_vm_boot_absent(db_session):
+    """Omitting ``vm_boot`` disables the guard entirely — a task recorded to a
+    different provider is still eligible (pre-feature behavior preserved)."""
+    project = await _make_project(db_session, name="No Boot Identity")
+    vm_id = "agent-vm-noboot"
+    await _make_backlog_task(db_session, project.id, provider="gemini")
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    assert (
+        await select_backlog_reuse_candidate(db_session, project.id, vm_id) is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_match_with_divergent_account_is_ineligible(db_session):
+    """Same provider but a different recorded account is still incompatible —
+    the boot manifest freezes the account, not just the provider."""
+    project = await _make_project(db_session, name="Account Mismatch")
+    vm_id = "agent-vm-acct"
+    vm_boot = {"provider": "anthropic", "account_id": "acct-boot"}
+    await _make_backlog_task(
+        db_session, project.id, provider="anthropic", account_id="acct-other"
+    )
+    assert (
+        await select_backlog_reuse_candidate(
+            db_session, project.id, vm_id, vm_boot=vm_boot
+        )
+        is None
+    )
+
+
 @pytest.mark.asyncio
 async def test_in_progress_scan_computed_once_when_reused(db_session, mocker):
     """A caller pairing the eligibility gate with the claim can compute the
@@ -608,6 +735,7 @@ def _clear_funnel_events(wbr):
     wbr._scan_skipped_depends_on_events.clear()
     wbr._scan_skipped_pinned_vm_events.clear()
     wbr._scan_skipped_file_conflict_events.clear()
+    wbr._scan_skipped_provider_mismatch_events.clear()
     wbr._scan_saturated_events.clear()
 
 
