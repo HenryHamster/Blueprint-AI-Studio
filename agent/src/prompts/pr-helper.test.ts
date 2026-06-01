@@ -26,7 +26,15 @@ vi.mock('fs', () => ({
 
 import { writePrHelper } from './pr-helper.js';
 
-describe('writePrHelper', () => {
+// These are POSIX integration tests: they execFileSync('bash', …) on the
+// generated `pr` script, which hands the PR URL back through the hardcoded
+// /tmp/pr_url_<task> path (correct for the Linux agent VM). On Windows, Node's
+// `/tmp` resolves to a drive path (D:\tmp) while msys-bash writes to its own
+// /tmp, so the cross-process file handoff cannot be observed — skip there. The
+// suite runs in full on Linux CI.
+const describePosix = process.platform === 'win32' ? describe.skip : describe;
+
+describePosix('writePrHelper', () => {
   let capturedScripts: Record<string, string> = {};
 
   beforeEach(() => {

@@ -112,7 +112,9 @@ describe('hardcoded branch-literal regression guard (agent)', () => {
     const offenders: Offender[] = [];
 
     for (const file of files) {
-      const rel = path.relative(SRC_DIR, file);
+      // Normalize to forward slashes so the allowlist keys (which use '/')
+      // match on Windows, where path.relative yields backslash separators.
+      const rel = path.relative(SRC_DIR, file).split(path.sep).join('/');
       const raw = readFileSync(file, 'utf-8');
       const rawLines = raw.split('\n');
 

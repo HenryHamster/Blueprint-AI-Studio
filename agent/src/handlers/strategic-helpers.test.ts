@@ -1,8 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 
-const testWorkspace = '/tmp/test-strategic-helpers-workspace';
+// Use the OS temp dir (not a hardcoded /tmp) so this suite runs on Windows too.
+const testWorkspace = path.join(os.tmpdir(), 'test-strategic-helpers-workspace');
 
 describe('writeStrategicHelpers', () => {
   beforeEach(() => {
@@ -36,7 +39,14 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const stat = fs.statSync(`${testWorkspace}/strategic`);
-    expect((stat.mode & 0o111) !== 0).toBe(true); // Check execute bit
+    // POSIX execute bits are not modeled on Windows (mode & 0o111 is always 0
+    // there regardless of the requested 0o755), so the bit assertion only makes
+    // sense on POSIX. On Windows just assert the file was created.
+    if (process.platform === 'win32') {
+      expect(stat.isFile()).toBe(true);
+    } else {
+      expect((stat.mode & 0o111) !== 0).toBe(true); // Check execute bit
+    }
   });
 
   it('embeds taskId in strategic script safely', () => {
@@ -81,10 +91,16 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const strategicContent = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
-    // taskId is embedded in double quotes, so $ is literal
-    expect(strategicContent).toContain(`TASK="${taskId}"`);
-    // Verify the injection payload is not executed in the quoting context
-    expect(strategicContent).not.toContain('whoami');
+    // The `$` is backslash-escaped before being baked into the double-quoted
+    // TASK assignment, so bash sees a literal string, not a command substitution.
+    expect(strategicContent).toContain('TASK="test\\$(whoami)task"');
+    // The dangerous *unescaped* command-substitution form must NOT appear — that
+    // is the form that would actually run `whoami` at script load time. (We can't
+    // just assert the absence of the substring "$(whoami)" because the safe,
+    // escaped form "\$(whoami)" legitimately contains it.)
+    expect(strategicContent).not.toContain('TASK="test$(whoami)task"');
+    // Every "$(whoami)" occurrence must be backslash-escaped.
+    expect(/(^|[^\\])\$\(whoami\)/.test(strategicContent)).toBe(false);
   });
 
   it('prevents shell injection in projectId with special characters', () => {
@@ -93,8 +109,11 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const fetchContent = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    // projectId is embedded in double quotes, so $ is literal
-    expect(fetchContent).toContain(`PROJECT="${projectId}"`);
+    // The `$` is backslash-escaped so the substitution never executes.
+    expect(fetchContent).toContain('PROJECT="project\\$(echo hacked)id"');
+    expect(fetchContent).not.toContain('PROJECT="project$(echo hacked)id"');
+    // Every "$(echo hacked)" occurrence must be backslash-escaped.
+    expect(/(^|[^\\])\$\(echo hacked\)/.test(fetchContent)).toBe(false);
   });
 
   it('produces valid bash scripts with proper escaping', () => {

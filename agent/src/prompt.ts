@@ -493,7 +493,19 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 
 // ── Playbook helpers ─────────────────────────────────────────────────────────
 
-export function writePlaybookHelper(taskId: string): void {
+// Neutralize the four characters that retain meaning inside a double-quoted
+// bash string — backslash, double-quote, backtick, and dollar — so an id baked
+// into `TASK="<value>"` is a literal assignment even if it contains `$(...)`,
+// backticks, or quote-breakout attempts. ids are server-generated, so this is
+// defense-in-depth, not a primary trust boundary. The character class escapes
+// the backslash too, and `$&` re-emits the matched char prefixed with one
+// backslash, so each special char is neutralized exactly once.
+export function shellEscapeDoubleQuoted(value: string): string {
+  return value.replace(/[\\"`$]/g, '\\$&');
+}
+
+export function writePlaybookHelper(taskIdRaw: string): void {
+  const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 OP="\${1:?Usage: playbook get|set|list [key] [content]}"
 KEY="$2"
@@ -526,7 +538,8 @@ echo ""
   excludeAgentHelpers();
 }
 
-export function writeMessagesHelper(taskId: string): void {
+export function writeMessagesHelper(taskIdRaw: string): void {
+  const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
@@ -575,7 +588,8 @@ echo ""
 // expecting the client to retry (see backend/app/task_locking.py). A single
 // fail-fast curl would drop the page write silently, so set/delete retry a
 // bounded number of times, honoring Retry-After, before surfacing a real error.
-export function writeDesignDocHelper(taskId: string, workspace: string = WORKSPACE): void {
+export function writeDesignDocHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
+  const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
 # Design doc wiki tool — updates pages incrementally via API
 # Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)

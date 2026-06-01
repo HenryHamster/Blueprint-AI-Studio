@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { excludeAgentHelpers, writeDesignDocHelper } from '../prompt.js';
+import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted } from '../prompt.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -7,7 +7,8 @@ import { excludeAgentHelpers, writeDesignDocHelper } from '../prompt.js';
 // - fetch: detail-pull for items trimmed by the packer
 // - design-doc: CRUD operations for design document sections
 
-function generateStrategicScript(taskId: string): string {
+function generateStrategicScript(taskIdRaw: string): string {
+  const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
@@ -76,7 +77,8 @@ echo ""
 `;
 }
 
-function generateFetchScript(projectId: string): string {
+function generateFetchScript(projectIdRaw: string): string {
+  const projectId = shellEscapeDoubleQuoted(projectIdRaw);
   return `#!/bin/bash
 # Strategic-context fetch tool — pull detail for items the packer trimmed.
 # Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from env. project_id is baked in.

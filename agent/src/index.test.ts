@@ -78,6 +78,8 @@ import {
 import {
   MAX_TEST_FIX_ATTEMPTS,
   TOOL_USE_STALL_TIMEOUT_MS,
+  WORKFLOW_TOOL_STALL_TIMEOUT_MS,
+  isWorkflowToolName,
   CLAUDE_STREAM_STALL_MS,
   LLM_NO_PROGRESS_STALL_MS,
   TOKEN_REFRESH_FLOOR_MS,
@@ -3683,6 +3685,290 @@ describe('LLM-no-progress watchdog (C7 dual-staleness, robust to lost tool-resul
   });
 });
 
+// ── isWorkflowToolName ────────────────────────────────────────────────────────
+// The classifier that grants the longer in-flight silence budget to fan-out
+// tools. Matches the built-in Task/Agent tool, any "*workflow*" tool, and future
+// MCP-namespaced variants, case-insensitively, without an allowlist edit.
+describe('isWorkflowToolName', () => {
+  it('matches the built-in Task / Agent / Workflow tools (case-insensitive)', () => {
+    expect(isWorkflowToolName('Task')).toBe(true);
+    expect(isWorkflowToolName('task')).toBe(true);
+    expect(isWorkflowToolName('Agent')).toBe(true);
+    expect(isWorkflowToolName('Workflow')).toBe(true);
+  });
+
+  it('matches future custom / MCP-namespaced workflow + sub-agent tools by substring', () => {
+    expect(isWorkflowToolName('mcp__workflow__run')).toBe(true);
+    expect(isWorkflowToolName('RunSubAgentWorkflow')).toBe(true);
+    expect(isWorkflowToolName('mcp__claude__Task')).toBe(true);
+  });
+
+  it('does NOT match ordinary tools', () => {
+    expect(isWorkflowToolName('Bash')).toBe(false);
+    expect(isWorkflowToolName('Read')).toBe(false);
+    expect(isWorkflowToolName('Edit')).toBe(false);
+    expect(isWorkflowToolName('Grep')).toBe(false);
+    expect(isWorkflowToolName(undefined)).toBe(false);
+    expect(isWorkflowToolName('')).toBe(false);
+  });
+});
+
+// ── long-running workflow / sub-agent fan-out does not false-trip watchdogs ────
+// Root-cause regression for the ~20-min thrash loop: a Blueprint agent that
+// invokes a long-running workflow / sub-agent fan-out (the built-in Task/Agent
+// tool, or the prompt-guided parallel-review/parallel-fix fan-out, which is the
+// SAME built-in tool) makes the parent's top-level stream go quiet for >12 min
+// while the workflow runs. Pre-fix, the C7 dual-staleness no-progress watchdog
+// fired (lastToolUseAt aged past LLM_NO_PROGRESS_STALL_MS) → RateLimitError →
+// the orchestrator requeued the task as rate_limited with ZERO real 429/529.
+// The fix: nested sub-agent events (parent_tool_use_id set) count as in-flight
+// tool sub-progress, keeping lastToolProgressAt fresh so neither the no-progress
+// nor the tool-use-stall watchdog false-fires — while a workflow that goes
+// genuinely silent (no sub-progress at all) still eventually times out.
+describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
+  type StdoutCb = (data: Buffer) => void;
+  type ChildHandlers = {
+    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
+    error?: (err: Error) => void;
+  };
+
+  function makeChild(pid: number) {
+    const stdoutCbs: StdoutCb[] = [];
+    const handlers: ChildHandlers = {};
+    const child = {
+      pid,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdin: { end: vi.fn() },
+      stdout: {
+        on: vi.fn((event: string, cb: StdoutCb) => {
+          if (event === 'data') stdoutCbs.push(cb);
+        }),
+      },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'close') handlers.close = cb as ChildHandlers['close'];
+        else if (event === 'error') handlers.error = cb as ChildHandlers['error'];
+      }),
+    };
+    const emitStdout = (line: string) => {
+      for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
+    };
+    return { child, handlers, emitStdout };
+  }
+
+  // A nested sub-agent event: carries parent_tool_use_id, so the parser treats
+  // it as in-flight sub-progress for the parent's workflow tool rather than as a
+  // top-level model turn. This is exactly what a Task/Agent fan-out streams while
+  // its sub-agents work.
+  const nestedSubAgentEvent = (parentId: string, i: number) => JSON.stringify({
+    type: 'assistant',
+    parent_tool_use_id: parentId,
+    message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: `/sub/${i}` } }] },
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.mocked(spawn).mockReset();
+    clearPidRegistry();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearPidRegistry();
+  });
+
+  it('does NOT fire no-progress OR tool-use-stall while a workflow tool streams nested sub-agent progress past every window', async () => {
+    const { child, handlers, emitStdout } = makeChild(7901);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Parent invokes the workflow/Task tool. No top-level content events follow
+    // for the entire fan-out — only nested sub-agent events. Pre-fix this is the
+    // exact shape that tripped the no-progress watchdog into a false rate_limited.
+    const PARENT_ID = 'toolu_workflow_parent';
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Task', id: PARENT_ID, input: { description: 'fan out review' } }] },
+    }));
+
+    // Run the fan-out well past BOTH the no-progress window AND the ordinary
+    // tool-use-stall window, streaming nested sub-agent progress in steps shorter
+    // than the no-progress window. Each nested event refreshes lastToolProgressAt.
+    const totalMs = Math.max(LLM_NO_PROGRESS_STALL_MS, TOOL_USE_STALL_TIMEOUT_MS) + 5 * 60_000;
+    const STEP = LLM_NO_PROGRESS_STALL_MS - 120_000;
+    let remaining = totalMs;
+    let i = 0;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(nestedSubAgentEvent(PARENT_ID, i++));
+      remaining -= STEP;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+
+    // No watchdog fired — the workflow was legitimately busy the whole time.
+    expect(killSpy).not.toHaveBeenCalledWith(-7901, 'SIGTERM');
+
+    // The workflow finishes and the parent emits its terminal result.
+    emitStdout(JSON.stringify({ type: 'user' }));
+    emitStdout(JSON.stringify({ type: 'result', result: 'review complete' }));
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await vi.runAllTimersAsync();
+    const result = await promise;
+    expect(result.exitCode).toBe(0);
+    // Critically: the call did NOT resolve as a rate-limit requeue.
+    expect(killSpy).not.toHaveBeenCalledWith(-7901, 'SIGTERM');
+
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it('a nested sub-agent tool-result (user) event does NOT clear the parent workflow tool', async () => {
+    const { child, handlers, emitStdout } = makeChild(7902);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    const PARENT_ID = 'toolu_workflow_parent_2';
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Task', id: PARENT_ID, input: {} }] },
+    }));
+
+    // A sub-agent finishes one of its own tool calls — a NESTED `user` event.
+    // Pre-fix this would have set toolInFlight=false, re-exposing the parent to a
+    // false no-progress fire. The parent's Task tool is still running, so it must
+    // stay in flight. Then the fan-out goes silent for a while but still under
+    // the workflow budget, kept alive by nested progress.
+    emitStdout(JSON.stringify({ type: 'user', parent_tool_use_id: PARENT_ID }));
+
+    // Advance past the no-progress window with only periodic nested progress.
+    const STEP = LLM_NO_PROGRESS_STALL_MS - 120_000;
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(nestedSubAgentEvent(PARENT_ID, i));
+    }
+
+    expect(killSpy).not.toHaveBeenCalledWith(-7902, 'SIGTERM');
+
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await vi.runAllTimersAsync();
+    await promise.catch(() => undefined);
+    killSpy.mockRestore();
+  });
+
+  // Helper: keep the top-level CONTENT stream fresh (so the no-progress watchdog
+  // cannot fire) while the in-flight TOOL itself emits no sub-progress. This
+  // isolates the tool-use-stall watchdog and its workflow-aware silence budget.
+  // A top-level `assistant` text event resets lastStreamEventAt AND the raw-stdout
+  // stall watchdog (via stdout.on('data')), but is NOT a nested sub-agent event,
+  // so it does NOT refresh lastToolProgressAt — the in-flight tool stays "silent".
+  const freshContentKeepalive = (emitStdout: (s: string) => void) => {
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'parent still thinking' }] },
+    }));
+  };
+
+  it('STILL fires tool-use-stall (SIGTERM) when a workflow tool goes silent past the LARGER workflow budget, but NOT before', async () => {
+    const { child, handlers, emitStdout } = makeChild(7903);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Workflow tool starts, then emits NO sub-progress — a genuinely hung
+    // fan-out. Top-level content is kept fresh so the no-progress watchdog stays
+    // out of it; only the tool-use-stall watchdog (workflow budget) can fire.
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Task', input: {} }] },
+    }));
+
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 60_000;
+
+    // Past the SHORTER ordinary tool-use budget — a workflow must NOT be killed
+    // here, proving the larger budget is in effect.
+    let elapsed = 0;
+    const beforeTarget = TOOL_USE_STALL_TIMEOUT_MS + 120_000;
+    while (elapsed < beforeTarget) {
+      const step = Math.min(STEP, beforeTarget - elapsed);
+      await vi.advanceTimersByTimeAsync(step);
+      elapsed += step;
+      freshContentKeepalive(emitStdout);
+    }
+    expect(killSpy).not.toHaveBeenCalledWith(-7903, 'SIGTERM');
+
+    // Continue past the larger workflow budget — now it must fire (hangs are
+    // bounded, not immortal).
+    const afterTarget = WORKFLOW_TOOL_STALL_TIMEOUT_MS + 120_000;
+    while (elapsed < afterTarget) {
+      const step = Math.min(STEP, afterTarget - elapsed);
+      await vi.advanceTimersByTimeAsync(step);
+      elapsed += step;
+      freshContentKeepalive(emitStdout);
+    }
+    expect(killSpy).toHaveBeenCalledWith(-7903, 'SIGTERM');
+
+    // Attach the rejection assertion BEFORE flushing so the eventual rejection is
+    // never momentarily unhandled when the drain's setImmediate macrotasks settle
+    // the promise under runAllTimersAsync.
+    const rejection = expect(promise).rejects.toBeInstanceOf(ClaudeTimeoutError);
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+    // close() routes through drainPendingThenResolve, whose drain yields via
+    // setImmediate macrotasks that fake timers do not auto-flush — drain them so
+    // the promise settles instead of hanging to the test timeout.
+    await vi.runAllTimersAsync();
+    await rejection;
+    killSpy.mockRestore();
+  }, 20_000);
+
+  it('an ordinary (non-workflow) tool that goes silent still times out at the SHORTER tool-use budget', async () => {
+    const { child, handlers, emitStdout } = makeChild(7904);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+
+    // Ordinary Bash tool — NOT a workflow — gets the shorter TOOL_USE_STALL budget.
+    emitStdout(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'sleep 9999' } }] },
+    }));
+
+    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 60_000;
+    let elapsed = 0;
+    const target = TOOL_USE_STALL_TIMEOUT_MS + 120_000;
+    while (elapsed < target) {
+      const step = Math.min(STEP, target - elapsed);
+      await vi.advanceTimersByTimeAsync(step);
+      elapsed += step;
+      freshContentKeepalive(emitStdout);
+    }
+
+    expect(killSpy).toHaveBeenCalledWith(-7904, 'SIGTERM');
+
+    const rejection = expect(promise).rejects.toBeInstanceOf(ClaudeTimeoutError);
+    child.exitCode = 143;
+    child.signalCode = 'SIGTERM';
+    handlers.close?.(143, 'SIGTERM');
+    await vi.runAllTimersAsync();
+    await rejection;
+    killSpy.mockRestore();
+  }, 20_000);
+});
+
 // ── final drain awaits in-flight drain (cluster C7) ───────────────────────────
 // Regression: drainPendingThenResolve's boolean mutex made drainJsonChunks()
 // early-return when a drain was already active, so the process promise resolved
@@ -3985,7 +4271,10 @@ describe('cross-language classification contracts', () => {
     // so we can read real source files for the contract assertions.
     const realFs = await vi.importActual<typeof import('fs')>('fs');
     const nodePath = await import('node:path');
-    const dir = new URL('.', import.meta.url).pathname;
+    const nodeUrl = await import('node:url');
+    // fileURLToPath (not URL.pathname) so Windows does not yield a leading-slash
+    // '/D:/…' that path.join then doubles into an invalid 'D:\D:\…' path.
+    const dir = nodePath.dirname(nodeUrl.fileURLToPath(import.meta.url));
     classifierSrc = realFs.readFileSync(
       nodePath.join(dir, '..', '..', 'backend', 'app', 'failure_classification.py'),
       'utf-8',
