@@ -7788,6 +7788,97 @@ async def test_completed_terminal_populates_terminated_cache(
 
 
 @pytest.mark.asyncio
+async def test_terminal_to_nonterminal_transition_emits_revive_notify(
+    db_session, mocker
+):
+    """A genuine terminal → non-terminal (requeue) status transition fires the
+    cross-instance revive NOTIFY via the before_flush listener.
+
+    This is the fix for the asymmetric coherency bug: TERMINAL was already
+    broadcast cross-instance, but REVIVE was evicted in-process only, so a
+    requeued task's heartbeat could load-balance to a stale instance and 401.
+    """
+    revive_calls = mocker.patch("app.jwt_revocation.emit_task_revived_notify")
+
+    project = Project(name="Revive Notify Test", user_id="test-user-revive-notify")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed the task already terminal (FAILED) so the requeue is a real
+    # terminal → non-terminal transition.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test"}],
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    # Reset call count so only the requeue transition is observed.
+    revive_calls.reset_mock()
+
+    # Requeue: FAILED → QUEUED.
+    task.status = TaskStatus.QUEUED
+    db_session.add(task)
+    await db_session.commit()
+
+    assert revive_calls.call_count == 1, (
+        f"terminal → non-terminal transition must emit exactly one revive "
+        f"notify, got {revive_calls.call_count}"
+    )
+    # Second positional arg is the task id string.
+    emitted_tid = revive_calls.call_args[0][1]
+    assert emitted_tid == task_id_str, (
+        f"revive notify should carry the requeued task id, got {emitted_tid}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_normal_nonterminal_transition_does_not_emit_revive_notify(
+    db_session, mocker
+):
+    """A normal non-terminal lifecycle step (QUEUED → PROVISIONING → IN_PROGRESS)
+    must NOT fire the revive NOTIFY — only a real terminal → non-terminal
+    transition does, to avoid cross-instance notify spam.
+    """
+    revive_calls = mocker.patch("app.jwt_revocation.emit_task_revived_notify")
+
+    project = Project(name="No Revive Spam Test", user_id="test-user-no-revive-spam")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Start non-terminal (QUEUED) so no transition crosses the terminal boundary.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "test"}],
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    revive_calls.reset_mock()
+
+    # Ordinary forward lifecycle: none of these crosses terminal → non-terminal.
+    task.status = TaskStatus.PROVISIONING
+    db_session.add(task)
+    await db_session.commit()
+
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    assert revive_calls.call_count == 0, (
+        f"normal non-terminal lifecycle steps must NOT emit revive notify, "
+        f"got {revive_calls.call_count} call(s)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_requeue_allows_subsequent_claim(
     client: AsyncClient, db_session, mocker
 ):

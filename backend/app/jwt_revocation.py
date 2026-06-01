@@ -23,6 +23,11 @@ from app.database import enable_tcp_keepalive, split_listen_dsn
 logger = logging.getLogger(__name__)
 
 _NOTIFY_CHANNEL = "task_terminated"
+# Symmetric channel for the inverse transition: a task leaving a terminal
+# status (requeue/revive). Broadcast so EVERY instance evicts its stale
+# deny-list entry, not just the one that handled the requeue flush. See
+# models.py:_emit_jwt_revocation_on_terminal for the asymmetry this closes.
+_REVIVE_NOTIFY_CHANNEL = "task_revived"
 # True when the process is connected to Postgres; controls no-op guards.
 _IS_POSTGRES = "postgresql" in (os.getenv("DATABASE_URL") or "")
 
@@ -191,13 +196,29 @@ async def jwt_revocation_service() -> None:
                     payload,
                 )
 
+        def _on_revive_notify(conn, pid, channel, payload):  # noqa: ANN001
+            # Inverse of _on_notify: a task left terminal (requeue), so evict the
+            # stale deny-list entry on THIS instance. Without the cross-instance
+            # broadcast, only the instance that handled the requeue flush would
+            # evict, and the new VM's heartbeat could load-balance to a stale
+            # instance and get a spurious 401. The pop is safe: the DB-proof path
+            # re-adds the entry if the task is genuinely terminal.
+            if payload:
+                _terminated_task_ids.pop(payload, None)
+                logger.debug(
+                    "[JWT_REVOCATION] Received task_revived notify for task %s",
+                    payload,
+                )
+
         try:
             conn.add_termination_listener(_on_terminate)
             await conn.add_listener(_NOTIFY_CHANNEL, _on_notify)
+            await conn.add_listener(_REVIVE_NOTIFY_CHANNEL, _on_revive_notify)
             await _seed_deny_list(conn, _terminated_task_ids)
             logger.info(
-                "[JWT_REVOCATION] LISTEN %s — cross-instance revocation active",
+                "[JWT_REVOCATION] LISTEN %s/%s — cross-instance revocation active",
                 _NOTIFY_CHANNEL,
+                _REVIVE_NOTIFY_CHANNEL,
             )
 
             # Block until the server terminates the connection OR a liveness
@@ -258,6 +279,37 @@ def emit_task_terminated_notify(session, task_id: str) -> None:
     except Exception as exc:
         logger.warning(
             "[JWT_REVOCATION] emit_task_terminated_notify failed for task %s: %s",
+            task_id,
+            exc,
+        )
+
+
+def emit_task_revived_notify(session, task_id: str) -> None:
+    """Sync helper: issue pg_notify on the revive channel inside the transaction.
+
+    Mirror of ``emit_task_terminated_notify`` for the inverse transition: a
+    task leaving a terminal status (requeue/revive). Broadcasting this lets
+    EVERY Cloud Run instance evict the stale ``_terminated_task_ids`` entry,
+    not just the single instance that handled the requeue flush. Without it,
+    the requeued task's new VM heartbeat can load-balance to an instance that
+    still holds the stale deny-list entry and get a spurious 401, so the whole
+    retry is doomed until the 75-min TTL clears the entry.
+
+    Designed for use in SQLAlchemy ``before_flush`` event listeners (sync
+    Session). NOTIFY is transactional, so listeners observe the revive only
+    after commit. No-ops on non-Postgres dialects; exceptions are swallowed so
+    a NOTIFY failure never aborts the status mutation.
+    """
+    if not _IS_POSTGRES:
+        return
+    try:
+        session.execute(
+            text("SELECT pg_notify(:channel, :tid)"),
+            {"channel": _REVIVE_NOTIFY_CHANNEL, "tid": task_id},
+        )
+    except Exception as exc:
+        logger.warning(
+            "[JWT_REVOCATION] emit_task_revived_notify failed for task %s: %s",
             task_id,
             exc,
         )
