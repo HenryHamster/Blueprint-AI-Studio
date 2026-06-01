@@ -853,6 +853,31 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(steps).not.toMatch(/Bump .* \(MANDATORY\)/);
     // The migration workflow itself still runs.
     expect(steps).toContain('alembic revision --autogenerate');
+    // Remaining steps renumber contiguously (no gap at 4): review/apply/
+    // downgrade/finish become 4–7 rather than leaving 4 missing.
+    expect(steps).toContain('4. **Review the generated migration**');
+    expect(steps).toContain('5. **Test the migration applies cleanly**');
+    expect(steps).toContain('6. **Test downgrade**');
+    expect(steps).toMatch(/7\. Once migration applies cleanly/);
+    expect(steps).not.toMatch(/8\. Once migration applies cleanly/);
+  });
+
+  it('numbers the schema-revision step 4 and renumbers the rest 5–8 when a gate is declared', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'backend', type: 'python' }],
+      migration: {},
+    });
+    await handleMigrate(
+      TASK_ID,
+      { ...BASE_PAYLOAD, prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const steps = coreMigrateSteps(capturedMigratePrompt());
+    expect(steps).toMatch(/4\. \*\*Bump EXPECTED_SCHEMA_REVISION \(MANDATORY\)\*\*/);
+    expect(steps).toContain('5. **Review the generated migration**');
+    expect(steps).toContain('6. **Test the migration applies cleanly**');
+    expect(steps).toContain('7. **Test downgrade**');
+    expect(steps).toMatch(/8\. Once migration applies cleanly/);
   });
 });
 
@@ -984,6 +1009,40 @@ describe('handleMigrate — migrate self-review focus block', () => {
     const focusIdx = prompt.indexOf('Self-review focus: migrate tasks');
     expect(guidanceIdx).toBeGreaterThanOrEqual(0);
     expect(focusIdx).toBeGreaterThan(guidanceIdx);
+  });
+
+  // Extract just the migrate self-review focus block (bounded at the next
+  // "## " heading) so assertions don't pick up unrelated later guidance such
+  // as READ_THE_FAILURE_MESSAGE, which also mentions EXPECTED_SCHEMA_REVISION.
+  const sliceMigrateFocus = (prompt: string): string => {
+    const start = prompt.indexOf('## Self-review focus: migrate tasks');
+    const rest = prompt.slice(start + 1);
+    const nextHeading = rest.indexOf('\n## ');
+    return nextHeading >= 0 ? rest.slice(0, nextHeading) : rest;
+  };
+
+  it('focus block emits the project schema-revision file/constant and does not leak Blueprint paths', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python' }],
+      migration: { schema_revision_file: 'svc/app/config.py', schema_revision_const: 'SCHEMA_REV' },
+    } as ReturnType<typeof resolveBuildConfig>);
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const focus = sliceMigrateFocus(capturedMigratePrompt());
+    expect(focus).toContain('SCHEMA_REV');
+    expect(focus).toContain('svc/app/config.py');
+    expect(focus).not.toContain('EXPECTED_SCHEMA_REVISION');
+    expect(focus).not.toContain('backend/app/main.py');
+  });
+
+  it('focus block omits the schema-revision step when the project declares no gate', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python' }],
+      migration: { schema_revision_file: '' },
+    } as ReturnType<typeof resolveBuildConfig>);
+    await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const focus = sliceMigrateFocus(capturedMigratePrompt());
+    expect(focus).not.toContain('EXPECTED_SCHEMA_REVISION');
+    expect(focus).not.toContain('backend/app/main.py');
   });
 
 });

@@ -40,6 +40,8 @@ export function detectMigrationConflict(
 export function buildMigrationConflictGuidance(
   c: MigrationConflict,
   versionsDir: string = ALEMBIC_VERSIONS_DIR,
+  schemaRevisionFile: string = 'backend/app/main.py',
+  schemaRevisionConst: string = 'EXPECTED_SCHEMA_REVISION',
 ): string {
   if (!c.detected) return '';
   const latestBase = [...c.baseNewMigrations].sort().pop() || '';
@@ -59,6 +61,17 @@ export function buildMigrationConflictGuidance(
     ? `${versionsDir}${nextRev}_${prDesc}.py`
     : '';
   const concrete = nextRev && latestRev;
+  // Schema-revision step (step 4) is emitted only when the project declares a
+  // schema-revision gate. A repo with none passes schemaRevisionFile='' and the
+  // step — and its number — drop out, so the final test step renumbers 5→4 and
+  // no Blueprint file is ever named.
+  const hasSchemaRevisionGate = schemaRevisionFile !== '';
+  const schemaStep = hasSchemaRevisionGate
+    ? (concrete
+      ? `4. Set \`${schemaRevisionConst} = "${nextRev}"\` in ${schemaRevisionFile} to match the renumbered revision.\n`
+      : `4. Bump \`${schemaRevisionConst}\` in ${schemaRevisionFile} to match the renumbered revision id.\n`)
+    : '';
+  const testStepNum = hasSchemaRevisionGate ? 5 : 4;
   return (
     `## Migration revision conflict\n` +
     `This PR adds alembic migration file(s):\n${c.prMigrations.map(f => `  - ${f}`).join('\n')}\n` +
@@ -68,12 +81,11 @@ export function buildMigrationConflictGuidance(
     (concrete
       ? `1. Latest base-branch migration is ${latestBase} (revision="${latestRev}"). Open it to confirm its \`revision\` string matches "${latestRev}".\n` +
         `2. Rename this PR's migration to ${renamedFile} and set \`revision = "${nextRev}"\` inside it.\n` +
-        `3. Set this PR's migration \`down_revision = "${latestRev}"\` so the chain is linear.\n` +
-        `4. Set \`EXPECTED_SCHEMA_REVISION = "${nextRev}"\` in backend/app/main.py to match the renumbered revision.\n`
+        `3. Set this PR's migration \`down_revision = "${latestRev}"\` so the chain is linear.\n`
       : `1. Read the latest migration on the base branch (${latestBase}) to obtain its revision id.\n` +
         `2. Rename this PR's migration file to the next sequential numeric prefix AFTER the base branch's latest, and update its \`revision\` string to a fresh unique id.\n` +
-        `3. Set this PR's migration \`down_revision\` to the base branch's latest revision id so the chain is linear.\n` +
-        `4. Bump \`EXPECTED_SCHEMA_REVISION\` in backend/app/main.py to match the renumbered revision id.\n`) +
-    `5. Re-run the backend tests (\`bash scripts/test-backend.sh\`) to confirm the chain applies cleanly.\n\n`
+        `3. Set this PR's migration \`down_revision\` to the base branch's latest revision id so the chain is linear.\n`) +
+    schemaStep +
+    `${testStepNum}. Re-run the backend tests (\`bash scripts/test-backend.sh\`) to confirm the chain applies cleanly.\n\n`
   );
 }

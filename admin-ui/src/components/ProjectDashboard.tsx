@@ -1,7 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings } from 'lucide-react';
 import type { Task } from './TaskCard';
 import { parseTimestamp } from '../utils/time';
+import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
+import { fetchApprovalGateConfig, updateApprovalGateConfig, type ApprovalGateConfigResponse } from '../api';
 
 export type { Project } from '../types/project';
 import type { Project } from '../types/project';
@@ -45,6 +47,47 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
     const stored = localStorage.getItem('projectDashboardCollapsed');
     return stored === null ? true : stored === 'true';
   });
+  const [approvalGateState, setApprovalGateState] = useState<ApprovalGateConfigResponse | null>(null);
+  const selectedProject = projects.find(p => p.id === selectedProjectId) ?? null;
+  const approvalGateData = selectedProjectId
+    ? (approvalGateState?.project_id === selectedProjectId
+      ? approvalGateState
+      : { project_id: selectedProjectId, approval_gate_config: { infra_files: [], critical_files: [] }, is_default: true })
+    : null;
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    let cancelled = false;
+    fetchApprovalGateConfig(selectedProjectId)
+      .then(data => {
+        if (cancelled) return;
+        setApprovalGateState(data?.approval_gate_config ? data : {
+          project_id: selectedProjectId,
+          approval_gate_config: { infra_files: [], critical_files: [] },
+          is_default: true,
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setApprovalGateState({
+            project_id: selectedProjectId,
+            approval_gate_config: { infra_files: [], critical_files: [] },
+            is_default: true,
+          });
+        }
+      });
+    return () => { cancelled = true; };
+  }, [selectedProjectId]);
+
+  const handleSaveApprovalGate = async (config: ApprovalGateConfigResponse['approval_gate_config']) => {
+    if (!selectedProjectId) return;
+    const data = await updateApprovalGateConfig(selectedProjectId, config);
+    setApprovalGateState(data?.approval_gate_config ? data : {
+      project_id: selectedProjectId,
+      approval_gate_config: config,
+      is_default: false,
+    });
+  };
 
   if (projects.length === 0) return null;
 
@@ -216,6 +259,15 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
             );
           })}
           </div>
+          {selectedProject && (
+            <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4">
+              <ProjectApprovalGateSection
+                data={approvalGateData}
+                canSave={selectedProject.my_role === 'owner'}
+                onSave={handleSaveApprovalGate}
+              />
+            </div>
+          )}
         </>
       )}
     </div>
