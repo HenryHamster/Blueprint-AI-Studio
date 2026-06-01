@@ -380,7 +380,8 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     }
   }
 
-  // No PR opened. Did Claude make any changes?
+  // No PR opened and no ./done|./fail|./blocked marker. Did Claude make any
+  // changes?
   let hasChanges = false;
   try {
     const diff = git(['status', '--porcelain']);
@@ -388,14 +389,27 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     hasChanges = diff.length > 0 || head !== opts.baseCommit;
   } catch { /* git may be in odd state */ }
 
+  // SAFEGUARD (2026-06-01): a bare no-diff clean exit is NOT auto-completed.
+  //
+  // The previous behaviour completed ANY no-diff clean exit when
+  // `noChangesMessage` was set — a passive "no diff ⇒ COMPLETED" rule. That let
+  // a task that produced no diff because the agent gave up, errored before
+  // editing, or simply stopped early masquerade as a legitimate "nothing to do"
+  // success. The canonical no-op completion is now an AFFIRMATIVE signal:
+  // `./done --already-done "<reason>"` (done-helper.ts), which posts COMPLETED
+  // (no PR) with a verified reason and writes /tmp/done_<id> — handled by the
+  // marker check above (line ~321). Reaching here means the agent did NOT make
+  // that affirmation, so a no-diff exit is treated as `incomplete` and FAILS:
+  // the retry/operator then sees the agent never shipped or signalled. This is
+  // the false-completion guard required by the redundant-no-op work — the only
+  // path to a no-PR COMPLETED is the explicit ./done --already-done verb.
   if (!hasChanges && exitCode === 0 && opts.noChangesMessage) {
-    // Edge case: Claude legitimately decided no changes were needed (e.g. a
-    // docs task where the codebase is already documented). Treat as success.
-    sendLog(ws, '[wrapper] No changes detected and Claude exited cleanly. Posting COMPLETED.\n');
-    await persistAndPostStatus(taskId, {
-      task_id: taskId, status: 'COMPLETED', logs: opts.noChangesMessage,
-    });
-    return;
+    sendLog(
+      ws,
+      '[wrapper] No diff and no ./done|./fail|./blocked. The agent did not affirmatively ' +
+      'signal "already done" via ./done --already-done — treating as incomplete (NOT a ' +
+      'silent COMPLETED).\n',
+    );
   }
 
   // Anything else is a failure: Claude exited without shipping. Capture the
@@ -403,7 +417,11 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
   // what actually happened (the lint-output-capture commit 0a35f0b8 is for
   // wrapper-driven lint loops; this captures the Claude session output).
   const reason = exitCode === 0
-    ? 'Claude exited without calling ./done, ./fail, or opening a PR. Task did not ship.'
+    ? (!hasChanges
+        ? 'Claude exited with no diff and without calling ./done (incl. ./done --already-done), ' +
+          './fail, or ./blocked. If the deliverable already exists, the agent must affirmatively ' +
+          'call ./done --already-done "<reason>"; a bare no-diff exit is treated as incomplete.'
+        : 'Claude exited without calling ./done, ./fail, or opening a PR. Task did not ship.')
     : `Claude subprocess exited with code ${exitCode} without shipping a PR.`;
   const logs = `${reason}\n\n--- Claude output tail ---\n${sanitize(allOutput.slice(-10_000))}`;
   sendLog(ws, `[wrapper] ${reason}\n`);

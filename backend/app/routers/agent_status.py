@@ -1060,6 +1060,18 @@ async def update_agent_status(
         ctx["scope_gate_triggered"] = payload.scope_gate_triggered
         task.context = ctx
         flag_modified(task, "context")
+    if payload.no_op_reason:
+        # Affirmative no-op completion (`./done --already-done`): the agent
+        # verified the deliverable already exists on the base branch, so there
+        # is no PR/diff. Persist the reason so operators (and the task detail
+        # view) can see WHY a COMPLETED task has no PR — and so a no-PR
+        # completion is distinguishable from a dropped/abandoned one. The
+        # `logs` field already carries the same reason and lands in
+        # latest_status_message via the no-artifact branch below.
+        ctx = dict(task.context or {})
+        ctx["no_op_reason"] = payload.no_op_reason[:2000]
+        task.context = ctx
+        flag_modified(task, "context")
     if payload.file_change_details:
         ctx = dict(task.context or {})
         ctx["_file_change_details"] = payload.file_change_details[:50]

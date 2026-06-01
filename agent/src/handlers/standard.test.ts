@@ -1370,7 +1370,11 @@ describe('runCodeChangeTask marker detection', () => {
     );
   });
 
-  it('posts COMPLETED with the no-changes message when Claude exits cleanly with no diff and noChangesMessage is set', async () => {
+  it('FAILS as incomplete (NOT a silent COMPLETED) on a bare no-diff clean exit even when noChangesMessage is set', async () => {
+    // SAFEGUARD (2026-06-01): the passive "no diff ⇒ COMPLETED" rule was removed.
+    // A no-op completion now requires the affirmative ./done --already-done verb
+    // (which writes /tmp/done_<id>). Without that marker, a no-diff exit is
+    // `incomplete` so a give-up/error cannot masquerade as "nothing to do".
     const fs = (await import('fs')).default;
     const idx = await import('../index.js');
     vi.mocked(fs.existsSync).mockReturnValue(false);
@@ -1385,10 +1389,28 @@ describe('runCodeChangeTask marker detection', () => {
     expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
       TASK_ID,
       expect.objectContaining({
-        status: 'COMPLETED',
-        logs: 'No documentation changes needed.',
+        status: 'FAILED',
+        failure_category: 'incomplete',
       }),
     );
+    // It must NOT silently complete with the no-changes message.
+    const completed = vi.mocked(idx.persistAndPostStatus).mock.calls.filter(
+      c => c[1].status === 'COMPLETED',
+    );
+    expect(completed).toHaveLength(0);
+  });
+
+  it('exits cleanly (no terminal post) when ./done --already-done wrote the done marker', async () => {
+    // Affirmative no-op completion: ./done --already-done already posted
+    // COMPLETED (no PR) and wrote /tmp/done_<id>; the wrapper just exits.
+    const fs = (await import('fs')).default;
+    const idx = await import('../index.js');
+    vi.mocked(fs.existsSync).mockImplementation((p) =>
+      String(p) === `/tmp/done_${TASK_ID}`,
+    );
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await realRunCodeChangeTask({ ...baseOpts(), noChangesMessage: 'No documentation changes needed.' });
+    expect(vi.mocked(idx.persistAndPostStatus)).not.toHaveBeenCalled();
   });
 
   it('cleans up stale markers from a prior attempt before running Claude', async () => {

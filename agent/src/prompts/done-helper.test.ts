@@ -306,3 +306,128 @@ describe('writeDoneHelper — thinning categories gate', () => {
     expect(doneScript).toContain('file:line anchor');
   });
 });
+
+// ── writeDoneHelper — --already-done (affirmative no-op completion) ────────────
+describe('writeDoneHelper — --already-done no-op completion', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('emits an --already-done branch that posts COMPLETED with no PR and a no_op_reason', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-1',
+      workBranch: 'blueprint/noop-task-1',
+      baseBranch: 'plan/3a47191b',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // The flag is parsed.
+    expect(doneScript).toContain('--already-done');
+    expect(doneScript).toContain('ALREADY_DONE_REASON');
+    // The no-op branch posts COMPLETED with a no_op_reason field and NO pr_url.
+    expect(doneScript).toContain('status: "COMPLETED", no_op_reason: $r');
+    // The branch runs BEFORE the PR-file requirement (so it does not need ./pr open).
+    const noopIdx = doneScript.indexOf('if [ -n "$ALREADY_DONE_REASON" ]; then');
+    const prFileIdx = doneScript.indexOf('PR_FILE="/tmp/pr_url_noop-task-1"');
+    expect(noopIdx).toBeGreaterThan(-1);
+    expect(prFileIdx).toBeGreaterThan(-1);
+    expect(noopIdx).toBeLessThan(prFileIdx);
+    // It writes the done marker on success so the wrapper exits cleanly.
+    expect(doneScript).toContain('touch /tmp/done_noop-task-1');
+    // Operator-facing status text explains the missing PR.
+    expect(doneScript).toContain('deliverable already present');
+  });
+
+  it('requires an affirmative reason of at least 30 chars for --already-done', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-2',
+      workBranch: 'blueprint/noop-task-2',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    // Empty-reason guard.
+    expect(doneScript).toContain('--already-done requires a reason argument');
+    // Minimum-length guard (≥30) so a vacuous "done" cannot land COMPLETED.
+    expect(doneScript).toContain('--already-done reason must be at least 30 chars');
+    expect(doneScript).toContain('lt 30');
+  });
+
+  it('makes --already-done and --warn-out-of-scope mutually exclusive', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-3',
+      workBranch: 'blueprint/noop-task-3',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('mutually exclusive');
+  });
+
+  it('does not require ./pr open for the --already-done path (no PR_FILE gate inside the branch)', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-4',
+      workBranch: 'blueprint/noop-task-4',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    // The no-op branch must exit 0 before the standard PR-required path runs.
+    const branch = doneScript.slice(
+      doneScript.indexOf('if [ -n "$ALREADY_DONE_REASON" ]; then'),
+      doneScript.indexOf('PR_FILE="/tmp/pr_url_noop-task-4"'),
+    );
+    expect(branch).toContain('exit 0');
+    // And the no-op branch never reads the pr_url marker file.
+    expect(branch).not.toContain('pr_url_noop-task-4');
+  });
+
+  it('generated ./done script (with the --already-done branch) passes `bash -n` syntax check', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({
+      taskId: 'noop-task-5',
+      workBranch: 'blueprint/noop-task-5',
+      baseBranch: 'plan/3a47191b',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+      regressingCategories: ['correctness'],
+    });
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/done_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, doneScript);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+});

@@ -7070,6 +7070,75 @@ async def test_playbook_confirmed_count_not_incremented_on_retry_success(
 
 
 @pytest.mark.asyncio
+async def test_already_done_no_op_completion_lands_completed_with_reason(
+    client: AsyncClient, db_session, mocker
+):
+    """`./done --already-done` posts COMPLETED with no PR + a no_op_reason.
+
+    Models the redundant-no-op case (e.g. task 76ae55c2): the migrate agent
+    verified the deliverable already exists on the base branch, so there is no
+    diff/PR. The status endpoint must land the task COMPLETED (not requeue /
+    fail), persist no_op_reason into task.context so operators see WHY there's
+    no PR, and surface the reason in latest_status_message. No PR artifact is
+    created.
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(name="Already-Done No-Op", user_id="test-user-already-done")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "migrate", "prompt": "add Alembic migration for PoolVm registry"}],
+        vm_instance_id="agent-vm-already-done-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    reason = (
+        "0133_poolvm_registry.py + PoolVm model + EXPECTED_SCHEMA_REVISION=0133 "
+        "already present on base via sibling PR #6978; a new migration would "
+        "branch the revision chain"
+    )
+    token = create_agent_token(str(task.id), "agent-vm-already-done-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={
+            "task_id": str(task.id),
+            "status": "COMPLETED",
+            "no_op_reason": reason,
+            "logs": f"Completed: no changes needed — deliverable already present. {reason}",
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    # Landed COMPLETED — not requeued, not failed.
+    assert task.status == TaskStatus.COMPLETED
+    # The affirmative reason is persisted so operators see why there's no PR.
+    assert (task.context or {}).get("no_op_reason") == reason
+    # And surfaced in the status message (no artifact ⇒ logs → latest_status_message).
+    assert task.latest_status_message
+    assert "deliverable already present" in task.latest_status_message
+
+    # No PR artifact was created for this no-op completion.
+    from sqlalchemy import select as _select
+
+    artifacts = (
+        await db_session.execute(
+            _select(Artifact).where(Artifact.task_id == task.id)
+        )
+    ).scalars().all()
+    assert all(a.artifact_type != ArtifactType.PULL_REQUEST for a in artifacts)
+
+
+@pytest.mark.asyncio
 async def test_playbook_recent_outcomes_flipped_on_first_attempt_success(
     client: AsyncClient, db_session, mocker
 ):

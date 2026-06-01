@@ -164,6 +164,8 @@ ${schemaRevisionStep}5. **Review the generated migration**: Open and carefully r
 
 8. Once migration applies cleanly, run \`./check test\` (NOT just \`./check\` — migrations always touch backend, so the Docker pytest suite must pass before shipping). Then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
 
+ALREADY-DONE CASE: If you discover the requested migration/model change ALREADY EXISTS on the base branch (e.g. a sibling PR already added the same revision file and model${hasSchemaRevisionGate ? ` and the matching ${migrateLayout.schemaRevisionConst} bump` : ''}), do NOT create a duplicate migration — a second revision with the same logical change would branch the revision chain and break chain-linearity tests. Instead, VERIFY the deliverable is present (name the revision file and model${hasSchemaRevisionGate ? ' and schema-revision value' : ''}) and call \`./done --already-done "<reason naming the existing revision file and model${hasSchemaRevisionGate ? ' and schema-revision value' : ''}, and the sibling PR if known>"\`. This lands the task COMPLETED with no PR and records why. Do NOT just exit — a bare no-diff exit is treated as incomplete and fails.
+
 CRITICAL RULES:
 - Never delete or modify existing migration files in \`${alembicVersionsPath}\` (except the one you just generated)
 - Never run \`alembic stamp\` or \`alembic downgrade base\` — these can corrupt production databases
