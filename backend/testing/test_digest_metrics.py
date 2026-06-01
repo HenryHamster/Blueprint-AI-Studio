@@ -223,6 +223,52 @@ def test_compute_narrative_summary_empty_window_fallback():
     assert _build_narrative_summary() == "All quiet — no activity in the last 24h."
 
 
+def test_compute_narrative_summary_convergence_verdict_appears():
+    """When the outer-loop window has churn signal (>=2 trend buckets) and a
+    dominant blocker, the briefing states a falling/rising churn verdict and
+    names the quantified blocker."""
+    narrative = _build_narrative_summary(
+        outer_loop_convergence_summary={
+            "dominant_blocker": {
+                "cause": "cap_exhausted",
+                "count": 3,
+                "total": 4,
+                "share": 0.75,
+            }
+        },
+        outer_loop_convergence_trend={
+            "buckets": [
+                {"incidence_counts": {"churn": 5}, "churn_total": 5},
+                {"incidence_counts": {"churn": 2}, "churn_total": 2},
+            ]
+        },
+    )
+    assert narrative == (
+        "Review/fix churn is falling; the main blocker is cap exhausted "
+        "(3/4 non-converged PR chains)."
+    )
+
+
+def test_compute_narrative_summary_convergence_verdict_suppressed_thin_window():
+    """A thin window (single trend bucket) carries no convergence signal, so the
+    briefing emits no review/fix churn sentence."""
+    narrative = _build_narrative_summary(
+        outer_loop_convergence_summary={
+            "dominant_blocker": {
+                "cause": "cap_exhausted",
+                "count": 3,
+                "total": 4,
+                "share": 0.75,
+            }
+        },
+        outer_loop_convergence_trend={
+            "buckets": [{"incidence_counts": {"churn": 5}, "churn_total": 5}]
+        },
+    )
+    assert "churn" not in narrative.lower()
+    assert narrative == "All quiet — no activity in the last 24h."
+
+
 def _make_failed_task(**kwargs):
     """Minimal failed Task object for compute_failure_grouping unit tests."""
     return make_task(status=TaskStatus.FAILED, **kwargs)
