@@ -4330,7 +4330,7 @@ class TestFinalizeInfraFailure:
 
         dispatch_mock = AsyncMock()
         mocker.patch(
-            "app.release_qualifier_infra.dispatch_external_notification",
+            "app.release_qualifier.dispatch_external_notification",
             dispatch_mock,
         )
 
@@ -4363,7 +4363,7 @@ class TestFinalizeInfraFailure:
 
         dispatch_mock = AsyncMock()
         mocker.patch(
-            "app.release_qualifier_infra.dispatch_external_notification",
+            "app.release_qualifier.dispatch_external_notification",
             dispatch_mock,
         )
 
@@ -4481,7 +4481,7 @@ class TestFinalizeInfraFailure:
         """When audit_rl_respawn_count hits _MAX_AUDIT_RL_RESPAWNS, fall through to
         infra_failure with label 'audit_rate_limit_respawn_cap_exceeded'."""
         from app.failure_classification import RATE_LIMIT, persist_failure_category
-        from app.release_qualifier_finalize import _MAX_AUDIT_RL_RESPAWNS
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
 
         project, version = await _make_project_and_version(db_session)
         audit_task = Task(

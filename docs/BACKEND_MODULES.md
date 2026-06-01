@@ -603,7 +603,7 @@ Audit-driven release readiness assessment.
 
 **Key functions:**
 - `run_qualification()` — Score entire release
-- Score uses sub-modules: `release_qualifier_infra.py`, `release_qualifier_readiness.py`, etc.
+- Pure scoring math lives in `release_scoring.py`; promotion execution in `release_promotion.py`; out-of-band reconciliation in `release_reconciliation.py`; lifecycle-stall alerts in `release_stall_alerts.py`.
 
 #### `release_promotion.py`
 
