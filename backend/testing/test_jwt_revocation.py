@@ -5,6 +5,7 @@ Listener callback: verify _terminated_task_ids is updated.
 """
 
 import asyncio
+import contextlib
 import time
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -70,6 +71,46 @@ class TestEmitTaskTerminatedNotify:
         session.execute.side_effect = RuntimeError("DB error")
         # Should not raise
         emit_task_terminated_notify(session, "task-id")
+
+
+# ---------------------------------------------------------------------------
+# emit_task_revived_notify (sync helper) — inverse of the terminated helper
+# ---------------------------------------------------------------------------
+
+
+class TestEmitTaskRevivedNotify:
+    def test_noop_when_not_postgres(self, monkeypatch):
+        monkeypatch.setattr("app.jwt_revocation._IS_POSTGRES", False)
+        from app.jwt_revocation import emit_task_revived_notify
+
+        session = _make_sync_session()
+        emit_task_revived_notify(session, "some-task-id")
+        session.execute.assert_not_called()
+
+    def test_executes_pg_notify_on_revive_channel(self, monkeypatch):
+        monkeypatch.setattr("app.jwt_revocation._IS_POSTGRES", True)
+        from app.jwt_revocation import _REVIVE_NOTIFY_CHANNEL, emit_task_revived_notify
+
+        task_id = str(uuid.uuid4())
+        session = _make_sync_session()
+        emit_task_revived_notify(session, task_id)
+        session.execute.assert_called_once()
+        call_args = session.execute.call_args
+        assert "pg_notify" in str(call_args[0][0])
+        params = call_args[0][1]
+        assert params["tid"] == task_id
+        # Must target the revive channel, NOT the terminated channel.
+        assert params["channel"] == _REVIVE_NOTIFY_CHANNEL
+        assert _REVIVE_NOTIFY_CHANNEL == "task_revived"
+
+    def test_swallows_exceptions(self, monkeypatch):
+        monkeypatch.setattr("app.jwt_revocation._IS_POSTGRES", True)
+        from app.jwt_revocation import emit_task_revived_notify
+
+        session = _make_sync_session()
+        session.execute.side_effect = RuntimeError("DB error")
+        # Should not raise
+        emit_task_revived_notify(session, "task-id")
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +268,89 @@ class TestJwtRevocationServiceCallback:
         captured_listener["callback"](None, 1234, "task_terminated", task_id)
         assert task_id in terminated_task_ids
         assert terminated_task_ids[task_id] >= before
+
+    @pytest.mark.anyio
+    async def test_service_registers_revive_listener_that_pops_entry(
+        self, monkeypatch
+    ):
+        """The revive listener registered by the real service evicts the entry.
+
+        Drives jwt_revocation_service with a fake connection that captures every
+        add_listener(channel, callback) pair, then fires the task_revived
+        callback the service registered and asserts the deny-list entry is
+        popped (inverse of the task_terminated path).
+        """
+        task_id = str(uuid.uuid4())
+        terminated_task_ids: dict = {task_id: time.time()}
+
+        monkeypatch.setattr(
+            "app.routers.agent._terminated_task_ids", terminated_task_ids
+        )
+        monkeypatch.setattr(
+            "app.jwt_revocation._get_raw_dsn", lambda: "postgresql://host/db"
+        )
+        monkeypatch.setattr("app.jwt_revocation.enable_tcp_keepalive", lambda c: None)
+
+        async def _noop_seed(conn, cache):
+            return None
+
+        monkeypatch.setattr("app.jwt_revocation._seed_deny_list", _noop_seed)
+
+        captured: dict = {}
+
+        async def _fake_add_listener(channel, callback):
+            captured[channel] = callback
+
+        fake_conn = MagicMock()
+        # Fire termination immediately so the service's wait returns and it
+        # proceeds to the (patched, cancelling) sleep.
+        fake_conn.add_termination_listener = MagicMock(
+            side_effect=lambda cb: cb(fake_conn)
+        )
+        fake_conn.add_listener = _fake_add_listener
+        fake_conn.close = AsyncMock()
+
+        async def _cancel_on_first_sleep(secs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch(
+                "app.jwt_revocation._asyncpg.connect",
+                new=AsyncMock(return_value=fake_conn),
+            ),
+            patch("asyncio.sleep", side_effect=_cancel_on_first_sleep),
+        ):
+            from app.jwt_revocation import (
+                _REVIVE_NOTIFY_CHANNEL,
+                jwt_revocation_service,
+            )
+
+            with contextlib.suppress(asyncio.CancelledError):
+                await jwt_revocation_service()
+
+        assert _REVIVE_NOTIFY_CHANNEL in captured, (
+            "Service must register a listener on the task_revived channel"
+        )
+        # Fire the revive callback exactly as asyncpg would on a NOTIFY.
+        captured[_REVIVE_NOTIFY_CHANNEL](None, 1234, _REVIVE_NOTIFY_CHANNEL, task_id)
+        assert task_id not in terminated_task_ids, (
+            "task_revived NOTIFY must evict the stale deny-list entry"
+        )
+
+    @pytest.mark.anyio
+    async def test_revive_listener_pop_is_safe_when_entry_absent(self):
+        """The revive callback pops missing entries without raising (mirrors the
+        in-process pop(tid, None) semantics)."""
+        # Build the callback inline with the exact body the service registers.
+        terminated_task_ids: dict = {}
+
+        def _on_revive_notify(conn, pid, channel, payload):
+            if payload:
+                terminated_task_ids.pop(payload, None)
+
+        # No KeyError even though the entry was never present.
+        _on_revive_notify(None, 1, "task_revived", str(uuid.uuid4()))
+        assert terminated_task_ids == {}
 
     @pytest.mark.anyio
     async def test_service_noop_on_non_postgres(self, monkeypatch):

@@ -1426,7 +1426,24 @@ def notify_tasks_terminated(task_ids: list) -> None:
 
 @event.listens_for(_OrmSession, "before_flush")
 def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
-    """Emit pg_notify for Task rows transitioning to a terminal status.
+    """Emit pg_notify for Task rows crossing the terminal boundary.
+
+    Two symmetric transitions are broadcast cross-instance so every Cloud Run
+    instance keeps its in-memory ``_terminated_task_ids`` deny-list coherent:
+
+    * non-terminal → terminal  → ``task_terminated``  (deny-list ADD)
+    * terminal     → non-terminal (requeue/revive) → ``task_revived`` (EVICT)
+
+    The revive broadcast closes an asymmetry: the in-process
+    ``_on_task_revive_callbacks`` path (see ``_on_status_set``) only evicts on
+    the single instance that handled the requeue flush, so a requeued task's
+    new VM heartbeat could load-balance to a stale instance and get a spurious
+    401 — dooming the whole retry until the 75-min deny-list TTL. The revive
+    NOTIFY mirrors the proven terminal path so every instance evicts.
+
+    Guardrail: revive only fires on a REAL terminal→non-terminal transition
+    (prior status was terminal), never on ordinary non-terminal lifecycle
+    steps (QUEUED→PROVISIONING→IN_PROGRESS…), to avoid notify spam.
 
     Runs inside the before_flush hook (sync context, greenlet-driven by
     AsyncSession.flush) so the NOTIFY lands in the same transaction as the
@@ -1439,7 +1456,10 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
     """
     try:
         from sqlalchemy import inspect as _sa_inspect
-        from app.jwt_revocation import emit_task_terminated_notify
+        from app.jwt_revocation import (
+            emit_task_revived_notify,
+            emit_task_terminated_notify,
+        )
 
         terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
         for instance in session.dirty:
@@ -1448,8 +1468,15 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             history = _sa_inspect(instance).attrs.status.history
             if not history.added:
                 continue
-            if history.added[0] in terminal:
+            new_status = history.added[0]
+            if new_status in terminal:
                 emit_task_terminated_notify(session, str(instance.id))
+            elif history.deleted and history.deleted[0] in terminal:
+                # Real terminal → non-terminal transition (requeue/revive): the
+                # prior status was terminal and the new one is not. Broadcast so
+                # every instance evicts its stale deny-list entry. The guard on
+                # the PRIOR status keeps normal non-terminal steps silent.
+                emit_task_revived_notify(session, str(instance.id))
     except Exception as exc:  # noqa: BLE001 — never block the flush
         logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
 

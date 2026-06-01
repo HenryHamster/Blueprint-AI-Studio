@@ -805,11 +805,21 @@ async def _update_direction_research_outcomes(
     # Decomposition quality: per plan-parent metrics so future calibration
     # can correlate decomposition shape (breadth, file overlap, cross-module
     # coupling, dep depth) with subtask merge success.
+    #
+    # Affirmative-no-op plans (those carrying a verified ``no_op_reason`` — the
+    # #7021 principle applied to plan in plan_completion.py) are excluded: a
+    # plan that legitimately had nothing to decompose must NOT be scored as a
+    # decomposition failure (subtask_merge_rate=0.0), which would penalize the
+    # direction for correctly finding the work already done. These land
+    # CANCELLED today (already outside the COMPLETED/FAILED filter), but the
+    # no_op_reason guard makes the exclusion explicit and robust to the terminal
+    # status changing.
     plan_child_ids = [
         ct.id
         for ct in child_tasks_rows
         if (ct.first_payload or {}).get("type") == "plan"
         and ct.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+        and not (ct.context or {}).get("no_op_reason")
     ]
     decomposition_quality: list = []
     if plan_child_ids:
