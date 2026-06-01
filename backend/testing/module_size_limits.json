@@ -123,7 +123,7 @@
     "components/DirectionsPanel.tsx": 3000,
     "components/CatchUpPanel.tsx": 3600,
     "components/TaskDetailDrawer.tsx": 2500,
-    "components/SettingsDropdown.tsx": 2500,
+    "components/SettingsDropdown.tsx": 800,
     "components/KanbanBoard.tsx": 1500,
     "components/KanbanColumn.tsx": 1500,
     "App.tsx": 2000,

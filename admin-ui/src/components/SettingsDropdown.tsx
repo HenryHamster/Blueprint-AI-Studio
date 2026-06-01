@@ -1,25 +1,12 @@
 import { useEffect, useState } from 'react';
-import { SettingsAdvancedSection } from './SettingsAdvancedSection';
-import { SettingsGeneralSection } from './SettingsGeneralSection';
-import { SettingsOrchestratorSection } from './SettingsOrchestratorSection';
-import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import type { NotificationConfig } from './SettingsNotificationsSection';
-import { ProviderSettingsPanel } from './ProviderSettingsPanel';
-import { ProviderCategoriesPanel } from './ProviderCategoriesPanel';
-import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
-import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
-import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
-import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
-import { ProjectIntegrationBranchSection } from './ProjectIntegrationBranchSection';
-import { ProjectPromotionTargetSection } from './ProjectPromotionTargetSection';
-import { SettingsAccountsSection } from './SettingsAccountsSection';
+import { SettingsSectionRouter } from './SettingsSectionRouter';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
 import { Settings, GitBranch, Shield, X, Sliders, ListChecks, Server, User, LogOut, Bell, Wrench, Tag, HelpCircle, FileDown } from 'lucide-react';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
 export type { MaxPlanAccount } from '../types/settings';
 import type { AuthMode, CategoryRoutingEntry, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
-import { DeploySection } from './SettingsDeploySection';
 
 
 interface SettingsDropdownProps {
@@ -396,287 +383,6 @@ export function SettingsDropdown({
     ...Object.values(taskTypeModelPreferences).flatMap(prefs => prefs.map(pref => pref.model)),
   ])).filter(Boolean).sort();
 
-  // --- Section renderers ---
-
-  function renderGeneral() {
-    return (
-      <SettingsGeneralSection
-        apiHealthy={apiHealthy}
-        wsConnected={wsConnected}
-        lastFetchTime={lastFetchTime}
-        defaultTaskType={defaultTaskType}
-        onUpdateDefaultTaskType={onUpdateDefaultTaskType}
-        viewMode={viewMode}
-        onSetViewMode={onSetViewMode}
-        allModelOptions={allModelOptions}
-        refreshInterval={refreshInterval}
-        onUpdateRefreshInterval={onUpdateRefreshInterval}
-        pageSize={pageSize}
-        onUpdatePageSize={onUpdatePageSize}
-        notifyOnComplete={notifyOnComplete}
-        onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
-        notifyOnFail={notifyOnFail}
-        onUpdateNotifyOnFail={onUpdateNotifyOnFail}
-        notifyOnApprovalNeeded={notifyOnApprovalNeeded}
-        onUpdateNotifyOnApprovalNeeded={onUpdateNotifyOnApprovalNeeded}
-        soundOnComplete={soundOnComplete}
-        onUpdateSoundOnComplete={onUpdateSoundOnComplete}
-        notifyOnHighSignalMessage={notifyOnHighSignalMessage}
-        onUpdateNotifyOnHighSignalMessage={onUpdateNotifyOnHighSignalMessage}
-        onNavigateToNotifications={() => setActiveSection('notifications')}
-      />
-    );
-  }
-  function renderOrchestrator() {
-    return (
-      <SettingsOrchestratorSection
-        maxConcurrentVMs={maxConcurrentVMs}
-        onUpdateMaxVMs={onUpdateMaxVMs}
-        maxRetries={maxRetries}
-        onUpdateMaxRetries={onUpdateMaxRetries}
-        requireApprovalGates={requireApprovalGates}
-        onUpdateRequireApprovalGates={onUpdateRequireApprovalGates}
-        autoArchiveEnabled={autoArchiveEnabled}
-        onUpdateAutoArchiveEnabled={onUpdateAutoArchiveEnabled}
-        autoArchiveTerminalAfterDays={autoArchiveTerminalAfterDays}
-        onUpdateAutoArchiveTerminalAfterDays={onUpdateAutoArchiveTerminalAfterDays}
-        autoArchiveMaxTerminalTasksPerProject={autoArchiveMaxTerminalTasksPerProject}
-        onUpdateAutoArchiveMaxTerminalTasksPerProject={onUpdateAutoArchiveMaxTerminalTasksPerProject}
-        autoArchiveIntervalMinutes={autoArchiveIntervalMinutes}
-        onUpdateAutoArchiveIntervalMinutes={onUpdateAutoArchiveIntervalMinutes}
-        maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
-        onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
-        maxGlobalAutonomousTasksPerHour={maxGlobalAutonomousTasksPerHour}
-        onUpdateMaxGlobalAutonomousRate={onUpdateMaxGlobalAutonomousRate}
-        maxPipelineSlots={maxPipelineSlots}
-        onUpdateMaxPipelineSlots={onUpdateMaxPipelineSlots}
-        reservedSlotsForTypes={reservedSlotsForTypes}
-        onUpdateReservedSlotsForTypes={onUpdateReservedSlotsForTypes}
-        evaluatingPipelineTimeoutMinutes={evaluatingPipelineTimeoutMinutes}
-        onUpdateEvaluatingPipelineTimeout={onUpdateEvaluatingPipelineTimeout}
-        evaluatingFailHours={evaluatingFailHours}
-        onUpdateEvaluatingFailHours={onUpdateEvaluatingFailHours}
-        ciBackstopTimeoutMinutes={ciBackstopTimeoutMinutes}
-        onUpdateCiBackstopTimeout={onUpdateCiBackstopTimeout}
-        autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
-        onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
-        directionCooldownMinutes={directionCooldownMinutes}
-        onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
-        strategicResearchFrequency={strategicResearchFrequency}
-        onUpdateStrategicResearchFrequency={onUpdateStrategicResearchFrequency}
-        anyAutonomousEnabled={anyAutonomousEnabled}
-        onPauseAllAutonomous={onPauseAllAutonomous}
-        onRestartOrchestrator={onRestartOrchestrator}
-      />
-    );
-  }
-
-  function renderDeploy() {
-    return (
-      <DeploySection
-        deployState={deployState}
-        onPausePipeline={onPausePipeline}
-        onResumePipeline={onResumePipeline}
-        onResetHealth={onResetHealth}
-        onRollback={onRollback}
-        onMarkStable={onMarkStable}
-        onRepairState={onRepairState}
-        zoneHealth={zoneHealth}
-      />
-    );
-  }
-
-  function renderAccounts() {
-    return (
-      <SettingsAccountsSection
-        githubAccount={githubAccount}
-        onConnectGitHub={onConnectGitHub}
-        isAdmin={isAdmin}
-        maxPlanAccounts={maxPlanAccounts}
-        onToggleAccount={onToggleAccount}
-        onRemoveAccount={onRemoveAccount}
-        onResetRateLimits={onResetRateLimits}
-        onRefreshAccountModels={onRefreshAccountModels}
-        onUpdateAccountCaps={onUpdateAccountCaps}
-        showUserManagement={showUserManagement}
-        onToggleUserManagement={onToggleUserManagement}
-        showProjectMembers={showProjectMembers}
-        onToggleProjectMembers={onToggleProjectMembers}
-        selectedProjectId={selectedProjectId}
-        selectedProjectMyRole={selectedProjectMyRole}
-        onToggleSettings={onToggleSettings}
-        providers={providers}
-        newAccountName={newAccountName}
-        setNewAccountName={setNewAccountName}
-        newAccountProvider={newAccountProvider}
-        setNewAccountProvider={setNewAccountProvider}
-        newAccountAuthMode={newAccountAuthMode}
-        setNewAccountAuthMode={setNewAccountAuthMode}
-        newAccountToken={newAccountToken}
-        setNewAccountToken={setNewAccountToken}
-        newAccountProviderMetadata={newAccountProviderMetadata}
-        setNewAccountProviderMetadata={setNewAccountProviderMetadata}
-        newAccountClaudeConfigJson={newAccountClaudeConfigJson}
-        setNewAccountClaudeConfigJson={setNewAccountClaudeConfigJson}
-        newAccountDailyTaskCap={newAccountDailyTaskCap}
-        setNewAccountDailyTaskCap={setNewAccountDailyTaskCap}
-        newAccountMaxConcurrentTasks={newAccountMaxConcurrentTasks}
-        setNewAccountMaxConcurrentTasks={setNewAccountMaxConcurrentTasks}
-        newAccountAutoDisableAfterRateLimits={newAccountAutoDisableAfterRateLimits}
-        setNewAccountAutoDisableAfterRateLimits={setNewAccountAutoDisableAfterRateLimits}
-        onAddAccount={onAddAccount}
-      />
-    );
-  }
-
-  function renderNotifications() {
-    return (
-      <SettingsNotificationsSection
-        webhookUrl={notificationConfig.webhook_url}
-        onUpdateWebhookUrl={url => onUpdateNotificationConfig({ webhook_url: url })}
-        enabledEvents={notificationConfig.enabled_events}
-        onUpdateEnabledEvents={events => onUpdateNotificationConfig({ enabled_events: events })}
-        throttleSeconds={notificationConfig.throttle_seconds}
-        onUpdateThrottleSeconds={secs => onUpdateNotificationConfig({ throttle_seconds: secs })}
-        dailyCostCeilingUsd={dailyCostCeilingUsd}
-        onUpdateDailyCostCeiling={onUpdateDailyCostCeiling}
-        isAdmin={isAdmin}
-      />
-    );
-  }
-
-  function renderAdvanced() {
-    return (
-      <SettingsAdvancedSection
-        healthCheckUrlsInput={healthCheckUrlsInput}
-        onHealthCheckUrlsChange={setHealthCheckUrlsInput}
-        onUpdateHealthCheckUrls={onUpdateHealthCheckUrls}
-      />
-    );
-  }
-
-  function renderBuildConfig() {
-    return (
-      <ProjectBuildConfigSection
-        githubOwner={selectedProjectOwner}
-        githubRepo={selectedProjectRepo}
-        isSelfRepo={selectedProjectIsSelfRepo}
-        buildConfig={buildConfig}
-        onSave={onUpdateBuildConfig}
-        onDetect={onDetectBuildConfig}
-        detectAvailable={Boolean(selectedProjectOwner && selectedProjectRepo)}
-        projectId={selectedProjectId}
-      />
-    );
-  }
-
-  function renderAutoRemediation() {
-    return (
-      <ProjectAutoRemediationSection
-        githubOwner={selectedProjectOwner}
-        githubRepo={selectedProjectRepo}
-        config={autoRemediationConfig}
-        stats={autoRemediationStats}
-        onSave={onUpdateAutoRemediationConfig}
-        integrationBranch={integrationBranchData?.integration_branch}
-        promotionTarget={promotionTargetData?.promotion_target}
-      />
-    );
-  }
-
-  function renderAutoReview() {
-    return (
-      <ProjectAutoReviewSection
-        config={autoReviewConfig}
-        canSave={selectedProjectRole === 'owner'}
-        onSave={onUpdateAutoReviewConfig}
-      />
-    );
-  }
-
-  function renderIntegrationBranch() {
-    return (
-      <ProjectIntegrationBranchSection
-        data={integrationBranchData}
-        canSave={selectedProjectRole === 'owner'}
-        onSave={onUpdateIntegrationBranch}
-        relatedPromotionTarget={promotionTargetData?.promotion_target}
-      />
-    );
-  }
-
-  function renderPromotionTarget() {
-    return (
-      <ProjectPromotionTargetSection
-        data={promotionTargetData}
-        canSave={selectedProjectRole === 'owner'}
-        onSave={onUpdatePromotionTarget}
-        relatedIntegrationBranch={integrationBranchData?.integration_branch}
-      />
-    );
-  }
-
-  function renderIssueImplementation() {
-    return (
-      <ProjectIssueImplementationSection
-        githubOwner={selectedProjectOwner}
-        githubRepo={selectedProjectRepo}
-        config={issueImplementationConfig}
-        onSave={onUpdateIssueImplementationConfig}
-      />
-    );
-  }
-
-  function renderProviderSettings() {
-    return (
-      <ProviderSettingsPanel
-        providers={providers}
-        providerSettingsDefaults={providerSettingsDefaults}
-        taskTypeProviderOverrides={taskTypeProviderOverrides}
-        providerSettingsByEffort={providerSettingsByEffort}
-        maxPlanAccounts={maxPlanAccounts}
-        onUpdateDefaults={onUpdateProviderSettingsDefaults}
-        onUpdateOverrides={onUpdateTaskTypeProviderOverrides}
-        onUpdateProviderSettingsByEffort={onUpdateProviderSettingsByEffort}
-      />
-    );
-  }
-
-  function renderProviderRouting() {
-    return (
-      <ProviderCategoriesPanel
-        providers={providers}
-        selectionMode={providerSelectionMode}
-        onUpdateSelectionMode={onUpdateProviderSelectionMode}
-        taskTypeCategories={taskTypeCategories}
-        onUpdateTaskTypeCategories={onUpdateTaskTypeCategories}
-        categoryRouting={categoryRouting}
-        onUpdateCategoryRouting={onUpdateCategoryRouting}
-        taskTypeRouting={taskTypeRouting}
-        onUpdateTaskTypeRouting={onUpdateTaskTypeRouting}
-      />
-    );
-  }
-
-  function renderActiveSection() {
-    switch (activeSection) {
-      case 'general': return renderGeneral();
-      case 'provider-routing': return renderProviderRouting();
-      case 'provider-settings': return renderProviderSettings();
-      case 'orchestrator': return renderOrchestrator();
-      case 'deploy': return renderDeploy();
-      case 'accounts': return renderAccounts();
-      case 'notifications': return renderNotifications();
-      case 'build-config': return renderBuildConfig();
-      case 'auto-review': return renderAutoReview();
-      case 'auto-remediation': return renderAutoRemediation();
-      case 'issue-implementation': return renderIssueImplementation();
-      case 'integration-branch': return renderIntegrationBranch();
-      case 'promotion-target': return renderPromotionTarget();
-      case 'advanced': return renderAdvanced();
-    }
-  }
-
   return (
     <div className="relative" ref={settingsRef}>
       {/* reason: dense-UI icon trigger (p-2 around 16px icon) — operator-density convention for settings panels */}
@@ -765,7 +471,152 @@ export function SettingsDropdown({
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto px-4 md:px-6 py-5 custom-scrollbar">
-                {renderActiveSection()}
+                <SettingsSectionRouter
+                  activeSection={activeSection}
+                  isAdmin={isAdmin}
+                  onNavigateToSection={setActiveSection}
+                  onToggleSettings={onToggleSettings}
+                  allModelOptions={allModelOptions}
+                  healthCheckUrlsInput={healthCheckUrlsInput}
+                  onHealthCheckUrlsInputChange={setHealthCheckUrlsInput}
+                  onUpdateHealthCheckUrls={onUpdateHealthCheckUrls}
+                  defaultTaskType={defaultTaskType}
+                  onUpdateDefaultTaskType={onUpdateDefaultTaskType}
+                  viewMode={viewMode}
+                  onSetViewMode={onSetViewMode}
+                  refreshInterval={refreshInterval}
+                  onUpdateRefreshInterval={onUpdateRefreshInterval}
+                  pageSize={pageSize}
+                  onUpdatePageSize={onUpdatePageSize}
+                  apiHealthy={apiHealthy}
+                  wsConnected={wsConnected}
+                  lastFetchTime={lastFetchTime}
+                  notifyOnComplete={notifyOnComplete}
+                  onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
+                  notifyOnFail={notifyOnFail}
+                  onUpdateNotifyOnFail={onUpdateNotifyOnFail}
+                  notifyOnApprovalNeeded={notifyOnApprovalNeeded}
+                  onUpdateNotifyOnApprovalNeeded={onUpdateNotifyOnApprovalNeeded}
+                  soundOnComplete={soundOnComplete}
+                  onUpdateSoundOnComplete={onUpdateSoundOnComplete}
+                  notifyOnHighSignalMessage={notifyOnHighSignalMessage}
+                  onUpdateNotifyOnHighSignalMessage={onUpdateNotifyOnHighSignalMessage}
+                  maxConcurrentVMs={maxConcurrentVMs}
+                  onUpdateMaxVMs={onUpdateMaxVMs}
+                  maxRetries={maxRetries}
+                  onUpdateMaxRetries={onUpdateMaxRetries}
+                  requireApprovalGates={requireApprovalGates}
+                  onUpdateRequireApprovalGates={onUpdateRequireApprovalGates}
+                  autoArchiveEnabled={autoArchiveEnabled}
+                  onUpdateAutoArchiveEnabled={onUpdateAutoArchiveEnabled}
+                  autoArchiveTerminalAfterDays={autoArchiveTerminalAfterDays}
+                  onUpdateAutoArchiveTerminalAfterDays={onUpdateAutoArchiveTerminalAfterDays}
+                  autoArchiveMaxTerminalTasksPerProject={autoArchiveMaxTerminalTasksPerProject}
+                  onUpdateAutoArchiveMaxTerminalTasksPerProject={onUpdateAutoArchiveMaxTerminalTasksPerProject}
+                  autoArchiveIntervalMinutes={autoArchiveIntervalMinutes}
+                  onUpdateAutoArchiveIntervalMinutes={onUpdateAutoArchiveIntervalMinutes}
+                  maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
+                  onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
+                  maxGlobalAutonomousTasksPerHour={maxGlobalAutonomousTasksPerHour}
+                  onUpdateMaxGlobalAutonomousRate={onUpdateMaxGlobalAutonomousRate}
+                  maxPipelineSlots={maxPipelineSlots}
+                  onUpdateMaxPipelineSlots={onUpdateMaxPipelineSlots}
+                  reservedSlotsForTypes={reservedSlotsForTypes}
+                  onUpdateReservedSlotsForTypes={onUpdateReservedSlotsForTypes}
+                  evaluatingPipelineTimeoutMinutes={evaluatingPipelineTimeoutMinutes}
+                  onUpdateEvaluatingPipelineTimeout={onUpdateEvaluatingPipelineTimeout}
+                  evaluatingFailHours={evaluatingFailHours}
+                  onUpdateEvaluatingFailHours={onUpdateEvaluatingFailHours}
+                  ciBackstopTimeoutMinutes={ciBackstopTimeoutMinutes}
+                  onUpdateCiBackstopTimeout={onUpdateCiBackstopTimeout}
+                  autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
+                  onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
+                  directionCooldownMinutes={directionCooldownMinutes}
+                  onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
+                  strategicResearchFrequency={strategicResearchFrequency}
+                  onUpdateStrategicResearchFrequency={onUpdateStrategicResearchFrequency}
+                  anyAutonomousEnabled={anyAutonomousEnabled}
+                  onPauseAllAutonomous={onPauseAllAutonomous}
+                  onRestartOrchestrator={onRestartOrchestrator}
+                  githubAccount={githubAccount}
+                  onConnectGitHub={onConnectGitHub}
+                  maxPlanAccounts={maxPlanAccounts}
+                  onToggleAccount={onToggleAccount}
+                  onRemoveAccount={onRemoveAccount}
+                  onResetRateLimits={onResetRateLimits}
+                  onRefreshAccountModels={onRefreshAccountModels}
+                  onUpdateAccountCaps={onUpdateAccountCaps}
+                  showUserManagement={showUserManagement}
+                  onToggleUserManagement={onToggleUserManagement}
+                  showProjectMembers={showProjectMembers}
+                  onToggleProjectMembers={onToggleProjectMembers}
+                  selectedProjectMyRole={selectedProjectMyRole}
+                  newAccountName={newAccountName}
+                  setNewAccountName={setNewAccountName}
+                  newAccountProvider={newAccountProvider}
+                  setNewAccountProvider={setNewAccountProvider}
+                  newAccountAuthMode={newAccountAuthMode}
+                  setNewAccountAuthMode={setNewAccountAuthMode}
+                  newAccountToken={newAccountToken}
+                  setNewAccountToken={setNewAccountToken}
+                  newAccountProviderMetadata={newAccountProviderMetadata}
+                  setNewAccountProviderMetadata={setNewAccountProviderMetadata}
+                  newAccountClaudeConfigJson={newAccountClaudeConfigJson}
+                  setNewAccountClaudeConfigJson={setNewAccountClaudeConfigJson}
+                  newAccountDailyTaskCap={newAccountDailyTaskCap}
+                  setNewAccountDailyTaskCap={setNewAccountDailyTaskCap}
+                  newAccountMaxConcurrentTasks={newAccountMaxConcurrentTasks}
+                  setNewAccountMaxConcurrentTasks={setNewAccountMaxConcurrentTasks}
+                  newAccountAutoDisableAfterRateLimits={newAccountAutoDisableAfterRateLimits}
+                  setNewAccountAutoDisableAfterRateLimits={setNewAccountAutoDisableAfterRateLimits}
+                  onAddAccount={onAddAccount}
+                  providers={providers}
+                  providerSettingsDefaults={providerSettingsDefaults}
+                  taskTypeProviderOverrides={taskTypeProviderOverrides}
+                  providerSettingsByEffort={providerSettingsByEffort}
+                  onUpdateProviderSettingsDefaults={onUpdateProviderSettingsDefaults}
+                  onUpdateTaskTypeProviderOverrides={onUpdateTaskTypeProviderOverrides}
+                  onUpdateProviderSettingsByEffort={onUpdateProviderSettingsByEffort}
+                  providerSelectionMode={providerSelectionMode}
+                  onUpdateProviderSelectionMode={onUpdateProviderSelectionMode}
+                  taskTypeCategories={taskTypeCategories}
+                  onUpdateTaskTypeCategories={onUpdateTaskTypeCategories}
+                  categoryRouting={categoryRouting}
+                  onUpdateCategoryRouting={onUpdateCategoryRouting}
+                  taskTypeRouting={taskTypeRouting}
+                  onUpdateTaskTypeRouting={onUpdateTaskTypeRouting}
+                  deployState={deployState}
+                  onPausePipeline={onPausePipeline}
+                  onResumePipeline={onResumePipeline}
+                  onResetHealth={onResetHealth}
+                  onRollback={onRollback}
+                  onMarkStable={onMarkStable}
+                  onRepairState={onRepairState}
+                  zoneHealth={zoneHealth}
+                  notificationConfig={notificationConfig}
+                  onUpdateNotificationConfig={onUpdateNotificationConfig}
+                  dailyCostCeilingUsd={dailyCostCeilingUsd}
+                  onUpdateDailyCostCeiling={onUpdateDailyCostCeiling}
+                  selectedProjectId={selectedProjectId}
+                  selectedProjectOwner={selectedProjectOwner}
+                  selectedProjectRepo={selectedProjectRepo}
+                  selectedProjectIsSelfRepo={selectedProjectIsSelfRepo}
+                  selectedProjectRole={selectedProjectRole}
+                  buildConfig={buildConfig}
+                  onUpdateBuildConfig={onUpdateBuildConfig}
+                  onDetectBuildConfig={onDetectBuildConfig}
+                  autoRemediationConfig={autoRemediationConfig}
+                  autoRemediationStats={autoRemediationStats}
+                  onUpdateAutoRemediationConfig={onUpdateAutoRemediationConfig}
+                  issueImplementationConfig={issueImplementationConfig}
+                  onUpdateIssueImplementationConfig={onUpdateIssueImplementationConfig}
+                  autoReviewConfig={autoReviewConfig}
+                  onUpdateAutoReviewConfig={onUpdateAutoReviewConfig}
+                  integrationBranchData={integrationBranchData}
+                  onUpdateIntegrationBranch={onUpdateIntegrationBranch}
+                  promotionTargetData={promotionTargetData}
+                  onUpdatePromotionTarget={onUpdatePromotionTarget}
+                />
               </div>
               {/* Mobile footer with user info and Sign Out */}
               <div className="md:hidden px-4 py-3 border-t border-neutral-800 bg-neutral-900/50 flex items-center justify-between gap-3">
