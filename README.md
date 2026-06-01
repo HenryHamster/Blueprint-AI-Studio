@@ -263,10 +263,11 @@ Local mode runs agents as subprocess instead of GCP VMs. Full CI suite runs on P
 
 Contributions are welcome. Please:
 
-1. **Read [CLAUDE.md](CLAUDE.md)** for coding standards and restrictions
-2. **Open an issue** for bugs or feature requests
-3. **Follow the test guidelines** — all code paths must have tests
-4. **Update documentation** when adding new features or APIs
+1. **Read [CONTRIBUTING.md](CONTRIBUTING.md)** for environment setup and the contribution workflow
+2. **Read [CLAUDE.md](CLAUDE.md)** for coding standards and restrictions
+3. **Open an issue** for bugs or feature requests
+4. **Follow the test guidelines** — all code paths must have tests
+5. **Update documentation** when adding new features or APIs
 
 For significant architectural changes, open an issue to discuss approach first.
 
@@ -291,5 +292,6 @@ For issues, questions, or feedback:
 
 - **Deployment** — See [Deploy.md](Deploy.md) for GCP Cloud Run + Terraform setup
 - **Database** — See [docs/db-operations.md](docs/db-operations.md) for manual DB queries and operations
+- **Deferred DB work** — See [docs/db-deferrals.md](docs/db-deferrals.md) for items the database audit deliberately deferred, with re-evaluation triggers
 - **Concurrency** — See [docs/concurrency.md](docs/concurrency.md) for row-locking and async patterns
 - **Analysis** — See [docs/codebase-analysis.md](docs/codebase-analysis.md) for cross-cutting architecture overview

@@ -10,6 +10,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 - **[../README.md](../README.md)** — Project overview, quick start, architecture, and high-level description
 - **[../Deploy.md](../Deploy.md)** — Production deployment on GCP Cloud Run with Terraform and Packer
 - **[ONBOARDING.md](ONBOARDING.md)** — Onboard a new repository end to end (GitHub App install, the onboard endpoint and auto-derived fields, post-onboard branch/build tuning, and the `approval_gate_config` limitation)
+- **[../CONTRIBUTING.md](../CONTRIBUTING.md)** — Contributor environment setup and the clone → branch → test → PR workflow
 - **[../CLAUDE.md](../CLAUDE.md)** — Project coding standards, file restrictions, and development guidelines
 
 ### API & Data
@@ -84,6 +85,8 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Race condition handling
 
 - **[db-migration-plan.md](db-migration-plan.md)** — Database migration strategy
+
+- **[db-deferrals.md](db-deferrals.md)** — Database/infrastructure work deliberately deferred by the 2026-04-29 audit, each with a re-evaluation trigger and current mitigation
 
 ---
 
