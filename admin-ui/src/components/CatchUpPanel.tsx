@@ -1,10 +1,7 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
-import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, DollarSign, Compass } from 'lucide-react';
+import { Clock, ChevronDown, ChevronUp, Compass, CheckCircle } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
-import { timeAgo, parseTimestamp } from '../utils/time';
-import { TaskTypeBadge, TASK_TYPE_STYLES } from './TaskCard';
-import type { TaskType } from './TaskCard';
 import { DirectionProgressSection } from './DirectionProgressSection';
 import type { DirectionProgress } from './DirectionProgressSection';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -15,9 +12,9 @@ import {
   getLastCatchUpViewed,
   windowToHours,
 } from './catchupHelpers';
-import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
+import type { TimeWindow, DismissedState } from './catchupHelpers';
 import { sortDesc } from './catchupAnalytics';
-import { CompletionRow, SkeletonRow } from './catchupRows';
+import { SkeletonRow } from './catchupRows';
 import { usePoller } from '../hooks/usePoller';
 import { CatchUpReviewQualitySection } from './CatchUpReviewQualitySection';
 import { RecentFailureGroupsSection } from './RecentFailureGroupsSection';
@@ -27,6 +24,12 @@ import { CatchUpRemediationPipelineSection } from './CatchUpRemediationPipelineS
 import { CatchUpFailureSignalsSection } from './CatchUpFailureSignalsSection';
 import { CatchUpInProgressSection } from './CatchUpInProgressSection';
 import { CatchUpOperationalMetricsSection } from './CatchUpOperationalMetricsSection';
+import { CatchUpStatsRow } from './CatchUpStatsRow';
+import { CatchUpNarrativeSummary } from './CatchUpNarrativeSummary';
+import { CatchUpLatestCycleSection } from './CatchUpLatestCycleSection';
+import { CatchUpMemoPathwaySection } from './CatchUpMemoPathwaySection';
+import { CatchUpResearchYieldSection } from './CatchUpResearchYieldSection';
+import { CatchUpRecentCompletionsSection } from './CatchUpRecentCompletionsSection';
 import type { Project } from '../types/project';
 
 // DigestData (and FailureGroup / RecentCompletion / RecentFailure) are the
@@ -117,7 +120,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   const [activeExpanded, setActiveExpanded] = useState(false);
   const [failuresExpanded, setFailuresExpanded] = useState(false);
   const [completionsExpanded, setCompletionsExpanded] = useState(false);
-  const [cycleSummaryExpanded, setCycleSummaryExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
   const [activeTaxonomyFilter, setActiveTaxonomyFilter] = useState<string | null>(null);
   const [activeStageFilter, setActiveStageFilter] = useState<string | null>(null);
@@ -370,6 +372,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
 
   const handleToggleShowDismissed = useCallback(() => setShowDismissed(v => !v), []);
   const handleToggleActiveExpanded = useCallback(() => setActiveExpanded(v => !v), []);
+  const handleToggleCompletionsExpanded = useCallback(() => setCompletionsExpanded(v => !v), []);
+  const handleToggleFailuresExpanded = useCallback(() => setFailuresExpanded(v => !v), []);
 
   const handleWindowChange = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
     setActiveWindow(e.currentTarget.dataset.key as TimeWindow);
@@ -394,43 +398,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     { key: '24h', label: 'Last 24h' },
     { key: '7d', label: 'Last 7d' },
   ];
-
-  const costs = useMemo(
-    () => (digest?.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number),
-    [digest?.trend_history]
-  );
-
-  const directionCostTotals = useMemo(() => {
-    const totals: Record<string, number> = {};
-    for (const dp of digest?.direction_progress ?? []) {
-      if (!dp.cost_by_scope) continue;
-      for (const [scope, usd] of Object.entries(dp.cost_by_scope)) {
-        if (typeof usd === 'number' && usd > 0) {
-          totals[scope] = (totals[scope] ?? 0) + usd;
-        }
-      }
-    }
-    return totals;
-  }, [digest?.direction_progress]);
-
-  const FILTER_KEYS: { key: string; label: string }[] = [
-    { key: 'hash_dedup', label: 'hash dedup' },
-    { key: 'word_overlap', label: 'word overlap' },
-    { key: 'file_overlap', label: 'file overlap' },
-    { key: 'type_filtered', label: 'type filter' },
-    { key: 'empty_prompt', label: 'empty prompt' },
-    { key: 'batch_cap', label: 'batch cap' },
-  ];
-
-  const drops = useMemo(() => {
-    const ff = digest?.pipeline_filter_funnel;
-    if (!ff) return [];
-    return FILTER_KEYS
-      .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
-      .filter(f => f.v > 0)
-      .sort((a, b) => b.v - a.v);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [digest?.pipeline_filter_funnel]);
 
   const { frbcEntries, mrbcEntries, cmbcEntries, carTypeEntries, dropOffEntries } = useMemo(() => {
     const rf = digest?.remediation_funnel;
@@ -542,451 +509,13 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
             </div>
           ) : (
             <div className="flex flex-col gap-3">
-              {(digest.narrative_summary || digest.trend) && (
-                <div className="flex items-start gap-2 mb-3">
-                  {digest.narrative_summary && (
-                    <p className="text-sm text-neutral-300 leading-relaxed flex-1">
-                      {activeWindow === 'last_visit' && digest.window_hours && (
-                        <span className="text-neutral-400">Since you last checked ({digest.window_hours}h ago): </span>
-                      )}
-                      {digest.narrative_summary}
-                    </p>
-                  )}
-                  {digest.trend && (
-                    <span
-                      className={`shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
-                        digest.trend === 'improving'
-                          ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20'
-                          : digest.trend === 'declining'
-                            ? 'bg-red-500/15 text-red-400 border-red-500/20'
-                            : 'bg-neutral-700/30 text-neutral-500 border-neutral-700/30'
-                      }`}
-                      aria-label={`Trend: ${digest.trend === 'improving' ? 'Improving' : digest.trend === 'declining' ? 'Declining' : 'Stable'}`}
-                    >
-                      {digest.trend === 'improving' ? 'Improving' : digest.trend === 'declining' ? 'Declining' : 'Stable'}
-                    </span>
-                  )}
-                </div>
-              )}
+              <CatchUpNarrativeSummary digest={digest} activeWindow={activeWindow} />
               {digest.latest_cycle && (
-                <div className="flex flex-col gap-1 p-2 rounded border border-neutral-800 bg-neutral-900/40">
-                  <div className="flex items-center gap-2 text-[11px]">
-                    <span className="font-semibold text-neutral-400">Latest strategic cycle</span>
-                    {digest.latest_cycle.outcome && (
-                      <span className="px-1.5 py-0.5 rounded border text-[10px] bg-neutral-800/60 text-neutral-300 border-neutral-700">
-                        {digest.latest_cycle.outcome}
-                      </span>
-                    )}
-                    {digest.latest_cycle.completed_at && (
-                      <span className="text-[10px] text-neutral-600 font-mono">{timeAgo(digest.latest_cycle.completed_at)}</span>
-                    )}
-                    <span className="text-[10px] text-neutral-500">
-                      +{digest.latest_cycle.directions_created ?? 0} / −{digest.latest_cycle.directions_retired ?? 0} directions
-                    </span>
-                    {digest.latest_cycle.vision_updated && (
-                      <span className="text-[10px] text-cyan-400">vision updated</span>
-                    )}
-                    {(digest.latest_cycle.memos_available != null || digest.latest_cycle.memos_cited != null) && (
-                      <span className="text-[10px] text-violet-400" title="memos available / cited in this cycle">
-                        {digest.latest_cycle.memos_available ?? 0}m avail, {digest.latest_cycle.memos_cited ?? 0} cited
-                      </span>
-                    )}
-                  </div>
-                  {digest.latest_cycle.summary_text && (
-                    <div className="text-[11px] text-neutral-400 leading-relaxed">
-                      {cycleSummaryExpanded || digest.latest_cycle.summary_text.length <= 200
-                        ? digest.latest_cycle.summary_text
-                        : digest.latest_cycle.summary_text.slice(0, 200) + '…'}
-                      {digest.latest_cycle.summary_text.length > 200 && (
-                        <button
-                          type="button"
-                          onClick={() => setCycleSummaryExpanded(v => !v)}
-                          className="ml-1 text-[10px] text-cyan-500 hover:text-cyan-400"
-                        >
-                          {cycleSummaryExpanded ? 'less' : 'more'}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <CatchUpLatestCycleSection latestCycle={digest.latest_cycle} />
               )}
-              {/* Memo pathway metrics */}
-              {(digest.memo_pathway_exits ?? 0) > 0 && (
-                <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Memo pathway</span>
-                  <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
-                    {digest.memo_pathway_exits} exit{digest.memo_pathway_exits !== 1 ? 's' : ''}
-                  </span>
-                  {digest.memo_ever_cited?.ever_cited ? (
-                    <span
-                      className="text-[10px] font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
-                      title={digest.memo_ever_cited.first_cited_at ? `first cited ${timeAgo(digest.memo_ever_cited.first_cited_at)}` : undefined}
-                    >
-                      ever cited ✓
-                    </span>
-                  ) : digest.memo_ever_cited != null ? (
-                    <span className="text-[10px] text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
-                      not yet cited
-                    </span>
-                  ) : null}
-                  {(digest.recent_cycle_memo_stats ?? []).length > 0 && (
-                    <div className="flex flex-wrap gap-1">
-                      {(digest.recent_cycle_memo_stats ?? []).slice(0, 5).map((s, i) => (
-                        <span
-                          key={s.cycle_id ?? i}
-                          className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
-                          title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
-                        >
-                          {s.memos_cited}/{s.memos_available}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {/* Stats row */}
-              <div className="flex flex-wrap gap-x-3 gap-y-2 text-[11px] text-neutral-400">
-                {digest.success_rate != null && (
-                  <span
-                    className={`flex items-center gap-1 ${digest.success_rate >= 0.8 ? 'text-emerald-400' : digest.success_rate >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}
-                    aria-label={`Success rate: ${Math.round(digest.success_rate * 100)}% (${digest.success_rate >= 0.8 ? 'healthy' : digest.success_rate >= 0.5 ? 'warning' : 'critical'})`}
-                  >
-                    {Math.round(digest.success_rate * 100)}% success
-                    {digest.success_rate_delta != null && (
-                      <span className={digest.success_rate_delta > 0 ? 'text-emerald-400' : digest.success_rate_delta < 0 ? 'text-red-400' : 'text-neutral-500'}>
-                        {digest.success_rate_delta > 0 ? '+' : ''}{Math.round(digest.success_rate_delta * 100)}%
-                      </span>
-                    )}
-                    {digest.trend_history && digest.trend_history.length >= 3 && (
-                      <div className="flex items-end gap-px h-3 ml-1">
-                        {digest.trend_history.map((p, i) => {
-                          const rate = p.success_rate ?? 0;
-                          const color = rate >= 0.8 ? 'bg-emerald-400' : rate >= 0.5 ? 'bg-amber-400' : 'bg-red-400';
-                          const dateLabel = (() => {
-                            const d = parseTimestamp(p.period_end);
-                            return isNaN(d.getTime()) ? p.period_end : d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
-                          })();
-                          const ratePart = p.success_rate == null ? 'no data' : `${Math.round(p.success_rate * 100)}%`;
-                          const titleParts = [`Success: ${ratePart}`];
-                          if (p.first_attempt_success_rate != null) {
-                            titleParts.push(`1st attempt: ${Math.round(p.first_attempt_success_rate * 100)}%`);
-                          }
-                          if (p.period_cost_usd != null) {
-                            titleParts.push(`Cost: $${p.period_cost_usd.toFixed(2)}`);
-                          }
-                          const title = `${dateLabel}: ${titleParts.join(' | ')} (${p.completed} done, ${p.failed} failed)`;
-                          return <div key={i} title={title} className={`w-1 rounded-sm ${p.success_rate == null ? 'bg-neutral-700' : color}`} style={{height: `${Math.max(rate * 100, 8)}%`}} />;
-                        })}
-                      </div>
-                    )}
-                  </span>
-                )}
-                {digest.first_attempt_success_rate && digest.first_attempt_success_rate.sample_size >= 5 && (() => {
-                  const fas = digest.first_attempt_success_rate;
-                  if (!fas) return null;
-                  const tone = (r: number | null) => r == null ? 'text-neutral-500' : r >= 0.8 ? 'text-emerald-400' : r >= 0.5 ? 'text-amber-400' : 'text-red-400';
-                  const compareTone = (w: number | null, wo: number | null) =>
-                    w == null || wo == null ? 'text-neutral-500' : w > wo ? 'text-emerald-400' : w < wo ? 'text-red-400' : 'text-amber-400';
-                  const fmt = (r: number | null) => r == null ? '—' : `${Math.round(r * 100)}%`;
-                  return (
-                    <>
-                      {fas.overall != null && (
-                        <span
-                          className={`flex items-center gap-1 ${tone(fas.overall)}`}
-                          title={`First-attempt success rate (n=${fas.sample_size})${fas.trend ? ` — trend: ${fas.trend}` : ''}`}
-                        >
-                          {Math.round(fas.overall * 100)}% 1st-attempt
-                          {fas.trend === 'improving' && <span className="text-emerald-400">↑</span>}
-                          {fas.trend === 'declining' && <span className="text-red-400">↓</span>}
-                          {fas.trend === 'stable' && <span className="text-neutral-500">→</span>}
-                        </span>
-                      )}
-                      {(fas.with_playbook != null || fas.without_playbook != null) && (
-                        <span
-                          className={compareTone(fas.with_playbook, fas.without_playbook)}
-                          title="First-attempt success with vs without playbook"
-                        >
-                          Playbook: {fmt(fas.with_playbook)} vs {fmt(fas.without_playbook)} without
-                        </span>
-                      )}
-                      {(fas.with_arch_context != null || fas.without_arch_context != null) && (
-                        <span
-                          className={compareTone(fas.with_arch_context, fas.without_arch_context)}
-                          title="First-attempt success with vs without arch context"
-                        >
-                          Arch context: {fmt(fas.with_arch_context)} vs {fmt(fas.without_arch_context)} without
-                        </span>
-                      )}
-                      {fas.by_scope && Object.keys(fas.by_scope).length > 0 && (() => {
-                        const order = ['small', 'medium', 'large'];
-                        const byScope = fas.by_scope;
-                        if (!byScope) return null;
-                        const entries = Object.entries(byScope)
-                          .filter(([, v]) => typeof v === 'number')
-                          .sort(([a], [b]) => {
-                            const ai = order.indexOf(a); const bi = order.indexOf(b);
-                            return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-                          });
-                        if (entries.length === 0) return null;
-                        return (
-                          <span
-                            className="flex items-center gap-1 text-neutral-400"
-                            title="First-attempt success rate by task scope"
-                          >
-                            <span>Scope:</span>
-                            {entries.map(([scope, rate], i) => (
-                              <span key={scope} className={tone(rate)}>
-                                {scope}: {Math.round(rate * 100)}%{i < entries.length - 1 ? ' |' : ''}
-                              </span>
-                            ))}
-                          </span>
-                        );
-                      })()}
-                      {fas.first_attempt_by_review_category && Object.keys(fas.first_attempt_by_review_category).length > 0 && (() => {
-                        const fbrc = fas.first_attempt_by_review_category;
-                        if (!fbrc) return null;
-                        const entries = Object.entries(fbrc)
-                          .filter(([, v]) => typeof v === 'number' && v > 0)
-                          .sort((a, b) => b[1] - a[1])
-                          .slice(0, 3);
-                        if (entries.length === 0) return null;
-                        return (
-                          <span
-                            className="flex items-center gap-1 text-neutral-400"
-                            title="Top review categories responsible for first-attempt rejections"
-                          >
-                            <span>Rejections:</span>
-                            {entries.map(([cat, frac]) => (
-                              <span
-                                key={cat}
-                                className="px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-300"
-                              >
-                                {cat} {Math.round(frac * 100)}%
-                              </span>
-                            ))}
-                          </span>
-                        );
-                      })()}
-                    </>
-                  );
-                })()}
-                {digest.pipeline_acceptance_rate != null && (() => {
-                  const par = digest.pipeline_acceptance_rate;
-                  if (par == null) return null;
-                  const pct = Math.round(par * 100);
-                  const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
-                  return (
-                    <span className={tone} title="PRs merged / PRs decided (merged + rejected)">
-                      {pct}% accepted
-                    </span>
-                  );
-                })()}
-                {digest.pipeline_conversion_rate != null && (() => {
-                  const pcr = digest.pipeline_conversion_rate;
-                  if (pcr == null) return null;
-                  const pct = Math.round(pcr * 100);
-                  const tone = pct >= 60 ? 'text-emerald-400' : pct >= 30 ? 'text-amber-400' : 'text-red-400';
-                  return (
-                    <span className={tone} title="PRs merged / tasks created">
-                      {pct}% conv
-                    </span>
-                  );
-                })()}
-                {digest.overall_product_ratio != null && (() => {
-                  const opr = digest.overall_product_ratio;
-                  if (opr == null) return null;
-                  const pct = Math.round(opr * 100);
-                  const tone = opr >= 0.6 ? 'text-emerald-400' : opr >= 0.4 ? 'text-amber-400' : 'text-slate-400';
-                  return (
-                    <span className={tone} title="Fraction of tasks targeting product features vs structural work">
-                      {pct}% product focus
-                    </span>
-                  );
-                })()}
-                {digest.overall_type_distribution && Object.keys(digest.overall_type_distribution).length > 0 && (
-                  <span className="flex items-center gap-1" title="Task type distribution across all directions">
-                    {Object.entries(digest.overall_type_distribution)
-                      .sort((a, b) => b[1] - a[1])
-                      .map(([type, count]) => {
-                        const style = TASK_TYPE_STYLES[type];
-                        return (
-                          <span
-                            key={type}
-                            className={`${style?.bg ?? 'bg-neutral-500/10 border-neutral-500/20'} ${style?.text ?? 'text-neutral-400'} border px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider text-[10px]`}
-                          >
-                            {style?.label ?? type} {count}
-                          </span>
-                        );
-                      })}
-                  </span>
-                )}
-                {digest.pending_approval_count > 0 && (
-                  <span className="flex items-center gap-1">
-                    <AlertTriangle className="w-3 h-3 text-amber-400" />
-                    {digest.pending_approval_count} pending approval
-                  </span>
-                )}
-                {digest.completed_count > 0 && (
-                  <span className="flex items-center gap-1">
-                    <CheckCircle className="w-3 h-3 text-emerald-500" />
-                    {digest.completed_count} completed
-                    {digest.completed_delta != null && digest.completed_delta !== 0 && (
-                      <span
-                        className={digest.completed_delta > 0 ? 'text-emerald-400' : 'text-red-400'}
-                        title={digest.prev_completed_count != null ? `was ${digest.prev_completed_count} last period` : undefined}
-                      >
-                        {digest.completed_delta > 0 ? '↑' : '↓'}
-                      </span>
-                    )}
-                  </span>
-                )}
-                {digest.failed_count > 0 && (
-                  <span className="flex items-center gap-1">
-                    <XCircle className="w-3 h-3 text-red-500" />
-                    {digest.failed_count} failed
-                    {digest.failed_delta != null && digest.failed_delta !== 0 && (
-                      <span
-                        className={digest.failed_delta > 0 ? 'text-red-400' : 'text-emerald-400'}
-                        title={digest.prev_failed_count != null ? `was ${digest.prev_failed_count} last period` : undefined}
-                      >
-                        {digest.failed_delta > 0 ? '↑' : '↓'}
-                      </span>
-                    )}
-                    {digest.total_failed_cost_usd != null && digest.total_failed_cost_usd > 0 && (
-                      <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono">
-                        ·<DollarSign className="w-2.5 h-2.5" />{digest.total_failed_cost_usd.toFixed(2)} wasted
-                      </span>
-                    )}
-                  </span>
-                )}
-                {digest.total_estimated_cost_usd != null && digest.total_estimated_cost_usd > 0 && (
-                  <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono" title="Total estimated spend">
-                    <DollarSign className="w-2.5 h-2.5" />{digest.total_estimated_cost_usd.toFixed(2)} total
-                    {(() => {
-                      if (costs.length < 2) return null;
-                      const curr = costs[costs.length - 1];
-                      const prev = costs[costs.length - 2];
-                      const delta = curr - prev;
-                      if (Math.abs(delta) < 0.01) return null;
-                      const up = delta > 0;
-                      return (
-                        <span
-                          className={up ? "text-amber-600" : "text-emerald-600"}
-                          title={`Period cost change: $${prev.toFixed(2)} → $${curr.toFixed(2)}`}
-                        >
-                          {up ? "↑" : "↓"}${Math.abs(delta).toFixed(2)}
-                        </span>
-                      );
-                    })()}
-                  </span>
-                )}
-                {(digest.spot_cost_usd != null || digest.on_demand_cost_usd != null) && (
-                  (digest.spot_cost_usd ?? 0) + (digest.on_demand_cost_usd ?? 0) > 0
-                ) && (
-                  <span
-                    className="inline-flex items-center gap-0.5 text-neutral-500 font-mono"
-                    title="Spot vs on-demand compute cost split"
-                  >
-                    Spot: ${(digest.spot_cost_usd ?? 0).toFixed(2)} / On-demand: ${(digest.on_demand_cost_usd ?? 0).toFixed(2)}
-                  </span>
-                )}
-                {(() => {
-                  if (!digest.direction_progress || digest.direction_progress.length === 0) return null;
-                  const order = ['small', 'medium', 'large'];
-                  const entries = order.filter(s => directionCostTotals[s] != null);
-                  if (entries.length === 0) return null;
-                  const title = `Cost by scope: ${entries.map(s => `${s} $${directionCostTotals[s].toFixed(2)}`).join(' · ')}`;
-                  return (
-                    <span className="inline-flex items-center gap-1 font-mono text-neutral-500" title={title}>
-                      {entries.map(s => (
-                        <span key={s} className="inline-flex items-center gap-0.5 rounded bg-neutral-100 px-1 py-0.5 text-[10px]">
-                          {s} ${directionCostTotals[s].toFixed(2)}
-                        </span>
-                      ))}
-                    </span>
-                  );
-                })()}
-                {digest.provisioning_overhead_pct != null && digest.provisioning_overhead_pct > 0 && (() => {
-                  const pop = digest.provisioning_overhead_pct;
-                  if (pop == null) return null;
-                  const pctDisplay = pop * 100;
-                  const tone = pctDisplay < 10
-                    ? 'text-emerald-500'
-                    : pctDisplay <= 25
-                      ? 'text-amber-500'
-                      : 'text-red-500';
-                  const overheadUsd = digest.provisioning_overhead_usd ?? 0;
-                  return (
-                    <span
-                      className={`inline-flex items-center gap-0.5 font-mono ${tone}`}
-                      title={`Provisioning overhead: $${overheadUsd.toFixed(2)} (${pctDisplay.toFixed(1)}%)`}
-                    >
-                      Provisioning overhead: {pctDisplay.toFixed(1)}%
-                    </span>
-                  );
-                })()}
-                {digest.daily_cost_usd != null && digest.daily_cost_usd > 0 && (() => {
-                  const spent = digest.daily_cost_usd;
-                  if (spent == null) return null;
-                  const ceiling = digest.daily_cost_ceiling_usd ?? 0;
-                  const ratio = ceiling > 0 ? spent / ceiling : 0;
-                  const tone = ceiling <= 0
-                    ? 'text-neutral-500'
-                    : ratio >= 0.9
-                      ? 'text-red-500'
-                      : ratio >= 0.7
-                        ? 'text-amber-500'
-                        : 'text-emerald-500';
-                  const title = ceiling > 0
-                    ? `Today: $${spent.toFixed(2)} of $${ceiling.toFixed(2)} daily ceiling (${Math.round(ratio * 100)}%)`
-                    : `Today: $${spent.toFixed(2)} (no daily ceiling set)`;
-                  return (
-                    <span className={`inline-flex items-center gap-0.5 font-mono ${tone}`} title={title}>
-                      <DollarSign className="w-2.5 h-2.5" />{spent.toFixed(2)} today
-                      {ceiling > 0 && <span className="text-neutral-500">/{ceiling.toFixed(0)}</span>}
-                    </span>
-                  );
-                })()}
-                {digest.research_cycles > 0 && (
-                  <span>{digest.research_cycles} research cycle{digest.research_cycles !== 1 ? 's' : ''}</span>
-                )}
-                {digest.prs_opened > 0 && (
-                  <span>{digest.prs_opened} PR{digest.prs_opened !== 1 ? 's' : ''} opened</span>
-                )}
-                {digest.running_count > 0 && (
-                  <span className="flex items-center gap-1">
-                    <Loader2 className="w-3 h-3 text-neutral-500 animate-spin" />
-                    {digest.running_count} running
-                  </span>
-                )}
-                {digest.queued_count > 0 && (
-                  <span>{digest.queued_count} queued</span>
-                )}
-              </div>
-
-              {/* Pipeline filter funnel */}
-              {digest.pipeline_filter_funnel && (digest.pipeline_filter_funnel.findings_produced ?? 0) > 0 && (() => {
-                const ff = digest.pipeline_filter_funnel;
-                if (!ff) return null;
-                const produced = ff.findings_produced ?? 0;
-                const created = ff.tasks_created ?? 0;
-                const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
-                return (
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
-                    <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
-                    <span>
-                      <span className="font-semibold text-neutral-200">{created}</span>
-                      <span className="text-neutral-500"> / {produced} findings &rarr; tasks </span>
-                      <span className="font-semibold text-neutral-200">({pct}%)</span>
-                    </span>
-                    {drops.slice(0, 3).map(d => (
-                      <span key={d.key} className="text-neutral-500" title={d.label}>
-                        {d.label} <span className="font-mono text-neutral-400">-{d.v}</span>
-                      </span>
-                    ))}
-                  </div>
-                );
-              })()}
+              <CatchUpMemoPathwaySection digest={digest} />
+              <CatchUpStatsRow digest={digest} />
+              <CatchUpResearchYieldSection pipelineFilterFunnel={digest.pipeline_filter_funnel} />
 
               {/* Direction progress */}
               {digest.direction_progress && digest.direction_progress.length > 0 && (
@@ -1107,7 +636,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 onToggleSnippet={toggleSnippet}
                 onSelectTask={onSelectTask}
                 failuresExpanded={failuresExpanded}
-                onToggleFailuresExpanded={() => setFailuresExpanded(v => !v)}
+                onToggleFailuresExpanded={handleToggleFailuresExpanded}
               />
 
               {/* Remediation pipeline */}
@@ -1127,70 +656,12 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
               )}
 
               {/* Recent completions */}
-              {(digest.recent_completions ?? []).length > 0 && (() => {
-                const completions = digest.recent_completions ?? [];
-                // Group by task_type, preserving insertion order
-                const groups = new Map<string, RecentCompletion[]>();
-                for (const c of completions) {
-                  const key = c.task_type || 'other';
-                  let bucket = groups.get(key);
-                  if (!bucket) { bucket = []; groups.set(key, bucket); }
-                  bucket.push(c);
-                }
-                const groupEntries = Array.from(groups.entries());
-                const allSameType = groupEntries.length === 1;
-
-                return (
-                  <div>
-                    <button
-                      onClick={() => setCompletionsExpanded(v => !v)}
-                      aria-expanded={completionsExpanded}
-                      className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
-                    >
-                      {completionsExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                      <CheckCircle className="w-3 h-3 text-emerald-500" />
-                      Recent completions ({completions.length})
-                    </button>
-                    {completionsExpanded && (
-                      <div className="flex flex-col gap-2">
-                        {/* Type summary line */}
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          {groupEntries.map(([type, items], idx) => {
-                            const style = TASK_TYPE_STYLES[type];
-                            return (
-                              <span key={type} className="flex items-center gap-1 text-[10px]">
-                                {idx > 0 && <span className="text-neutral-700">·</span>}
-                                <span className={`${style?.bg ?? 'bg-neutral-500/10 border-neutral-500/20'} ${style?.text ?? 'text-neutral-400'} border px-1.5 py-0.5 rounded font-semibold uppercase tracking-wider`}>
-                                  {items.length} {style?.label ?? type}
-                                </span>
-                              </span>
-                            );
-                          })}
-                        </div>
-                        {/* Grouped completion rows */}
-                        {allSameType ? (
-                          <div className="flex flex-col gap-1.5">
-                            {completions.map(c => (
-                              <CompletionRow key={c.task_id} c={c} onSelectTask={onSelectTask} />
-                            ))}
-                          </div>
-                        ) : (
-                          groupEntries.map(([type, items]) => (
-                            <div key={type} className="flex flex-col gap-1.5">
-                              <div className="flex items-center gap-1.5">
-                                <TaskTypeBadge taskType={type as TaskType} />
-                              </div>
-                              {items.map(c => (
-                                <CompletionRow key={c.task_id} c={c} onSelectTask={onSelectTask} />
-                              ))}
-                            </div>
-                          ))
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+              <CatchUpRecentCompletionsSection
+                completions={digest.recent_completions ?? []}
+                expanded={completionsExpanded}
+                onToggle={handleToggleCompletionsExpanded}
+                onSelectTask={onSelectTask}
+              />
             </div>
           )}
         </div>

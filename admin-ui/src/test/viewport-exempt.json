@@ -10,6 +10,12 @@
     "MessageBubble": "Message-row sub-component rendered exclusively inside MessagesPanel; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises the bubble inline (overflow, text-truncation, touch-target).",
     "CatchUpNeedsAttentionSection": "Needs-attention worklist sub-component rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx which exercises it inline.",
     "CatchUpRemediationPipelineSection": "Remediation-pipeline funnel sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.",
+    "CatchUpStatsRow": "Headline stats-row sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx which exercises it inline.",
+    "CatchUpNarrativeSummary": "Narrative-summary + trend-pill sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.",
+    "CatchUpLatestCycleSection": "Latest-strategic-cycle card sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.",
+    "CatchUpMemoPathwaySection": "Memo-pathway metrics sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.",
+    "CatchUpResearchYieldSection": "Research-yield funnel sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.",
+    "CatchUpRecentCompletionsSection": "Recent-completions list sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx which exercises it inline.",
     "CategoryRow": "Per-category trend row rendered exclusively inside SrTrendBreakdown (card and inline variants); viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.",
     "SrDiagnosticsStack": "SR diagnostics stack rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline."
   }
