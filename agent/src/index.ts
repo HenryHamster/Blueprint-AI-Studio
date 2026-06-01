@@ -49,7 +49,8 @@ import {
 } from './utils/test-runners.js';
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, RateLimitError, getProviderRunner,
+  parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  getProviderRunner,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
@@ -58,7 +59,8 @@ import {
 
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
-  parseLLMCliTranslation, matchesRateLimit, RateLimitError, getProviderRunner,
+  parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  getProviderRunner,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
 };
@@ -66,7 +68,7 @@ export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand,
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
-export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned';
+export type FailureCategory = 'clone_failed' | 'build_failed' | 'test_failed' | 'lint_failed' | 'pr_creation_failed' | 'claude_code_failed' | 'parse_failed' | 'fatal' | 'rate_limited' | 'no_progress_timeout' | 'timeout' | 'oauth_rotation_failed' | 'reset_failed' | 'reassigned';
 
 // ── Graceful-shutdown signalling (cluster C7) ────────────────────────────────
 // A non-error "shutdown requested" control signal. Thrown from the deep call

@@ -45,17 +45,23 @@ export const CLAUDE_RESULT_GRACE_MS = 30_000;
 // independent 30s setInterval, so the reaper still sees the VM as alive.
 export const CLAUDE_STREAM_STALL_MS = 12 * 60_000;
 
-// Max time the model may go without emitting a single stream-json content event
-// (assistant/result) while NO tool is in flight, before the call is treated as a
-// silent provider hang. When Anthropic returns 429/529, the Claude Code SDK
-// retries internally and emits non-content stdout (so CLAUDE_STREAM_STALL_MS,
-// which watches raw stdout, never trips) while producing 0 output tokens. Such a
-// hang otherwise rides to the 45-min wall-clock timeout and is misclassified
-// AGENT_TIMEOUT (incident 2026-05-29). On trigger the agent reports rate_limited
-// so the orchestrator holds/reroutes instead of burning the retry budget.
-// Env-overridable for ops tuning.
+// Max time the model may go without ANY stream-json progress signal — a content
+// event (assistant/result) OR an incremental partial-message delta
+// (content_block_delta text / thinking_delta, emitted by --include-partial-messages)
+// — while NO tool is in flight, before the call is treated as a silent provider
+// hang. With partial messages the model emits a delta every few seconds while
+// actively generating/thinking, so a slow-but-working opus turn keeps this fresh
+// and never trips; only a genuinely hung call (a real 429/529 the SDK retries
+// silently, emitting ZERO model deltas) goes stale and fires. Such a hang
+// otherwise rides to the 45-min wall-clock timeout and is misclassified
+// AGENT_TIMEOUT (incident 2026-05-29). On trigger, the agent reports the hang
+// (rate_limited only when a confirmed rate-limit message is present, else the
+// transient no_progress_timeout) so the orchestrator holds/reroutes instead of
+// burning the retry budget. Bumped 12→15 min as defense-in-depth so a brief
+// inter-delta gap (large thinking block, big tool-result re-ingest) has more
+// slack. Env-overridable for ops tuning.
 export const LLM_NO_PROGRESS_STALL_MS =
-  Number(process.env.LLM_NO_PROGRESS_STALL_MS) || 12 * 60_000;
+  Number(process.env.LLM_NO_PROGRESS_STALL_MS) || 15 * 60_000;
 
 // Log/error message tail length used in status reports.
 export const LOG_TAIL_BYTES = 5_000;

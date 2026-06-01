@@ -146,6 +146,19 @@ SCOPE_EMPTY = "SCOPE_EMPTY"
 # it out → false AGENT_TIMEOUT). This is NOT a code defect: it must NOT consume
 # the retry budget or penalize direction health, so it lives in INFRA_CLASSES.
 REASSIGNED = "REASSIGNED"
+# The agent's llm-no-progress watchdog fired on a GENUINELY silent LLM call (no
+# stream-json progress signal for >LLM_NO_PROGRESS_STALL_MS) but NO confirmed
+# rate-limit message was present (no RATE_LIMIT_PATTERNS match). This is a
+# transient provider hang of UNKNOWN cause -- NOT a confirmed account rate-limit.
+# Distinct from RATE_LIMIT so the requeue path leaves the account AVAILABLE (does
+# NOT block its model / apply the canonical cooldown): the pipeline runs many
+# Max-20x accounts that are not actually rate-limited, so blocking a healthy
+# account on an inferred hang is a self-inflicted cascade that mimics rate-limiting
+# (incident 2026-05-31). Like RATE_LIMIT it requeues without burning the retry
+# budget; unlike RATE_LIMIT it never touches account state. A CONFIRMED rate-limit
+# message still routes to RATE_LIMIT (block + cooldown) -- that path is unchanged.
+# Lowercase to match the literal failure_category string the agent posts.
+NO_PROGRESS_TIMEOUT = "no_progress_timeout"
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -275,6 +288,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         AGENT_STALLED,
         SCOPE_EMPTY,
         REASSIGNED,
+        NO_PROGRESS_TIMEOUT,
     }
 )
 
@@ -292,6 +306,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     BLOCKED_PRECONDITION,
     SCOPE_EMPTY,
     REASSIGNED,
+    NO_PROGRESS_TIMEOUT,
 )
 
 
@@ -512,6 +527,13 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # defect — REASSIGNED is in INFRA_CLASSES so it neither burns the retry
     # budget nor penalizes direction health.
     "reassigned": REASSIGNED,
+    # ``no_progress_timeout`` -- agent's llm-no-progress watchdog fired on a
+    # genuinely silent call with NO confirmed rate-limit message. Transient
+    # provider hang of unknown cause; routes to NO_PROGRESS_TIMEOUT (in
+    # INFRA_CLASSES) so it requeues without burning retry AND without blocking the
+    # account. A CONFIRMED rate-limit message is reported as ``rate_limited``
+    # (-> RATE_LIMIT, block + cooldown) instead — see runners.ts.
+    "no_progress_timeout": NO_PROGRESS_TIMEOUT,
 }
 
 

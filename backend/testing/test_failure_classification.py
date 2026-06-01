@@ -21,6 +21,7 @@ from app.failure_classification import (
     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
     EXTERNAL_API_SUBTYPE_PROVIDER_QUOTA,
     MIGRATION_ERROR,
+    NO_PROGRESS_TIMEOUT,
     PROVISION_FAILURE,
     RATE_LIMIT,
     REASSIGNED,
@@ -397,6 +398,53 @@ class TestNormalizeAgentFailureCategory:
             {"failure_category": "reassigned"},
         )
         assert classify_failure(task) == REASSIGNED
+
+
+class TestNoProgressTimeout:
+    """The agent's no-progress watchdog fired on a genuinely silent call but NO
+    confirmed rate-limit message matched. Reported as failure_category
+    'no_progress_timeout' → NO_PROGRESS_TIMEOUT class: transient infra, requeue
+    without burning retry, and (critically) WITHOUT blocking the account. Only a
+    CONFIRMED rate-limit message ('rate_limited') routes to RATE_LIMIT + block."""
+
+    def test_normalizes_to_no_progress_timeout_class(self):
+        task = _task(
+            "Claude Code produced no model output for >15 min — transient provider hang"
+        )
+        assert (
+            normalize_agent_failure_category("no_progress_timeout", task)
+            == NO_PROGRESS_TIMEOUT
+        )
+
+    def test_context_fast_path_honors_label(self):
+        task = _task(
+            "Claude Code produced no model output (no stream deltas)",
+            {"failure_category": "no_progress_timeout"},
+        )
+        assert classify_failure(task) == NO_PROGRESS_TIMEOUT
+
+    def test_is_infra_class_no_budget_burn_no_health_penalty(self):
+        """NO_PROGRESS_TIMEOUT must be in INFRA_CLASSES (it is also imported there
+        as the direction-health infra set) so an inferred transient hang neither
+        burns the retry budget nor penalizes direction health — and it is NOT a
+        code defect."""
+        from app.failure_classification import INFRA_CLASSES
+
+        assert NO_PROGRESS_TIMEOUT in INFRA_CLASSES
+        assert NO_PROGRESS_TIMEOUT != CODE_ERROR
+        # Distinct from RATE_LIMIT: the requeue path's account-block branches are
+        # gated on RATE_LIMIT, so a NO_PROGRESS_TIMEOUT requeue leaves the account
+        # available. The two must never collapse to the same class.
+        assert NO_PROGRESS_TIMEOUT != RATE_LIMIT
+
+    def test_in_all_failure_classes(self):
+        assert NO_PROGRESS_TIMEOUT in ALL_FAILURE_CLASSES
+
+    def test_confidence_is_high_for_structured_label(self):
+        task = _task("anything", ctx={"failure_category": "no_progress_timeout"})
+        result = classify_failure_with_confidence(task)
+        assert result.failure_class == NO_PROGRESS_TIMEOUT
+        assert result.confidence == 0.9
 
 
 class TestClassifyFailureCodeError:
