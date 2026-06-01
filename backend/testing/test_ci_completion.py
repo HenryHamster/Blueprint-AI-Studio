@@ -927,10 +927,12 @@ async def test_merge_failure_escalates_at_10_failures(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
+async def test_merge_failure_escalation_dedups_until_hard_cap(db_session, mocker):
     """
-    When merge_failures reaches MERGE_FAILURE_HARD_CAP - 2 (13) and the task is
-    already escalated, a second 'hard-cap imminent' alert fires exactly once.
+    Consolidated ladder: once the single escalation rung has fired
+    (merge_escalated set), every later transient failure up to the hard cap is
+    silent — no second 'final-warn'/'imminent' alert. The next and only further
+    operator signal is the terminal hard-cap FAIL (covered separately).
     """
     from app.ci_completion import (
         MERGE_FAILURE_HARD_CAP,
@@ -949,13 +951,13 @@ async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
         return_value={"merged": False, "message": "server error"},
     )
 
-    project = Project(name="Final warn at 13", user_id="test-user")
+    project = Project(name="Escalation dedup", user_id="test-user")
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     # Pre-existing in-flight fix task → `already_fixing` gate skips the
-    # rebase-fix spawn so this test validates the final-warn alert path.
+    # rebase-fix spawn so this test validates the dedup behavior.
     existing_fix = Task(
         project_id=project.id,
         title="existing fix",
@@ -965,8 +967,8 @@ async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
     )
     db_session.add(existing_fix)
 
-    # Start at HARD_CAP - 3 with merge_escalated already set; this call pushes
-    # failures to HARD_CAP - 2 (13) and should trigger the final-warn alert.
+    # Already escalated, mid-way to the cap (HARD_CAP - 3). This call pushes
+    # failures to HARD_CAP - 2 — still below the cap — and must NOT alert again.
     task = _make_task(
         db_session,
         project,
@@ -984,17 +986,9 @@ async def test_merge_failure_final_warn_at_13_failures(db_session, mocker):
 
     review_loop = (task.context or {}).get("review_loop", {})
     assert review_loop.get("merge_failures") == MERGE_FAILURE_HARD_CAP - 2
-    assert review_loop.get("merge_final_warn") is True
-    alert_mock.assert_called_once()
-    assert "imminent" in alert_mock.call_args[0][2].lower()
-
-    # A second failure at HARD_CAP - 1 must not fire the final-warn alert again.
-    alert_mock.reset_mock()
-    await _attempt_merge_with_retry_and_escalation(
-        task, "fake-token", "owner", "repo", db_session, source="webhook"
-    )
-    for call in alert_mock.call_args_list:
-        assert "imminent" not in call[0][2].lower()
+    # No 'final-warn' latch exists anymore and no second warning alert fires.
+    assert "merge_final_warn" not in review_loop
+    alert_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1028,7 @@ async def test_merge_failure_does_not_double_escalate(db_session, mocker):
     db_session.add(existing_fix)
 
     # Already escalated with 10 failures; no new alert should fire on the next
-    # transient failure (still below final-warn and hard-cap thresholds).
+    # transient failure (escalation rung already latched, still below hard cap).
     task = _make_task(
         db_session,
         project,
@@ -1094,14 +1088,13 @@ async def test_merge_failure_hard_cap_marks_failed(db_session, mocker):
     db_session.add(existing_fix)
 
     # One below the cap so this call crosses it; merge_escalated already True
-    # so we test that the cap fires independently of the 10-failure escalation.
+    # so we test that the cap fires independently of the escalation rung.
     task = _make_task(
         db_session,
         project,
         ci_loop_extra={
             "merge_failures": MERGE_FAILURE_HARD_CAP - 1,
             "merge_escalated": True,
-            "merge_final_warn": True,
         },
     )
     await db_session.commit()

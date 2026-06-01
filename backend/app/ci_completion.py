@@ -19,6 +19,7 @@ accepted as a fallback so in-flight tasks from before the gate split still merge
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import uuid
 
@@ -52,9 +53,17 @@ def _pr_number_match(session, pr_number: int):
 
 # Hard cap on merge retries — scope-aware. Small-scope PRs (single-file tweaks)
 # have fewer legitimate reasons for transient merge failures, so cap sooner.
-# Escalation alert fires at (cap - 5), final-warn at (cap - 2).
 MERGE_FAILURE_HARD_CAP = 15
 _SCOPE_MERGE_HARD_CAP = {"small": 8, "medium": 12, "large": 15}
+
+# Single escalation rung for the per-PR stuck-merge ladder: how many failures
+# before the hard cap the one (deduped) "still stuck, retrying" operator alert
+# fires. Past this point the next milestone is the terminal hard-cap FAIL — no
+# intermediate "final-warn" rung (that second warning was redundant: the same
+# stuck PR already alerted once here and the operator gains nothing from a
+# countdown). Tunable via env to move the warning closer to / further from the
+# cap without touching the cap itself.
+MERGE_ESCALATE_BEFORE_CAP = int(os.getenv("MERGE_ESCALATE_BEFORE_CAP", "5"))
 
 
 def _merge_hard_cap_for_task(task: Task) -> int:
@@ -1130,8 +1139,7 @@ async def _attempt_merge_with_retry_and_escalation(
                 return False
 
             _hard_cap = _merge_hard_cap_for_task(task)
-            _escalate_at = max(1, _hard_cap - 5)
-            _final_warn_at = max(1, _hard_cap - 2)
+            _escalate_at = max(1, _hard_cap - MERGE_ESCALATE_BEFORE_CAP)
             _deterministic = _is_deterministic_merge_error(_norm_cur)
             _repeated_identical = _err_streak >= 2
 
@@ -1242,26 +1250,22 @@ async def _attempt_merge_with_retry_and_escalation(
                         await session.commit()
                         return True
 
+            # Single escalation rung: one deduped operator alert when the PR
+            # first crosses _escalate_at, surfacing both that it's stuck and how
+            # close the terminal hard-cap is. The ``merge_escalated`` latch makes
+            # it fire exactly once — every later failure up to the cap is silent
+            # (the operator already knows; the next signal is the hard-cap FAIL
+            # below). Replaces the former two-rung "still retrying" + "imminent"
+            # ladder, which double-alerted the same stuck PR for no added signal.
             if _merge_failures >= _escalate_at and not ci_loop.get("merge_escalated"):
                 ci_loop["merge_escalated"] = True
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
                 await _maybe_create_failure_alert(
                     task,
                     session,
-                    f"Rollup PR #{ci_pr_number} merge failed {_merge_failures} times — still retrying",
-                )
-            if (
-                _merge_failures >= _final_warn_at
-                and ci_loop.get("merge_escalated")
-                and not ci_loop.get("merge_final_warn")
-            ):
-                ci_loop["merge_final_warn"] = True
-                task.context = {**(task.context or {}), "review_loop": ci_loop}
-                await _maybe_create_failure_alert(
-                    task,
-                    session,
                     f"PR #{ci_pr_number} merge failed {_merge_failures} times — "
-                    f"hard cap imminent ({_hard_cap - _merge_failures} retries remaining)",
+                    f"still retrying ({_hard_cap - _merge_failures} attempts before "
+                    f"hard cap, then manual action required)",
                 )
             if _merge_failures >= _hard_cap or _repeated_identical or _deterministic:
                 from app.shared_state import runtime_config as _rt_cfg
