@@ -364,6 +364,110 @@ async def test_orphan_recovery_uses_project_namespace(svc_db, mocker):
     )
 
 
+# ── Audit P1 session-hygiene seam ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_cancelled_row_does_not_drop_next_rows_mutation(
+    svc_db, mocker
+):
+    """Audit P1 seam: a per-row op that is CANCELLED / times out mid-DB-op must
+    NOT drop a SUBSEQUENT orphan's recovery mutation in the same sweep, and each
+    row must run on its OWN session.
+
+    Pre-fix _recover_orphaned_tasks held ONE shared session across the whole
+    per-row loop. A _bounded(get_github_token_for_task, session) timeout fired a
+    cancellation INTO the coroutine while it was mid-DB-op on that shared
+    session, leaving it in PendingRollback for the REST of the tick; the body's
+    per-row ``except`` swallowed the TimeoutError and ``continue``d WITHOUT
+    rolling back, so the next orphan's ``session.commit()`` raised
+    PendingRollbackError → the outer ``except`` aborted the sweep → every later
+    orphan's artifact/alert/review-spawn (or _recovery_attempts back-off bump)
+    was silently dropped, exactly under the load (many orphans + slow GitHub)
+    where recovery matters most.
+
+    The fix gives each orphan its OWN short-lived session. This test asserts
+    BOTH halves of the invariant:
+      1. each processed row received a DISTINCT session object (so a poison on
+         one cannot reach the next) — this is what FAILS on the old shared
+         design (same session id reused), and
+      2. the second orphan's recovery mutation (the no-PR back-off bump) still
+         commits even though the first row's token fetch raised a TimeoutError.
+    """
+    project = await _make_project(svc_db)
+    # Two distinct orphan candidates. created_at ASC services the oldest first,
+    # so t_cancel (older) is processed before t_victim.
+    t_cancel = await _make_completed_task(
+        svc_db, project.id, task_type="create", minutes_ago=40
+    )
+    t_victim = await _make_completed_task(
+        svc_db, project.id, task_type="create", minutes_ago=30
+    )
+
+    # Run the wrapped coroutine on this loop (production _bounded wraps it in
+    # asyncio.wait_for which detaches into a new task and loses the greenlet
+    # context under in-memory SQLite — a harness-only artifact).
+    async def _passthrough_bounded(coro, *_a, **_k):
+        return await coro
+
+    mocker.patch("app.services._bounded", side_effect=_passthrough_bounded)
+
+    seen_sessions: list = []
+
+    async def _token_fetch(task_id, session, *_a, **_k):
+        # Record which session object this row ran on so the test can prove
+        # per-row isolation (distinct objects ⇒ a poison can't cross rows).
+        seen_sessions.append((task_id, id(session)))
+        if task_id == t_cancel.id:
+            # The wait_for ceiling fired: _bounded re-raises TimeoutError after
+            # cancelling the wrapped coroutine mid-DB-op. The body logs+skips.
+            raise asyncio.TimeoutError("simulated _bounded ceiling on token fetch")
+        return ("gh_token", "owner", "repo")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        side_effect=_token_fetch,
+    )
+
+    # The victim row's GitHub PR lookup finds no open PR → it takes the
+    # _recovery_attempts back-off bump + commit path. That commit is the
+    # mutation we assert survives.
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = []
+    mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
+
+    # Must not raise even though row #1 is cancelled mid-op.
+    await _recover_orphaned_tasks()
+
+    # Both orphans were processed (token fetch attempted on each).
+    seen_ids = {tid for tid, _ in seen_sessions}
+    assert t_cancel.id in seen_ids and t_victim.id in seen_ids, (
+        f"expected both orphans to be processed, saw {seen_ids}"
+    )
+    # Invariant 1: distinct session object per row — a poisoned session on the
+    # cancelled row can never reach the victim row. Fails on the old shared
+    # design (single session reused → identical id()).
+    session_ids = {sid for _, sid in seen_sessions}
+    assert len(session_ids) == len(seen_sessions), (
+        "each orphan must run on its OWN session; a session object was reused "
+        "across rows (the audit-P1 shared-session design)"
+    )
+
+    # Invariant 2: the victim's recovery mutation (back-off bump) committed,
+    # despite the cancelled row earlier in the same sweep.
+    import app.services as _services
+
+    async with _services.AsyncSessionLocal() as verify:
+        victim = await verify.get(Task, t_victim.id)
+        assert victim is not None
+        assert (victim.context or {}).get("_recovery_attempts") == 1, (
+            "the second orphan's recovery mutation was dropped — a cancelled "
+            "earlier row leaked into the rest of the sweep (the audit-P1 "
+            "shared-session bug)"
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Registry extensibility: WRITE_TASK_TYPES is the single edit point
 # ══════════════════════════════════════════════════════════════════════════════

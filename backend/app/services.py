@@ -65,6 +65,39 @@ _POST_COMMIT_CALL_TIMEOUT_S = 260.0
 MAX_TOTAL_ATTEMPTS = 20
 
 
+class _DeployPauseSnapshot:
+    """Plain (session-free) snapshot of the DeploymentState pause fields that
+    ``pause_clock.total_paused_seconds`` / ``active_elapsed`` read.
+
+    Audit P1 (session hygiene): the EVALUATING-timeout sweep now opens a fresh
+    session per row (so a _bounded cancellation on one row can't poison the
+    whole tick). The pause clock needs DeploymentState; rather than reuse the
+    cycle-read session's ORM instance across per-row sessions (which would risk
+    a cross-session lazy-load / MissingGreenlet), we re-fetch it per row and
+    keep this attribute-compatible snapshot only as a fallback if the singleton
+    row went away mid-cycle. Exposes exactly the attributes pause_clock reads.
+    """
+
+    __slots__ = (
+        "paused_at",
+        "total_auto_paused_seconds",
+        "total_manual_paused_seconds",
+    )
+
+    def __init__(self, paused_at, total_manual_paused_seconds, total_auto_paused_seconds):
+        self.paused_at = paused_at
+        self.total_manual_paused_seconds = total_manual_paused_seconds
+        self.total_auto_paused_seconds = total_auto_paused_seconds
+
+    @classmethod
+    def from_state(cls, state) -> "_DeployPauseSnapshot":
+        return cls(
+            paused_at=state.paused_at,
+            total_manual_paused_seconds=state.total_manual_paused_seconds,
+            total_auto_paused_seconds=state.total_auto_paused_seconds,
+        )
+
+
 async def _bounded(coro, timeout_s: float, *, what: str):
     """Await ``coro`` with a hard ``timeout_s`` ceiling.
 
@@ -952,51 +985,46 @@ async def _check_evaluating_timeouts(progress_cb=None):
     TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 
     try:
-        async with AsyncSessionLocal() as session:
-            from app import pause_clock
-            from app.models import DeploymentState
+        from app import pause_clock
+        from app.models import DeploymentState
 
-            now = _utcnow()
+        now = _utcnow()
+
+        # ── Phase A: cycle reads on a short-lived session ──────────────────
+        # Audit P1 (session hygiene): the cycle-level candidate scan + child
+        # snapshot run on their OWN session that is CLOSED before the per-row
+        # loop opens any per-row session. Previously a single shared session
+        # was held open across the whole loop, and a _bounded() timeout /
+        # cancellation mid-DB-op left that shared session in PendingRollback
+        # for the REST of the tick — so every later per-row recovery mutation
+        # was silently dropped (exactly under the load — many EVALUATING rows +
+        # slow GitHub — where recovery matters most). The fix below gives each
+        # row its OWN short-lived session, so a cancellation/rollback on one
+        # row can never poison the others. Only PLAIN snapshots (ids, statuses)
+        # cross the session boundary; no live ORM instance is reused across
+        # sessions (which would risk a cross-session lazy-load / MissingGreenlet).
+        # NB the in-memory SQLite test DB shares one connection across sessions
+        # (StaticPool), so two concurrently-open sessions self-deadlock; Phase A
+        # is fully closed before Phase B opens, and per-row sessions are
+        # strictly sequential — never two open at once.
+        async with AsyncSessionLocal() as read_session:
             # Fetch DeployState once per cycle so CI backstop can subtract
             # pause windows from elapsed (admin pause + auto-pause both count).
-            _deploy_state = await session.get(DeploymentState, 1)
+            # Snapshot the pause fields into a plain object so the per-row
+            # sessions (Phase B) don't reuse this read_session's ORM instance.
+            _ds_row = await read_session.get(DeploymentState, 1)
+            _deploy_state_snapshot = (
+                _DeployPauseSnapshot.from_state(_ds_row) if _ds_row else None
+            )
             # Phase B4 (H-P2): drop ``plan_output`` JSONB; the EVALUATING-timeout
             # loop only reads context/payloads/status_log of the heavy JSONB
             # columns. status_log is consumed at lines ~1216 and ~1384 to find
             # the last EVALUATING transition, so it must remain loaded.
             evaluating_tasks = (
                 (
-                    await session.execute(
+                    await read_session.execute(
                         select(Task)
-                        .options(
-                            load_only(
-                                Task.id,
-                                Task.status,
-                                Task.title,
-                                Task.project_id,
-                                Task.parent_task_id,
-                                Task.archived,
-                                Task.requires_approval,
-                                Task.created_at,
-                                Task.started_at,
-                                Task.updated_at,
-                                Task.latest_status_message,
-                                Task.context,
-                                Task.payloads,
-                                Task.status_log,
-                                Task.last_heartbeat,
-                                Task.attempt_count,
-                                Task.account_id,
-                                Task.vm_instance_id,
-                                # C6 rework (A): the _pr_state_check_pending
-                                # consumer's review re-spawn falls back to
-                                # ``task.description`` for the prompt when the
-                                # payload has none. Without it loaded here that
-                                # read fires a sync lazy-load → MissingGreenlet
-                                # under the async session ([[load_only_lazy_load_trap]]).
-                                Task.description,
-                            )
-                        )
+                        .options(load_only(Task.id, Task.status, Task.archived))
                         .where(
                             Task.status == TaskStatus.EVALUATING,
                             Task.archived.is_(False),
@@ -1013,7 +1041,10 @@ async def _check_evaluating_timeouts(progress_cb=None):
                 .scalars()
                 .all()
             )
-            if len(evaluating_tasks) >= _EVAL_TIMEOUT_MAX_PER_CYCLE:
+            # Snapshot just the candidate IDs — each row is re-fetched fresh in
+            # its own per-row session below.
+            evaluating_task_ids = [t.id for t in evaluating_tasks]
+            if len(evaluating_task_ids) >= _EVAL_TIMEOUT_MAX_PER_CYCLE:
                 logger.warning(
                     "[EVAL TIMEOUT] Hit per-cycle cap of %d EVALUATING rows — "
                     "remainder deferred to next sweep",
@@ -1024,24 +1055,19 @@ async def _check_evaluating_timeouts(progress_cb=None):
             # into one ``IN (...)`` query instead of one-per-parent (N+1).
             #
             # Only a plain (id, status) snapshot is kept — NOT live ORM rows.
-            # This loop commits per task, and a commit/rollback inside
-            # _check_and_trigger_rollup expires every loaded instance; a later
-            # iteration reading ``child.status`` off a stale batch fires a sync
-            # lazy-load that crashes the cycle on an unhealthy connection (prod
-            # 2026-05-21, services.py:1868). The hot all-terminal check below
-            # reads the snapshot; the rare branches that mutate children
-            # re-fetch them fresh.
+            # The hot all-terminal check below reads the snapshot; the rare
+            # branches that mutate children re-fetch them fresh on the per-row
+            # session.
             _eval_child_status_by_parent: Dict[uuid.UUID, list[tuple]] = {}
-            if evaluating_tasks:
-                _eval_parent_ids = [t.id for t in evaluating_tasks]
+            if evaluating_task_ids:
                 _eval_child_rows = (
                     (
-                        await session.execute(
+                        await read_session.execute(
                             select(Task)
                             .options(
                                 load_only(Task.id, Task.parent_task_id, Task.status)
                             )
-                            .where(Task.parent_task_id.in_(_eval_parent_ids))
+                            .where(Task.parent_task_id.in_(evaluating_task_ids))
                         )
                     )
                     .scalars()
@@ -1051,17 +1077,79 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     _eval_child_status_by_parent.setdefault(
                         _ec.parent_task_id, []
                     ).append((_ec.id, _ec.status))
+        # read_session is now closed — no session is held across the loop.
 
-            for task in evaluating_tasks:
-                # C3 heartbeat: this loop performs serial GitHub I/O
-                # (get_pull_request / close_pull_request / _check_and_trigger_rollup)
-                # per task and is the dominant contributor to the EVALUATING-sweep
-                # wall time. Pump the CALLER'S OWN liveness marker each row so a
-                # legitimately long-but-progressing sweep is never mistaken for a
-                # hung task. NB: this is the background task's own heartbeat, NOT
-                # the orchestrator_worker's — pumping the worker's shared marker
-                # from here would mask a genuinely hung worker (fix D).
-                _heartbeat()
+        # ── Phase B: per-row recovery, each on its OWN short-lived session ──
+        for _eval_task_id in evaluating_task_ids:
+            # C3 heartbeat: this loop performs serial GitHub I/O
+            # (get_pull_request / close_pull_request / _check_and_trigger_rollup)
+            # per task and is the dominant contributor to the EVALUATING-sweep
+            # wall time. Pump the CALLER'S OWN liveness marker each row so a
+            # legitimately long-but-progressing sweep is never mistaken for a
+            # hung task. NB: this is the background task's own heartbeat, NOT
+            # the orchestrator_worker's — pumping the worker's shared marker
+            # from here would mask a genuinely hung worker (fix D).
+            _heartbeat()
+            # Audit P1: open a FRESH session per row. A _bounded() timeout /
+            # cancellation that poisons THIS session (PendingRollback) is
+            # confined to this iteration — the `async with` closes it on the
+            # way out and the next row gets a clean session, so one slow /
+            # cancelled row no longer silently drops the rest of the sweep's
+            # recovery mutations.
+            async with AsyncSessionLocal() as session:
+                # Re-fetch the candidate fresh on this session and re-validate
+                # it is still an unarchived EVALUATING row (it may have been
+                # resolved by another worker between Phase A and now). Same
+                # load_only column set the cycle scan used to use, so deferred
+                # heavy JSONB stays deferred and ``description`` stays loaded
+                # for the _pr_state_check_pending consumer's fallback prompt
+                # ([[load_only_lazy_load_trap]]).
+                task = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .options(
+                                load_only(
+                                    Task.id,
+                                    Task.status,
+                                    Task.title,
+                                    Task.project_id,
+                                    Task.parent_task_id,
+                                    Task.archived,
+                                    Task.requires_approval,
+                                    Task.created_at,
+                                    Task.started_at,
+                                    Task.updated_at,
+                                    Task.latest_status_message,
+                                    Task.context,
+                                    Task.payloads,
+                                    Task.status_log,
+                                    Task.last_heartbeat,
+                                    Task.attempt_count,
+                                    Task.account_id,
+                                    Task.vm_instance_id,
+                                    Task.description,
+                                )
+                            )
+                            .where(Task.id == _eval_task_id)
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if (
+                    task is None
+                    or task.status != TaskStatus.EVALUATING
+                    or task.archived
+                ):
+                    continue
+                # Re-fetch the live DeploymentState on THIS session for the
+                # pause-aware elapsed calcs (the snapshot is only used as a
+                # fallback if the row went away). Reusing a foreign-session ORM
+                # instance here would risk a cross-session lazy-load.
+                _deploy_state = (
+                    await session.get(DeploymentState, 1)
+                ) or _deploy_state_snapshot
                 ctx = task.context or {}
 
                 # _pr_state_check_pending consumer. The agent_status FAILED→
@@ -1112,12 +1200,14 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             from app.routers.agent import get_github_token_for_task
                             from app.github import get_pull_request
 
-                            # C3 NOTE (fix E): get_github_token_for_task runs DB
-                            # I/O on the SHARED `session`. A _bounded() timeout
-                            # cancellation mid-query can leave the shared session
-                            # poisoned for the rest of the tick — mitigated by the
-                            # per-row try/except here (and the per-tick try in the
-                            # background service). No behaviour change.
+                            # Audit P1: get_github_token_for_task runs DB I/O on
+                            # ``session``. ``session`` is now this ROW's own
+                            # short-lived session, so a _bounded() timeout
+                            # cancellation mid-query that leaves it in
+                            # PendingRollback is confined to this iteration — the
+                            # per-row try/except below logs+skips and the
+                            # per-row ``async with`` closes the poisoned session;
+                            # the next row gets a clean one.
                             gh_token, owner, repo = await _bounded(
                                 get_github_token_for_task(task.id, session),
                                 _GH_CALL_TIMEOUT_S,
@@ -1626,9 +1716,10 @@ async def _check_evaluating_timeouts(progress_cb=None):
 
                 elapsed = (now - evaluating_since).total_seconds()
 
-                # Child statuses snapshotted at batch-fetch time (plain tuples).
-                # Reading live ORM children here would fire a sync lazy-load if an
-                # earlier iteration's commit/rollback expired the shared batch.
+                # Child statuses snapshotted at cycle-read time (plain tuples,
+                # Phase A). Kept as plain data so they survive across the
+                # per-row sessions; the rare branches that MUTATE children
+                # re-fetch them fresh on this row's session.
                 child_status_snap = _eval_child_status_by_parent.get(task.id, [])
 
                 all_children_terminal = bool(child_status_snap) and all(
@@ -1647,17 +1738,15 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         # C3: bound the rollup trigger — _check_and_trigger_rollup
                         # does serial GitHub I/O (PR verify/create/merge) per
                         # child. A hung call here would otherwise pin the whole
-                        # sweep. On timeout the session may be mid-transaction, so
-                        # roll back before the next row is processed.
+                        # sweep.
                         #
-                        # C3 NOTE (fix E): this _bounded() wraps a SHARED-session
-                        # coroutine that does DB I/O on `session`. An
-                        # asyncio.wait_for cancellation that fires mid-DB-op can
-                        # leave the shared session poisoned (PendingRollback) for
-                        # the rest of this tick — mitigated by the explicit
-                        # rollback in the except below (and the per-tick try in
-                        # the background service). No behaviour change; documenting
-                        # the failure mode for the next reader.
+                        # Audit P1: this _bounded() wraps a coroutine that does
+                        # DB I/O on ``session`` — now this ROW's own short-lived
+                        # session. An asyncio.wait_for cancellation mid-DB-op
+                        # that leaves it in PendingRollback is confined to this
+                        # iteration: the explicit rollback below clears it for
+                        # the rest of this row, and the per-row ``async with``
+                        # closes it before the next row gets a clean session.
                         try:
                             await _bounded(
                                 # C3: thread the caller's own heartbeat so the
@@ -2442,15 +2531,23 @@ async def _recover_orphaned_tasks():
     from app.models import Project
 
     try:
-        async with AsyncSessionLocal() as session:
-            five_min_ago = _utcnow() - timedelta(minutes=5)
-            one_hour_ago = _utcnow() - timedelta(hours=1)
+        five_min_ago = _utcnow() - timedelta(minutes=5)
+        one_hour_ago = _utcnow() - timedelta(hours=1)
+
+        # ── Phase A: cycle reads on a short-lived session, snapshot to plain
+        # data, then CLOSE it before any per-row session opens (audit P1). A
+        # single shared session held across the per-row loop meant a _bounded
+        # token-fetch cancellation could poison it (PendingRollback), silently
+        # dropping every later orphan's artifact/alert/review-spawn commit. We
+        # snapshot just the skip-decision data here; each row that needs GitHub
+        # I/O opens its OWN session below and re-fetches the task fresh.
+        async with AsyncSessionLocal() as read_session:
             # Phase B4 (H-P6): drop status_log/plan_output JSONB. The recovery
             # loop only reads first_payload / context / description / project_id /
             # id and writes context. status_log is not consumed in this branch.
             candidates = (
                 (
-                    await session.execute(
+                    await read_session.execute(
                         select(Task)
                         .options(
                             load_only(
@@ -2491,10 +2588,16 @@ async def _recover_orphaned_tasks():
                     _ORPHAN_RECOVERY_MAX_PER_CYCLE,
                 )
 
+            # Snapshot the per-row skip-decision data as plain tuples so it
+            # outlives the read_session (id, task_type, first_payload, context).
+            cand_snaps = [
+                (t.id, (t.first_payload or {}).get("type", ""))
+                for t in candidates
+            ]
             cand_ids = [t.id for t in candidates]
             if cand_ids:
                 artifact_rows = (
-                    await session.execute(
+                    await read_session.execute(
                         select(Artifact.task_id).where(
                             Artifact.task_id.in_(cand_ids),
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
@@ -2504,7 +2607,7 @@ async def _recover_orphaned_tasks():
                 tasks_with_pr = {row[0] for row in artifact_rows}
 
                 child_rows = (
-                    await session.execute(
+                    await read_session.execute(
                         select(Task.parent_task_id, Task.payloads).where(
                             Task.parent_task_id.in_(cand_ids)
                         )
@@ -2516,30 +2619,43 @@ async def _recover_orphaned_tasks():
             else:
                 tasks_with_pr = set()
                 children_by_parent = {}
+        # read_session closed — no session held across the per-row loop.
 
-            for task in candidates:
-                # C3 heartbeat: serial GitHub I/O per candidate — pump the
-                # orchestrator progress heartbeat each row so a long-but-
-                # progressing recovery pass is not watchdog-killed.
-                _mark_orchestrator_progress()
-                task_type = task.first_payload.get("type", "")
-                # Canonical write-task-type allowlist: a task type that opens a PR
-                # is recovery-eligible. Sourced from the registry so a newly-added
-                # write type is honored here automatically (no string-literal tuple
-                # to keep in sync). See app/task_capabilities.py:WRITE_TASK_TYPES.
-                if task_type not in WRITE_TASK_TYPES:
-                    continue
+        for task_id, task_type in cand_snaps:
+            # C3 heartbeat: serial GitHub I/O per candidate — pump the
+            # orchestrator progress heartbeat each row so a long-but-
+            # progressing recovery pass is not watchdog-killed.
+            _mark_orchestrator_progress()
+            # Canonical write-task-type allowlist: a task type that opens a PR
+            # is recovery-eligible. Sourced from the registry so a newly-added
+            # write type is honored here automatically (no string-literal tuple
+            # to keep in sync). See app/task_capabilities.py:WRITE_TASK_TYPES.
+            if task_type not in WRITE_TASK_TYPES:
+                continue
 
-                # Check if PR artifact exists
-                if task.id in tasks_with_pr:
-                    continue
+            # Check if PR artifact exists
+            if task_id in tasks_with_pr:
+                continue
 
-                # Check if review child exists
-                child_payloads_list = children_by_parent.get(task.id, [])
-                if any(
-                    (payloads or [{}])[0].get("type") == "review"
-                    for payloads in child_payloads_list
-                ):
+            # Check if review child exists
+            child_payloads_list = children_by_parent.get(task_id, [])
+            if any(
+                (payloads or [{}])[0].get("type") == "review"
+                for payloads in child_payloads_list
+            ):
+                continue
+
+            # Audit P1: open a FRESH session per orphan. A _bounded() token /
+            # list-pulls cancellation that poisons THIS session is confined to
+            # this iteration — the `async with` closes it on the way out and the
+            # next orphan gets a clean session, so one slow / cancelled lookup
+            # no longer drops the rest of the sweep's artifact/alert/spawn work.
+            async with AsyncSessionLocal() as session:
+                # Re-fetch the orphan fresh on this session (the spawn path
+                # below needs a live ORM instance bound to it) and re-validate
+                # it is still a COMPLETED orphan.
+                task = await session.get(Task, task_id)
+                if task is None or task.status != TaskStatus.COMPLETED:
                     continue
 
                 # Orphan has no PR yet. Cap retries — if we've looked 3 times
@@ -2663,13 +2779,18 @@ async def _recover_orphaned_tasks():
                     f"[RECOVERY] Auto-recovered orphaned task {str(task.id)[:8]} → PR #{pr_number}, review={str(review_task.id)[:8] if review_task else 'NONE'}"
                 )
 
-            # Phase 2: Reaped-with-artifact recovery.
-            # Tasks that were reaped (set back to QUEUED/PROVISIONING) after the PR was already
-            # created.  The PR endpoint saves the artifact, so these tasks have an artifact but
-            # never reached COMPLETED and thus never triggered pipeline routing.
+        # Phase 2: Reaped-with-artifact recovery.
+        # Tasks that were reaped (set back to QUEUED/PROVISIONING) after the PR
+        # was already created. The PR endpoint saves the artifact, so these
+        # tasks have an artifact but never reached COMPLETED and thus never
+        # triggered pipeline routing.
+        #
+        # Audit P1: same Phase-A (short-lived read session, snapshot, close) /
+        # Phase-B (per-row session) split as Phase 1 above.
+        async with AsyncSessionLocal() as read_session:
             reaped_candidates = (
                 (
-                    await session.execute(
+                    await read_session.execute(
                         select(Task).where(
                             Task.status.in_(
                                 [TaskStatus.QUEUED, TaskStatus.PROVISIONING]
@@ -2684,10 +2805,14 @@ async def _recover_orphaned_tasks():
                 .all()
             )
 
+            reaped_snaps = [
+                (t.id, (t.first_payload or {}).get("type", ""))
+                for t in reaped_candidates
+            ]
             reaped_ids = [t.id for t in reaped_candidates]
             if reaped_ids:
                 pr_artifact_rows = (
-                    await session.execute(
+                    await read_session.execute(
                         select(Artifact.task_id, Artifact.pr_url).where(
                             Artifact.task_id.in_(reaped_ids),
                             Artifact.artifact_type == ArtifactType.PULL_REQUEST,
@@ -2695,12 +2820,12 @@ async def _recover_orphaned_tasks():
                     )
                 ).all()
                 pr_url_by_task: dict = {}
-                for task_id, pr_url in pr_artifact_rows:
-                    if pr_url and not pr_url_by_task.get(task_id):
-                        pr_url_by_task[task_id] = pr_url
+                for _t_id, _pr_url in pr_artifact_rows:
+                    if _pr_url and not pr_url_by_task.get(_t_id):
+                        pr_url_by_task[_t_id] = _pr_url
 
                 reaped_child_rows = (
-                    await session.execute(
+                    await read_session.execute(
                         select(Task.parent_task_id, Task.payloads).where(
                             Task.parent_task_id.in_(reaped_ids)
                         )
@@ -2712,28 +2837,32 @@ async def _recover_orphaned_tasks():
             else:
                 pr_url_by_task = {}
                 reaped_children_by_parent = {}
+        # read_session closed — no session held across the per-row loop.
 
-            for task in reaped_candidates:
-                task_type = task.first_payload.get("type", "")
-                # Same canonical write-task-type allowlist as _recover_orphaned_tasks
-                # — a reaped task that opened a PR is eligible for review handoff.
-                # See app/task_capabilities.py:WRITE_TASK_TYPES.
-                if task_type not in WRITE_TASK_TYPES:
-                    continue
+        for task_id, task_type in reaped_snaps:
+            # Same canonical write-task-type allowlist as _recover_orphaned_tasks
+            # — a reaped task that opened a PR is eligible for review handoff.
+            # See app/task_capabilities.py:WRITE_TASK_TYPES.
+            if task_type not in WRITE_TASK_TYPES:
+                continue
 
-                # Only recover tasks that already have a PR artifact
-                pr_url = pr_url_by_task.get(task.id)
-                if not pr_url:
-                    continue
+            # Only recover tasks that already have a PR artifact
+            pr_url = pr_url_by_task.get(task_id)
+            if not pr_url:
+                continue
 
-                # Skip if review child already exists
-                child_payloads_list = reaped_children_by_parent.get(task.id, [])
-                if any(
-                    (payloads or [{}])[0].get("type") == "review"
-                    for payloads in child_payloads_list
-                ):
-                    continue
+            # Skip if review child already exists
+            child_payloads_list = reaped_children_by_parent.get(task_id, [])
+            if any(
+                (payloads or [{}])[0].get("type") == "review"
+                for payloads in child_payloads_list
+            ):
+                continue
 
+            # Audit P1: per-row session. The lock+release-commit+spawn unit
+            # runs in its own session so a cancellation/poison on one reaped
+            # row can't drop the others.
+            async with AsyncSessionLocal() as session:
                 # ── Site 3 lock-during-IO fix ──
                 # Previously this loop held FOR UPDATE on `task` across
                 # `_spawn_pipeline_task`, which acquires
@@ -2751,7 +2880,7 @@ async def _recover_orphaned_tasks():
                     (
                         await session.execute(
                             select(Task)
-                            .where(Task.id == task.id)
+                            .where(Task.id == task_id)
                             .with_for_update(skip_locked=True)
                         )
                     )

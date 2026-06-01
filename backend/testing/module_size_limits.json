@@ -29,7 +29,7 @@
     "max_plan_pool.py": 2750,
     "anomaly_detection.py": 2100,
     "routers/agent.py": 5550,
-    "services.py": 2950,
+    "services.py": 3100,
     "routers/agent_status.py": 3850,
     "autonomous_research.py": 2850,
     "autonomous_research_residual.py": 600,
