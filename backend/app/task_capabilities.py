@@ -221,6 +221,17 @@ READ_ONLY_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.agent_mode == "read_only"
 )
+# Canonical registry of task types that run the agent in *write* mode — i.e. they
+# push a branch and open a PR. This is the SINGLE source of truth for "does this
+# task type produce a branch/PR?" and MUST be the only edit point for that
+# question. The orphan-recovery / reaped-but-PR-exists sweeps (services.py), the
+# completion review-pipeline router (task_completion.py / task_lifecycle.py) and
+# any other dispatch allowlist derive their membership from this set rather than
+# hardcoding string-literal tuples — so a newly-added write task type is honored
+# everywhere automatically. NOTE: this is intentionally distinct from the various
+# analytics filters (e.g. "code-change" = {create, fix, refactor, migrate} for SR
+# metrics, "review-eligible" = {create, refactor}); those measure a narrower thing
+# than "opens a PR" and are deliberately NOT folded in here.
 WRITE_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES

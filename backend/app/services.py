@@ -24,6 +24,7 @@ from app.models import (
 )
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
+from app.task_capabilities import WRITE_TASK_TYPES
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -2522,14 +2523,11 @@ async def _recover_orphaned_tasks():
                 # progressing recovery pass is not watchdog-killed.
                 _mark_orchestrator_progress()
                 task_type = task.first_payload.get("type", "")
-                if task_type not in (
-                    "create",
-                    "refactor",
-                    "fix",
-                    "docs",
-                    "deps",
-                    "migrate",
-                ):
+                # Canonical write-task-type allowlist: a task type that opens a PR
+                # is recovery-eligible. Sourced from the registry so a newly-added
+                # write type is honored here automatically (no string-literal tuple
+                # to keep in sync). See app/task_capabilities.py:WRITE_TASK_TYPES.
+                if task_type not in WRITE_TASK_TYPES:
                     continue
 
                 # Check if PR artifact exists
@@ -2717,14 +2715,10 @@ async def _recover_orphaned_tasks():
 
             for task in reaped_candidates:
                 task_type = task.first_payload.get("type", "")
-                if task_type not in (
-                    "create",
-                    "refactor",
-                    "fix",
-                    "docs",
-                    "deps",
-                    "migrate",
-                ):
+                # Same canonical write-task-type allowlist as _recover_orphaned_tasks
+                # — a reaped task that opened a PR is eligible for review handoff.
+                # See app/task_capabilities.py:WRITE_TASK_TYPES.
+                if task_type not in WRITE_TASK_TYPES:
                     continue
 
                 # Only recover tasks that already have a PR artifact

@@ -37,6 +37,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     derive_task_branch as _derive_task_branch,
 )
+from app.task_capabilities import WRITE_TASK_TYPES
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project  # noqa: F401 — re-exported for test patching
 from app.payload_schemas import validate_internal_payload
@@ -55,6 +56,16 @@ from app.notification_dispatch import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Write task types whose COMPLETED handler opens a *fresh* PR and routes it
+# straight into the review pipeline (the first branch of the completion if/elif
+# chain in _process_post_commit). Derived from the canonical WRITE_TASK_TYPES so
+# a new write type is honored automatically. Two deliberate deviations:
+#   • "fix" is excluded — fix tasks have their own `elif task_type == "fix"`
+#     branch (they iterate an EXISTING PR, not open a new one).
+#   • "" is included — a legacy/untyped task defaults to create-like routing.
+_PR_OPENING_COMPLETION_TYPES: frozenset[str] = (WRITE_TASK_TYPES - {"fix"}) | {""}
 
 
 # Verdict-word aliases used by the structured-verdict fallback parser. Each
@@ -627,7 +638,7 @@ async def _process_post_commit(
 
             # Create task completed with PR → route based on target branch
             if (
-                task_type in ("create", "refactor", "docs", "qa", "deps", "migrate", "")
+                task_type in _PR_OPENING_COMPLETION_TYPES
                 and payload.pr_url
                 and payload.artifact_type == ArtifactType.PULL_REQUEST
             ):

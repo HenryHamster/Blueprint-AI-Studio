@@ -365,6 +365,102 @@ async def test_orphan_recovery_uses_project_namespace(svc_db, mocker):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Registry extensibility: WRITE_TASK_TYPES is the single edit point
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Design-audit must-fix: a new PR-producing task type must NOT be silently
+# invisible to the orphan-recovery sweep. The recovery gate membership-checks
+# `app.services.WRITE_TASK_TYPES` (the canonical registry in
+# app/task_capabilities.py), so adding a type to the registry is the ONLY edit
+# required for the recovery path to honor it.
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_honors_new_write_type_from_registry(svc_db, mocker):
+    """A task type that is NOT recognized today becomes recovery-eligible the
+    moment it is added to WRITE_TASK_TYPES — no edit to services.py required.
+
+    This proves the registry is the single source of truth: we simulate adding a
+    brand-new write task type by extending the frozenset the recovery gate reads,
+    then assert the GitHub PR lookup is attempted for a task of that type.
+    """
+    from app import services as _services
+
+    new_type = "fundamental_new_write_type"
+    # Sanity: the type is genuinely unknown today, so any positive result is
+    # attributable to the registry extension and not a pre-existing literal.
+    assert new_type not in _services.WRITE_TASK_TYPES
+
+    mocker.patch.object(
+        _services, "WRITE_TASK_TYPES", _services.WRITE_TASK_TYPES | {new_type}
+    )
+
+    project = await _make_project(svc_db)
+    await _make_completed_task(svc_db, project.id, task_type=new_type)
+
+    mock_get_token = AsyncMock(return_value=("gh_token", "owner", "repo"))
+    mocker.patch("app.routers.agent.get_github_token_for_task", mock_get_token)
+
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = []
+    mock_github_request = AsyncMock(return_value=mock_gh_resp)
+    mocker.patch("app.github._github_request", mock_github_request)
+
+    await _recover_orphaned_tasks()
+
+    # The recovery gate let the new type through → it attempted a GitHub lookup.
+    mock_get_token.assert_called_once()
+    mock_github_request.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_skips_type_absent_from_registry(svc_db, mocker):
+    """A type that is NOT in WRITE_TASK_TYPES (and not added) is skipped — the
+    complement of the extensibility test above. Confirms the gate actually
+    consults the registry rather than letting everything through."""
+    from app import services as _services
+
+    absent_type = "fundamental_new_write_type"
+    assert absent_type not in _services.WRITE_TASK_TYPES
+
+    project = await _make_project(svc_db)
+    await _make_completed_task(svc_db, project.id, task_type=absent_type)
+
+    mock_get_token = AsyncMock(return_value=("gh_token", "owner", "repo"))
+    mocker.patch("app.routers.agent.get_github_token_for_task", mock_get_token)
+
+    await _recover_orphaned_tasks()
+
+    mock_get_token.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_recovers_qa_task(svc_db, mocker):
+    """`qa` opens a PR (agent_mode=write) so it MUST be recovery-eligible. The
+    pre-consolidation hardcoded tuple omitted `qa`, silently abandoning orphaned
+    qa tasks; sourcing the gate from WRITE_TASK_TYPES fixes that."""
+    from app import services as _services
+
+    assert "qa" in _services.WRITE_TASK_TYPES
+
+    project = await _make_project(svc_db)
+    await _make_completed_task(svc_db, project.id, task_type="qa")
+
+    mock_get_token = AsyncMock(return_value=("gh_token", "owner", "repo"))
+    mocker.patch("app.routers.agent.get_github_token_for_task", mock_get_token)
+
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = []
+    mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
+
+    await _recover_orphaned_tasks()
+
+    mock_get_token.assert_called_once()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _persist_circuit_breakers
 # ══════════════════════════════════════════════════════════════════════════════
 

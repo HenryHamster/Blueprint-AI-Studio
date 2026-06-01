@@ -35,6 +35,7 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.task_capabilities import WRITE_TASK_TYPES
 from app.plan_completion import (
     # Re-exports — task_completion is the canonical completion-API import surface
     # for downstream modules (task_lifecycle, research_completion, tests). The
@@ -665,16 +666,12 @@ async def _record_remediation_if_terminal(
     # pipeline exhausts its iteration cap. Recording on the PR-creating task's
     # COMPLETED would prematurely stamp merged=True before review/CI has run.
     # FAILED/CANCELLED still record immediately since no viable PR exists.
-    _REVIEW_PIPELINE_TYPES = {
-        "create",
-        "refactor",
-        "docs",
-        "qa",
-        "deps",
-        "migrate",
-        "fix",
-        "review",
-    }
+    # Every write task type opens a PR and thus enters the review pipeline; the
+    # `review` task itself also operates on that PR. Derive from the canonical
+    # registry so a newly-added write type is honored automatically — `review` is
+    # the only non-write member and is listed explicitly. See
+    # app/task_capabilities.py:WRITE_TASK_TYPES.
+    _REVIEW_PIPELINE_TYPES = WRITE_TASK_TYPES | {"review"}
     if status == TaskStatus.COMPLETED:
         task_type = (task.first_payload or {}).get("type")
         if task_type in _REVIEW_PIPELINE_TYPES:

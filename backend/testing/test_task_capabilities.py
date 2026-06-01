@@ -17,7 +17,7 @@ from app.task_capabilities import (
 def test_task_capability_registry_covers_task_type_enum():
     assert {capability.id for capability in TASK_CAPABILITIES} == set(TaskType)
     assert set(TASK_CAPABILITY_BY_TYPE) == set(TaskType)
-    assert ALL_TASK_TYPES == frozenset(t.value for t in TaskType)
+    assert frozenset(t.value for t in TaskType) == ALL_TASK_TYPES
 
 
 def test_task_capability_modes_partition_all_known_types():
@@ -39,6 +39,40 @@ def test_task_capability_ui_subsets_only_reference_known_types():
         "research",
         "migrate",
         "refactor",
+    )
+
+
+def test_write_task_types_is_canonical_pr_producing_set():
+    """WRITE_TASK_TYPES is the single source of truth for "produces a branch/PR".
+
+    Guards against the consolidated recovery/dispatch allowlists silently
+    diverging if the registry is edited: every write-mode capability — and only
+    those — must be a member. `qa` in particular MUST be present (it opens a PR);
+    the pre-consolidation orphan-recovery tuple omitted it.
+    """
+    expected = {
+        cap.id.value for cap in TASK_CAPABILITIES if cap.agent_mode == "write"
+    }
+    assert frozenset(expected) == WRITE_TASK_TYPES
+    assert "qa" in WRITE_TASK_TYPES
+    # Read-only types that merely operate on an existing PR must NOT leak in.
+    assert "review" not in WRITE_TASK_TYPES
+    assert "research" not in WRITE_TASK_TYPES
+
+
+def test_recovery_paths_source_write_allowlist_from_registry():
+    """The orphan-recovery / reaped-PR sweeps and the completion router must read
+    the registry object, not a private copy. Importing the same frozenset
+    identity into those modules is what makes the registry the only edit point."""
+    from app import services, task_completion, task_lifecycle
+
+    assert services.WRITE_TASK_TYPES is WRITE_TASK_TYPES
+    assert task_completion.WRITE_TASK_TYPES is WRITE_TASK_TYPES
+    assert task_lifecycle.WRITE_TASK_TYPES is WRITE_TASK_TYPES
+    # task_lifecycle's PR-opening completion branch derives from the registry,
+    # excluding `fix` (own elif branch) and including the legacy "" default.
+    assert ((WRITE_TASK_TYPES - {"fix"}) | {""}) == (
+        task_lifecycle._PR_OPENING_COMPLETION_TYPES
     )
 
 
