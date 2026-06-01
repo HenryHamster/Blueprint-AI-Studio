@@ -1,10 +1,7 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { Task } from './types/task';
-import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from './types/project';
-import type { Alert } from './types/alert';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
-import { STATUS_OPTIONS } from './constants';
 import { usePersistedState } from './hooks/usePersistedState';
 import { usePoller } from './hooks/usePoller';
 import { useAuth } from './hooks/useAuth';
@@ -19,25 +16,25 @@ import { useTaskModal } from './hooks/useTaskModal';
 import { useSettings } from './hooks/useSettings';
 import { useUserManagement } from './hooks/useUserManagement';
 import { useProjectMembers } from './hooks/useProjectMembers';
+import { useNotificationPrefs } from './hooks/useNotificationPrefs';
+import { useTasksState } from './hooks/useTasksState';
+import { useProjectsState } from './hooks/useProjectsState';
+import { useAlertsState } from './hooks/useAlertsState';
+import { useProjectConfig } from './hooks/useProjectConfig';
 
 export type { DeployState } from './types/settings';
 
-function playCompletionSound() {
-  try {
-    const ctx = new AudioContext();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.setValueAtTime(880, ctx.currentTime);
-    osc.frequency.setValueAtTime(1100, ctx.currentTime + 0.1);
-    gain.gain.setValueAtTime(0.3, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.4);
-  } catch { /* AudioContext not available */ }
-}
-
+/**
+ * useAppState is a THIN FACADE: it composes the per-domain hooks
+ * (useTasksState / useProjectsState / useAlertsState / useProjectConfig /
+ * useNotificationPrefs / useSettings / ...), wires the small amount of
+ * cross-domain glue (shared refs, leading/polling fetches, keyboard
+ * shortcuts, OAuth redirect handling, research feed) and re-exports the exact
+ * same public return shape its ~140 consumers already depend on.
+ *
+ * Behavior is preserved end-to-end: the domain hooks own their own state and
+ * callbacks; only the shape of the source file changed, not the runtime API.
+ */
 export function useAppState() {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
@@ -54,9 +51,11 @@ export function useAppState() {
     archiveSortOrder, setArchiveSortOrder,
   } = useArchive(addToast);
 
+  // ── Shared refs (cross-domain glue owned by the facade) ──────────────────
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
   const defaultTaskBranchRef = useRef<string | null>(null);
   const selectedProjectRepoRef = useRef<string | null>(null);
+  const prevTasksRef = useRef<Task[]>([]);
 
   // Moved before useDeploymentState so it can be passed as a parameter
   const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
@@ -160,48 +159,58 @@ export function useAppState() {
     projectMembers, fetchProjectMembers, addProjectMember, updateProjectMemberRole, removeProjectMember,
   } = useProjectMembers();
 
-  // ── Remaining state ─────────────────────────────────────────────────────
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [totalTasks, setTotalTasks] = useState(0);
-  const [globalActiveCount, setGlobalActiveCount] = useState(0);
-  const [globalEvaluatingCount, setGlobalEvaluatingCount] = useState(0);
-  const [globalQueuedCount, setGlobalQueuedCount] = useState(0);
-  const [initialLoading, setInitialLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [page, setPage] = useState(1);
-  const [rawLimit, setLimit] = usePersistedState<number>('pageSize', 50);
-  // Backend caps /admin/tasks at 500 rows to keep response under Cloud Run's
-  // 32 MB body limit; clamp stale localStorage values so pagination offsets
-  // stay consistent with what the server actually returns.
-  const limit = Math.min(rawLimit, 500);
-  const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
+  // ── Notification preferences ─────────────────────────────────────────────
+  const {
+    notifyOnComplete, setNotifyOnComplete,
+    notifyOnFail, setNotifyOnFail,
+    notifyOnApprovalNeeded, setNotifyOnApprovalNeeded,
+    soundOnComplete, setSoundOnComplete,
+    notifyOnHighSignalMessage, setNotifyOnHighSignalMessage,
+    notifyRef, notifyOnFailRef, notifyOnApprovalNeededRef, soundOnCompleteRef,
+  } = useNotificationPrefs();
 
-  const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
-  const [alerts, setAlerts] = useState<Alert[]>([]);
+  // ── Projects domain ──────────────────────────────────────────────────────
+  const {
+    projects, projectsFetchError,
+    fetchProjects, handlePauseAllAutonomous, handleClearWaveDeps,
+  } = useProjectsState(addToast, fetchTasksRef);
 
-  // Notification defaults
-  const [notifyOnComplete, setNotifyOnComplete] = usePersistedState<boolean>('notifyOnComplete', false);
-  const [notifyOnFail, setNotifyOnFail] = usePersistedState<boolean>('notifyOnFail', false);
-  const [notifyOnApprovalNeeded, setNotifyOnApprovalNeeded] = usePersistedState<boolean>('notifyOnApprovalNeeded', false);
-  const [soundOnComplete, setSoundOnComplete] = usePersistedState<boolean>('soundOnComplete', false);
-  const [notifyOnHighSignalMessage, setNotifyOnHighSignalMessage] = usePersistedState<boolean>('notifyOnHighSignalMessage', false);
-  const prevTasksRef = useRef<Task[]>([]);
-  const notifyRef = useRef(notifyOnComplete);
-  useEffect(() => { notifyRef.current = notifyOnComplete; }, [notifyOnComplete]);
-  const notifyOnFailRef = useRef(notifyOnFail);
-  useEffect(() => { notifyOnFailRef.current = notifyOnFail; }, [notifyOnFail]);
-  const notifyOnApprovalNeededRef = useRef(notifyOnApprovalNeeded);
-  useEffect(() => { notifyOnApprovalNeededRef.current = notifyOnApprovalNeeded; }, [notifyOnApprovalNeeded]);
-  const soundOnCompleteRef = useRef(soundOnComplete);
-  useEffect(() => { soundOnCompleteRef.current = soundOnComplete; }, [soundOnComplete]);
-  const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
-  useEffect(() => { notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage; }, [notifyOnHighSignalMessage]);
+  // ── Alerts domain ────────────────────────────────────────────────────────
+  const { alerts, fetchAlerts, dismissAlert, dismissAllAlerts } = useAlertsState(addToast, selectedProjectId);
 
-  // Project dashboard state
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
+  // ── Tasks domain ─────────────────────────────────────────────────────────
+  const {
+    tasks, totalTasks, globalActiveCount, globalEvaluatingCount, globalQueuedCount,
+    initialLoading, refreshing,
+    page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
+    actionLoadingMap,
+    lastRefresh, apiHealthy, lastFetchTime,
+    needsAttentionCount,
+    fetchTasks,
+    handleApprove, handleRequestChanges, handleCancel, handleRetry,
+    handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
+    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
+    handleBulkAction, handleBulkCancel,
+  } = useTasksState({
+    addToast, setError, statusFilter, addMetricsPoint,
+    notifyRef, notifyOnFailRef, notifyOnApprovalNeededRef, soundOnCompleteRef,
+    fetchArchiveTasks,
+    selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
+    fetchTasksRef, prevTasksRef,
+  });
 
-  // Last visit timestamp — captures when the user previously loaded the app, scoped per operator.
+  // ── Project-scoped config domain ─────────────────────────────────────────
+  const {
+    autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
+    issueImplementationConfig, handleUpdateIssueImplementationConfig,
+    autoReviewConfig, handleUpdateAutoReviewConfig,
+    integrationBranchData, handleUpdateIntegrationBranch,
+    promotionTargetData, handleUpdatePromotionTarget,
+    taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
+  } = useProjectConfig(addToast, selectedProjectId, projects, selectedProjectRepoRef, defaultTaskBranchRef);
+
+  // ── Last visit timestamp ──────────────────────────────────────────────────
+  // Captures when the user previously loaded the app, scoped per operator.
   // Global key retained as migration source and unauthenticated fallback.
   const LAST_VISIT_GLOBAL_KEY = 'blueprint-admin:lastVisitTimestamp';
   const lastVisitKey = (email: string | null | undefined) =>
@@ -245,15 +254,7 @@ export function useAppState() {
       .catch(() => {});
   }, [user]);
 
-  // Refresh indicator state
-  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
-
-  // Status bar state
-  const [apiHealthy, setApiHealthy] = useState(true);
-  const [lastFetchTime, setLastFetchTime] = useState<number>(0);
-
-  // Reset page when status filter changes
-  useEffect(() => { setPage(1); }, [statusFilter]);
+  // ── Research feed ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (!showResearchBrowser || !selectedProjectId) { setResearchFeed([]); return; }
     const pid = selectedProjectId;
@@ -443,385 +444,7 @@ export function useAppState() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showDirections, showMetrics, showSettings, showShortcutHelp, showArchive, selectionMode, selectedTaskIds, tasks]);
 
-  // ── Functions ───────────────────────────────────────────────────────────
-
-  const fetchTasks = async () => {
-    if (tasks.length === 0) {
-      setInitialLoading(true);
-    } else {
-      setRefreshing(true);
-    }
-    try {
-      const offset = (page - 1) * limit;
-      let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
-      if (statusFilter.length < STATUS_OPTIONS.length) {
-        statusFilter.forEach(s => { url += `&status=${s}`; });
-      }
-      const res = await authGet(url);
-      if (res.ok) {
-        const data = await res.json();
-        let newTasks: Task[];
-        if (Array.isArray(data)) {
-          newTasks = data;
-          setTotalTasks(data.length);
-        } else {
-          newTasks = data.tasks || [];
-          setTotalTasks(data.total ?? newTasks.length);
-          if (data.active_count !== undefined) setGlobalActiveCount(data.active_count);
-          if (data.evaluating_count !== undefined) setGlobalEvaluatingCount(data.evaluating_count);
-          if (data.queued_count !== undefined) setGlobalQueuedCount(data.queued_count);
-        }
-
-        // Browser notifications for completed/failed tasks
-        if (prevTasksRef.current.length > 0) {
-          const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
-          const prevApprovalMap = new Map(prevTasksRef.current.map(t => [t.id, t.requires_approval]));
-          let didTransition = false;
-          for (const t of newTasks) {
-            const prev = prevMap.get(t.id);
-            if (prev && prev !== t.status && (t.status === 'COMPLETED' || t.status === 'FAILED')) {
-              if (t.status === 'COMPLETED' && notifyRef.current && Notification.permission === 'granted') {
-                new Notification('Task completed', {
-                  body: t.title || t.id,
-                });
-              }
-              if (t.status === 'FAILED' && notifyOnFailRef.current && Notification.permission === 'granted') {
-                new Notification('Task failed', {
-                  body: t.title || t.id,
-                });
-              }
-              didTransition = true;
-            }
-            // Approval-needed notification: task newly requires approval and is not in a terminal state
-            const prevApproval = prevApprovalMap.get(t.id);
-            const nonTerminal = t.status !== 'COMPLETED' && t.status !== 'FAILED' && t.status !== 'CANCELLED';
-            if (!prevApproval && t.requires_approval && nonTerminal) {
-              if (notifyOnApprovalNeededRef.current && Notification.permission === 'granted') {
-                new Notification('Task requires approval', {
-                  body: t.title || t.id,
-                });
-              }
-            }
-          }
-          if (didTransition && soundOnCompleteRef.current) {
-            playCompletionSound();
-          }
-        }
-        // Count incremental completed/failed transitions since last snapshot
-        let completedCount = 0;
-        let failedCount = 0;
-        if (prevTasksRef.current.length > 0) {
-          const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
-          for (const t of newTasks) {
-            const prev = prevMap.get(t.id);
-            if (prev && prev !== t.status) {
-              if (t.status === 'COMPLETED') completedCount++;
-              else if (t.status === 'FAILED') failedCount++;
-            }
-          }
-        }
-
-        prevTasksRef.current = newTasks;
-
-        setTasks(newTasks);
-        setLastRefresh(new Date());
-        setError(null);
-        setApiHealthy(true);
-        setLastFetchTime(Date.now());
-
-        // Record metrics data point
-        addMetricsPoint(data.active_count, newTasks, completedCount, failedCount);
-      } else {
-        setError(`Failed to fetch tasks: ${res.statusText}`);
-        setApiHealthy(false);
-      }
-    } catch (err) {
-      console.error('Failed to fetch tasks:', err);
-      setError('Failed to connect to backend server.');
-      setApiHealthy(false);
-    } finally {
-      setInitialLoading(false);
-      setRefreshing(false);
-    }
-  };
-  fetchTasksRef.current = fetchTasks;
-
-  const fetchProjects = async (silent = false) => {
-    try {
-      const PAGE_LIMIT = 50;
-      const allItems: unknown[] = [];
-      let offset = 0;
-      let hasMore = true;
-      while (hasMore) {
-        const res = await authGet(`${API_BASE_URL}/api/admin/projects?limit=${PAGE_LIMIT}&offset=${offset}`);
-        if (!res.ok) {
-          setProjectsFetchError('Failed to load projects');
-          if (!silent) addToast('Failed to load projects', 'error');
-          return;
-        }
-        const data = await res.json() as { items: unknown[]; has_more: boolean };
-        allItems.push(...(data.items || []));
-        hasMore = data.has_more ?? false;
-        offset += PAGE_LIMIT;
-      }
-      setProjects(allItems as never[]);
-      setProjectsFetchError(null);
-    } catch (err) {
-      console.error('Failed to fetch projects:', err);
-      setProjectsFetchError('Failed to load projects');
-      if (!silent) addToast('Failed to load projects', 'error');
-    }
-  };
-
-  const fetchAlerts = async (silent = false) => {
-    try {
-      const url = selectedProjectId
-        ? `${API_BASE_URL}/api/admin/alerts?project_id=${selectedProjectId}`
-        : `${API_BASE_URL}/api/admin/alerts`;
-      const res = await authGet(url);
-      if (res.ok) {
-        setAlerts(await res.json());
-      }
-    } catch (err) {
-      console.error('Failed to fetch alerts:', err);
-      if (!silent) addToast('Failed to load alerts', 'error');
-    }
-  };
-
-  const dismissAlert = async (alertId: string) => {
-    const prev = alerts;
-    setAlerts(prevAlerts => prevAlerts.filter(a => a.id !== alertId));
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/alerts/${alertId}/dismiss`, {
-        method: 'POST',
-        headers: await authHeaders(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch (err) {
-      console.error('Failed to dismiss alert:', err);
-      setAlerts(prev);
-      addToast('Failed to dismiss alert', 'error');
-    }
-  };
-
-  const dismissAllAlerts = async () => {
-    const prev = alerts;
-    setAlerts([]);
-    try {
-      const url = selectedProjectId
-        ? `${API_BASE_URL}/api/admin/alerts/dismiss-all?project_id=${selectedProjectId}`
-        : `${API_BASE_URL}/api/admin/alerts/dismiss-all`;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: await authHeaders(),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    } catch (err) {
-      console.error('Failed to dismiss all alerts:', err);
-      setAlerts(prev);
-      addToast('Failed to dismiss all alerts', 'error');
-    }
-  };
-
-  const handlePauseAllAutonomous = async () => {
-    const res = await fetch(`${API_BASE_URL}/api/admin/autonomous/pause-all`, {
-      method: 'POST',
-      headers: await authHeaders(),
-    });
-    if (res.ok) {
-      await fetchProjects();
-      addToast('All autonomous projects paused', 'success');
-    } else {
-      addToast('Failed to pause autonomous projects', 'error');
-    }
-  };
-
-  const handleClearWaveDeps = async (projectId: string) => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}/clear-wave-deps`, {
-        method: 'POST',
-        headers: await authHeaders(),
-        body: '{}',
-      });
-      const data = await res.json();
-      addToast(`Cleared dependencies on ${data.cleared} tasks`, 'success');
-      fetchTasks();
-    } catch (error) {
-      console.error('Failed to clear wave deps:', error);
-      addToast('Failed to clear wave dependencies', 'error');
-    }
-  };
-
-  const handleApprove = async (taskId: string) => {
-    const original = tasks.find(t => t.id === taskId);
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, requires_approval: false, status: 'IN_PROGRESS' } : t));
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'approve' }));
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ requires_approval: false }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
-        addToast(data.detail ? `Failed to approve task: ${data.detail}` : 'Failed to approve task', 'error');
-        return;
-      }
-      fetchTasks();
-      addToast('Task approved', 'success');
-    } catch (error) {
-      console.error('Failed to approve task:', error);
-      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
-      addToast('Failed to approve task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleRequestChanges = async (taskId: string, feedback: string, action: 'fix' | 'review' = 'fix') => {
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'request-changes' }));
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/request-changes`, {
-        method: 'POST',
-        headers: await authHeaders(),
-        body: JSON.stringify({ feedback, action }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        addToast(data.detail || 'Failed to request changes', 'error');
-        return;
-      }
-      fetchTasks();
-      addToast(action === 'fix' ? 'Fix task spawned' : 'Re-review spawned', 'success');
-    } catch {
-      addToast('Failed to request changes', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleCancel = async (taskId: string) => {
-    const original = tasks.find(t => t.id === taskId);
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'CANCELLED' } : t));
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'cancel' }));
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ status: 'CANCELLED' }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
-        addToast(data.detail ? `Failed to cancel task: ${data.detail}` : 'Failed to cancel task', 'error');
-        return;
-      }
-      fetchTasks();
-      addToast('Task cancelled', 'success');
-    } catch (error) {
-      console.error('Failed to cancel task:', error);
-      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
-      addToast('Failed to cancel task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleRetry = async (taskId: string) => {
-    const original = tasks.find(t => t.id === taskId);
-    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'QUEUED' } : t));
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'retry' }));
-    try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ status: 'QUEUED' }),
-      });
-      fetchTasks();
-      fetchArchiveTasks();
-      addToast('Task queued for retry', 'success');
-    } catch (error) {
-      console.error('Failed to retry task:', error);
-      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
-      addToast('Failed to retry task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleEditPrompt = async (taskId: string, newPrompt: string) => {
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'edit' }));
-    try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ payloads: [{ prompt: newPrompt }] }),
-      });
-      fetchTasks();
-      addToast('Prompt updated', 'success');
-    } catch (error) {
-      console.error('Failed to edit task:', error);
-      addToast('Failed to edit task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleDismiss = async (taskId: string) => {
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'dismiss' }));
-    try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ status: 'CANCELLED' }),
-      });
-      fetchTasks();
-      addToast('Task dismissed', 'success');
-    } catch (error) {
-      console.error('Failed to dismiss task:', error);
-      addToast('Failed to dismiss task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleArchiveTask = async (taskId: string) => {
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'archive' }));
-    try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/archive`, {
-        method: 'POST',
-        headers: await authHeaders(),
-      });
-      fetchTasks();
-      addToast('Task archived', 'success');
-    } catch (error) {
-      console.error('Failed to archive task:', error);
-      addToast('Failed to archive task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
-
-  const handleUnarchiveTask = async (taskId: string) => {
-    setActionLoadingMap(m => ({ ...m, [taskId]: 'unarchive' }));
-    try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/unarchive`, {
-        method: 'POST',
-        headers: await authHeaders(),
-      });
-      fetchArchiveTasks();
-      // Also refresh the main task list so pipeline/kanban pick up the
-      // now-unarchived task (used by pipeline-view "Unarchive parent").
-      fetchTasks();
-      addToast('Task unarchived', 'success');
-    } catch (error) {
-      console.error('Failed to unarchive task:', error);
-      addToast('Failed to unarchive task', 'error');
-    } finally {
-      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
-    }
-  };
+  // ── Cross-domain glue handlers ────────────────────────────────────────────
 
   const handleRestartOrchestrator = async () => {
     try {
@@ -838,131 +461,12 @@ export function useAppState() {
     }
   };
 
-  const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
-        method: 'POST',
-        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filter }),
-      });
-      if (!res.ok) throw new Error('Request failed');
-      const data = await res.json();
-      fetchTasks();
-      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
-    } catch (error) {
-      console.error('Failed to bulk archive tasks:', error);
-      addToast('Failed to archive tasks', 'error');
-    }
-    setConfirmDialog(null);
-  };
-
-  const handleBulkAction = async (action: 'approve' | 'retry', taskIds: string[]) => {
-    if (taskIds.length === 0) return;
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
-        method: 'POST',
-        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, task_ids: taskIds }),
-      });
-      if (!res.ok) throw new Error('Request failed');
-      const data = await res.json();
-      fetchTasks();
-      if (data.error_count === 0) {
-        addToast(`${action === 'approve' ? 'Approved' : 'Retried'} ${data.success_count} task${data.success_count !== 1 ? 's' : ''}`, 'success');
-      } else {
-        addToast(`${data.success_count} succeeded, ${data.error_count} failed`, 'error');
-      }
-    } catch (error) {
-      console.error(`Failed to bulk ${action} tasks:`, error);
-      addToast(`Failed to ${action} tasks`, 'error');
-    }
-  };
-
-  const handleBulkArchiveSelected = async () => {
-    const ids = Array.from(selectedTaskIds);
-    if (ids.length === 0) return;
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
-        method: 'POST',
-        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ task_ids: ids }),
-      });
-      if (!res.ok) throw new Error('Request failed');
-      const data = await res.json();
-      setSelectedTaskIds(new Set());
-      setSelectionMode(false);
-      fetchTasks();
-      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
-    } catch (error) {
-      console.error('Failed to archive selected tasks:', error);
-      addToast('Failed to archive tasks', 'error');
-    }
-    setConfirmDialog(null);
-  };
-
-  const handleBulkArchiveColumn = async (taskIds: string[]) => {
-    if (taskIds.length === 0) return;
-    // Chunk to avoid large single requests that can hit Cloud Run request timeouts.
-    const CHUNK_SIZE = 100;
-    try {
-      let totalArchived = 0;
-      for (let i = 0; i < taskIds.length; i += CHUNK_SIZE) {
-        const chunk = taskIds.slice(i, i + CHUNK_SIZE);
-        const res = await apiFetch('/api/admin/tasks/bulk-archive', {
-          method: 'POST',
-          body: JSON.stringify({ task_ids: chunk }),
-        });
-        if (!res.ok) throw new Error(`Request failed (${res.status})`);
-        const data = await res.json();
-        totalArchived += data.archived_count ?? 0;
-      }
-      fetchTasks();
-      addToast(`Archived ${totalArchived} task${totalArchived !== 1 ? 's' : ''}`, 'success');
-    } catch (error) {
-      console.error('Failed to archive column tasks:', error);
-      addToast('Failed to archive tasks', 'error');
-    }
-    setConfirmDialog(null);
-  };
-
-  const handleBulkCancel = async (taskIds: string[]) => {
-    if (taskIds.length === 0) return;
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
-        method: 'POST',
-        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'cancel', task_ids: taskIds }),
-      });
-      if (!res.ok) throw new Error('Request failed');
-      const data = await res.json();
-      setSelectedTaskIds(new Set());
-      setSelectionMode(false);
-      fetchTasks();
-      if (data.error_count === 0) {
-        addToast(`Cancelled ${data.success_count} task${data.success_count !== 1 ? 's' : ''}`, 'success');
-      } else {
-        addToast(`${data.success_count} succeeded, ${data.error_count} failed`, 'error');
-      }
-    } catch (error) {
-      console.error('Failed to bulk cancel tasks:', error);
-      addToast('Failed to cancel tasks', 'error');
-    }
-    setConfirmDialog(null);
-  };
-
   const handleToggleSettings = () => {
     setShowSettings(prev => {
       if (!prev) fetchSettings();
       return !prev;
     });
   };
-
-  const needsAttentionCount = useMemo(() => {
-    return tasks.filter(t =>
-      t.status === 'FAILED' ||
-      (t.requires_approval && t.status !== 'COMPLETED' && t.status !== 'CANCELLED')
-    ).length;
-  }, [tasks]);
 
   const handleUpdateBuildConfig = async (config: import('./types/project').BuildConfig) => {
     if (!selectedProjectId) return;
@@ -997,237 +501,6 @@ export function useAppState() {
       fetchProjects(true);
     } catch {
       addToast('Detection failed', 'error');
-    }
-  };
-
-  // ── Auto-remediation config (project-scoped) ────────────────────────────
-  const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
-  const [autoRemediationStats, setAutoRemediationStats] = useState<AutoRemediationStats | null>(null);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setAutoRemediationConfig(null);
-      setAutoRemediationStats(null);
-      return;
-    }
-    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-remediation`)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => {
-        if (data?.config) setAutoRemediationConfig(data.config);
-        if (data?.stats) setAutoRemediationStats(data.stats);
-      })
-      .catch(() => {});
-  }, [selectedProjectId]);
-
-  const handleUpdateAutoRemediationConfig = async (config: AutoRemediationConfig) => {
-    if (!selectedProjectId) return;
-    const prev = autoRemediationConfig;
-    setAutoRemediationConfig(config);
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-remediation`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify(config),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setAutoRemediationConfig(data.config);
-      addToast('Auto-remediation config saved', 'success');
-    } catch {
-      setAutoRemediationConfig(prev);
-      addToast('Failed to save auto-remediation config', 'error');
-    }
-  };
-
-  // ── Issue implementation config (project-scoped) ────────────────────────
-  const [issueImplementationConfig, setIssueImplementationConfig] = useState<IssueImplementationConfig | null>(null);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setIssueImplementationConfig(null);
-      return;
-    }
-    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/issue-implementation`)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data?.config) setIssueImplementationConfig(data.config); })
-      .catch(() => {});
-  }, [selectedProjectId]);
-
-  const handleUpdateIssueImplementationConfig = async (update: IssueImplementationConfigUpdate) => {
-    if (!selectedProjectId) return;
-    const prev = issueImplementationConfig;
-    // Optimistic update: preserve server-derived base_branch from prev/default.
-    if (prev) setIssueImplementationConfig({ ...prev, ...update });
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/issue-implementation`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        // base_branch is server-derived from project.integration_branch and rejected by the PATCH validator.
-        body: JSON.stringify(update),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setIssueImplementationConfig(data.config);
-      addToast('Issue implementation config saved', 'success');
-    } catch {
-      setIssueImplementationConfig(prev);
-      addToast('Failed to save issue implementation config', 'error');
-    }
-  };
-
-  // ── Auto-review config (project-scoped) ─────────────────────────────────
-  const [autoReviewConfig, setAutoReviewConfig] = useState<AutoReviewConfig | null>(null);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setAutoReviewConfig(null);
-      return;
-    }
-    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-review`)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data?.config) setAutoReviewConfig(data.config); })
-      .catch(() => {});
-  }, [selectedProjectId]);
-
-  const handleUpdateAutoReviewConfig = async (patch: Partial<AutoReviewConfig>) => {
-    if (!selectedProjectId || Object.keys(patch).length === 0) return;
-    const prev = autoReviewConfig;
-    setAutoReviewConfig(prev ? { ...prev, ...patch } : prev);
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/auto-review`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify(patch),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setAutoReviewConfig(data.config);
-      addToast('Auto-review config saved', 'success');
-    } catch {
-      setAutoReviewConfig(prev);
-      addToast('Failed to save auto-review config', 'error');
-    }
-  };
-
-  // ── Integration branch config (project-scoped) ───────────────────────────
-  const [integrationBranchData, setIntegrationBranchData] = useState<{ integration_branch: string; is_default: boolean } | null>(null);
-  const [integrationBranchLoaded, setIntegrationBranchLoaded] = useState(false);
-  const [integrationBranchError, setIntegrationBranchError] = useState<string | null>(null);
-
-  // ── Promotion target config (project-scoped) ─────────────────────────────
-  const [promotionTargetData, setPromotionTargetData] = useState<{ promotion_target: string; is_default: boolean } | null>(null);
-  const [promotionTargetLoaded, setPromotionTargetLoaded] = useState(false);
-  const [promotionTargetError, setPromotionTargetError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setIntegrationBranchData(null);
-      setIntegrationBranchLoaded(false);
-      setIntegrationBranchError(null);
-      return;
-    }
-    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => {
-        if (data?.integration_branch !== undefined) setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default });
-        setIntegrationBranchLoaded(true);
-        setIntegrationBranchError(null);
-      })
-      .catch(() => {
-        setIntegrationBranchLoaded(true);
-        setIntegrationBranchError('Failed to load integration branch');
-      });
-  }, [selectedProjectId]);
-
-  const handleUpdateIntegrationBranch = async (branch: string | null) => {
-    if (!selectedProjectId) return;
-    const prev = integrationBranchData;
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ integration_branch: branch }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default });
-      addToast('Integration branch saved', 'success');
-    } catch {
-      setIntegrationBranchData(prev);
-      addToast('Failed to save integration branch', 'error');
-      throw new Error('Failed to save integration branch');
-    }
-  };
-
-  useEffect(() => {
-    if (!selectedProjectId) {
-      setPromotionTargetData(null);
-      setPromotionTargetLoaded(false);
-      setPromotionTargetError(null);
-      return;
-    }
-    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => {
-        if (data?.promotion_target !== undefined) setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default });
-        setPromotionTargetLoaded(true);
-        setPromotionTargetError(null);
-      })
-      .catch(() => {
-        setPromotionTargetLoaded(true);
-        setPromotionTargetError('Failed to load promotion target');
-      });
-  }, [selectedProjectId]);
-
-  useEffect(() => {
-    const project = projects.find(p => p.id === selectedProjectId) ?? null;
-    selectedProjectRepoRef.current = project ? `${project.github_owner}/${project.github_repo}` : null;
-    const branchConfigReady = !selectedProjectId || (
-      integrationBranchLoaded &&
-      promotionTargetLoaded &&
-      !integrationBranchError &&
-      !promotionTargetError
-    );
-    defaultTaskBranchRef.current = branchConfigReady
-      ? promotionTargetData?.promotion_target || integrationBranchData?.integration_branch || null
-      : null;
-  }, [
-    projects,
-    selectedProjectId,
-    promotionTargetData,
-    integrationBranchData,
-    integrationBranchLoaded,
-    promotionTargetLoaded,
-    integrationBranchError,
-    promotionTargetError,
-  ]);
-
-  const taskBranchDefaultsReady = !selectedProjectId || (
-    integrationBranchLoaded &&
-    promotionTargetLoaded &&
-    !integrationBranchError &&
-    !promotionTargetError
-  );
-  const taskBranchDefaultsLoading = Boolean(selectedProjectId) && !taskBranchDefaultsReady && !integrationBranchError && !promotionTargetError;
-  const taskBranchDefaultsError = integrationBranchError || promotionTargetError;
-
-  const handleUpdatePromotionTarget = async (branch: string | null) => {
-    if (!selectedProjectId) return;
-    const prev = promotionTargetData;
-    try {
-      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`, {
-        method: 'PATCH',
-        headers: await authHeaders(),
-        body: JSON.stringify({ promotion_target: branch }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default });
-      addToast('Promotion target saved', 'success');
-    } catch {
-      setPromotionTargetData(prev);
-      addToast('Failed to save promotion target', 'error');
-      throw new Error('Failed to save promotion target');
     }
   };
 

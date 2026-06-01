@@ -1,0 +1,498 @@
+import { useState, useEffect, useMemo } from 'react';
+import type { Task } from '../types/task';
+import { API_BASE_URL, apiFetch, authHeaders, authGet } from '../api';
+import { STATUS_OPTIONS } from '../constants';
+import { usePersistedState } from './usePersistedState';
+
+function playCompletionSound() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.setValueAtTime(1100, ctx.currentTime + 0.1);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.4);
+  } catch { /* AudioContext not available */ }
+}
+
+interface ConfirmDialog {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+}
+
+/**
+ * Collaborators the tasks domain needs from sibling domain hooks. They are
+ * passed in (rather than re-derived) so this hook stays behavior-identical to
+ * the original monolith — same callback identities and timing at the call
+ * sites that matter (selection bulk-actions, archive refresh, notifications).
+ */
+interface UseTasksStateDeps {
+  addToast: (msg: string, type: 'success' | 'error') => void;
+  setError: (msg: string | null) => void;
+  statusFilter: string[];
+  // Metrics sink for each completed fetch.
+  addMetricsPoint: (activeCount: number | undefined, tasks: Task[], completedCount: number, failedCount: number) => void;
+  // Notification preference refs (latest value, read inside async fetch).
+  notifyRef: React.MutableRefObject<boolean>;
+  notifyOnFailRef: React.MutableRefObject<boolean>;
+  notifyOnApprovalNeededRef: React.MutableRefObject<boolean>;
+  soundOnCompleteRef: React.MutableRefObject<boolean>;
+  // Archive refresh (used after retry/unarchive paths).
+  fetchArchiveTasks: () => Promise<void> | void;
+  // Selection / confirm-dialog state owned by useUIState.
+  selectedTaskIds: Set<string>;
+  setSelectedTaskIds: (ids: Set<string>) => void;
+  setSelectionMode: (mode: boolean) => void;
+  setConfirmDialog: (dialog: ConfirmDialog | null) => void;
+  // Shared ref the facade keeps pointed at the latest fetchTasks.
+  fetchTasksRef: React.MutableRefObject<() => Promise<void>>;
+  prevTasksRef: React.MutableRefObject<Task[]>;
+}
+
+export function useTasksState(deps: UseTasksStateDeps) {
+  const {
+    addToast, setError, statusFilter, addMetricsPoint,
+    notifyRef, notifyOnFailRef, notifyOnApprovalNeededRef, soundOnCompleteRef,
+    fetchArchiveTasks,
+    selectedTaskIds, setSelectedTaskIds, setSelectionMode, setConfirmDialog,
+    fetchTasksRef, prevTasksRef,
+  } = deps;
+
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [totalTasks, setTotalTasks] = useState(0);
+  const [globalActiveCount, setGlobalActiveCount] = useState(0);
+  const [globalEvaluatingCount, setGlobalEvaluatingCount] = useState(0);
+  const [globalQueuedCount, setGlobalQueuedCount] = useState(0);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1);
+  const [rawLimit, setLimit] = usePersistedState<number>('pageSize', 50);
+  // Backend caps /admin/tasks at 500 rows to keep response under Cloud Run's
+  // 32 MB body limit; clamp stale localStorage values so pagination offsets
+  // stay consistent with what the server actually returns.
+  const limit = Math.min(rawLimit, 500);
+  const [refreshInterval, setRefreshInterval] = usePersistedState<number>('refreshInterval', 30000);
+
+  const [actionLoadingMap, setActionLoadingMap] = useState<Record<string, string>>({});
+
+  // Refresh indicator + status-bar state driven by the task fetch.
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [apiHealthy, setApiHealthy] = useState(true);
+  const [lastFetchTime, setLastFetchTime] = useState<number>(0);
+
+  // Reset page when status filter changes
+  useEffect(() => { setPage(1); }, [statusFilter]);
+
+  const fetchTasks = async () => {
+    if (tasks.length === 0) {
+      setInitialLoading(true);
+    } else {
+      setRefreshing(true);
+    }
+    try {
+      const offset = (page - 1) * limit;
+      let url = `${API_BASE_URL}/api/admin/tasks?limit=${limit}&offset=${offset}&archived=false`;
+      if (statusFilter.length < STATUS_OPTIONS.length) {
+        statusFilter.forEach(s => { url += `&status=${s}`; });
+      }
+      const res = await authGet(url);
+      if (res.ok) {
+        const data = await res.json();
+        let newTasks: Task[];
+        if (Array.isArray(data)) {
+          newTasks = data;
+          setTotalTasks(data.length);
+        } else {
+          newTasks = data.tasks || [];
+          setTotalTasks(data.total ?? newTasks.length);
+          if (data.active_count !== undefined) setGlobalActiveCount(data.active_count);
+          if (data.evaluating_count !== undefined) setGlobalEvaluatingCount(data.evaluating_count);
+          if (data.queued_count !== undefined) setGlobalQueuedCount(data.queued_count);
+        }
+
+        // Browser notifications for completed/failed tasks
+        if (prevTasksRef.current.length > 0) {
+          const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
+          const prevApprovalMap = new Map(prevTasksRef.current.map(t => [t.id, t.requires_approval]));
+          let didTransition = false;
+          for (const t of newTasks) {
+            const prev = prevMap.get(t.id);
+            if (prev && prev !== t.status && (t.status === 'COMPLETED' || t.status === 'FAILED')) {
+              if (t.status === 'COMPLETED' && notifyRef.current && Notification.permission === 'granted') {
+                new Notification('Task completed', {
+                  body: t.title || t.id,
+                });
+              }
+              if (t.status === 'FAILED' && notifyOnFailRef.current && Notification.permission === 'granted') {
+                new Notification('Task failed', {
+                  body: t.title || t.id,
+                });
+              }
+              didTransition = true;
+            }
+            // Approval-needed notification: task newly requires approval and is not in a terminal state
+            const prevApproval = prevApprovalMap.get(t.id);
+            const nonTerminal = t.status !== 'COMPLETED' && t.status !== 'FAILED' && t.status !== 'CANCELLED';
+            if (!prevApproval && t.requires_approval && nonTerminal) {
+              if (notifyOnApprovalNeededRef.current && Notification.permission === 'granted') {
+                new Notification('Task requires approval', {
+                  body: t.title || t.id,
+                });
+              }
+            }
+          }
+          if (didTransition && soundOnCompleteRef.current) {
+            playCompletionSound();
+          }
+        }
+        // Count incremental completed/failed transitions since last snapshot
+        let completedCount = 0;
+        let failedCount = 0;
+        if (prevTasksRef.current.length > 0) {
+          const prevMap = new Map(prevTasksRef.current.map(t => [t.id, t.status]));
+          for (const t of newTasks) {
+            const prev = prevMap.get(t.id);
+            if (prev && prev !== t.status) {
+              if (t.status === 'COMPLETED') completedCount++;
+              else if (t.status === 'FAILED') failedCount++;
+            }
+          }
+        }
+
+        prevTasksRef.current = newTasks;
+
+        setTasks(newTasks);
+        setLastRefresh(new Date());
+        setError(null);
+        setApiHealthy(true);
+        setLastFetchTime(Date.now());
+
+        // Record metrics data point
+        addMetricsPoint(data.active_count, newTasks, completedCount, failedCount);
+      } else {
+        setError(`Failed to fetch tasks: ${res.statusText}`);
+        setApiHealthy(false);
+      }
+    } catch (err) {
+      console.error('Failed to fetch tasks:', err);
+      setError('Failed to connect to backend server.');
+      setApiHealthy(false);
+    } finally {
+      setInitialLoading(false);
+      setRefreshing(false);
+    }
+  };
+  fetchTasksRef.current = fetchTasks;
+
+  const handleApprove = async (taskId: string) => {
+    const original = tasks.find(t => t.id === taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, requires_approval: false, status: 'IN_PROGRESS' } : t));
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'approve' }));
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ requires_approval: false }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
+        addToast(data.detail ? `Failed to approve task: ${data.detail}` : 'Failed to approve task', 'error');
+        return;
+      }
+      fetchTasks();
+      addToast('Task approved', 'success');
+    } catch (error) {
+      console.error('Failed to approve task:', error);
+      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
+      addToast('Failed to approve task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleRequestChanges = async (taskId: string, feedback: string, action: 'fix' | 'review' = 'fix') => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'request-changes' }));
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/request-changes`, {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({ feedback, action }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail || 'Failed to request changes', 'error');
+        return;
+      }
+      fetchTasks();
+      addToast(action === 'fix' ? 'Fix task spawned' : 'Re-review spawned', 'success');
+    } catch {
+      addToast('Failed to request changes', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleCancel = async (taskId: string) => {
+    const original = tasks.find(t => t.id === taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'CANCELLED' } : t));
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'cancel' }));
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ status: 'CANCELLED' }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
+        addToast(data.detail ? `Failed to cancel task: ${data.detail}` : 'Failed to cancel task', 'error');
+        return;
+      }
+      fetchTasks();
+      addToast('Task cancelled', 'success');
+    } catch (error) {
+      console.error('Failed to cancel task:', error);
+      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
+      addToast('Failed to cancel task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleRetry = async (taskId: string) => {
+    const original = tasks.find(t => t.id === taskId);
+    setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'QUEUED' } : t));
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'retry' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ status: 'QUEUED' }),
+      });
+      fetchTasks();
+      fetchArchiveTasks();
+      addToast('Task queued for retry', 'success');
+    } catch (error) {
+      console.error('Failed to retry task:', error);
+      if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
+      addToast('Failed to retry task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleEditPrompt = async (taskId: string, newPrompt: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'edit' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ payloads: [{ prompt: newPrompt }] }),
+      });
+      fetchTasks();
+      addToast('Prompt updated', 'success');
+    } catch (error) {
+      console.error('Failed to edit task:', error);
+      addToast('Failed to edit task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleDismiss = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'dismiss' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ status: 'CANCELLED' }),
+      });
+      fetchTasks();
+      addToast('Task dismissed', 'success');
+    } catch (error) {
+      console.error('Failed to dismiss task:', error);
+      addToast('Failed to dismiss task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleArchiveTask = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'archive' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/archive`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      fetchTasks();
+      addToast('Task archived', 'success');
+    } catch (error) {
+      console.error('Failed to archive task:', error);
+      addToast('Failed to archive task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleUnarchiveTask = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'unarchive' }));
+    try {
+      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/unarchive`, {
+        method: 'POST',
+        headers: await authHeaders(),
+      });
+      fetchArchiveTasks();
+      // Also refresh the main task list so pipeline/kanban pick up the
+      // now-unarchived task (used by pipeline-view "Unarchive parent").
+      fetchTasks();
+      addToast('Task unarchived', 'success');
+    } catch (error) {
+      console.error('Failed to unarchive task:', error);
+      addToast('Failed to unarchive task', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleBulkArchive = async (filter: 'completed' | 'terminal') => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filter }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      fetchTasks();
+      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
+    } catch (error) {
+      console.error('Failed to bulk archive tasks:', error);
+      addToast('Failed to archive tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const handleBulkAction = async (action: 'approve' | 'retry', taskIds: string[]) => {
+    if (taskIds.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, task_ids: taskIds }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      fetchTasks();
+      if (data.error_count === 0) {
+        addToast(`${action === 'approve' ? 'Approved' : 'Retried'} ${data.success_count} task${data.success_count !== 1 ? 's' : ''}`, 'success');
+      } else {
+        addToast(`${data.success_count} succeeded, ${data.error_count} failed`, 'error');
+      }
+    } catch (error) {
+      console.error(`Failed to bulk ${action} tasks:`, error);
+      addToast(`Failed to ${action} tasks`, 'error');
+    }
+  };
+
+  const handleBulkArchiveSelected = async () => {
+    const ids = Array.from(selectedTaskIds);
+    if (ids.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-archive`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_ids: ids }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      setSelectedTaskIds(new Set());
+      setSelectionMode(false);
+      fetchTasks();
+      addToast(`Archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''}`, 'success');
+    } catch (error) {
+      console.error('Failed to archive selected tasks:', error);
+      addToast('Failed to archive tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const handleBulkArchiveColumn = async (taskIds: string[]) => {
+    if (taskIds.length === 0) return;
+    // Chunk to avoid large single requests that can hit Cloud Run request timeouts.
+    const CHUNK_SIZE = 100;
+    try {
+      let totalArchived = 0;
+      for (let i = 0; i < taskIds.length; i += CHUNK_SIZE) {
+        const chunk = taskIds.slice(i, i + CHUNK_SIZE);
+        const res = await apiFetch('/api/admin/tasks/bulk-archive', {
+          method: 'POST',
+          body: JSON.stringify({ task_ids: chunk }),
+        });
+        if (!res.ok) throw new Error(`Request failed (${res.status})`);
+        const data = await res.json();
+        totalArchived += data.archived_count ?? 0;
+      }
+      fetchTasks();
+      addToast(`Archived ${totalArchived} task${totalArchived !== 1 ? 's' : ''}`, 'success');
+    } catch (error) {
+      console.error('Failed to archive column tasks:', error);
+      addToast('Failed to archive tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const handleBulkCancel = async (taskIds: string[]) => {
+    if (taskIds.length === 0) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/bulk-action`, {
+        method: 'POST',
+        headers: { ...(await authHeaders()), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'cancel', task_ids: taskIds }),
+      });
+      if (!res.ok) throw new Error('Request failed');
+      const data = await res.json();
+      setSelectedTaskIds(new Set());
+      setSelectionMode(false);
+      fetchTasks();
+      if (data.error_count === 0) {
+        addToast(`Cancelled ${data.success_count} task${data.success_count !== 1 ? 's' : ''}`, 'success');
+      } else {
+        addToast(`${data.success_count} succeeded, ${data.error_count} failed`, 'error');
+      }
+    } catch (error) {
+      console.error('Failed to bulk cancel tasks:', error);
+      addToast('Failed to cancel tasks', 'error');
+    }
+    setConfirmDialog(null);
+  };
+
+  const needsAttentionCount = useMemo(() => {
+    return tasks.filter(t =>
+      t.status === 'FAILED' ||
+      (t.requires_approval && t.status !== 'COMPLETED' && t.status !== 'CANCELLED')
+    ).length;
+  }, [tasks]);
+
+  return {
+    tasks, setTasks, totalTasks,
+    globalActiveCount, globalEvaluatingCount, globalQueuedCount,
+    initialLoading, refreshing,
+    page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
+    actionLoadingMap,
+    lastRefresh, apiHealthy, lastFetchTime,
+    needsAttentionCount,
+    fetchTasks,
+    handleApprove, handleRequestChanges, handleCancel, handleRetry,
+    handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
+    handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
+    handleBulkAction, handleBulkCancel,
+  };
+}
