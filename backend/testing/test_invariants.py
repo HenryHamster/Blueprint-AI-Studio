@@ -3371,3 +3371,152 @@ class TestVmCostRateConsolidation:
             f"Unknown machine type '{unknown_type}' spot rate should fall back to "
             f"e2-standard-2 spot rate ({expected_spot}), got {unknown_spot}"
         )
+
+
+# ── pr_merged "landed on integration" writer allowlist ─────────────────────
+
+
+class TestPrMergedLandedWriterAllowlist:
+    """Tripwire: every backend/app/ site that SETS the ``pr_merged`` "landed on
+    integration" signal to literal ``True`` must appear in a reviewed allowlist.
+
+    Motivation
+    ----------
+    ``pr_merged`` is the canonical "this task's PR actually merged into the
+    project integration branch" signal — setting it unblocks dependent work
+    and feeds the release/landed query helpers. It must ONLY be set when a PR
+    truly landed on the integration branch, and the writers are being
+    consolidated behind a single guarded setter (see direction
+    "refactor: separate landed signal from pr_merged").
+
+    Today many code paths set ``"pr_merged": True`` directly. This ratchet
+    enumerates every such writer file and asserts the set matches a known,
+    reviewed allowlist so that:
+
+      * a NEW writer fails CI with a message directing the author to route
+        through the shared guarded setter rather than stamping the signal
+        inline (``found - _ALLOWLIST``); and
+      * as the consolidation work collapses writers toward the single setter,
+        a file that no longer contains a literal writer leaves the discovered
+        set and an unremoved stale allowlist entry fails too
+        (``_ALLOWLIST - found``).
+
+    How it works
+    ------------
+    The test walks every ``.py`` file under ``backend/app/`` line-by-line
+    (the same source-walking style as ``TestBaseBranchFallback`` /
+    ``TestStagingBranchClassification``), skipping comment lines
+    (``#``-prefixed) and ``# noqa`` lines, and matches writer lines with two
+    regexes — a dict-literal/spread form (``"pr_merged": True``) and a
+    subscript-assignment form (``ctx["pr_merged"] = True``). It collects the
+    SET of relative file paths containing at least one match (file-level keys,
+    so no line numbers are hardcoded and consolidation that removes the last
+    literal in a file drops it from the set) and asserts set equality against
+    ``_ALLOWLIST``.
+
+    Excluded files
+    --------------
+    ``release_version.py`` is the landed-signal reader/query-helper: it
+    contains a ``cast({"pr_merged": True}, JSONB)`` ``@>`` containment query
+    plus docstrings describing the signal — it does not WRITE the signal onto
+    a task. It is listed in ``_SKIP_FILES`` so the docstring/query text does
+    not register as a writer (mirrors how the behind-recovery tripwire skips
+    ``github.py``).
+    """
+
+    # Dict-literal / spread form: ``"pr_merged": True`` (also matches the
+    # conditional-spread idiom ``**({"pr_merged": True} if _landed else {})``).
+    _DICT_PATTERN = re.compile(r"""["']pr_merged["']\s*:\s*True\b""")
+    # Subscript-assignment form: ``ctx["pr_merged"] = True``.
+    _SUBSCRIPT_PATTERN = re.compile(r"""["']pr_merged["']\s*\]\s*=\s*True\b""")
+
+    # Reader / query-helper files that mention ``pr_merged: True`` in a query
+    # cast or docstring but never stamp the signal onto a task.
+    _SKIP_FILES = frozenset({"release_version.py"})
+
+    # Reviewed set of files that currently set the landed signal to True.
+    # This shrinks as setter-consolidation collapses writers toward the
+    # single guarded setter. Keys are paths relative to backend/app/.
+    _ALLOWLIST = frozenset(
+        {
+            "rollup_management.py",
+            "ci_completion.py",
+            "rollup_pr_verification.py",
+            "task_lifecycle.py",
+            "admin.py",
+            "reaper.py",
+            "routers/admin_operator_triggers.py",
+            "routers/agent_status.py",
+            "routers/github.py",
+            "recovery_sweeps.py",
+            "admin_task_mutations.py",
+            "orchestrator.py",
+        }
+    )
+
+    @classmethod
+    def _discover_writers(cls):
+        """Return the set of backend/app-relative paths that set pr_merged=True."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        found: set[str] = set()
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, app_dir).replace(os.sep, "/")
+                if rel in cls._SKIP_FILES:
+                    continue
+                with open(fpath, encoding="utf-8") as f:
+                    for line in f:
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if cls._DICT_PATTERN.search(line) or cls._SUBSCRIPT_PATTERN.search(line):
+                            found.add(rel)
+                            break
+        return found
+
+    def test_landed_writer_set_matches_allowlist(self):
+        """The set of pr_merged=True writer files must equal the reviewed allowlist."""
+        found = self._discover_writers()
+        new_writers = sorted(found - self._ALLOWLIST)
+        stale_entries = sorted(self._ALLOWLIST - found)
+        assert found == self._ALLOWLIST, (
+            "The set of backend/app/ files that set the pr_merged 'landed on "
+            "integration' signal to True drifted from the reviewed allowlist.\n"
+            + (
+                "\nNEW writer(s) detected — the landed signal must only be set "
+                "for a real integration-branch merge. Route the write through the "
+                "shared guarded setter instead of stamping \"pr_merged\": True "
+                "inline; do NOT just add the file to _ALLOWLIST:\n"
+                + "\n".join(f"  + {p}" for p in new_writers)
+                if new_writers
+                else ""
+            )
+            + (
+                "\nSTALE allowlist entry — this file no longer sets pr_merged=True "
+                "(consolidation removed it). Remove it from _ALLOWLIST in "
+                "TestPrMergedLandedWriterAllowlist:\n"
+                + "\n".join(f"  - {p}" for p in stale_entries)
+                if stale_entries
+                else ""
+            )
+        )
+
+    def test_allowlist_is_nonempty_sanity(self):
+        """Positive sanity: the scan must detect writers (guards a broken regex).
+
+        Mirrors the template's ``test_known_guarded_sites_are_detected`` — if
+        the writer regexes ever silently stop matching, set-equality would pass
+        only against an empty allowlist; this asserts the scan actually finds
+        the known writers.
+        """
+        found = self._discover_writers()
+        assert found, (
+            "No pr_merged=True writers were discovered under backend/app/. "
+            "The writer-detection regexes are likely broken — the set-equality "
+            "tripwire cannot enforce the allowlist if it detects nothing."
+        )
+        # The two known multi-writer hubs must be among the detected files.
+        assert "rollup_management.py" in found
+        assert "ci_completion.py" in found
