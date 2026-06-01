@@ -138,6 +138,25 @@ async def _vm_is_refresh_capable(
     return (await session.execute(stmt)).first() is not None
 
 
+async def _prior_task_vm_boot(
+    session: AsyncSession, prior_task_id: uuid.UUID
+) -> dict | None:
+    """Return the boot identity frozen into the VM that ran ``prior_task_id``."""
+    result = await session.execute(
+        select(Task.provider, Task.account_id, Task.model).where(
+            Task.id == prior_task_id
+        )
+    )
+    prior_task = result.first()
+    if prior_task is None:
+        return None
+    return {
+        "provider": prior_task.provider,
+        "account_id": prior_task.account_id,
+        "model": prior_task.model,
+    }
+
+
 async def _finalize_warm_claim(
     session: AsyncSession,
     task: Task,
@@ -405,6 +424,7 @@ async def next_role(
                 # BEFORE refreshing so only pre-existing windows count.
                 if _shared_state.is_backlog_first_refusal_active(str(_project_uuid)):
                     _record_next_role_poll()
+                vm_boot = await _prior_task_vm_boot(session, req.prior_task_id)
 
                 # Refresh the project's first-refusal window so the orchestrator
                 # holds off cold-provisioning eligible backlog tasks while this VM
@@ -413,7 +433,10 @@ async def next_role(
                 _shared_state.register_backlog_first_refusal(str(_project_uuid))
 
                 backlog_task = await select_backlog_reuse_candidate(
-                    session, _project_uuid, req.vm_instance_id
+                    session,
+                    _project_uuid,
+                    req.vm_instance_id,
+                    vm_boot=vm_boot,
                 )
                 if backlog_task is not None:
                     try:
