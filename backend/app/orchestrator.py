@@ -516,6 +516,61 @@ def _resolve_ci_fix_branch(
     return branch or ""
 
 
+async def _apply_ci_merged_landed_signal(
+    ci_task: Task,
+    session: AsyncSession,
+    *,
+    base_branch: str,
+    review_loop: dict,
+) -> bool:
+    """Stage the pr_merged landed signal only when the merged PR landed on
+    the project's integration branch.
+
+    Returns True when the merged PR landed on the integration branch. When the
+    base branch resolves to a distinct promotion target, the helper withholds
+    pr_merged and stages the same branch-safety alert the rollup boundary uses.
+    """
+    from app.branch_resolution import (
+        _signal_blocking_project_branch_configuration,
+    )
+
+    project = (
+        await session.get(Project, ci_task.project_id) if ci_task.project_id else None
+    )
+    integration_branch = _shared_state.get_project_integration_branch(project)
+    promotion_target = _shared_state.get_project_promotion_target(project)
+    hotfix_lane = bool(
+        (ci_task.first_payload or {}).get("hotfix")
+        or (ci_task.context or {}).get("hotfix")
+        or review_loop.get("hotfix")
+    )
+    landed_on_integration = bool(
+        integration_branch and base_branch == integration_branch
+    )
+    if (
+        promotion_target
+        and base_branch == promotion_target
+        and base_branch != integration_branch
+        and not hotfix_lane
+        and project is not None
+    ):
+        _signal_blocking_project_branch_configuration(
+            project,
+            "rollup_target_matches_promotion_target",
+            (
+                f"Rollup blocked: target branch '{base_branch}' is this "
+                "project's promotion target. Configure a distinct "
+                "integration branch before landing fleet work."
+            ),
+        )
+    if landed_on_integration:
+        ci_task.context = {
+            **(ci_task.context or {}),
+            "pr_merged": True,
+        }
+    return landed_on_integration
+
+
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
 # starving new provisions and creating a cascading failure where no VM can
@@ -3504,14 +3559,31 @@ async def orchestrator_worker():
                                     )
                                 continue
                             if pr_data.get("merged"):
+                                _orch_ci_project = (
+                                    await session.get(Project, ci_task.project_id)
+                                    if ci_task.project_id
+                                    else None
+                                )
+                                _ci_base = (
+                                    (pr_data.get("base") or {}).get("ref", "")
+                                    or ci_loop.get("base_branch", "")
+                                    or (ci_task.first_payload or {}).get(
+                                        "base_branch", ""
+                                    )
+                                    or _shared_state.get_project_integration_branch(
+                                        _orch_ci_project
+                                    )
+                                )
+                                await _apply_ci_merged_landed_signal(
+                                    ci_task,
+                                    session,
+                                    base_branch=_ci_base,
+                                    review_loop=ci_loop,
+                                )
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = (
                                     f"PR #{ci_pr_number} merged"
                                 )
-                                ci_task.context = {
-                                    **(ci_task.context or {}),
-                                    "pr_merged": True,
-                                }
                                 session.add(ci_task)
                                 await session.commit()
                                 await broadcast_to_project(

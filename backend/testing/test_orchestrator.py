@@ -2738,3 +2738,65 @@ class TestWarmVMSkipProvision:
             "record_warm_pin_clear must not be invoked when the commit "
             "that persists the warm-field clear has not landed"
         )
+
+    @pytest.mark.asyncio
+    async def test_ci_poll_merge_on_promotion_target_withholds_pr_merged(
+        self, db_session
+    ):
+        """The direct CI poll merge path must not stamp pr_merged when GitHub
+        reports a merged PR whose base branch is the project's promotion target
+        rather than its integration branch."""
+        from app.models import Alert
+        from app.orchestrator import _apply_ci_merged_landed_signal
+        from sqlmodel import select as _select
+
+        project = make_project(
+            name="CI promotion target",
+            user_id=_TEST_USER,
+            integration_branch="main",
+            promotion_target="release",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "review", "pr_number": 123, "base_branch": "release"}],
+            context={
+                "review_loop": {
+                    "pr_number": 123,
+                    "ci_waiting": True,
+                    "base_branch": "release",
+                }
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        landed = await _apply_ci_merged_landed_signal(
+            task,
+            db_session,
+            base_branch="release",
+            review_loop=(task.context or {}).get("review_loop", {}),
+        )
+        task.status = TaskStatus.COMPLETED
+        db_session.add(task)
+        await db_session.commit()
+
+        assert landed is False
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is not True
+        alert = (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Blocking branch configuration",
+                )
+            )
+        ).scalars().first()
+        assert alert is not None
+        assert "promotion target" in alert.message

@@ -184,6 +184,102 @@ def _signal_blocking_project_branch_configuration(
     )
 
 
+# Stable, escalated title for the blocking-class branch-safety signal. Used as
+# the database-existence dedupe key (project_id + this title + not-dismissed) so
+# the loud signal survives a process restart and is shared across backend
+# instances — unlike the in-process ``_blocking_project_branch_alerts`` set,
+# which resets on restart and is poisoned by a rolled-back caller. No new
+# severity tier is introduced: the house convention is top severity (ERROR) +
+# this escalated title + a paired BLOCKER operator message.
+_UNSAFE_BRANCH_ALERT_TITLE = (
+    "Unsafe branch configuration — fleet work would route to the promotion target"
+)
+
+
+async def signal_unsafe_branch_configuration(
+    session,
+    project,
+    *,
+    issue_code: str,
+    detail: str,
+) -> None:
+    """Durably raise the loud, blocking-class operator signal for an unsafe
+    branch configuration and commit it.
+
+    Mirrors the release-stall pattern (an Alert paired with a high-visibility
+    BLOCKER operator message). Both halves are deduplicated by a
+    database-existence check rather than an in-process set, so the signal
+    survives a restart and is shared across instances, and neither half is
+    silently dropped by a rolled-back caller because this commits its own work.
+
+    The Alert is emitted at the top severity (``ERROR``) under the stable
+    escalated title :data:`_UNSAFE_BRANCH_ALERT_TITLE`; the paired
+    :class:`ProjectMessage` is of type ``BLOCKER`` and carries its own stable
+    dedupe key in ``context`` so it lands on the operator's high-signal message
+    board exactly once per (project, issue) until resolved.
+
+    Callers that raise the blocking signal from an async write path (rollup /
+    admin merge gates) should ``await`` this instead of the best-effort sync
+    :func:`_signal_blocking_project_branch_configuration`.
+    """
+    from sqlmodel import select
+
+    from app.models import Alert, AlertSeverity, MessageType, ProjectMessage
+
+    project_id = getattr(project, "id", None)
+    logger.error("[BRANCH_RESOLVER] %s", detail)
+    if session is None or project_id is None:
+        return
+
+    # Alert: database-existence dedupe on (project, stable title, not dismissed).
+    existing_alert = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.title == _UNSAFE_BRANCH_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    if existing_alert.scalars().first() is None:
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.ERROR,
+                title=_UNSAFE_BRANCH_ALERT_TITLE,
+                message=detail,
+            )
+        )
+
+    # Paired BLOCKER operator message, deduped by its own stable context key.
+    dedupe_key = f"unsafe_branch_configuration:{project_id}:{issue_code}"
+    open_blockers = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.message_type == MessageType.BLOCKER,
+            ProjectMessage.status == "open",
+        )
+    )
+    already_posted = any(
+        (msg.context or {}).get("dedupe_key") == dedupe_key
+        for msg in open_blockers.scalars().all()
+    )
+    if not already_posted:
+        session.add(
+            ProjectMessage(
+                project_id=project_id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content=detail,
+                context={
+                    "event_type": "unsafe_branch_configuration",
+                    "issue_code": issue_code,
+                    "dedupe_key": dedupe_key,
+                },
+            )
+        )
+
+    await session.commit()
+
+
 def _uses_legacy_branch_resolver_shape(project) -> bool:
     """Keep partial test doubles on the old fallback contract.
 

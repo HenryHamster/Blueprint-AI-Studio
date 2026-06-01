@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from app.ci_completion import _normalize_merge_error
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, Project, Task, TaskStatus
 
 
 # ---------------------------------------------------------------------------
@@ -1626,6 +1626,76 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
     assert (orig_task.context or {}).get("pr_merged") is True, (
         "pr_merged=True must be set on the original task's context after merge"
     )
+
+
+@pytest.mark.asyncio
+async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
+    db_session, mocker
+):
+    """
+    When the merged PR lands on the project's promotion target instead of its
+    integration branch, pr_merged must stay unset and the branch-safety alert
+    must be staged.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from sqlmodel import select
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
+
+    project = Project(
+        name="Promotion target merge",
+        user_id="test-user",
+        integration_branch="main",
+        promotion_target="release",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        context={},
+        vm_instance_id="agent-vm-orig-004",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "base_branch": "release",
+            "original_task_id": str(orig_task.id),
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(orig_task)
+    assert orig_task.status == TaskStatus.COMPLETED
+    assert (orig_task.context or {}).get("pr_merged") is not True
+
+    alert = (
+        await db_session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == "Blocking branch configuration",
+            )
+        )
+    ).scalars().first()
+    assert alert is not None
+    assert "promotion target" in alert.message
 
 
 @pytest.mark.asyncio

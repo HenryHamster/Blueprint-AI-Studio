@@ -309,7 +309,10 @@ async def _attempt_merge_with_retry_and_escalation(
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.models import Project
-    from app.shared_state import get_project_integration_branch
+    from app.shared_state import (
+        get_project_integration_branch,
+        get_project_promotion_target,
+    )
     from app.shared_state import runtime_config as _rt_cfg
 
     # C5 invariant: the approval/safeguard gate is enforced AT the merge call,
@@ -552,12 +555,52 @@ async def _attempt_merge_with_retry_and_escalation(
             # maybe_finalize_qualification / reaper Step 9): it commits the flag
             # independently and an error here is fully contained.
             try:
+                from app.branch_resolution import (
+                    _signal_blocking_project_branch_configuration,
+                )
                 from app.database import AsyncSessionLocal
 
                 async with AsyncSessionLocal() as _orig_session:
                     orig = await _orig_session.get(Task, uuid.UUID(ci_orig_id))
                     if orig:
-                        orig.context = {**(orig.context or {}), "pr_merged": True}
+                        orig_project = (
+                            await _orig_session.get(Project, orig.project_id)
+                            if orig.project_id
+                            else None
+                        )
+                        _integration_branch = get_project_integration_branch(
+                            orig_project
+                        )
+                        _promotion_target = get_project_promotion_target(orig_project)
+                        _hotfix_lane = bool(
+                            (task.first_payload or {}).get("hotfix")
+                            or (task.context or {}).get("hotfix")
+                            or ci_loop.get("hotfix")
+                        )
+                        _landed_on_integration = bool(
+                            _integration_branch and ci_base == _integration_branch
+                        )
+                        if (
+                            _promotion_target
+                            and ci_base == _promotion_target
+                            and ci_base != _integration_branch
+                            and not _hotfix_lane
+                            and orig_project is not None
+                        ):
+                            _signal_blocking_project_branch_configuration(
+                                orig_project,
+                                "rollup_target_matches_promotion_target",
+                                (
+                                    f"Rollup blocked: target branch '{ci_base}' is this "
+                                    "project's promotion target. Configure a distinct "
+                                    "integration branch before landing fleet work."
+                                ),
+                            )
+                        if _landed_on_integration:
+                            orig.context = {
+                                **(orig.context or {}),
+                                "pr_merged": True,
+                            }
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):
