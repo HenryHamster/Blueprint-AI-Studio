@@ -152,8 +152,12 @@ async def _eligible_backlog_ids(
       - status == QUEUED, same project_id
       - not requires_approval (orchestrator skips these too)
       - retry_after_until null or already elapsed
-      - no ``depends_on`` (avoids re-implementing dependency / PR-merge
-        resolution; dependency-bearing tasks simply cold-dispatch as before)
+      - either no ``depends_on`` OR the orchestrator has already resolved
+        every dependency and durably stamped ``context["_deps_satisfied"]``
+        (avoids re-implementing dependency / PR-merge resolution on the hot
+        path — the marker is the orchestrator's authoritative, GitHub-aware
+        readiness signal). A dependency-bearing task whose deps are still
+        unresolved carries no marker and continues to cold-dispatch as before.
       - not pinned to a *different* VM via ``warm_target_vm_id`` (a pin to
         this VM is the chain path's job; a pin elsewhere must not be stolen)
       - no related_files overlap with an IN_PROGRESS task in the same project
@@ -213,10 +217,15 @@ async def _eligible_backlog_ids(
     skipped_file_conflict = 0
 
     for task_id, depends_on, ctx in rows:
-        if depends_on:
+        ctx = ctx or {}
+        # Dependency-bearing tasks are claimable warm ONLY once the
+        # orchestrator's authoritative dep resolution has marked them ready
+        # (``_deps_satisfied``). Without the marker the deps are still
+        # unresolved, so the task stays ineligible and cold-dispatches — the
+        # warm check is thus never looser than the cold dispatcher's gate.
+        if depends_on and not ctx.get("_deps_satisfied"):
             skipped_depends_on += 1
             continue
-        ctx = ctx or {}
         pinned_vm = ctx.get("warm_target_vm_id")
         if pinned_vm and pinned_vm != vm_instance_id:
             skipped_pinned_vm += 1

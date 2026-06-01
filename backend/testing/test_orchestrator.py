@@ -2282,6 +2282,77 @@ class TestBatchedDepRowsSurviveCommit:
             assert spy.call_count == 1
 
 
+class TestPersistDepsSatisfied:
+    """The orchestrator durably stamps ``context['_deps_satisfied']`` on a
+    dependency-bearing task once its deps resolve eligible. This sticky marker
+    is the contract the warm-backlog scan and dispatch first-refusal hold key
+    off so dependency-ready work can run warm without re-running the
+    (GitHub-aware) dep resolution on the hot path."""
+
+    @pytest.mark.asyncio
+    async def test_persist_deps_satisfied_stamps_and_persists(
+        self, db_session, mocker
+    ):
+        from app.orchestrator import _persist_deps_satisfied
+
+        project = make_project(name="Deps Satisfied", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(uuid.uuid4())],
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Redirect the helper's separate-session write to the test DB.
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        await _persist_deps_satisfied(task)
+
+        # In-memory mirror set for the same-cycle dispatch first-refusal hold.
+        assert task.context.get("_deps_satisfied") is True
+        # And durably persisted so the next-role warm scan (separate session)
+        # and the Step 3 dispatch re-read observe it.
+        db_session.expire(task)
+        await db_session.refresh(task)
+        assert task.context.get("_deps_satisfied") is True
+        # Pre-existing context keys are preserved, not clobbered.
+        assert task.context.get("scope") == "small"
+
+    @pytest.mark.asyncio
+    async def test_persist_deps_satisfied_is_idempotent_noop(
+        self, db_session, mocker
+    ):
+        """A task already carrying the marker is left untouched (no redundant
+        write), so repeated eligible cycles don't thrash the row."""
+        from app.orchestrator import _persist_deps_satisfied
+
+        task = make_task(
+            payloads=[{"type": "create", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(uuid.uuid4())],
+            context={"_deps_satisfied": True},
+        )
+        # If the helper opened a session it would hit this un-redirected factory
+        # and fail; the early-return guard means it never does.
+        sentinel = mocker.patch(
+            "app.orchestrator.AsyncSessionLocal",
+            side_effect=AssertionError("should not open a session when marker present"),
+        )
+        await _persist_deps_satisfied(task)
+        assert task.context.get("_deps_satisfied") is True
+        assert sentinel.call_count == 0
+
+
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker
     silently shadows the module-level X for the *entire* function, which then
