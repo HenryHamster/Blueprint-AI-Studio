@@ -19,6 +19,47 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import ci_resolution
+from app.models import Project
+
+
+def _proj(build_config=None):
+    return Project(name="t", user_id="u", build_config=build_config)
+
+
+# proceed_on_no_checks / requires_ci_checks — greenfield no-CI repo merge policy
+
+
+def test_requires_ci_checks_defaults_true():
+    assert ci_resolution.requires_ci_checks(_proj()) is True
+    assert ci_resolution.requires_ci_checks(_proj({"other": 1})) is True
+
+
+def test_requires_ci_checks_false_when_declared():
+    assert ci_resolution.requires_ci_checks(_proj({"requires_ci_checks": False})) is False
+
+
+def test_proceed_on_no_checks_ci_repo_non_staging_keeps_polling():
+    # CI-gated repo: a definitive no_checks on a trunk base must NOT proceed —
+    # for a CI repo a missing check means "not registered yet", so keep polling.
+    assert ci_resolution.proceed_on_no_checks(_proj(), "main") is False
+
+
+def test_proceed_on_no_checks_staging_base_proceeds():
+    # Staging-branch rollups have CI path-filtered out by design → proceed.
+    assert ci_resolution.proceed_on_no_checks(_proj(), "research/cycle-1") is True
+    assert ci_resolution.proceed_on_no_checks(_proj(), "plan/cycle-1") is True
+
+
+def test_proceed_on_no_checks_no_ci_project_proceeds_any_base():
+    # The greenfield-repo fix: no-CI project proceeds on a definitive no_checks
+    # for ANY base (e.g. a fresh repo with no GitHub Actions).
+    p = _proj({"requires_ci_checks": False})
+    assert ci_resolution.proceed_on_no_checks(p, "main") is True
+    assert ci_resolution.proceed_on_no_checks(p, None) is True
+
+
+def test_proceed_on_no_checks_none_project():
+    assert ci_resolution.proceed_on_no_checks(None, "main") is False
 
 
 @pytest.mark.asyncio

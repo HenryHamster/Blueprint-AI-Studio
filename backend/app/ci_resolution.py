@@ -71,6 +71,37 @@ def _classify_check_runs(result: dict[str, Any] | None) -> str:
     return _CI_PENDING
 
 
+def requires_ci_checks(project) -> bool:
+    """Whether a project's PRs must wait for CI status checks before merging.
+
+    Defaults True (CI-gated, like Blueprint's own repo). A project with no CI at
+    all — e.g. a greenfield repo with no GitHub Actions — can declare
+    ``build_config.requires_ci_checks = False`` so a *definitive* absence of
+    checks is treated as 'CI not applicable' instead of polled until the merge
+    backstop FAILs the task.
+    """
+    return bool(
+        (getattr(project, "build_config", None) or {}).get("requires_ci_checks", True)
+    )
+
+
+def proceed_on_no_checks(project, branch: str | None) -> bool:
+    """Whether a *definitive* ``no_checks`` (every reachable SHA queried cleanly,
+    zero check-runs) should be treated as passed so the orchestrator proceeds to
+    the mergeability-gated merge, rather than polled until the backstop FAILs it.
+
+    True when the PR targets an internal staging branch (research/plan rollups,
+    where CI is path-filtered out by design), OR when the project declares it has
+    no CI (``requires_ci_checks`` is False). CI-gated repos keep polling — for
+    them a missing check means 'not registered yet', never 'will never run'.
+    """
+    if project is None:
+        return False
+    if project.is_staging_branch(branch):
+        return True
+    return not requires_ci_checks(project)
+
+
 ResolutionSource = Literal["branch_head", "merge_sha", "unresolved"]
 
 

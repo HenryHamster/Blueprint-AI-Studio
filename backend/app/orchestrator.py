@@ -812,7 +812,7 @@ async def orchestrator_worker():
                                 f"[ORCHESTRATOR] Runtime config drift corrected: {_changed_keys}"
                             )
             except TimeoutError:
-                logger.error(
+                logger.exception(
                     "[ORCHESTRATOR] Timed out (30s) acquiring session / reading DeploymentState — "
                     "likely DB pool contention or row-level lock from a stale transaction. "
                     "Skipping this cycle."
@@ -1753,8 +1753,10 @@ async def orchestrator_worker():
                                     Task.id.in_(all_dep_ids_broad)
                                 )
                             )
-                            for dep_id, dep_status in broad_dep_rows.all():
-                                broad_dep_status[dep_id] = dep_status
+                            broad_dep_status = {
+                                dep_id: dep_status
+                                for dep_id, dep_status in broad_dep_rows.all()
+                            }
 
                         broad_classified = _classify_stuck_tasks(
                             broad_stuck,
@@ -4380,14 +4382,26 @@ async def orchestrator_worker():
                                     if ci_task.project_id
                                     else None
                                 )
-                                if _ci_proj is not None and _ci_proj.is_staging_branch(
-                                    _ci_base_ref
+                                # A *definitive* no_checks proceeds to the
+                                # mergeability-gated merge when the PR targets an
+                                # internal staging branch (research/plan, CI
+                                # path-filtered by design) OR the project declares
+                                # it has no CI (build_config.requires_ci_checks=
+                                # False) — otherwise (CI-gated repo, checks merely
+                                # not registered yet) keep polling. See
+                                # Project.proceed_on_no_checks.
+                                if _ci_proj is not None and ci_resolution.proceed_on_no_checks(
+                                    _ci_proj, _ci_base_ref
                                 ):
+                                    _ci_reason = (
+                                        f"targets internal staging branch '{_ci_base_ref}'"
+                                        if _ci_proj.is_staging_branch(_ci_base_ref)
+                                        else "the project declares no CI (requires_ci_checks=False)"
+                                    )
                                     logger.info(
-                                        f"[CI] PR #{ci_pr_number} targets internal "
-                                        f"staging branch '{_ci_base_ref}' with 0 "
-                                        f"check-runs (CI not applicable) — treating "
-                                        f"as passed so the rollup can proceed"
+                                        f"[CI] PR #{ci_pr_number} has 0 check-runs and "
+                                        f"{_ci_reason} — treating as passed so the "
+                                        f"merge can proceed"
                                     )
                                     ci_result = {
                                         "status": "completed",
