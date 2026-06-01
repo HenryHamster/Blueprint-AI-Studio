@@ -115,12 +115,15 @@ ${violations.join('\n')}
     expect(violations, errorMessage).toEqual([]);
   });
 
-  it('python _EXEMPT_FROM_VIEWPORT_TEST mirror matches the JS canonical exemption set', () => {
-    // The operator Viewport Debt panel computes untested_count using
-    // _EXEMPT_FROM_VIEWPORT_TEST in backend/app/viewport_debt.py. If that
-    // list drifts from the JS EXEMPT_FROM_VIEWPORT_TEST set (the source of
-    // truth that CI uses), operators see a different untested count than
-    // the gate enforces — the exact bug fix #5752 / #5759 addressed.
+  it('backend viewport_debt.py derives its exemption set from the single canonical viewport-exempt.json', () => {
+    // The operator Viewport Debt panel computes untested_count from the
+    // exemption set in backend/app/viewport_debt.py. That set must be DERIVED
+    // from the one canonical source (admin-ui/src/test/viewport-exempt.json),
+    // the same file CI reads — not from a parallel hand-edited Python literal.
+    // A backend copy that drifts from the JS canonical set is the exact bug
+    // #5752 / #5759 addressed; reading the one JSON makes that drift
+    // structurally impossible. This guards against a regression that
+    // reintroduces a hardcoded backend copy.
     const violations = checkBackendExemptionMirror();
 
     const errorMessage =

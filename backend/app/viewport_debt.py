@@ -40,39 +40,47 @@ _DATA_SMALL_TARGET_RE = _re.compile(r"data-viewport-allow-small-target")
 _DATA_OVERFLOW_RE = _re.compile(r"data-viewport-allow-overflow")
 _DATA_TRUNCATION_RE = _re.compile(r"data-viewport-allow-truncation")
 
-# Mirror of EXEMPT_FROM_VIEWPORT_TEST in admin-ui/src/test/viewport-checks.js.
-# Components here are internal/utility and never rendered standalone on operator
-# pages — keep in sync so the Viewport Debt panel "untested" count matches CI.
-_EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
-    [
-        "ErrorBoundary",
-        "MarkdownContent",
-        "ColumnsPicker",
-        "Toasts",
-        "catchupRows",
-        "regressionPhaseChips",
-        "VersionLifecyclePanel",
-        # Message-row sub-component rendered exclusively inside MessagesPanel;
-        # viewport coverage is provided by MessagesPanel.viewport.test.tsx.
-        "MessageBubble",
-        # Needs-attention worklist sub-component rendered exclusively inside
-        # CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
-        "CatchUpNeedsAttentionSection",
-        # Remediation-pipeline funnel sub-section rendered exclusively inside
-        # CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
-        "CatchUpRemediationPipelineSection",
-        # Per-category trend row rendered exclusively inside SrTrendBreakdown;
-        # viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.
-        "CategoryRow",
-        # SR diagnostics stack rendered exclusively inside DashboardHome;
-        # viewport coverage is provided by DashboardHome.viewport.test.tsx.
-        "SrDiagnosticsStack",
-        # Internal inline chip/label renderer for regression_class strings; used inside
-        # MttaTimelinePanel, PipelineRegressionsPanel, and RecentlyResolvedRegressionsPanel.
-        # Never rendered standalone on operator pages — layout controlled by parent containers.
-        "regressionClassLabel",
-    ]
-)
+# SINGLE SOURCE OF TRUTH for the viewport-test exemption set:
+# admin-ui/src/test/viewport-exempt.json. The CI gate
+# (admin-ui/src/test/viewport-checks.js -> EXEMPT_FROM_VIEWPORT_TEST) reads the
+# same JSON, so the operator Viewport Debt panel "untested" count can never
+# drift from what CI enforces. Do NOT reintroduce a hardcoded Python copy here
+# (the viewport-coverage invariant checkBackendExemptionMirror enforces this).
+def _find_repo_file(*relparts: str) -> Optional[_Path]:
+    """Walk up from this module to find a repo file by relative path parts."""
+    here = _Path(__file__).resolve().parent
+    for _ in range(6):
+        candidate = here.joinpath(*relparts)
+        if candidate.is_file():
+            return candidate
+        here = here.parent
+    return None
+
+
+def _load_exempt_components() -> frozenset[str]:
+    """Load the canonical viewport-test exemption set from viewport-exempt.json.
+
+    Returns an empty frozenset if the file is missing/unparseable; the panel
+    then treats every component as testable, which is the safe (over-counting)
+    direction for an operator-facing debt summary.
+    """
+    path = _find_repo_file("admin-ui", "src", "test", "viewport-exempt.json")
+    if path is None:
+        return frozenset()
+    try:
+        import json as _json
+
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # OSError: unreadable file. ValueError covers json.JSONDecodeError.
+        return frozenset()
+    exempt = data.get("exempt")
+    if not isinstance(exempt, dict):
+        return frozenset()
+    return frozenset(str(name) for name in exempt)
+
+
+_EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = _load_exempt_components()
 
 
 def _find_components_dir() -> Optional[_Path]:
@@ -87,20 +95,18 @@ def _find_components_dir() -> Optional[_Path]:
 
 def _load_viewport_budget() -> Dict[str, Any]:
     """Load viewport-escape-hatch-budget.json, returning empty dict on failure."""
-    here = _Path(__file__).resolve().parent
-    for _ in range(6):
-        candidate = (
-            here / "admin-ui" / "src" / "test" / "viewport-escape-hatch-budget.json"
-        )
-        if candidate.is_file():
-            try:
-                import json as _json
+    path = _find_repo_file(
+        "admin-ui", "src", "test", "viewport-escape-hatch-budget.json"
+    )
+    if path is None:
+        return {}
+    try:
+        import json as _json
 
-                return _json.loads(candidate.read_text(encoding="utf-8"))
-            except Exception:
-                return {}
-        here = here.parent
-    return {}
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # OSError: unreadable file. ValueError covers json.JSONDecodeError.
+        return {}
 
 
 def _scan_viewport_debt_rows() -> tuple[

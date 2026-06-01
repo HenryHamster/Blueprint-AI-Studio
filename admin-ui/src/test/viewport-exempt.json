@@ -1,0 +1,16 @@
+{
+  "_doc": "SINGLE SOURCE OF TRUTH for viewport-test exemptions. Components listed here are internal/utility and never rendered standalone on an operator page -- overflow is handled by the parent that composes them. Edit this file ONCE: both the CI gate (admin-ui/src/test/viewport-checks.js -> EXEMPT_FROM_VIEWPORT_TEST) and the operator Viewport Debt panel (backend/app/viewport_debt.py -> _load_exempt_components) read this file directly, so there is no parallel hand-edited copy to keep in sync. `exempt` is an object mapping component name -> one-line justification (the justification is documentation only; CI uses the keys).",
+  "exempt": {
+    "ErrorBoundary": "Internal decorator component for error isolation; not operator-facing.",
+    "MarkdownContent": "Pure presentation: renders markdown blocks, used in help/documentation panels where overflow is already handled by parent scroll container.",
+    "ColumnsPicker": "Utility component: renders chip columns in KanbanBoard's table; layout controlled entirely by parent, not rendering standalone in operator pages.",
+    "Toasts": "Toast notifications: positioned fixed/absolutely, exempt from viewport flow overflow checks; positioned via Tailwind fixed positioning.",
+    "catchupRows": "Internal mapper: generates DOM from regression data array; not used standalone on operator pages, used within parent containers that handle layout.",
+    "VersionLifecyclePanel": "Sub-panel rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline.",
+    "MessageBubble": "Message-row sub-component rendered exclusively inside MessagesPanel; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises the bubble inline (overflow, text-truncation, touch-target).",
+    "CatchUpNeedsAttentionSection": "Needs-attention worklist sub-component rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx which exercises it inline.",
+    "CatchUpRemediationPipelineSection": "Remediation-pipeline funnel sub-section rendered exclusively inside CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.",
+    "CategoryRow": "Per-category trend row rendered exclusively inside SrTrendBreakdown (card and inline variants); viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.",
+    "SrDiagnosticsStack": "SR diagnostics stack rendered exclusively inside DashboardHome; viewport coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline."
+  }
+}

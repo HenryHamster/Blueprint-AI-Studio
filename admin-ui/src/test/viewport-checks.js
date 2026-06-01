@@ -12,6 +12,7 @@ const __dirname = path.dirname(__filename);
 const COMPONENTS_DIR = path.join(__dirname, '../components');
 const REQUIRED_JSON = path.join(__dirname, 'viewport-required.json');
 const BUDGET_JSON = path.join(__dirname, 'viewport-escape-hatch-budget.json');
+const EXEMPT_JSON = path.join(__dirname, 'viewport-exempt.json');
 const BACKEND_PY = path.join(__dirname, '../../../backend/app/failure_classification.py');
 const VIEWPORT_DEBT_PY = path.join(__dirname, '../../../backend/app/viewport_debt.py');
 
@@ -20,55 +21,21 @@ const VIEWPORT_DEBT_PY = path.join(__dirname, '../../../backend/app/viewport_deb
 // so the count shown in the Viewport Debt panel matches the count CI enforces.
 export const ESLINT_VIEWPORT_PATTERN = 'eslint-disable[^\\n]*viewport';
 
-// Single source of truth for viewport-test exemptions.
-// Components listed here are internal/utility and never rendered standalone on
-// an operator page — overflow is handled by the parent that composes them.
-// Keep in sync with the Python mirror in backend/app/viewport_debt.py
-// (_EXEMPT_FROM_VIEWPORT_TEST) so the operator Viewport Debt panel
-// "untested" count matches what the CI gate enforces.
-export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
-  // Internal decorator component for error isolation; not operator-facing.
-  'ErrorBoundary',
-  // Pure presentation: renders markdown blocks, used in help/documentation
-  // panels where overflow is already handled by parent scroll container.
-  'MarkdownContent',
-  // Utility component: renders chip columns in KanbanBoard's table; layout
-  // controlled entirely by parent, not rendering standalone in operator pages.
-  'ColumnsPicker',
-  // Toast notifications: positioned fixed/absolutely, exempt from viewport
-  // flow overflow checks; positioned via Tailwind fixed positioning.
-  'Toasts',
-  // Internal mapper: generates DOM from regression data array; not used
-  // standalone on operator pages, used within parent containers that handle layout.
-  'catchupRows',
-  // Internal mapper: generates chip DOM from phase data; not standalone,
-  // layout controlled by parent container.
-  'regressionPhaseChips',
-  // Sub-panel rendered exclusively inside DashboardHome; viewport coverage
-  // is provided by DashboardHome.viewport.test.tsx which exercises it inline.
-  'VersionLifecyclePanel',
-  // Message-row sub-component rendered exclusively inside MessagesPanel;
-  // viewport coverage is provided by MessagesPanel.viewport.test.tsx which
-  // exercises the bubble inline (overflow, text-truncation, touch-target).
-  'MessageBubble',
-  // Needs-attention worklist sub-component rendered exclusively inside
-  // CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx
-  // which exercises it inline.
-  'CatchUpNeedsAttentionSection',
-  // Remediation-pipeline funnel sub-section rendered exclusively inside
-  // CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
-  'CatchUpRemediationPipelineSection',
-  // Per-category trend row rendered exclusively inside SrTrendBreakdown (card and
-  // inline variants); viewport coverage is provided by SrTrendBreakdown.viewport.test.tsx.
-  'CategoryRow',
-  // SR diagnostics stack rendered exclusively inside DashboardHome; viewport
-  // coverage is provided by DashboardHome.viewport.test.tsx which exercises it inline.
-  'SrDiagnosticsStack',
-  // Internal inline chip/label renderer for regression_class strings; used inside
-  // MttaTimelinePanel, PipelineRegressionsPanel, and RecentlyResolvedRegressionsPanel.
-  // Never rendered standalone on operator pages — layout controlled by parent containers.
-  'regressionClassLabel',
-]);
+// Single source of truth for viewport-test exemptions: the committed JSON
+// viewport-exempt.json. Components listed there are internal/utility and never
+// rendered standalone on an operator page — overflow is handled by the parent
+// that composes them. The backend operator Viewport Debt panel
+// (backend/app/viewport_debt.py) reads the SAME JSON file directly, so a single
+// edit to viewport-exempt.json updates both the CI gate and the operator panel
+// — there is no parallel hand-edited copy to keep in sync.
+function loadExemptComponents() {
+  const { exempt } = JSON.parse(fs.readFileSync(EXEMPT_JSON, 'utf-8'));
+  // `exempt` is an object mapping component name -> justification string; CI
+  // only uses the keys (the justification is documentation).
+  return new Set(Object.keys(exempt ?? {}));
+}
+
+export const EXEMPT_FROM_VIEWPORT_TEST = loadExemptComponents();
 
 /**
  * Invariant 1: every component in viewport-required.json has all three
@@ -196,49 +163,41 @@ export function checkBackendEslintPattern() {
 }
 
 /**
- * Invariant 6: the Python mirror of EXEMPT_FROM_VIEWPORT_TEST in
- * backend/app/viewport_debt.py (_EXEMPT_FROM_VIEWPORT_TEST) must contain
- * exactly the same component names as the JS canonical set. Drift here
- * silently reintroduces the backend-vs-CI untested_count mismatch that
- * motivated #5752 / #5759.
+ * Invariant 6: the backend operator Viewport Debt panel
+ * (backend/app/viewport_debt.py) must DERIVE its exemption set from the single
+ * canonical viewport-exempt.json — not from a parallel hand-edited Python
+ * literal. The motivating bug (#5752 / #5759) was drift between a backend copy
+ * of the exemption list and the JS canonical set, which made operators see a
+ * different untested_count than CI enforces. With both consumers reading the
+ * one JSON, that drift is structurally impossible; this invariant just guards
+ * against a regression that reintroduces a hardcoded backend copy.
  * Returns human-readable violation strings (empty = pass).
  */
 export function checkBackendExemptionMirror() {
   const src = fs.readFileSync(VIEWPORT_DEBT_PY, 'utf-8');
-  // Capture the frozenset literal body so we only parse what's intended as
-  // the exemption list (not random "ErrorBoundary" strings in comments).
-  const m = src.match(/_EXEMPT_FROM_VIEWPORT_TEST[^=]*=\s*frozenset\(\s*\[([\s\S]*?)\]\s*\)/);
-  if (!m) {
-    return [
-      `backend/app/viewport_debt.py: could not locate _EXEMPT_FROM_VIEWPORT_TEST frozenset literal.` +
-      ` Expected: _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset([...]).` +
-      ` Keep its members in sync with EXEMPT_FROM_VIEWPORT_TEST in viewport-checks.js.`,
-    ];
-  }
-  const pyMembers = new Set(
-    Array.from(m[1].matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g)).map(x => x[1])
-  );
-  const jsMembers = EXEMPT_FROM_VIEWPORT_TEST;
-
   const violations = [];
-  for (const name of jsMembers) {
-    if (!pyMembers.has(name)) {
-      violations.push(
-        `"${name}" is in EXEMPT_FROM_VIEWPORT_TEST (viewport-checks.js) but missing from` +
-        ` _EXEMPT_FROM_VIEWPORT_TEST in backend/app/viewport_debt.py — add it there so the` +
-        ` Viewport Debt panel untested_count matches CI.`
-      );
-    }
+
+  // The backend must read the canonical JSON (single source of truth) rather
+  // than embed its own list. Require a reference to the JSON filename.
+  if (!src.includes('viewport-exempt.json')) {
+    violations.push(
+      `backend/app/viewport_debt.py no longer reads the canonical exemption source` +
+      ` admin-ui/src/test/viewport-exempt.json. The exemption list must be DERIVED from` +
+      ` that single JSON (do not reintroduce a hand-edited Python copy) so the operator` +
+      ` Viewport Debt panel untested_count cannot drift from what CI enforces.`
+    );
   }
-  for (const name of pyMembers) {
-    if (!jsMembers.has(name)) {
-      violations.push(
-        `"${name}" is in _EXEMPT_FROM_VIEWPORT_TEST (backend/app/viewport_debt.py) but missing` +
-        ` from EXEMPT_FROM_VIEWPORT_TEST in admin-ui/src/test/viewport-checks.js — add it there` +
-        ` so CI exempts the same components the backend panel does.`
-      );
-    }
+
+  // Guard against a regression that re-adds a parallel hardcoded frozenset
+  // literal alongside (or instead of) reading the JSON.
+  if (/_EXEMPT_FROM_VIEWPORT_TEST[^=]*=\s*frozenset\(\s*\[/.test(src)) {
+    violations.push(
+      `backend/app/viewport_debt.py contains a hardcoded _EXEMPT_FROM_VIEWPORT_TEST` +
+      ` frozenset literal again. Delete it and derive the exemption set from` +
+      ` admin-ui/src/test/viewport-exempt.json (the single source of truth) instead.`
+    );
   }
+
   return violations;
 }
 
