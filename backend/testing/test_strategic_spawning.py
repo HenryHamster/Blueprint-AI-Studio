@@ -2600,6 +2600,177 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
 
 
 @pytest.mark.asyncio
+async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
+    db_session, mocker
+):
+    """Phase 1 payload ships the reconciled design doc built with GitHub context."""
+    from app.strategic_spawning import _agent_view_design_doc
+
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "automain",
+        "project_id": "proj-123",
+    }
+    reconciled_design_doc = {
+        "systems/api": {
+            "status": "missing",
+            "presence_warning": "reconciled against integration branch",
+        }
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "functional",
+                "modules": ["backend/app/api.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_shipped_changes_manifest",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    reconcile_mock = mocker.patch(
+        "app.strategic_spawning.reconcile_design_doc",
+        new=AsyncMock(return_value=reconciled_design_doc),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    assert payload["design_doc"] == reconciled_design_doc
+    reconcile_mock.assert_awaited_once_with(
+        _agent_view_design_doc(project.design_doc), **verification_context
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_uses_reconciled_design_doc(
+    db_session, mocker
+):
+    """Phase 2 payload ships the reconciled design doc built with GitHub context."""
+    from app.strategic_spawning import _agent_view_design_doc
+
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "main",
+        "project_id": "proj-456",
+    }
+    reconciled_design_doc = {
+        "capabilities/search": {
+            "status": "missing",
+            "presence_warning": "reconciled against integration branch",
+        }
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        integration_branch="main",
+        promotion_target="main",
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": "d-reconcile",
+                "status": "active",
+                "text": "Verify strategic payload grounding",
+                "priority": "medium",
+            }
+        ],
+        design_doc={
+            "capabilities/search": {
+                "status": "working",
+                "modules": ["backend/app/search.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_cycle.recent_for_agent_context",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_recent_interventions",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    reconcile_mock = mocker.patch(
+        "app.strategic_spawning.reconcile_design_doc",
+        new=AsyncMock(return_value=reconciled_design_doc),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_system_maturity_payload",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.drift_detection.compute_direction_drift",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.drift_detection.persist_drift_snapshot",
+        new=AsyncMock(return_value=None),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    assert payload["design_doc"] == reconciled_design_doc
+    reconcile_mock.assert_awaited_once_with(
+        _agent_view_design_doc(project.design_doc), **verification_context
+    )
+
+
+@pytest.mark.asyncio
 async def test_strategic_review_payload_includes_calibration_factor(db_session):
     """prediction_calibration_factor and note are always present in strategic payload."""
     project = _make_project(

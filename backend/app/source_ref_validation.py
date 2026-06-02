@@ -431,19 +431,31 @@ async def reconcile_design_doc_presence(
     value: Any,
     key: str,
     repo_root: str = _REPO_ROOT,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
 ) -> Any:
     """Downgrade present-status design-doc entries whose backing files are gone.
 
-    Conservative no-op when the entry is not a system/capability record, the
-    repo root is invalid, any referenced path is indeterminate, or at least one
-    referenced path still exists. Only entries whose every referenced path is
-    confirmed absent are downgraded to ``missing`` and annotated.
+    Conservative no-op when the entry is not a system/capability record, any
+    referenced path is indeterminate, or at least one referenced path still
+    exists. Only entries whose every referenced path is confirmed absent are
+    downgraded to ``missing`` and annotated.
+
+    When ``token``/``owner``/``repo``/``branch`` are all provided, backing-path
+    presence is checked against the project's real GitHub integration-branch
+    tree (boolean, never indeterminate — same mechanism
+    :func:`classify_existing_paths` uses). Otherwise the local checkout's git
+    HEAD is consulted via :func:`_path_exists_at_head`, in which case a valid
+    ``repo_root`` is required (the ``os.path.isdir`` guard gates only this local
+    branch) and an indeterminate result leaves the entry untouched.
     """
     if not isinstance(value, dict):
         return value
     if not isinstance(key, str):
-        return value
-    if not repo_root or not os.path.isdir(repo_root):
         return value
 
     if key.startswith("systems/"):
@@ -463,11 +475,26 @@ async def reconcile_design_doc_presence(
     if not paths:
         return value
 
+    use_repo_branch = all([token, owner, repo, branch])
+    if not use_repo_branch and (not repo_root or not os.path.isdir(repo_root)):
+        # Local-git fallback needs a valid checkout root; degrade to a no-op.
+        return value
+
     seen_present = False
     for path in paths:
-        exists = await _path_exists_at_head(path, repo_root=repo_root)
-        if exists is None:
-            return value
+        if use_repo_branch:
+            exists: Optional[bool] = await _file_exists_in_repo_branch(
+                path,
+                token=str(token),
+                owner=str(owner),
+                repo=str(repo),
+                branch=str(branch),
+                project_id=project_id,
+            )
+        else:
+            exists = await _path_exists_at_head(path, repo_root=repo_root)
+            if exists is None:
+                return value
         if exists:
             seen_present = True
     if seen_present:
@@ -484,6 +511,78 @@ async def reconcile_design_doc_presence(
         f"{existing} " if existing else ""
     ) + f"[reconciled: {warning}]"
     return downgraded
+
+
+async def reconcile_design_doc(
+    doc: Any,
+    *,
+    repo_root: str = _REPO_ROOT,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> Any:
+    """Reconcile every ``systems/*`` and ``capabilities/*`` entry in *doc*.
+
+    Walks the design-doc mapping and applies
+    :func:`reconcile_design_doc_presence` to each system/capability key,
+    forwarding the GitHub verification context so present-but-absent entries
+    are downgraded against the project's real integration branch when
+    credentials are available (and the local-git fallback otherwise). Non
+    system/capability keys are passed through untouched. Operates on a shallow
+    copy: the input mapping is never mutated.
+    """
+    if not isinstance(doc, dict):
+        return doc
+    out: dict[str, Any] = dict(doc)
+    for entry_key, entry_value in doc.items():
+        if not isinstance(entry_key, str):
+            continue
+        if entry_key.startswith("systems/") or entry_key.startswith("capabilities/"):
+            out[entry_key] = await reconcile_design_doc_presence(
+                entry_value,
+                entry_key,
+                repo_root,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+            )
+    return out
+
+
+async def resolve_branch_verification_context(session: Any, project: Any) -> Dict[str, str]:
+    """Resolve the GitHub-backed verification context for design-doc grounding.
+
+    Returns the keyword arguments shared by :func:`classify_existing_paths`,
+    :func:`reconcile_design_doc`, and the capability backing-path verifiers:
+    always ``branch`` + ``project_id``, plus ``token``/``owner``/``repo`` when
+    the project's GitHub credentials resolve. Degrades gracefully — on any
+    credential-resolution failure (or a project without an authorized repo) the
+    branch-only dict is returned so callers fall back to local git HEAD.
+    """
+    from app.branch_resolution import get_project_integration_branch
+
+    ctx: Dict[str, str] = {
+        "branch": get_project_integration_branch(project),
+        "project_id": str(project.id),
+    }
+    try:
+        from app.release_promotion import _resolve_github_with_session
+
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved:
+            token, owner, repo = resolved
+            ctx.update({"token": token, "owner": owner, "repo": repo})
+    except Exception:
+        logger.debug(
+            "[SOURCE_REF_VALIDATION] GitHub credential resolution skipped for "
+            "design-doc grounding",
+            exc_info=True,
+        )
+    return ctx
 
 
 async def detect_absent_symbols(

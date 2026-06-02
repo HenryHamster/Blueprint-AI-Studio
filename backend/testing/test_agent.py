@@ -2617,6 +2617,144 @@ async def test_design_doc_get_reconciles_absent_capability_entry(
 
 
 @pytest.mark.asyncio
+async def test_design_doc_get_reconciles_against_github_branch_not_local_checkout(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # The on-demand read endpoint must ground presence against the project's
+    # real integration branch via GitHub — not the orchestrator's local
+    # checkout, which is absent in prod/CI. Here we resolve full GitHub
+    # credentials and mock ONLY the GitHub contents probe to report the backing
+    # file absent; no local checkout is consulted, so the entry must still be
+    # downgraded to 'missing'.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(
+            return_value={
+                "token": "gh-token",
+                "owner": "acme",
+                "repo": "widget",
+                "branch": "automain",
+                "project_id": "p-1",
+            }
+        ),
+    )
+    # GitHub reports the backing module missing on the branch. If the endpoint
+    # were still using the local-git path this mock would be ignored.
+    github_probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(srv, "_file_exists_in_repo_branch", github_probe)
+
+    project = Project(
+        name="Design Doc GitHub Grounding Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments_missing.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-github",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-github", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "missing"
+    assert "presence_warning" in value
+    assert "[reconciled:" in value["description"]
+    # The GitHub branch probe — not a local git call — drove the downgrade.
+    github_probe.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_noop_when_github_credentials_unavailable(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # When the project's GitHub credentials don't resolve, the verification
+    # context degrades to branch-only (no token/owner/repo), so the endpoint
+    # falls back to the orchestrator's local git HEAD. On the deployed
+    # orchestrator (and in CI) there's no per-project checkout there, so the
+    # existence probe is indeterminate and reconciliation must gracefully
+    # no-op — the present-status entry is served as-is, NOT downgraded, and the
+    # GitHub branch probe is never reached.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(return_value={"branch": "automain", "project_id": "p-1"}),
+    )
+    # Local git HEAD is indeterminate (no checkout / git unavailable).
+    monkeypatch.setattr(srv, "_path_exists_at_head", AsyncMock(return_value=None))
+    # The GitHub branch probe must NOT be consulted in the no-credential path.
+    github_probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(srv, "_file_exists_in_repo_branch", github_probe)
+
+    project = Project(
+        name="Design Doc No-Credential No-Op Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments_missing.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-nocreds",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-nocreds", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    # Indeterminate presence => graceful no-op: entry served un-downgraded.
+    assert value["status"] == "functional"
+    assert value["description"] == "Payments system."
+    assert "presence_warning" not in value
+    assert "[reconciled:" not in value["description"]
+    # No GitHub probe in the credential-unavailable fallback path.
+    github_probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_design_doc_get_leaves_present_system_entry_unchanged(
     client: AsyncClient, db_session
 ):

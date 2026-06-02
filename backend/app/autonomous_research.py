@@ -42,7 +42,11 @@ from app.playbook_learning import (
     RECENT_SUCCESSES_TASK_TYPES,
     summarize_recent_successes,
 )
-from app.source_ref_validation import classify_existing_paths, detect_absent_symbols
+from app.source_ref_validation import (
+    classify_existing_paths,
+    detect_absent_symbols,
+    resolve_branch_verification_context,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -1232,25 +1236,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # confabulating phantom code behind a status it trusts. Flat storage
         # shape: each ``systems/<id>`` key is a dict carrying a ``modules`` list.
         # Sorted iteration keeps the annotation deterministic for identical input.
-        verification_kwargs: dict[str, str] = {
-            "branch": _get_project_integration_branch(project),
-            "project_id": str(project.id),
-        }
-        try:
-            from app.release_promotion import _resolve_github_with_session
-
-            resolved = await _resolve_github_with_session(session, project)
-            if resolved:
-                gh_token, gh_owner, gh_repo = resolved
-                verification_kwargs.update(
-                    {"token": gh_token, "owner": gh_owner, "repo": gh_repo}
-                )
-        except Exception:
-            logger.debug(
-                "[AUTONOMOUS_RESEARCH] GitHub credential resolution skipped for "
-                "system verification",
-                exc_info=True,
-            )
+        verification_kwargs = await resolve_branch_verification_context(
+            session, project
+        )
         system_verification: dict = {}
         for dkey in sorted(
             k for k in doc if isinstance(k, str) and k.startswith("systems/")

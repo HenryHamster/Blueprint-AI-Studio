@@ -660,7 +660,7 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
         structural_grade = "LOW"
         if effective_claims >= 2 and valid_sources >= 1 and len(desc) >= 80:
             structural_grade = "HIGH"
-        elif (effective_claims >= 1 or valid_sources >= 1) and len(desc) >= 40:
+        elif effective_claims >= 1 and len(desc) >= 40:
             structural_grade = "MEDIUM"
         current = f.get("actionability_grade", "MEDIUM")
         if grade_order[structural_grade] < grade_order.get(current, 1):

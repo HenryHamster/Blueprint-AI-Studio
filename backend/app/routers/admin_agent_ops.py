@@ -39,6 +39,7 @@ from app.source_ref_validation import (
     _PRESENT_SYSTEM_STATUSES,
     detect_absent_symbols as _detect_absent_symbols,
     reconcile_design_doc_presence as _reconcile_design_doc_presence,
+    resolve_branch_verification_context as _resolve_branch_verification_context,
 )
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
@@ -109,7 +110,7 @@ class DesignDocUpdate(BaseModel):
     value: Any | None = None
 
 
-async def _ground_design_doc_value(value: Any, key: str) -> Any:
+async def _ground_design_doc_value(value: Any, key: str, **verification_kwargs: Any) -> Any:
     """File- AND symbol-level grounding for an on-demand design-doc read.
 
     First applies the file-level reconciliation (downgrades a present-status
@@ -125,8 +126,14 @@ async def _ground_design_doc_value(value: Any, key: str) -> Any:
     an unambiguous absence (file present at HEAD, no plausible definition). An
     indeterminate result (git unavailable / non-repo) or a present symbol never
     downgrades the entry.
+
+    *verification_kwargs* (branch/token/owner/repo/project_id, from
+    :func:`resolve_branch_verification_context`) ground the file-level reconcile
+    against the project's real integration branch via the GitHub API rather than
+    the orchestrator's local checkout. The symbol-level check remains a local
+    HEAD lookup (its only available source).
     """
-    value = await _reconcile_design_doc_presence(value, key)
+    value = await _reconcile_design_doc_presence(value, key, **verification_kwargs)
     if not isinstance(value, dict) or not isinstance(key, str):
         return value
     if key.startswith("systems/"):
@@ -210,7 +217,20 @@ async def update_design_doc(
             raise HTTPException(
                 status_code=404, detail=f"Key '{payload.key}' not found"
             )
-        value = await _ground_design_doc_value(value, payload.key)
+        # Ground presence against the project's real integration branch via the
+        # GitHub API — not the orchestrator's local checkout, which is absent in
+        # prod/CI and would silently degrade this reconcile to a no-op. Mirrors
+        # the finding-ingestion and strategic-payload grounding paths
+        # (strategic_spawning.py / autonomous_research.py). Falls back to local
+        # git HEAD when credentials/branch are unavailable.
+        verification_kwargs = (
+            await _resolve_branch_verification_context(session, project)
+            if project
+            else {}
+        )
+        value = await _ground_design_doc_value(
+            value, payload.key, **verification_kwargs
+        )
         return {"key": payload.key, "value": value}
 
     if not payload.key or not isinstance(payload.key, str):

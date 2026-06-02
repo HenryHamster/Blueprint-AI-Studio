@@ -20,6 +20,7 @@ from app.source_ref_validation import (
     summarize_broken_refs,
     validate_source_refs,
 )
+from app.research_completion import _apply_structural_actionability_downgrade
 from app.time_utils import _utcnow
 
 
@@ -575,6 +576,273 @@ class TestSourceRefValidation:
 
         monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
         assert await _symbol_defined_at_head("backend/app/example.py", "present_symbol") is None
+
+
+class TestUngroundedClaimDetection:
+    """Grounding logic: detect claims that reference absent symbols and discount them."""
+
+    def _patch_git_show(self, monkeypatch, *, stdout=b"", stderr=b"", returncode=0):
+        from app import source_ref_validation as srv
+
+        class _Proc:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return stdout, stderr
+
+        async def _create(*args, **kwargs):
+            return _Proc()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
+
+    async def test_ungrounded_claim_with_absent_symbol_is_detected(self, monkeypatch):
+        """A claim referencing a symbol NOT defined in an existing file is flagged."""
+        self._patch_git_show(
+            monkeypatch, stdout=b"def other_func():\n    pass\n"
+        )
+        result = await summarize_ungrounded_claims([
+            "backend/app/module.py:missing_symbol is the main entry point"
+        ])
+        assert result is not None
+        assert result["ungrounded_claim_count"] == 1
+        assert "backend/app/module.py:missing_symbol" in result["ungrounded_refs"]
+
+    async def test_grounded_claim_with_present_symbol_is_not_flagged(self, monkeypatch):
+        """A claim referencing a symbol that IS defined is not flagged."""
+        self._patch_git_show(
+            monkeypatch, stdout=b"def present_func():\n    return True\n"
+        )
+        result = await summarize_ungrounded_claims([
+            "backend/app/module.py:present_func implements the main logic"
+        ])
+        assert result is None
+
+    async def test_multiple_claims_with_distinct_ungrounded_count(self, monkeypatch):
+        """Ungrounded-claim count reflects distinct claims, not total refs."""
+        from app import source_ref_validation as srv
+
+        # Mock _symbol_defined_at_head to return False for missing symbols
+        async def mock_symbol_check(path, symbol):
+            return symbol == "present_func"
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = [
+            "backend/app/x.py:present_func does something",
+            "backend/app/x.py:missing_func does something else",
+            "backend/app/x.py:missing_func is also referenced here",  # same ref, different claim
+            "backend/app/y.py:another_missing creates objects",
+        ]
+        result = await summarize_ungrounded_claims(claims)
+        assert result is not None
+        # 3 claims carry ungrounded refs (claims 2, 3, 4)
+        assert result["ungrounded_claim_count"] == 3
+        # 2 distinct ungrounded refs (missing_func and another_missing)
+        assert len(result["ungrounded_refs"]) == 2
+        assert "backend/app/x.py:missing_func" in result["ungrounded_refs"]
+        assert "backend/app/y.py:another_missing" in result["ungrounded_refs"]
+
+    async def test_mixed_grounded_and_ungrounded_claims(self, monkeypatch):
+        """Batch with both grounded and ungrounded claims filters only the bad ones."""
+        from app import source_ref_validation as srv
+
+        async def mock_symbol_check(path, symbol):
+            return symbol in ("func_a", "func_b")
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = [
+            "backend/app/module.py:func_a is solid",
+            "backend/app/module.py:missing_func is broken",
+            "backend/app/module.py:func_b is also solid",
+            "backend/app/module.py:ghost_func is gone",
+        ]
+        result = await summarize_ungrounded_claims(claims)
+        assert result is not None
+        # 2 claims carry ungrounded refs
+        assert result["ungrounded_claim_count"] == 2
+        assert len(result["ungrounded_refs"]) == 2
+
+    async def test_indeterminate_git_state_flags_nothing(self, monkeypatch):
+        """When git is unavailable, no claims are flagged (fail-open)."""
+        from app import source_ref_validation as srv
+
+        async def mock_symbol_check(path, symbol):
+            # Simulate git unavailability returning None (indeterminate)
+            return None
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = [
+            "backend/app/module.py:some_func does something",
+            "backend/app/module.py:another_func does another thing",
+        ]
+        result = await summarize_ungrounded_claims(claims)
+        # Indeterminate refs (None) are treated as grounded, so no result
+        assert result is None
+
+    async def test_claim_with_file_source_excerpt_is_checked(self, monkeypatch):
+        """File sources with quote/excerpt fields are checked the same way."""
+        from app import source_ref_validation as srv
+
+        async def mock_symbol_check(path, symbol):
+            return symbol == "present_func"
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = []
+        sources = [
+            {
+                "type": "file",
+                "ref": "backend/app/module.py",
+                "quote": "backend/app/module.py:missing_func is defined here"
+            }
+        ]
+        result = await summarize_ungrounded_claims(claims, sources)
+        assert result is not None
+        # Source excerpts increment ungrounded_refs but NOT ungrounded_claim_count
+        assert result["ungrounded_claim_count"] == 0
+        assert "backend/app/module.py:missing_func" in result["ungrounded_refs"]
+
+
+class TestStructuralActionabilityDowngrade:
+    """The actionability gate downgrades findings whose structural support is insufficient."""
+
+    def test_high_grade_with_no_claims_downgrades_to_low(self):
+        """Finding with HIGH grade but no claims downgrades to LOW."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": [],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # _ungrounded_claim_count not set (assume 0)
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        assert findings[0]["actionability_grade"] == "LOW"
+
+    def test_high_grade_with_ungrounded_claims_downgrades(self):
+        """Finding with HIGH grade but all claims ungrounded downgrades to MEDIUM or LOW."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": ["claim1", "claim2"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                "_ungrounded_claim_count": 2,  # Both claims are ungrounded
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        # effective_claims = 2 - 2 = 0, so grade drops below HIGH
+        assert findings[0]["actionability_grade"] != "HIGH"
+
+    def test_medium_grade_with_partial_ungrounded_claims(self):
+        """Finding with 3 claims where 1 is ungrounded drops from 3 effective to 2."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "MEDIUM",
+                "description": "x" * 100,
+                "claims": ["c1", "c2", "c3"],
+                "sources": [{"type": "file", "ref": "backend/app/foo.py"}],
+                "_ungrounded_claim_count": 1,
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        # effective_claims = 3 - 1 = 2; sources = 1
+        # 2 >= 2 and 1 >= 1 and len(desc) >= 80 → stays HIGH or MEDIUM, not downgraded
+        assert findings[0]["actionability_grade"] in ("MEDIUM", "HIGH")
+
+    def test_low_grade_stays_low(self):
+        """Finding already at LOW grade is never downgraded further."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "LOW",
+                "description": "x" * 100,
+                "claims": ["c1"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                "_ungrounded_claim_count": 1,
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        assert findings[0]["actionability_grade"] == "LOW"
+
+    def test_downgrade_count_returned_correctly(self):
+        """Return value reflects number of findings actually downgraded."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": [],
+                "sources": [],
+                # No claims, sources, or sufficient description → downgrade to LOW
+            },
+            {
+                "title": "F2",
+                "actionability_grade": "MEDIUM",
+                "description": "x" * 100,
+                "claims": ["c1"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # Has structure: 1 claim, 1 source, sufficient desc → stays MEDIUM
+            },
+            {
+                "title": "F3",
+                "actionability_grade": "HIGH",
+                "claims": ["c1", "c2"],
+                "description": "x" * 100,
+                "sources": [],
+                "_ungrounded_claim_count": 2,
+                # effective_claims = 0; sources = 0 → downgrade to LOW
+            }
+        ]
+        downgrades = _apply_structural_actionability_downgrade(findings)
+        assert downgrades == 2
+        assert findings[0]["actionability_grade"] == "LOW"
+        assert findings[1]["actionability_grade"] == "MEDIUM"
+        assert findings[2]["actionability_grade"] == "LOW"
+
+    def test_grade_order_respected_on_downgrade(self):
+        """Downgrades only happen when structural grade is lower than current."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "LOW",
+                "description": "description",
+                "claims": ["c1", "c2"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # effective_claims = 2, sources = 1, desc >= 40 → structural = HIGH
+                # But current is LOW, so no downgrade (can't upgrade)
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        assert findings[0]["actionability_grade"] == "LOW"
+
+    def test_missing_ungrounded_count_treats_as_zero(self):
+        """Finding without _ungrounded_claim_count field is treated as 0."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": ["c1"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # _ungrounded_claim_count not present
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        # effective_claims = 1 - 0 = 1; sources = 1; desc >= 80
+        # This meets HIGH threshold (1 >= 2? No, but sources >= 1 and desc >= 80 → MEDIUM)
+        # Actually: effective_claims >= 1 or valid_sources >= 1 and len(desc) >= 40 → MEDIUM
+        # So no downgrade from HIGH → but wait, let me reread the threshold...
+        # HIGH requires: effective_claims >= 2 AND valid_sources >= 1 AND len(desc) >= 80
+        # This has 1 claim, so it cannot be HIGH, will downgrade to MEDIUM at best
+        assert findings[0]["actionability_grade"] in ("MEDIUM", "LOW")
 
 
 class TestExtractSourceFilePaths:

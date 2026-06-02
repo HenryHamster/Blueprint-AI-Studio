@@ -27,7 +27,11 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
-from app.source_ref_validation import classify_existing_paths
+from app.source_ref_validation import (
+    classify_existing_paths,
+    reconcile_design_doc,
+    resolve_branch_verification_context,
+)
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
@@ -1524,30 +1528,20 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
 
-    verification_kwargs: dict[str, str] = {
-        "branch": get_project_integration_branch(project),
-        "project_id": str(project.id),
-    }
-    try:
-        from app.release_qualifier import _resolve_github_with_session
+    verification_kwargs = await resolve_branch_verification_context(session, project)
 
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved:
-            gh_token, gh_owner, gh_repo = resolved
-            verification_kwargs.update(
-                {"token": gh_token, "owner": gh_owner, "repo": gh_repo}
-            )
-    except Exception:
-        logger.debug(
-            "[STRATEGIC] GitHub credential resolution skipped for design-doc "
-            "capability verification",
-            exc_info=True,
-        )
+    # Ground the design doc against the real integration branch before shipping
+    # it: present-but-absent systems/capabilities are downgraded so the agent
+    # never sees a status the backing code can't support. Read-only/advisory —
+    # the stored design_doc is untouched; reconcile operates on the agent view.
+    reconciled_design_doc = await reconcile_design_doc(
+        _agent_view_design_doc(project.design_doc), **verification_kwargs
+    )
 
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
-            "design_doc": _agent_view_design_doc(project.design_doc),
+            "design_doc": reconciled_design_doc,
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
@@ -1893,25 +1887,7 @@ async def _spawn_strategic_review(
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )
-    verification_kwargs: dict[str, str] = {
-        "branch": get_project_integration_branch(project),
-        "project_id": str(project.id),
-    }
-    try:
-        from app.release_qualifier import _resolve_github_with_session
-
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved:
-            gh_token, gh_owner, gh_repo = resolved
-            verification_kwargs.update(
-                {"token": gh_token, "owner": gh_owner, "repo": gh_repo}
-            )
-    except Exception:
-        logger.debug(
-            "[STRATEGIC] GitHub credential resolution skipped for strategic "
-            "capability verification",
-            exc_info=True,
-        )
+    verification_kwargs = await resolve_branch_verification_context(session, project)
     # Mode-aware additions: per-system maturity snapshots + short-window
     # claim-vs-shipped drift. Both are best-effort: empty/None when the
     # project has no SystemMaturity rows or no in-window task data.
@@ -2412,7 +2388,9 @@ async def _spawn_strategic_review(
         {
             "type": "strategic_review",
             "research_mode": "strategic",
-            "design_doc": _agent_view_design_doc(project.design_doc),
+            "design_doc": await reconcile_design_doc(
+                _agent_view_design_doc(project.design_doc), **verification_kwargs
+            ),
             "vision": project.vision or {},
             "problem_model": await _verify_capability_backing_paths(
                 _agent_view_problem_model(project.problem_model),
