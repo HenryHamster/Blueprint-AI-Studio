@@ -2183,6 +2183,87 @@ async def _maybe_reconcile_after_promotion_conflict(
         )
 
 
+# Qualification outcomes after which the strategic agent should re-plan: a
+# RESOLVED verdict (a promote, or any flavour of miss). Excludes the in-flight
+# (``pending_auto_merge``), transient (``audit_rate_limit_respawned``) and
+# read-only no-op (``None``) states, which do not represent a settled cut.
+_STRATEGIC_RETRIGGER_STATUSES: frozenset[str] = frozenset(
+    {"promoted", "promotion_failed", "not_promoted", "dry_run", "error"}
+)
+
+
+async def _maybe_trigger_strategic_after_qualification(
+    version_id: uuid.UUID,
+    result: dict[str, Any] | None,
+    *,
+    session_factory=None,
+) -> None:
+    """Best-effort: once a qualification has RESOLVED, kick a strategic review.
+
+    A version cut deliberately lets the direction frontier go dry — the
+    strategic agent winds its active directions down to a paused residual while
+    it waits to qualify ("do not open the next feature wave until vN promotes").
+    When qualification then resolves the agent must re-plan: open the next wave
+    on a promote, or work the blocker on a miss. But nothing was re-triggering
+    it. With every direction paused, no tactical research spawns, so the
+    strategic cadence counter never advances and the project sits idle with free
+    VMs until the wall-clock backstop eventually fires (up to
+    ``strategic_max_interval_minutes`` later). Spawning a ``strategic_review``
+    here closes that gap immediately, for both promote and miss outcomes.
+
+    Runs AFTER the dedicated finalize session committed + closed (mirrors
+    ``_maybe_reconcile_after_promotion_conflict``): its own session, never under
+    the ``ReleaseVersion`` row lock. Idempotent — ``_spawn_strategic_review``'s
+    ``_has_active_strategic_task`` guard makes a cycle already in flight a no-op,
+    so this can neither pile up strategic tasks nor loop. A failure never
+    propagates; the wall-clock backstop in ``_spawn_research_task`` retries if
+    this best-effort call does not land. ``session_factory`` is threaded through
+    for test injection.
+    """
+    if not isinstance(result, dict):
+        return
+    if result.get("status") not in _STRATEGIC_RETRIGGER_STATUSES:
+        return
+    try:
+        factory = session_factory or AsyncSessionLocal
+        async with factory() as session:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None:
+                return
+            project = await session.get(Project, version.project_id)
+            if project is None or not project.autonomous_enabled:
+                return
+            # Lazy import — release_qualifier <-> strategic_spawning is circular.
+            from app.strategic_spawning import _spawn_strategic_review
+
+            spawned = await _spawn_strategic_review(project, session)
+            if spawned:
+                await session.commit()
+                logger.info(
+                    "[RELEASE_QUALIFIER] qualification resolved (%s) for v%d — "
+                    "triggered a strategic review for project %s",
+                    result.get("status"),
+                    version.version_number,
+                    project.id,
+                )
+    except PayloadTooLargeError as exc:
+        # The strategic payload outgrew the cap; the autonomous loop surfaces a
+        # dedicated alert for this case and the wall-clock backstop retries.
+        logger.warning(
+            "[RELEASE_QUALIFIER] post-qualification strategic trigger skipped "
+            "for version %s — payload too large (%s)",
+            version_id,
+            exc,
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; wall-clock backstop retries
+        logger.warning(
+            "[RELEASE_QUALIFIER] post-qualification strategic trigger failed for "
+            "version %s (non-fatal — wall-clock backstop will retry): %s",
+            version_id,
+            exc,
+        )
+
+
 async def _finalize_in_dedicated_session(
     version_id: uuid.UUID,
     *,
@@ -2274,6 +2355,12 @@ async def _finalize_in_dedicated_session(
     # dead-ending in stabilize (automain/LTS promotion-conflict recovery).
     # Best-effort: a failure never propagates and never alters ``result``.
     await _maybe_reconcile_after_promotion_conflict(
+        version_id, result, session_factory=session_factory
+    )
+    # And whenever the qualification RESOLVED (promote or miss), re-trigger the
+    # strategic agent so it re-plans — otherwise a project whose frontier went
+    # dry during the cut can sit idle until the wall-clock backstop fires.
+    await _maybe_trigger_strategic_after_qualification(
         version_id, result, session_factory=session_factory
     )
     return result

@@ -5870,11 +5870,18 @@ async def test_sweep_smoketest_disabled_audit_only(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_force_finalizes_timed_out_qualification(db_session):
+async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker):
     """Audit H2: a qualification pending longer than the qualification-timeout
     is force-finalized as a blocked one (blocker=qualification_timeout) EVEN
     when a child is still non-terminal — the escape hatch for a child that
     heartbeats-but-hangs."""
+    # Isolate this sweep/timeout test from the post-commit strategic re-trigger
+    # (covered by its own tests); a resolved verdict would otherwise spawn a
+    # real strategic_review whose branch-resolution emits extra alerts.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -6032,6 +6039,133 @@ async def test_finalize_in_dedicated_session_reconciles_on_promotion_conflict(
     assert result is not None
     assert result["status"] == "promotion_failed"
     recon_mock.assert_awaited_once()
+
+
+# ===========================================================================
+# _maybe_trigger_strategic_after_qualification — re-plan on a resolved verdict
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["not_promoted", "dry_run", "promoted", "error"])
+async def test_resolved_qualification_triggers_strategic_review(
+    db_session, mocker, status
+):
+    """Every RESOLVED qualification verdict — a promote or any flavour of miss —
+    re-triggers the strategic agent so it re-plans (opens the next wave on a
+    promote, works the blocker on a miss) instead of leaving a dry frontier
+    idle until the wall-clock backstop fires."""
+    project, version = await _make_project_and_version(db_session)
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": status, "confidence": 0.8},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    spawn_mock.assert_awaited_once()
+    assert spawn_mock.call_args.args[0].id == project.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": "pending_auto_merge"},  # promotion still in flight
+        {"status": "audit_rate_limit_respawned", "respawn_count": 1},  # transient
+        {"status": "wrong_phase"},  # no-op
+        None,  # read-only no-op finalize
+    ],
+)
+async def test_unresolved_qualification_does_not_trigger_strategic(
+    db_session, mocker, result
+):
+    """In-flight / transient / no-op finalize results must NOT re-trigger the
+    strategic agent — only a settled verdict warrants a re-plan."""
+    _project, version = await _make_project_and_version(db_session)
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        result,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    spawn_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strategic_trigger_skipped_when_autonomy_disabled(db_session, mocker):
+    """A project with autonomy disabled is never auto-driven into a strategic
+    cycle by a qualification verdict."""
+    project, version = await _make_project_and_version(db_session)
+    project.autonomous_enabled = False
+    db_session.add(project)
+    await db_session.commit()
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "not_promoted"},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    spawn_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_strategic_trigger_swallows_spawn_failure(db_session, mocker):
+    """The trigger is best-effort: a spawn failure (e.g. payload too large) is
+    logged but never propagates to break the finalize chain."""
+    _project, version = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    # Must not raise.
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "not_promoted"},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_in_dedicated_session_triggers_strategic_on_miss(
+    db_session, mocker
+):
+    """End-to-end wiring: a finalize that resolves to a miss drives
+    _finalize_in_dedicated_session to re-trigger a strategic review after its
+    dedicated session has committed and closed."""
+    _project, version = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.release_qualifier._finalize_locked_version",
+        new=AsyncMock(
+            return_value={"status": "not_promoted", "blocker": "below_threshold"}
+        ),
+    )
+    spawn_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+
+    result = await rq._finalize_in_dedicated_session(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is not None and result["status"] == "not_promoted"
+    spawn_mock.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -6961,11 +7095,18 @@ async def test_sweep_skips_non_open_version(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_timeout_fires_when_started_at_unparseable(db_session):
+async def test_sweep_timeout_fires_when_started_at_unparseable(db_session, mocker):
     """R4-H5: when started_at is corrupt/unparseable, the qualification-timeout
     backstop must STILL fire — it falls back to version.updated_at as the
     timeout clock.  A bad timestamp string must never wedge a qualification
     forever."""
+    # Isolate this sweep/timeout test from the post-commit strategic re-trigger
+    # (covered by its own tests); a resolved verdict would otherwise spawn a
+    # real strategic_review whose branch-resolution emits extra alerts.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
     from datetime import timedelta
 
     from app.models import ReleaseVersion as _RV
@@ -7433,6 +7574,14 @@ async def test_maybe_finalize_takes_no_caller_session(db_session, mocker):
     NO ``session`` parameter — it cannot, by construction, operate on or commit
     a caller's session.  It opens its OWN session via the injected factory; the
     factory IS invoked exactly once for a real qualifier child."""
+    # Isolate the factory-count invariant from the post-commit strategic
+    # re-trigger (covered by its own tests), which opens its OWN session via the
+    # same factory — so the finalize chain's single dedicated session stays the
+    # only factory call this assertion counts.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
     import inspect
 
     from app import shared_state
