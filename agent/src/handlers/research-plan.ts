@@ -447,6 +447,72 @@ export function buildUserPausedSection(
   return `\n## User-Paused Directions\nThese directions were paused by the user (not auto-paused by the system). Treat as an explicit user constraint — do NOT unpause, retire, or duplicate them without a strong reason backed by user intent.\n${lines.join('\n')}\n`;
 }
 
+const QUALIFICATION_SCORE_KEYS = ['audit', 'test_erosion', 'smoketest'] as const;
+const QUALIFICATION_SEVERITY_ORDER: Record<string, number> = {
+  blocker: 0,
+  critical: 1,
+  high: 2,
+  medium: 3,
+  moderate: 3,
+  warning: 4,
+  low: 5,
+  info: 6,
+};
+
+function formatQualificationDetails(qualification: Record<string, unknown>): string[] {
+  const lines: string[] = [];
+
+  const subScoresRaw = qualification.sub_scores;
+  if (subScoresRaw && typeof subScoresRaw === 'object' && !Array.isArray(subScoresRaw)) {
+    const subScores = subScoresRaw as Record<string, unknown>;
+    const scoreBits: string[] = [];
+    let bindingKey: string | null = null;
+    let bindingValue: number | null = null;
+    for (const key of QUALIFICATION_SCORE_KEYS) {
+      const value = typeof subScores[key] === 'number' ? subScores[key] : null;
+      if (value === null) continue;
+      scoreBits.push(`${key}=${value.toFixed(2)}`);
+      if (bindingValue === null || value < bindingValue) {
+        bindingKey = key;
+        bindingValue = value;
+      }
+    }
+    if (scoreBits.length > 0 && bindingKey !== null && bindingValue !== null) {
+      lines.push(`  Qualification details: sub-scores: ${scoreBits.join(', ')} (binding=${bindingKey}=${bindingValue.toFixed(2)})`);
+    }
+  }
+
+  const findingsRaw = qualification.audit_findings;
+  if (Array.isArray(findingsRaw) && findingsRaw.length > 0) {
+    const findings = findingsRaw
+      .map((finding, idx) => {
+        if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return null;
+        const rec = finding as Record<string, unknown>;
+        const severity = typeof rec.severity === 'string' ? rec.severity.trim() : '';
+        const summary = typeof rec.summary === 'string' ? rec.summary.trim() : '';
+        if (!severity || !summary) return null;
+        return {
+          severity,
+          summary,
+          order: QUALIFICATION_SEVERITY_ORDER[severity.toLowerCase()] ?? 99,
+          idx,
+        };
+      })
+      .filter((finding): finding is { severity: string; summary: string; order: number; idx: number } => finding !== null)
+      .sort((a, b) => (a.order - b.order) || (a.idx - b.idx))
+      .slice(0, 3);
+
+    if (findings.length > 0) {
+      const moreCount = findingsRaw.length - findings.length;
+      const findingBits = findings.map(f => `${f.severity}: ${f.summary}`);
+      const tail = moreCount > 0 ? ` (+${moreCount} more)` : '';
+      lines.push(`  Audit findings: ${findingBits.join('; ')}${tail}`);
+    }
+  }
+
+  return lines;
+}
+
 /**
  * Builds the version-phase status block for the strategic thinker prompt.
  * Explains the current phase, what each phase means, and instructs the agent
@@ -516,6 +582,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       qualBits.push(`would_promote=true`);
     }
     parts.push(`Last qualification: ${qualBits.join(', ')}`);
+    parts.push(...formatQualificationDetails(lastQualification));
     if (qualificationPending) {
       parts.push(
         `A qualification is currently **PENDING** (running now). Do NOT emit ` +
@@ -589,6 +656,9 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       if (lqBlocker) lqBits.push(`blocker=${lqBlocker}`);
       const lqSuffix = lqBits.length > 0 ? ` [${lqBits.join(', ')}]` : '';
       rvLines.push(`  - v${rvNum} (${rvStatus})${lqSuffix}`);
+      if (lqRec) {
+        rvLines.push(...formatQualificationDetails(lqRec).map(line => `    ${line.trimStart()}`));
+      }
     }
     if (rvLines.length > 1) parts.push(rvLines.join('\n'));
   }

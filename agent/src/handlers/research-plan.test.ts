@@ -1042,6 +1042,32 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('blocker=test_file_deleted');
   });
 
+  it('renders sub-scores and audit findings for the current last_qualification, including the binding dimension', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        candidate_sha: 'abcdef0123456789',
+        blocker: 'test_file_deleted',
+        sub_scores: {
+          audit: 0.74,
+          test_erosion: 0.42,
+          smoketest: 0.88,
+        },
+        audit_findings: [
+          { severity: 'low', summary: 'documentation drift' },
+          { severity: 'critical', summary: 'unsafe release path' },
+          { severity: 'high', summary: 'broken retry guard' },
+          { severity: 'medium', summary: 'missing null check' },
+        ],
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.74, test_erosion=0.42, smoketest=0.88 (binding=test_erosion=0.42)');
+    expect(result).toContain('Audit findings: critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
+  });
+
   it('renders a pending last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
     const result = buildVersionPhaseSection({
       version_number: 4,
@@ -1242,7 +1268,16 @@ describe('buildVersionPhaseSection', () => {
       version_number: 3,
       phase: 'stabilize',
       recent_versions: [
-        { version_number: 2, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.91 } },
+        {
+          version_number: 2,
+          status: 'promoted',
+          last_qualification: {
+            status: 'promoted',
+            confidence: 0.91,
+            sub_scores: { audit: 0.86, test_erosion: 0.73, smoketest: 0.49 },
+            audit_findings: [{ severity: 'high', summary: 'flaky audit step' }],
+          },
+        },
         { version_number: 1, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.85 } },
       ],
     });
@@ -1251,7 +1286,30 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('promoted');
     expect(result).toContain('qual=promoted');
     expect(result).toContain('confidence=0.91');
+    expect(result).toContain('binding=smoketest=0.49');
+    expect(result).toContain('Audit findings: high: flaky audit step');
     expect(result).toContain('v1');
+  });
+
+  it('renders recent_versions qualification details with smoketest as the binding dimension', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      recent_versions: [
+        {
+          version_number: 3,
+          status: 'promoted',
+          last_qualification: {
+            status: 'not_promoted',
+            confidence: 0.5,
+            sub_scores: { audit: 0.71, test_erosion: 0.64, smoketest: 0.31 },
+            audit_findings: [{ severity: 'medium', summary: 'startup-suite regression' }],
+          },
+        },
+      ],
+    });
+    expect(result).toContain('binding=smoketest=0.31');
+    expect(result).toContain('Audit findings: medium: startup-suite regression');
   });
 
   it('omits recent_versions gracefully when absent', () => {

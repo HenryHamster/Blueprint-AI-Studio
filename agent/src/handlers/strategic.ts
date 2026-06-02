@@ -49,6 +49,21 @@ import {
   buildDirHealthSummary,
 } from './strategic-sections.js';
 
+/**
+ * Render the backend-supplied `prompt_suffix` as an "Additional instructions"
+ * block, matching the convention every other agent task type uses (see
+ * research-plan.ts / standard.ts / audits.ts). The strategic payload packs
+ * per-cycle guidance here every cycle — deployment-model framing, stabilize
+ * audit-findings hints, build/stabilize stall nudges, mode hints — so this is
+ * reasoning input that must reach the thinker (analysis) pass. Returns '' when
+ * the suffix is absent so the prompt stays unchanged for empty payloads.
+ */
+export function renderStrategicPromptSuffix(payload: Record<string, unknown>): string {
+  return payload.prompt_suffix
+    ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}`
+    : '';
+}
+
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -345,8 +360,14 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       efficiencySnapshotSection,
     });
 
+    // Append the backend-supplied prompt_suffix as "Additional instructions"
+    // (same convention as every other task type). This guidance is reasoning
+    // input — deployment framing, stabilize audit-findings hints, stall nudges,
+    // mode hints — so it belongs in the analysis pass that produces decisions.
+    const thinkerPromptWithSuffix = thinkerPrompt + renderStrategicPromptSuffix(payload);
+
     const thinkerGateResult = await runThinkerWithGate(
-      thinkerPrompt, taskId, ws, statusRef, model, effort, disallowedTools,
+      thinkerPromptWithSuffix, taskId, ws, statusRef, model, effort, disallowedTools,
     );
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
