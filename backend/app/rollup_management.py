@@ -61,6 +61,7 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
+from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
@@ -713,7 +714,7 @@ async def _check_and_trigger_rollup(
                 if not pr_art or not pr_art.pr_url:
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.
-                    c.context = {**(c.context or {}), "pr_merged": True}
+                    mark_unblocked_non_merge(c, reason="rollup_no_pr_artifact")
                     session.add(c)
                     logger.info(
                         f"[ROLLUP] Child {str(c.id)[:8]} has no PR artifact — marking as merged"
@@ -730,7 +731,7 @@ async def _check_and_trigger_rollup(
                         f"{str(c.id)[:8]} — cannot parse PR number; "
                         f"force-setting pr_merged=True so rollup progresses"
                     )
-                    c.context = {**(c.context or {}), "pr_merged": True}
+                    mark_unblocked_non_merge(c, reason="malformed_pr_url")
                     session.add(c)
                     continue
 
@@ -765,9 +766,9 @@ async def _check_and_trigger_rollup(
                             f"{respawn_count}x without merging — manual intervention required"
                         )
                     elif not gates_on:
+                        mark_unblocked_non_merge(c, reason="review_respawn_cap")
                         c.context = {
                             **(c.context or {}),
-                            "pr_merged": True,
                             "_rollup_skipped_reason": "review_respawn_cap",
                         }
                         session.add(c)
@@ -1461,8 +1462,17 @@ async def _check_and_trigger_rollup(
                             )
                             parent.context = {
                                 **_clear_rollup_transient_state(parent_ctx),
-                                **({"pr_merged": True} if _landed else {}),
                             }
+                            if _landed:
+                                apply_merged_landed_signal(
+                                    parent,
+                                    project,
+                                    base_branch=target_branch,
+                                    hotfix_lane=_promotion_target_rollup_allowed(
+                                        parent, target_branch
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
                             if _terminal_rollup_merge:
                                 parent.latest_status_message = (
                                     f"Rollup PR #{existing_pr} already merged"
@@ -1819,8 +1829,17 @@ async def _check_and_trigger_rollup(
                             for k, v in _cleared.items()
                             if k not in ("rollup_pr_number", "rollup_pr_url")
                         },
-                        **({"pr_merged": True} if _landed else {}),
                     }
+                    if _landed:
+                        apply_merged_landed_signal(
+                            parent,
+                            project,
+                            base_branch=target_branch,
+                            hotfix_lane=_promotion_target_rollup_allowed(
+                                parent, target_branch
+                            ),
+                            non_merge_reason="merged_pr_non_integration_branch",
+                        )
                     session.add(parent)
                     await session.commit()
                     await _cleanup_branches(parent, session)
@@ -2172,9 +2191,18 @@ async def _check_and_trigger_rollup(
                         )
                         parent.context = {
                             **_clear_rollup_transient_state(parent_ctx),
-                            **({"pr_merged": True} if _landed else {}),
                             "rollup_pr_url": rollup_pr_url,
                         }
+                        if _landed:
+                            apply_merged_landed_signal(
+                                parent,
+                                project,
+                                base_branch=target_branch,
+                                hotfix_lane=_promotion_target_rollup_allowed(
+                                    parent, target_branch
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                         if _terminal_rollup_merge:
                             parent.latest_status_message = (
                                 f"All {completed_count} subtasks merged, rollup PR auto-merged"

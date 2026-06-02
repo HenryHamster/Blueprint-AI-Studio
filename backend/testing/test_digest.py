@@ -4206,6 +4206,8 @@ async def test_digest_prior_investigation_reuse(client: AsyncClient, db_session)
             "auto_remediation": True,
             "prior_diagnosis_task_id": "inv-1",
             "ci_failure_type": "test",
+            "pr_merged": True,
+            "landed_on_integration": True,
         },
     )
     with_prior_failed = make_task(
@@ -6427,7 +6429,8 @@ async def test_research_actionability_research_task_does_not_self_attribute(
 async def test_research_actionability_merge_requires_pr_merged_flag(
     client: AsyncClient, db_session
 ):
-    """Merge attribution requires `context['pr_merged'] is True`, not just COMPLETED."""
+    """Merge attribution requires a landed signal, not just COMPLETED or
+    merge-equivalent unblocks."""
     from app.models import StrategicCycle
     from datetime import timedelta as _td
 
@@ -6478,6 +6481,22 @@ async def test_research_actionability_merge_requires_pr_merged_flag(
             payloads=[{"type": "create"}],
             created_at=research_at + _td(minutes=30),
             context={"direction_id": "dir-merged", "pr_merged": True},
+        )
+    )
+    # Follow-on for dir-merged created after research but only merged to a
+    # non-integration branch — must not count as merged.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=research_at + _td(minutes=45),
+            context={
+                "direction_id": "dir-merged",
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            },
         )
     )
     # Follow-on for dir-tasked: COMPLETED but NO pr_merged → tasked only.

@@ -55,6 +55,7 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
+from app.landed_signal import apply_merged_landed_signal
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.rollup_locking import _lock_original_task, _OriginalTaskLockTimeout
 from app.notification_dispatch import (
@@ -973,10 +974,16 @@ async def _process_post_commit(
                                     )
                                 )
                             if _record_pr_merged:
-                                task.context = {
-                                    **(task.context or {}),
-                                    "pr_merged": True,
-                                }
+                                apply_merged_landed_signal(
+                                    task,
+                                    _project,
+                                    base_branch=base_branch,
+                                    hotfix_lane=bool(
+                                        (task.first_payload or {}).get("hotfix")
+                                        or (task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
                             session.add(task)
                             _t_ctx = task.context or {}
                             # Audit W1: auto_remediation is now a column.
@@ -2227,10 +2234,22 @@ async def _process_post_commit(
                                                 )
                                             )
                                         if _record_pr_merged:
-                                            orig.context = {
-                                                **(orig.context or {}),
-                                                "pr_merged": True,
-                                            }
+                                            apply_merged_landed_signal(
+                                                orig,
+                                                _orig_project,
+                                                base_branch=base_branch,
+                                                hotfix_lane=bool(
+                                                    (orig.first_payload or {}).get(
+                                                        "hotfix"
+                                                    )
+                                                    or (orig.context or {}).get(
+                                                        "hotfix"
+                                                    )
+                                                ),
+                                                non_merge_reason=(
+                                                    "merged_pr_non_integration_branch"
+                                                ),
+                                            )
                                         # If this was a rollup PR review, mark the
                                         # parent COMPLETED — but only if it is STILL
                                         # EVALUATING after the relock. A peer (e.g.
@@ -2973,12 +2992,24 @@ async def _process_post_commit(
                                         **(_orig.context or {}),
                                         "review_loop": _orig_loop,
                                         "pr_closed_empty": True,
-                                        **(
-                                            {"pr_merged": True}
-                                            if _record_pr_merged
-                                            else {}
-                                        ),
                                     }
+                                    if _record_pr_merged:
+                                        apply_merged_landed_signal(
+                                            _orig,
+                                            _orig_project,
+                                            base_branch=_landed_branch,
+                                            hotfix_lane=bool(
+                                                (_orig.first_payload or {}).get(
+                                                    "hotfix"
+                                                )
+                                                or (_orig.context or {}).get(
+                                                    "hotfix"
+                                                )
+                                            ),
+                                            non_merge_reason=(
+                                                "merged_pr_non_integration_branch"
+                                            ),
+                                        )
                                     flag_modified(_orig, "context")
                                     _orig.status = (
                                         TaskStatus.COMPLETED

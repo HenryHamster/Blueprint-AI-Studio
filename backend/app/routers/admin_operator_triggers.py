@@ -17,6 +17,7 @@ import logging
 
 from app.database import get_session
 from app.branch_resolution import classify_rollup_merge_outcome
+from app.landed_signal import apply_merged_landed_signal
 from app.shared_state import (
     get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
@@ -287,10 +288,20 @@ async def trigger_rollup(
             )
             task.context = {
                 **ctx,
-                **({"pr_merged": True} if record_pr_merged else {}),
                 "rollup_pr_number": rollup_pr_number,
                 "rollup_pr_url": rollup_pr_url,
             }
+            if record_pr_merged:
+                apply_merged_landed_signal(
+                    task,
+                    _project,
+                    base_branch=landed_branch,
+                    hotfix_lane=bool(
+                        (task.first_payload or {}).get("hotfix")
+                        or (task.context or {}).get("hotfix")
+                    ),
+                    non_merge_reason="merged_pr_non_integration_branch",
+                )
             if terminal_rollup_merge:
                 task.latest_status_message = (
                     f"Rollup PR auto-merged into {landed_branch}"
@@ -357,8 +368,18 @@ async def trigger_rollup(
                 )
                 task.context = {
                     **(task.context or {}),
-                    **({"pr_merged": True} if record_pr_merged else {}),
                 }
+                if record_pr_merged:
+                    apply_merged_landed_signal(
+                        task,
+                        _project,
+                        base_branch=landed_branch,
+                        hotfix_lane=bool(
+                            (task.first_payload or {}).get("hotfix")
+                            or (task.context or {}).get("hotfix")
+                        ),
+                        non_merge_reason="merged_pr_non_integration_branch",
+                    )
                 if terminal_rollup_merge:
                     task.latest_status_message = (
                         f"Rollup PR #{rollup_pr_number} already merged"

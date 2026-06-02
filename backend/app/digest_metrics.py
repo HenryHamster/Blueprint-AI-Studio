@@ -18,6 +18,7 @@ from typing import Dict, Any, List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.landed_signal import has_landed_signal
 from app.models import (
     Alert,
     Task,
@@ -203,7 +204,7 @@ def _compute_first_review_approval_breakdowns(
             t
             for t in tasks
             if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
-            and (t.context or {}).get("pr_merged") is True
+            and has_landed_signal(t)
         ]
         if not eligible:
             return None
@@ -254,7 +255,7 @@ def _compute_first_review_approval_breakdowns(
         t
         for t in terminal_tasks
         if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
-        and (t.context or {}).get("pr_merged") is True
+        and has_landed_signal(t)
     ]
 
     return {
@@ -625,7 +626,7 @@ def _outer_loop_terminal_outcome(t: "Task") -> Optional[str]:
             kind = "repeat_fingerprint_halt"
         if kind in _TERMINAL_OUTCOME_KEYS:
             return kind
-    if ctx.get("pr_merged") is True:
+    if has_landed_signal(t):
         return "merged"
     if (ctx or {}).get("failure_detail") == "review_cap_exhausted":
         return "cap_exhausted"
@@ -721,7 +722,7 @@ def _resolve_chain_outcome(outcome_tasks: List[Task], chain_reasons: set) -> Opt
     ``merged`` is checked first, an escalated-then-merged chain resolves to
     ``merged`` and is never attributed to its prior escalation reason.
     """
-    if any((t.context or {}).get("pr_merged") is True for t in outcome_tasks):
+    if any(has_landed_signal(t) for t in outcome_tasks):
         return "merged"
     if any(
         (t.context or {}).get("failure_detail") == "review_cap_exhausted"
@@ -1439,7 +1440,7 @@ def compute_digest_cost_economics(
         t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
         task_type = (t.first_payload or {}).get("type", "unknown")
         _type_cost[task_type] = _type_cost.get(task_type, 0.0) + t_cost
-        if (t.context or {}).get("pr_merged") is True:
+        if has_landed_signal(t):
             _type_merges[task_type] = _type_merges.get(task_type, 0) + 1
     _type_cpms = {
         ttype: _type_cost[ttype] / _type_merges[ttype]

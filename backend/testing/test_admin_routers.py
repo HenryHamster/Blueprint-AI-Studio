@@ -5763,6 +5763,39 @@ class TestModifyTaskApplySeam:
         assert changes["merged_pr"] == 321
 
     @pytest.mark.asyncio
+    async def test_merge_context_records_landed_signal_on_integration_merge(
+        self, db_session
+    ):
+        from app.admin_task_mutations import _merge_context_with_hotfix_non_landing
+
+        project = await _make_project(db_session)
+        project.integration_branch = "main"
+        project.promotion_target = "main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Integration merge task",
+            payloads=[{"type": "research", "prompt": "merge", "base_branch": "main"}],
+            status=TaskStatus.EVALUATING,
+            context={},
+        )
+
+        merged_context = _merge_context_with_hotfix_non_landing(
+            task,
+            project,
+            base_context={"rollup_pr_number": 123},
+            landed_branch="main",
+            record_pr_merged=True,
+        )
+
+        assert merged_context.get("pr_merged") is True
+        assert merged_context.get("landed_on_integration") is True
+        assert merged_context.get("_non_merge_unblock_reason") is None
+
+    @pytest.mark.asyncio
     async def test_rollup_pr_approval_keeps_custom_staged_root_evaluating(
         self, db_session, mocker
     ):
@@ -5865,7 +5898,7 @@ class TestClearWaveDeps:
 
 class TestBulkApprove:
     @pytest.mark.asyncio
-    async def test_bulk_approve_critical_merge_skips_pr_merged_on_promotion_target(
+    async def test_bulk_approve_critical_merge_to_promotion_target_returns_error(
         self, client: AsyncClient, db_session, mocker
     ):
         project = await _make_project(db_session)
@@ -5904,7 +5937,7 @@ class TestBulkApprove:
             new_callable=AsyncMock,
             return_value=("token", "owner", "repo"),
         )
-        mocker.patch(
+        merge_pr = mocker.patch(
             "app.github.merge_pull_request",
             new_callable=AsyncMock,
             return_value={"merged": True},
@@ -5918,10 +5951,16 @@ class TestBulkApprove:
         )
 
         assert resp.status_code == 200
+        body = resp.json()
+        assert body["success_count"] == 0
+        assert body["error_count"] == 1
+        assert body["results"][0]["status"] == "error"
+        assert "promotion target" in body["results"][0]["error"]
         await db_session.refresh(task)
-        assert task.requires_approval is False
+        assert task.requires_approval is True
         assert task.status == TaskStatus.COMPLETED
         assert (task.context or {}).get("pr_merged") is None
+        merge_pr.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_bulk_approve_rollup_keeps_custom_staged_root_evaluating(

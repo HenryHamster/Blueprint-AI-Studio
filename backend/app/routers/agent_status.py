@@ -23,6 +23,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
 from app.branch_resolution import classify_rollup_merge_outcome
+from app.landed_signal import apply_merged_landed_signal
 from app.models import (
     Alert,
     AlertSeverity,
@@ -2091,7 +2092,16 @@ async def update_agent_status(
                             f"{_landed_branch}; awaiting downstream landing"
                         )
                     if _record_pr_merged:
-                        task.context = {**(task.context or {}), "pr_merged": True}
+                        apply_merged_landed_signal(
+                            task,
+                            _proj,
+                            base_branch=_landed_branch,
+                            hotfix_lane=bool(
+                                (task.first_payload or {}).get("hotfix")
+                                or (task.context or {}).get("hotfix")
+                            ),
+                            non_merge_reason="merged_pr_non_integration_branch",
+                        )
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(

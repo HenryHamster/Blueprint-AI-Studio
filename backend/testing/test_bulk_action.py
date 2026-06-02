@@ -351,10 +351,13 @@ async def test_bulk_approve_rollup_hotfix_to_promotion_target_merges(
 ):
     """A hotfix-marked rollup merges to the promotion target via bulk approve,
     same as a non-hotfix rollup (the rollup human-approval lane never refuses a
-    promotion-target landing). The merge proceeds, but
-    ``classify_rollup_merge_outcome`` still withholds ``pr_merged`` because the
-    landing is on the promotion target, distinct from the integration branch —
-    a promotion-target landing never counts as an integration landing."""
+    promotion-target landing). The merge proceeds and, because the PR did merge,
+    ``apply_merged_landed_signal`` records the merge-equivalent unblock
+    (``pr_merged=True``) so the hotfix's dependents are released — but the
+    landing is on the promotion target, distinct from the integration branch, so
+    it is NOT an integration landing (``landed_on_integration=False``, with the
+    ``merged_pr_non_integration_branch`` reason). Analytics key off
+    ``landed_on_integration``, not ``pr_merged``."""
     project = await _make_distinct_branch_project_with_member(db_session)
     task = await _make_rollup_approval_task(db_session, project, "main", hotfix=True)
 
@@ -380,10 +383,14 @@ async def test_bulk_approve_rollup_hotfix_to_promotion_target_merges(
     mock_merge.assert_awaited_once()
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
-    # Merge proceeded (hotfix exemption), but a landing on the promotion target
-    # that is distinct from the integration branch is never an integration
-    # landing, so pr_merged stays unset.
-    assert (task.context or {}).get("pr_merged") is not True
+    # Merge proceeded (hotfix exemption). Because the PR merged, the
+    # merge-equivalent unblock is recorded (pr_merged=True) so dependents are
+    # released — but a landing on the promotion target that is distinct from the
+    # integration branch is NOT an integration landing.
+    ctx = task.context or {}
+    assert ctx.get("pr_merged") is True
+    assert ctx.get("landed_on_integration") is False
+    assert ctx.get("_non_merge_unblock_reason") == "merged_pr_non_integration_branch"
 
 
 # ── trigger_rollup landed-on-integration guard ──────────────────────────────

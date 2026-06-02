@@ -106,6 +106,32 @@ async def test_compute_current_axes_values(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cost_per_merged_pr_excludes_non_merge_unblocks(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            context={
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            },
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    expected_cpm = round(2 * 300 * ON_DEMAND_RATE, 4)
+    assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
+
+
+@pytest.mark.asyncio
 async def test_vm_reuse_rate_reads_timing_warm_start(db_session):
     """Regression: reuse rate must read context['_timing']['warm_start'], the
     same source /pipeline-efficiency uses — NOT the vm_warm_start column, which

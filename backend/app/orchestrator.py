@@ -530,45 +530,22 @@ async def _apply_ci_merged_landed_signal(
     base branch resolves to a distinct promotion target, the helper withholds
     pr_merged and stages the same branch-safety alert the rollup boundary uses.
     """
-    from app.branch_resolution import (
-        _signal_blocking_project_branch_configuration,
-    )
+    from app.landed_signal import apply_merged_landed_signal
 
     project = (
         await session.get(Project, ci_task.project_id) if ci_task.project_id else None
     )
-    integration_branch = _shared_state.get_project_integration_branch(project)
-    promotion_target = _shared_state.get_project_promotion_target(project)
     hotfix_lane = bool(
         (ci_task.first_payload or {}).get("hotfix")
         or (ci_task.context or {}).get("hotfix")
         or review_loop.get("hotfix")
     )
-    landed_on_integration = bool(
-        integration_branch and base_branch == integration_branch
+    return apply_merged_landed_signal(
+        ci_task,
+        project,
+        base_branch=base_branch,
+        hotfix_lane=hotfix_lane,
     )
-    if (
-        promotion_target
-        and base_branch == promotion_target
-        and base_branch != integration_branch
-        and not hotfix_lane
-        and project is not None
-    ):
-        _signal_blocking_project_branch_configuration(
-            project,
-            "rollup_target_matches_promotion_target",
-            (
-                f"Rollup blocked: target branch '{base_branch}' is this "
-                "project's promotion target. Configure a distinct "
-                "integration branch before landing fleet work."
-            ),
-        )
-    if landed_on_integration:
-        ci_task.context = {
-            **(ci_task.context or {}),
-            "pr_merged": True,
-        }
-    return landed_on_integration
 
 
 # Track in-flight provision coroutines so stale recovery can cancel them.

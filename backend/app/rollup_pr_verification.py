@@ -30,6 +30,7 @@ from app.models import (
     Project,
 )
 from app.branch_resolution import merged_pr_counts_as_integration_landing
+from app.landed_signal import mark_landed_on_integration, mark_unblocked_non_merge
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         # Treat as "done" so it doesn't block rollup.
         # Cache in context so partial-rollup path (which checks context.pr_merged directly)
         # doesn't see this task as "unmerged".
-        task.context = {**(task.context or {}), "pr_merged": True}
+        mark_unblocked_non_merge(task, reason="rollup_no_pr_artifact")
         return True
     if artifact and artifact.pr_url:
         # Shape-validate before parsing. Production incident 2026-05-06: a
@@ -203,7 +204,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 if record_pr_merged:
                     # Update in-memory first so caller sees the change even if DB write
                     # fails.
-                    task.context = {**(task.context or {}), "pr_merged": True}
+                    mark_landed_on_integration(task)
                     # Persist to DB in separate session (best-effort — may fail if
                     # caller holds FOR UPDATE lock on this row, but in-memory update is
                     # sufficient for the current rollup cycle).
@@ -213,7 +214,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                             if db_task:
                                 db_task.context = {
                                     **(db_task.context or {}),
-                                    "pr_merged": True,
+                                    **(task.context or {}),
                                 }
                                 write_session.add(db_task)
                                 await write_session.commit()
@@ -258,11 +259,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                         merged_base_branch=merged_base_branch,
                         source="rollup_pr_verification.success_close",
                     )
-                    task.context = (
-                        {**_ctx, "pr_merged": True}
-                        if record_pr_merged
-                        else dict(_ctx)
-                    )
+                    task.context = dict(_ctx)
+                    if record_pr_merged:
+                        mark_landed_on_integration(task)
                     if task.status != TaskStatus.COMPLETED:
                         task.status = TaskStatus.COMPLETED
                     try:
@@ -272,7 +271,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                                 if record_pr_merged:
                                     db_task.context = {
                                         **(db_task.context or {}),
-                                        "pr_merged": True,
+                                        **(task.context or {}),
                                     }
                                 if db_task.status != TaskStatus.COMPLETED:
                                     db_task.status = TaskStatus.COMPLETED

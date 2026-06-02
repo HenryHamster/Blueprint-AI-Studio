@@ -35,6 +35,7 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.branch_resolution import classify_rollup_merge_outcome
+from app.landed_signal import apply_merged_landed_signal
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -2115,10 +2116,16 @@ async def reaper_service():
                                     f"{_landed_branch}; awaiting downstream landing"
                                 )
                             if _record_pr_merged:
-                                task.context = {
-                                    **(task.context or {}),
-                                    "pr_merged": True,
-                                }
+                                apply_merged_landed_signal(
+                                    task,
+                                    _proj,
+                                    base_branch=_landed_branch,
+                                    hotfix_lane=bool(
+                                        (task.first_payload or {}).get("hotfix")
+                                        or (task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
