@@ -3377,29 +3377,30 @@ class TestVmCostRateConsolidation:
 
 
 class TestPrMergedLandedWriterAllowlist:
-    """Tripwire: every backend/app/ site that SETS the ``pr_merged`` "landed on
-    integration" signal to literal ``True`` must appear in a reviewed allowlist.
+    """Tripwire: NO backend/app/ site may SET the ``pr_merged`` "landed on
+    integration" signal via a bare literal ``True`` — every writer must funnel
+    through the guarded setter in ``app/landed_signal.py``. The reviewed
+    allowlist of permitted inline writers is now EMPTY.
 
     Motivation
     ----------
     ``pr_merged`` is the canonical "this task's PR actually merged into the
     project integration branch" signal — setting it unblocks dependent work
     and feeds the release/landed query helpers. It must ONLY be set when a PR
-    truly landed on the integration branch, and the writers are being
-    consolidated behind a single guarded setter (see direction
-    "refactor: separate landed signal from pr_merged").
+    truly landed on the integration branch.
 
-    Today many code paths set ``"pr_merged": True`` directly. This ratchet
-    enumerates every such writer file and asserts the set matches a known,
-    reviewed allowlist so that:
+    Setter-consolidation (direction "refactor: separate landed signal from
+    pr_merged") is COMPLETE: every writer now funnels through
+    ``app/landed_signal.py`` — ``mark_landed_on_integration`` /
+    ``apply_merged_landed_signal`` — which stamps the signal through the
+    ``LANDED_SIGNAL_KEY`` constant, not a bare ``"pr_merged": True`` literal.
+    This ratchet now enumerates any remaining inline literal writer and asserts
+    the set is empty so that:
 
-      * a NEW writer fails CI with a message directing the author to route
-        through the shared guarded setter rather than stamping the signal
-        inline (``found - _ALLOWLIST``); and
-      * as the consolidation work collapses writers toward the single setter,
-        a file that no longer contains a literal writer leaves the discovered
-        set and an unremoved stale allowlist entry fails too
-        (``_ALLOWLIST - found``).
+      * a NEW inline writer fails CI with a message directing the author to
+        route through the guarded setter rather than stamping the signal
+        inline (``found - _ALLOWLIST`` — the allowlist being empty, ANY inline
+        writer trips it).
 
     How it works
     ------------
@@ -3434,25 +3435,17 @@ class TestPrMergedLandedWriterAllowlist:
     # cast or docstring but never stamp the signal onto a task.
     _SKIP_FILES = frozenset({"release_version.py"})
 
-    # Reviewed set of files that currently set the landed signal to True.
-    # This shrinks as setter-consolidation collapses writers toward the
-    # single guarded setter. Keys are paths relative to backend/app/.
-    _ALLOWLIST = frozenset(
-        {
-            "rollup_management.py",
-            "ci_completion.py",
-            "rollup_pr_verification.py",
-            "task_lifecycle.py",
-            "admin.py",
-            "reaper.py",
-            "routers/admin_operator_triggers.py",
-            "routers/agent_status.py",
-            "routers/github.py",
-            "recovery_sweeps.py",
-            "admin_task_mutations.py",
-            "orchestrator.py",
-        }
-    )
+    # Reviewed set of files that may set the landed signal to True inline.
+    # Setter-consolidation is now COMPLETE: every writer funnels through the
+    # guarded setter in ``app/landed_signal.py`` (``mark_landed_on_integration``
+    # / ``apply_merged_landed_signal``), which stamps ``LANDED_SIGNAL_KEY: True``
+    # via the centralised constant rather than a bare ``"pr_merged": True``
+    # literal — so the regexes below (which require the quoted ``pr_merged``
+    # key) do not match it. The allowlist is therefore EMPTY: no backend/app/
+    # file may stamp the literal signal inline. A NEW inline writer fails CI
+    # and must route through ``landed_signal`` instead. Keys are paths relative
+    # to backend/app/.
+    _ALLOWLIST: frozenset[str] = frozenset()
 
     @classmethod
     def _discover_writers(cls):
@@ -3503,20 +3496,20 @@ class TestPrMergedLandedWriterAllowlist:
             )
         )
 
-    def test_allowlist_is_nonempty_sanity(self):
-        """Positive sanity: the scan must detect writers (guards a broken regex).
+    def test_writer_regexes_still_match_sample_literals(self):
+        """Positive sanity: the writer regexes must still match a known literal.
 
-        Mirrors the template's ``test_known_guarded_sites_are_detected`` — if
-        the writer regexes ever silently stop matching, set-equality would pass
-        only against an empty allowlist; this asserts the scan actually finds
-        the known writers.
+        Now that consolidation is complete the live scan finds ZERO inline
+        writers, so a file-based "must detect something" check would be
+        unsatisfiable. Instead we assert the detection regexes still match the
+        canonical inline forms directly — if they silently stop matching, the
+        empty-allowlist set-equality tripwire would pass vacuously even after a
+        real inline writer reappears. This guards against that regression
+        without requiring any inline writer to exist.
         """
-        found = self._discover_writers()
-        assert found, (
-            "No pr_merged=True writers were discovered under backend/app/. "
-            "The writer-detection regexes are likely broken — the set-equality "
-            "tripwire cannot enforce the allowlist if it detects nothing."
-        )
-        # The two known multi-writer hubs must be among the detected files.
-        assert "rollup_management.py" in found
-        assert "ci_completion.py" in found
+        assert self._DICT_PATTERN.search('        "pr_merged": True,')
+        assert self._DICT_PATTERN.search("ctx = {**base, 'pr_merged': True}")
+        assert self._SUBSCRIPT_PATTERN.search('    ctx["pr_merged"] = True')
+        # And it must NOT match the centralised-constant form the guarded setter
+        # uses, so ``app/landed_signal.py`` is correctly left undetected.
+        assert not self._DICT_PATTERN.search("        LANDED_SIGNAL_KEY: True,")
