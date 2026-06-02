@@ -61,6 +61,16 @@ def _task_pinned_providers(task_provider, ctx) -> set[str]:
     return constrained
 
 
+def _retarget_enabled() -> bool:
+    """True iff warm-VM re-targeting is enabled (default-off ``warm_retarget_enabled``).
+
+    When on, the warm-claim finalizer re-materializes the resolved account's
+    credentials onto the VM, so boot-identity divergence no longer needs to
+    disqualify a candidate (see ``_vm_boot_incompatible``).
+    """
+    return bool(_runtime_config.get("warm_retarget_enabled", False))
+
+
 def _vm_boot_incompatible(
     vm_boot, task_provider, task_account_id, task_model, ctx
 ) -> bool:
@@ -73,6 +83,14 @@ def _vm_boot_incompatible(
     account, or model differs from the boot identity would silently run on the
     wrong account; such tasks must cold-dispatch instead of being warm-claimed.
 
+    EXCEPTION — warm re-targeting (``warm_retarget_enabled``): when on, the
+    warm-claim finalizer re-resolves the task's LLM runtime and re-materializes
+    the resolved account's secret manifest onto the VM, so provider/account/
+    model divergence is fully re-targetable and no longer disqualifies. The
+    only remaining isolation boundary is same-project scoping, which the caller
+    already enforces — so this gate becomes a pure no-op. With the flag OFF the
+    original boot-compat behavior below is byte-for-byte unchanged.
+
     Deliberately a NO-OP (returns False) when ``vm_boot`` is absent or its
     provider is unknown, and for single-provider/single-account projects where
     tasks carry no divergent constraint — so those (dominant) projects keep
@@ -80,6 +98,8 @@ def _vm_boot_incompatible(
     needs: it never runs full per-candidate account selection.
     """
     if not vm_boot:
+        return False
+    if _retarget_enabled():
         return False
     vm_provider = _norm(vm_boot.get("provider"))
     if vm_provider is None:

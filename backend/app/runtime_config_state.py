@@ -415,6 +415,16 @@ runtime_config: Dict = {
     # warm_continuity_cooldown_seconds for the chain-continuity breaker.
     "warm_backlog_reuse_failure_rate_threshold": 5,
     "warm_backlog_reuse_cooldown_seconds": 1800,
+    # Warm-VM re-targeting (parent direction: re-target reused VM provider on
+    # warm claim). When True, a warm VM may claim a same-project QUEUED task
+    # whose resolved provider/auth/model/account diverges from the VM's frozen
+    # boot manifest: the warm-claim finalizer re-resolves the task's LLM runtime
+    # (select_llm_runtime_for_task), acquires the resolved account's slot, stamps
+    # it onto task.context, and hands the agent the resolved account's secret
+    # manifest in the claim response so it can re-materialize credentials.
+    # Defaults to FALSE — the whole capability ships dark, so this leaves
+    # eligibility and the claim response byte-for-byte unchanged until enabled.
+    "warm_retarget_enabled": False,
     # Maximum seconds the agent waits in /api/agent/next-role polling before
     # falling through to the normal exit path. Bounded by the warm-handoff
     # window and the typical role transition cadence; tunable down for
@@ -771,6 +781,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "warm_backlog_reuse_enabled",
                         bool(config_json["warm_backlog_reuse_enabled"]),
+                    )
+                if "warm_retarget_enabled" in config_json:
+                    _set(
+                        "warm_retarget_enabled",
+                        bool(config_json["warm_retarget_enabled"]),
                     )
                 for int_key in (
                     "max_provision_retries",

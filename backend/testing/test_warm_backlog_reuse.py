@@ -66,9 +66,10 @@ def _patch_broadcast(mocker):
 class _FlagGuard:
     """Snapshot/restore runtime_config flags + the first-refusal registry."""
 
-    def __init__(self, backlog=False, continuity=False):
+    def __init__(self, backlog=False, continuity=False, retarget=False):
         self.backlog = backlog
         self.continuity = continuity
+        self.retarget = retarget
 
     def __enter__(self):
         import app.shared_state as ss
@@ -78,15 +79,18 @@ class _FlagGuard:
         self._rc = rc
         self._prior_backlog = rc.get("warm_backlog_reuse_enabled")
         self._prior_continuity = rc.get("warm_continuity_enabled")
+        self._prior_retarget = rc.get("warm_retarget_enabled")
         self._prior_refusal = dict(ss.warm_backlog_first_refusal)
         rc["warm_backlog_reuse_enabled"] = self.backlog
         rc["warm_continuity_enabled"] = self.continuity
+        rc["warm_retarget_enabled"] = self.retarget
         return self
 
     def __exit__(self, *exc):
         for key, prior in (
             ("warm_backlog_reuse_enabled", self._prior_backlog),
             ("warm_continuity_enabled", self._prior_continuity),
+            ("warm_retarget_enabled", self._prior_retarget),
         ):
             if prior is None:
                 self._rc.pop(key, None)
@@ -544,6 +548,268 @@ async def test_provider_match_with_divergent_account_is_ineligible(db_session):
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_retarget_disabled_keeps_boot_compat_gate(db_session):
+    """REGRESSION (flag off): with warm_retarget_enabled OFF the boot-compat gate
+    is byte-for-byte unchanged — an account/provider-divergent task stays
+    ineligible and cold-dispatches as before."""
+    with _FlagGuard(backlog=True, retarget=False):
+        project = await _make_project(db_session, name="Retarget Off")
+        vm_id = "agent-vm-retarget-off"
+        vm_boot = {"provider": "anthropic", "account_id": "acct-boot", "model": "opus"}
+        await _make_backlog_task(
+            db_session, project.id, provider="gemini", account_id="acct-other"
+        )
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is False
+        )
+        assert (
+            await select_backlog_reuse_candidate(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_retarget_enabled_relaxes_boot_compat_gate(db_session):
+    """Flag on: warm_retarget_enabled makes account/provider/model divergence
+    re-targetable, so a same-project task that diverges from the VM's boot
+    manifest becomes claimable (the finalizer re-materializes its credentials)."""
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session, name="Retarget On")
+        vm_id = "agent-vm-retarget-on"
+        vm_boot = {"provider": "anthropic", "account_id": "acct-boot", "model": "opus"}
+        divergent = await _make_backlog_task(
+            db_session,
+            project.id,
+            provider="gemini",
+            account_id="acct-other",
+            model="gemini-2.5-pro",
+        )
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is True
+        )
+        picked = await select_backlog_reuse_candidate(
+            db_session, project.id, vm_id, vm_boot=vm_boot
+        )
+        assert picked is not None and picked.id == divergent.id
+
+
+def _pool_account(account_id, user_id="test-user-123", provider="anthropic"):
+    """Minimal in-memory pool account dict select_max_plan_account treats as
+    healthy (runtime-ready OAuth, enabled, no disabled models, zero load)."""
+    return {
+        "id": account_id,
+        "user_id": user_id,
+        "name": f"acct-{account_id}",
+        "provider": provider,
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-retarget-token",
+        "runtime_secret": "sk-ant-retarget-token",
+        "runtime_ready": True,
+        "claude_config_json": None,
+        "provider_metadata": {},
+        "enabled": True,
+        "active_tasks": 0,
+        "daily_task_count": 0,
+        "disabled_models": {},
+    }
+
+
+def _seed_pool(mocker, accounts, user_id="test-user-123"):
+    """Patch the in-memory account pool with ``accounts`` for ``user_id``."""
+    import app.max_plan_pool as pool
+
+    mocker.patch.object(pool, "_max_plan_pools", {user_id: list(accounts)})
+    mocker.patch.object(pool, "_account_by_id", {a["id"]: a for a in accounts})
+
+
+@pytest.mark.asyncio
+async def test_retarget_claim_emits_secret_manifest_when_account_differs(
+    client: AsyncClient, db_session, mocker
+):
+    """Flag on + resolved account != VM boot account: the claim response carries
+    secret_manifest for the resolved account, the task is stamped/acquired to
+    that account, and the bootstrap token is NOT duplicated into the manifest."""
+    _patch_broadcast(mocker)
+    retarget_acct = _pool_account("acct-retarget")
+    _seed_pool(mocker, [retarget_acct])
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-diff"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(backlog.id)
+        manifest = body.get("secret_manifest")
+        assert manifest is not None, "expected secret_manifest for divergent account"
+        assert manifest["metadata"]["provider"] == "anthropic"
+        assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-retarget-token"
+        # The authoritative JWT is the rotated agent_token, not the manifest.
+        assert "AGENT_SECRET_TOKEN" not in manifest["env"]
+
+        # Slot acquired against the resolved account and durably stamped.
+        assert retarget_acct["active_tasks"] == 1
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-retarget"
+
+
+@pytest.mark.asyncio
+async def test_retarget_claim_omits_manifest_when_account_matches(
+    client: AsyncClient, db_session, mocker
+):
+    """Flag on but resolved account == VM boot account: response stays
+    byte-identical (no secret_manifest), while the slot is still acquired and
+    stamped so accounting follows the account the task runs on."""
+    _patch_broadcast(mocker)
+    boot_acct = _pool_account("acct-boot")
+    _seed_pool(mocker, [boot_acct])
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-match"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert "secret_manifest" not in body
+        assert boot_acct["active_tasks"] == 1
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-boot"
+
+
+@pytest.mark.asyncio
+async def test_retarget_releases_slot_on_finalize_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """If finalization fails after the re-target slot was acquired, the slot is
+    released (acquire/release balanced) and the task is rolled back to QUEUED."""
+    _patch_broadcast(mocker)
+    retarget_acct = _pool_account("acct-retarget-fail")
+    _seed_pool(mocker, [retarget_acct])
+    mocker.patch(
+        "app.routers.agent_warm_continuity.create_agent_token",
+        side_effect=RuntimeError("mint boom"),
+    )
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-fail"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 500
+        # Acquired slot was released — net zero.
+        assert retarget_acct["active_tasks"] == 0
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_retarget_scopes_pool_to_launcher_not_project_owner(
+    client: AsyncClient, db_session, mocker
+):
+    """A user-launched backlog task (launcher != project owner) must re-target
+    against the LAUNCHER's account pool, mirroring cold dispatch (the launcher
+    pays). Resolving against the project owner would mis-attribute cost and, when
+    the owner's pool has no match, strand the task on the VM's boot creds."""
+    _patch_broadcast(mocker)
+    # Pool belongs to the LAUNCHER, not the project owner ("test-user-123").
+    launcher_acct = _pool_account("acct-launcher", user_id="launcher-user-999")
+    _seed_pool(mocker, [launcher_acct], user_id="launcher-user-999")
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-launcher"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(
+            db_session, project.id, launched_by_user_id="launcher-user-999"
+        )
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        manifest = body.get("secret_manifest")
+        assert manifest is not None, "expected manifest from launcher's pool account"
+        # Slot acquired against the launcher's account and stamped onto the task.
+        assert launcher_acct["active_tasks"] == 1
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-launcher"
 
 
 @pytest.mark.asyncio

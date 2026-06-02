@@ -8,7 +8,7 @@ import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
-import { resetForNextRole } from './reset.js';
+import { resetForNextRole, clearProviderCredentials } from './reset.js';
 import { isHeartbeatTransient } from './heartbeat-classify.js';
 import {
   type FixLoopEvent,
@@ -581,6 +581,18 @@ export function log(msg: string) {
 // honours whatever response shape comes back. The only knob agents see is
 // the poll timeout default (180s), which matches the backend default.
 
+// Provider secret manifest shape, identical to what build_agent_secret_manifest
+// (backend/app/compute_manifest.py) produces and what the boot-time
+// materialize_manifest.py consumes: an env dict (provider/auth/model + secret
+// env), provider credential files, and metadata. The backend includes this
+// under the next-role response's `secret_manifest` ONLY when the warm-claimed
+// task re-targets to an LLM account different from the VM's frozen boot account.
+export interface SecretManifest {
+  env?: Record<string, unknown>;
+  files?: { path: string; content?: string; mode?: string }[];
+  metadata?: Record<string, unknown>;
+}
+
 export interface PollResult {
   action: 'claim' | 'exit';
   taskId?: string;
@@ -591,6 +603,11 @@ export interface PollResult {
   // idempotent-replay), since the prior task's JWT is terminal and only
   // authenticates the idempotent next-role/vm-heartbeat paths.
   agentToken?: string;
+  // Present only on an account-divergent warm claim: the resolved account's
+  // provider secret manifest. When set, the role loop must re-materialize
+  // credentials and re-exec so the frozen provider constants are re-read on
+  // the correct account. Absent (same-account claim) → JWT-only rotation.
+  secretManifest?: SecretManifest;
 }
 
 export interface PollForNextRoleOptions {
@@ -702,19 +719,28 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         }
         // 200 OK with a JSON body that selects claim or exit.
         if (res.status === 200) {
-          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string } = {};
+          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown } = {};
           try {
-            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string };
+            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown };
           } catch (e) {
             log(`pollForNextRole: 200 with unparseable body: ${String(e)}`);
             await new Promise(r => setTimeout(r, pollIntervalMs));
             continue;
           }
           if (body.action === 'claim' && typeof body.task_id === 'string') {
+            // secret_manifest is present ONLY for account-divergent re-targets;
+            // an object with an env/files shape signals the role loop to
+            // re-materialize + re-exec. Anything else (absent/null) → same-account
+            // JWT-only rotation, byte-for-byte unchanged from before.
+            const sm = body.secret_manifest;
+            const secretManifest = (sm && typeof sm === 'object' && !Array.isArray(sm))
+              ? (sm as SecretManifest)
+              : undefined;
             return {
               action: 'claim',
               taskId: body.task_id,
               agentToken: typeof body.agent_token === 'string' ? body.agent_token : undefined,
+              ...(secretManifest ? { secretManifest } : {}),
             };
           }
           if (body.action === 'exit') {
@@ -740,6 +766,135 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
   } finally {
     clearInterval(heartbeatTimer);
   }
+}
+
+// ── Warm-VM provider re-targeting (account-divergent warm claim) ──────────────
+//
+// A warm VM runs many sequential roles in ONE process. The provider/auth/
+// execution-mode constants (PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE,
+// LLM_CLI_TRANSLATION in providers/runners.ts) are FROZEN at import from the
+// boot /etc/agent.env, and the provider secret material (CLAUDE_CODE_OAUTH_TOKEN,
+// ANTHROPIC_API_KEY, GEMINI_API_KEY, CODEX_HOME, …) lives in the process env +
+// on-disk credential files written at boot. So when the backend warm-claims a
+// task that resolves to a DIFFERENT LLM account, a JWT-only rotation cannot
+// adopt the new material — the role would run on the wrong provider.
+//
+// performWarmRetarget re-materializes the new account's credentials and then
+// performs a controlled re-exec (systemd unit restart) so the constants are
+// re-read from the freshly written /etc/agent.env. This reuses the boot path
+// rather than refactoring the ~50 frozen-const call sites into per-role getters.
+
+// Absolute path to the materialize helper baked into the agent VM image
+// alongside the agent source (infra/packer copies agent/src → /opt/agent/src).
+// It is a byte-identical mirror of backend/app/_agent_scripts/materialize_manifest.py
+// (CI enforces parity); the boot path embeds the same canonical file. Reusing
+// the real helper avoids a parallel materializer + the cross-language escaping
+// hazards of inlining the script (see CLAUDE.md).
+export const MATERIALIZE_SCRIPT_PATH = fileURLToPath(
+  new URL('./_agent_scripts/materialize_manifest.py', import.meta.url),
+);
+
+// Injectable side effects of the re-target path, so unit tests can assert the
+// clear → materialize → re-exec sequence without touching sudo / systemd /
+// the real filesystem. Mirrors the __setRunClaudeCodeOverrideForSmoke pattern.
+export interface WarmRetargetDeps {
+  /** Wipe the prior account's credential material (env file + cred dirs). */
+  clearCreds: () => Promise<void>;
+  /** Run the real materialize helper as root to (re)write envPath + cred files. */
+  materialize: (manifest: SecretManifest, envPath: string) => void;
+  /** Re-exec the agent process so frozen provider constants are re-read. */
+  reexec: () => Promise<never> | Promise<void>;
+}
+
+function defaultMaterialize(manifest: SecretManifest, envPath: string): void {
+  // The helper writes /etc/agent.env (root-owned 0600) and chowns provider
+  // credential files to the agent user, so it must run as root — exactly as the
+  // boot path invokes it. The manifest JSON itself carries no extra escaping
+  // burden (it is plain JSON.stringify), and the embedded script is a real
+  // file, so the cross-language code-generation hazards do not apply here.
+  const manifestPath = `/tmp/agent_retarget_manifest_${process.pid}.json`;
+  writePrivateFileSync(manifestPath, JSON.stringify(manifest));
+  try {
+    execFileSync('sudo', ['python3', MATERIALIZE_SCRIPT_PATH, manifestPath, envPath], {
+      timeout: 60_000,
+      stdio: 'pipe',
+    });
+  } finally {
+    try { fs.unlinkSync(manifestPath); } catch { /* ignore — best effort */ }
+  }
+}
+
+async function defaultReexec(): Promise<never> {
+  // Suppress this (about-to-be-killed) process's SIGTERM crash report: the
+  // restart SIGTERMs us and the FRESH process owns the just-claimed task. With
+  // TASK_ID blanked, _crashReport's `if (taskId)` gate skips, so the benign
+  // restart never overwrites the new task's status with a FATAL message.
+  requestCancel();
+  process.env.TASK_ID = '';
+  // --no-block returns immediately instead of blocking until the unit (us!)
+  // stops; systemd then asynchronously SIGTERMs this process and starts a fresh
+  // one that re-reads /etc/agent.env. A blocking restart would deadlock: the
+  // synchronous execFileSync would hold the event loop so our SIGTERM handler
+  // could never run, hanging until TimeoutStopSec → SIGKILL.
+  execFileSync('sudo', ['systemctl', 'restart', '--no-block', 'blueprint-agent'], {
+    timeout: 30_000,
+    stdio: 'pipe',
+  });
+  log('Warm re-target: systemd restart requested — awaiting SIGTERM to re-exec on new provider');
+  // Block forever; the incoming SIGTERM tears us down. Never resolves so the
+  // role loop cannot re-enter and run on stale credentials.
+  return new Promise<never>(() => { /* resolved only by process teardown */ });
+}
+
+let warmRetargetDeps: WarmRetargetDeps = {
+  clearCreds: () => clearProviderCredentials(),
+  materialize: defaultMaterialize,
+  reexec: defaultReexec,
+};
+
+/** Test-only: override the warm-retarget side effects. */
+export function __setWarmRetargetDepsForTesting(deps: Partial<WarmRetargetDeps> | null): void {
+  warmRetargetDeps = deps
+    ? { clearCreds: () => clearProviderCredentials(), materialize: defaultMaterialize, reexec: defaultReexec, ...deps }
+    : { clearCreds: () => clearProviderCredentials(), materialize: defaultMaterialize, reexec: defaultReexec };
+}
+
+/**
+ * Re-target a warm VM onto the account-divergent claim's provider credentials.
+ *
+ * 1. Clear the prior account's credential material (no leakage).
+ * 2. Re-inject the rotated JWT + task id + warm-handoff/re-exec markers the
+ *    backend dropped/omitted from the manifest, then materialize the new
+ *    account's manifest (rewrites /etc/agent.env + provider cred files).
+ * 3. Controlled re-exec so the frozen provider constants are re-read and the
+ *    role resumes on the correct provider.
+ *
+ * In production step 3 never returns (the restart SIGTERMs us). The injectable
+ * deps make the sequence assertable in tests.
+ */
+export async function performWarmRetarget(
+  secretManifest: SecretManifest,
+  opts: { rotatedJwt: string; taskId: string },
+  deps: WarmRetargetDeps = warmRetargetDeps,
+): Promise<void> {
+  // 1. Clear-then-write ordering: wipe prior creds before materializing new ones.
+  await deps.clearCreds();
+
+  // 2. The backend strips AGENT_SECRET_TOKEN from the manifest (the authoritative
+  //    rotated JWT rides the response's agent_token), so re-inject it here. TASK_ID
+  //    pins the just-claimed role so the re-exec'd process resumes THAT claim
+  //    (idempotent /api/agent/claim replay) rather than re-polling. The warm
+  //    markers tell main() to keep the workspace warm and count this as a warm role.
+  const env: Record<string, unknown> = { ...(secretManifest.env ?? {}) };
+  env.AGENT_SECRET_TOKEN = opts.rotatedJwt;
+  if (opts.taskId) env.TASK_ID = opts.taskId;
+  env.BLUEPRINT_WARM_HANDOFF = '1';
+  env.BLUEPRINT_REEXEC = '1';
+  const manifest: SecretManifest = { ...secretManifest, env };
+
+  // 3. Materialize via the real helper, then re-exec.
+  deps.materialize(manifest, '/etc/agent.env');
+  await deps.reexec();
 }
 
 // ── Tool-use ring buffer ────────────────────────────────────────────────────
@@ -1795,16 +1950,30 @@ async function main() {
   log(`Agent source: ${import.meta.url}`);
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
 
-  // Cold start — ensure prepareWorkspaceForRole takes the fresh-clone path on
-  // role 1. The flag is set later by the role-loop AFTER resetForNextRole
-  // succeeds; on first boot the workspace is empty and we always cold-clone.
-  delete process.env.BLUEPRINT_WARM_HANDOFF;
+  // Distinguish a genuine cold boot from a warm re-target re-exec. The
+  // re-target path (performWarmRetarget) restarts the systemd unit after
+  // resetForNextRole already cleaned + preserved the workspace, stamping
+  // BLUEPRINT_REEXEC=1 (+ BLUEPRINT_WARM_HANDOFF=1) into /etc/agent.env. On
+  // such a resume we KEEP the warm-handoff flag so prepareWorkspaceForRole
+  // reuses the workspace instead of cold-cloning, and we count the role as a
+  // warm start so the telemetry the backend stamped (context._timing.warm_start)
+  // is not overwritten with a spurious cold sample.
+  const isReexecResume = process.env.BLUEPRINT_REEXEC === '1';
+  if (isReexecResume) {
+    // One-shot marker — consume it so a later genuine cold path is unaffected.
+    delete process.env.BLUEPRINT_REEXEC;
+  } else {
+    // Cold start — ensure prepareWorkspaceForRole takes the fresh-clone path on
+    // role 1. The flag is set later by the role-loop AFTER resetForNextRole
+    // succeeds; on first boot the workspace is empty and we always cold-clone.
+    delete process.env.BLUEPRINT_WARM_HANDOFF;
+  }
 
   // Per-role state reset on cold-start. Mirrors the role-loop's warm handoff
   // (same single source of truth) so a stale value from a previous process
   // incarnation (shouldn't happen, but defensive) cannot leak into the first
-  // role's status payload. warmStart:false — role 1 is a cold start.
-  resetPerRoleModuleState({ warmStart: false });
+  // role's status payload. warmStart is true only on a warm re-target re-exec.
+  resetPerRoleModuleState({ warmStart: isReexecResume });
 
   // TASK_ID is baked into /etc/agent.env by the orchestrator's startup script
   // so we can post pre-claim failure heartbeats. The JWT also binds sub=task_id,
@@ -2064,6 +2233,36 @@ async function main() {
       // as a warm role; the next runRoleOnce sets roleClaimTimestamp after a
       // successful re-claim. See resetPerRoleModuleState for the field list.
       resetPerRoleModuleState({ warmStart: true });
+
+      // Account-divergent warm claim: the backend resolved this task to an LLM
+      // account different from the VM's frozen boot account and shipped its
+      // secret manifest. A JWT-only rotation cannot adopt the new provider
+      // material (the constants are frozen at import), so re-materialize the new
+      // credentials and re-exec. In production performWarmRetarget never returns
+      // (systemd restarts us); same-account claims (no secretManifest) fall
+      // straight through to the loop and re-enter on JWT-only rotation, exactly
+      // as before.
+      if (pollResult.secretManifest) {
+        log('Warm claim is account-divergent — re-materializing provider creds + re-exec');
+        try {
+          await performWarmRetarget(pollResult.secretManifest, {
+            rotatedJwt: AGENT_TOKEN,
+            taskId: pollResult.taskId ?? '',
+          });
+        } catch (rtErr) {
+          const rtMsg = rtErr instanceof Error ? rtErr.message : String(rtErr);
+          log(`warm re-target failed: ${rtMsg}`);
+          // Surface as reset_failed so the orchestrator cold-provisions a fresh
+          // VM rather than letting the role run on the prior account's creds.
+          const err = new Error(`reset_failed: warm re-target failed: ${rtMsg}`) as Error & { failureCategory?: FailureCategory };
+          err.failureCategory = 'reset_failed';
+          throw err;
+        }
+        // Unreachable in production (the restart SIGTERMs us). If reexec was a
+        // no-op (e.g. test injection), break rather than risk running the role
+        // on stale credentials.
+        break;
+      }
     }
   } finally {
     // Workspace teardown happens once at process exit, not per-role —

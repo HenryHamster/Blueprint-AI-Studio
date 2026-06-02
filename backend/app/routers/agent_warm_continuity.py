@@ -141,7 +141,14 @@ async def _vm_is_refresh_capable(
 async def _prior_task_vm_boot(
     session: AsyncSession, prior_task_id: uuid.UUID
 ) -> dict | None:
-    """Return the boot identity frozen into the VM that ran ``prior_task_id``."""
+    """Return the boot identity frozen into the VM that ran ``prior_task_id``.
+
+    ``Task.provider/account_id/model`` are stamped at task completion
+    (agent_status.py) from the runtime the task actually ran on, so for a
+    just-completed prior role they faithfully reflect the VM's frozen boot
+    account — the comparison key the re-target path uses to decide whether to
+    re-materialize credentials.
+    """
     result = await session.execute(
         select(Task.provider, Task.account_id, Task.model).where(
             Task.id == prior_task_id
@@ -157,6 +164,161 @@ async def _prior_task_vm_boot(
     }
 
 
+def _norm_account(value) -> str | None:
+    """Stripped string form of an account id, or None for empty/missing."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+async def _project_user_id(session: AsyncSession, project_id) -> str:
+    """Return the owning user_id for ``project_id`` (empty string if absent).
+
+    This is the FALLBACK pool owner. Cold dispatch (orchestrator.py) scopes the
+    account pool to ``task.launched_by_user_id`` when set (the launcher pays) and
+    falls back to ``Project.user_id`` only for autonomous tasks with no launcher;
+    the re-target path mirrors that order, using this helper for the fallback leg.
+    """
+    if project_id is None:
+        return ""
+    from app.models import Project
+
+    result = await session.execute(
+        select(Project.user_id).where(Project.id == project_id)
+    )
+    row = result.first()
+    return str(row[0]) if row and row[0] else ""
+
+
+async def _resolve_retarget(
+    session: AsyncSession,
+    task: Task,
+    vm_instance_id: str,
+    vm_boot: dict | None,
+    ctx: dict,
+    task_type: str,
+) -> tuple[dict | None, dict, str | None]:
+    """Re-target a warm-claimed task to its own resolved LLM account.
+
+    Mirrors cold dispatch: resolves the claimed task's LLM runtime via
+    ``select_llm_runtime_for_task`` (which pre-increments / ACQUIRES the
+    resolved account's slot exactly as the orchestrator does), stamps the
+    resolved provider/auth/model/account onto the task context so the durable
+    slot/cost reconciliation and the completion-time slot release both follow
+    the account the task actually runs on, and builds the provider secret
+    manifest ONLY when the resolved account differs from the VM's frozen boot
+    account.
+
+    Returns ``(secret_manifest_or_None, updated_ctx, acquired_account_id)``.
+    ``acquired_account_id`` is the slot the caller must release if finalization
+    later fails (so acquire/release stays exactly balanced). When no pool
+    account resolves (env-fallback / empty pool) nothing is acquired and the
+    manifest is None — the VM keeps its boot credentials.
+    """
+    from app.compute_manifest import build_agent_secret_manifest
+    from app.max_plan_pool import (
+        apply_task_llm_runtime_context,
+        select_llm_runtime_for_task,
+    )
+
+    runtime_config = _shared_state.runtime_config
+    # Mirror cold dispatch's pool scoping: the launcher pays, so prefer
+    # ``task.launched_by_user_id`` and fall back to the project owner only for
+    # autonomous tasks with no launcher. Backlog reuse has no launched_by filter,
+    # so a user-launched task whose launcher != project owner is reachable here;
+    # selecting from the project owner's pool would mis-attribute cost and, when
+    # the owner's pool has no matching account, yield a synthetic account=None
+    # result (no manifest/slot) that strands the task on the VM's boot creds.
+    user_id = task.launched_by_user_id or await _project_user_id(
+        session, task.project_id
+    )
+    # Union the same two blacklist keys cold dispatch unions into its effective
+    # blacklist: caller-supplied ``blacklisted_accounts`` plus sticky
+    # ``provision_failed_accounts`` (accounts that died pre-claim).
+    _blacklist = ctx.get("blacklisted_accounts") or []
+    _sticky = ctx.get("provision_failed_accounts") or []
+    blacklist = list(
+        {
+            *(_blacklist if isinstance(_blacklist, list) else []),
+            *(_sticky if isinstance(_sticky, list) else []),
+        }
+    ) or None
+    selection = await select_llm_runtime_for_task(
+        user_id=user_id,
+        task=task,
+        runtime_config=runtime_config,
+        blacklist=blacklist,
+    )
+    if selection is None:
+        return None, ctx, None
+
+    account = selection.account
+    if account is None:
+        # No pool account (synthetic/env-fallback result) — no slot acquired and
+        # nothing to re-materialize. Leave the VM on its boot credentials.
+        new_ctx = apply_task_llm_runtime_context(
+            ctx,
+            account_id=None,
+            provider=selection.provider,
+            auth_mode=selection.auth_mode,
+            model=selection.model,
+            execution_mode=selection.execution_mode,
+        )
+        return None, new_ctx, None
+
+    # The account slot is now ACQUIRED (select_max_plan_account pre-incremented
+    # active_tasks). From here on any raise must release it before propagating,
+    # otherwise the in-memory slot leaks until per-cycle reconciliation heals it.
+    # The caller cannot release it for us (it only learns acquired_account_id from
+    # our return value), so this function owns release-on-throw for its own steps.
+    acquired_account_id = account["id"]
+    try:
+        new_ctx = apply_task_llm_runtime_context(
+            ctx,
+            account_id=acquired_account_id,
+            provider=selection.provider,
+            auth_mode=selection.auth_mode,
+            model=selection.model,
+            execution_mode=selection.execution_mode,
+        )
+
+        boot_account = _norm_account(vm_boot.get("account_id")) if vm_boot else None
+        if _norm_account(acquired_account_id) == boot_account:
+            # Same account as the VM's boot manifest — the VM already holds the
+            # right credentials, so the response stays byte-identical (no
+            # manifest). The slot is still acquired/stamped so reconciliation and
+            # the completion-time release stay balanced for this account.
+            return None, new_ctx, acquired_account_id
+
+        manifest = build_agent_secret_manifest(
+            vm_instance_id=vm_instance_id,
+            task_id=task.id,
+            oauth_token=account.get("runtime_secret") or account.get("oauth_token"),
+            claude_config_json=account.get("claude_config_json"),
+            task_type=task_type,
+            provider=selection.provider,
+            auth_mode=selection.auth_mode,
+            model=selection.model,
+            execution_mode=selection.execution_mode,
+            provider_metadata=account.get("provider_metadata") or {},
+            provider_settings=selection.settings,
+            project_id=str(task.project_id) if task.project_id else "",
+        )
+    except Exception:
+        from app.max_plan_pool import release_max_plan_account
+
+        await release_max_plan_account(acquired_account_id)
+        raise
+    # The manifest is PURELY the provider/credential payload. The authoritative,
+    # TTL-gated agent JWT is the response's rotated ``agent_token``; drop the
+    # bootstrap-TTL token build_agent_secret_manifest mints as a side effect so
+    # the two never collide (and we never duplicate the authoritative JWT).
+    if isinstance(manifest.get("env"), dict):
+        manifest["env"].pop("AGENT_SECRET_TOKEN", None)
+    return manifest, new_ctx, acquired_account_id
+
+
 async def _finalize_warm_claim(
     session: AsyncSession,
     task: Task,
@@ -164,6 +326,7 @@ async def _finalize_warm_claim(
     *,
     origin: str,
     refresh_capable: bool,
+    vm_boot: dict | None = None,
 ) -> dict:
     """Flip a locked QUEUED task to IN_PROGRESS for a warm VM and build the
     /next-role claim response.
@@ -180,6 +343,17 @@ async def _finalize_warm_claim(
     refresh-capable gets the short security-bounded TTL (no fresh bootstrap
     window), while an unconfirmed VM keeps the long bootstrap window so a
     deploy/rebake cutover can't 401 it mid-task.
+
+    ``vm_boot`` is the VM's frozen boot identity (provider/account/model). When
+    warm re-targeting is enabled (``warm_retarget_enabled``) and ``vm_boot`` is
+    supplied, the claimed task is re-targeted to its own resolved LLM account:
+    the resolved provider/auth/model/account is acquired and stamped onto the
+    task context, and — only when the resolved account differs from the boot
+    account — the resolved account's secret manifest is added to the response
+    under ``secret_manifest`` so the agent can re-materialize credentials. The
+    field is additive: an older agent that ignores it behaves exactly as today,
+    and same-account claims (the common case) never emit it. With the flag off
+    this is a no-op and the response is byte-for-byte unchanged.
     """
     from app.compute import VM_PROVISIONING_MODEL
 
@@ -195,22 +369,7 @@ async def _finalize_warm_claim(
     task.vm_warm_start = True
     if task.started_at is None:
         task.started_at = _utcnow()
-    # Carry warm-start signal forward into context._timing. setdefault keeps
-    # this server-side write idempotent; the agent's status update remains the
-    # authoritative source and may overwrite warm_start. warm_claim_origin
-    # distinguishes chain continuity from backlog reuse for post-mortem and
-    # telemetry (efficiency direction d-91d8dede).
-    ctx = dict(task.context or {})
-    existing_timing = dict(ctx.get("_timing") or {})
-    existing_timing.setdefault("warm_start", True)
-    existing_timing["warm_claim_origin"] = origin
-    existing_timing["prior_role_vm_id"] = vm_instance_id
-    ctx["_timing"] = existing_timing
-    task.context = ctx
-    flag_modified(task, "context")
-    # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If mint
-    # raises, the rollback restores QUEUED so a retry can succeed instead of
-    # leaving the task stuck IN_PROGRESS with no live agent.
+
     task_type = ""
     try:
         payloads = task.payloads or []
@@ -218,10 +377,44 @@ async def _finalize_warm_claim(
             task_type = str(payloads[0].get("type") or "")
     except Exception:  # noqa: BLE001 — task_type is best-effort metadata
         task_type = ""
+
+    # Carry warm-start signal forward into context._timing. setdefault keeps
+    # this server-side write idempotent; the agent's status update remains the
+    # authoritative source and may overwrite warm_start. warm_claim_origin
+    # distinguishes chain continuity from backlog reuse for post-mortem and
+    # telemetry (efficiency direction d-91d8dede).
+    ctx = dict(task.context or {})
+
+    # Warm re-target: resolve + acquire the claimed task's own account and stamp
+    # it onto ctx BEFORE the timing write so a single context commit persists
+    # both. The whole resolve→stamp→mint→commit sequence runs INSIDE the try so
+    # ``acquired_account_id`` is released on ANY finalize-path failure (including
+    # a raise from build_agent_secret_manifest or select_llm_runtime_for_task
+    # after the slot was acquired) — acquire/release stays airtight rather than
+    # reconciliation-dependent.
+    secret_manifest: dict | None = None
+    acquired_account_id: str | None = None
+    # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If mint
+    # raises, the rollback restores QUEUED so a retry can succeed instead of
+    # leaving the task stuck IN_PROGRESS with no live agent.
     ttl_hours = (
         AGENT_TOKEN_TTL_HOURS if refresh_capable else AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
     )
     try:
+        if vm_boot is not None and _shared_state.runtime_config.get(
+            "warm_retarget_enabled", False
+        ):
+            secret_manifest, ctx, acquired_account_id = await _resolve_retarget(
+                session, task, vm_instance_id, vm_boot, ctx, task_type
+            )
+
+        existing_timing = dict(ctx.get("_timing") or {})
+        existing_timing.setdefault("warm_start", True)
+        existing_timing["warm_claim_origin"] = origin
+        existing_timing["prior_role_vm_id"] = vm_instance_id
+        ctx["_timing"] = existing_timing
+        task.context = ctx
+        flag_modified(task, "context")
         agent_token = create_agent_token(
             task_id=str(task.id),
             vm_instance_id=vm_instance_id,
@@ -229,13 +422,21 @@ async def _finalize_warm_claim(
             project_id=str(task.project_id) if task.project_id else "",
             ttl_hours=ttl_hours,
         )
+        session.add(task)
+        await session.commit()
     except Exception as exc:
+        # Release the slot acquired by the re-target so acquire/release stays
+        # balanced when the claim does not land.
+        if acquired_account_id:
+            from app.max_plan_pool import release_max_plan_account
+
+            await release_max_plan_account(acquired_account_id)
         await session.rollback()
-        logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
+        if isinstance(exc, HTTPException):
+            raise
+        logger.exception("[NEXT-ROLE] warm-claim finalize failed; rolling back")
         raise HTTPException(status_code=500, detail="token_mint_failed") from exc
 
-    session.add(task)
-    await session.commit()
     await session.refresh(task)
 
     # Broadcast AFTER the commit so a rollback path doesn't fire a spurious
@@ -245,12 +446,15 @@ async def _finalize_warm_claim(
         "task_updated",
         {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
     )
-    return {
+    response = {
         "action": "claim",
         "task_id": str(task.id),
         "warm_start": True,
         "agent_token": agent_token,
     }
+    if secret_manifest is not None:
+        response["secret_manifest"] = secret_manifest
+    return response
 
 
 @router.post("/next-role")
@@ -320,6 +524,12 @@ async def next_role(
     # that has never refreshed (e.g. an old image). See _vm_is_refresh_capable.
     vm_refresh_capable = await _vm_is_refresh_capable(session, req.vm_instance_id)
 
+    # The VM's frozen boot identity (provider/account/model of the prior role).
+    # Computed once here because both the chain-continuity and backlog-reuse
+    # claims need it: as the boot-compat pre-check for backlog eligibility and
+    # as the re-target comparison key in _finalize_warm_claim.
+    vm_boot = await _prior_task_vm_boot(session, req.prior_task_id)
+
     # Circuit-breaker / feature-flag gate: if warm continuity is disabled or
     # auto-suppressed (pin-clear rate exceeded the threshold), skip the warm-
     # chain-continuity lookup so no new warm chains start. The orchestrator's
@@ -362,6 +572,7 @@ async def next_role(
                 req.vm_instance_id,
                 origin="next_role_endpoint",
                 refresh_capable=vm_refresh_capable,
+                vm_boot=vm_boot,
             )
             from app.warm_backlog_reuse import (
                 record_chain_claimed as _record_chain_claimed,
@@ -424,7 +635,6 @@ async def next_role(
                 # BEFORE refreshing so only pre-existing windows count.
                 if _shared_state.is_backlog_first_refusal_active(str(_project_uuid)):
                     _record_next_role_poll()
-                vm_boot = await _prior_task_vm_boot(session, req.prior_task_id)
 
                 # Refresh the project's first-refusal window so the orchestrator
                 # holds off cold-provisioning eligible backlog tasks while this VM
@@ -446,6 +656,7 @@ async def next_role(
                             req.vm_instance_id,
                             origin="backlog_reuse",
                             refresh_capable=vm_refresh_capable,
+                            vm_boot=vm_boot,
                         )
                     except Exception:
                         _shared_state.record_backlog_reuse_failure("finalize_error")

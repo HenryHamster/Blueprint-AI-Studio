@@ -236,6 +236,34 @@ class TestAgentSecretManifest:
         assert manifest["files"][0]["path"] == "/opt/agent/gemini/sa.json"
         assert '"client_email":"bot@example.com"' in manifest["files"][0]["content"]
 
+    def test_build_agent_secret_manifest_carries_provider_settings_bag(self):
+        """Re-target hands the agent the resolved account's provider settings
+        bag: a provided (even empty) bag must surface as LLM_SETTINGS + a CLI
+        translation, and the runtime identity must reflect the resolved account
+        — this is the material warm re-targeting reuses to re-credential a VM."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-retarget",
+            task_id=task_id,
+            oauth_token="sk-ant-retarget",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            provider_settings={},
+        )
+
+        # Resolved-account identity carried for re-credentialing the warm VM.
+        assert manifest["env"]["PROVIDER"] == "anthropic"
+        assert manifest["env"]["AUTH_MODE"] == "oauth"
+        assert manifest["env"]["LLM_MODEL"] == "claude-opus-4-8"
+        assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-retarget"
+        # An explicit (even empty) settings bag opts into the settings-bag
+        # protocol: LLM_SETTINGS is emitted and a CLI translation is computed.
+        assert manifest["env"]["LLM_SETTINGS"] == "{}"
+        assert "LLM_CLI_TRANSLATION" in manifest["env"]
+        assert manifest["metadata"]["model"] == "claude-opus-4-8"
+
 
 # ─── Zone success-rate tracking tests ────────────────────────────────────────
 
