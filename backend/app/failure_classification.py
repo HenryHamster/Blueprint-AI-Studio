@@ -270,6 +270,23 @@ _AGENT_LIVE_WORK_PATTERNS: tuple[str, ...] = (
 )
 
 
+# Orchestrator-emitted defer markers. When the dispatcher cannot satisfy a
+# precondition yet (a file is being edited by another in-flight task, or the
+# task overlaps a pending rollup), it leaves the task QUEUED and stamps one of
+# these "Waiting: ..." status messages (see orchestrator_filters.py
+# filter_file_conflicts / filter_rollup_conflicts). These are precondition
+# blockers surfaced by the orchestrator itself — semantically identical to an
+# agent-emitted "BLOCKER:" — so they route to BLOCKED_PRECONDITION (a
+# budget-exempt INFRA class) rather than burning a retry slot on CODE_ERROR.
+# Kept narrow on purpose: "Waiting: serializing migration" (line 495) is a
+# deliberate ordering wait that stays AGENT_TIMEOUT, and a bare "file conflict"
+# mention without the "Waiting:" defer prefix must not over-match.
+_ORCHESTRATOR_DEFER_MARKERS: tuple[str, ...] = (
+    "waiting: file conflict",
+    "waiting: overlaps pending rollup",
+)
+
+
 # Substrings that uniquely identify migration-related failures. Kept narrow so
 # generic database connectivity errors stay in EXTERNAL_API.
 _MIGRATION_PATTERNS: tuple[str, ...] = (
@@ -1436,6 +1453,16 @@ def _classify_failure_class(
     if _status_msg_raw[:12].lower().startswith("scope_empty:"):
         return SCOPE_EMPTY
     if _status_msg_raw[:8].lower().startswith("blocker:"):
+        return BLOCKED_PRECONDITION
+
+    # Orchestrator-surfaced precondition blockers. Checked alongside the agent
+    # prefixes (before the agent_category fast-path) so a precondition recognized
+    # by the *orchestrator* is treated identically to one surfaced by the
+    # *agent*: routed to a budget-exempt class instead of consuming a retry slot
+    # / dinging direction health. See the marker definitions for why the matched
+    # substrings are deliberately narrow.
+    _status_msg_lower = _status_msg_raw.lower()
+    if any(marker in _status_msg_lower for marker in _ORCHESTRATOR_DEFER_MARKERS):
         return BLOCKED_PRECONDITION
 
     # Authoritative LLM rate-limit signal from the Claude Code CLI: the agent

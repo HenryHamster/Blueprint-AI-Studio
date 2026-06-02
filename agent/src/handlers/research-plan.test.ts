@@ -1555,6 +1555,83 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   });
 });
 
+// ── handleResearch — SYSTEM VERIFICATION rendering ───────────────────────────
+// The backend annotates the research payload with per-system code-existence
+// verdicts (system_verification). handleResearch must surface claimed-but-absent
+// and partial systems prominently so tactical research reasons about what
+// actually exists rather than trusting a stale design-doc status.
+describe('handleResearch — system verification prompt rendering', () => {
+  const SV_TASK_ID = 'sv-task-001';
+  const SV_GH_TOKEN = 'gh-token';
+  const SV_OWNER = 'owner';
+  const SV_REPO = 'repo';
+  const SV_WS = null;
+  const SV_STATUS_REF = () => ({ value: '' });
+  const SV_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('renders a SYSTEM VERIFICATION section flagging claimed-but-absent systems', async () => {
+    const payload = {
+      base_branch: 'main',
+      prompt: 'analyze',
+      system_verification: {
+        ghost: { status: 'claimed_absent', claimed_status: 'mature', present: [], missing: ['backend/app/ghost.py'] },
+      },
+    };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('# SYSTEM VERIFICATION');
+    expect(p).toContain('CLAIMED-BUT-ABSENT');
+    expect(p).toContain('backend/app/ghost.py');
+    expect(p).toContain('ghost');
+  });
+
+  it('renders partial systems under the partial heading', async () => {
+    const payload = {
+      base_branch: 'main',
+      prompt: 'analyze',
+      system_verification: {
+        half: { status: 'partial', claimed_status: 'functional', present: ['backend/app/real.py'], missing: ['backend/app/fake.py'] },
+      },
+    };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('PARTIAL');
+    expect(p).toContain('backend/app/fake.py');
+  });
+
+  it('omits the SYSTEM VERIFICATION section when no verification is present', async () => {
+    const payload = { base_branch: 'main', prompt: 'analyze' };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('# SYSTEM VERIFICATION');
+  });
+
+  it('surfaces the current direction verdict inside the architecture-context highlight', async () => {
+    const payload = {
+      base_branch: 'main',
+      prompt: 'analyze',
+      direction_design_context: {
+        system_id: 'sys-x',
+        verification: { status: 'claimed_absent', present: [], missing: ['backend/app/x.py'] },
+      },
+    };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('CODE VERIFICATION');
+    expect(p).toContain('CLAIMED-BUT-ABSENT');
+    expect(p).toContain('backend/app/x.py');
+  });
+});
+
 // ── Strategic executor prompt — step 1 / step 5 consistency (R4-LOW) ──────────
 //
 // R4-LOW: the executor prompt's step 1 ("read-and-pass `$(cat ...problem_model...)`,

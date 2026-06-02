@@ -45,6 +45,41 @@ export function buildDriftSection(driftSignals: Record<string, unknown> | null):
   return lines.join('\n');
 }
 
+export function buildCapabilityVerificationSection(problemModel: Record<string, unknown> | undefined): string {
+  if (!problemModel || typeof problemModel !== 'object') return '';
+  const capabilities = Array.isArray(problemModel.capabilities)
+    ? problemModel.capabilities as Array<Record<string, unknown>>
+    : [];
+  if (capabilities.length === 0) return '';
+
+  const flagged: string[] = [];
+  for (const capability of capabilities) {
+    const verification = capability.verification as Record<string, unknown> | undefined;
+    if (!verification || typeof verification !== 'object') continue;
+    const effectiveStatus = strVal(verification.effective_status as string);
+    if (effectiveStatus !== 'absent' && effectiveStatus !== 'partial') continue;
+
+    const name = strVal(capability.name as string, 'Unnamed capability');
+    const claimedStatus = strVal(capability.status as string);
+    const missing = Array.isArray(verification.missing) ? verification.missing as string[] : [];
+    const present = Array.isArray(verification.present) ? verification.present as string[] : [];
+    const claimedNote = claimedStatus ? ` (claimed status: ${claimedStatus})` : '';
+
+    if (effectiveStatus === 'absent') {
+      flagged.push(`- **${name}**${claimedNote}: CLAIMED-BUT-ABSENT — all declared backing paths are missing: ${missing.join(', ')}`);
+    } else {
+      flagged.push(`- **${name}**${claimedNote}: PARTIAL — missing: ${missing.join(', ')}; present: ${present.join(', ')}`);
+    }
+  }
+
+  if (flagged.length === 0) return '';
+
+  const lines: string[] = ['\n## Capability Verification (advisory)'];
+  lines.push('The backend checked declared capability backing paths against the integration-branch file tree. Use flagged entries to avoid hallucinating current behavior, but do not treat missing code as a ban on proposing future work.');
+  lines.push(...flagged);
+  return lines.join('\n');
+}
+
 export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undefined): string {
   if (!outcomeEval || typeof outcomeEval !== 'object') return '';
   const window = outcomeEval.window as Record<string, unknown> | undefined;

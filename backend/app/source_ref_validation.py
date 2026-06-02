@@ -9,7 +9,8 @@ on validation failures — does not crash.
 import asyncio
 import logging
 import re
-from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -49,18 +50,25 @@ def _parse_ref(ref: str) -> Tuple[str, Optional[int], Optional[int]]:
     return ref, None, None
 
 
-async def _file_exists_at_head(path: str) -> bool:
+def _looks_like_file_path(path: str) -> bool:
+    """Cheap rejector for obvious non-file refs before expensive checks."""
+    return bool(
+        path
+        and isinstance(path, str)
+        and (
+            "/" in path
+            or path.endswith((".py", ".ts", ".tsx", ".js", ".go", ".rs"))
+        )
+    )
+
+
+async def _file_exists_at_head(path: str, *, cwd: str = "/tmp/workspace") -> bool:
     """Check if a file exists in the HEAD commit using 'git ls-files'.
 
     Returns False if git command fails, file doesn't exist, or path is invalid.
     Does not raise exceptions — logs and returns False on errors.
     """
-    if (
-        not path
-        or not isinstance(path, str)
-        or "/" not in path
-        and not path.endswith((".py", ".ts", ".tsx", ".js", ".go", ".rs"))
-    ):
+    if not _looks_like_file_path(path):
         # Reject obvious non-file paths to avoid wasting git calls
         return False
 
@@ -70,7 +78,7 @@ async def _file_exists_at_head(path: str) -> bool:
             "ls-files",
             "--",
             path,
-            cwd="/tmp/workspace",
+            cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -87,6 +95,68 @@ async def _file_exists_at_head(path: str) -> bool:
     except Exception as e:
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}"
+        )
+        return False
+
+
+async def _file_exists_in_repo_branch(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> bool:
+    """Check whether *path* exists on ``owner/repo@branch`` via GitHub API."""
+    if not _looks_like_file_path(path):
+        return False
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_branch = quote(branch, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_branch}"
+    )
+    try:
+        from app.github import _github_request
+
+        response = await _github_request(
+            "GET",
+            url,
+            headers,
+            max_retries=2,
+            project_id=project_id,
+        )
+        if response.status_code == 404:
+            return False
+        if response.status_code != 200:
+            logger.warning(
+                "[SOURCE_REF_VALIDATION] GitHub contents lookup failed for %s on "
+                "%s/%s@%s: HTTP %s",
+                path,
+                owner,
+                repo,
+                branch,
+                response.status_code,
+            )
+            return False
+        payload = response.json()
+        return isinstance(payload, dict) and payload.get("type") == "file"
+    except Exception as e:
+        logger.warning(
+            "[SOURCE_REF_VALIDATION] Failed GitHub contents lookup for %s on "
+            "%s/%s@%s: %s",
+            path,
+            owner,
+            repo,
+            branch,
+            e,
         )
         return False
 
@@ -132,6 +202,75 @@ async def _file_has_line_count(path: str, min_line: int) -> bool:
             f"[SOURCE_REF_VALIDATION] Error validating line count for {path}: {e}"
         )
         return False
+
+
+def partition_missing(
+    paths: list, exists_fn: Callable[[str], bool]
+) -> Tuple[List[str], List[str]]:
+    """Split *paths* into (present, missing) using the synchronous *exists_fn*.
+
+    Pure partitioner shared by the file-existence checkers. *exists_fn* is a
+    ``path -> bool`` predicate. Non-string entries are treated as missing.
+    Order is preserved within each bucket. Used by the playbook stale-ref
+    path (``os.path.isfile``-backed) so it shares partition logic with the
+    async git-backed classifier below.
+    """
+    present: List[str] = []
+    missing: List[str] = []
+    for p in paths:
+        if isinstance(p, str) and exists_fn(p):
+            present.append(p)
+        else:
+            missing.append(p)
+    return present, missing
+
+
+async def classify_existing_paths(
+    paths: list,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> Tuple[List[str], List[str]]:
+    """Classify *paths* into (present, missing) against the integration-branch
+    file tree.
+
+    When ``token/owner/repo/branch`` are provided, checks the project's real
+    GitHub repository tree at that branch. Otherwise falls back to the local
+    checkout's git HEAD (the same mechanism :func:`validate_source_refs`
+    relies on). Read-only and advisory: callers use the result to annotate,
+    never to mutate stored state. Non-string entries are treated as missing.
+    Order is preserved within each bucket.
+    """
+    present: List[str] = []
+    missing: List[str] = []
+    use_repo_branch = all([token, owner, repo, branch])
+    for p in paths:
+        exists = False
+        if isinstance(p, str):
+            if use_repo_branch:
+                exists = await _file_exists_in_repo_branch(
+                    p,
+                    token=str(token),
+                    owner=str(owner),
+                    repo=str(repo),
+                    branch=str(branch),
+                    project_id=project_id,
+                )
+            else:
+                exists = (
+                    await _file_exists_at_head(p)
+                    if cwd == "/tmp/workspace"
+                    else await _file_exists_at_head(p, cwd=cwd)
+                )
+        if exists:
+            present.append(p)
+        else:
+            missing.append(p)
+    return present, missing
 
 
 # Recognizes the `path/to/file.ext:symbol` convention used in finding claims

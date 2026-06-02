@@ -42,6 +42,7 @@ from app.playbook_learning import (
     RECENT_SUCCESSES_TASK_TYPES,
     summarize_recent_successes,
 )
+from app.source_ref_validation import classify_existing_paths
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -1224,6 +1225,60 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     continue
                 design_doc_summary[k] = v.get("content", "")
 
+        # Verify design-doc system module paths against the integration-branch
+        # file tree before trusting their status claims. Read-only/advisory: the
+        # stored design_doc is NOT mutated — we only annotate the payload so the
+        # research agent reasons about what actually exists instead of
+        # confabulating phantom code behind a status it trusts. Flat storage
+        # shape: each ``systems/<id>`` key is a dict carrying a ``modules`` list.
+        # Sorted iteration keeps the annotation deterministic for identical input.
+        verification_kwargs: dict[str, str] = {
+            "branch": _get_project_integration_branch(project),
+            "project_id": str(project.id),
+        }
+        try:
+            from app.release_promotion import _resolve_github_with_session
+
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved:
+                gh_token, gh_owner, gh_repo = resolved
+                verification_kwargs.update(
+                    {"token": gh_token, "owner": gh_owner, "repo": gh_repo}
+                )
+        except Exception:
+            logger.debug(
+                "[AUTONOMOUS_RESEARCH] GitHub credential resolution skipped for "
+                "system verification",
+                exc_info=True,
+            )
+        system_verification: dict = {}
+        for dkey in sorted(
+            k for k in doc if isinstance(k, str) and k.startswith("systems/")
+        ):
+            dval = doc[dkey]
+            if not isinstance(dval, dict):
+                continue
+            modules = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+            if not modules:
+                continue
+            present, missing = await classify_existing_paths(
+                modules, **verification_kwargs
+            )
+            if not missing:
+                status = "verified"
+            elif present:
+                status = "partial"
+            else:
+                # Every declared module is absent from the integration branch:
+                # the system is claimed but its backing code does not exist.
+                status = "claimed_absent"
+            system_verification[dkey[len("systems/"):]] = {
+                "status": status,
+                "claimed_status": str(dval.get("status", "")),
+                "present": present,
+                "missing": missing,
+            }
+
         research_payload: dict = {
             "type": "research",
             "directions": direction_summaries,
@@ -1236,6 +1291,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             **({"effort": research_effort} if research_effort else {}),
             **({"prompt_suffix": research_suffix} if research_suffix else {}),
         }
+        if system_verification:
+            research_payload["system_verification"] = system_verification
         if chosen_direction and chosen_direction.get("category") == "product":
             append_prompt_suffix(
                 research_payload,
@@ -1290,6 +1347,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     }
                     if related_caps:
                         relevant["missing_capabilities"] = related_caps
+                # Surface the current direction's system verification verdict
+                # inline so the agent sees claimed-but-absent / partial code
+                # right next to the architecture context it would otherwise trust.
+                if dir_system_id in system_verification:
+                    relevant["verification"] = system_verification[dir_system_id]
                 research_payload["direction_design_context"] = relevant
             if chosen_direction.get("possibly_complete"):
                 research_payload["direction_possibly_complete"] = True

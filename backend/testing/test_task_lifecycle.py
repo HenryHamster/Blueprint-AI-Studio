@@ -24,7 +24,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
-from app.models import Project, Task, TaskStatus, ArtifactType
+from app.models import Project, Task, TaskStatus, ArtifactType, Alert, AlertSeverity
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
@@ -715,6 +715,79 @@ async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_
     entries = list(_ss.deploy_monitoring["task_results"])
     matching = [e for e in entries if e[1] == "failure" and e[2] == "AGENT_TIMEOUT"]
     assert matching, f"expected an AGENT_TIMEOUT failure entry, got {entries}"
+
+
+@pytest.mark.asyncio
+async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, mocker):
+    """All-children-blocked parent raises ONE deduplicated precondition alert.
+
+    When every FAILED child is BLOCKED_PRECONDITION (upstream dependency unmet),
+    the parent terminates as BLOCKED_PRECONDITION rather than a code failure, and
+    a single operator-visible WARNING alert describing the upstream blocker is
+    raised — not a silent generic FAILED. Re-running the requeue must NOT spam a
+    second alert (deduplicated by task + blocker identity).
+    """
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.deploy_monitoring["task_results"].clear()
+    _recorded_task_ids.clear()
+    # The precondition-blocker helper broadcasts via app.alert_dispatch; suppress
+    # the socket call but keep the real (dedup) helper so we exercise idempotence.
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    # Single FAILED child whose status message routes to BLOCKED_PRECONDITION.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: upstream PR #42 not yet merged",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    # Parent classified as the budget-exempt precondition class, not a code error.
+    assert parent.context.get("failure_category") == "BLOCKED_PRECONDITION"
+
+    precondition_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(precondition_alerts) == 1
+    alert = precondition_alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "upstream dependency" in alert.title
+
+    # Re-run: dedup must hold — still exactly one precondition alert.
+    await _requeue_parent_task(parent, session)
+    precondition_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(precondition_alerts) == 1
 
 
 @pytest.mark.asyncio

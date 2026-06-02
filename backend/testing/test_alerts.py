@@ -15,6 +15,7 @@ from app.alert_dispatch import (
     _maybe_create_failure_alert,
     _maybe_create_circuit_breaker_alert,
     _maybe_create_escalation_alert,
+    _maybe_create_precondition_blocker_alert,
 )
 from app.deploy_health import (
     _create_auto_pause_alerts,
@@ -524,6 +525,108 @@ class TestEscalationAlert:
 
         await _maybe_create_escalation_alert(
             task, db_session, pr_number=42, reason="stuck", iteration=5
+        )
+
+        mock_bc.assert_called_once()
+        call_args = mock_bc.call_args
+        assert call_args[0][0] == str(project.id)
+        assert call_args[0][1] == "alert_created"
+        assert call_args[0][2]["severity"] == "WARNING"
+
+
+# ---------------------------------------------------------------------------
+# Precondition-blocker escalation alerts
+# ---------------------------------------------------------------------------
+
+
+class TestPreconditionBlockerAlert:
+    """Tests for _maybe_create_precondition_blocker_alert.
+
+    Mirrors the review-fix escalation lane: a WARNING alert tied to the task,
+    deduplicated by (task_id, blocker identity), fired regardless of approval
+    gates (the helper reads no gate).
+    """
+
+    async def _make_task(self, db_session):
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id, status=TaskStatus.QUEUED, title="Build widget"
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        return project, task
+
+    @pytest.mark.asyncio
+    async def test_creates_warning_alert_tied_to_task(self, db_session, mocker):
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        project, task = await self._make_task(db_session)
+
+        await _maybe_create_precondition_blocker_alert(
+            task,
+            db_session,
+            blocker_kind="file conflict on a.py, b.py",
+            detail="Waiting: file conflict on a.py, b.py",
+        )
+
+        alerts = await _all_alerts(db_session, task_id=task.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.project_id == project.id
+        assert alert.task_id == task.id
+        # Title encodes the blocker identity so distinct blockers dedup apart.
+        assert "file conflict on a.py, b.py" in alert.title
+        assert "Waiting: file conflict" in alert.message
+
+    @pytest.mark.asyncio
+    async def test_deduplicates_same_blocker(self, db_session, mocker):
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        _project, task = await self._make_task(db_session)
+
+        await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="upstream dependency", detail="first"
+        )
+        # Re-fire on the same blocker identity must NOT create a second alert.
+        await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="upstream dependency", detail="second"
+        )
+
+        alerts = await _all_alerts(db_session, task_id=task.id)
+        assert len(alerts) == 1
+        # Original message preserved — dedup short-circuits before re-insert.
+        assert alerts[0].message == "first"
+
+    @pytest.mark.asyncio
+    async def test_distinct_blockers_create_separate_alerts(self, db_session, mocker):
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        _project, task = await self._make_task(db_session)
+
+        await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="file conflict on a.py", detail="d1"
+        )
+        await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="pending rollup 'Refactor X'", detail="d2"
+        )
+
+        alerts = await _all_alerts(db_session, task_id=task.id)
+        assert len(alerts) == 2
+        titles = {a.title for a in alerts}
+        assert any("file conflict on a.py" in t for t in titles)
+        assert any("pending rollup 'Refactor X'" in t for t in titles)
+
+    @pytest.mark.asyncio
+    async def test_broadcasts_alert_created_event(self, db_session, mocker):
+        mock_bc = mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+        project, task = await self._make_task(db_session)
+
+        await _maybe_create_precondition_blocker_alert(
+            task, db_session, blocker_kind="upstream dependency", detail="d"
         )
 
         mock_bc.assert_called_once()

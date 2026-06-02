@@ -126,6 +126,15 @@ class Capability(BaseModel):
     """Where the current status assertion came from — e.g., a shipped PR
     or a direction outcome that established the capability."""
 
+    backing_paths: list[str] = Field(default_factory=list)
+    """Integration-branch file paths that back this capability. Optional and
+    default-empty so every stored model and older agent payload validates
+    unchanged. Used by strategic payload assembly to verify (advisory, never
+    mutating the durable model) whether the code a status claims actually
+    exists — a capability whose backing files are all missing is framed as
+    absent/unverified, mixed presence as partial. Mirrors the design-doc
+    ``systems/<id>.modules`` verification."""
+
 
 # ---------------------------------------------------------------------------
 # Gaps

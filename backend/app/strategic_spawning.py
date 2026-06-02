@@ -27,6 +27,7 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.source_ref_validation import classify_existing_paths
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
@@ -150,6 +151,84 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
     return trimmed
+
+
+async def _verify_capability_backing_paths(
+    pm: dict | None,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Annotate each capability in *pm* with advisory backing-path verification.
+
+    Mirrors the design-doc ``systems/<id>.modules`` verification in
+    ``autonomous_research.py``: for every capability that declares
+    ``backing_paths``, classify those paths against the integration-branch
+    file tree (prefer the project's real GitHub repo/branch when available,
+    else local git HEAD via :func:`classify_existing_paths`) and attach a
+    per-capability ``verification`` block::
+
+        {"present": [...], "missing": [...], "effective_status": "..."}
+
+    ``effective_status`` framing so downstream prompts reason about what the
+    code actually shows rather than trusting the stored status verbatim:
+      - ``backing_paths`` empty → ``"unverified"`` (no linkage to check)
+      - all paths present → the capability's own stored status (verified)
+      - mixed presence → ``"partial"``
+      - all paths missing → ``"absent"`` (claimed but no backing code exists)
+
+    Operates on a copy: the input *pm* (and therefore the durable
+    ``project.problem_model``) is never mutated. *pm* is expected to already
+    be ``_agent_view_problem_model``-trimmed; this helper only adds keys.
+    """
+    if not pm:
+        return {}
+    annotated = dict(pm)
+    caps = annotated.get("capabilities") or []
+    if not isinstance(caps, list):
+        return annotated
+    new_caps: list = []
+    for cap in caps:
+        if not isinstance(cap, dict):
+            new_caps.append(cap)
+            continue
+        cap2 = dict(cap)
+        paths = [p for p in (cap2.get("backing_paths") or []) if isinstance(p, str)]
+        if not paths:
+            cap2["verification"] = {
+                "present": [],
+                "missing": [],
+                "effective_status": "unverified",
+            }
+            new_caps.append(cap2)
+            continue
+        present, missing = await classify_existing_paths(
+            paths,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+        if not missing:
+            effective_status = str(cap2.get("status", "")) or "unverified"
+        elif present:
+            effective_status = "partial"
+        else:
+            # Every declared backing path is absent from the integration
+            # branch: the capability is claimed but its code does not exist.
+            effective_status = "absent"
+        cap2["verification"] = {
+            "present": present,
+            "missing": missing,
+            "effective_status": effective_status,
+        }
+        new_caps.append(cap2)
+    annotated["capabilities"] = new_caps
+    return annotated
 
 
 # Per-system maturity rows can be heavy if `top_issues` and `evidence` carry
@@ -1445,6 +1524,26 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
 
+    verification_kwargs: dict[str, str] = {
+        "branch": get_project_integration_branch(project),
+        "project_id": str(project.id),
+    }
+    try:
+        from app.release_qualifier import _resolve_github_with_session
+
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved:
+            gh_token, gh_owner, gh_repo = resolved
+            verification_kwargs.update(
+                {"token": gh_token, "owner": gh_owner, "repo": gh_repo}
+            )
+    except Exception:
+        logger.debug(
+            "[STRATEGIC] GitHub credential resolution skipped for design-doc "
+            "capability verification",
+            exc_info=True,
+        )
+
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
@@ -1452,7 +1551,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
-            "problem_model": _agent_view_problem_model(project.problem_model),
+            "problem_model": await _verify_capability_backing_paths(
+                _agent_view_problem_model(project.problem_model),
+                **verification_kwargs,
+            ),
             "open_messages": open_msgs,
             "shipped_changes_manifest": shipped_changes_manifest,
             "base_branch": get_project_integration_branch(project),
@@ -1790,6 +1892,25 @@ async def _spawn_strategic_review(
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )
+    verification_kwargs: dict[str, str] = {
+        "branch": get_project_integration_branch(project),
+        "project_id": str(project.id),
+    }
+    try:
+        from app.release_qualifier import _resolve_github_with_session
+
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved:
+            gh_token, gh_owner, gh_repo = resolved
+            verification_kwargs.update(
+                {"token": gh_token, "owner": gh_owner, "repo": gh_repo}
+            )
+    except Exception:
+        logger.debug(
+            "[STRATEGIC] GitHub credential resolution skipped for strategic "
+            "capability verification",
+            exc_info=True,
+        )
     # Mode-aware additions: per-system maturity snapshots + short-window
     # claim-vs-shipped drift. Both are best-effort: empty/None when the
     # project has no SystemMaturity rows or no in-window task data.
@@ -2292,7 +2413,10 @@ async def _spawn_strategic_review(
             "research_mode": "strategic",
             "design_doc": _agent_view_design_doc(project.design_doc),
             "vision": project.vision or {},
-            "problem_model": _agent_view_problem_model(project.problem_model),
+            "problem_model": await _verify_capability_backing_paths(
+                _agent_view_problem_model(project.problem_model),
+                **verification_kwargs,
+            ),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()

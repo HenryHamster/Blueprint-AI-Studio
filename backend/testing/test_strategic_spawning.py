@@ -15,7 +15,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
@@ -5232,6 +5232,180 @@ class TestGetProjectIntegrationBranch:
         """
         project = _make_project(integration_branch="release", promotion_target="release")
         assert _shared_state.get_project_integration_branch(project) == "release"
+
+
+# ── _verify_capability_backing_paths: advisory capability verification ────────
+
+
+class TestVerifyCapabilityBackingPaths:
+    """The strategic payload annotates each capability with advisory backing-
+    path verification, never mutating the durable problem_model.
+
+    classify_existing_paths is patched per-test so the cases are deterministic
+    and don't depend on the integration-branch file tree.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_pm_returns_empty(self):
+        from app.strategic_spawning import _verify_capability_backing_paths
+
+        assert await _verify_capability_backing_paths(None) == {}
+        assert await _verify_capability_backing_paths({}) == {}
+
+    @pytest.mark.asyncio
+    async def test_no_backing_paths_is_unverified(self):
+        from app import strategic_spawning
+
+        pm = {"capabilities": [{"name": "CapA", "status": "working"}]}
+        # classify must never be called when there are no paths to check.
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(side_effect=AssertionError("should not be called")),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "unverified"
+        assert ver["present"] == [] and ver["missing"] == []
+
+    @pytest.mark.asyncio
+    async def test_all_present_preserves_status(self):
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py", "b.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=(["a.py", "b.py"], [])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "working"
+        assert ver["present"] == ["a.py", "b.py"]
+        assert ver["missing"] == []
+
+    @pytest.mark.asyncio
+    async def test_mixed_presence_is_partial(self):
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py", "gone.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=(["a.py"], ["gone.py"])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "partial"
+        assert ver["present"] == ["a.py"]
+        assert ver["missing"] == ["gone.py"]
+
+    @pytest.mark.asyncio
+    async def test_all_missing_is_absent(self):
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["gone1.py", "gone2.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=([], ["gone1.py", "gone2.py"])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "absent"
+        assert ver["present"] == []
+        assert ver["missing"] == ["gone1.py", "gone2.py"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_mutate_input(self):
+        """The durable problem_model dict passed in is never mutated — only a
+        copy is annotated."""
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=(["a.py"], [])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        # Input capability is untouched (no verification key added in place).
+        assert "verification" not in pm["capabilities"][0]
+        assert out is not pm
+        assert out["capabilities"][0] is not pm["capabilities"][0]
+
+    @pytest.mark.asyncio
+    async def test_passes_repo_branch_context_to_classifier(self):
+        from app import strategic_spawning
+
+        seen_kwargs = {}
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py"],
+                }
+            ]
+        }
+
+        async def _classify(paths, **kwargs):
+            seen_kwargs.update(kwargs)
+            return (paths, [])
+
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(side_effect=_classify),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(
+                pm,
+                token="ghs_test",
+                owner="acme",
+                repo="widget",
+                branch="automain",
+                project_id="proj-123",
+            )
+        assert out["capabilities"][0]["verification"]["effective_status"] == "working"
+        assert seen_kwargs == {
+            "token": "ghs_test",
+            "owner": "acme",
+            "repo": "widget",
+            "branch": "automain",
+            "project_id": "proj-123",
+        }
 
 
 # ── Onboarding goal reaches the first strategic cycle's payload ─────────────────

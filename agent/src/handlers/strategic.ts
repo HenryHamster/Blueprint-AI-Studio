@@ -38,6 +38,7 @@ import {
 } from './research-plan.js';
 import {
   buildSystemMaturitySection,
+  buildCapabilityVerificationSection,
   buildDriftSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
@@ -279,6 +280,7 @@ export async function handleStrategic(
     const problemModelSection = problemModelJson
       ? `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``
       : `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
+    const verificationFailuresSection = buildCapabilityVerificationSection(problemModel);
 
     const runningUpdateSection = `## Running update (living document — rewrite, don't append)\n${renderRunningUpdateDoc(runningUpdateDoc)}\n\n_This is the document the user currently sees. Refine it this cycle — remove stale content, integrate what's new, keep it coherent and short. It's a current snapshot, not a log._`;
 
@@ -317,6 +319,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       packerMetaSection,
       strategicContext,
       problemModelSection,
+      verificationFailuresSection,
       reflectionSection,
       selfImprovementBlock,
       runningUpdateSection,

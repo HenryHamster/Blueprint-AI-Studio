@@ -1146,6 +1146,55 @@ class TestClassifyFailureScopeEmpty:
         assert SCOPE_EMPTY in INFRA_CLASSES
 
 
+class TestClassifyFailureOrchestratorDefer:
+    """The orchestrator defers a task on a precondition it cannot satisfy yet
+    (a file is being edited by another in-flight task, or the task overlaps a
+    pending rollup) by stamping a "Waiting: ..." status message and leaving the
+    task QUEUED. When such a task later reaches a terminal classification path,
+    its defer marker must route to BLOCKED_PRECONDITION (budget-exempt) just
+    like an agent-emitted "BLOCKER:" — not to a generic CODE_ERROR that burns a
+    retry slot and dings direction health."""
+
+    def test_file_conflict_defer_marker(self):
+        t = _task("Waiting: file conflict on backend/app/x.py (blocked by: Refactor X)")
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_rollup_overlap_defer_marker(self):
+        t = _task("Waiting: overlaps pending rollup 'Refactor X'")
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_defer_marker_overrides_generic_agent_category(self):
+        """The marker is authoritative even when a generic CODE_ERROR category
+        was written alongside it — mirrors the "BLOCKER:" prefix behavior."""
+        t = _task(
+            "Waiting: file conflict on backend/app/x.py",
+            {"failure_category": "CODE_ERROR"},
+        )
+        assert classify_failure(t) == BLOCKED_PRECONDITION
+
+    def test_high_confidence_for_defer_marker(self):
+        t = _task("Waiting: overlaps pending rollup 'Refactor X'")
+        result = classify_failure_with_confidence(t)
+        assert result.failure_class == BLOCKED_PRECONDITION
+        assert result.confidence >= 0.9
+
+    def test_serializing_migration_stays_agent_timeout(self):
+        """The migration-serialization wait is a deliberate ordering wait, not a
+        precondition blocker — it must keep its AGENT_TIMEOUT route. This is the
+        primary regression guard for the narrow defer-marker substrings."""
+        t = _task(
+            "Waiting: serializing migration — task 7af4d393 is already producing "
+            "a migration in this project"
+        )
+        assert classify_failure(t) == AGENT_TIMEOUT
+
+    def test_bare_file_conflict_mention_does_not_match(self):
+        """A passing mention of "file conflict" without the "Waiting:" defer
+        prefix must NOT over-match — it stays in its normal class."""
+        t = _task("AssertionError: file conflict detected during merge")
+        assert classify_failure(t) == CODE_ERROR
+
+
 class TestClassifyFailureFastPath:
     """context['failure_category'] shortcut preempts text matching."""
 

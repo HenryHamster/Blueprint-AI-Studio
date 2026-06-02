@@ -134,6 +134,68 @@ class TestFilterFileConflicts:
         assert args[2]["status"] == "QUEUED"
 
     @pytest.mark.asyncio
+    async def test_single_defer_does_not_escalate(self, mocker):
+        esc = mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        esc.assert_not_called()
+        # Persistence counter is seeded but below the escalation threshold.
+        assert c.context["_precondition_defer"]["count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_repeated_defer_on_same_blocker_escalates_once(self, mocker):
+        esc = mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        # Defer across several dispatch cycles on the SAME blocker identity.
+        for _ in range(5):
+            await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+
+        # Escalated exactly once at the threshold, not re-fired every cycle.
+        assert esc.call_count == 1
+        _, kwargs = esc.call_args
+        assert kwargs["blocker_kind"] == "file conflict on a.py"
+        assert c.context["_precondition_escalated_key"] == "file conflict on a.py"
+
+    @pytest.mark.asyncio
+    async def test_changing_blocker_resets_counter(self, mocker):
+        esc = mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        ip_a = _in_progress(pid, ["a.py"])
+        await filter_file_conflicts([c.id], [c], [ip_a], session, broadcast_fn)
+        await filter_file_conflicts([c.id], [c], [ip_a], session, broadcast_fn)
+        assert c.context["_precondition_defer"]["count"] == 2
+
+        # Blocker identity shifts to a different file → counter resets to 1.
+        ip_b = _in_progress(pid, ["b.py"])
+        await filter_file_conflicts([c.id], [c], [ip_b], session, broadcast_fn)
+        assert c.context["_precondition_defer"]["key"] == "file conflict on b.py"
+        assert c.context["_precondition_defer"]["count"] == 1
+        esc.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_shared_test_files_not_deferred(self):
         pid = uuid.uuid4()
         c = _queued(pid, ["backend/testing/test_foo.py", "backend/testing/test_bar.py"])

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   fmtScalar,
   buildSystemMaturitySection,
+  buildCapabilityVerificationSection,
   buildDriftSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
@@ -100,6 +101,63 @@ describe('buildDriftSection', () => {
     expect(result).toContain('Direction d-1');
     expect(result).toContain('over_claim');
     expect(result).toContain('0.20');
+  });
+});
+
+describe('buildCapabilityVerificationSection', () => {
+  it('returns empty when problem model is missing or has no capabilities', () => {
+    expect(buildCapabilityVerificationSection(undefined)).toBe('');
+    expect(buildCapabilityVerificationSection({})).toBe('');
+  });
+
+  it('omits the section when capabilities are verified-only', () => {
+    const result = buildCapabilityVerificationSection({
+      capabilities: [{
+        name: 'search',
+        status: 'working',
+        verification: {
+          effective_status: 'working',
+          present: ['backend/app/search.py'],
+          missing: [],
+        },
+      }],
+    });
+    expect(result).toBe('');
+  });
+
+  it('renders claimed-but-absent capabilities with advisory framing', () => {
+    const result = buildCapabilityVerificationSection({
+      capabilities: [{
+        name: 'payments',
+        status: 'working',
+        verification: {
+          effective_status: 'absent',
+          present: [],
+          missing: ['backend/app/payments.py', 'backend/app/ledger.py'],
+        },
+      }],
+    });
+    expect(result).toContain('## Capability Verification (advisory)');
+    expect(result).toContain('avoid hallucinating current behavior');
+    expect(result).toContain('do not treat missing code as a ban on proposing future work');
+    expect(result).toContain('**payments** (claimed status: working): CLAIMED-BUT-ABSENT');
+    expect(result).toContain('backend/app/payments.py, backend/app/ledger.py');
+  });
+
+  it('renders partial capabilities with missing and present paths', () => {
+    const result = buildCapabilityVerificationSection({
+      capabilities: [{
+        name: 'notifications',
+        status: 'partial',
+        verification: {
+          effective_status: 'partial',
+          present: ['backend/app/notify.py'],
+          missing: ['backend/app/notify_worker.py'],
+        },
+      }],
+    });
+    expect(result).toContain('**notifications** (claimed status: partial): PARTIAL');
+    expect(result).toContain('missing: backend/app/notify_worker.py; present: backend/app/notify.py');
   });
 });
 

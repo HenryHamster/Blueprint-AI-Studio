@@ -135,6 +135,81 @@ def test_capability_enum_validation():
         Capability(name="x", status="maybe")  # invalid status
 
 
+def test_capability_backing_paths_defaults_empty():
+    """Old-shape capability (no backing_paths) parses with an empty list, so
+    every stored model and older agent payload remains valid."""
+    cap = Capability(name="auth", status="working")
+    assert cap.backing_paths == []
+
+
+def test_capability_backing_paths_round_trips():
+    cap = Capability(
+        name="auth",
+        status="working",
+        backing_paths=["backend/app/auth.py", "backend/app/models.py"],
+    )
+    dumped = cap.model_dump()
+    assert dumped["backing_paths"] == [
+        "backend/app/auth.py",
+        "backend/app/models.py",
+    ]
+    restored = Capability.model_validate(dumped)
+    assert restored.backing_paths == cap.backing_paths
+
+
+def test_problem_model_round_trip_preserves_backing_paths():
+    """Full ProblemModel round-trip keeps capability backing_paths intact."""
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="auth",
+                status="working",
+                backing_paths=["backend/app/auth.py"],
+            ),
+            Capability(name="legacy", status="partial"),  # old shape, no paths
+        ]
+    )
+    raw = model.model_dump()
+    restored = parse_problem_model(raw)
+    assert restored.capabilities[0].backing_paths == ["backend/app/auth.py"]
+    assert restored.capabilities[1].backing_paths == []
+
+
+def test_old_shape_problem_model_with_capabilities_parses():
+    """A stored problem_model whose capabilities predate backing_paths still
+    validates cleanly (backward compatibility)."""
+    raw = {
+        "revision": 3,
+        "capabilities": [
+            {"name": "CapA", "status": "working", "notes": "stable"},
+            {"name": "CapB", "status": "planned"},
+        ],
+    }
+    model = parse_problem_model(raw)
+    assert all(c.backing_paths == [] for c in model.capabilities)
+
+
+def test_apply_agent_update_unaffected_by_backing_paths_only_change():
+    """A capability that only adds/changes backing_paths (status unchanged)
+    is not reported as a capability status change by _compute_diff."""
+    current = {
+        "revision": 1,
+        "capabilities": [{"name": "CapA", "status": "working"}],
+    }
+    proposed = {
+        "capabilities": [
+            {
+                "name": "CapA",
+                "status": "working",  # unchanged
+                "backing_paths": ["backend/app/foo.py"],  # newly linked
+            }
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert "capabilities_changed" not in diff
+    assert new_raw["capabilities"][0]["backing_paths"] == ["backend/app/foo.py"]
+
+
 def test_is_empty_detects_meaningful_content():
     empty = ProblemModel()
     assert is_empty(empty)

@@ -566,6 +566,21 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             await _maybe_create_failure_alert(
                 parent, session, parent.latest_status_message
             )
+            # When the parent failed because every subtask is blocked on an
+            # upstream precondition (not a code failure), raise one
+            # deduplicated, operator-visible precondition-blocker alert so the
+            # real cause is surfaced instead of just a generic FAILED state.
+            if parent_class == BLOCKED_PRECONDITION:
+                from app.alert_dispatch import (
+                    _maybe_create_precondition_blocker_alert,
+                )
+
+                await _maybe_create_precondition_blocker_alert(
+                    parent,
+                    session,
+                    blocker_kind="upstream dependency",
+                    detail=parent.latest_status_message,
+                )
             await broadcast_to_project(
                 str(parent.project_id),
                 "task_updated",

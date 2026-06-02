@@ -1243,6 +1243,19 @@ ${hotspotsSection}
     } else {
       lines.push(`System ${strVal(dirDesignCtx.system_id as string)}: not yet documented in design doc`);
     }
+    const dirVerif = dirDesignCtx.verification as Record<string, unknown> | undefined;
+    if (dirVerif) {
+      const vstatus = strVal(dirVerif.status as string);
+      const missing = Array.isArray(dirVerif.missing) ? dirVerif.missing as string[] : [];
+      const present = Array.isArray(dirVerif.present) ? dirVerif.present as string[] : [];
+      if (vstatus === 'claimed_absent') {
+        lines.push(`⚠️ CODE VERIFICATION: this system is CLAIMED-BUT-ABSENT — every declared module is missing from the integration branch. Treat its status as effectively missing/unverified and design from what actually exists. Missing: ${missing.join(', ')}`);
+      } else if (vstatus === 'partial') {
+        lines.push(`⚠️ CODE VERIFICATION: this system is PARTIAL — some declared modules are missing. Verify before relying on the claimed status. Missing: ${missing.join(', ')}; Present: ${present.join(', ')}`);
+      } else if (vstatus === 'verified') {
+        lines.push(`CODE VERIFICATION: all ${present.length} declared module(s) exist on the integration branch (status verified).`);
+      }
+    }
     const missingCaps = reconcileMissingCapabilities(
       dirDesignCtx.missing_capabilities as Record<string, Record<string, string>> | undefined,
       WORKSPACE,
@@ -1272,6 +1285,50 @@ Available sections (use \`./design-doc get <key>\` to read): ${docKeys.join(', '
 
 ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
 `;
+  }
+
+  // System verification: backend checked each design-doc system's declared
+  // module paths against the integration-branch file tree. Surface flagged
+  // (claimed-but-absent / partial) systems prominently so tactical research
+  // reasons about what actually exists instead of trusting a stale status.
+  let systemVerificationSection = '';
+  const sysVerif = payload.system_verification as Record<string, Record<string, unknown>> | undefined;
+  if (sysVerif && Object.keys(sysVerif).length > 0) {
+    const absent: string[] = [];
+    const partial: string[] = [];
+    const verified: string[] = [];
+    for (const sysId of Object.keys(sysVerif).sort()) {
+      const v = sysVerif[sysId];
+      const status = strVal(v.status as string);
+      const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
+      const present = Array.isArray(v.present) ? v.present as string[] : [];
+      const claimed = strVal(v.claimed_status as string);
+      const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
+      if (status === 'claimed_absent') {
+        absent.push(`- **${sysId}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared module(s) missing: ${missing.join(', ')}`);
+      } else if (status === 'partial') {
+        partial.push(`- **${sysId}**${claimedNote}: PARTIAL — missing: ${missing.join(', ')}; present: ${present.join(', ')}`);
+      } else if (status === 'verified') {
+        verified.push(`- **${sysId}**: verified — ${present.length} declared module(s) exist`);
+      }
+    }
+    if (absent.length > 0 || partial.length > 0 || verified.length > 0) {
+      const vlines: string[] = ['# SYSTEM VERIFICATION (code existence vs. design-doc claims)'];
+      vlines.push('The backend verified each design-doc system\'s declared module paths against the integration-branch file tree. Do NOT trust a system\'s status over this evidence — if a system is flagged below, treat its claimed status as unreliable and design from what actually exists.');
+      if (absent.length > 0) {
+        vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');
+        vlines.push(...absent);
+      }
+      if (partial.length > 0) {
+        vlines.push('\n## ⚠️ Partial (some declared modules missing)');
+        vlines.push(...partial);
+      }
+      if (verified.length > 0) {
+        vlines.push('\n## Verified (all declared modules present)');
+        vlines.push(...verified);
+      }
+      systemVerificationSection = vlines.join('\n') + '\n\n';
+    }
   }
 
   const researchRetryContext = buildRetryContext(task);
@@ -1314,7 +1371,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 # CODEBASE CONTEXT
 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
-${designDocHighlight}${designDocSection}# DIRECTIONS
+${designDocHighlight}${designDocSection}${systemVerificationSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these

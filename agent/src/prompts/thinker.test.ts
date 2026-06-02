@@ -99,6 +99,22 @@ describe('buildThinkerPrompt', () => {
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
   });
 
+  it('renders verificationFailuresSection before # Your job when provided', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      verificationFailuresSection: '\n## Capability Verification (advisory)\nflagged capability\n',
+    });
+    const verificationIdx = prompt.indexOf('## Capability Verification (advisory)');
+    const jobIdx = prompt.indexOf('# Your job');
+    expect(verificationIdx).toBeGreaterThan(-1);
+    expect(verificationIdx).toBeLessThan(jobIdx);
+  });
+
+  it('omits verificationFailuresSection when empty', () => {
+    const prompt = buildThinkerPrompt({ ...base, verificationFailuresSection: '' });
+    expect(prompt).not.toContain('## Capability Verification (advisory)');
+  });
+
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
     const prompt = buildThinkerPrompt({
       ...base,
@@ -172,6 +188,12 @@ describe('buildThinkerPrompt', () => {
     // Agents must cite sources on gaps/directions so dedup logic can trace provenance
     expect(prompt).toMatch(/source.*user_message/);
     expect(prompt).toContain('Cite sources');
+  });
+
+  it('requires capabilities to round-trip backing_paths', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('backing_paths');
+    expect(prompt).toContain('Emit `backing_paths: []` instead of dropping the field');
   });
 
   it('includes retire-direction instruction language', () => {

@@ -420,6 +420,63 @@ async def _maybe_create_escalation_alert(
     )
 
 
+async def _maybe_create_precondition_blocker_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    blocker_kind: str,
+    detail: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert for a persistent precondition blocker.
+
+    Fires when a *recognized* precondition blocker won't clear on its own: a
+    task deferred on the same file / pending-rollup conflict across repeated
+    dispatch cycles (see ``orchestrator_filters._record_defer_and_maybe_escalate``),
+    or a parent that exhausts its requeues on an upstream-dependency blocker
+    rather than a code failure (see ``task_lifecycle_requeue._requeue_parent_task``).
+
+    Surfaces the blocker in the same Alerts banner as review-fix escalations,
+    *regardless* of approval-gate settings, so a blocked task is visible instead
+    of silently deferring forever or quietly landing in a generic FAILED state.
+    Alerting only — it does not attempt to resolve the blocker.
+
+    Deduplicated by ``(task_id, title)``. The title encodes the blocker
+    identity via ``blocker_kind`` (e.g. the overlapping files or the blocking
+    rollup title), so a blocker that persists across many dispatch cycles
+    raises exactly ONE alert. A genuinely *different* blocker on the same task
+    (distinct ``blocker_kind``) gets its own alert.
+    """
+    title = f"Precondition blocker: {blocker_kind}"[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=severity,
+        title=title,
+        message=detail[:1000],
+        task_id=task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

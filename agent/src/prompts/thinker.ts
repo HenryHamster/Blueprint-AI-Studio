@@ -45,6 +45,7 @@ export interface ThinkerPromptParams {
   packerMetaSection: string;
   strategicContext: string;
   problemModelSection: string;
+  verificationFailuresSection?: string;
   reflectionSection: string;
   selfImprovementBlock: string;
   runningUpdateSection: string;
@@ -82,6 +83,7 @@ ${p.userStateLine}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
 ${p.problemModelSection}
+${p.verificationFailuresSection ? `\n${p.verificationFailuresSection}\n` : ''}
 
 ${p.reflectionSection}
 
@@ -228,9 +230,11 @@ Write the full updated problem_model as JSON to \`/tmp/problem_model_${p.taskId}
 - intent: {purpose, current_focus, source?}
 - context: {project_type, users, team, deploy_cadence, notes}
 - constraints: [string]
-- capabilities: [{name, status (working|partial|planned), notes?, source?}]
+- capabilities: [{name, status (working|partial|planned), notes?, source?, backing_paths}]
 - gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history}]
 - friction: [{id, name, description, seen_in, status, source?, promoted_to_gap_id?}]
+
+For every capability, preserve existing \`backing_paths\` and add repo-relative file paths when the code implementing that capability is known. Emit \`backing_paths: []\` instead of dropping the field when the implementation is still unknown.
 
 Source = {type (user_message|friction_promotion|agent_observation|self_reflection|shipped_change|direction_outcome), message_id?, excerpt?, pr_number?, direction_id?, friction_id?}
 
