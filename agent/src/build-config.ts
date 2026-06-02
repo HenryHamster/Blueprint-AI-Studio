@@ -88,6 +88,20 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     if (prefixes.length > 0) config.staging_branch_prefixes = prefixes;
   }
 
+  // Per-project feature-branch namespace. The orchestrator operates on the
+  // branch it derives as `${task_branch_namespace}/<type>-<id>`; if the agent
+  // drops this field it falls back to the "blueprint" default in
+  // setupWorkspace, so every branch diverges from what the orchestrator looks
+  // for — orphaning the PR on any non-Blueprint repo (the namespace-divergence
+  // bug). Accept only a single branch-safe slug ([a-z0-9-], no '/'), matching
+  // the backend's _derive_task_branch_namespace slugifier.
+  if (
+    typeof raw.task_branch_namespace === 'string' &&
+    /^[a-z0-9][a-z0-9-]{0,39}$/.test(raw.task_branch_namespace)
+  ) {
+    config.task_branch_namespace = raw.task_branch_namespace;
+  }
+
   // Project-specific migration layout (alembic versions dir, models dir,
   // schema-revision file/constant). Each entry is path/identifier-shaped and
   // gets interpolated into the migrate prompt, so apply the same

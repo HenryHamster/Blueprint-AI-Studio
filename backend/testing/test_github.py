@@ -3493,3 +3493,209 @@ async def test_get_repo_default_branch_missing_key_raises_502(mocker):
         await get_repo_default_branch("tok", "acme", "repo")
     assert exc_info.value.status_code == 502
     assert "default_branch" in exc_info.value.detail
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# submit_pr_review — 422 disambiguation (self-authored vs. bad inline comments)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _patch_get_pr(mocker, sha="abc123"):
+    """Stub get_pull_request so submit_pr_review can read head.sha."""
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": sha}, "user": {"login": "blueprint[bot]"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_submit_pr_review_self_authored_downgrades_to_comment(mocker):
+    """
+    A self-authored PR rejects APPROVE/REQUEST_CHANGES with a 422 whose body
+    says "your own pull request". submit_pr_review must downgrade the event to
+    COMMENT and retry — posting a clean review with NO futile strip-comments
+    retry and NO surfaced error. Exactly two POSTs (original + COMMENT retry).
+    """
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(
+                422,
+                {"message": "Unprocessable"},
+                text="Can not request changes on your own pull request",
+            ),
+            MockResponse(200, {"id": 555, "state": "COMMENTED"}),
+        ],
+    )
+
+    inline = [{"path": "a.py", "line": 3, "body": "[MAJOR] x"}]
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 42, "REQUEST_CHANGES", "verdict body", inline
+    )
+
+    assert result == {"id": 555, "state": "COMMENTED"}
+    # Exactly two POSTs: original REQUEST_CHANGES, then the COMMENT retry.
+    assert req.await_count == 2
+    first_kwargs = req.await_args_list[0].kwargs
+    second_kwargs = req.await_args_list[1].kwargs
+    assert first_kwargs["json"]["event"] == "REQUEST_CHANGES"
+    assert second_kwargs["json"]["event"] == "COMMENT"
+    # Verdict body preserved, and inline comments NOT stripped (they weren't the cause).
+    assert second_kwargs["json"]["body"] == "verdict body"
+    assert second_kwargs["json"]["comments"] == inline
+
+
+@pytest.mark.asyncio
+async def test_submit_pr_review_self_authored_approve_downgrades_to_comment(mocker):
+    """Same self-review handling for an APPROVE verdict."""
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(
+                422, {}, text="Can not approve your own pull request"
+            ),
+            MockResponse(200, {"id": 1}),
+        ],
+    )
+
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 7, "APPROVE", "LGTM", []
+    )
+
+    assert result == {"id": 1}
+    assert req.await_count == 2
+    assert req.await_args_list[0].kwargs["json"]["event"] == "APPROVE"
+    assert req.await_args_list[1].kwargs["json"]["event"] == "COMMENT"
+
+
+@pytest.mark.asyncio
+async def test_submit_pr_review_different_author_keeps_request_changes(mocker):
+    """
+    When the PR author differs from the reviewing identity (external contributor
+    / future separate reviewer), a REQUEST_CHANGES review succeeds on the first
+    POST and the event is NEVER downgraded to COMMENT.
+    """
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"id": 9, "state": "CHANGES_REQUESTED"}),
+    )
+
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 12, "REQUEST_CHANGES", "please fix", []
+    )
+
+    assert result == {"id": 9, "state": "CHANGES_REQUESTED"}
+    # Single POST, event unchanged.
+    assert req.await_count == 1
+    assert req.await_args_list[0].kwargs["json"]["event"] == "REQUEST_CHANGES"
+
+
+@pytest.mark.asyncio
+async def test_submit_pr_review_bad_inline_comments_strips_and_retries(mocker):
+    """
+    A 422 that is NOT a self-review (e.g. an inline comment anchored outside the
+    diff) must still strip the inline comments and retry with the ORIGINAL event,
+    preserving the legacy behavior.
+    """
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(
+                422,
+                {"message": "Validation Failed"},
+                text="pull_request_review_thread.line must be part of the diff",
+            ),
+            MockResponse(200, {"id": 77, "state": "CHANGES_REQUESTED"}),
+        ],
+    )
+
+    inline = [{"path": "z.py", "line": 9999, "body": "[MINOR] y"}]
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 5, "REQUEST_CHANGES", "body", inline
+    )
+
+    assert result == {"id": 77, "state": "CHANGES_REQUESTED"}
+    assert req.await_count == 2
+    # Event preserved (NOT downgraded), inline comments stripped on retry.
+    assert req.await_args_list[1].kwargs["json"]["event"] == "REQUEST_CHANGES"
+    assert req.await_args_list[1].kwargs["json"]["comments"] == []
+
+
+@pytest.mark.asyncio
+async def test_submit_pr_review_self_authored_then_bad_comments(mocker):
+    """
+    Both 422 causes can compound: a self-authored PR whose COMMENT retry then
+    trips the inline-comment 422. The handler downgrades to COMMENT, then strips
+    comments — three POSTs total — and still posts a review.
+    """
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(422, {}, text="Can not approve your own pull request"),
+            MockResponse(
+                422, {}, text="line must be part of the diff"
+            ),
+            MockResponse(201, {"id": 3, "state": "COMMENTED"}),
+        ],
+    )
+
+    inline = [{"path": "z.py", "line": 9999, "body": "bad"}]
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 8, "APPROVE", "body", inline
+    )
+
+    assert result == {"id": 3, "state": "COMMENTED"}
+    assert req.await_count == 3
+    assert req.await_args_list[1].kwargs["json"]["event"] == "COMMENT"
+    assert req.await_args_list[2].kwargs["json"]["event"] == "COMMENT"
+    assert req.await_args_list[2].kwargs["json"]["comments"] == []
+
+
+@pytest.mark.asyncio
+async def test_submit_pr_review_404_returns_none(mocker):
+    """A 404 from the reviews endpoint returns None (PR gone)."""
+    from app.github import submit_pr_review
+
+    _patch_get_pr(mocker)
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(404, {}, text="Not Found"),
+    )
+
+    result = await submit_pr_review(
+        "tok", "owner", "repo", 404, "REQUEST_CHANGES", "body", []
+    )
+    assert result is None
+
+
+def test_is_self_review_422_signal():
+    """Unit-level guard for the self-review signal detector."""
+    from app.github_issues import _is_self_review_422
+
+    assert _is_self_review_422("Can not request changes on your own pull request")
+    assert _is_self_review_422("Can not approve your own pull request")
+    assert _is_self_review_422("YOUR OWN PULL REQUEST")  # case-insensitive
+    assert not _is_self_review_422("line must be part of the diff")
+    assert not _is_self_review_422("")

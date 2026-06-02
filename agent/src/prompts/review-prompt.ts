@@ -28,6 +28,18 @@ export const REVIEW_FILE_RESTRICTIONS_NOTE = 'Check that the changes respect the
 export const REVIEW_HISTORY_INTRO = 'Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):';
 export const REVIEW_ITERATION_PRIOR_NOTE = '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.';
 
+// Delta-focus guidance for iteration ≥2. Round 1 keeps the full-PR-diff,
+// full-rigor review (this fragment is NOT emitted then). From round 2 onward the
+// reviewer would otherwise re-scan the entire PR every round and re-derive the
+// same already-handed-off issues — "verification-only" drift that produces
+// another REQUEST_CHANGES with no new code defect. This fragment scopes later
+// rounds to the changes the fix agent just made plus the unresolved set, without
+// lowering the bar: a genuinely-unresolved prior blocker or a NEW blocker the
+// delta introduced still blocks merge.
+export const REVIEW_DELTA_FOCUS_NOTE = (
+  `\nDelta-focus (iteration ≥2): the prior issues were handed to a fixer. Concentrate on the changes since the last fix commit — run \`git log --oneline -5\` and \`git diff HEAD~1...HEAD\` (or the range from the last fix commit to HEAD) to see what the fixer just touched. Verify each prior blocker is resolved in that delta, and only raise a NEW blocker if the delta introduced one OR a prior blocker is genuinely unresolved. Do NOT re-litigate already-addressed issues, out-of-scope concerns, or pre-existing code the fixer did not touch. The full-PR re-scan already happened in iteration 1; repeating it every round burns the iteration budget without finding new defects.`
+);
+
 function buildReviewBudgetMidHint(maxIters: number): string {
   return `\nBudget-awareness: you are at or past 50% of the ${maxIters}-iteration budget. Do NOT flag MINOR-severity issues — every iteration now costs a meaningful fraction of remaining budget and cosmetic nits are not worth a round trip. Focus only on CRITICAL and MAJOR findings. If only MINOR issues remain, APPROVE and note them as non-blocking polish in \`feedback\`.`;
 }
@@ -42,7 +54,8 @@ export function buildReviewIterationPreamble(
   const budgetHint = midBudget ? buildReviewBudgetMidHint(maxIters) : '';
   const smallHint = smallScopeEarly ? REVIEW_SMALL_SCOPE_EARLY_HINT : '';
   const priorNote = iteration > 1 ? REVIEW_ITERATION_PRIOR_NOTE : '';
-  return `This is review iteration ${iteration} of ${maxIters} in the automated review-fix cycle.${priorNote}${budgetHint}${smallHint}`;
+  const deltaFocus = iteration > 1 ? REVIEW_DELTA_FOCUS_NOTE : '';
+  return `This is review iteration ${iteration} of ${maxIters} in the automated review-fix cycle.${priorNote}${deltaFocus}${budgetHint}${smallHint}`;
 }
 
 export const REVIEW_QA_FOCUS_HINT = 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n';

@@ -60,6 +60,38 @@ def is_warm_pool_enabled() -> bool:
     return bool(_runtime_config.get("warm_pool_enabled", False))
 
 
+def is_warm_pool_account_retarget_enabled() -> bool:
+    """True iff the pool may lease an ACCOUNT-MISMATCHED idle member.
+
+    Master gate for the account-agnostic lease: when on, a same-tenant idle
+    member may be leased for a task whose resolved account differs from the
+    member's frozen boot account, and the warm-claim path re-materializes the
+    resolved account's credentials before the role runs (see
+    ``max_plan_pool.build_account_retarget_manifest`` +
+    ``agent_warm_continuity``). Defaults False so the pool stays STRICT-equality
+    (today's behavior) until the agent-side re-materialize step ships — a
+    relaxed lease WITHOUT working re-materialization would silently run the task
+    on the member's wrong frozen credentials, so the relaxation and the
+    re-target capability MUST be enabled together by the operator.
+    """
+    return bool(_runtime_config.get("warm_pool_account_retarget_enabled", False))
+
+
+def is_warm_pool_cross_provider_retarget_enabled() -> bool:
+    """True iff an account-mismatched lease may also cross PROVIDERS.
+
+    Cross-provider re-target (Anthropic<->OpenAI<->Gemini) additionally requires
+    the agent to re-materialize the provider / auth-mode / execution-mode
+    constants, not just the secret files. Defaults False so account retarget (on
+    its own) stays restricted to SAME-provider same-tenant idle members until
+    the cross-provider agent capability lands. Only meaningful when
+    :func:`is_warm_pool_account_retarget_enabled` is also on.
+    """
+    return bool(
+        _runtime_config.get("warm_pool_cross_provider_retarget_enabled", False)
+    )
+
+
 async def register_pool_vm(
     session,
     *,
@@ -203,6 +235,36 @@ async def count_live_pool_vms(
     return int((await session.execute(stmt)).scalar() or 0)
 
 
+async def is_pool_cost_guard_engaged(session) -> bool:
+    """True iff the cost-aware auto-drain guard is currently engaged.
+
+    Cheap LIVE check — the in-memory dispatch funnel (lease-hit rate) plus a
+    single pool idle-cost aggregate, never the once-per-day efficiency snapshot —
+    so the dispatch hook can pause leasing the MOMENT the pool's idle spend stops
+    being amortized by warm-start hits, rather than waiting for the next
+    maintainer tick (~120s) to drain idle members. Delegates the threshold logic
+    to ``warm_pool_maintainer.evaluate_pool_cost_guard`` so the lease side (here)
+    and the provision side (the maintainer's reconcile) engage on the SAME
+    configurable thresholds and disengage together once a healthy hit rate
+    returns. Deferred import avoids a warm_pool <-> warm_pool_maintainer cycle.
+
+    Degrades OPEN (returns False) on any evaluation error so a transient signal
+    hiccup can never wedge the pool shut — the failure-based circuit breaker and
+    the maintainer drain remain as backstops.
+    """
+    try:
+        from app.warm_pool_maintainer import evaluate_pool_cost_guard
+
+        guard = await evaluate_pool_cost_guard(session, runtime_config=_runtime_config)
+        return bool(guard.get("engaged"))
+    except Exception:
+        logger.debug(
+            "[WARM-POOL] cost-guard evaluation failed; treating as disengaged",
+            exc_info=True,
+        )
+        return False
+
+
 def is_pool_vm_image_stale(member: PoolVm, stale_vm_ids: set[str]) -> bool:
     """True iff a pool member is running a stale agent image.
 
@@ -224,6 +286,8 @@ async def lease_idle_pool_vm(
     excluded_account_ids: Optional[list[str]] = None,
     leased_task_id: Optional[uuid.UUID] = None,
     lease_ttl_secs: Optional[int] = None,
+    allow_account_mismatch: bool = False,
+    allow_provider_mismatch: bool = False,
 ) -> Optional[PoolVm]:
     """Atomically lease an IDLE, compatible, same-tenant pool member, or None.
 
@@ -251,6 +315,19 @@ async def lease_idle_pool_vm(
         the warm claim runs straight into the rate limit. NULL-account members are
         never blacklisted and stay eligible.
 
+    Account-agnostic relaxation (``allow_account_mismatch`` /
+    ``allow_provider_mismatch``): when ``allow_account_mismatch`` is True the
+    account AND model equality gates are dropped, so ANY same-tenant idle member
+    can be claimed for the task and its credentials are re-targeted to the
+    resolved account at claim time (see ``agent_warm_continuity`` +
+    ``build_account_retarget_manifest``). ``allow_provider_mismatch`` additionally
+    drops the provider gate (cross-provider re-target). The HARD guarantees are
+    NEVER relaxed: the ``project_id`` tenant gate and the ``excluded_account_ids``
+    blacklist always apply. These flags default False, preserving strict equality;
+    the caller (``try_pool_dispatch``) only sets them when the operator has
+    enabled re-target AND the claim path will emit the re-materialization
+    manifest, so a relaxed lease can never run on the wrong frozen credentials.
+
     The caller owns the transaction (commit). Returns the locked, now-LEASED
     member, or None when no compatible IDLE member is free.
     """
@@ -258,11 +335,15 @@ async def lease_idle_pool_vm(
         PoolVm.project_id == project_id,
         PoolVm.state == PoolVmState.IDLE,
     ]
-    if account_id is not None:
+    # Account + model are re-targeted together by the claim-time manifest, so
+    # both gates relax under allow_account_mismatch; provider relaxes only with
+    # the additional cross-provider flag (it also needs the agent to swap the
+    # provider/auth-mode constants).
+    if account_id is not None and not allow_account_mismatch:
         filters.append(PoolVm.account_id == account_id)
-    if provider is not None:
+    if provider is not None and not allow_provider_mismatch:
         filters.append(PoolVm.provider == provider)
-    if model is not None:
+    if model is not None and not allow_account_mismatch:
         filters.append(PoolVm.model == model)
     if excluded_account_ids:
         _excluded = set(excluded_account_ids)
@@ -389,6 +470,7 @@ async def try_pool_dispatch(
     required_provider: str | None = None,
     required_model: str | None = None,
     required_account: str | None = None,
+    required_auth_mode: str | None = None,
     excluded_account_ids: list[str] | None = None,
     lease_ttl_secs: int | None = None,
 ) -> PoolVm | None:
@@ -435,6 +517,15 @@ async def try_pool_dispatch(
         record_pool_lease_miss("suppressed")
         return None
 
+    # Cost-aware auto-drain: pause leasing while the pool's idle spend is not
+    # being amortized by warm-start hits, so an unattended pool can't regress
+    # cost-per-PR in the window before the maintainer drains idle members. The
+    # guard reverses on its own (here and in the maintainer) once the hit rate
+    # recovers above the configured floor.
+    if await is_pool_cost_guard_engaged(session):
+        record_pool_lease_miss("cost_guard")
+        return None
+
     # The required identity is the caller's RESOLVED LLM selection (provider /
     # model / account post-routing, honoring the blacklist) — NOT the task's raw
     # context. The pool VM runs on the credentials baked into its boot manifest,
@@ -442,6 +533,17 @@ async def try_pool_dispatch(
     # compatible with the VM's pinned identity (the lease helper treats a None
     # requirement as a wildcard for that dimension, and never leases a member
     # pinned to an account in ``excluded_account_ids``).
+    # Account-agnostic lease (efficiency direction d-5fd69fe1). When the operator
+    # has enabled account re-target, relax the account (+ model) equality gate so
+    # ONE small idle pool serves the project's whole account mix — the claim path
+    # re-materializes the resolved account's credentials before the role runs.
+    # Cross-provider relaxation is a further opt-in. Both default off, so the pool
+    # stays strict-equality until the agent re-materialize step ships; the HARD
+    # tenant + blacklist gates always apply (see lease_idle_pool_vm).
+    allow_account_mismatch = is_warm_pool_account_retarget_enabled()
+    allow_provider_mismatch = (
+        allow_account_mismatch and is_warm_pool_cross_provider_retarget_enabled()
+    )
     try:
         member = await lease_idle_pool_vm(
             session,
@@ -452,6 +554,8 @@ async def try_pool_dispatch(
             excluded_account_ids=excluded_account_ids,
             leased_task_id=task.id,
             lease_ttl_secs=lease_ttl_secs,
+            allow_account_mismatch=allow_account_mismatch,
+            allow_provider_mismatch=allow_provider_mismatch,
         )
     except Exception:
         logger.exception(
@@ -484,7 +588,14 @@ async def try_pool_dispatch(
         record_pool_lease_miss("doomed_vm")
         return None
 
-    _pin_task_to_pool_vm(task, member)
+    _pin_task_to_pool_vm(
+        task,
+        member,
+        resolved_account=required_account,
+        resolved_provider=required_provider,
+        resolved_auth_mode=required_auth_mode,
+        resolved_model=required_model,
+    )
     logger.info(
         "[WARM-POOL] dispatch hook leased member %s for task %s (project %s) — "
         "skipping cold provision",
@@ -495,27 +606,54 @@ async def try_pool_dispatch(
     return member
 
 
-def _pin_task_to_pool_vm(task: Task, member: PoolVm) -> None:
+def _pin_task_to_pool_vm(
+    task: Task,
+    member: PoolVm,
+    *,
+    resolved_account: str | None = None,
+    resolved_provider: str | None = None,
+    resolved_auth_mode: str | None = None,
+    resolved_model: str | None = None,
+) -> None:
     """Pin a QUEUED task to a leased pool VM so its agent claims it warm.
 
     Mirrors the chain-continuity warm pin (``warm_target_vm_id`` +
     ``warm_handoff_deadline``) so the orchestrator's skip-provision branch leaves
     the task QUEUED while the member is alive, and the member's /next-role poll
     finds it. Adds the ``warm_pool_pin`` marker so the claim is attributed to the
-    pool, and stamps the member's pinned LLM identity into context so per-account
-    concurrency accounting is correct (the reused VM runs on its boot account).
+    pool, and stamps the LLM identity the task will actually RUN ON into context
+    so per-account concurrency / cost accounting is correct.
+
+    The run identity is the task's RESOLVED account (``resolved_*``, post
+    LLM-routing) when the task pinned one — under the account-agnostic lease the
+    VM is re-targeted to that account at claim time, so accounting MUST attribute
+    to it, NOT the member's frozen boot account. When the task pinned no account
+    (account wildcard) there is nothing to re-target to, so the task runs on the
+    member's boot identity and we attribute to that instead.
     """
     from app.max_plan_pool import apply_task_llm_runtime_context
 
     task.vm_instance_id = member.vm_instance_id
     new_ctx = dict(task.context or {})
-    if member.account_id:
+    # Effective run identity: the resolved account the task will be re-targeted
+    # to (if any), else the member's frozen boot identity.
+    if resolved_account:
+        run_account = resolved_account
+        run_provider = resolved_provider
+        run_auth_mode = resolved_auth_mode
+        run_model = resolved_model
+    else:
+        run_account = member.account_id
+        run_provider = member.provider
+        run_auth_mode = member.auth_mode
+        run_model = member.model
+    if run_account:
         new_ctx = apply_task_llm_runtime_context(
             new_ctx,
-            account_id=member.account_id,
-            provider=member.provider,
-            auth_mode=member.auth_mode,
-            model=member.model,
+            account_id=run_account,
+            provider=run_provider,
+            auth_mode=run_auth_mode,
+            model=run_model,
         )
     new_ctx["warm_target_vm_id"] = member.vm_instance_id
     new_ctx[WARM_POOL_PIN_KEY] = True

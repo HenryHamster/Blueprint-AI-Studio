@@ -1653,3 +1653,72 @@ async def test_snapshot_persists_reuse_dropout_and_surfaces_trend(db_session):
     assert trend[0]["dominant_reason"] == "scan_file_conflict"
     assert trend[0]["dominant_share"] == result["reuse_dropout"]["dominant_dropout"]["share"]
     assert trend[0]["dropout_total"] == 6
+
+
+def test_compute_pool_cost_amortization_no_hits():
+    """No warm-start hit yet => idle spend is not amortized at all."""
+    from app.efficiency_snapshot import compute_pool_cost_amortization
+
+    funnel = {
+        "window_hours": 24,
+        "pool_lease_hits": 0,
+        "pool_hit_rate": 0.0,
+        "total_dispatches": 30,
+    }
+    result = compute_pool_cost_amortization(5.0, funnel)
+    assert result["pool_idle_cost_usd"] == 5.0
+    assert result["pool_lease_hits"] == 0
+    assert result["total_dispatches"] == 30
+    # No hits => cost-per-hit is undefined (not amortized).
+    assert result["cost_per_pool_hit_usd"] is None
+
+
+def test_compute_pool_cost_amortization_with_hits():
+    """Idle spend divided by warm-start hits gives the per-hit amortized cost."""
+    from app.efficiency_snapshot import compute_pool_cost_amortization
+
+    funnel = {
+        "window_hours": 24,
+        "pool_lease_hits": 4,
+        "pool_hit_rate": 0.4,
+        "total_dispatches": 10,
+    }
+    result = compute_pool_cost_amortization(6.0, funnel)
+    assert result["cost_per_pool_hit_usd"] == 1.5
+    assert result["pool_hit_rate"] == 0.4
+    assert result["window_hours"] == 24
+
+
+def test_compute_pool_cost_amortization_handles_none_idle():
+    """A None/zero idle cost is coerced to 0.0 without raising."""
+    from app.efficiency_snapshot import compute_pool_cost_amortization
+
+    result = compute_pool_cost_amortization(None, {"pool_lease_hits": 0})
+    assert result["pool_idle_cost_usd"] == 0.0
+    assert result["cost_per_pool_hit_usd"] is None
+    assert result["total_dispatches"] == 0
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_pool_cost_amortization(db_session):
+    """read_baseline_with_drift surfaces the pool cost-amortization companion."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    assert "pool_cost_amortization" in result
+    amort = result["pool_cost_amortization"]
+    assert "pool_idle_cost_usd" in amort
+    assert "pool_lease_hits" in amort
+    assert "cost_per_pool_hit_usd" in amort
+    # Fresh instance: no idle cost recorded and no hits => not amortized.
+    assert amort["pool_lease_hits"] == 0
+    assert amort["cost_per_pool_hit_usd"] is None

@@ -2506,6 +2506,7 @@ async def orchestrator_worker():
                                 if runtime_selection.account
                                 else None
                             ),
+                            required_auth_mode=runtime_selection.auth_mode,
                             excluded_account_ids=_effective_blacklist,
                         )
                         if _leased_member is not None:
