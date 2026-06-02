@@ -2224,6 +2224,13 @@ async def _maybe_trigger_strategic_after_qualification(
         return
     if result.get("status") not in _STRATEGIC_RETRIGGER_STATUSES:
         return
+    # Local import so this helper does not depend on a module-level
+    # `PayloadTooLargeError` import. On the integration branch release_qualifier.py
+    # is split into sub-modules and does NOT import this name at module scope, so a
+    # back-merge that grafts this function onto that structure would otherwise hit a
+    # NameError at the `except` below. payload_schemas defines it on both branches.
+    from app.payload_schemas import PayloadTooLargeError
+
     try:
         factory = session_factory or AsyncSessionLocal
         async with factory() as session:
