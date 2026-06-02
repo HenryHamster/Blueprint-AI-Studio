@@ -1,7 +1,13 @@
 """Tests for ground_design_doc_systems — durable file-tree grounding of
 design-doc systems/capabilities, mirroring the playbook stale-ref sweep."""
 
-from app.playbook_learning import ground_design_doc_systems
+import asyncio
+from unittest.mock import AsyncMock
+
+from app.playbook_learning import (
+    ground_design_doc_systems,
+    ground_design_doc_systems_branch_aware,
+)
 
 
 def _make_repo(tmp_path, *rel_paths):
@@ -27,6 +33,34 @@ def test_no_repo_root_is_noop():
 
     missing_root = ground_design_doc_systems(doc, "/nonexistent/path/xyz")
     assert missing_root["systems/auth"]["status"] == "mature"
+
+
+def test_branch_aware_grounding_works_without_local_checkout(monkeypatch):
+    """The backend-facing path grounds against the integration branch, not a checkout."""
+    monkeypatch.setattr(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        AsyncMock(return_value=False),
+    )
+    doc = {
+        "systems/auth": {
+            "status": "mature",
+            "modules": ["backend/app/gone.py"],
+        }
+    }
+    result = asyncio.run(
+        ground_design_doc_systems_branch_aware(
+            doc,
+            repo_root="",
+            token="ghs_tok",
+            owner="acme",
+            repo="widget",
+            branch="automain",
+        )
+    )
+    entry = result["systems/auth"]
+    assert entry["status"] == "missing"
+    assert "integration branch" in entry["presence_warning"]
+    assert result["_meta"]["updated_by"] == "design-doc-grounding"
 
 
 def test_system_all_modules_absent_downgraded(tmp_path):

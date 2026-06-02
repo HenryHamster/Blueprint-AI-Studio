@@ -1900,41 +1900,56 @@ async def claim_task(
                                     entry["stale"] = True
                                     entry["effectiveness_score"] = 0.0
                                 doc[full_key] = entry
-                        # Check file-path references (config-driven; skipped when unset)
-                        try:
-                            from app.playbook_learning import check_and_flag_stale_refs
-
-                            repo_root: str = (
-                                _shared_state.runtime_config.get(
-                                    "playbook_repo_root", ""
-                                )
-                                or ""
-                            )
-                            if repo_root:
-                                doc = check_and_flag_stale_refs(doc, repo_root)
-                        except Exception:  # noqa: BLE001 — best-effort, never block claim
-                            logger.debug(
-                                "[AGENT] Stale-ref check skipped (non-critical)"
-                            )
-                        # Ground design-doc systems/capabilities against the file
-                        # tree: persist a presence warning + downgrade when a
-                        # present-status entry's backing module files are all gone.
+                        # Ground stale playbook file refs AND present-status
+                        # design-doc systems/capabilities against the project's
+                        # REAL integration branch (GitHub contents API) — the same
+                        # mechanism the strategic/research reconcile uses — so the
+                        # downgrade persists even on the backend, which has no local
+                        # checkout. The old local-only path silently skipped on the
+                        # backend (empty playbook_repo_root), giving a false
+                        # impression that grounding occurred.
+                        #
+                        # The GitHub network I/O is kept OFF the per-claim hot path:
+                        # branch_grounding_due() bounds it to at most once per
+                        # cooldown window per project, and the whole pass is
+                        # best-effort (never blocks the claim). When GitHub creds do
+                        # not resolve the branch-aware helpers fall back to the local
+                        # checkout (a no-op when none is configured).
                         try:
                             from app.playbook_learning import (
-                                ground_design_doc_systems,
+                                branch_grounding_due,
+                                check_and_flag_stale_refs_branch_aware,
+                                ground_design_doc_systems_branch_aware,
+                                mark_branch_grounding_done,
                             )
 
-                            repo_root = (
-                                _shared_state.runtime_config.get(
-                                    "playbook_repo_root", ""
+                            if branch_grounding_due(doc):
+                                from app.source_ref_validation import (
+                                    resolve_branch_verification_context,
                                 )
-                                or ""
-                            )
-                            if repo_root:
-                                doc = ground_design_doc_systems(doc, repo_root)
+
+                                repo_root: str = (
+                                    _shared_state.runtime_config.get(
+                                        "playbook_repo_root", ""
+                                    )
+                                    or ""
+                                )
+                                verification_kwargs = (
+                                    await resolve_branch_verification_context(
+                                        session, _pb_proj
+                                    )
+                                )
+                                doc = await check_and_flag_stale_refs_branch_aware(
+                                    doc, repo_root=repo_root, **verification_kwargs
+                                )
+                                doc = await ground_design_doc_systems_branch_aware(
+                                    doc, repo_root=repo_root, **verification_kwargs
+                                )
+                                mark_branch_grounding_done(doc)
                         except Exception:  # noqa: BLE001 — best-effort, never block claim
                             logger.debug(
-                                "[AGENT] Design-doc grounding skipped (non-critical)"
+                                "[AGENT] Branch-aware design-doc grounding skipped "
+                                "(non-critical)"
                             )
                         try:
                             from app.playbook_learning import retire_idle_auto_entries

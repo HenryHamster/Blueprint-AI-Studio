@@ -2762,6 +2762,156 @@ async def test_design_doc_get_noop_when_github_credentials_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_design_doc_get_symbol_check_uses_github_branch_not_local_checkout(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # The symbol-level grounding (file present, cited symbol gone) must run
+    # against the project's real integration branch via the SAME GitHub context
+    # the file-level reconcile already resolves — not the absent local checkout.
+    # Here the backing file EXISTS on the branch (file-level pass survives) but
+    # its cited symbol is gone, so the entry must be downgraded to 'missing' via
+    # the GitHub content fetch, with no local-git call.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(
+            return_value={
+                "token": "gh-token",
+                "owner": "acme",
+                "repo": "widget",
+                "branch": "automain",
+                "project_id": "p-1",
+            }
+        ),
+    )
+    # File-level pass: the module file still exists on the branch.
+    monkeypatch.setattr(
+        srv, "_file_exists_in_repo_branch", AsyncMock(return_value=True)
+    )
+    # Symbol-level pass: GitHub returns the file content, but the cited symbol
+    # is NOT defined in it -> unambiguous absence. A local-git fallback would
+    # never reach this mock.
+    content_probe = AsyncMock(return_value=(True, "def something_else():\n    pass\n"))
+    monkeypatch.setattr(srv, "_file_content_in_repo_branch", content_probe)
+
+    project = Project(
+        name="Design Doc Symbol GitHub Grounding Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments.py:process_payment"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-symbol-gh",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-symbol-gh", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "missing"
+    assert "presence_warning" in value
+    assert "process_payment" in value["presence_warning"]
+    assert "[reconciled:" in value["description"]
+    # The GitHub content fetch — not a local git call — drove the symbol verdict.
+    content_probe.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_symbol_check_indeterminate_does_not_flag(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # Conservative semantics for the symbol-level path: when the GitHub content
+    # fetch is indeterminate (e.g. transient API error -> (None, None)), the
+    # symbol check must NOT flag, even though the file exists on the branch. The
+    # present-status entry is served as-is.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(
+            return_value={
+                "token": "gh-token",
+                "owner": "acme",
+                "repo": "widget",
+                "branch": "automain",
+                "project_id": "p-1",
+            }
+        ),
+    )
+    # File present on the branch (file-level pass survives).
+    monkeypatch.setattr(
+        srv, "_file_exists_in_repo_branch", AsyncMock(return_value=True)
+    )
+    # Symbol-level fetch is indeterminate -> never flags.
+    monkeypatch.setattr(
+        srv, "_file_content_in_repo_branch", AsyncMock(return_value=(None, None))
+    )
+
+    project = Project(
+        name="Design Doc Symbol Indeterminate Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments.py:process_payment"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-symbol-indet",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-symbol-indet", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    # Indeterminate symbol verdict => graceful no-op: entry served un-downgraded.
+    assert value["status"] == "functional"
+    assert value["description"] == "Payments system."
+    assert "presence_warning" not in value
+    assert "[reconciled:" not in value["description"]
+
+
+@pytest.mark.asyncio
 async def test_design_doc_get_leaves_present_system_entry_unchanged(
     client: AsyncClient, db_session
 ):
@@ -8097,6 +8247,78 @@ async def test_playbook_claim_stale_file_refs_deprioritised(
     assert keys.index("clean-entry") < keys.index("stale-entry"), (
         f"Expected clean-entry before stale-entry, got order: {keys}"
     )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_grounds_design_doc_against_integration_branch(
+    client: AsyncClient, db_session, mocker
+):
+    """On claim, a present-status system whose backing file is absent on the
+    REAL integration branch is downgraded to ``missing`` and persisted — even
+    though the backend has no local checkout (``playbook_repo_root`` empty).
+
+    This is the core regression: the old local-only grounding silently skipped
+    on the backend, so design-doc presence was never reconciled on this path.
+    """
+
+    # Branch verification context resolves to real GitHub creds…
+    async def _ctx(session, project):
+        return {
+            "token": "ghs_tok",
+            "owner": "acme",
+            "repo": "widget",
+            "branch": "automain",
+            "project_id": str(project.id),
+        }
+
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        side_effect=_ctx,
+    )
+    # …and the backing module is absent on that branch.
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = Project(name="Branch Grounding", user_id="test-user-branch-ground")
+    project.design_doc = {
+        "playbook/tip": {
+            "content": "a tip",
+            "confirmed_count": 1,
+            "reference_count": 1,
+            "applicable_types": ["create"],
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+        "systems/gone": {
+            "status": "functional",
+            "modules": ["backend/app/deleted_module.py"],
+            "description": "claims to be built",
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-branch-ground-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-branch-ground-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    entry = project.design_doc["systems/gone"]
+    assert entry["status"] == "missing"
+    assert "presence_warning" in entry
+    # The cooldown marker was stamped so a follow-up claim does not re-fire I/O.
+    assert project.design_doc.get("_meta", {}).get("last_branch_grounding_at")
 
 
 @pytest.mark.asyncio

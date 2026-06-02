@@ -128,10 +128,12 @@ async def _ground_design_doc_value(value: Any, key: str, **verification_kwargs: 
     downgrades the entry.
 
     *verification_kwargs* (branch/token/owner/repo/project_id, from
-    :func:`resolve_branch_verification_context`) ground the file-level reconcile
-    against the project's real integration branch via the GitHub API rather than
-    the orchestrator's local checkout. The symbol-level check remains a local
-    HEAD lookup (its only available source).
+    :func:`resolve_branch_verification_context`) ground BOTH the file-level
+    reconcile and the symbol-level absence check against the project's real
+    integration branch via the GitHub API rather than the orchestrator's local
+    checkout (which does not exist on the backend). When credentials are absent
+    the kwargs degrade to branch-only and both checks fall back to local git
+    HEAD, preserving the conservative indeterminate-never-flags semantics.
     """
     value = await _reconcile_design_doc_presence(value, key, **verification_kwargs)
     if not isinstance(value, dict) or not isinstance(key, str):
@@ -153,7 +155,9 @@ async def _ground_design_doc_value(value: Any, key: str, **verification_kwargs: 
     modules = value.get("modules")
     module_pointers = modules if isinstance(modules, list) else []
     absent = await _detect_absent_symbols(
-        module_pointers, [value.get("notes"), value.get("description")]
+        module_pointers,
+        [value.get("notes"), value.get("description")],
+        **verification_kwargs,
     )
     if not absent:
         return value

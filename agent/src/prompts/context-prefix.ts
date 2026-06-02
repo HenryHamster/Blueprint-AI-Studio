@@ -126,6 +126,49 @@ export function synthesizeFailureHotspots(
     .map(([file, count]) => ({ file, count }));
 }
 
+export function formatProjectVision(vision: Record<string, unknown> | undefined): string {
+  if (!vision || typeof vision !== 'object') return '';
+  const lines: string[] = ['## Project Vision'];
+  const purpose = strVal(vision.purpose);
+  if (purpose) lines.push(`**Purpose:** ${purpose}`);
+  const successCriteria = vision.success_criteria;
+  if (typeof successCriteria === 'string' && successCriteria) {
+    lines.push(`**Success criteria:** ${successCriteria}`);
+  } else if (Array.isArray(successCriteria) && successCriteria.length > 0) {
+    lines.push('**Success criteria:**');
+    for (const sc of successCriteria) {
+      const s = strVal(sc);
+      if (s) lines.push(`- ${s}`);
+    }
+  }
+  const priorities = Array.isArray(vision.priorities) ? vision.priorities as unknown[] : [];
+  if (priorities.length > 0) {
+    lines.push('**Priorities:**');
+    for (const p of priorities) {
+      const s = strVal(p);
+      if (s) lines.push(`- ${s}`);
+    }
+  }
+  const systems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
+  if (systems.length > 0) {
+    lines.push('**Systems:**');
+    for (const sys of systems) {
+      const name = strVal(sys.name);
+      if (!name) continue;
+      const status = strVal(sys.status);
+      const desc = strVal(sys.description);
+      const statusSuffix = status ? ` (${status})` : '';
+      const descSuffix = desc ? ` — ${desc}` : '';
+      lines.push(`- **${name}**${statusSuffix}${descSuffix}`);
+    }
+  }
+  const context = strVal(vision.context);
+  if (context) lines.push(`**Context:** ${context}`);
+  if (lines.length === 1) return '';
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
 // Render the operator's current strategic intent (purpose + current_focus) as
 // a distinct markdown section. Retained for the fix path (review-fix.ts), which
 // assembles its prompt manually and never calls buildContextPrefix. NOT called
@@ -157,49 +200,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
 
   // Project Vision — strategic "why" set by the strategic research agent.
   // Surfaced first so tactical agents can align their work to it.
-  const vision = task.vision as Record<string, unknown> | undefined;
-  if (vision && typeof vision === 'object') {
-    const vLines: string[] = ['## Project Vision'];
-    const purpose = strVal(vision.purpose);
-    if (purpose) vLines.push(`**Purpose:** ${purpose}`);
-    const successCriteria = vision.success_criteria;
-    if (typeof successCriteria === 'string' && successCriteria) {
-      vLines.push(`**Success criteria:** ${successCriteria}`);
-    } else if (Array.isArray(successCriteria) && successCriteria.length > 0) {
-      vLines.push('**Success criteria:**');
-      for (const sc of successCriteria) {
-        const s = strVal(sc);
-        if (s) vLines.push(`- ${s}`);
-      }
-    }
-    const priorities = Array.isArray(vision.priorities) ? vision.priorities as unknown[] : [];
-    if (priorities.length > 0) {
-      vLines.push('**Priorities:**');
-      for (const p of priorities) {
-        const s = strVal(p);
-        if (s) vLines.push(`- ${s}`);
-      }
-    }
-    const systems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
-    if (systems.length > 0) {
-      vLines.push('**Systems:**');
-      for (const sys of systems) {
-        const name = strVal(sys.name);
-        if (!name) continue;
-        const status = strVal(sys.status);
-        const desc = strVal(sys.description);
-        const statusSuffix = status ? ` (${status})` : '';
-        const descSuffix = desc ? ` — ${desc}` : '';
-        vLines.push(`- **${name}**${statusSuffix}${descSuffix}`);
-      }
-    }
-    const context = strVal(vision.context);
-    if (context) vLines.push(`**Context:** ${context}`);
-    if (vLines.length > 1) {
-      vLines.push('');
-      prefix += vLines.join('\n') + '\n';
-    }
-  }
+  prefix += formatProjectVision(task.vision as Record<string, unknown> | undefined);
 
   // Strategic Intent — the LIVE, operator-editable problem-model steering
   // (purpose, current focus, project context framing, active constraints).

@@ -20,7 +20,10 @@ from app.source_ref_validation import (
     summarize_broken_refs,
     validate_source_refs,
 )
-from app.research_completion import _apply_structural_actionability_downgrade
+from app.research_completion import (
+    _apply_structural_actionability_downgrade,
+    _summarize_ungrounded_claims_grounded,
+)
 from app.time_utils import _utcnow
 
 
@@ -505,8 +508,23 @@ class TestSourceRefValidation:
         validated = await validate_source_refs("not a list")
         assert validated == []
 
-    async def test_mixed_source_types(self):
-        """Batch with mixed source types is validated correctly."""
+    async def test_mixed_source_types(self, monkeypatch):
+        """Batch with mixed source types is validated correctly.
+
+        The existence check is mocked so the test does not depend on a local
+        /tmp/workspace checkout (absent in the backend test container). Under
+        the conservative degradation rules an unmocked missing file would be
+        indeterminate (None) and therefore NOT flagged — so the missing ref is
+        explicitly resolved to False here to exercise the invalid-marking path.
+        """
+        from app import source_ref_validation as srv
+
+        missing = "nonexistent/missing.py"
+        monkeypatch.setattr(
+            srv,
+            "_file_exists_at_head",
+            AsyncMock(side_effect=lambda path: path != missing),
+        )
         sources = [
             {
                 "type": "pr",
@@ -522,7 +540,7 @@ class TestSourceRefValidation:
             },
             {
                 "type": "file",
-                "ref": "nonexistent/missing.py",
+                "ref": missing,
             },
         ]
         validated = await validate_source_refs(sources)
@@ -576,6 +594,128 @@ class TestSourceRefValidation:
 
         monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
         assert await _symbol_defined_at_head("backend/app/example.py", "present_symbol") is None
+
+
+class TestSourceRefValidationBranchAware:
+    """validate_source_refs verifies against the project's REAL integration
+    branch (via the GitHub contents API) when a verification context is passed,
+    with a graceful local fallback, and NEVER marks a citation invalid on an
+    indeterminate result.
+    """
+
+    _CTX = {
+        "token": "tok",
+        "owner": "octo",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+
+    async def test_github_path_valid_file_not_flagged(self, monkeypatch):
+        """A file present on the integration branch is not flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 100))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert len(validated) == 1
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_github_path_absent_file_flagged(self, monkeypatch):
+        """A file unambiguously absent on the integration branch (404) is flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(False, None))
+        )
+        sources = [{"type": "file", "ref": "backend/app/gone.py"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") == False  # noqa: E712
+
+    async def test_github_path_line_out_of_range_flagged(self, monkeypatch):
+        """A line number beyond the branch file's length is flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 10))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:99"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") == False  # noqa: E712
+
+    async def test_github_path_line_within_range_not_flagged(self, monkeypatch):
+        """A line number within the branch file's length is not flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 200))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:42-50"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_github_path_indeterminate_existence_never_invalid(self, monkeypatch):
+        """An indeterminate existence result (None) never marks the ref invalid.
+
+        This is the core prod fix: a backend with no checkout and a GitHub
+        API error must NOT collapse every citation into file-not-found.
+        """
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(None, None))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:42"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_github_path_indeterminate_line_count_never_invalid(self, monkeypatch):
+        """File exists but its line count is indeterminate → line ref not flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, None))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:9999"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_partial_context_falls_back_to_local(self, monkeypatch):
+        """An incomplete GitHub context falls back to the local HEAD checker."""
+        from app import source_ref_validation as srv
+
+        content_spy = AsyncMock(return_value=(False, None))
+        monkeypatch.setattr(srv, "_file_content_in_repo_branch", content_spy)
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=True))
+        sources = [{"type": "file", "ref": "backend/app/foo.py"}]
+        # owner/repo/branch present but token missing → not use_repo_branch.
+        validated = await validate_source_refs(
+            sources, owner="octo", repo="repo", branch="integration"
+        )
+        assert validated[0].get("valid") != False  # noqa: E712
+        content_spy.assert_not_awaited()
+
+    async def test_local_fallback_indeterminate_never_invalid(self, monkeypatch):
+        """Local-path indeterminate (no checkout → None) never marks invalid."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=None))
+        sources = [{"type": "file", "ref": "backend/app/foo.py:42"}]
+        validated = await validate_source_refs(sources)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_malformed_range_flagged_regardless_of_tree(self, monkeypatch):
+        """end < start is intrinsically malformed and flagged even on the branch path."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 500))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:50-10"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") == False  # noqa: E712
 
 
 class TestUngroundedClaimDetection:
@@ -702,6 +842,102 @@ class TestUngroundedClaimDetection:
         result = await summarize_ungrounded_claims(claims, sources)
         assert result is not None
         # Source excerpts increment ungrounded_refs but NOT ungrounded_claim_count
+        assert result["ungrounded_claim_count"] == 0
+        assert "backend/app/module.py:missing_func" in result["ungrounded_refs"]
+
+
+class TestUngroundedClaimsGroundedAgainstBranch:
+    """_summarize_ungrounded_claims_grounded threads the GitHub repo/branch
+    verification context through to the symbol check so symbol grounding runs
+    against the real integration branch, with a conservative local fallback."""
+
+    _CTX = {
+        "token": "tok",
+        "owner": "octo",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+
+    async def test_github_context_absent_symbol_flagged(self, monkeypatch):
+        """With GitHub creds, an absent symbol on the branch is flagged via the
+        GitHub content fetch (the local checkout is never consulted)."""
+        from app import source_ref_validation as srv
+
+        fetch = AsyncMock(return_value=(True, "def other_func():\n    pass\n"))
+        monkeypatch.setattr(srv, "_file_content_in_repo_branch", fetch)
+        # Local git must never be touched on the GitHub-context path.
+        monkeypatch.setattr(
+            srv.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=AssertionError("local git used on GitHub path")),
+        )
+
+        result = await _summarize_ungrounded_claims_grounded(
+            ["backend/app/module.py:missing_symbol is the entry point"],
+            None,
+            self._CTX,
+        )
+        assert result is not None
+        assert result["ungrounded_claim_count"] == 1
+        assert "backend/app/module.py:missing_symbol" in result["ungrounded_refs"]
+        # Context threaded through to the content fetch.
+        assert fetch.await_count >= 1
+        _, kwargs = fetch.call_args
+        assert kwargs["branch"] == "integration"
+        assert kwargs["owner"] == "octo"
+
+    async def test_github_context_present_symbol_not_flagged(self, monkeypatch):
+        """A symbol present on the branch is grounded → None."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv,
+            "_file_content_in_repo_branch",
+            AsyncMock(return_value=(True, "def present_func():\n    return True\n")),
+        )
+        result = await _summarize_ungrounded_claims_grounded(
+            ["backend/app/module.py:present_func implements the logic"],
+            None,
+            self._CTX,
+        )
+        assert result is None
+
+    async def test_indeterminate_check_never_flags(self, monkeypatch):
+        """An indeterminate symbol check (no creds → local git unavailable)
+        never produces an ungrounded ref, even with a branch-only context."""
+        from app import source_ref_validation as srv
+
+        async def _indeterminate(path, symbol, **kwargs):
+            return None
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", _indeterminate)
+        result = await _summarize_ungrounded_claims_grounded(
+            ["backend/app/module.py:some_func does something"],
+            None,
+            {"branch": "integration", "project_id": "proj-1"},  # no token/owner/repo
+        )
+        assert result is None
+
+    async def test_file_source_excerpt_counts_refs_not_claims(self, monkeypatch):
+        """File-source excerpts add ungrounded refs but never increment the
+        claim count (mirrors summarize_ungrounded_claims' count_claim=False)."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv,
+            "_file_content_in_repo_branch",
+            AsyncMock(return_value=(True, "def other_func():\n    pass\n")),
+        )
+        sources = [
+            {
+                "type": "file",
+                "ref": "backend/app/module.py",
+                "quote": "backend/app/module.py:missing_func is defined here",
+            }
+        ]
+        result = await _summarize_ungrounded_claims_grounded([], sources, self._CTX)
+        assert result is not None
         assert result["ungrounded_claim_count"] == 0
         assert "backend/app/module.py:missing_func" in result["ungrounded_refs"]
 

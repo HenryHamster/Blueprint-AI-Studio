@@ -6,6 +6,8 @@ playbook stale-ref flagging share one partition path:
 - ``classify_existing_paths`` — async git-HEAD-backed classifier.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.source_ref_validation import (
@@ -13,6 +15,7 @@ from app.source_ref_validation import (
     detect_absent_symbols,
     partition_missing,
     summarize_ungrounded_claims,
+    validate_source_refs,
 )
 
 
@@ -563,14 +566,19 @@ async def test_resolve_branch_context_branch_only_when_creds_raise(mocker):
 async def test_detect_absent_symbols_present_symbol_not_flagged(mocker):
     """File present + symbol present → grounded, nothing flagged."""
 
-    async def _defined(path, symbol):
-        return True
+    async def _content(path, **kwargs):
+        return True, "def do_thing():\n    pass\n"
 
     mocker.patch(
-        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
     )
     absent = await detect_absent_symbols(
-        ["backend/app/x.py:do_thing"], ["see backend/app/y.py:helper"]
+        ["backend/app/x.py:do_thing"],
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+        project_id="proj-1",
     )
     assert absent == []
 
@@ -579,15 +587,20 @@ async def test_detect_absent_symbols_present_symbol_not_flagged(mocker):
 async def test_detect_absent_symbols_absent_symbol_in_present_file_flagged(mocker):
     """File present but cited symbol gone → flagged as effectively-absent."""
 
-    async def _defined(path, symbol):
-        return False
+    async def _content(path, **kwargs):
+        return True, "def live_func():\n    pass\n"
 
     mocker.patch(
-        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
     )
     absent = await detect_absent_symbols(
         ["backend/app/x.py:gone_func"],
         ["the impl in backend/app/x.py:gone_func handles Y"],
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+        project_id="proj-1",
     )
     # Deduplicated: the module pointer and the free-text ref collapse to one.
     assert absent == ["backend/app/x.py:gone_func"]
@@ -597,13 +610,20 @@ async def test_detect_absent_symbols_absent_symbol_in_present_file_flagged(mocke
 async def test_detect_absent_symbols_indeterminate_not_flagged(mocker):
     """Indeterminate git result (None) → conservatively not flagged."""
 
-    async def _defined(path, symbol):
-        return None
+    async def _content(path, **kwargs):
+        return None, None
 
     mocker.patch(
-        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
     )
-    absent = await detect_absent_symbols(["backend/app/x.py:maybe_func"])
+    absent = await detect_absent_symbols(
+        ["backend/app/x.py:maybe_func"],
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+        project_id="proj-1",
+    )
     assert absent == []
 
 
@@ -611,7 +631,7 @@ async def test_detect_absent_symbols_indeterminate_not_flagged(mocker):
 async def test_detect_absent_symbols_partial_hit_only_flags_absent(mocker):
     """Mixed: only the unambiguously-absent symbol is reported."""
 
-    async def _defined(path, symbol):
+    async def _defined(path, symbol, **kwargs):
         return symbol != "gone_func"
 
     mocker.patch(
@@ -632,3 +652,283 @@ async def test_detect_absent_symbols_no_symbol_refs_returns_empty(mocker):
     )
     assert absent == []
     called.assert_not_called()
+
+
+# ── validate_source_refs (integration-branch grounding + local fallback) ──────
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_repo_branch_absent_flags_invalid(mocker):
+    """With GitHub context, an unambiguous absence (False) marks the ref invalid
+    via the GitHub contents path — the local HEAD must NOT be consulted."""
+
+    async def _content(path, **kwargs):
+        assert kwargs["token"] == "ghs_tok"
+        assert kwargs["owner"] == "acme"
+        assert kwargs["repo"] == "widget"
+        assert kwargs["branch"] == "automain"
+        assert kwargs["project_id"] == "proj-1"
+        return (False, None)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
+    )
+    local = mocker.patch(
+        "app.source_ref_validation._file_exists_at_head",
+        side_effect=AssertionError("local HEAD should not be consulted"),
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/gone.py"}],
+        token="ghs_tok",
+        owner="acme",
+        repo="widget",
+        branch="automain",
+        project_id="proj-1",
+    )
+    assert result[0]["valid"] is False
+    local.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_repo_branch_present_in_bounds_valid(mocker):
+    """A present file with an in-range line number is not flagged."""
+
+    async def _content(path, **kwargs):
+        return (True, 120)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/x.py:50-90"}],
+        token="t",
+        owner="o",
+        repo="r",
+        branch="b",
+    )
+    assert result[0].get("valid") is not False
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_repo_branch_line_out_of_range_invalid(mocker):
+    """A present file whose cited line exceeds the file length is flagged."""
+
+    async def _content(path, **kwargs):
+        return (True, 10)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/x.py:50"}],
+        token="t",
+        owner="o",
+        repo="r",
+        branch="b",
+    )
+    assert result[0]["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_repo_branch_indeterminate_never_invalid(mocker):
+    """An indeterminate GitHub result (None) NEVER marks a citation invalid."""
+
+    async def _content(path, **kwargs):
+        return (None, None)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/x.py:50"}],
+        token="t",
+        owner="o",
+        repo="r",
+        branch="b",
+    )
+    assert result[0].get("valid") is not False
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_local_fallback_absent_flags_invalid(mocker):
+    """Without creds, a confirmed-absent local HEAD result (False) flags the ref
+    and the GitHub contents path is not used."""
+
+    async def _exists(path, *, cwd=None):
+        return False
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+    repo = mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch",
+        side_effect=AssertionError("repo-branch path should not be used"),
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/gone.py"}]
+    )
+    assert result[0]["valid"] is False
+    repo.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_local_indeterminate_never_invalid(mocker):
+    """The production-bug guard: no creds + no checkout (None) keeps citations
+    valid instead of marking every file ref broken."""
+
+    async def _exists(path, *, cwd=None):
+        return None
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/x.py:999"}]
+    )
+    assert result[0].get("valid") is not False
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_end_before_start_invalid(mocker):
+    """An intrinsically malformed range (end < start) is invalid even when the
+    file is present and the bounds would otherwise fit."""
+
+    async def _content(path, **kwargs):
+        return (True, 100)
+
+    mocker.patch(
+        "app.source_ref_validation._file_content_in_repo_branch", side_effect=_content
+    )
+    result = await validate_source_refs(
+        [{"type": "file", "ref": "backend/app/x.py:50-10"}],
+        token="t",
+        owner="o",
+        repo="r",
+        branch="b",
+    )
+    assert result[0]["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_validate_source_refs_passthrough_non_file(mocker):
+    """PR/message sources pass through with no existence lookup at all."""
+    repo = mocker.patch("app.source_ref_validation._file_content_in_repo_branch")
+    local = mocker.patch("app.source_ref_validation._file_exists_at_head")
+    result = await validate_source_refs(
+        [{"type": "pr", "ref": "o/r#1"}, {"type": "message", "text": "hi"}]
+    )
+    assert result == [
+        {"type": "pr", "ref": "o/r#1"},
+        {"type": "message", "text": "hi"},
+    ]
+    repo.assert_not_called()
+    local.assert_not_called()
+
+
+# ── _symbol_defined_in_repo_branch (branch-aware symbol grounding) ────────────
+
+
+class _GhResp:
+    """Minimal stand-in for the httpx response _github_request returns."""
+
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def _file_payload(text: str) -> dict:
+    import base64
+
+    return {
+        "type": "file",
+        "content": base64.b64encode(text.encode()).decode(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_symbol_defined_in_repo_branch_present_true(mocker):
+    """File present on the branch + a plausible definition → True."""
+    from app.source_ref_validation import _symbol_defined_in_repo_branch
+
+    resp = _GhResp(200, _file_payload("def do_thing():\n    return 1\n"))
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=resp),
+    )
+    result = await _symbol_defined_in_repo_branch(
+        "backend/app/x.py",
+        "do_thing",
+        token="t",
+        owner="o",
+        repo="r",
+        branch="main",
+        project_id="p1",
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_symbol_defined_in_repo_branch_file_present_symbol_gone_false(mocker):
+    """File present but no plausible definition → unambiguous absence (False)."""
+    from app.source_ref_validation import _symbol_defined_in_repo_branch
+
+    resp = _GhResp(200, _file_payload("def something_else():\n    pass\n"))
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=resp),
+    )
+    result = await _symbol_defined_in_repo_branch(
+        "backend/app/x.py",
+        "gone_func",
+        token="t",
+        owner="o",
+        repo="r",
+        branch="main",
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_symbol_defined_in_repo_branch_404_indeterminate(mocker):
+    """A 404 (file absent) is a file-level concern → indeterminate None, never
+    flagged by the symbol path."""
+    from app.source_ref_validation import _symbol_defined_in_repo_branch
+
+    resp = _GhResp(404, None)
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=resp),
+    )
+    result = await _symbol_defined_in_repo_branch(
+        "backend/app/x.py",
+        "maybe_func",
+        token="t",
+        owner="o",
+        repo="r",
+        branch="main",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_symbol_defined_in_repo_branch_api_error_indeterminate(mocker):
+    """A non-200/non-404 (e.g. 500) → indeterminate None, never flagged."""
+    from app.source_ref_validation import _symbol_defined_in_repo_branch
+
+    resp = _GhResp(500, None)
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=resp),
+    )
+    result = await _symbol_defined_in_repo_branch(
+        "backend/app/x.py",
+        "do_thing",
+        token="t",
+        owner="o",
+        repo="r",
+        branch="main",
+    )
+    assert result is None

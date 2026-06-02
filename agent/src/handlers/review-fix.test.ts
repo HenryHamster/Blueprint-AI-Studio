@@ -252,6 +252,39 @@ describe('handleFix — operator steering (strategic_intent)', () => {
     issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
   }];
 
+  it('prepends ## Project Vision before ## Operator Steering when vision is present', async () => {
+    await handleFix(
+      'task-vision-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 7, prompt: 'address review' },
+      {
+        vision: {
+          purpose: 'Ship the right user outcome.',
+          success_criteria: ['The fix is validated by the review feedback.'],
+          priorities: ['Keep the change minimal.'],
+          context: 'Fixes should inherit the project-level why.',
+        },
+        context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } },
+        strategic_intent: {
+          purpose: 'Build an autonomous coding studio.',
+          current_focus: 'Thread operator steering into tactical prompts.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Project Vision');
+    expect(prompt).toContain('**Purpose:** Ship the right user outcome.');
+    expect(prompt).toContain('**Success criteria:**');
+    expect(prompt).toContain('- The fix is validated by the review feedback.');
+    expect(prompt).toContain('**Priorities:**');
+    expect(prompt).toContain('- Keep the change minimal.');
+    expect(prompt).toContain('**Context:** Fixes should inherit the project-level why.');
+    expect(prompt).toContain('## Operator Steering');
+    expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
+    expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
   it('prepends ## Operator Steering alongside the existing review context', async () => {
     await handleFix(
       'task-steering-fix',

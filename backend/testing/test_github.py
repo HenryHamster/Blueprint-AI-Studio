@@ -3780,3 +3780,121 @@ def test_is_self_review_422_signal():
     assert _is_self_review_422("YOUR OWN PULL REQUEST")  # case-insensitive
     assert not _is_self_review_422("line must be part of the diff")
     assert not _is_self_review_422("")
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_success_counts_lines(mocker):
+    """A 200 file payload returns (True, newline_count) decoded from base64."""
+    import base64
+
+    from app.github import get_file_content_at_ref
+
+    body = "line1\nline2\nline3\n"
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(
+            200,
+            {
+                "type": "file",
+                "content": base64.b64encode(body.encode()).decode(),
+            },
+        ),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is True
+    assert line_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_404_is_definite_absence(mocker):
+    """A 404 is the only path that returns a definite absence (False)."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(404, {"message": "Not Found"}),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/gone.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is False
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_non_200_is_indeterminate(mocker):
+    """A non-200/non-404 (e.g. 403 rate limit) is indeterminate, NEVER absence."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(403, {"message": "rate limited"}),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is None  # indeterminate — must not flag the citation
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_directory_payload_is_indeterminate(mocker):
+    """A non-file payload (e.g. a directory listing) is indeterminate, not absence."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, [{"type": "file", "name": "a.py"}]),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is None
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_undecodable_body_keeps_existence(mocker):
+    """A file with a missing/garbled content blob stays (True, None) — present,
+    but the line count is unknown so it cannot invalidate a line-number ref."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"type": "file", "content": "!!!not base64!!!"}),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is True
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_request_error_is_indeterminate(mocker):
+    """An exception during the fetch is indeterminate (None), never absence."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("boom"),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is None
+    assert line_count is None

@@ -70,17 +70,24 @@ def _looks_like_file_path(path: str) -> bool:
     )
 
 
-async def _file_exists_at_head(path: str, *, cwd: str = "/tmp/workspace") -> bool:
-    """Check if a file exists in the HEAD commit using 'git ls-files'.
+async def _file_exists_at_head(
+    path: str, *, cwd: str = "/tmp/workspace"
+) -> Optional[bool]:
+    """Check whether a file exists in HEAD using 'git ls-files'. Tri-state.
 
-    Returns False if git command fails, file doesn't exist, or path is invalid.
-    Does not raise exceptions — logs and returns False on errors.
+    True  → present at HEAD.
+    False → unambiguously absent at HEAD.
+    None  → indeterminate (no local checkout, git error/timeout, or an
+            unrecognizable path).
+
+    An indeterminate result must NEVER be collapsed into "absent": a backend
+    without a local checkout has no HEAD to consult, so callers that flag
+    missing refs treat None as "leave untouched" rather than marking every
+    citation invalid. Path-existence partitioners that have no notion of
+    indeterminacy (e.g. :func:`classify_existing_paths`) treat the falsy None
+    as missing, which preserves their prior behavior.
     """
-    if not _looks_like_file_path(path):
-        # Reject obvious non-file paths to avoid wasting git calls
-        return False
-    exists = await _path_exists_at_head(path, repo_root=cwd)
-    return exists is True
+    return await _path_exists_at_head(path, repo_root=cwd)
 
 
 async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> Optional[bool]:
@@ -185,6 +192,91 @@ async def _file_exists_in_repo_branch(
             e,
         )
         return False
+
+
+async def _file_content_in_repo_branch(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+    return_content: bool = False,
+) -> Tuple[Optional[bool], Optional[Any]]:
+    """Fetch *path* on ``owner/repo@branch`` and return ``(exists, line_count)``.
+
+    The GitHub-API content foundation that line-number validation needs (the
+    existing :func:`_file_exists_in_repo_branch` only answers existence). Also
+    reusable by the symbol- and playbook-grounding paths that fetch content.
+
+    ``exists`` is tri-state:
+      True  → the path is a file on the branch (``line_count`` is its newline
+              count, matching :func:`_file_has_line_count`'s ``count(b"\\n")``).
+      False → the branch unambiguously has no such file (HTTP 404).
+      None  → indeterminate (non-200/non-404, not-a-file payload, undecodable
+              content, or any error). Callers must NOT treat None as absent.
+
+    ``line_count`` is None whenever it cannot be determined, so an indeterminate
+    count never invalidates a line-number citation.
+    """
+    if not _looks_like_file_path(path):
+        return None, None
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_branch = quote(branch, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_branch}"
+    )
+    try:
+        from app.github import _github_request
+
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code == 404:
+            return False, None
+        if response.status_code != 200:
+            logger.warning(
+                "[SOURCE_REF_VALIDATION] GitHub contents fetch failed for %s on "
+                "%s/%s@%s: HTTP %s",
+                path,
+                owner,
+                repo,
+                branch,
+                response.status_code,
+            )
+            return None, None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None, None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return True, None
+        import base64
+
+        try:
+            text = base64.b64decode(content_b64).decode(errors="replace")
+        except Exception:
+            return True, None
+        return (True, text) if return_content else (True, text.count("\n"))
+    except Exception as e:
+        logger.warning(
+            "[SOURCE_REF_VALIDATION] Failed GitHub contents fetch for %s on "
+            "%s/%s@%s: %s",
+            path,
+            owner,
+            repo,
+            branch,
+            e,
+        )
+        return None, None
 
 
 async def _file_has_line_count(path: str, min_line: int) -> bool:
@@ -359,7 +451,16 @@ def _symbol_definition_regex(symbol: str) -> "re.Pattern":
     return re.compile(kw + "|" + lhs, re.MULTILINE)
 
 
-async def _symbol_defined_at_head(path: str, symbol: str) -> Optional[bool]:
+async def _symbol_defined_at_head(
+    path: str,
+    symbol: str,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> Optional[bool]:
     """Return whether ``symbol`` is defined in ``path`` at HEAD.
 
     True  → file exists at HEAD and a plausible definition of ``symbol`` found.
@@ -370,6 +471,23 @@ async def _symbol_defined_at_head(path: str, symbol: str) -> Optional[bool]:
     """
     if not path or not symbol or not isinstance(path, str) or not isinstance(symbol, str):
         return None
+    use_repo_branch = all([token, owner, repo, branch])
+    if use_repo_branch:
+        exists, text = await _file_content_in_repo_branch(
+            path,
+            token=str(token),
+            owner=str(owner),
+            repo=str(repo),
+            branch=str(branch),
+            project_id=project_id,
+            return_content=True,
+        )
+        if exists is False:
+            return False
+        if not isinstance(text, str):
+            return None
+        return bool(_symbol_definition_regex(symbol).search(text))
+
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
@@ -396,6 +514,97 @@ async def _symbol_defined_at_head(path: str, symbol: str) -> Optional[bool]:
         return False
     # not-a-repo or any other git error → indeterminate, degrade gracefully.
     return None
+
+
+async def _symbol_defined_in_repo_branch(
+    path: str,
+    symbol: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> Optional[bool]:
+    """Return whether ``symbol`` is defined in ``path`` on ``owner/repo@branch``.
+
+    Branch-aware sibling of :func:`_symbol_defined_at_head` (which only reads the
+    local checkout's HEAD). Fetches the file content from the project's real
+    integration branch via the GitHub contents API and matches a plausible
+    definition with :func:`_symbol_definition_regex` — the same content-fetch
+    foundation :func:`_file_content_in_repo_branch` uses, so symbol grounding on
+    the backend reflects the integration branch rather than a checkout that does
+    not exist there.
+
+    Tri-state, mirroring the conservative local-HEAD semantics:
+      True  → the file exists on the branch and a plausible definition of
+              ``symbol`` is found.
+      False → unambiguously absent: the file exists on the branch but no
+              plausible definition is found.
+      None  → indeterminate (file 404/absent, not-a-file payload, undecodable
+              content, or any API error). Callers treat None as grounded so a
+              transient outage never flags a ref.
+
+    Note the deliberate asymmetry with :func:`_symbol_defined_at_head`, which
+    returns ``False`` for a file that is genuinely absent at HEAD: here a 404
+    yields ``None`` because the symbol-level verdict is only meaningful when the
+    file EXISTS. File-level absence is the file-level grounding's concern, so the
+    symbol path must never flag (or double-flag) a missing file.
+    """
+    if (
+        not path
+        or not symbol
+        or not isinstance(path, str)
+        or not isinstance(symbol, str)
+        or not _looks_like_file_path(path)
+    ):
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_branch = quote(branch, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_branch}"
+    )
+    try:
+        from app.github import _github_request
+
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        # A non-200 (incl. 404) means we cannot read the file → indeterminate.
+        # File-level absence is handled by the file-level grounding pass.
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return None
+        import base64
+
+        try:
+            text = base64.b64decode(content_b64).decode(errors="replace")
+        except Exception:
+            return None
+        return bool(_symbol_definition_regex(symbol).search(text))
+    except Exception as e:
+        logger.warning(
+            "[SOURCE_REF_VALIDATION] Failed symbol lookup for %s:%s on %s/%s@%s: %s",
+            path,
+            symbol,
+            owner,
+            repo,
+            branch,
+            e,
+        )
+        return None
 
 
 def _extract_design_doc_paths(entry: Any) -> list[str]:
@@ -588,6 +797,12 @@ async def resolve_branch_verification_context(session: Any, project: Any) -> Dic
 async def detect_absent_symbols(
     module_pointers: Optional[list] = None,
     text_fields: Optional[list] = None,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
 ) -> List[str]:
     """Return ``path:symbol`` refs whose symbol is absent from a present file.
 
@@ -617,7 +832,15 @@ async def detect_absent_symbols(
                 pairs.append(pair)
     absent: List[str] = []
     for path, symbol in pairs:
-        if await _symbol_defined_at_head(path, symbol) is False:
+        if await _symbol_defined_at_head(
+            path,
+            symbol,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        ) is False:
             absent.append(f"{path}:{symbol}")
     return absent
 
@@ -761,27 +984,47 @@ def collect_stale_refs(validated_sources: list) -> list:
     ]
 
 
-async def validate_source_refs(sources: Optional[list]) -> list:
+async def validate_source_refs(
+    sources: Optional[list],
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+    cwd: str = "/tmp/workspace",
+) -> list:
     """Validate all file-type source refs in a sources list.
 
     For each source with type='file':
-    - Validates that the file exists at HEAD
+    - Validates that the file exists on the project's integration branch
     - Validates that line numbers (if present) are within bounds
-    - Marks invalid sources with valid: false or drops them
+    - Marks unambiguously-invalid sources with valid: false
+
+    When ``token``/``owner``/``repo``/``branch`` are all provided, existence and
+    line counts are checked against the project's REAL integration branch via
+    the GitHub contents API (:func:`_file_content_in_repo_branch`) — the same
+    repo/branch verification context the design-doc reconcile path resolves. The
+    finding-ingestion caller already holds the project + session, so it resolves
+    that context once (see :func:`resolve_branch_verification_context`) and
+    passes it through. Otherwise validation falls back to the local checkout's
+    git HEAD (the agent VM legitimately has one).
+
+    Degradation is conservative: an INDETERMINATE result (no GitHub credentials,
+    no local checkout, or a git/API error) must NEVER mark a citation invalid —
+    only an unambiguous absence on the integration branch (or a genuinely
+    out-of-range line) flags a ref. This keeps prod findings (where the backend
+    has no checkout) from having every valid citation marked broken.
 
     For sources with type='pr' or type='message': no validation needed.
 
-    Args:
-        sources: List of source dicts with 'type' and 'ref' fields.
-                Can be None.
-
-    Returns:
-        List of validated sources, with invalid file refs marked valid: false
-        or dropped (depending on validation error severity).
+    Returns the list of validated sources, with invalid file refs marked
+    valid: false (refs missing a 'ref' field are dropped).
     """
     if not isinstance(sources, list):
         return []
 
+    use_repo_branch = all([token, owner, repo, branch])
     validated: list[Dict[str, Any]] = []
 
     for source in sources:
@@ -796,69 +1039,106 @@ async def validate_source_refs(sources: Optional[list]) -> list:
             validated.append(source)
             continue
 
-        # File sources require validation
-        if source_type == "file":
-            ref = source.get("ref")
-            if not ref:
-                logger.warning(
-                    "[SOURCE_REF_VALIDATION] File source missing 'ref' field"
-                )
-                continue
+        # Unknown (non-file) source types pass through untouched
+        if source_type != "file":
+            validated.append(source)
+            continue
 
-            path, start_line, end_line = _parse_ref(ref)
+        ref = source.get("ref")
+        if not ref:
+            logger.warning("[SOURCE_REF_VALIDATION] File source missing 'ref' field")
+            continue
 
-            # Validate path exists
-            if not await _file_exists_at_head(path):
+        path, start_line, end_line = _parse_ref(ref)
+
+        # Resolve existence (tri-state) against the integration branch or local
+        # HEAD. ``line_count`` is only populated by the GitHub path; the local
+        # path validates line bounds lazily via _file_has_line_count below.
+        if use_repo_branch:
+            exists, line_count = await _file_content_in_repo_branch(
+                path,
+                token=str(token),
+                owner=str(owner),
+                repo=str(repo),
+                branch=str(branch),
+                project_id=project_id,
+            )
+        else:
+            # Preserve the legacy single-arg call signature when cwd is the
+            # default so existing callers/mocks (path-only) keep working.
+            exists = (
+                await _file_exists_at_head(path)
+                if cwd == "/tmp/workspace"
+                else await _file_exists_at_head(path, cwd=cwd)
+            )
+            line_count = None
+
+        # Indeterminate existence (None) must never flag a citation — leave it
+        # untouched. Only an unambiguous absence (False) marks the ref invalid.
+        if exists is None:
+            validated.append(source)
+            continue
+        if exists is False:
+            logger.warning(
+                f"[SOURCE_REF_VALIDATION] File not found on integration branch: "
+                f"{path} (from ref {ref})"
+            )
+            marked = dict(source)
+            marked["valid"] = False
+            validated.append(marked)
+            continue
+
+        # exists is True — validate line numbers when present.
+        if start_line is not None:
+            # end < start is intrinsically malformed regardless of the tree.
+            if end_line is not None and end_line < start_line:
                 logger.warning(
-                    f"[SOURCE_REF_VALIDATION] File not found in HEAD: {path} "
-                    f"(from ref {ref})"
+                    f"[SOURCE_REF_VALIDATION] Invalid line range: "
+                    f"{path}:{start_line}-{end_line} (end < start in ref {ref})"
                 )
-                # Mark as invalid rather than dropping, so downstream can decide
-                # whether to use it or log it as stale
                 marked = dict(source)
                 marked["valid"] = False
                 validated.append(marked)
                 continue
 
-            # Validate line numbers if present
-            if start_line is not None:
+            if use_repo_branch:
+                # An indeterminate line_count (None) never invalidates; only a
+                # definite out-of-range count does.
+                if line_count is not None and (
+                    start_line > line_count
+                    or (end_line is not None and end_line > line_count)
+                ):
+                    logger.warning(
+                        f"[SOURCE_REF_VALIDATION] Line number out of range: "
+                        f"{path}:{start_line} (file has {line_count} lines, "
+                        f"from ref {ref})"
+                    )
+                    marked = dict(source)
+                    marked["valid"] = False
+                    validated.append(marked)
+                    continue
+            else:
                 if not await _file_has_line_count(path, start_line):
                     logger.warning(
-                        f"[SOURCE_REF_VALIDATION] Line number out of range: {path}:{start_line} "
-                        f"(from ref {ref})"
+                        f"[SOURCE_REF_VALIDATION] Line number out of range: "
+                        f"{path}:{start_line} (from ref {ref})"
                     )
                     marked = dict(source)
                     marked["valid"] = False
                     validated.append(marked)
                     continue
-
-                # Also validate end_line if present
-                if end_line is not None and end_line < start_line:
-                    logger.warning(
-                        f"[SOURCE_REF_VALIDATION] Invalid line range: {path}:{start_line}-{end_line} "
-                        f"(end < start in ref {ref})"
-                    )
-                    marked = dict(source)
-                    marked["valid"] = False
-                    validated.append(marked)
-                    continue
-
                 if end_line is not None and not await _file_has_line_count(
                     path, end_line
                 ):
                     logger.warning(
-                        f"[SOURCE_REF_VALIDATION] End line out of range: {path}:{start_line}-{end_line} "
-                        f"(from ref {ref})"
+                        f"[SOURCE_REF_VALIDATION] End line out of range: "
+                        f"{path}:{start_line}-{end_line} (from ref {ref})"
                     )
                     marked = dict(source)
                     marked["valid"] = False
                     validated.append(marked)
                     continue
 
-            # Validation passed
-            validated.append(source)
-        else:
-            # Unknown source type — pass through
-            validated.append(source)
+        validated.append(source)
 
     return validated

@@ -23,7 +23,7 @@ import {
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
 } from '../prompt.js';
-import { formatStrategicIntent } from '../prompts/context-prefix.js';
+import { formatProjectVision, formatStrategicIntent } from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
 import {
   REVIEW_CLAUDEMD_PROMPT_HEADER, REVIEW_CLAUDEMD_PROMPT_FOOTER,
@@ -941,6 +941,15 @@ export async function handleFix(
       `## Reviewer's Working Set\n` +
       `The reviewer Read/Edit/Grep'd these paths while forming the verdict above. Start your investigation here — they are the most likely place the cited issues live. You may look elsewhere if the trail leads there:\n${formatted}\n\n` +
       enrichedPrompt;
+  }
+
+  // Prepend the shared Project Vision block so review-driven fixes inherit the
+  // same strategic "why" as standard task agents.
+  const fixProjectVision = formatProjectVision(
+    task.vision as Record<string, unknown> | undefined,
+  );
+  if (fixProjectVision) {
+    enrichedPrompt = `${fixProjectVision}${enrichedPrompt}`;
   }
 
   // Prepend operator steering (current strategic intent). The fix path

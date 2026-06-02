@@ -72,8 +72,10 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
 )
 from app.source_ref_validation import (
     validate_source_refs,
+    resolve_branch_verification_context,
     summarize_broken_refs,
-    summarize_ungrounded_claims,
+    summarize_ungrounded_claims,  # noqa: F401 — re-exported for callers/tests
+    detect_absent_symbols,
 )
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
@@ -707,6 +709,63 @@ def _summarize_dispatch_outcome(
     return " | ".join(parts)[:500]
 
 
+async def _summarize_ungrounded_claims_grounded(
+    claims: Optional[list],
+    sources: Optional[list],
+    ctx: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """GitHub-context-aware variant of :func:`summarize_ungrounded_claims`.
+
+    The shared ``summarize_ungrounded_claims`` helper checks each
+    ``path:symbol`` reference against the local ``/tmp/workspace`` git
+    checkout, which the backend does not have — so at research-finding
+    ingestion the symbol-level grounding silently verifies nothing outside the
+    agent VM. This threads the already-resolved GitHub repo/branch verification
+    context (``ctx`` — the same dict the file-level source-ref validation uses)
+    through :func:`detect_absent_symbols` so the symbol check runs against the
+    project's real integration branch, reusing the GitHub file-content fetch
+    behind ``detect_absent_symbols`` rather than adding a second content path.
+
+    Returns the same ``{"ungrounded_claim_count", "ungrounded_refs"}`` shape as
+    ``summarize_ungrounded_claims`` (or None when nothing is ungrounded).
+    Conservative semantics are preserved: when no GitHub credentials resolved
+    (``ctx`` lacks a token), ``detect_absent_symbols`` falls back to local git
+    HEAD whose indeterminate result never flags, so an indeterminate check
+    never produces an ungrounded ref.
+    """
+    if not isinstance(claims, list):
+        claims = []
+    seen_refs: set = set()
+    ungrounded_refs: list = []
+    ungrounded_claim_count = 0
+    for claim in claims:
+        absent = await detect_absent_symbols(text_fields=[claim], **ctx)
+        if absent:
+            ungrounded_claim_count += 1
+        for ref in absent:
+            if ref not in seen_refs:
+                seen_refs.add(ref)
+                ungrounded_refs.append(ref)
+    # File-source excerpts contribute refs but never increment a claim count,
+    # mirroring summarize_ungrounded_claims' count_claim=False handling.
+    excerpts = [
+        s.get("quote") or s.get("excerpt")
+        for s in (sources or [])
+        if isinstance(s, dict) and str(s.get("type") or "").lower() == "file"
+    ]
+    if excerpts:
+        for ref in await detect_absent_symbols(text_fields=excerpts, **ctx):
+            if ref not in seen_refs:
+                seen_refs.add(ref)
+                ungrounded_refs.append(ref)
+    if not ungrounded_refs:
+        return None
+    return {
+        "ungrounded_claim_count": ungrounded_claim_count,
+        "ungrounded_refs": ungrounded_refs,
+    }
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Increment _research_spawn_count on completion (variable name is legacy;
@@ -768,6 +827,28 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             _f["actionability_grade"] = "MEDIUM"
 
+    # Resolve the project's real integration-branch verification context once so
+    # file-type source refs validate against the GitHub tree rather than a local
+    # /tmp/workspace checkout, which the backend/orchestrator does not have (git
+    # isn't even installed there). Without this every file citation collapses to
+    # "not found" and gets a spurious broken-reference downgrade. Degrades
+    # gracefully: on any failure the branch-only dict (or empty) is used, which
+    # makes validate_source_refs fall back to local git HEAD, and an
+    # indeterminate result there never marks a citation invalid.
+    _src_ref_ctx: Dict[str, Any] = {}
+    if project_obj is not None:
+        try:
+            _src_ref_ctx = await resolve_branch_verification_context(
+                session, project_obj
+            )
+        except Exception:  # noqa: BLE001 — context resolution must never crash ingestion
+            logger.debug(
+                "[RESEARCH] source-ref verification context resolution failed; "
+                "falling back to local git HEAD",
+                exc_info=True,
+            )
+            _src_ref_ctx = {}
+
     # Validate optional structured fields: claims and sources.
     for _f in findings:
         if "claims" in _f and not isinstance(_f.get("claims"), list):
@@ -780,20 +861,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _f["sources"] = [
                     s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")
                 ]
-                # Validate file-type source refs at write time
-                _f["sources"] = await validate_source_refs(_f["sources"])
+                # Validate file-type source refs at write time against the
+                # project's real integration branch (resolved once above).
+                _f["sources"] = await validate_source_refs(
+                    _f["sources"], **_src_ref_ctx
+                )
                 # Attach a structured provenance summary when the validation
                 # marks file refs invalid. The finding still spawns; the data
                 # is here so downstream consumers (admin UI, agent prompts)
                 # can flag research with bad citations as lower-trust.
                 _broken_provenance = summarize_broken_refs(_f["sources"])
         # Symbol-level grounding: verify path:symbol references in claims (and
-        # file source excerpts) name code that actually exists at HEAD. A claim
+        # file source excerpts) name code that actually exists on the project's
+        # real integration branch, threading the same GitHub verification
+        # context the file-level check above uses (local git HEAD only as a
+        # graceful fallback when credentials don't resolve). A claim
         # asserting facts about a function/class/constant that is absent from an
         # otherwise-existing file is surfaced the same way a broken file citation
         # is, and discounted from the actionability grade below.
-        _ungrounded = await summarize_ungrounded_claims(
-            _f.get("claims"), _f.get("sources")
+        _ungrounded = await _summarize_ungrounded_claims_grounded(
+            _f.get("claims"), _f.get("sources"), _src_ref_ctx
         )
         if _ungrounded is not None:
             _f["_ungrounded_claim_count"] = _ungrounded["ungrounded_claim_count"]

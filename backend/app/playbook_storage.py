@@ -328,6 +328,309 @@ def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
     return doc
 
 
+# Cooldown (hours) that bounds how often the GitHub-backed claim-path grounding
+# may run. The task-claim handler runs on EVERY claim and is best-effort, so the
+# GitHub network I/O is throttled to at most once per window per project rather
+# than firing on every claim. Configurable via runtime_config.
+_BRANCH_GROUNDING_COOLDOWN_HOURS_DEFAULT = 6
+
+
+def branch_grounding_due(doc: dict, *, cooldown_hours: int | None = None) -> bool:
+    """Return True when the GitHub-backed claim-path grounding may run again.
+
+    Keeps the GitHub network I/O off the per-claim hot path: returns False while
+    the previous grounding's ``_meta.last_branch_grounding_at`` timestamp is
+    within *cooldown_hours*, so the (best-effort) reconcile fires at most once
+    per window per project. A missing or unparseable timestamp means due, and a
+    non-positive cooldown disables throttling.
+    """
+    if cooldown_hours is None:
+        from app.shared_state import runtime_config as _rc
+
+        cooldown_hours = _rc.get(
+            "playbook_branch_grounding_cooldown_hours",
+            _BRANCH_GROUNDING_COOLDOWN_HOURS_DEFAULT,
+        )
+    if cooldown_hours <= 0:
+        return True
+    ts_str = (doc.get("_meta") or {}).get("last_branch_grounding_at")
+    if not ts_str:
+        return True
+    try:
+        ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return True
+    return (_utcnow() - ts) >= timedelta(hours=cooldown_hours)
+
+
+def mark_branch_grounding_done(doc: dict) -> None:
+    """Stamp ``_meta.last_branch_grounding_at`` so :func:`branch_grounding_due`
+    can bound how often the claim-path grounding runs.
+
+    Bookkeeping only — it does NOT bump the doc revision, so a no-op grounding
+    pass leaves the design-doc content (and its ``revision``) untouched.
+    """
+    meta = dict(doc.get("_meta", {"revision": 0}))
+    meta["last_branch_grounding_at"] = _utcnow().isoformat()
+    doc["_meta"] = meta
+
+
+async def _absent_symbol_in_repo_branch(
+    entry: dict,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> str | None:
+    """Branch-aware sibling of :func:`_absent_symbol_in_present_file`.
+
+    Returns a ``path:symbol`` ref whose symbol is unambiguously absent from a
+    file that still exists on ``owner/repo@branch``, or ``None``. Reuses the
+    ``path:symbol`` parsing from :mod:`app.source_ref_validation` and checks each
+    pointer with :func:`_symbol_defined_in_repo_branch` (GitHub-backed) rather
+    than the local checkout. Conservative: a ref is returned ONLY on an
+    unambiguous absence (``False``); an indeterminate result (``None``, e.g. the
+    file is itself absent or unreadable) and a present symbol both yield
+    ``None``, so a missing file is never double-flagged here.
+    """
+    from app.source_ref_validation import (
+        _parse_path_symbol_refs,
+        _symbol_defined_in_repo_branch,
+    )
+
+    texts: list[str] = []
+    modules = entry.get("modules")
+    if isinstance(modules, list):
+        texts.extend(m for m in modules if isinstance(m, str) and m)
+    texts.extend(
+        entry[key]
+        for key in ("notes", "description")
+        if isinstance(entry.get(key), str) and entry[key]
+    )
+
+    seen: set = set()
+    for text in texts:
+        for path, symbol in _parse_path_symbol_refs(text):
+            if (path, symbol) in seen:
+                continue
+            seen.add((path, symbol))
+            defined = await _symbol_defined_in_repo_branch(
+                path,
+                symbol,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+            )
+            if defined is False:
+                return f"{path}:{symbol}"
+    return None
+
+
+async def check_and_flag_stale_refs_branch_aware(
+    doc: dict,
+    *,
+    repo_root: str | None = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Branch-aware sibling of :func:`check_and_flag_stale_refs`.
+
+    Flags playbook entries whose referenced file paths are absent on the
+    project's REAL integration branch (via the GitHub contents API, using
+    :func:`app.source_ref_validation.classify_existing_paths`) instead of a local
+    checkout that does not exist on the backend. When GitHub credentials do not
+    resolve it falls back to the synchronous local-disk scan against *repo_root*
+    (a no-op when no checkout is configured), so a backend with neither creds nor
+    a checkout never invents stale flags.
+
+    Same mutate-and-return contract and ``stale_file_refs`` semantics as the sync
+    function: an entry is flagged when at least one referenced path is missing
+    and the flag is cleared when all referenced paths are present again.
+    """
+    use_repo_branch = all([token, owner, repo, branch])
+    if not use_repo_branch:
+        return check_and_flag_stale_refs(doc, repo_root or "")
+
+    from app.source_ref_validation import classify_existing_paths
+
+    updated = False
+    for key, value in doc.items():
+        if not key.startswith("playbook/") or not isinstance(value, dict):
+            continue
+        paths = _extract_file_paths(value.get("content", ""))
+        if not paths:
+            continue
+        _present, missing = await classify_existing_paths(
+            paths,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+        any_missing = bool(missing)
+        if any_missing and not value.get("stale_file_refs"):
+            entry = dict(value)
+            entry["stale_file_refs"] = True
+            doc[key] = entry
+            updated = True
+            logger.debug(
+                "[PLAYBOOK] Flagged '%s' as stale_file_refs (missing on branch: %s)",
+                key,
+                missing,
+            )
+        elif not any_missing and value.get("stale_file_refs"):
+            entry = dict(value)
+            entry["stale_file_refs"] = False
+            doc[key] = entry
+            updated = True
+
+    if updated:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "stale-ref-check"
+        doc["_meta"] = meta
+
+    return doc
+
+
+async def ground_design_doc_systems_branch_aware(
+    doc: dict,
+    *,
+    repo_root: str | None = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Branch-aware sibling of :func:`ground_design_doc_systems`.
+
+    Grounds present-status ``systems/*`` and ``capabilities/*`` entries against
+    the project's REAL integration branch via the GitHub contents API (the same
+    mechanism the strategic/research design-doc reconcile uses) instead of a
+    local checkout that does not exist on the backend. When GitHub credentials
+    do not resolve it falls back to the synchronous local-disk grounding against
+    *repo_root* (a no-op when no checkout is configured).
+
+    File-level and symbol-level absence are handled exactly as in the sync
+    function — only the existence/definition source differs (GitHub branch vs.
+    local disk):
+
+      - *file-level absence*: every referenced backing path is absent on the
+        branch (``_file_exists_in_repo_branch``), OR
+      - *symbol-level absence*: a cited ``path:symbol`` whose file still exists on
+        the branch but whose symbol is unambiguously gone
+        (:func:`_absent_symbol_in_repo_branch`).
+
+    Conservative tri-state semantics are preserved: entries with no path pointer
+    and partial file hits are left untouched, and a symbol downgrades only on an
+    unambiguous absence. Mutates and returns *doc* (same contract as the sync
+    function).
+    """
+    use_repo_branch = all([token, owner, repo, branch])
+    if not use_repo_branch:
+        return ground_design_doc_systems(doc, repo_root or "")
+
+    from app.source_ref_validation import _file_exists_in_repo_branch
+
+    updated = False
+    for key, value in doc.items():
+        if not isinstance(value, dict):
+            continue
+        if key.startswith("systems/"):
+            present_set = _PRESENT_SYSTEM_STATUSES
+        elif key.startswith("capabilities/"):
+            present_set = _PRESENT_CAPABILITY_STATUSES
+        else:
+            continue
+
+        status_raw = value.get("status")
+        status = status_raw.lower() if isinstance(status_raw, str) else ""
+        if status not in present_set:
+            continue
+
+        paths = _extract_entry_paths(value)
+
+        # File-level absence: downgrade only when EVERY referenced path is gone on
+        # the branch. No pointer / a partial hit leaves the entry untouched.
+        file_absent = False
+        if paths:
+            any_present = False
+            for path in paths:
+                if await _file_exists_in_repo_branch(
+                    path,
+                    token=str(token),
+                    owner=str(owner),
+                    repo=str(repo),
+                    branch=str(branch),
+                    project_id=project_id,
+                ):
+                    any_present = True
+                    break
+            file_absent = not any_present
+
+        # Symbol-level absence: only consulted when the file-level check did not
+        # already fire (complementary, not a replacement).
+        absent_symbol = (
+            None
+            if file_absent
+            else await _absent_symbol_in_repo_branch(
+                value,
+                token=str(token),
+                owner=str(owner),
+                repo=str(repo),
+                branch=str(branch),
+                project_id=project_id,
+            )
+        )
+
+        if not file_absent and absent_symbol is None:
+            continue
+
+        if file_absent:
+            warning = (
+                f"claimed {status} but all referenced module file(s) are absent "
+                f"on the integration branch — treat as missing"
+            )
+            detail = f"all referenced paths absent: {paths}"
+        else:
+            warning = (
+                f"claimed {status} but cited symbol '{absent_symbol}' is absent on "
+                f"the integration branch though its file exists — treat as missing"
+            )
+            detail = f"cited symbol absent: {absent_symbol}"
+        entry = dict(value)
+        entry["status"] = "missing"
+        entry["presence_warning"] = warning
+        doc[key] = entry
+        updated = True
+        logger.debug(
+            "[DESIGN-DOC] Grounded '%s' to missing on branch (%s)",
+            key,
+            detail,
+        )
+
+    if updated:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "design-doc-grounding"
+        doc["_meta"] = meta
+
+    return doc
+
+
 def _playbook_size_bytes(doc: dict) -> int:
     """Return the JSON-serialised byte size of all playbook entries in *doc*."""
     playbook_subset = {
