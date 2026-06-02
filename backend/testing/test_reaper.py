@@ -2829,6 +2829,42 @@ async def test_step6_requires_approval_sets_likely_cause(
     assert "awaiting operator approval" in alerts[0].message
 
 
+@pytest.mark.asyncio
+async def test_step6_precondition_defer_sets_likely_cause(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A QUEUED task whose latest_status_message is a dispatcher precondition
+    defer ('Waiting: ...') escalates with that precondition as the likely
+    cause, in preference to the generic infrastructure fallback."""
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+        latest_status_message=(
+            "Waiting: serializing migration — task abcd1234 holds the chain"
+        ),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == t.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "serializing migration — task abcd1234 holds the chain" in (
+        alerts[0].message
+    )
+    # The precondition cause replaces — not appends to — the generic guesses.
+    assert "all accounts healthy but VM slot limit reached" not in alerts[0].message
+
+
 # ── Terminal failure finalization (non-provision budget exhausted) ────────
 
 
