@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -1486,7 +1487,12 @@ async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, m
 
 
 def _make_pr_merged_payload(
-    owner: str, repo: str, pr_number: int, body: str = ""
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str = "",
+    *,
+    base_branch: str = "main",
 ) -> bytes:
     """Build a minimal pull_request closed+merged webhook payload."""
     return json.dumps(
@@ -1496,6 +1502,7 @@ def _make_pr_merged_payload(
                 "number": pr_number,
                 "merged": True,
                 "body": body,
+                "base": {"ref": base_branch},
             },
             "repository": {
                 "full_name": f"{owner}/{repo}",
@@ -1597,7 +1604,8 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     A pull_request webhook with action=closed and merged=True sets pr_merged=True
     on the matching task's context.
     """
-    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+    from sqlmodel import select
+    from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
     mocker.patch(
@@ -1606,7 +1614,7 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch(
+    dispatch_mock = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
@@ -1616,6 +1624,8 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
         user_id="user1",
         github_owner="mergeorg",
         github_repo="mergerepo",
+        integration_branch="main",
+        promotion_target="main",
     )
     db_session.add(project)
     await db_session.commit()
@@ -1624,7 +1634,13 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     task = Task(
         project_id=project.id,
         title="Add feature",
-        payloads=[{"type": "create", "prompt": "do it"}],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do it",
+                "base_branch": "automain",
+            }
+        ],
         status=TaskStatus.COMPLETED,
         context={},
         created_by="user1",
@@ -1643,11 +1659,121 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
 
     payload_bytes = _make_pr_merged_payload("mergeorg", "mergerepo", 55)
     resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
 
     assert resp.status_code == 200
 
     await db_session.refresh(task)
     assert task.context.get("pr_merged") is True
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_to_distinct_promotion_target_alerts_without_pr_merged(
+    client, db_session, mocker
+):
+    """A merged webhook landing on promotion_target must not mark work as landed on integration."""
+    from sqlmodel import select
+    from app.models import (
+        Alert,
+        AlertSeverity,
+        Artifact,
+        ArtifactType,
+        Project,
+        Task,
+        TaskStatus,
+    )
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Promotion Merge Guard",
+        user_id="user1",
+        github_owner="guardorg",
+        github_repo="guardrepo",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Guarded merge",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do it",
+                "base_branch": "automain",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/guardorg/guardrepo/pull/56",
+        )
+    )
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload(
+        "guardorg", "guardrepo", 56, base_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is None
+    rollup_mock.assert_not_called()
+
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    assert "promotion_target" in alerts[0].message
+    assert "integration_branch" in alerts[0].message
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 56
 
 
 @pytest.mark.asyncio
@@ -1723,6 +1849,78 @@ async def test_pr_merged_dispatches_enriched_payload(client, db_session, mocker)
     assert body["scope"] == "small"
     assert body["changed_files"] == 3
     assert body["repo"] == "enrichorg/enrichrepo"
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_intermediate_rollup_keeps_parent_waiting(
+    client, db_session, mocker
+):
+    """Merged custom staged rollup roots on intermediate branches must not set pr_merged."""
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Intermediate Rollup Merge",
+        user_id="user1",
+        github_owner="midorg",
+        github_repo="midrepo",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Intermediate rollup parent",
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "x",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={"rollup_pr_number": 57},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/midorg/midrepo/pull/57",
+        )
+    )
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload(
+        "midorg", "midrepo", 57, base_branch="release/candidate-1"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is None
+    assert "awaiting downstream landing" in (task.latest_status_message or "")
+    rollup_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

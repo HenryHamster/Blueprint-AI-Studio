@@ -58,6 +58,8 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 from app.branch_resolution import (
     InvalidProjectBranchConfiguration,
     _signal_blocking_project_branch_configuration,
+    is_custom_staged_rollup_root,
+    merged_pr_counts_as_integration_landing,
 )
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -69,6 +71,37 @@ from app.shared_state import (
 from app.task_locking import with_directions_locked
 
 logger = logging.getLogger(__name__)
+
+
+async def _classify_merged_rollup_landing(
+    parent: Task,
+    project: Project | None,
+    session: AsyncSession,
+    *,
+    pr_number: int | None,
+    target_branch: str,
+    source: str,
+) -> tuple[bool, bool]:
+    """Return ``(integration_landing, terminal_merge)``.
+
+    Terminal rollup merges are those that land on either the integration branch
+    or the promotion target. Merges into intermediate staging branches must keep
+    the parent EVALUATING until a later downstream landing completes the chain.
+    """
+    integration_branch = _get_project_integration_branch(project)
+    promotion_target = _get_project_promotion_target(project)
+    landed = target_branch == integration_branch
+    promotion_landing = target_branch == promotion_target
+    if not landed and promotion_landing:
+        await merged_pr_counts_as_integration_landing(
+            parent,
+            project,
+            session,
+            pr_number=pr_number,
+            merged_base_branch=target_branch,
+            source=source,
+        )
+    return landed, landed or promotion_landing
 
 
 def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
@@ -939,11 +972,22 @@ async def _check_and_trigger_rollup(
             # land every rollup on that shared trunk; holding those would stall
             # the project entirely. The hotfix lane is the explicit exemption for
             # the distinct-branch case.
+            #
+            # A custom staged rollup root (e.g. a project whose staging family is
+            # 'release/' rolling up onto 'release/main') is ALSO exempt: landing
+            # on such a staging branch is the intended staged flow even when that
+            # branch happens to coincide with promotion_target. Those merges are
+            # not held but proceed and are classified downstream by
+            # merged_pr_counts_as_integration_landing, which raises the
+            # "Merged PR landed on promotion target before integration" alert and
+            # leaves pr_merged unset. Holding them here would shadow that path and
+            # strand the staged rollup (PR #7064 vs #7105 merge-lane reconciliation).
             if (
                 promotion_target
                 and target_branch == promotion_target
                 and target_branch != integration_branch
                 and not _promotion_target_rollup_allowed(parent, target_branch)
+                and not is_custom_staged_rollup_root(parent, project, target_branch)
             ):
                 await _hold_rollup_for_branch_safety(
                     parent,
@@ -1254,18 +1298,36 @@ async def _check_and_trigger_rollup(
                     elif existing_pr is not None and pr_state is not None:
                         if pr_state.get("merged"):
                             logger.info(
-                                f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED"
+                                f"[ROLLUP] PR #{existing_pr} already merged — classifying landing"
                             )
-                            _integration_br = _get_project_integration_branch(project)
-                            _landed = target_branch == _integration_br
-                            parent.status = TaskStatus.COMPLETED
+                            (_landed, _terminal_rollup_merge) = (
+                                await _classify_merged_rollup_landing(
+                                    parent,
+                                    project,
+                                    session,
+                                    pr_number=existing_pr,
+                                    target_branch=target_branch,
+                                    source="rollup_management.existing_pr_merged",
+                                )
+                            )
+                            parent.status = (
+                                TaskStatus.COMPLETED
+                                if _terminal_rollup_merge
+                                else TaskStatus.EVALUATING
+                            )
                             parent.context = {
                                 **_clear_rollup_transient_state(parent_ctx),
                                 **({"pr_merged": True} if _landed else {}),
                             }
-                            parent.latest_status_message = (
-                                f"Rollup PR #{existing_pr} already merged"
-                            )
+                            if _terminal_rollup_merge:
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{existing_pr} already merged"
+                                )
+                            else:
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{existing_pr} already merged into "
+                                    f"{target_branch}; awaiting downstream landing"
+                                )
                             session.add(parent)
                             await session.commit()
                             await _cleanup_branches(parent, session)
@@ -1274,7 +1336,7 @@ async def _check_and_trigger_rollup(
                                 "task_updated",
                                 {
                                     "task_id": str(parent.id),
-                                    "status": TaskStatus.COMPLETED,
+                                    "status": parent.status,
                                 },
                             )
                             return
@@ -1550,7 +1612,7 @@ async def _check_and_trigger_rollup(
                 # but no file changes. Close before spawning review/fix VMs.
                 if pr_detail is not None and lines_changed == 0:
                     logger.info(
-                        f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and marking COMPLETED"
+                        f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and classifying landing"
                     )
                     try:
                         await close_pull_request(
@@ -1579,13 +1641,41 @@ async def _check_and_trigger_rollup(
                     )
                     if parent is None:
                         return
-                    parent.status = TaskStatus.COMPLETED
-                    parent.latest_status_message = f"✓ All {completed_count} subtasks completed — rollup PR #{rollup_pr_number} had no file changes (already on {target_branch})"
+                    (_landed, _terminal_rollup_merge) = (
+                        await _classify_merged_rollup_landing(
+                            parent,
+                            project,
+                            session,
+                            pr_number=rollup_pr_number,
+                            target_branch=target_branch,
+                            source="rollup_management.zero_diff_close",
+                        )
+                    )
+                    parent.status = (
+                        TaskStatus.COMPLETED
+                        if _terminal_rollup_merge
+                        else TaskStatus.EVALUATING
+                    )
+                    if _terminal_rollup_merge:
+                        parent.latest_status_message = (
+                            f"✓ All {completed_count} subtasks completed — rollup PR "
+                            f"#{rollup_pr_number} had no file changes (already on "
+                            f"{target_branch})"
+                        )
+                    else:
+                        parent.latest_status_message = (
+                            f"✓ All {completed_count} subtasks completed — rollup PR "
+                            f"#{rollup_pr_number} had no file changes (already on "
+                            f"{target_branch}); awaiting downstream landing"
+                        )
                     _cleared = _clear_rollup_transient_state(parent.context)
                     parent.context = {
-                        k: v
-                        for k, v in _cleared.items()
-                        if k not in ("rollup_pr_number", "rollup_pr_url")
+                        **{
+                            k: v
+                            for k, v in _cleared.items()
+                            if k not in ("rollup_pr_number", "rollup_pr_url")
+                        },
+                        **({"pr_merged": True} if _landed else {}),
                     }
                     session.add(parent)
                     await session.commit()
@@ -1593,7 +1683,7 @@ async def _check_and_trigger_rollup(
                     await broadcast_to_project(
                         str(parent.project_id),
                         "task_updated",
-                        {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+                        {"task_id": str(parent.id), "status": parent.status},
                     )
                     return
 
@@ -1921,15 +2011,37 @@ async def _check_and_trigger_rollup(
                         return
                     parent_ctx = parent.context or {}
                     if merge_result.get("merged"):
-                        _integration_br = _get_project_integration_branch(project)
-                        _landed = target_branch == _integration_br
-                        parent.status = TaskStatus.COMPLETED
+                        (_landed, _terminal_rollup_merge) = (
+                            await _classify_merged_rollup_landing(
+                                parent,
+                                project,
+                                session,
+                                pr_number=rollup_pr_number,
+                                target_branch=target_branch,
+                                source="rollup_management.auto_merge_success",
+                            )
+                        )
+                        parent.status = (
+                            TaskStatus.COMPLETED
+                            if _terminal_rollup_merge
+                            else TaskStatus.EVALUATING
+                        )
                         parent.context = {
                             **_clear_rollup_transient_state(parent_ctx),
                             **({"pr_merged": True} if _landed else {}),
                             "rollup_pr_url": rollup_pr_url,
                         }
-                        parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
+                        if _terminal_rollup_merge:
+                            parent.latest_status_message = (
+                                f"All {completed_count} subtasks merged, rollup PR auto-merged"
+                            )
+                        else:
+                            parent.latest_status_message = (
+                                f"All {completed_count} subtasks merged into "
+                                f"{target_branch}; awaiting downstream landing"
+                            )
+                        session.add(parent)
+                        await session.commit()
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
                         except Exception as del_err:
@@ -1981,6 +2093,18 @@ async def _check_and_trigger_rollup(
                             logger.warning(
                                 f"[ROLLUP] Failed to update viewport_coverage_snapshot: {_snap_e}"
                             )
+                        await session.commit()
+                        if _terminal_rollup_merge:
+                            await _cleanup_branches(parent, session)
+                            await broadcast_to_project(
+                                str(parent.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(parent.id),
+                                    "status": TaskStatus.COMPLETED,
+                                },
+                            )
+                        return
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")

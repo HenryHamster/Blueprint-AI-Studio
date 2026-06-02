@@ -22,6 +22,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.models import (
     Alert,
     AlertSeverity,
@@ -1944,6 +1945,7 @@ async def update_agent_status(
 
                 _gh_pr_state: str | None = None
                 _gh_pr_merged: bool = False
+                _gh_pr_base_branch: str | None = None
                 try:
                     from app.routers.agent import get_github_token_for_task
                     from app.github import get_pull_request
@@ -1956,6 +1958,7 @@ async def update_agent_status(
                     )
                     _gh_pr_state = _pr_data.get("state")
                     _gh_pr_merged = bool(_pr_data.get("merged"))
+                    _gh_pr_base_branch = (_pr_data.get("base") or {}).get("ref")
                 except Exception as _gh_exc:
                     # Mirror reaper behavior: assume open on transient GH failure
                     # so a brief outage doesn't strand the task as FAILED-forever.
@@ -2034,20 +2037,44 @@ async def update_agent_status(
                 # the spawn succeeds.
                 _ctx = dict(task.context or {})
                 if _gh_pr_state == "closed" and _gh_pr_merged:
+                    _proj = await session.get(Project, task.project_id)
                     logger.info(
                         f"[AGENT_STATUS] Task {task.id} reported FAILED but PR #{_pr_num} was merged "
-                        f"out-of-band — marking COMPLETED"
+                        f"out-of-band — classifying landing"
+                    )
+                    (
+                        _record_pr_merged,
+                        _terminal_rollup_merge,
+                        _landed_branch,
+                    ) = await classify_rollup_merge_outcome(
+                        task,
+                        _proj,
+                        session,
+                        pr_number=_pr_num,
+                        merged_base_branch=_gh_pr_base_branch,
+                        source="agent_status.failed_pr_recovery",
                     )
                     _ctx.pop("_pr_state_check_pending", None)
                     task.context = _ctx
                     flag_modified(task, "context")
-                    task.status = TaskStatus.COMPLETED
+                    task.status = (
+                        TaskStatus.COMPLETED
+                        if _terminal_rollup_merge
+                        else TaskStatus.EVALUATING
+                    )
                     task.vm_instance_id = None
                     task.last_heartbeat = None
-                    task.latest_status_message = (
-                        f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
-                    )
-                    task.context = {**(task.context or {}), "pr_merged": True}
+                    if _terminal_rollup_merge:
+                        task.latest_status_message = (
+                            f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
+                        )
+                    else:
+                        task.latest_status_message = (
+                            f"Reported FAILED; PR #{_pr_num} merged into "
+                            f"{_landed_branch}; awaiting downstream landing"
+                        )
+                    if _record_pr_merged:
+                        task.context = {**(task.context or {}), "pr_merged": True}
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(

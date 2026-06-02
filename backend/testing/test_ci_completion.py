@@ -11,6 +11,8 @@ Covers:
 """
 
 import uuid
+from unittest.mock import AsyncMock
+
 import pytest
 
 from app.ci_completion import _normalize_merge_error
@@ -1229,6 +1231,157 @@ async def test_already_merged_pr_completes_task(db_session, mocker):
     assert result is True, "Should return True when PR was already merged"
     assert task.status == TaskStatus.COMPLETED
     assert "already merged" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_merge_success_leaves_orig_pr_merged_unset_on_promotion_target(
+    db_session, mocker
+):
+    """Merged review PRs that land on promotion_target must not mark orig pr_merged."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion._post_merge_summary", new_callable=AsyncMock)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "deadbeef"},
+    )
+
+    project = Project(
+        name="Promotion target merge",
+        user_id="test-user",
+        integration_branch="automain",
+        promotion_target="release/main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = Task(
+        project_id=project.id,
+        title="Original task",
+        payloads=[{"type": "research", "prompt": "orig"}],
+        context={},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "original_task_id": str(orig.id),
+            "base_branch": "release/main",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    await db_session.refresh(orig)
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.task_id == orig.id)))
+        .scalars()
+        .all()
+    )
+
+    assert result is True
+    assert orig.status == TaskStatus.COMPLETED
+    assert (orig.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_merge_success_keeps_rollup_orig_evaluating_on_intermediate_branch(
+    db_session, mocker
+):
+    """Merged rollup PRs on staging branches must await downstream landing."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion._post_merge_summary", new_callable=AsyncMock)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "feedface"},
+    )
+
+    project = Project(
+        name="Intermediate rollup merge",
+        user_id="test-user",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        payloads=[{"type": "research", "prompt": "orig"}],
+        context={"_is_rollup_review": True},
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "original_task_id": str(orig.id),
+            "base_branch": "release/candidate-1",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    await db_session.refresh(orig)
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.task_id == orig.id)))
+        .scalars()
+        .all()
+    )
+
+    assert result is True
+    assert orig.status == TaskStatus.EVALUATING
+    assert (orig.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (orig.latest_status_message or "")
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
 
 
 @pytest.mark.asyncio

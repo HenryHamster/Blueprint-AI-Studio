@@ -50,6 +50,11 @@ from app.review_pipeline import (
     should_auto_approve_diff,
 )
 from app.failure_classification import classify_failure
+from app.branch_resolution import (
+    classify_rollup_merge_outcome,
+    is_custom_staged_rollup_root,
+    merged_pr_counts_as_integration_landing,
+)
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.rollup_locking import _lock_original_task, _OriginalTaskLockTimeout
 from app.notification_dispatch import (
@@ -913,7 +918,23 @@ async def _process_post_commit(
                             merge_method=_pick_merge_method(task),
                         )
                         if merge_result.get("merged"):
-                            task.context = {**(task.context or {}), "pr_merged": True}
+                            _record_pr_merged = is_intermediate
+                            if not _record_pr_merged:
+                                _record_pr_merged = await (
+                                    merged_pr_counts_as_integration_landing(
+                                        task,
+                                        _project,
+                                        session,
+                                        pr_number=pr_number,
+                                        merged_base_branch=base_branch,
+                                        source="task_lifecycle.small_scope_auto_merge",
+                                    )
+                                )
+                            if _record_pr_merged:
+                                task.context = {
+                                    **(task.context or {}),
+                                    "pr_merged": True,
+                                }
                             session.add(task)
                             _t_ctx = task.context or {}
                             # Audit W1: auto_remediation is now a column.
@@ -2096,10 +2117,6 @@ async def _process_post_commit(
                                         skip_locked=False,
                                     )
                                     if orig:
-                                        orig.context = {
-                                            **(orig.context or {}),
-                                            "pr_merged": True,
-                                        }
                                         _orig_project = await session.get(
                                             Project, orig.project_id
                                         )
@@ -2108,6 +2125,64 @@ async def _process_post_commit(
                                                 _orig_project
                                             )
                                         )
+                                        _orig_is_custom_staged_rollup = (
+                                            is_custom_staged_rollup_root(
+                                                orig, _orig_project, base_branch
+                                            )
+                                        )
+                                        _terminal_rollup_merge = True
+                                        if (
+                                            _orig_is_custom_staged_rollup
+                                            and _orig_project is not None
+                                        ):
+                                            _orig_integration_branch = (
+                                                _shared_state.get_project_integration_branch(
+                                                    _orig_project
+                                                )
+                                            )
+                                            _landed_on_integration = (
+                                                base_branch
+                                                == _orig_integration_branch
+                                            )
+                                            _landed_on_promotion = (
+                                                base_branch
+                                                == _orig_promotion_target
+                                            )
+                                            if (
+                                                not _landed_on_integration
+                                                and _landed_on_promotion
+                                            ):
+                                                await merged_pr_counts_as_integration_landing(
+                                                    orig,
+                                                    _orig_project,
+                                                    session,
+                                                    pr_number=pr_number,
+                                                    merged_base_branch=base_branch,
+                                                    source="task_lifecycle.review_merge_success",
+                                                )
+                                            _record_pr_merged = (
+                                                _landed_on_integration
+                                            )
+                                            _terminal_rollup_merge = (
+                                                _landed_on_integration
+                                                or _landed_on_promotion
+                                            )
+                                        else:
+                                            _record_pr_merged = await (
+                                                merged_pr_counts_as_integration_landing(
+                                                    orig,
+                                                    _orig_project,
+                                                    session,
+                                                    pr_number=pr_number,
+                                                    merged_base_branch=base_branch,
+                                                    source="task_lifecycle.review_merge_success",
+                                                )
+                                            )
+                                        if _record_pr_merged:
+                                            orig.context = {
+                                                **(orig.context or {}),
+                                                "pr_merged": True,
+                                            }
                                         # If this was a rollup PR review, mark the
                                         # parent COMPLETED — but only if it is STILL
                                         # EVALUATING after the relock. A peer (e.g.
@@ -2115,14 +2190,37 @@ async def _process_post_commit(
                                         # terminalized it during the merge window;
                                         # COMPLETED is irreversible, so we must not
                                         # overwrite a peer's terminal transition.
+                                        # "Was this a rollup merge at all?" — true
+                                        # whenever the original task was parked
+                                        # EVALUATING awaiting its rollup PR (the
+                                        # pre-mutation state captured here). This
+                                        # drives the downstream smoketest and hotfix
+                                        # back-merge gates, which must fire for ANY
+                                        # rollup landing on the promotion target —
+                                        # NOT only custom-staged (release/) ones.
+                                        # The custom-staged terminal-vs-deferred
+                                        # decision below uses _orig_is_custom_staged_rollup
+                                        # directly; conflating the two (PR #7064 vs
+                                        # automain merge) silently skipped the hotfix
+                                        # back-merge for a plain hotfix->main landing.
                                         is_rollup_merge = (
                                             orig.status == TaskStatus.EVALUATING
                                         )
-                                        if is_rollup_merge:
-                                            orig.status = TaskStatus.COMPLETED
-                                            orig.latest_status_message = (
-                                                "Rollup PR merged"
-                                            )
+                                        if orig.status == TaskStatus.EVALUATING:
+                                            if (
+                                                not _orig_is_custom_staged_rollup
+                                                or _terminal_rollup_merge
+                                            ):
+                                                orig.status = TaskStatus.COMPLETED
+                                                orig.latest_status_message = (
+                                                    "Rollup PR merged"
+                                                )
+                                            else:
+                                                orig.latest_status_message = (
+                                                    f"Rollup PR merged into "
+                                                    f"{base_branch}; awaiting "
+                                                    "downstream landing"
+                                                )
                                         session.add(orig)
                                         _o_ctx = orig.context or {}
                                         # Audit W1: auto_remediation is now a column.
@@ -2748,8 +2846,8 @@ async def _process_post_commit(
                     # Empty-PR short-circuit: if the PR has no file changes (because a
                     # prior fix cycle rebased the branch flat so all its commits are in
                     # the base), spawning another fix is futile — there's nothing to
-                    # fix. Close the PR and mark the rollup parent COMPLETED so it
-                    # stops blocking the pipeline.
+                    # fix. Close the PR and classify the rollup parent's landing
+                    # so intermediate staged targets keep waiting downstream.
                     try:
                         (
                             _empty_gh,
@@ -2785,6 +2883,7 @@ async def _process_post_commit(
                                 f"[REVIEW PIPELINE] Failed to close empty PR #{pr_number}: {_close_err}"
                             )
                         if original_task_id:
+                            _orig_broadcast_status = TaskStatus.EVALUATING
                             try:
                                 # Phase A1: skip_locked + bounded retry. If the
                                 # parent row is held, defer the empty-PR cleanup;
@@ -2800,14 +2899,51 @@ async def _process_post_commit(
                                         "review_loop", {}
                                     ) or {}
                                     _orig_loop.pop("ci_waiting", None)
+                                    _orig_project = await session.get(
+                                        Project, _orig.project_id
+                                    )
+                                    (
+                                        _record_pr_merged,
+                                        _terminal_rollup_merge,
+                                        _landed_branch,
+                                    ) = await classify_rollup_merge_outcome(
+                                        _orig,
+                                        _orig_project,
+                                        session,
+                                        pr_number=pr_number,
+                                        merged_base_branch=base_branch,
+                                        source="task_lifecycle.review_empty_pr_cleanup",
+                                    )
                                     _orig.context = {
                                         **(_orig.context or {}),
                                         "review_loop": _orig_loop,
                                         "pr_closed_empty": True,
+                                        **(
+                                            {"pr_merged": True}
+                                            if _record_pr_merged
+                                            else {}
+                                        ),
                                     }
                                     flag_modified(_orig, "context")
-                                    _orig.status = TaskStatus.COMPLETED
-                                    _orig.latest_status_message = f"✓ Rollup PR #{pr_number} closed — branch equivalent to {base_branch}, no new changes to merge"
+                                    _orig.status = (
+                                        TaskStatus.COMPLETED
+                                        if _terminal_rollup_merge
+                                        else TaskStatus.EVALUATING
+                                    )
+                                    if _terminal_rollup_merge:
+                                        _orig.latest_status_message = (
+                                            f"✓ Rollup PR #{pr_number} closed — "
+                                            f"branch equivalent to {base_branch}, "
+                                            "no new changes to merge"
+                                        )
+                                    else:
+                                        _orig.latest_status_message = (
+                                            f"✓ Rollup PR #{pr_number} closed — "
+                                            f"branch equivalent to {_landed_branch}, "
+                                            "no new changes to merge; awaiting "
+                                            "downstream landing"
+                                        )
+                                    _orig_broadcast_status = _orig.status
                                     session.add(_orig)
                                 else:
                                     logger.warning(
@@ -2828,7 +2964,7 @@ async def _process_post_commit(
                                     "task_updated",
                                     {
                                         "task_id": original_task_id,
-                                        "status": TaskStatus.COMPLETED,
+                                        "status": _orig_broadcast_status,
                                     },
                                 )
                             except Exception:  # noqa: S110

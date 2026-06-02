@@ -34,6 +34,7 @@ from app.compute import (
     any_zone_available,
     soonest_zone_recovery,
 )
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -714,7 +715,7 @@ async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
     return True, pr_num
 
 
-from app.reaper_sweeps import (
+from app.reaper_sweeps import (  # noqa: E402
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
@@ -1705,6 +1706,7 @@ async def reaper_service():
                         )
                         io_gh_pr_state: str | None = None
                         io_gh_pr_merged: bool = False
+                        io_gh_pr_base_branch: str | None = None
                         if _has_pr_artifact and _pr_num:
                             try:
                                 from app.routers.agent import get_github_token_for_task
@@ -1720,6 +1722,9 @@ async def reaper_service():
                                 )
                                 io_gh_pr_state = _pr_data.get("state")
                                 io_gh_pr_merged = bool(_pr_data.get("merged"))
+                                io_gh_pr_base_branch = (
+                                    (_pr_data.get("base") or {}).get("ref")
+                                )
                             except Exception as _gh_exc:  # noqa: BLE001
                                 # GH API unreachable: fall back to "open" — handing off
                                 # to review pipeline is the safer default.
@@ -2021,6 +2026,7 @@ async def reaper_service():
                         # doesn't run with FOR UPDATE held. Reuse those values here.
                         _gh_pr_state = io_gh_pr_state
                         _gh_pr_merged = io_gh_pr_merged
+                        _gh_pr_base_branch = io_gh_pr_base_branch
                         _pr_actually_open = (
                             _has_pr_artifact and _pr_num and _gh_pr_state == "open"
                         )
@@ -2037,15 +2043,42 @@ async def reaper_service():
                             # see the merge.
                             logger.info(
                                 f"[REAPER] Task {task.id} reaped mid-run; PR #{_pr_num} already merged — "
-                                f"marking COMPLETED"
+                                f"classifying landing"
                             )
-                            task.status = TaskStatus.COMPLETED
+                            _proj = await session.get(Project, task.project_id)
+                            (
+                                _record_pr_merged,
+                                _terminal_rollup_merge,
+                                _landed_branch,
+                            ) = await classify_rollup_merge_outcome(
+                                task,
+                                _proj,
+                                session,
+                                pr_number=_pr_num,
+                                merged_base_branch=_gh_pr_base_branch,
+                                source="reaper.orphan_recovery",
+                            )
+                            task.status = (
+                                TaskStatus.COMPLETED
+                                if _terminal_rollup_merge
+                                else TaskStatus.EVALUATING
+                            )
                             task.vm_instance_id = None
                             task.last_heartbeat = None
-                            task.latest_status_message = (
-                                f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
-                            )
-                            task.context = {**(task.context or {}), "pr_merged": True}
+                            if _terminal_rollup_merge:
+                                task.latest_status_message = (
+                                    f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
+                                )
+                            else:
+                                task.latest_status_message = (
+                                    f"Reaped mid-run; PR #{_pr_num} merged into "
+                                    f"{_landed_branch}; awaiting downstream landing"
+                                )
+                            if _record_pr_merged:
+                                task.context = {
+                                    **(task.context or {}),
+                                    "pr_merged": True,
+                                }
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),

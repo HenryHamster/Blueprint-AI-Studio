@@ -22,6 +22,8 @@ from app.broadcast import broadcast_to_project
 from app.branch_resolution import (
     InvalidProjectBranchConfiguration,
     _signal_blocking_project_branch_configuration,
+    classify_rollup_merge_outcome,
+    merged_pr_counts_as_integration_landing,
 )
 from app.models import (
     Artifact,
@@ -360,28 +362,15 @@ async def _handle_rollup_pr_approval(
     )
 
     _promotion_target = _get_project_promotion_target(_project)
-    _integration_branch = get_project_integration_branch(_project)
-    # Refuse ONLY when the merge would land on the promotion target AND that
-    # target is distinct from the integration branch. Single-trunk projects
-    # (integration == promotion) legitimately merge onto the shared trunk.
-    if (
-        base_branch == _promotion_target
-        and base_branch != _integration_branch
-        and not _promotion_target_merge_allowed(task, base_branch)
-    ):
-        detail = (
-            f"Approved rollup merge refused: target branch '{base_branch}' is this "
-            "project's promotion target. Configure a distinct integration branch "
-            "before landing fleet work."
-        )
-        await _block_admin_merge_for_branch_safety(
-            task,
-            _project,
-            session,
-            detail,
-            issue_code="admin_rollup_target_matches_promotion_target",
-        )
-        raise HTTPException(status_code=409, detail=detail)
+    # A human has explicitly approved this rollup merge, so we do NOT refuse a
+    # landing on the promotion target here (PR #7064 superseded the earlier
+    # hard-refuse of PR #6995 for the human-approval lane). Instead the merge
+    # proceeds and classify_rollup_merge_outcome below decides the outcome:
+    # a landing on a distinct promotion target raises the out-of-band alert and
+    # leaves pr_merged unset so the rollup stays unqualified, rather than
+    # dead-ending the operator's explicit approval with a 409. The autonomous
+    # rollup path (rollup_management) still HOLDS such landings for human
+    # approval first; this handler IS that approval.
 
     try:
         from app.routers.agent import get_github_token_for_task
@@ -392,11 +381,40 @@ async def _handle_rollup_pr_approval(
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
-            task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True}
-            task.latest_status_message = (
-                f"Human-approved merge of rollup PR #{rollup_pr_number}"
+            _project = await session.get(Project, task.project_id)
+            base_branch = (task.first_payload).get(
+                "base_branch"
+            ) or get_project_integration_branch(_project)
+            (
+                record_pr_merged,
+                terminal_rollup_merge,
+                landed_branch,
+            ) = await classify_rollup_merge_outcome(
+                task,
+                _project,
+                session,
+                pr_number=rollup_pr_number,
+                merged_base_branch=base_branch,
+                source="admin_task_mutations.rollup_pr_approval",
             )
+            task.status = (
+                TaskStatus.COMPLETED
+                if terminal_rollup_merge
+                else TaskStatus.EVALUATING
+            )
+            task.context = {
+                **ctx,
+                **({"pr_merged": True} if record_pr_merged else {}),
+            }
+            if terminal_rollup_merge:
+                task.latest_status_message = (
+                    f"Human-approved merge of rollup PR #{rollup_pr_number}"
+                )
+            else:
+                task.latest_status_message = (
+                    f"Human-approved merge of rollup PR #{rollup_pr_number} "
+                    f"into {landed_branch}; awaiting downstream landing"
+                )
             await create_pr_comment(
                 gh_token,
                 owner,
@@ -606,8 +624,23 @@ async def _merge_critical_pr(
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
         if merge_result.get("merged"):
+            _project = await session.get(Project, task.project_id)
+            base_branch = (task.first_payload).get(
+                "base_branch"
+            ) or get_project_integration_branch(_project)
+            record_pr_merged = await merged_pr_counts_as_integration_landing(
+                task,
+                _project,
+                session,
+                pr_number=pr_number,
+                merged_base_branch=base_branch,
+                source="admin_task_mutations.critical_pr_approval",
+            )
             task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True}
+            task.context = {
+                **ctx,
+                **({"pr_merged": True} if record_pr_merged else {}),
+            }
             task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
             await create_pr_comment(
                 gh_token,

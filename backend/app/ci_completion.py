@@ -87,6 +87,10 @@ async def _attempt_merge_with_retry_and_escalation(
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.alert_dispatch import _maybe_create_failure_alert
+    from app.branch_resolution import (
+        is_custom_staged_rollup_root,
+        merged_pr_counts_as_integration_landing,
+    )
     from app.models import Project
     from app.shared_state import (
         get_project_integration_branch,
@@ -338,6 +342,7 @@ async def _attempt_merge_with_retry_and_escalation(
                     _signal_blocking_project_branch_configuration,
                 )
                 from app.database import AsyncSessionLocal
+                from app.models import Project
 
                 async with AsyncSessionLocal() as _orig_session:
                     orig = await _orig_session.get(Task, uuid.UUID(ci_orig_id))
@@ -356,9 +361,10 @@ async def _attempt_merge_with_retry_and_escalation(
                             or (task.context or {}).get("hotfix")
                             or ci_loop.get("hotfix")
                         )
-                        _landed_on_integration = bool(
-                            _integration_branch and ci_base == _integration_branch
-                        )
+                        # automain branch-safety signal: a rollup landing on the
+                        # promotion target while that branch is distinct from the
+                        # integration branch (outside the hotfix lane) is a
+                        # misconfiguration — stage the deferred operator alert.
                         if (
                             _promotion_target
                             and ci_base == _promotion_target
@@ -375,16 +381,56 @@ async def _attempt_merge_with_retry_and_escalation(
                                     "integration branch before landing fleet work."
                                 ),
                             )
-                        if _landed_on_integration:
-                            orig.context = {
-                                **(orig.context or {}),
-                                "pr_merged": True,
-                            }
+                        # PR feature: custom staged rollup roots stay non-terminal
+                        # until they land downstream; promotion-target landings raise
+                        # the dedicated landing alert and leave pr_merged unset.
+                        _orig_is_custom_staged_rollup = is_custom_staged_rollup_root(
+                            orig, orig_project, ci_base
+                        )
+                        _terminal_rollup_merge = True
+                        if _orig_is_custom_staged_rollup and orig_project is not None:
+                            _landed_on_integration = ci_base == _integration_branch
+                            _landed_on_promotion = ci_base == _promotion_target
+                            if not _landed_on_integration and _landed_on_promotion:
+                                await merged_pr_counts_as_integration_landing(
+                                    orig,
+                                    orig_project,
+                                    _orig_session,
+                                    pr_number=ci_pr_number,
+                                    merged_base_branch=ci_base,
+                                    source="ci_completion.original_merge_success",
+                                )
+                            record_pr_merged = _landed_on_integration
+                            _terminal_rollup_merge = (
+                                _landed_on_integration or _landed_on_promotion
+                            )
+                        else:
+                            record_pr_merged = (
+                                await merged_pr_counts_as_integration_landing(
+                                    orig,
+                                    orig_project,
+                                    _orig_session,
+                                    pr_number=ci_pr_number,
+                                    merged_base_branch=ci_base,
+                                    source="ci_completion.original_merge_success",
+                                )
+                            )
+                        if record_pr_merged:
+                            orig.context = {**(orig.context or {}), "pr_merged": True}
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):
-                            orig.status = TaskStatus.COMPLETED
-                            orig.latest_status_message = "Rollup PR merged"
+                            if (
+                                not _orig_is_custom_staged_rollup
+                                or _terminal_rollup_merge
+                            ):
+                                orig.status = TaskStatus.COMPLETED
+                                orig.latest_status_message = "Rollup PR merged"
+                            else:
+                                orig.latest_status_message = (
+                                    f"Rollup PR merged into {ci_base}; awaiting "
+                                    "downstream landing"
+                                )
                         _orig_session.add(orig)
                         await _orig_session.commit()
             except Exception as e:

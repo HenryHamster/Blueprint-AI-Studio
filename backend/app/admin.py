@@ -48,6 +48,7 @@ from app.models import (
     get_task_total_vm_cost_usd_or_none,
 )
 from app.auth import get_current_user
+from app.branch_resolution import classify_rollup_merge_outcome, merged_pr_counts_as_integration_landing
 from app.task_locking import task_lock
 
 from app.broadcast import broadcast_to_project
@@ -716,9 +717,46 @@ async def bulk_action_tasks(
                                 gh_token, owner, repo, rollup_pr_number
                             )
                             if merge_result.get("merged"):
-                                task.status = TaskStatus.COMPLETED
-                                task.context = {**ctx, "pr_merged": True}
-                                task.latest_status_message = f"Human-approved merge of rollup PR #{rollup_pr_number}"
+                                _project = await session.get(Project, task.project_id)
+                                base_branch = (task.first_payload).get(
+                                    "base_branch"
+                                ) or get_project_integration_branch(_project)
+                                (
+                                    record_pr_merged,
+                                    terminal_rollup_merge,
+                                    landed_branch,
+                                ) = await classify_rollup_merge_outcome(
+                                    task,
+                                    _project,
+                                    session,
+                                    pr_number=rollup_pr_number,
+                                    merged_base_branch=base_branch,
+                                    source="admin.bulk_action.rollup_pr_approval",
+                                )
+                                task.status = (
+                                    TaskStatus.COMPLETED
+                                    if terminal_rollup_merge
+                                    else TaskStatus.EVALUATING
+                                )
+                                task.context = {
+                                    **ctx,
+                                    **(
+                                        {"pr_merged": True}
+                                        if record_pr_merged
+                                        else {}
+                                    ),
+                                }
+                                if terminal_rollup_merge:
+                                    task.latest_status_message = (
+                                        f"Human-approved merge of rollup PR "
+                                        f"#{rollup_pr_number}"
+                                    )
+                                else:
+                                    task.latest_status_message = (
+                                        f"Human-approved merge of rollup PR "
+                                        f"#{rollup_pr_number} into {landed_branch}; "
+                                        "awaiting downstream landing"
+                                    )
                                 await create_pr_comment(
                                     gh_token,
                                     owner,
@@ -732,10 +770,6 @@ async def bulk_action_tasks(
                                 session.add(task)
                                 await session.commit()
                                 await _cleanup_branches(task, session)
-                                _project = await session.get(Project, task.project_id)
-                                base_branch = (task.first_payload).get(
-                                    "base_branch"
-                                ) or get_project_integration_branch(_project)
                                 _promotion_target = _get_project_promotion_target(
                                     _project
                                 )
@@ -883,8 +917,25 @@ async def bulk_action_tasks(
                                         gh_token, owner, repo, pr_number
                                     )
                                     if merge_result.get("merged"):
+                                        record_pr_merged = (
+                                            await merged_pr_counts_as_integration_landing(
+                                                task,
+                                                _project,
+                                                session,
+                                                pr_number=pr_number,
+                                                merged_base_branch=base_branch,
+                                                source="admin.bulk_action.critical_pr_approval",
+                                            )
+                                        )
                                         task.status = TaskStatus.COMPLETED
-                                        task.context = {**ctx, "pr_merged": True}
+                                        task.context = {
+                                            **ctx,
+                                            **(
+                                                {"pr_merged": True}
+                                                if record_pr_merged
+                                                else {}
+                                            ),
+                                        }
                                         task.latest_status_message = (
                                             f"Human-approved merge of PR #{pr_number}"
                                         )
