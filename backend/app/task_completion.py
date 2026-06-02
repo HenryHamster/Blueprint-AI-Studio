@@ -640,6 +640,75 @@ async def _record_project_remediation_outcome(
     return True
 
 
+async def _release_pool_member_if_terminal(
+    task: Task,
+    status: "TaskStatus",
+    session: AsyncSession,
+) -> Optional[str]:
+    """Return or retire the warm-pool member that served a now-terminal task.
+
+    A leased :class:`~app.models.PoolVm` row stays ``LEASED`` — counting against
+    the per-project pool target and the fleet budget (blocking replenishment) —
+    until the reaper's orphan-lease sweep eventually reclaims and DELETEs it,
+    making every member single-use. Reconcile the registry promptly instead,
+    matching what the pool agent does next:
+
+      * ``COMPLETED`` — the agent loops back to ``/next-role``
+        (``bootstrapPoolMode`` -> ``pollForNextRole``), so return the member to
+        IDLE via :func:`~app.warm_pool.release_pool_vm` (a fresh idle window
+        starts; the idle-TTL reaper / stale-image recycling / cost guard still
+        decide when it is ultimately retired).
+      * ``FAILED`` / ``CANCELLED`` — the agent re-throws and exits without
+        polling, so it cannot be reused: mark it ``RETIRING`` via
+        :func:`~app.warm_pool.mark_pool_vm_retiring`.
+
+    No-op (returns ``None``) for non-terminal states, when the pool is disabled,
+    or when no LEASED member is bound to this task (the common cold-provisioned
+    case + idempotency guard). Returns the outcome label when it acted; the
+    caller owns the commit.
+    """
+    if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+        return None
+    # Deferred imports: keep the module-level surface stable and avoid importing
+    # the warm-pool registry on the hot completion path when the pool is dark.
+    from app.models import PoolVmState  # noqa: PLC0415
+    from app.warm_pool import (  # noqa: PLC0415
+        get_pool_vm,
+        is_warm_pool_enabled,
+        mark_pool_vm_retiring,
+        release_pool_vm,
+    )
+
+    if not is_warm_pool_enabled():
+        return None
+    vm_id = task.vm_instance_id
+    if not vm_id:
+        return None
+    member = await get_pool_vm(session, vm_id)
+    if member is None or member.state != PoolVmState.LEASED:
+        # Not a pool member, or already reconciled / retiring — nothing to do.
+        return None
+    # Only reclaim the member actually bound to THIS task: a vm_instance_id
+    # reused across tasks must not let one task's terminal state pull back a
+    # member leased to a different task.
+    if member.leased_task_id is not None and member.leased_task_id != task.id:
+        return None
+    if status == TaskStatus.COMPLETED:
+        await release_pool_vm(session, vm_id)
+        outcome = "idle"
+    else:
+        await mark_pool_vm_retiring(session, vm_id)
+        outcome = "retiring"
+    logger.info(
+        "[WARM-POOL] task %s terminal (%s) — pool member %s -> %s",
+        task.id,
+        getattr(status, "value", status),
+        vm_id,
+        outcome,
+    )
+    return outcome
+
+
 async def _record_remediation_if_terminal(
     task: Task,
     status: "TaskStatus",
@@ -653,6 +722,18 @@ async def _record_remediation_if_terminal(
     """
     if status not in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
         return
+    # Reconcile the warm-pool member that served this task BEFORE the
+    # remediation-specific early returns below, so every terminal task — not
+    # just diagnosis-linked ones — promptly returns/retires its pool member
+    # instead of stranding it LEASED against the pool budget. Best-effort: a
+    # failure here must not block remediation recording (the orphan-lease reaper
+    # remains the backstop).
+    try:
+        await _release_pool_member_if_terminal(task, status, session)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"[WARM-POOL] Failed to reconcile pool member for terminal task {task.id}: {exc!r}"
+        )
     ctx = task.context or {}
     has_direction_linkage = bool(
         ctx.get("diagnosis_task_id") and ctx.get("direction_id")

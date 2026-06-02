@@ -3,6 +3,28 @@
 Extracted from app.main to reduce module size. The worker polls for QUEUED tasks,
 checks dependencies, handles file conflicts, provisions VMs, and monitors
 EVALUATING tasks.
+
+The orchestrator loop runs every ~10 seconds and:
+
+1. **Task Polling**: Fetches QUEUED tasks in priority order (high → medium → low)
+2. **Dependency Checking**: Validates file conflicts, rollup conflicts, and migration
+   serialization before provisioning
+3. **VM Provisioning**: Creates GCP VMs for non-dependent tasks (subject to
+   MAX_CONCURRENT_VMS and MAX_PROVISION_SLOTS limits)
+4. **Autonomous Research**: Spawns new research/plan tasks from strategic directions
+5. **EVALUATING Monitoring**: Watches tasks waiting on CI/review and triggers PR rollups
+   when ready
+6. **Circuit Breaker**: Halts new provisioning if a project exceeds failure threshold
+
+Key Functions:
+- orchestrator_worker() - Main polling loop (async, called by lifecycle)
+- _check_idle_research() - Spawns autonomous research tasks if pipeline is idle
+- _provision_and_handle() - Attempts to provision a task, with retry and fallback logic
+- _monitor_evaluating_tasks() - Checks CI completion and review status for EVALUATING tasks
+
+The orchestrator is the single source of truth for when work moves from QUEUED →
+PROVISIONING. All other state transitions (PROVISIONING → IN_PROGRESS, IN_PROGRESS →
+COMPLETED/FAILED, etc.) are driven by agent reports or task lifecycle handlers.
 """
 
 import asyncio
@@ -33,7 +55,7 @@ from app.compute import (
     record_zone_failure,
     zone_recovery_wait_seconds,
 )
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.models import (
     DeploymentState,
     Project,
@@ -145,7 +167,7 @@ def _ci_waiting_sql_filter(session):
     SQLite (standalone tests): ``json_extract`` returns the integer 1 for a JSON
     ``true``, so compare against 1.
     """
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         return _func.json_extract(Task.context, "$.review_loop.ci_waiting") == 1
     return Task.context["review_loop"]["ci_waiting"].astext == "true"

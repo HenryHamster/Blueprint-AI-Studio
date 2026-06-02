@@ -545,9 +545,14 @@ async def provision_pool_vm(
     provision fails without raising, so the caller must NOT commit on a None return.
 
     INFRASTRUCTURE ONLY — gated by ``warm_pool_enabled`` (default False); raises
-    RuntimeError when the pool is disabled so the path is inert in production
-    until the maintainer + dispatch hook (sibling tasks) land. Mirrors
-    provision_agent_vm's image-family validation and provider/account plumbing.
+    RuntimeError when the pool is disabled so the path is inert in production.
+    The maintainer (provisions toward target), the dispatch lease hook
+    (``lease_idle_pool_vm``), and the boot-heartbeat readiness promotion
+    (``warm_pool.promote_pool_vm_to_idle``, called from the /vm-heartbeat
+    handler) are all live; this
+    function's job is only to boot a credentialed taskless member and register
+    it PROVISIONING. Mirrors provision_agent_vm's image-family validation and
+    provider/account plumbing.
     """
     from app.warm_pool import is_warm_pool_enabled, register_pool_vm
     from app.models import PoolVmState
@@ -638,8 +643,10 @@ async def provision_pool_vm(
         )
         return None
 
-    # Register the freshly-booted member. It starts PROVISIONING; the agent's
-    # first ready signal / the maintainer (sibling task) transitions it to IDLE.
+    # Register the freshly-booted member in PROVISIONING. It becomes leasable
+    # (IDLE) when its agent fires the boot-time /vm-heartbeat readiness signal,
+    # promoted by warm_pool.promote_pool_vm_to_idle from the /vm-heartbeat
+    # handler; the lease path (lease_idle_pool_vm) only ever selects IDLE members.
     await register_pool_vm(
         session,
         vm_instance_id=vm_instance_id,

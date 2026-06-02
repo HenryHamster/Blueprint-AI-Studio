@@ -301,6 +301,49 @@ async def test_transition_helpers_noop_on_unknown_vm(db_session):
     assert await get_pool_vm(db_session, "ghost") is None
 
 
+@pytest.mark.asyncio
+async def test_release_pool_vm_is_guarded_to_leased_only(db_session):
+    """``release_pool_vm`` returns a member to IDLE only from LEASED — so the
+    task-completion return path can never resurrect a member a concurrent reaper
+    already moved to RETIRING (mid-teardown), and a duplicate completion signal
+    is a race-safe no-op."""
+    project = await _make_project(db_session, name="Release Guard")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-guard",
+        project_id=project.id,
+        account_id="acct-1",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+
+    # PROVISIONING is NOT a lease return — guard refuses (no-op).
+    assert await release_pool_vm(db_session, "vm-guard") is None
+    assert (await get_pool_vm(db_session, "vm-guard")).state == PoolVmState.PROVISIONING
+
+    # Promote -> lease, then release: LEASED -> IDLE, lease binding cleared.
+    await mark_pool_vm_idle(db_session, "vm-guard")
+    await db_session.commit()
+    leased = await lease_idle_pool_vm(
+        db_session, project_id=project.id, account_id="acct-1"
+    )
+    await db_session.commit()
+    assert leased.state == PoolVmState.LEASED
+
+    released = await release_pool_vm(db_session, "vm-guard")
+    await db_session.commit()
+    assert released.state == PoolVmState.IDLE
+    assert released.leased_task_id is None
+    assert released.lease_expires_at is None
+    assert released.idle_since is not None
+
+    # A RETIRING member is NEVER pulled back to IDLE by a late/duplicate release.
+    await mark_pool_vm_retiring(db_session, "vm-guard")
+    await db_session.commit()
+    assert await release_pool_vm(db_session, "vm-guard") is None
+    assert (await get_pool_vm(db_session, "vm-guard")).state == PoolVmState.RETIRING
+
+
 # ---------------------------------------------------------------------------
 # Rate-limit blacklist exclusion on the lease gate
 # ---------------------------------------------------------------------------
@@ -389,6 +432,123 @@ async def test_cleanup_exemptions_excludes_retiring_members(db_session):
         assert await pool_vm_cleanup_exemptions(db_session) == set()
     finally:
         shared_state.runtime_config["warm_pool_enabled"] = prev
+
+
+# ---------------------------------------------------------------------------
+# Completion-teardown guard: a live pool member's VM is NOT cold-deleted when its
+# task completes — the pool lifecycle owns its return-to-IDLE / retire. (Sibling
+# of the orphan-sweep exemption above, but for vm_lifecycle._ensure_vm_deleted,
+# the path agent_status fires on every terminal task.)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ensure_vm_deleted_skips_live_pool_member(db_session, mocker):
+    """A live (IDLE) pool member's VM must be SPARED on completion — it is returned
+    to the pool for re-lease, not torn down — and any orchestrator-deleted marker
+    fire_and_forget pre-recorded is dropped so the still-alive VM is not later
+    mis-attributed as an orchestrator delete."""
+    from app import vm_lifecycle
+
+    project = await _make_project(db_session, name="Guard Idle")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-idle-keep",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    delete = mocker.patch(
+        "app.vm_lifecycle.delete_agent_vm", new_callable=mocker.AsyncMock
+    )
+    vm_lifecycle._orchestrator_deleted_vms["vm-idle-keep"] = (0.0, "agent_completion")
+
+    prev = shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        shared_state.runtime_config["warm_pool_enabled"] = True
+        result = await vm_lifecycle._ensure_vm_deleted(
+            "vm-idle-keep", reason="agent_completion"
+        )
+    finally:
+        shared_state.runtime_config["warm_pool_enabled"] = prev
+        vm_lifecycle._orchestrator_deleted_vms.pop("vm-idle-keep", None)
+
+    assert result is True
+    delete.assert_not_called()
+    assert "vm-idle-keep" not in vm_lifecycle._orchestrator_deleted_vms
+
+
+@pytest.mark.asyncio
+async def test_ensure_vm_deleted_tears_down_retiring_pool_member(db_session, mocker):
+    """A RETIRING member is NOT governed by the guard: the pool's own retire path
+    flips it RETIRING then calls _ensure_vm_deleted, which must still delete it."""
+    from app import vm_lifecycle
+
+    project = await _make_project(db_session, name="Guard Retiring")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-retire-del",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.RETIRING,
+    )
+    await db_session.commit()
+
+    delete = mocker.patch(
+        "app.vm_lifecycle.delete_agent_vm",
+        new_callable=mocker.AsyncMock,
+        return_value=True,
+    )
+
+    prev = shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        shared_state.runtime_config["warm_pool_enabled"] = True
+        result = await vm_lifecycle._ensure_vm_deleted(
+            "vm-retire-del", reason="pool_retiring_cleanup"
+        )
+    finally:
+        shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    assert result is True
+    delete.assert_awaited_once_with("vm-retire-del")
+
+
+@pytest.mark.asyncio
+async def test_ensure_vm_deleted_tears_down_when_pool_disabled(db_session, mocker):
+    """With the pool disabled the guard is inert — even a live member is torn down
+    (the pool reapers are off, so sparing it would leak the VM forever)."""
+    from app import vm_lifecycle
+
+    project = await _make_project(db_session, name="Guard Disabled")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-disabled",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    delete = mocker.patch(
+        "app.vm_lifecycle.delete_agent_vm",
+        new_callable=mocker.AsyncMock,
+        return_value=True,
+    )
+
+    prev = shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        shared_state.runtime_config["warm_pool_enabled"] = False
+        result = await vm_lifecycle._ensure_vm_deleted("vm-disabled")
+    finally:
+        shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    assert result is True
+    delete.assert_awaited_once_with("vm-disabled")
 
 
 # ---------------------------------------------------------------------------

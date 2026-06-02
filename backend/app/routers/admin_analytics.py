@@ -13,7 +13,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import (
     Task,
     TaskStatus,
@@ -406,7 +406,7 @@ async def get_task_duration_stats(
     # degrades to created_at instead of erroring the whole query — mirrors the
     # try/except in the previous Python implementation.
     cutoff = _utcnow() - timedelta(days=7)
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name != "postgresql":
         # Test harness path: compute in Python (test dataset sizes are tiny).
         filters = [

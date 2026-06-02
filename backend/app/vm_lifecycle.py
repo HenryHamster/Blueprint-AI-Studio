@@ -96,6 +96,47 @@ def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     return True, entry[1]
 
 
+async def _vm_is_governed_pool_member(vm_id: str) -> bool:
+    """True iff *vm_id* is a LIVE warm-pool member whose teardown is owned by the
+    warm-pool lifecycle, not the generic task-completion teardown path.
+
+    Mirrors :func:`app.warm_pool.pool_vm_cleanup_exemptions` (the orphan-sweep
+    exemption) for a single VM. When a pool-leased task reaches a terminal state
+    the agent_status handler fires ``fire_and_forget_vm_delete`` like any other
+    task — but a pool member must NOT be cold-deleted there: the pool reconciles it
+    itself, returning it to IDLE for re-lease (:func:`app.warm_pool.release_pool_vm`,
+    COMPLETED) or flipping it RETIRING for the maintainer's
+    ``retire_and_delete_pool_vm`` (FAILED/CANCELLED), which also clears the
+    pre-staged secret and the registry row. Deleting the VM here would make every
+    member single-use and strand the registry row counting against the pool budget.
+
+    Only LIVE members (``LIVE_POOL_STATES`` = PROVISIONING/IDLE/LEASED) are
+    governed; a RETIRING member is intentionally excluded so the pool's OWN retire
+    path — which itself calls ``_ensure_vm_deleted`` — still tears it down. Returns
+    False (caller proceeds with teardown) when the pool is disabled, the VM is not a
+    registered member, or the lookup fails — we never leak a live VM by assuming
+    reuse. The flag check short-circuits before any DB I/O, so the common
+    cold-provisioned teardown pays nothing while the pool is dark.
+    """
+    try:
+        from app.warm_pool import is_warm_pool_enabled  # noqa: PLC0415
+
+        if not is_warm_pool_enabled():
+            return False
+        from app.warm_pool import LIVE_POOL_STATES, get_pool_vm  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as s:
+            member = await get_pool_vm(s, vm_id)
+        return member is not None and member.state in LIVE_POOL_STATES
+    except Exception:
+        logger.exception(
+            "[WARM-POOL] pool-member teardown guard failed for VM %s — "
+            "proceeding with teardown",
+            vm_id,
+        )
+        return False
+
+
 async def _ensure_vm_deleted(
     task_or_vm_id, *, reason: str = "terminal_transition"
 ) -> bool:
@@ -116,6 +157,24 @@ async def _ensure_vm_deleted(
 
     if not vm_id:
         return True  # No VM to delete
+
+    # Warm-pool guard: a live pool member that just finished a task is reconciled
+    # by the pool lifecycle (returned to IDLE for re-lease, or retired by the
+    # maintainer which also clears its secret + registry row). Tearing its VM down
+    # here would make every member single-use and strand the registry row. Skip,
+    # and drop any orchestrator-deleted marker fire_and_forget_vm_delete
+    # pre-recorded — the VM is staying alive, so a later DELETED observation must
+    # not be mis-attributed. RETIRING members are NOT governed (see helper) so the
+    # pool's own retire path still deletes them here.
+    if await _vm_is_governed_pool_member(vm_id):
+        _orchestrator_deleted_vms.pop(vm_id, None)
+        logger.info(
+            "[WARM-POOL] VM %s is a live pool member — skipping completion teardown "
+            "(task=%s); pool lifecycle governs its return-to-IDLE / retire",
+            vm_id,
+            task_id,
+        )
+        return True
 
     logger.info(f"[VM CLEANUP] Deleting VM {vm_id} (task={task_id}, reason={reason})")
     # Record the orchestrator-initiated delete BEFORE attempting the GCP

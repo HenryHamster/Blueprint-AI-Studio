@@ -204,6 +204,8 @@ Comprehensive documentation is available in the `docs/` directory:
 - **[FRONTEND_COMPONENTS.md](docs/FRONTEND_COMPONENTS.md)** — React component guide with props and usage patterns
 
 ### Operations & Debugging
+- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — Complete environment variable reference and configuration guide
+- **[TESTING_GUIDE.md](docs/TESTING_GUIDE.md)** — Testing strategies and best practices for backend, frontend, and agent
 - **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** — Troubleshooting failed tasks and interpreting logs
 - **[DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md)** — Local development setup and workflow
 - **[ONBOARDING.md](docs/ONBOARDING.md)** — Bringing a new repository under Blueprint management

@@ -455,12 +455,51 @@ async def mark_pool_vm_idle(session, vm_instance_id: str) -> Optional[PoolVm]:
 
 
 async def release_pool_vm(session, vm_instance_id: str) -> Optional[PoolVm]:
-    """Return a LEASED member to the IDLE pool. Alias of :func:`mark_pool_vm_idle`.
+    """Atomically return a LEASED member to the IDLE pool so it can be re-leased.
 
-    Kept as a distinct verb so call sites read intentionally (a task finished →
-    ``release_pool_vm``; a fresh boot reported ready → ``mark_pool_vm_idle``).
+    Called from the task-completion path when a pool-leased task reaches a
+    *reusable* terminal state (COMPLETED): the member's agent loops back to
+    polling ``/next-role`` (``bootstrapPoolMode`` -> ``pollForNextRole``), so the
+    backend must promptly return the member to IDLE — otherwise it lingers
+    LEASED, counting against the per-project target and the fleet budget
+    (blocking replenishment) until the reaper's orphan-lease sweep eventually
+    retires and DELETEs it, making every member single-use.
+
+    Unlike :func:`mark_pool_vm_idle` (which flips ANY state to IDLE — the
+    booted-ready PROVISIONING->IDLE signal), this return is GUARDED to a
+    ``state == LEASED`` row locked ``FOR UPDATE SKIP LOCKED`` before it is
+    flipped to IDLE, so a member a concurrent reaper/maintainer already moved to
+    RETIRING (mid-teardown) is NEVER resurrected onto the leasable set, and a
+    duplicate completion signal is a race-safe no-op. Returns the now-IDLE
+    member, or None when no LEASED row matches (unknown / already reconciled /
+    retiring). The caller owns the transaction (commit).
+
+    Idle-cost banking is preserved trivially: a LEASED member's ``idle_since`` is
+    already None (cleared at lease time, with its accrued span banked then), so
+    the fresh IDLE window simply restarts from now with nothing to erase.
     """
-    return await mark_pool_vm_idle(session, vm_instance_id)
+    stmt = (
+        select(PoolVm)
+        .where(
+            PoolVm.vm_instance_id == vm_instance_id,
+            PoolVm.state == PoolVmState.LEASED,
+        )
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    member = (await session.execute(stmt)).scalars().first()
+    if member is None:
+        return None
+    member.state = PoolVmState.IDLE
+    member.leased_task_id = None
+    member.lease_expires_at = None
+    member.idle_since = _utcnow()
+    session.add(member)
+    logger.info(
+        "[WARM-POOL] released pool VM vm_instance_id=%s -> IDLE (re-leasable)",
+        vm_instance_id,
+    )
+    return member
 
 
 async def mark_pool_vm_retiring(session, vm_instance_id: str) -> Optional[PoolVm]:
