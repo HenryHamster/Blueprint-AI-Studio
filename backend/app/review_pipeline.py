@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
@@ -81,9 +82,9 @@ from app.review_loop_convergence import (
     SCOPE_PRESSURE_WARN_THRESHOLD,
     _CHURN_NARROW_FOCUS_PREFIX,
     _EARLY_REPEATING_ISSUES_PREFIX,
+    _handle_cap_exhaustion,
     _MID_BUDGET_NARROW_FOCUS_PREFIX,
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
-    _handle_cap_exhaustion,
     _is_pipeline_task_stale,
     _set_review_loop_terminal_outcome,
 )
@@ -264,6 +265,7 @@ def _is_rollup_chain_source(source_task: "Task") -> bool:
 # (agent finishing prior role + a few VM-heartbeat ticks during the next-role
 # poll) without keeping a stale pin alive long enough to mask a dead VM.
 WARM_HANDOFF_WINDOW_SECS = 240
+
 
 
 def _max_review_iterations(task: Task, direction_data: dict | None = None) -> int:
@@ -956,7 +958,7 @@ async def _spawn_pipeline_task(
     # ``payloads`` for the SQLite branch), so seq-scan is acceptable for
     # tests. Postgres production path is the source of truth and gets the
     # index acceleration.
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         pr_number_match = (
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number

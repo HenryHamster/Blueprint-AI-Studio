@@ -55,7 +55,7 @@ from app.compute import (
     record_zone_failure,
     zone_recovery_wait_seconds,
 )
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.models import (
     DeploymentState,
     Project,
@@ -167,7 +167,7 @@ def _ci_waiting_sql_filter(session):
     SQLite (standalone tests): ``json_extract`` returns the integer 1 for a JSON
     ``true``, so compare against 1.
     """
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         return _func.json_extract(Task.context, "$.review_loop.ci_waiting") == 1
     return Task.context["review_loop"]["ci_waiting"].astext == "true"

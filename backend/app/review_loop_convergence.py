@@ -566,6 +566,15 @@ async def _handle_cap_exhaustion(
     ctx["pr_rejection_note"] = (
         f"Auto-closed by Blueprint: review-fix cap exhausted after {iterations} iterations"
     )
+    ctx["review_loop_terminal_outcome"] = {
+        "kind": "cap_exhausted",
+        "reason": "review_cap_exhausted",
+        "pr_number": pr_number,
+        "iterations": iterations,
+        "scope": scope,
+        "detail": cap_label,
+        "recorded_at": _utcnow().isoformat(),
+    }
     orig.context = ctx
     _set_review_loop_terminal_outcome(
         orig,

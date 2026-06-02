@@ -212,6 +212,7 @@ async def ensure_initial_release_version(
     )
 
 
+
 async def count_merged_since(
     session: AsyncSession,
     project_id: uuid.UUID,

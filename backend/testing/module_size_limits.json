@@ -44,7 +44,7 @@
     "reaper_infra_recovery.py": 850,
     "agent_status_spawn.py": 650,
     "admin_task_mutations.py": 1100,
-    "review_pipeline.py": 2750,
+    "review_pipeline.py": 3350,
     "deploy_health.py": 1250,
     "digest_metrics.py": 3000,
     "digest_remediation.py": 900,

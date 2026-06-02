@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import Task
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ async def _lock_original_task_blocking(
     write-lock contention, so on a non-Postgres dialect we just issue a plain
     blocking FOR UPDATE (which returns immediately there).
     """
-    is_pg = bool(session.bind) and session.bind.dialect.name == "postgresql"
+    is_pg = resolve_dialect_name(session) == "postgresql"
     last_exc: Exception | None = None
     for _attempt in range(max(1, attempts)):
         try:

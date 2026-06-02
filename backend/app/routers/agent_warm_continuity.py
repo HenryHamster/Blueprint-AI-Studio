@@ -34,7 +34,7 @@ from app.auth import (
     VM_SCOPED_TOKEN_SCOPE,
 )
 from app.broadcast import broadcast_to_project
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
@@ -464,7 +464,7 @@ async def next_role(
     # ``ix_task_context_gin``; SQLite test runs fall back to the portable
     # JSON-extract form. Computed once here because both the chain-continuity
     # lookup and the chain-fork exit below need it.
-    use_jsonb_has_key = session.get_bind().dialect.name == "postgresql"
+    use_jsonb_has_key = resolve_dialect_name(session) == "postgresql"
 
     # Determine once whether this VM has proven it can refresh, so every warm
     # claim below (chain-continuity and backlog-reuse) mints the short TTL for

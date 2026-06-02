@@ -24,7 +24,7 @@ from app.auth import (
     AGENT_TOKEN_TTL_HOURS,
     VM_SCOPED_TOKEN_SCOPE,
 )
-from app.database import get_session, AsyncSessionLocal
+from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
 from app.models import (
     Project,
     Task,
@@ -565,7 +565,7 @@ async def _refresh_sr_catch_rate(
     from app.sr_analytics import compute_sr_catch_rate_trends
 
     _sr_cutoff = _utcnow() - timedelta(days=28)
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     _where = [
         Task.project_id == project_id,
         Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),

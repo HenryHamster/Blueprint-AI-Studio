@@ -10,6 +10,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import (
     Alert,
     AlertSeverity,
@@ -93,7 +94,7 @@ async def _compute_sr_catch_rate_trends_impl(
 
     if len(cycle_rows) >= 2:
         relevant_cycle_ids = [r.id for r in cycle_rows]
-        dialect = session.bind.dialect.name if session.bind else "postgresql"
+        dialect = resolve_dialect_name(session)
         cycle_where = [
             Task.project_id == project_id,
             Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
