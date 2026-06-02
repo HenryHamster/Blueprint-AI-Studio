@@ -117,6 +117,10 @@ class ArtifactType(str, Enum):
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
     MEMO = "MEMO"
+    # Verdict from the verify_tests agent handler: the repo's detected test
+    # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
+    # a plain String column (sa_column=Column(String)) so no migration is needed.
+    MERGE_TEST_RESULT = "MERGE_TEST_RESULT"
 
 
 class LLMProviderName(str, Enum):

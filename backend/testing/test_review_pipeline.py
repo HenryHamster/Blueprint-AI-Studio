@@ -641,6 +641,86 @@ class TestShouldAutoApproveSmallDiff:
         assert "disabled" in reason
 
 
+# ── _spawn_pipeline_task: verify_tests fast-path ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_verify_tests_creates_task_and_bypasses_cap(db_session, mocker):
+    """_spawn_pipeline_task('verify_tests', ...) creates a one-shot verify_tests
+    task on the PR head, bypassing the review-fix iteration caps (a 99-iteration
+    chain that would block a review/fix spawn must NOT block verify_tests), and
+    dedups a second spawn to the same active task."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 222,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            # A 99-iteration chain would trip the per-chain review-fix cap for a
+            # review/fix spawn; verify_tests deliberately ignores it.
+            "review_loop": {
+                "iteration": 99,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    task, created = await _spawn_pipeline_task(
+        source_task,
+        "verify_tests",
+        db_session,
+        pr_number=222,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert task is not None
+    assert task.first_payload.get("type") == "verify_tests"
+    assert task.first_payload.get("branch") == "feat/x"
+    assert task.first_payload.get("pr_number") == 222
+    assert task.first_payload.get("base_branch") == "main"
+    assert task.status == TaskStatus.QUEUED
+
+    # Second spawn for the same PR dedups to the same active task.
+    task2, created2 = await _spawn_pipeline_task(
+        source_task,
+        "verify_tests",
+        db_session,
+        pr_number=222,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created2 is False
+    assert task2 is not None
+    assert task2.id == task.id
+
+
 # ── _spawn_pipeline_task: iteration cap ───────────────────────────────────────
 
 

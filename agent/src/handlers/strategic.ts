@@ -14,6 +14,7 @@ import {
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { parseBackendTimestamp } from '../utils/time.js';
+import { reconcileDesignDocPresence } from '../utils/design-doc-presence.js';
 import {
   formatPreviousDecisionOutcomes,
   formatPastRetirementCritiques,
@@ -123,7 +124,16 @@ export async function handleStrategic(
 
     const dirSummaryText = buildDirSummaryText(directionsSummary);
 
-    const designDoc = payload.design_doc as Record<string, unknown> | undefined;
+    // Reconcile the design doc's systems/* and capabilities/* statuses against
+    // the cloned file tree BEFORE serializing into the thinker prompt: any
+    // entry marked present (mature/functional/partial / working) whose backing
+    // module files are all absent on the integration branch is downgraded to
+    // `missing` + annotated, so the strategic agent never reasons on a status
+    // the code does not back up.
+    const designDoc = reconcileDesignDocPresence(
+      payload.design_doc as Record<string, unknown> | undefined,
+      WORKSPACE,
+    );
     const designDocJson = designDoc && Object.keys(designDoc).length > 0
       ? JSON.stringify(designDoc, null, 2)
       : '';

@@ -79,6 +79,16 @@ runtime_config: Dict = {
     # negatives in prod.
     "ci_resolution_strict_mode": os.getenv("CI_RESOLUTION_STRICT_MODE", "true").lower()
     not in ("0", "false", "no"),
+    # No-CI test-suite merge gate kill-switch. When True (default), a PR on an
+    # EXTERNAL no-CI project (build_config.requires_ci_checks=False) targeting a
+    # non-staging base is gated on a verify_tests verdict — the repo's detected
+    # suite is run on the PR head and must pass before the merge proceeds.
+    # Set False to fall back to the legacy immediate-pass (merge unverified on a
+    # definitive no_checks) without a deploy if the gate misbehaves. Repos with
+    # genuinely no detectable test command, and internal staging rollups, keep
+    # the immediate-pass regardless of this flag.
+    "no_ci_test_gate_enabled": os.getenv("NO_CI_TEST_GATE_ENABLED", "true").lower()
+    not in ("0", "false", "no"),
     # Hard cap on ``ci_wait_started`` clock resets when GitHub responds with
     # "checks in progress" / "status check pending" to a merge attempt.  Each
     # reset bumps the CI-wait deadline by another full backstop window; without

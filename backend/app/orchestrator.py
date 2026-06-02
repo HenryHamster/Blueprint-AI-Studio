@@ -4632,6 +4632,13 @@ async def orchestrator_worker():
                             runtime_config as _rt_cfg,
                         )
 
+                        # No-CI test-suite merge gate state for this poll. Set in
+                        # the no_checks branch when an EXTERNAL no-CI repo should
+                        # run its detected suite (verify_tests) before merging;
+                        # consumed in the locked block after the re-acquire below.
+                        _no_ci_verify_gate = False
+                        _no_ci_verify_base = ""
+
                         if _rt_cfg.get("ci_resolution_strict_mode", True):
                             from app import ci_resolution
 
@@ -4693,22 +4700,74 @@ async def orchestrator_worker():
                                 if _ci_proj is not None and ci_resolution.proceed_on_no_checks(
                                     _ci_proj, _ci_base_ref
                                 ):
-                                    _ci_reason = (
-                                        f"targets internal staging branch '{_ci_base_ref}'"
-                                        if _ci_proj.is_staging_branch(_ci_base_ref)
-                                        else "the project declares no CI (requires_ci_checks=False)"
+                                    _is_staging = _ci_proj.is_staging_branch(
+                                        _ci_base_ref
                                     )
-                                    logger.info(
-                                        f"[CI] PR #{ci_pr_number} has 0 check-runs and "
-                                        f"{_ci_reason} — treating as passed so the "
-                                        f"merge can proceed"
+                                    _gate_on = _rt_cfg.get(
+                                        "no_ci_test_gate_enabled", True
                                     )
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "success",
-                                        "details": _resolved.get("details", []),
-                                        "failed_logs": "",
-                                    }
+                                    if ci_resolution.should_run_no_ci_test_gate(
+                                        _ci_proj,
+                                        _ci_base_ref,
+                                        gate_enabled=_gate_on,
+                                    ):
+                                        # EXTERNAL no-CI repo (requires_ci_checks=
+                                        # False) on a real base WITH a runnable
+                                        # suite: gate the merge on a verify_tests
+                                        # verdict instead of merging blind. Defer
+                                        # the spawn / verdict-await to the locked
+                                        # block after the re-acquire below; keep
+                                        # ci_result PENDING so the loop keeps
+                                        # polling until the verdict lands.
+                                        _no_ci_verify_gate = True
+                                        _no_ci_verify_base = _ci_base_ref
+                                        logger.info(
+                                            f"[CI] PR #{ci_pr_number} has 0 check-runs "
+                                            f"and the project declares no CI — gating "
+                                            f"the merge on the repo's detected test "
+                                            f"suite (verify_tests) before proceeding"
+                                        )
+                                        ci_result = {
+                                            "status": "pending",
+                                            "conclusion": None,
+                                            "details": _resolved.get("details", []),
+                                            "failed_logs": "",
+                                        }
+                                    else:
+                                        # Immediate-pass (unchanged legacy behavior).
+                                        # Internal staging base (CI path-filtered by
+                                        # design), kill-switch off, or NO detectable
+                                        # test command — an absent-tests repo must
+                                        # still progress, so it merges UNVERIFIED.
+                                        if _is_staging:
+                                            _ci_reason = (
+                                                f"targets internal staging branch "
+                                                f"'{_ci_base_ref}'"
+                                            )
+                                        elif not _gate_on:
+                                            _ci_reason = (
+                                                "the project declares no CI "
+                                                "(requires_ci_checks=False) and the "
+                                                "no_ci_test_gate kill-switch is off"
+                                            )
+                                        else:
+                                            _ci_reason = (
+                                                "the project declares no CI "
+                                                "(requires_ci_checks=False) and no "
+                                                "test command is detectable — merging "
+                                                "UNVERIFIED"
+                                            )
+                                        logger.info(
+                                            f"[CI] PR #{ci_pr_number} has 0 check-runs and "
+                                            f"{_ci_reason} — treating as passed so the "
+                                            f"merge can proceed"
+                                        )
+                                        ci_result = {
+                                            "status": "completed",
+                                            "conclusion": "success",
+                                            "details": _resolved.get("details", []),
+                                            "failed_logs": "",
+                                        }
                                 else:
                                     ci_result = {
                                         "status": "pending",
@@ -4756,6 +4815,262 @@ async def orchestrator_worker():
                         ci_loop = dict(
                             (ci_task.context or {}).get("review_loop", {}) or {}
                         )
+
+                        # ── No-CI test-suite merge gate (verify_tests) ──────────
+                        # Reached when the no_checks branch flagged an external
+                        # no-CI repo with a runnable suite. We hold the task lock
+                        # and a fresh ci_loop here. First poll: spawn verify_tests
+                        # on the PR head, record its id, keep polling. Subsequent
+                        # polls: once that task is terminal, read its latest
+                        # MERGE_TEST_RESULT verdict and set ci_result —
+                        #   pass          → completed/success (merge proceeds,
+                        #                   still subject to the review gate);
+                        #   fail          → completed/failure so the existing
+                        #                   handle_ci_completion fix path fires
+                        #                   carrying the failing-test output;
+                        #   detected=false / no usable verdict → completed/success
+                        #                   UNVERIFIED (absent-tests repos must
+                        #                   still progress — logged as such).
+                        # Kill-switch (no_ci_test_gate_enabled) was checked in the
+                        # no_checks branch; when off, _no_ci_verify_gate is never
+                        # set and today's immediate-pass applies.
+                        if _no_ci_verify_gate:
+                            from sqlalchemy.orm.attributes import flag_modified
+                            from app.review_pipeline import _spawn_pipeline_task
+                            from app.release_qualifier_audit import (
+                                _latest_artifact_logs,
+                            )
+                            from app.models import ArtifactType
+
+                            # Mark active so the "no CI checks appeared" stall
+                            # escalation below is bypassed while we verify.
+                            ci_loop["ci_checks_seen"] = True
+                            _v_recorded = ci_loop.get("verify_tests_verdict")
+                            _v_task_id = ci_loop.get("verify_tests_task_id")
+                            _v_poll_interval = min(ci_poll_interval * 2, 90)
+
+                            if _v_recorded in ("pass", "undetected"):
+                                # Verdict already obtained on a prior poll —
+                                # proceed (idempotent until the merge lands).
+                                ci_result = {
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                    "details": [],
+                                    "failed_logs": "",
+                                }
+                            elif _v_recorded == "fail":
+                                # Already classified failed — belt-and-suspenders
+                                # if we re-enter before ci_fix_spawned is set.
+                                ci_result = {
+                                    "status": "completed",
+                                    "conclusion": "failure",
+                                    "details": [],
+                                    "failed_logs": ci_loop.get(
+                                        "verify_tests_output",
+                                        "Detected test suite failed.",
+                                    ),
+                                }
+                            elif not _v_task_id:
+                                # First encounter: spawn verify_tests on PR head.
+                                _v_branch = _resolve_ci_fix_branch(
+                                    ci_loop, ci_task.first_payload, pr_data
+                                )
+                                if not _v_branch:
+                                    logger.error(
+                                        f"[CI] PR #{ci_pr_number}: cannot resolve "
+                                        f"head branch for verify_tests spawn — "
+                                        f"retrying next cycle"
+                                    )
+                                    ci_loop["ci_poll_interval"] = _v_poll_interval
+                                    ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    continue
+                                _v_orig = ci_loop.get(
+                                    "original_task_id", ""
+                                ) or ci_task.first_payload.get("original_task_id", "")
+                                _verify_task, _ = await _spawn_pipeline_task(
+                                    ci_task,
+                                    "verify_tests",
+                                    session,
+                                    ci_pr_number,
+                                    _v_branch,
+                                    _no_ci_verify_base,
+                                    original_task_id=_v_orig,
+                                    suppress_warm_handoff=True,
+                                )
+                                # _spawn_pipeline_task commits internally — re-lock
+                                # the parent before mutating it.
+                                ci_task = await _lock_task_for_mutation(
+                                    session,
+                                    ci_task_id,
+                                    allowed_statuses=(TaskStatus.EVALUATING,),
+                                    reason="CI polling after verify_tests spawn",
+                                )
+                                if ci_task is None:
+                                    continue
+                                ci_loop = dict(
+                                    (ci_task.context or {}).get("review_loop", {})
+                                    or {}
+                                )
+                                ci_loop["ci_checks_seen"] = True
+                                if _verify_task is not None:
+                                    ci_loop["verify_tests_task_id"] = str(
+                                        _verify_task.id
+                                    )
+                                    ci_task.latest_status_message = (
+                                        f"No CI on PR #{ci_pr_number} — running "
+                                        f"detected test suite to gate merge → "
+                                        f"{_verify_task.id}"
+                                    )
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"spawned verify_tests → {_verify_task.id}"
+                                    )
+                                else:
+                                    ci_task.latest_status_message = (
+                                        f"No CI on PR #{ci_pr_number} — verify_tests "
+                                        f"spawn deferred, will retry"
+                                    )
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"verify_tests spawn suppressed/deferred — "
+                                        f"retrying"
+                                    )
+                                ci_loop["ci_poll_interval"] = _v_poll_interval
+                                ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                ci_loop["head_sha"] = ci_head_sha
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(ci_task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(ci_task.id),
+                                        "status": ci_task.status,
+                                    },
+                                )
+                                continue
+                            else:
+                                # Await: verify task spawned on a prior poll.
+                                _verify_task = None
+                                try:
+                                    _verify_task = await session.get(
+                                        Task, uuid.UUID(_v_task_id)
+                                    )
+                                except (ValueError, TypeError):
+                                    _verify_task = None
+                                _terminal = {
+                                    TaskStatus.COMPLETED,
+                                    TaskStatus.FAILED,
+                                    TaskStatus.CANCELLED,
+                                }
+                                if (
+                                    _verify_task is None
+                                    or _verify_task.status not in _terminal
+                                ):
+                                    # Still running — keep polling.
+                                    ci_loop["ci_poll_interval"] = _v_poll_interval
+                                    ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                    ci_loop["head_sha"] = ci_head_sha
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} — awaiting detected-test "
+                                        f"verdict (verify_tests {_v_task_id[:8]})"
+                                    )
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    await broadcast_to_project(
+                                        str(ci_task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(ci_task.id),
+                                            "status": ci_task.status,
+                                        },
+                                    )
+                                    continue
+                                # Terminal — read the latest verdict artifact.
+                                _verdict = None
+                                if _verify_task.status == TaskStatus.COMPLETED:
+                                    _verdict = await _latest_artifact_logs(
+                                        session,
+                                        _verify_task.id,
+                                        ArtifactType.MERGE_TEST_RESULT,
+                                    )
+                                _outcome, _detail = (
+                                    ci_resolution.classify_merge_test_verdict(
+                                        _verdict
+                                    )
+                                )
+                                ci_loop["verify_tests_verdict"] = _outcome
+                                if _outcome == "pass":
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"detected test suite PASSED — proceeding to "
+                                        f"merge (subject to review gate)"
+                                    )
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                        "details": [],
+                                        "failed_logs": "",
+                                    }
+                                elif _outcome == "fail":
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"detected test suite FAILED — blocking "
+                                        f"merge, spawning fix with failing output"
+                                    )
+                                    ci_loop["verify_tests_output"] = _detail[:4000]
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "failure",
+                                        "details": [],
+                                        "failed_logs": _detail,
+                                    }
+                                else:
+                                    # detected=false or no usable verdict (verify
+                                    # task crashed / produced no artifact): fall
+                                    # back to proceed-without-checks. Absent-tests
+                                    # repos must still progress — merge UNVERIFIED.
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"no test command detectable (verify_tests "
+                                        f"{_v_task_id[:8]} status="
+                                        f"{_verify_task.status}) — merge proceeding "
+                                        f"UNVERIFIED"
+                                    )
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                        "details": [],
+                                        "failed_logs": "",
+                                    }
+                                # Persist the recorded verdict before
+                                # handle_ci_completion re-reads task.context.
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                # Fall through: ci_result is "completed" so the
+                                # pending-skip below is bypassed and
+                                # handle_ci_completion runs.
 
                         # Track whether CI checks have ever been observed for this PR
                         ci_details = ci_result.get("details", [])

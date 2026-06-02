@@ -20,6 +20,7 @@ import {
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
+import { reconcileSystemEntry, reconcileMissingCapabilities } from '../utils/design-doc-presence.js';
 import {
   differentiationHintFor,
   formatCochangeHints,
@@ -1191,7 +1192,11 @@ ${hotspotsSection}
   let designDocHighlight = '';
   if (dirDesignCtx) {
     const lines: string[] = ['# YOUR DIRECTION\'S ARCHITECTURE CONTEXT'];
-    const sys = dirDesignCtx.system as Record<string, unknown> | undefined;
+    // Reconcile the claimed system status against the cloned file tree before
+    // formatting — a present-status system whose backing modules are all gone
+    // is downgraded to `missing` so the MISSION's "IMPROVE if partial/functional/
+    // mature" branch never fires on code that does not exist.
+    const sys = reconcileSystemEntry(dirDesignCtx.system as Record<string, unknown> | undefined, WORKSPACE);
     if (sys) {
       lines.push(`System: ${strVal(sys.name as string)} (${strVal(sys.id as string)}) — status: **${strVal(sys.status as string)}**`);
       if (sys.description) lines.push(`Description: ${strVal(sys.description as string)}`);
@@ -1207,7 +1212,10 @@ ${hotspotsSection}
     } else {
       lines.push(`System ${strVal(dirDesignCtx.system_id as string)}: not yet documented in design doc`);
     }
-    const missingCaps = dirDesignCtx.missing_capabilities as Record<string, Record<string, string>> | undefined;
+    const missingCaps = reconcileMissingCapabilities(
+      dirDesignCtx.missing_capabilities as Record<string, Record<string, string>> | undefined,
+      WORKSPACE,
+    );
     if (missingCaps && Object.keys(missingCaps).length > 0) {
       lines.push('Missing/partial capabilities relevant to your direction:');
       for (const [name, cap] of Object.entries(missingCaps)) {
@@ -1262,6 +1270,9 @@ foundational structure. Output a large-scope finding that bootstraps the target 
 or mature): your job is to IMPROVE it. Find specific, high-impact changes — missing capabilities,
 broken assumptions, architectural bottlenecks, or small fixes that prevent cascade failures.
 Quality over quantity — 2 real findings beats 10 incremental ones.
+(Note: any entry tagged with a "[reconciled: …]" / "presence_warning" annotation has been
+downgraded to "missing" because its referenced module files are absent on this branch — treat it
+as MISSING to DESIGN, never as something to IMPROVE, and do not confabulate its behavior.)
 
 **Sequencing matters.** If your findings have dependencies (e.g., "build cache infrastructure"
 must come before "add caching to user API"), use depends_on_indices to order them. The pipeline

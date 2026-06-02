@@ -86,8 +86,8 @@ import { persistAndPostStatus } from '../index.js';
 describe('handlers registry', () => {
   const EXPECTED_TYPES = ALL_AGENT_TASK_TYPES;
 
-  it('has exactly 20 handler entries', () => {
-    expect(Object.keys(handlers)).toHaveLength(20);
+  it('has exactly 21 handler entries', () => {
+    expect(Object.keys(handlers)).toHaveLength(21);
   });
 
   it.each(EXPECTED_TYPES)('contains handler for task type "%s"', (taskType) => {
@@ -145,7 +145,7 @@ const TASK_CLASS_MAP = {
   docs:              'code-change',
   qa:                'code-change',
   deps:              'code-change',
-  // Read-only / investigative (8): analysis only, must not push code
+  // Read-only / investigative (9): analysis only, must not push code
   review:            'read-only',
   security_audit:    'read-only',
   self_audit:        'read-only',
@@ -154,6 +154,7 @@ const TASK_CLASS_MAP = {
   debug:             'read-only',
   perf:              'read-only',
   investigate:       'read-only',
+  verify_tests:      'read-only',
   // Research / planning (5): read-heavy, no code shipped
   plan:              'research',
   research:          'research',
@@ -176,11 +177,11 @@ describe('task type class classification — cross-cutting invariants', () => {
     }
   });
 
-  it('class distribution is 7 code-change + 8 read-only + 5 research = 20 total', () => {
+  it('class distribution is 7 code-change + 9 read-only + 5 research = 21 total', () => {
     const counts: Record<TaskClass, number> = { 'code-change': 0, 'read-only': 0, research: 0 };
     for (const cls of Object.values(TASK_CLASS_MAP)) counts[cls]++;
     expect(counts['code-change']).toBe(7);
-    expect(counts['read-only']).toBe(8);
+    expect(counts['read-only']).toBe(9);
     expect(counts['research']).toBe(5);
   });
 

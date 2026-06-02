@@ -34,6 +34,7 @@ class TaskType(str, Enum):
     self_audit = "self_audit"
     release_audit = "release_audit"
     memo = "memo"
+    verify_tests = "verify_tests"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -201,6 +202,17 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
             "Terminal reasoning artifact: persist structured reasoning about a "
             "topic without opening a PR or spawning follow-up tasks. Strategic "
             "review can cite the resulting Artifact by id."
+        ),
+    ),
+    TaskCapability(
+        TaskType.verify_tests,
+        "Verify Tests",
+        "read_only",
+        default_category="review",
+        user_launchable=False,
+        description=(
+            "Clone a PR head, run the repo's detected test suite, and post a "
+            "structured pass/fail verdict the no-CI merge gate can consult."
         ),
     ),
 )

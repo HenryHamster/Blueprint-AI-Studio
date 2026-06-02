@@ -700,6 +700,173 @@ async def _emit_scope_overflow_pr_signal(session, signal: dict) -> None:
         )
 
 
+async def _spawn_verify_tests_task(
+    source_task: Task,
+    session: AsyncSession,
+    *,
+    pr_number: int,
+    branch: str,
+    base_branch: str,
+    original_task_id: str,
+) -> tuple[Task | None, bool]:
+    """Spawn (or reuse) a one-shot ``verify_tests`` merge-gate task on a PR head.
+
+    Returns ``(task, was_created)`` like ``_spawn_pipeline_task``:
+      - ``(existing, False)`` when an active verify_tests task for this PR is
+        already running (dedup) — the caller can await its verdict.
+      - ``(new_task, True)`` when a fresh task was created.
+
+    Called inline from ``_spawn_pipeline_task`` while it holds the per-PR
+    advisory lock, so the dedup SELECT + insert are serialized against
+    concurrent spawns on the same PR.  build_config (which the agent's
+    ``resolveBuildConfig`` reads to detect the suite) is attached to the task
+    at claim time from the Project, so it is not propagated here.
+    """
+    # Dedup: an active verify_tests task on the same PR is reused rather than
+    # duplicated. The no-CI gate records the spawned id and awaits it, so this
+    # is belt-and-suspenders against a double poll.
+    active = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == source_task.project_id,
+                    Task.status.in_(_PIPELINE_ACTIVE_STATUSES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for t in active:
+        if t.id == source_task.id:
+            continue
+        tp = t.first_payload
+        if tp.get("type") == "verify_tests" and tp.get("pr_number") == pr_number:
+            logger.info(
+                f"[PIPELINE] Reusing active verify_tests task {t.id} for PR #{pr_number}"
+            )
+            return (t, False)
+
+    idempotency_key = _pipeline_task_idempotency_key(
+        project_id=source_task.project_id,
+        task_type="verify_tests",
+        pr_number=pr_number,
+        original_task_id=original_task_id,
+        iteration=0,
+        is_rollup=False,
+    )
+    existing_by_key = await _get_active_pipeline_task_by_key(session, idempotency_key)
+    if existing_by_key is not None:
+        logger.warning(
+            f"[PIPELINE] Reusing idempotent verify_tests spawn for PR #{pr_number}: "
+            f"{existing_by_key.id}"
+        )
+        return (existing_by_key, False)
+
+    # Parent: mirror review/fix (sibling under the create task's parent).
+    parent_id = None
+    inherited_priority = source_task.priority
+    try:
+        orig = await session.get(Task, uuid.UUID(original_task_id))
+        if orig and orig.parent_task_id:
+            parent_id = orig.parent_task_id
+        elif orig:
+            parent_id = orig.id
+        if orig:
+            inherited_priority = orig.priority
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            f"[PIPELINE] verify_tests: could not inherit from original task "
+            f"{original_task_id[:8] if original_task_id else '?'}"
+        )
+
+    type_model = _runtime_config.get("task_type_models", {}).get("verify_tests") or None
+    type_effort = (
+        _runtime_config.get("task_type_efforts", {}).get("verify_tests") or None
+    )
+    payload_data = {
+        "type": "verify_tests",
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "original_task_id": original_task_id,
+        **({"model": type_model} if type_model else {}),
+        **({"effort": type_effort} if type_effort else {}),
+    }
+    payload_data = validate_internal_payload(
+        payload_data, f"review_pipeline:verify_tests:pr#{pr_number}"
+    )
+
+    # Carry strategic context (direction_id, scope, …) but drop the parking
+    # task's review_loop and transient underscore-internal flags.
+    source_ctx = source_task.context or {}
+    propagated_ctx = {
+        k: v
+        for k, v in source_ctx.items()
+        if k != "review_loop"
+        and (not k.startswith("_") or k in _PROPAGATE_UNDERSCORE_KEYS)
+    }
+    propagated_ctx["review_loop"] = {
+        "pr_number": pr_number,
+        "branch": branch,
+        "base_branch": base_branch,
+        "original_task_id": original_task_id,
+    }
+
+    new_task = Task(
+        project_id=source_task.project_id,
+        title=f"Verify tests PR #{pr_number}",
+        description=(
+            f"Run the repo's detected test suite on PR #{pr_number} head to gate "
+            f"the no-CI merge"
+        ),
+        parent_task_id=parent_id,
+        priority=inherited_priority,
+        payloads=[payload_data],
+        context=propagated_ctx,
+        idempotency_key=idempotency_key,
+        # verify_tests is a read-only one-shot — cold-provision a fresh VM (no
+        # warm-handoff pin); the review chain has ended at this point.
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(new_task)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        existing = await _get_active_pipeline_task_by_key(session, idempotency_key)
+        if existing is None:
+            raise
+        logger.warning(
+            f"[PIPELINE] Concurrent verify_tests spawn for PR #{pr_number} "
+            f"hit idempotency key; using existing task {existing.id}"
+        )
+        return (existing, False)
+    await session.refresh(new_task)
+
+    session.add(
+        TaskHistory(
+            task_id=new_task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "REVIEW_PIPELINE",
+                "type": "verify_tests",
+                "pr_number": pr_number,
+            },
+        )
+    )
+    await session.commit()
+
+    await broadcast_to_project(
+        str(source_task.project_id),
+        "task_updated",
+        {"task_id": str(new_task.id), "status": TaskStatus.QUEUED},
+    )
+    return (new_task, True)
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -802,6 +969,24 @@ async def _spawn_pipeline_task(
         _set_spawn_reason(source_task, SPAWN_REASON_ALREADY_MERGED)
         session.add(source_task)
         return (None, False)
+
+    # ── verify_tests fast-path ──────────────────────────────────────────────
+    # verify_tests is a one-shot, read-only merge-gate verification: it clones
+    # the PR head, runs the repo's detected test suite, and posts a
+    # MERGE_TEST_RESULT verdict the no-CI merge gate consults. It is NOT a
+    # review/fix iteration, so it deliberately bypasses the review-fix iteration
+    # caps, review_history threading, churn / stuck-cycle detection, and warm-
+    # handoff pinning the review/fix body below applies. It still runs under the
+    # per-PR advisory lock acquired above and behind the already-merged guard.
+    if task_type == "verify_tests":
+        return await _spawn_verify_tests_task(
+            source_task,
+            session,
+            pr_number=pr_number,
+            branch=branch,
+            base_branch=base_branch,
+            original_task_id=resolved_original_id,
+        )
 
     # Dedup guard for active pipeline tasks on this PR/chain. The match axes are
     # (pr_number, chain, task_type, liveness):
