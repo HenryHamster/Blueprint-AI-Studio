@@ -1181,6 +1181,69 @@ async def get_warm_reuse_funnel(
     return get_reuse_funnel_snapshot(window_hours=window_hours)
 
 
+@router.get("/projects/{project_id}/warm-reuse-dropout")
+async def get_warm_reuse_dropout(
+    project_id: uuid.UUID,
+    window_hours: int = Query(default=24, ge=1, le=168),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Ranked warm-reuse drop-out diagnostic for the last ``window_hours``.
+
+    Surfaces :func:`app.warm_backlog_reuse.compute_dominant_reuse_dropout`:
+    a per-reason breakdown of why completed VMs with eligible backlog failed to
+    convert to a warm claim, plus the single ``dominant_dropout`` (named only
+    when one reason clearly dominates — see the gating in that helper). Mirrors
+    the dominant-blocker pattern used for outer-loop convergence. Counters are
+    in-memory and reset on instance restart; use the ``-trend`` endpoint for the
+    restart-durable day-over-day view. This is observability only.
+    """
+    from app.warm_backlog_reuse import compute_dominant_reuse_dropout  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return compute_dominant_reuse_dropout(window_hours=window_hours)
+
+
+@router.get("/projects/{project_id}/warm-reuse-dropout-trend")
+async def get_warm_reuse_dropout_trend(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Day-over-day warm-reuse drop-out trend from persisted daily snapshots.
+
+    Reads the ``reuse_dropout`` block persisted into each daily
+    efficiency-snapshot (see :mod:`app.efficiency_snapshot`) so the dominant
+    drop-out survives instance restarts and an operator can confirm whether a
+    widening change reduced the leader. Returns an empty ``buckets`` list until
+    at least one daily snapshot has captured the drop-out block.
+    """
+    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    project = await session.get(Project, project_id)
+    container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
+    buckets: List[Dict[str, Any]] = []
+    for snap in container.get("snapshots") or []:
+        block = snap.get("reuse_dropout")
+        if not isinstance(block, dict):
+            continue
+        dominant = block.get("dominant_dropout") or {}
+        buckets.append(
+            {
+                "captured_at": snap.get("captured_at"),
+                "dropout_total": block.get("dropout_total"),
+                "dominant_reason": dominant.get("reason"),
+                "dominant_share": dominant.get("share"),
+            }
+        )
+    return {"buckets": buckets}
+
+
 @router.get("/pipeline-efficiency")
 async def get_pipeline_efficiency(
     project_id: Optional[uuid.UUID] = Query(default=None),
