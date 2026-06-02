@@ -5226,3 +5226,41 @@ class TestGetProjectIntegrationBranch:
         """
         project = _make_project(integration_branch="release", promotion_target="release")
         assert _shared_state.get_project_integration_branch(project) == "release"
+
+
+class TestParallelismHint:
+    """_build_parallelism_hint surfaces the direction-count -> parallelism cost."""
+
+    def test_healthy_lane_count_returns_empty(self):
+        from app.strategic_spawning import _build_parallelism_hint
+
+        # 3 active directions with capacity for more — no nag.
+        assert _build_parallelism_hint(3, max_concurrent_vms=8, max_active_directions=10) == ""
+        assert _build_parallelism_hint(5, max_concurrent_vms=8, max_active_directions=10) == ""
+
+    def test_below_floor_emits_cost_framed_hint(self):
+        from app.strategic_spawning import _build_parallelism_hint
+
+        hint = _build_parallelism_hint(1, max_concurrent_vms=8, max_active_directions=10)
+        assert hint  # non-empty
+        assert "PARALLELISM" in hint
+        assert "1 active direction" in hint
+        # Surfaces the idle fleet capacity and stays quality-framed (not a quota).
+        assert "8 VMs" in hint
+        assert "worthwhile parallel work" in hint
+        assert "load-bearing" in hint
+
+    def test_capacity_is_the_limit_does_not_nag(self):
+        from app.strategic_spawning import _build_parallelism_hint
+
+        # Fleet can only run 2 VMs, so 2 active directions is NOT underutilized.
+        assert _build_parallelism_hint(2, max_concurrent_vms=2, max_active_directions=10) == ""
+        # But 1 active on a 2-VM fleet still leaves a lane idle.
+        assert _build_parallelism_hint(1, max_concurrent_vms=2, max_active_directions=10)
+
+    def test_unknown_capacity_omits_vm_clause(self):
+        from app.strategic_spawning import _build_parallelism_hint
+
+        hint = _build_parallelism_hint(1, max_concurrent_vms=0, max_active_directions=10)
+        assert hint
+        assert "VMs at once" not in hint  # no concrete VM count when capacity unknown
