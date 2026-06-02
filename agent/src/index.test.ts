@@ -407,10 +407,19 @@ describe('deriveTaskBranch', () => {
   });
 
   it('resolveTaskBranchNamespace returns the per-project override or the Blueprint default', () => {
-    expect(resolveTaskBranchNamespace({ task_branch_namespace: 'autoproj' })).toBe('autoproj');
+    expect(resolveTaskBranchNamespace({ build_config: { task_branch_namespace: 'autoproj' } })).toBe('autoproj');
+    expect(resolveTaskBranchNamespace({ build_config: {} })).toBe('blueprint');
     expect(resolveTaskBranchNamespace({})).toBe('blueprint');
     expect(resolveTaskBranchNamespace(null)).toBe('blueprint');
     expect(resolveTaskBranchNamespace(undefined)).toBe('blueprint');
+    // Regression (#7136 follow-up): an empty/absent build_config.directories must
+    // NOT drop the namespace. resolveBuildConfig() returns undefined for empty
+    // directories, so namespace resolution reads the RAW build_config — a
+    // greenfield/docs-only repo keeps its slug instead of silently defaulting to
+    // "blueprint" (which orphaned the orchestrator-expected branch).
+    expect(resolveTaskBranchNamespace({ build_config: { directories: [], task_branch_namespace: 'stsbot' } })).toBe('stsbot');
+    // A malformed slug falls back to the default rather than injecting garbage.
+    expect(resolveTaskBranchNamespace({ build_config: { task_branch_namespace: 'Bad/Name' } })).toBe('blueprint');
   });
 });
 
@@ -1842,7 +1851,7 @@ describe('setupWorkspace reference-cache reuse', () => {
     vi.mocked(fs.existsSync).mockReturnValue(true); // mirror present on disk
     stubExecFileSyncNoStaleBranch();
 
-    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' });
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
 
     const cloneArgs = findCloneArgs();
     expect(cloneArgs).toContain('--reference-if-able');
@@ -1855,7 +1864,7 @@ describe('setupWorkspace reference-cache reuse', () => {
     vi.mocked(fs.existsSync).mockReturnValue(false); // no mirror seeded for this repo
     stubExecFileSyncNoStaleBranch();
 
-    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' });
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
 
     const cloneArgs = findCloneArgs();
     expect(cloneArgs).not.toContain('--reference-if-able');
@@ -1885,7 +1894,7 @@ describe('failure category classification', () => {
     });
 
     let caughtError: unknown;
-    const promise = setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' })
+    const promise = setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint')
       .catch((e: unknown) => { caughtError = e; });
 
     // Advance past all retry delays (CLONE_MAX_RETRIES=3: 5s + 10s = 15s total)

@@ -85,7 +85,7 @@ export async function handleMigrate(
   git(['config', 'user.email', migrateBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', migrateBuildConfig?.git_user_name || 'Blueprint Agent']);
 
-  const workBranch = deriveTaskBranch('migrate', taskId, resolveTaskBranchNamespace(migrateBuildConfig));
+  const workBranch = deriveTaskBranch('migrate', taskId, resolveTaskBranchNamespace(task));
   let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);

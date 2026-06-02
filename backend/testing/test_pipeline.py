@@ -3650,6 +3650,148 @@ async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocke
     assert "_strategic_failures_at" not in vision
 
 
+async def _post_spawn_task(strategic_db, task_id, *, title, prompt, spawn_type="plan"):
+    """POST a strategic spawn_task op against the test app, returning the JSON body."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    async def _override_session():
+        yield strategic_db
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "spawn_task",
+                    "task_id": task_id,
+                    "data": {"type": spawn_type, "title": title, "prompt": prompt},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        return resp.json()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_idempotent_on_retry_duplicate(strategic_db):
+    """A retried spawn_task (same source review, type and title) must return the
+    existing task instead of creating a duplicate.
+
+    Reproduces the 2026-06-02 incident: the agent's _call helper retries on its
+    own ``curl --max-time 30`` timeout, and the slow-but-successful first request
+    still commits server-side, so one logical spawn produced two identical tasks
+    (00a63ec1 / 65108ef3). The server-side idempotency guard collapses the retry."""
+    from sqlalchemy import func as _f
+    from sqlmodel import select
+
+    project = Project(name="P", user_id="u1")
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(review)
+    await strategic_db.commit()
+    await strategic_db.refresh(review)
+    review_id = str(review.id)
+
+    title = "Wire warm-pool PROVISIONING->IDLE ready signal"
+    prompt = "Implement the PROVISIONING->IDLE ready-signal wiring."
+
+    first = await _post_spawn_task(
+        strategic_db, review_id, title=title, prompt=prompt
+    )
+    assert first["status"] == "ok"
+    assert not first.get("deduplicated")
+    first_id = first["task_id"]
+
+    # The retry: identical source review, type and title.
+    second = await _post_spawn_task(
+        strategic_db, review_id, title=title, prompt=prompt
+    )
+    assert second["status"] == "ok"
+    assert second.get("deduplicated") is True
+    # Same task returned — no duplicate created.
+    assert second["task_id"] == first_id
+
+    # Exactly one strategic_direct child exists for this review.
+    count = (
+        await strategic_db.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT", Task.title == title)
+        )
+    ).scalar()
+    assert count == 1
+
+    # The parent's spawn counter incremented exactly once (the dedup path does
+    # not double-count).
+    await strategic_db.refresh(review)
+    assert (review.context or {}).get("_strategic_tasks_spawned") == 1
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_distinct_title_is_not_deduped(strategic_db):
+    """A genuinely different spawn (different title) from the same review must
+    create a new task — the guard only collapses exact duplicates."""
+    from sqlalchemy import func as _f
+    from sqlmodel import select
+
+    project = Project(name="P", user_id="u1")
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(review)
+    await strategic_db.commit()
+    await strategic_db.refresh(review)
+    review_id = str(review.id)
+
+    a = await _post_spawn_task(
+        strategic_db, review_id, title="Investigate A", prompt="do A"
+    )
+    b = await _post_spawn_task(
+        strategic_db, review_id, title="Investigate B", prompt="do B"
+    )
+    assert not a.get("deduplicated")
+    assert not b.get("deduplicated")
+    assert a["task_id"] != b["task_id"]
+
+    count = (
+        await strategic_db.execute(
+            select(_f.count())
+            .select_from(Task)
+            .where(Task.created_by == "STRATEGIC_AGENT")
+        )
+    ).scalar()
+    assert count == 2
+
+
 # ── Direction Starvation Detection ───────────────────────────────────────────
 
 
