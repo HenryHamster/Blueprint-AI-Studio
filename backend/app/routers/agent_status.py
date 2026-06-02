@@ -2174,13 +2174,27 @@ async def update_agent_status(
         # SCOPE_EMPTY is a deterministic "work already done" exit — retrying
         # just burns another VM for the identical result, so it is terminal
         # on first detection (finalized as CANCELLED in the else-branch).
-        from app.failure_classification import SCOPE_EMPTY, persist_failure_category
+        # REASSIGNED is the same shape of non-genuine outcome: the agent
+        # gracefully self-terminated because the task was superseded /
+        # reassigned / deauthed out from under its VM. Re-provisioning a fresh
+        # VM for a task that is no longer "owned" is wasted work, so it too is
+        # terminal-on-first-detection and lands CANCELLED (no alert, no
+        # account/direction ding) — mirroring the SCOPE_EMPTY precedent. A
+        # genuine code failure is NEVER classified REASSIGNED, so this never
+        # masks a real defect.
+        from app.failure_classification import (
+            REASSIGNED,
+            SCOPE_EMPTY,
+            persist_failure_category,
+        )
+
+        _NON_GENUINE_TERMINAL_CLASSES = (SCOPE_EMPTY, REASSIGNED)
 
         # Retry logic for failed tasks
         if (
             payload.status == TaskStatus.FAILED
             and task.attempt_count < _runtime_config["max_retries"]
-            and failure_class != SCOPE_EMPTY
+            and failure_class not in _NON_GENUINE_TERMINAL_CLASSES
         ):
             task.attempt_count += 1
             bank_task_current_attempt(task, stopped_at=task.vm_stopped_at)
@@ -2273,12 +2287,21 @@ async def update_agent_status(
             # COMPLETED results also reach this else-branch, and
             # ``failure_class`` is only bound on the FAILED path — so gate
             # on payload.status before reading it.
-            if payload.status == TaskStatus.FAILED and failure_class == SCOPE_EMPTY:
-                # Agent found the work already done — a clean no-op, not a
-                # failure. Land it CANCELLED (not FAILED) and skip the retry
-                # annotation, account success-rate ding, and failure alert.
+            if (
+                payload.status == TaskStatus.FAILED
+                and failure_class in _NON_GENUINE_TERMINAL_CLASSES
+            ):
+                # Non-genuine terminal outcome — NOT a code/review failure:
+                #   • SCOPE_EMPTY  — agent found the work already done (clean
+                #     no-op, sibling cluster already merged the change).
+                #   • REASSIGNED   — task was superseded / reassigned / deauthed
+                #     out from under the VM; the agent gracefully bowed out.
+                # Land it CANCELLED (not FAILED) and skip the retry annotation,
+                # account success-rate ding, and failure alert. FIX H: REASSIGNED
+                # parity with the SCOPE_EMPTY->CANCELLED precedent so a handoff
+                # neither false-fails the task nor pages the operator.
                 task.status = TaskStatus.CANCELLED
-                persist_failure_category(task, SCOPE_EMPTY)
+                persist_failure_category(task, failure_class)
                 session.add(task)
             elif payload.status == TaskStatus.FAILED:
                 max_r = _runtime_config["max_retries"]

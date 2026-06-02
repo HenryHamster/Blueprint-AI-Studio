@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.direction_outcomes import (
     _counts_as_failure,
     _is_cascade_cancelled,
+    _is_non_genuine_cancelled,
     _longest_chain_length,
     _refresh_pipeline_scope_merge_rates,
     _update_cochange_index,
@@ -2664,6 +2665,65 @@ def test_counts_as_failure_excludes_cascade_cancelled():
     assert _counts_as_failure(t)
     t.status = TaskStatus.FAILED
     assert _counts_as_failure(t)
+
+
+def _cancelled_task(context):
+    return Task(
+        project_id=uuid.uuid4(),
+        title="t",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.CANCELLED,
+        context=context,
+        created_by="ORCHESTRATOR",
+    )
+
+
+def test_non_genuine_cancelled_excludes_new_markers():
+    """CROSS-FILE CONSISTENCY: the FIX A / FIX D / FIX H non-genuine CANCELLED
+    outcomes must NOT count toward direction failure metrics."""
+    # FIX A: pr_closed_non_rejection
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_detail": "pr_closed_non_rejection"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_detail": "pr_closed_non_rejection"})
+    )
+    # FIX D: cap_exhausted_after_approve
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_detail": "cap_exhausted_after_approve"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_detail": "cap_exhausted_after_approve"})
+    )
+    # FIX H: REASSIGNED handoff (and the SCOPE_EMPTY no-op) lands CANCELLED.
+    assert _is_non_genuine_cancelled(
+        _cancelled_task({"failure_category": "REASSIGNED"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_category": "REASSIGNED"})
+    )
+    assert not _counts_as_failure(
+        _cancelled_task({"failure_category": "SCOPE_EMPTY"})
+    )
+
+
+def test_genuine_cancelled_and_failed_still_count():
+    """GUARDRAIL: a genuine CANCELLED (operator-cancelled with no non-genuine
+    marker) and a genuine FAILED still count toward failure metrics."""
+    genuine = _cancelled_task({})
+    genuine.latest_status_message = "Cancelled by admin"
+    assert not _is_non_genuine_cancelled(genuine)
+    assert _counts_as_failure(genuine)
+    # A real code failure that landed CANCELLED with a CODE_ERROR category is
+    # NOT excluded (only REASSIGNED/SCOPE_EMPTY categories are non-genuine).
+    code_err = _cancelled_task({"failure_category": "CODE_ERROR"})
+    code_err.latest_status_message = "Cancelled by admin"
+    assert not _is_non_genuine_cancelled(code_err)
+    assert _counts_as_failure(code_err)
+    # FAILED is always a genuine failure.
+    failed = _cancelled_task({"failure_detail": "pr_closed_non_rejection"})
+    failed.status = TaskStatus.FAILED
+    assert _counts_as_failure(failed)
 
 
 @pytest.mark.asyncio

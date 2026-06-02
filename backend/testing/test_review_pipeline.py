@@ -974,6 +974,170 @@ async def test_cap_exhaustion_skips_approval_when_gates_disabled(db_session, moc
     )
 
 
+# ── FIX D: cap exhaustion after approval → CANCELLED (no CODE_ERROR) ────────
+
+
+def _mock_cap_exhaustion_github(mocker):
+    """Mock the GitHub side effects of _handle_cap_exhaustion."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_cap_exhaustion_after_approve_lands_cancelled_no_code_error(
+    db_session, mocker
+):
+    """FIX D: when the review-fix cap is reached on an already-APPROVED PR
+    (orig.review_loop.review_approved=True, no outstanding CHANGES_REQUESTED),
+    the orig lands CANCELLED with failure_detail=cap_exhausted_after_approve and
+    NO CODE_ERROR is recorded — it is benign merge-mechanics churn, not a code
+    failure."""
+    _mock_cap_exhaustion_github(mocker)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec_task = mocker.patch("app.routers.agent_status.record_task_result")
+    rec_dir = mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            "review_loop": {"review_approved": True, "pr_number": 404},
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 404,
+                "original_task_id": str(orig.id),
+            }
+        ],
+        context={"review_loop": {"review_approved": True, "pr_number": 404}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task,
+        str(orig.id),
+        404,
+        16,
+        db_session,
+        scope="per-chain",
+    )
+
+    await db_session.refresh(orig)
+    assert orig.status == TaskStatus.CANCELLED, (
+        f"Cap-after-approve must land CANCELLED, got {orig.status}"
+    )
+    assert (orig.context or {}).get("failure_detail") == "cap_exhausted_after_approve"
+    assert (orig.context or {}).get("failure_category") != "CODE_ERROR", (
+        "No CODE_ERROR must be recorded for a benign post-approval cap"
+    )
+    assert (orig.context or {}).get("pr_rejected") is not True, (
+        "An approved PR is not a rejection — pr_rejected must not be set"
+    )
+    # No failure-side accounting / alert for a non-genuine outcome.
+    alert_mock.assert_not_called()
+    rec_task.assert_not_called()
+    rec_dir.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cap_exhaustion_with_outstanding_changes_requested_stays_failed(
+    db_session, mocker
+):
+    """GUARDRAIL: when the latest review iteration still has outstanding
+    CHANGES_REQUESTED (genuine non-convergence), cap exhaustion keeps today's
+    FAILED + CODE_ERROR path even though an earlier round may have approved."""
+    _mock_cap_exhaustion_github(mocker)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "small",
+            # A stale earlier approval flag must NOT override a later unresolved
+            # rejection: the latest iteration's review_history has CHANGES_REQUESTED.
+            "review_loop": {
+                "review_approved": True,
+                "pr_number": 405,
+                "review_history": [
+                    {"verdict": "APPROVE"},
+                    {"verdict": "CHANGES_REQUESTED", "issues": ["x"]},
+                ],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {"type": "fix", "pr_number": 405, "original_task_id": str(orig.id)}
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 405,
+                "review_history": [
+                    {"verdict": "CHANGES_REQUESTED", "issues": ["x"]},
+                ],
+            }
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 405, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert orig.status == TaskStatus.FAILED, (
+        "Outstanding CHANGES_REQUESTED is genuine non-convergence → FAILED"
+    )
+    assert (orig.context or {}).get("failure_detail") == "review_cap_exhausted"
+    assert (orig.context or {}).get("failure_category") == "CODE_ERROR"
+    assert (orig.context or {}).get("pr_rejected") is True
+
+
 @pytest.mark.asyncio
 async def test_infra_failed_tasks_dont_count_toward_global_cap(db_session, mocker):
     """FAILED tasks with infra failure_category (PROVISION_FAILURE, RATE_LIMIT,
@@ -3459,14 +3623,19 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_rollup_classifier_flags_propagate_to_spawned_fix(db_session, mocker):
-    """Rollup-classifier underscore flags (`_is_rollup_review`, `_rollup_retries`)
-    must survive spawn-time propagation so the elevated iteration cap stays in
-    force across every fix/review iteration of a rollup chain.
+    """Rollup-chain recognition must survive spawn-time propagation so the
+    elevated iteration cap stays in force across every fix/review iteration.
 
-    Regression for PR #6061 (auto-closed at iter 12 with reason="global"):
-    the underscore-prefix filter at review_pipeline.py was stripping these
-    flags at iter 1, collapsing the cap from MAX_REVIEW_FIX_ITERATIONS=16
-    down to the medium-scope base cap of 12.
+    EVALUATING-strand root fix: ``_is_rollup_review`` is the parent-ONLY marker
+    (``rollup_state._is_rollup_parent_awaiting_merge`` short-circuits on it), so
+    it is DELIBERATELY no longer propagated to child tasks — a child carrying it
+    looked like a rollup parent awaiting merge and stranded in EVALUATING. The
+    cap policy no longer depends on the child carrying it: ``_rollup_retries``
+    still propagates, and the propagated rollup lineage (``rollup_pr_number`` +
+    ``review_loop.pr_number``) is recognised by ``_is_rollup_chain_source``.
+
+    Regression for PR #6061 (auto-closed at iter 12 with reason="global"): the
+    elevated cap must NOT collapse to the medium-scope base cap.
     """
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
@@ -3488,7 +3657,8 @@ async def test_rollup_classifier_flags_propagate_to_spawned_fix(db_session, mock
             "scope": "medium",
             "_is_rollup_review": True,
             "_rollup_retries": 2,
-            "review_loop": {"iteration": 0},
+            "rollup_pr_number": 601,
+            "review_loop": {"iteration": 0, "pr_number": 601},
         },
     )
     db_session.add(source_task)
@@ -3509,22 +3679,46 @@ async def test_rollup_classifier_flags_propagate_to_spawned_fix(db_session, mock
     assert result is not None
 
     ctx = result.context or {}
-    assert ctx.get("_is_rollup_review") is True, (
-        "_is_rollup_review must propagate so cap policy keeps resolving to the "
-        "elevated rollup cap on downstream fix/review iterations"
+    assert "_is_rollup_review" not in ctx, (
+        "_is_rollup_review is the parent-only marker and must NOT propagate to "
+        "child tasks — propagating it strands children in EVALUATING because "
+        "_is_rollup_parent_awaiting_merge short-circuits True for them"
     )
     assert ctx.get("_rollup_retries") == 2, (
         "_rollup_retries must propagate so cap policy keeps recognising this "
         "chain as a rollup retry sequence"
+    )
+    # The propagated rollup lineage keeps the chain recognisable for the cap.
+    assert ctx.get("rollup_pr_number") == 601
+    assert ctx.get("review_loop", {}).get("pr_number") == 601
+
+    # The child, now WITHOUT _is_rollup_review, is correctly NOT a rollup parent.
+    from app.rollup_state import _is_rollup_parent_awaiting_merge
+
+    assert _is_rollup_parent_awaiting_merge(ctx) is False, (
+        "A child review/fix task must not be classified as a rollup parent "
+        "awaiting merge once _is_rollup_review no longer propagates"
+    )
+    # But the cap-policy source recogniser still sees it as a rollup chain.
+    from app.review_pipeline import _is_rollup_chain_source
+
+    assert _is_rollup_chain_source(result) is True, (
+        "_is_rollup_chain_source must still recognise the chain via "
+        "_rollup_retries / rollup lineage so the elevated cap holds"
     )
 
 
 @pytest.mark.asyncio
 async def test_rollup_chain_at_iter_13_does_not_hit_global_cap(db_session, mocker):
     """Cap-boundary regression: a rollup chain reaching 13 completed PR iterations
-    on a medium-scope task must NOT hit `_handle_cap_exhaustion` because
-    `_is_rollup_review` propagation keeps the cap at MAX_REVIEW_FIX_ITERATIONS=16,
-    not the medium-scope base_cap of 12.
+    on a medium-scope task must NOT hit `_handle_cap_exhaustion` because the
+    rollup-chain recogniser keeps the cap at MAX_REVIEW_FIX_ITERATIONS=16, not
+    the medium-scope base_cap of 12.
+
+    Post EVALUATING-strand fix: the elevated cap no longer depends on the child
+    carrying `_is_rollup_review` (the parent-only marker). The propagated rollup
+    lineage (`rollup_pr_number` + `review_loop.pr_number`) keeps the chain
+    recognisable via `_is_rollup_chain_source`.
     """
     broadcast_mock = mocker.patch(
         "app.review_pipeline.broadcast_to_project", new_callable=AsyncMock
@@ -3549,6 +3743,7 @@ async def test_rollup_chain_at_iter_13_does_not_hit_global_cap(db_session, mocke
         context={
             "scope": "medium",
             "_is_rollup_review": True,
+            "rollup_pr_number": 701,
             "review_loop": {"iteration": 12, "pr_number": 701},
         },
     )
@@ -3593,15 +3788,20 @@ async def test_rollup_chain_at_iter_13_does_not_hit_global_cap(db_session, mocke
 
     assert cap_exhaustion_mock.call_count == 0, (
         f"Rollup chain at 13 iterations (medium scope) must NOT hit "
-        f"_handle_cap_exhaustion when _is_rollup_review propagated correctly "
+        f"_handle_cap_exhaustion when the rollup chain is recognised correctly "
         f"(elevated cap=16). Got {cap_exhaustion_mock.call_count} call(s)."
     )
     assert result is not None, (
-        "Rollup chain at iter 13 (medium scope, _is_rollup_review=True) must "
-        "still spawn a fix task because the elevated cap (16) is not exhausted"
+        "Rollup chain at iter 13 (medium scope) must still spawn a fix task "
+        "because the elevated cap (16) is not exhausted"
     )
-    # Sanity: the spawned task should still carry the rollup flag forward.
-    assert (result.context or {}).get("_is_rollup_review") is True
+    # The child must NOT carry the parent-only _is_rollup_review marker (strand
+    # fix), but the rollup lineage that drives the elevated cap is carried.
+    assert "_is_rollup_review" not in (result.context or {})
+    assert (result.context or {}).get("rollup_pr_number") == 701
+    from app.review_pipeline import _is_rollup_chain_source
+
+    assert _is_rollup_chain_source(result) is True
     # broadcast_to_project is invoked for the new task; surface the mock to
     # keep linters happy and confirm the spawn path completed normally.
     assert broadcast_mock.await_count >= 1

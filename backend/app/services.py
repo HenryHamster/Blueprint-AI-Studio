@@ -1330,6 +1330,167 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         )
                         continue
 
+                # EVALUATING-STRAND BACKSTOP. A review/CI task that spawned a
+                # conflict-fix or ci-fix child (review_loop.conflict_fix_spawned /
+                # ci_fix_spawned set) parks here until the chain resolves. The
+                # historical strand: an APPROVED review hit a merge conflict,
+                # spawned a conflict-fix, the fix's PR later MERGED, but the
+                # original review was never terminalized — the conflict_fix_spawned
+                # latch was never cleared (orchestrator:3086 skips it, ci_completion
+                # only updates the chain root) so it sits in EVALUATING forever.
+                # The root cause (children inheriting _is_rollup_review and looking
+                # like rollup parents) is fixed in review_pipeline; this is a
+                # belt-and-suspenders recovery for already-stranded rows.
+                #
+                # GUARDRAIL: only acts on NON-rollup-parent tasks (real rollup
+                # parents are handled by their own merge gate), and NEVER completes
+                # a task whose PR is still OPEN — open PRs are left EVALUATING.
+                _strand_rl = ctx.get("review_loop") or {}
+                _strand_spawned = _strand_rl.get("conflict_fix_spawned") or (
+                    _strand_rl.get("ci_fix_spawned")
+                )
+                if _strand_spawned and not ctx.get("pr_merged"):
+                    from app.rollup_state import _is_rollup_parent_awaiting_merge
+
+                    if not _is_rollup_parent_awaiting_merge(ctx):
+                        _strand_pr = _strand_rl.get("pr_number") or ctx.get(
+                            "rollup_pr_number"
+                        )
+                        if _strand_pr:
+                            _s_state = "open"
+                            _s_merged = False
+                            _s_lookup_ok = False
+                            try:
+                                from app.routers.agent import (
+                                    get_github_token_for_task,
+                                )
+                                from app.github import get_pull_request
+
+                                _gh = await _bounded(
+                                    get_github_token_for_task(task.id, session),
+                                    _GH_CALL_TIMEOUT_S,
+                                    what=f"strand token {str(task.id)[:8]}",
+                                )
+                                _gh_token, _owner, _repo = _gh
+                                _pr = await _bounded(
+                                    get_pull_request(
+                                        _gh_token, _owner, _repo, _strand_pr
+                                    ),
+                                    _GH_CALL_TIMEOUT_S,
+                                    what=f"strand get_pull_request #{_strand_pr}",
+                                )
+                                _s_state = _pr.get("state") or "open"
+                                _s_merged = bool(_pr.get("merged"))
+                                _s_lookup_ok = True
+                            except Exception as _strand_exc:
+                                logger.warning(
+                                    f"[EVAL TIMEOUT strand] Task {str(task.id)[:8]} "
+                                    f"PR #{_strand_pr} lookup failed: "
+                                    f"{type(_strand_exc).__name__}: {_strand_exc} — "
+                                    f"leaving EVALUATING for next sweep"
+                                )
+                            if _s_lookup_ok and _s_state == "closed" and _s_merged:
+                                from sqlalchemy.orm.attributes import flag_modified
+
+                                task.status = TaskStatus.COMPLETED
+                                task.latest_status_message = (
+                                    f"Strand recovery: conflict/CI-fix PR "
+                                    f"#{_strand_pr} merged out-of-band"
+                                )
+                                task.context = {**ctx, "pr_merged": True}
+                                flag_modified(task, "context")
+                                session.add(task)
+                                await session.commit()
+                                logger.info(
+                                    f"[EVAL TIMEOUT strand] Task {str(task.id)[:8]} "
+                                    f"terminalized COMPLETED — PR #{_strand_pr} merged"
+                                )
+                                await broadcast_to_project(
+                                    str(task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(task.id),
+                                        "status": TaskStatus.COMPLETED,
+                                    },
+                                )
+                                continue
+                            if (
+                                _s_lookup_ok
+                                and _s_state == "closed"
+                                and not _s_merged
+                            ):
+                                # PR closed without merging — terminal, but route
+                                # through FIX A's non-rejection classifier so a
+                                # cleanup/supersession close lands CANCELLED and a
+                                # genuine rejection lands FAILED.
+                                from app.rollup_management import (
+                                    _pr_closed_is_non_rejection,
+                                )
+                                from sqlalchemy.orm.attributes import flag_modified
+                                from app.failure_classification import (
+                                    SCOPE_EMPTY,
+                                    classify_failure,
+                                    persist_failure_category,
+                                )
+
+                                _non_rej = False
+                                with contextlib.suppress(Exception):
+                                    _non_rej = await _pr_closed_is_non_rejection(
+                                        task, _pr, _strand_pr, session
+                                    )
+                                if _non_rej:
+                                    task.status = TaskStatus.CANCELLED
+                                    task.latest_status_message = (
+                                        f"Strand recovery: PR #{_strand_pr} closed "
+                                        f"without merging (no rejection — cleanup)"
+                                    )
+                                    task.context = {
+                                        **ctx,
+                                        "pr_closed_unmerged": True,
+                                        "failure_detail": "pr_closed_non_rejection",
+                                        "failure_category": SCOPE_EMPTY,
+                                    }
+                                    flag_modified(task, "context")
+                                    session.add(task)
+                                    await session.commit()
+                                    await broadcast_to_project(
+                                        str(task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(task.id),
+                                            "status": TaskStatus.CANCELLED,
+                                        },
+                                    )
+                                    continue
+                                task.status = TaskStatus.FAILED
+                                task.latest_status_message = (
+                                    f"Strand recovery: PR #{_strand_pr} closed "
+                                    f"without merging"
+                                )
+                                task.context = {**ctx, "pr_closed_unmerged": True}
+                                _sfc = classify_failure(task)
+                                persist_failure_category(task, _sfc)
+                                flag_modified(task, "context")
+                                session.add(task)
+                                await _maybe_create_failure_alert(
+                                    task,
+                                    session,
+                                    f"Strand recovery: PR #{_strand_pr} closed "
+                                    f"without merging",
+                                )
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(task.id),
+                                        "status": TaskStatus.FAILED,
+                                    },
+                                )
+                                continue
+                            # STILL OPEN (or lookup failed) → leave EVALUATING.
+                            # GUARDRAIL: never complete a task whose PR is open.
+
                 # Approval-gate hard timeout. Parents with requires_approval=True
                 # remain in EVALUATING waiting for human approval; the
                 # evaluating_fail_hours backstop can be deferred by an active
