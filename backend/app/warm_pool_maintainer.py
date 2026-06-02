@@ -27,7 +27,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -127,6 +127,14 @@ def _pool_max_vms(runtime_config) -> int:
         return max(0, int(runtime_config.get("warm_pool_max_vms", 20)))
     except (TypeError, ValueError):
         return 20
+
+
+def _demand_window_minutes(runtime_config) -> int:
+    """Lookback window (minutes) for the recent-cold-dispatch demand signal."""
+    try:
+        return max(0, int(runtime_config.get("warm_pool_demand_window_minutes", 30)))
+    except (TypeError, ValueError):
+        return 30
 
 
 async def retire_and_delete_pool_vm(
@@ -491,13 +499,58 @@ async def _projects_with_pool_members(session) -> list[uuid.UUID]:
     return list(rows)
 
 
+async def _demand_active_projects(session, *, runtime_config) -> set[uuid.UUID]:
+    """Projects with real dispatch demand, derived purely from the DB.
+
+    A project is demand-active when it has eligible QUEUED backlog (a task
+    waiting for a VM right now) OR a recent COLD dispatch
+    (``Task.vm_dispatched_at`` within ``warm_pool_demand_window_minutes``). This
+    is the signal that lets a pool FORM for a project that has ZERO live members
+    yet: :func:`run_pool_maintainer_cycle` reconciles the UNION of this set with
+    :func:`_projects_with_pool_members`, so a demand-active zero-member project
+    is bootstrapped up to target through the normal ``reconcile_project_pool``
+    deficit path (``target - 0``), within all the existing budget ceilings.
+
+    A DORMANT project (no QUEUED backlog, no recent dispatch, no live members)
+    is NEVER returned here, so it is never seeded — blanket-seeding every
+    project would explode VM spend, which is exactly what the maintainer's
+    members-only design avoided. The demand is DB-derived rather than read from
+    the in-process ``warm_backlog_reuse`` funnel counters because those counters
+    are not project-keyed and reset on every leader cutover.
+
+    Backed by the ``ix_task_project_status_created`` (project_id, status,
+    created_at) index for the QUEUED leg.
+    """
+    cutoff = _utcnow() - timedelta(minutes=_demand_window_minutes(runtime_config))
+    rows = (
+        await session.execute(
+            select(Task.project_id)
+            .where(
+                or_(
+                    Task.status == TaskStatus.QUEUED,
+                    Task.vm_dispatched_at >= cutoff,
+                )
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    return set(rows)
+
+
 async def run_pool_maintainer_cycle(
     *,
     runtime_config,
     provision_fn: ProvisionFn | None = None,
     session_factory=AsyncSessionLocal,
 ) -> dict:
-    """One maintainer tick across all projects with pool members. Inert when off."""
+    """One maintainer tick across projects with pool members OR live demand.
+
+    Reconciles the union of projects that already have live pool members and
+    demand-active projects (eligible QUEUED backlog or a recent cold dispatch),
+    so a demand-active project with zero members is bootstrapped up to target.
+    Inert (early-return zero totals, no demand query) when warm_pool_enabled is
+    off.
+    """
     totals = {"recycled": 0, "drained": 0, "provisioned": 0, "projects": 0}
     if not is_warm_pool_enabled():
         return totals
@@ -512,7 +565,15 @@ async def run_pool_maintainer_cycle(
     pool_max = _pool_max_vms(runtime_config)
 
     async with session_factory() as session:
-        project_ids = await _projects_with_pool_members(session)
+        # Reconcile the UNION of (a) projects that already have live pool members
+        # and (b) demand-active projects with no members yet. (b) is what lets a
+        # pool actually FORM: a demand-active zero-member project flows through
+        # the same reconcile_project_pool deficit path and is bootstrapped up to
+        # target within every existing budget ceiling. A set dedupes the overlap
+        # so a project in both groups is reconciled exactly once.
+        project_ids = set(await _projects_with_pool_members(session)) | (
+            await _demand_active_projects(session, runtime_config=runtime_config)
+        )
         if not project_ids:
             return totals
 

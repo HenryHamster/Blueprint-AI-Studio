@@ -23,6 +23,7 @@ and shared_state.vm_last_heartbeat so a regression in this flag's default
 or a stale heartbeat from a prior test won't pollute neighbours.
 """
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import pytest
@@ -177,6 +178,221 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
             _runtime_config["warm_continuity_enabled"] = prior_warm_continuity
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
+# ---------------------------------------------------------------------------
+# Backlog-reuse handoff: assembled end-to-end coverage
+# ---------------------------------------------------------------------------
+# The grace-window teardown decision (_deferred_backlog_teardown) and the
+# /next-role backlog claim each have unit coverage, but their seam is only ever
+# tested with _vm_claimed_backlog_work MOCKED. These tests wire the REAL
+# /next-role endpoint claim together with the REAL deferred-teardown coroutine
+# (mocking only asyncio.sleep + _ensure_vm_deleted, never the DB re-check) so
+# the claim is observed through the same DB the teardown loop reads — the whole
+# completion -> hold -> warm-claim -> no-teardown path as one flow.
+
+
+@contextmanager
+def _backlog_reuse_enabled():
+    """Enable warm_backlog_reuse_enabled and reset the first-refusal registry +
+    circuit-breaker so neighbour state cannot suppress the claim or leak out.
+
+    runtime_config keys are restored by the autouse reset_runtime_config fixture;
+    the shared_state module-level maps/deques are restored here.
+    """
+    import app.shared_state as ss
+    from app.shared_state import runtime_config as rc
+
+    prior_refusal = dict(ss.warm_backlog_first_refusal)
+    rc["warm_backlog_reuse_enabled"] = True
+    ss.warm_backlog_reuse_failure_events.clear()
+    ss.warm_backlog_reuse_suppressed_until = None
+    try:
+        yield ss
+    finally:
+        ss.warm_backlog_first_refusal.clear()
+        ss.warm_backlog_first_refusal.update(prior_refusal)
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_backlog_completion_to_reuse_full_flow(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end: a VM completes a task while eligible same-project backlog
+    exists; the /next-role poll atomically claims a QUEUED backlog task onto that
+    VM (warm telemetry stamped, first-refusal registered for the orchestrator),
+    and the deferred-teardown coroutine then sees the claim through the REAL DB
+    and does NOT tear the VM down (no double-dispatch, no premature teardown)."""
+    import app.vm_lifecycle as vml
+
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+
+    with _backlog_reuse_enabled() as ss:
+        project = Project(name="Warm Backlog E2E", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = "agent-vm-backlog-e2e"
+        prior = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "done"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.COMPLETED,
+        )
+        backlog = Task(
+            project_id=project.id,
+            title="Queued backlog work",
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={"scope": "small"},
+        )
+        db_session.add_all([prior, backlog])
+        await db_session.commit()
+        await db_session.refresh(prior)
+        await db_session.refresh(backlog)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        nr = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert nr.status_code == 200, nr.text
+        body = nr.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(backlog.id)
+        assert body["warm_start"] is True
+
+        # The endpoint registered the orchestrator's first-refusal window so the
+        # cold-dispatch loop holds off provisioning this project's backlog.
+        assert ss.is_backlog_first_refusal_active(str(project.id)) is True
+
+        # Warm telemetry stamped and the task is bound IN_PROGRESS to this VM.
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.IN_PROGRESS
+        assert backlog.vm_instance_id == vm_id
+        assert backlog.vm_warm_start is True
+        timing = (backlog.context or {}).get("_timing", {})
+        assert timing.get("warm_start") is True
+        assert timing.get("warm_claim_origin") == "backlog_reuse"
+
+        # Now the deferred-teardown coroutine must NOT delete the VM: its REAL DB
+        # re-check (_vm_claimed_backlog_work, unmocked) finds the IN_PROGRESS task
+        # bound to the VM. Only the timing sleep and the actual delete are mocked.
+        mocker.patch(
+            "app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock
+        )
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+
+        await vml._deferred_backlog_teardown(vm_id, "agent_completion")
+        delete_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_backlog_ineligible_skips_claim_and_grace_releases(
+    client: AsyncClient, db_session, mocker
+):
+    """Negative end-to-end: the only QUEUED backlog task is pinned to a DIFFERENT
+    VM, so /next-role declines to claim it (204, task untouched). With no claim
+    landing, the deferred-teardown coroutine's REAL DB re-check finds no work and
+    releases the hold without leaking the VM — both the idle exit (agent stopped
+    polling) and the bounded-ceiling exit (still polling, never claimed) tear the
+    VM down exactly once."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+
+    with _backlog_reuse_enabled():
+        project = Project(name="Warm Backlog Ineligible", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        vm_id = "agent-vm-backlog-ineligible"
+        prior = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "done"}],
+            vm_instance_id=vm_id,
+            status=TaskStatus.COMPLETED,
+        )
+        # QUEUED but pinned to a different VM -> ineligible for THIS VM's backlog.
+        pinned_elsewhere = Task(
+            project_id=project.id,
+            title="Pinned to another VM",
+            payloads=[{"type": "fix", "prompt": "y", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={"warm_target_vm_id": "agent-vm-someone-else"},
+        )
+        db_session.add_all([prior, pinned_elsewhere])
+        await db_session.commit()
+        await db_session.refresh(prior)
+        await db_session.refresh(pinned_elsewhere)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        nr = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert nr.status_code == 204
+
+        # The ineligible task is left strictly untouched — not claimed warm.
+        db_session.expire(pinned_elsewhere)
+        await db_session.refresh(pinned_elsewhere)
+        assert pinned_elsewhere.status == TaskStatus.QUEUED
+        assert pinned_elsewhere.vm_instance_id is None
+
+        # No claim landed, so the deferred-teardown coroutine must release the
+        # hold and delete the VM (no leak). Bound the ceiling so the activity-gate
+        # loop terminates quickly under mocked sleep.
+        from app.shared_state import runtime_config as rc
+
+        rc["warm_backlog_teardown_defer_secs"] = 20
+        rc["warm_backlog_grace_window_secs"] = 40
+        rc["warm_backlog_grace_idle_secs"] = 30
+        rc["warm_backlog_grace_poll_interval_secs"] = 5
+        mocker.patch(
+            "app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock
+        )
+
+        # Idle exit: the agent stopped heartbeating -> early release, deleted once.
+        wbr._grace_idle_release_events.clear()
+        wbr._grace_ceiling_release_events.clear()
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=False)
+        await vml._deferred_backlog_teardown(vm_id, "agent_completion")
+        delete_mock.assert_awaited_once()
+        assert len(wbr._grace_idle_release_events) == 1
+        assert len(wbr._grace_ceiling_release_events) == 0
+
+        # Ceiling exit: the agent keeps polling but never claims -> bounded
+        # teardown, deleted once.
+        wbr._grace_idle_release_events.clear()
+        wbr._grace_ceiling_release_events.clear()
+        delete_mock.reset_mock()
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+        await vml._deferred_backlog_teardown(vm_id, "agent_completion")
+        delete_mock.assert_awaited_once()
+        assert len(wbr._grace_ceiling_release_events) == 1
+        assert len(wbr._grace_idle_release_events) == 0
 
 
 @pytest.mark.asyncio

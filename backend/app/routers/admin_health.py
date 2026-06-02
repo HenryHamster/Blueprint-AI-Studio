@@ -940,7 +940,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         ),
         "chain_continuity_funnel": _get_chain_continuity_funnel(),
         "spawn_pin_funnel": _get_spawn_pin_funnel(),
-        "backlog_reuse_funnel": _get_backlog_reuse_funnel(),
+        "backlog_reuse_funnel": await _get_backlog_reuse_funnel(session),
         "pool_metrics": await _get_pool_metrics(session),
     }
 
@@ -998,11 +998,38 @@ def _get_spawn_pin_funnel() -> dict:
         return {}
 
 
-def _get_backlog_reuse_funnel() -> dict:
+async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
     try:
-        from app.warm_backlog_reuse import get_reuse_funnel_snapshot
+        from app.efficiency_snapshot import DESIGN_DOC_KEY
+        from app.warm_backlog_reuse import (
+            compute_dominant_reuse_dropout,
+            get_reuse_funnel_snapshot,
+        )
 
-        return get_reuse_funnel_snapshot()
+        snap = get_reuse_funnel_snapshot()
+        snap.update(compute_dominant_reuse_dropout())
+        rows = (await session.execute(
+            select(Project).options(load_only(Project.id, Project.design_doc)).limit(500)
+        )).scalars().all()
+        buckets = []
+        for project in rows:
+            for entry in (
+                (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+            ).get("snapshots") or []:
+                block = entry.get("reuse_dropout")
+                if not isinstance(block, dict):
+                    continue
+                dominant = block.get("dominant_dropout") or {}
+                buckets.append(
+                    {
+                        "captured_at": entry.get("captured_at"),
+                        "dropout_total": block.get("dropout_total"),
+                        "dominant_reason": dominant.get("reason"),
+                        "dominant_share": dominant.get("share"),
+                    }
+                )
+        snap["trend"] = {"buckets": buckets[-90:]}
+        return snap
     except Exception:
         return {}
 
