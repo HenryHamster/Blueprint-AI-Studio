@@ -34,6 +34,7 @@ from sqlmodel import select
 
 import app.shared_state as _shared_state
 from app import services
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.models import (
     Task,
     TaskStatus,
@@ -729,11 +730,43 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             )
 
                         if gh_pr_state == "closed" and gh_pr_merged:
-                            task.status = TaskStatus.COMPLETED
+                            from app.models import Project
+
+                            _proj = await session.get(Project, task.project_id)
+                            (
+                                record_pr_merged,
+                                terminal_rollup_merge,
+                                landed_branch,
+                            ) = await classify_rollup_merge_outcome(
+                                task,
+                                _proj,
+                                session,
+                                pr_number=pr_num,
+                                merged_base_branch=(pr_data.get("base") or {}).get(
+                                    "ref"
+                                ),
+                                source="services._check_evaluating_timeouts",
+                            )
+                            task.status = (
+                                TaskStatus.COMPLETED
+                                if terminal_rollup_merge
+                                else TaskStatus.EVALUATING
+                            )
                             task.vm_instance_id = None
                             task.last_heartbeat = None
-                            task.latest_status_message = f"Recovered _pr_state_check_pending: PR #{pr_num} merged out-of-band"
-                            _ctx2["pr_merged"] = True
+                            if terminal_rollup_merge:
+                                task.latest_status_message = (
+                                    f"Recovered _pr_state_check_pending: PR "
+                                    f"#{pr_num} merged out-of-band"
+                                )
+                            else:
+                                task.latest_status_message = (
+                                    f"Recovered _pr_state_check_pending: PR "
+                                    f"#{pr_num} merged into {landed_branch}; "
+                                    "awaiting downstream landing"
+                                )
+                            if record_pr_merged:
+                                _ctx2["pr_merged"] = True
                         elif gh_pr_state == "closed" and not gh_pr_merged:
                             task.status = TaskStatus.FAILED
                             task.vm_instance_id = None

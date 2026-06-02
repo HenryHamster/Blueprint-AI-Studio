@@ -5,7 +5,13 @@ from datetime import timedelta
 import pytest
 
 from app.models import TaskStatus
-from testing.factories import make_alert, make_project, make_task, _utcnow
+from testing.factories import (
+    make_alert,
+    make_membership,
+    make_project,
+    make_task,
+    _utcnow,
+)
 
 
 @pytest.mark.asyncio
@@ -267,3 +273,77 @@ async def test_outer_loop_chains_reason_filter(client, db_session):
         f"/api/admin/outer-loop-chains?hours=24&project_id={project.id}&reason=bogus"
     )
     assert bad.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_dropout_names_dominant_leader(client, db_session):
+    """The drop-out endpoint surfaces the ranked breakdown and names the single
+    dominant reason when one clearly dominates the non-converting population."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._claim_skipped_events.clear()
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._scan_skipped_depends_on_events.clear()
+    wbr._scan_skipped_pinned_vm_events.clear()
+    wbr._scan_skipped_file_conflict_events.clear()
+    wbr._scan_saturated_events.clear()
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    for _ in range(4):
+        wbr.record_claim_skipped("lost_claim_race")
+    wbr.record_grace_ceiling_release()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/warm-reuse-dropout")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["dropout_total"] == 5
+    assert data["dropout_by_reason"]["claim_lost_claim_race"] == 4
+    assert data["dominant_dropout"]["reason"] == "claim_lost_claim_race"
+    assert data["dominant_dropout"]["share"] == 0.8
+    assert "per-VM" in data["attribution_note"]
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_dropout_trend_reads_persisted_snapshots(client, db_session):
+    """The trend endpoint reads the ``reuse_dropout`` block persisted into each
+    daily efficiency snapshot, and ignores snapshots that lack the block."""
+    from app.efficiency_snapshot import DESIGN_DOC_KEY
+
+    project = make_project()
+    project.design_doc = {
+        DESIGN_DOC_KEY: {
+            "snapshots": [
+                {"captured_at": "2026-05-30T00:00:00"},  # no reuse_dropout -> skipped
+                {
+                    "captured_at": "2026-05-31T00:00:00",
+                    "reuse_dropout": {
+                        "dropout_total": 5,
+                        "dominant_dropout": {"reason": "claim_lost_claim_race", "share": 0.8},
+                    },
+                },
+            ]
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/warm-reuse-dropout-trend"
+    )
+    assert resp.status_code == 200
+    buckets = resp.json()["buckets"]
+    assert len(buckets) == 1
+    assert buckets[0]["captured_at"] == "2026-05-31T00:00:00"
+    assert buckets[0]["dropout_total"] == 5
+    assert buckets[0]["dominant_reason"] == "claim_lost_claim_race"
+    assert buckets[0]["dominant_share"] == 0.8

@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet } from '../api';
 import { parseTimestamp } from '../utils/time';
-import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot } from '../types/warmVm';
+import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics } from '../types/warmVm';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { usePoller } from '../hooks/usePoller';
 
@@ -73,7 +73,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
   };
 
   const flipFlag = useCallback(async (
-    configKey: 'warm_continuity_enabled' | 'warm_backlog_reuse_enabled',
+    configKey: 'warm_continuity_enabled' | 'warm_backlog_reuse_enabled' | 'warm_pool_enabled',
     label: string,
     currentValue: boolean,
   ) => {
@@ -114,6 +114,8 @@ export function WarmVmPanel({ onViewTask }: Props) {
   const backlogReuseOn = data?.warm_backlog_reuse_enabled ?? false;
   const backlogClaims = data?.warm_pin_metrics.active_backlog_reuse_claims ?? 0;
   const chainClaims = data?.warm_pin_metrics.active_chain_continuity_claims ?? 0;
+  const pool = data?.pool_metrics;
+  const poolOn = pool?.enabled ?? false;
   const overThreshold = clearsHour > 5;
 
   return (
@@ -170,6 +172,28 @@ export function WarmVmPanel({ onViewTask }: Props) {
           }
         >
           {flipping ? '…' : (backlogReuseOn ? 'REUSE' : 'NO-REUSE')}
+        </button>
+        <button
+          onClick={() => { void flipFlag('warm_pool_enabled', 'pre-warmed VM pool', poolOn); }}
+          disabled={flipping || !data}
+          className={
+            (poolOn
+              ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
+              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+            ) +
+            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
+            (!data ? ' opacity-50 cursor-not-allowed' : '')
+          }
+          title={
+            flipping
+              ? 'flipping…'
+              : (poolOn
+                  ? 'Click to DISABLE the pre-warmed VM pool'
+                  : 'Click to ENABLE the pre-warmed VM pool globally')
+          }
+        >
+          {flipping ? '…' : (poolOn ? 'POOL' : 'NO-POOL')}
         </button>
         <button
           onClick={toggle}
@@ -236,6 +260,8 @@ export function WarmVmPanel({ onViewTask }: Props) {
                 </div>
               )}
 
+              {pool && <PoolMetricsRow pool={pool} />}
+
               {data.spawn_pin_funnel && (
                 <SpawnPinFunnelRow funnel={data.spawn_pin_funnel} />
               )}
@@ -291,6 +317,38 @@ export function WarmVmPanel({ onViewTask }: Props) {
             </>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+function fmtUsd(v: number | undefined): string {
+  if (v === undefined || v === null || Number.isNaN(v)) return '—';
+  if (v === 0) return '$0';
+  if (v < 0.01) return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(2)}`;
+}
+
+function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {
+  const funnel = pool.funnel;
+  const hitRate = funnel?.pool_hit_rate;
+  return (
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60" data-testid="pool-metrics-row">
+      <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
+        Warm Pool {pool.enabled ? '(enabled)' : '(disabled)'}
+      </span>
+      <span><span className="text-neutral-500">size</span>: <span className="font-mono text-neutral-300">{pool.current_size ?? 0}</span><span className="text-neutral-600">/{pool.target_size ?? 0}</span></span>
+      <span><span className="text-neutral-500">idle</span>: <span className="font-mono text-violet-400">{pool.idle_count ?? 0}</span></span>
+      <span><span className="text-neutral-500">idle cost</span>: <span className="font-mono text-amber-400" data-testid="pool-idle-cost">{fmtUsd(pool.projected_idle_cost_usd)}</span></span>
+      {pool.idle_ttl_secs !== undefined && (
+        <span><span className="text-neutral-500">idle TTL</span>: <span className="font-mono text-neutral-300">{pool.idle_ttl_secs}s</span></span>
+      )}
+      {funnel && (
+        <>
+          <span><span className="text-neutral-500">hits</span>: <span className="font-mono text-emerald-400">{funnel.pool_lease_hits}</span></span>
+          <span><span className="text-neutral-500">cold</span>: <span className="font-mono text-neutral-300">{funnel.cold_dispatches}</span></span>
+          <span><span className="text-neutral-500">hit rate</span>: <span className="font-mono text-neutral-300">{hitRate === null || hitRate === undefined ? '—' : `${Math.round(hitRate * 100)}%`}</span></span>
+        </>
       )}
     </div>
   );

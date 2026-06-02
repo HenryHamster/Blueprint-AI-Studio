@@ -34,6 +34,7 @@ from app.compute import (
     any_zone_available,
     soonest_zone_recovery,
 )
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -714,7 +715,7 @@ async def _task_has_open_pr(task, session) -> tuple[bool, int | None]:
     return True, pr_num
 
 
-from app.reaper_sweeps import (
+from app.reaper_sweeps import (  # noqa: E402
     sweep_queued_age_alerts,
     sweep_stalled_strategic_cycles,
     sweep_regression_scan,
@@ -816,6 +817,46 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     if created:
         await session.commit()
     return created
+
+
+async def _mark_landed_parent_dependents(parent_id, session) -> None:
+    """Completion-side warm-reuse trigger for reaper-driven rollup landings.
+
+    The reaper re-triggers ``_check_and_trigger_rollup`` from two places — the
+    post-reap loop (a failed child whose surviving siblings complete the parent)
+    and the Step-3 stale-EVALUATING sweep. When that lands a parent's rollup PR
+    on the integration branch the parent transitions to COMPLETED and its QUEUED
+    dependents are unblocked, but — exactly as on the orchestrator's CI-completion
+    and the in-process merge paths — nothing here proactively stamps the sticky
+    ``_deps_satisfied`` readiness marker on those dependents. So a just-unblocked
+    sibling-to-sibling fan-out child stays unmarked until a later capacity-and-
+    window-bounded dispatch scan happens to reach it, and the warm VM polling for
+    follow-on work inside its teardown-defer grace window skips it and tears down
+    cold while the orchestrator cold-provisions a fresh VM for that very dependent.
+
+    Re-fetch the parent on the shared session (full row via ``session.get`` — no
+    partial projection, so no MissingGreenlet) and, ONLY if it has actually
+    landed (status COMPLETED), delegate to the single authoritative
+    ``_mark_dependents_warm_claimable``. That reuses the same GitHub-aware
+    dependency resolution the dispatch scan uses, runs in its own sessions, and
+    stamps only the ``"eligible"`` result — a dependent with any still-unresolved
+    or failed dependency continues to carry no marker and cold-dispatch exactly as
+    before. Adds no cold provisioning. Best-effort: a failure here never aborts the
+    reaper cycle.
+    """
+    if parent_id is None:
+        return
+    try:
+        from app.task_lifecycle import _mark_dependents_warm_claimable
+
+        parent = await session.get(Task, parent_id)
+        if parent is None or parent.status != TaskStatus.COMPLETED:
+            return
+        await _mark_dependents_warm_claimable(parent)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[REAPER] Dependent warm-claim marking failed for parent {parent_id}: {e}",
+        )
 
 
 async def reaper_service():
@@ -1705,6 +1746,7 @@ async def reaper_service():
                         )
                         io_gh_pr_state: str | None = None
                         io_gh_pr_merged: bool = False
+                        io_gh_pr_base_branch: str | None = None
                         if _has_pr_artifact and _pr_num:
                             try:
                                 from app.routers.agent import get_github_token_for_task
@@ -1720,6 +1762,9 @@ async def reaper_service():
                                 )
                                 io_gh_pr_state = _pr_data.get("state")
                                 io_gh_pr_merged = bool(_pr_data.get("merged"))
+                                io_gh_pr_base_branch = (
+                                    (_pr_data.get("base") or {}).get("ref")
+                                )
                             except Exception as _gh_exc:  # noqa: BLE001
                                 # GH API unreachable: fall back to "open" — handing off
                                 # to review pipeline is the safer default.
@@ -2021,6 +2066,7 @@ async def reaper_service():
                         # doesn't run with FOR UPDATE held. Reuse those values here.
                         _gh_pr_state = io_gh_pr_state
                         _gh_pr_merged = io_gh_pr_merged
+                        _gh_pr_base_branch = io_gh_pr_base_branch
                         _pr_actually_open = (
                             _has_pr_artifact and _pr_num and _gh_pr_state == "open"
                         )
@@ -2037,15 +2083,42 @@ async def reaper_service():
                             # see the merge.
                             logger.info(
                                 f"[REAPER] Task {task.id} reaped mid-run; PR #{_pr_num} already merged — "
-                                f"marking COMPLETED"
+                                f"classifying landing"
                             )
-                            task.status = TaskStatus.COMPLETED
+                            _proj = await session.get(Project, task.project_id)
+                            (
+                                _record_pr_merged,
+                                _terminal_rollup_merge,
+                                _landed_branch,
+                            ) = await classify_rollup_merge_outcome(
+                                task,
+                                _proj,
+                                session,
+                                pr_number=_pr_num,
+                                merged_base_branch=_gh_pr_base_branch,
+                                source="reaper.orphan_recovery",
+                            )
+                            task.status = (
+                                TaskStatus.COMPLETED
+                                if _terminal_rollup_merge
+                                else TaskStatus.EVALUATING
+                            )
                             task.vm_instance_id = None
                             task.last_heartbeat = None
-                            task.latest_status_message = (
-                                f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
-                            )
-                            task.context = {**(task.context or {}), "pr_merged": True}
+                            if _terminal_rollup_merge:
+                                task.latest_status_message = (
+                                    f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
+                                )
+                            else:
+                                task.latest_status_message = (
+                                    f"Reaped mid-run; PR #{_pr_num} merged into "
+                                    f"{_landed_branch}; awaiting downstream landing"
+                                )
+                            if _record_pr_merged:
+                                task.context = {
+                                    **(task.context or {}),
+                                    "pr_merged": True,
+                                }
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -2776,6 +2849,14 @@ async def reaper_service():
                                 await _check_and_trigger_rollup(
                                     task, session, progress_cb=_mark_reaper_progress
                                 )
+                                # Completion-side warm-reuse: if that landing
+                                # completed the parent rollup, stamp the
+                                # _deps_satisfied marker on the dependents it just
+                                # unblocked so a polling warm VM can claim them
+                                # before tearing down cold (see helper docstring).
+                                await _mark_landed_parent_dependents(
+                                    task.parent_task_id, session
+                                )
                             except Exception as e:
                                 logger.error(
                                     f"[REAPER] Rollup check failed for task {task.id}: {e}",
@@ -3122,6 +3203,16 @@ async def reaper_service():
                                             flag_modified(_nudged, "context")
                                             session.add(_nudged)
                                             await session.commit()
+                                    # Completion-side warm-reuse: if the sweep's
+                                    # rollup trigger landed this parent, stamp the
+                                    # _deps_satisfied marker on the dependents it
+                                    # just unblocked (see helper docstring) so a
+                                    # polling warm VM claims them before cold
+                                    # teardown rather than waiting for a later
+                                    # window-bounded dispatch scan.
+                                    await _mark_landed_parent_dependents(
+                                        parent_id, session
+                                    )
                             except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",
@@ -3336,6 +3427,25 @@ async def reaper_service():
                     await sweep_routine_message_retention(session)
                 except Exception as e:
                     logger.error(f"[REAPER] Routine message purge: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 11: Idle warm-pool VM reaper — retire over-TTL / zombie /
+                # stale-image / stuck-RETIRING pool members (Task-row reaper is
+                # blind to taskless pool VMs). Inert when warm_pool_enabled=False.
+                _mark_reaper_progress()
+                try:
+                    from app.warm_pool_maintainer import sweep_idle_pool_vms
+
+                    pool_retired = await sweep_idle_pool_vms(
+                        session, now, runtime_config=_runtime_config
+                    )
+                    if pool_retired:
+                        logger.info(
+                            f"[REAPER] Step 11: retired {pool_retired} idle pool VM(s)"
+                        )
+                except Exception as e:
+                    logger.error(f"[REAPER] Idle pool VM sweep error: {e}", exc_info=True)
                     with contextlib.suppress(Exception):
                         await session.rollback()
             consecutive_errors = 0

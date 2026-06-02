@@ -22,6 +22,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.models import (
     Alert,
     AlertSeverity,
@@ -1854,13 +1855,26 @@ async def update_agent_status(
         if not _teardown_deferred:
             fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
-        # Backlog-reuse circuit breaker: if this FAILED task was originally
-        # claimed via the warm-backlog path, record a failure event so the
-        # circuit breaker can suppress backlog reuse if failures accumulate.
+        # Backlog-reuse / warm-pool circuit breakers: if this FAILED task was
+        # originally claimed via a warm path, record a failure event so the
+        # matching circuit breaker can suppress that path if failures accumulate
+        # (the classic "a bad image silently fails a stream of tasks" mode).
         if payload.status == TaskStatus.FAILED:
+            from app.warm_pool import WARM_POOL_ORIGIN
+
             _timing_ctx = (task.context or {}).get("_timing", {})
-            if _timing_ctx.get("warm_claim_origin") == "backlog_reuse":
+            _claim_origin = _timing_ctx.get("warm_claim_origin")
+            if _claim_origin == "backlog_reuse":
                 _shared_state.record_backlog_reuse_failure("task_failed")
+            elif _claim_origin == WARM_POOL_ORIGIN:
+                # A warm-pool member served this task and it FAILED — feed the
+                # pool-claim breaker so the maintainer stops replenishing (and
+                # dispatch stops leasing) while a bad pool image is in rotation.
+                # The pool dispatch path stamps WARM_POOL_ORIGIN ("warm_pool"),
+                # NOT "pool" — compare against the canonical constant so this
+                # feed cannot silently drift out of sync with the stamp site
+                # (agent_warm_continuity._finalize_warm_claim, origin=WARM_POOL_ORIGIN).
+                _shared_state.record_pool_claim_failure("task_failed")
 
         # Open-PR handoff: if a previous attempt already pushed a branch and
         # opened a PR, retrying from scratch will collide with the agent's
@@ -1948,6 +1962,7 @@ async def update_agent_status(
 
                 _gh_pr_state: str | None = None
                 _gh_pr_merged: bool = False
+                _gh_pr_base_branch: str | None = None
                 try:
                     from app.routers.agent import get_github_token_for_task
                     from app.github import get_pull_request
@@ -1960,6 +1975,7 @@ async def update_agent_status(
                     )
                     _gh_pr_state = _pr_data.get("state")
                     _gh_pr_merged = bool(_pr_data.get("merged"))
+                    _gh_pr_base_branch = (_pr_data.get("base") or {}).get("ref")
                 except Exception as _gh_exc:
                     # Mirror reaper behavior: assume open on transient GH failure
                     # so a brief outage doesn't strand the task as FAILED-forever.
@@ -2038,20 +2054,44 @@ async def update_agent_status(
                 # the spawn succeeds.
                 _ctx = dict(task.context or {})
                 if _gh_pr_state == "closed" and _gh_pr_merged:
+                    _proj = await session.get(Project, task.project_id)
                     logger.info(
                         f"[AGENT_STATUS] Task {task.id} reported FAILED but PR #{_pr_num} was merged "
-                        f"out-of-band — marking COMPLETED"
+                        f"out-of-band — classifying landing"
+                    )
+                    (
+                        _record_pr_merged,
+                        _terminal_rollup_merge,
+                        _landed_branch,
+                    ) = await classify_rollup_merge_outcome(
+                        task,
+                        _proj,
+                        session,
+                        pr_number=_pr_num,
+                        merged_base_branch=_gh_pr_base_branch,
+                        source="agent_status.failed_pr_recovery",
                     )
                     _ctx.pop("_pr_state_check_pending", None)
                     task.context = _ctx
                     flag_modified(task, "context")
-                    task.status = TaskStatus.COMPLETED
+                    task.status = (
+                        TaskStatus.COMPLETED
+                        if _terminal_rollup_merge
+                        else TaskStatus.EVALUATING
+                    )
                     task.vm_instance_id = None
                     task.last_heartbeat = None
-                    task.latest_status_message = (
-                        f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
-                    )
-                    task.context = {**(task.context or {}), "pr_merged": True}
+                    if _terminal_rollup_merge:
+                        task.latest_status_message = (
+                            f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
+                        )
+                    else:
+                        task.latest_status_message = (
+                            f"Reported FAILED; PR #{_pr_num} merged into "
+                            f"{_landed_branch}; awaiting downstream landing"
+                        )
+                    if _record_pr_merged:
+                        task.context = {**(task.context or {}), "pr_merged": True}
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(

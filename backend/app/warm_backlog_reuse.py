@@ -332,6 +332,13 @@ async def _eligible_backlog_ids(
         if _vm_boot_incompatible(vm_boot, t_provider, t_account_id, t_model, ctx):
             skipped_provider_mismatch += 1
             continue
+        # A warm-pool pin is owned exclusively by the warm-pool dispatch path
+        # (claimed via the /next-role pool branch, origin "warm_pool"). Backlog
+        # reuse must never claim it — that would mis-attribute the lift and
+        # bypass the pool's lease accounting — even when it is pinned to THIS VM.
+        if ctx.get("warm_pool_pin"):
+            skipped_pinned_vm += 1
+            continue
         if in_progress_files:
             cfiles = _prod_files(ctx.get("related_files", []))
             if cfiles & in_progress_files:
@@ -474,6 +481,16 @@ _teardown_defers_events: deque = deque(maxlen=500)
 _next_role_polls_during_defer_events: deque = deque(maxlen=500)
 _warm_claims_succeeded_events: deque = deque(maxlen=500)
 _claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
+# Completion-side trigger stage: each entry is a (datetime, count) tuple, one
+# per COMPLETION event that proactively stamped ``_deps_satisfied`` on >=1
+# just-unblocked dependent (so the just-completed VM can warm-claim that
+# follow-on work inside its teardown-defer grace window rather than tearing
+# down cold while the dependent waits for a later dispatch scan). count is the
+# number of dependents marked by that event. Recorded by the completion-side
+# trigger that owns the marking (orchestrator/lifecycle/reaper termination
+# paths); surfaced here so the trigger's lift is visible alongside the
+# unresolved-dependency scan skips it is designed to drive down.
+_completion_dependents_marked_events: deque = deque(maxlen=500)  # (datetime, count)
 
 # Eligibility-scan skip-reason events. Each entry is a single _utcnow() per
 # poll where that reason fired (one or more rows skipped). This per-poll
@@ -568,6 +585,18 @@ def record_claim_skipped(reason: str) -> None:
     _claim_skipped_events.append((_utcnow(), reason))
 
 
+def record_completion_dependents_marked(count: int) -> None:
+    """Completion-side trigger: a finished task proactively stamped the sticky
+    ``_deps_satisfied`` readiness marker on *count* just-unblocked QUEUED
+    dependents, making them warm-claimable within the just-completed VM's
+    teardown-defer grace window instead of waiting for a later dispatch scan.
+
+    No-ops on a non-positive count so callers can record unconditionally.
+    """
+    if count and count > 0:
+        _completion_dependents_marked_events.append((_utcnow(), count))
+
+
 def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
     """Return rolling funnel counts for the warm-reuse claim pipeline.
 
@@ -591,6 +620,9 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         ),
         "warm_claims_succeeded": sum(
             1 for ts in _warm_claims_succeeded_events if ts >= cutoff
+        ),
+        "completion_dependents_marked": sum(
+            count for ts, count in _completion_dependents_marked_events if ts >= cutoff
         ),
         "claim_skipped_by_reason": skipped_by_reason,
         "claim_skipped_total": sum(skipped_by_reason.values()),
@@ -618,6 +650,143 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         "grace_ceiling_releases": sum(
             1 for ts in _grace_ceiling_release_events if ts >= cutoff
         ),
+    }
+
+
+# Gate for naming a single dominant reuse drop-out. Mirrors the
+# dominant-blocker gating in digest_metrics: a reason is named the leader only
+# when it is present at meaningful volume (>=2 events), covers at least half the
+# non-converting population, AND strictly outranks the runner-up (an even split
+# names no leader). Below the gate, dominant_dropout is None.
+_DOMINANT_DROPOUT_MIN_COUNT = 2
+_DOMINANT_DROPOUT_MIN_SHARE = 0.5
+
+# Human-readable funnel keys that represent a completed-VM-with-eligible-backlog
+# failing to convert to a warm claim, mapped to a ranking reason label. Each is
+# an independent rolling event stream (per-poll or per-occurrence), NOT a per-VM
+# record, so the ranking reflects event magnitude over the window rather than
+# exact per-VM causation (stated in attribution_note below).
+_DROPOUT_REASON_KEYS = (
+    ("grace_idle_releases", "grace_idle_release"),
+    ("grace_ceiling_releases", "grace_ceiling_release"),
+    ("scan_polls_with_depends_on_skip", "scan_depends_on"),
+    ("scan_polls_with_pinned_vm_skip", "scan_pinned_vm"),
+    ("scan_polls_with_file_conflict_skip", "scan_file_conflict"),
+    ("scan_polls_saturated", "scan_saturated"),
+)
+
+
+def compute_dominant_reuse_dropout(window_hours: int = 24) -> dict:
+    """Rank where warm-reuse leaks and name the single dominant drop-out.
+
+    Derives a per-reason drop-out breakdown from the rolling reuse funnel
+    (``get_reuse_funnel_snapshot``): every per-claim skip reason plus the
+    grace-window releases and eligibility-scan skips that prevented a completed
+    VM with eligible backlog from converting to a warm claim. The dominant
+    drop-out is named only when one reason clearly dominates the non-converting
+    population (see the gating constants); otherwise ``dominant_dropout`` is
+    None. Suitable for daily persistence (efficiency snapshot) and admin
+    surfacing so a widening change can be confirmed to reduce the leader.
+    """
+    snap = get_reuse_funnel_snapshot(window_hours)
+    dropout_by_reason: dict = {}
+    for reason, count in (snap.get("claim_skipped_by_reason") or {}).items():
+        if count:
+            dropout_by_reason[f"claim_{reason}"] = count
+    for key, reason in _DROPOUT_REASON_KEYS:
+        count = snap.get(key) or 0
+        if count:
+            dropout_by_reason[reason] = count
+
+    total = sum(dropout_by_reason.values())
+    dominant = None
+    if total > 0:
+        ranked = sorted(dropout_by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_reason, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= _DOMINANT_DROPOUT_MIN_COUNT
+            and top_count / total >= _DOMINANT_DROPOUT_MIN_SHARE
+            and top_count > second_count
+        ):
+            dominant = {
+                "reason": top_reason,
+                "count": top_count,
+                "total": total,
+                "share": round(top_count / total, 3),
+            }
+    return {
+        "window_hours": window_hours,
+        "dropout_by_reason": dropout_by_reason,
+        "dropout_total": total,
+        "dominant_dropout": dominant,
+        "attribution_note": (
+            "Drop-out reasons are independent rolling event-stream counts, not "
+            "per-VM-linked records; the ranking reflects event magnitude over "
+            "the window rather than exact per-VM causation."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Warm-POOL dispatch funnel observability counters (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# Pool-hit-vs-cold-dispatch funnel for the pre-provisioned VM pool. Mirrors the
+# backlog-reuse funnel above: bounded rolling deques of UTC timestamps (plus a
+# (datetime, reason) tuple for the multi-reason lease-miss stage), maxlen=500 to
+# bound memory on a long-lived process. The dispatch hook (sibling task) calls
+# these as it decides between leasing an IDLE pool member (a "hit") and
+# cold-provisioning a fresh VM (a "cold dispatch"); get_pool_funnel_snapshot
+# rolls them up for the operator panel.
+
+_pool_lease_hit_events: deque = deque(maxlen=500)
+_pool_cold_dispatch_events: deque = deque(maxlen=500)
+_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason)
+
+
+def record_pool_lease_hit() -> None:
+    """A queued task was served warm by leasing an IDLE pool member."""
+    _pool_lease_hit_events.append(_utcnow())
+
+
+def record_pool_cold_dispatch() -> None:
+    """A queued task cold-provisioned a VM (pool disabled, empty, or no match)."""
+    _pool_cold_dispatch_events.append(_utcnow())
+
+
+def record_pool_lease_miss(reason: str) -> None:
+    """The pool was consulted but no member could be leased.
+
+    reason should be one of: "no_idle_member" (pool empty / all leased),
+    "no_compatible_member" (idle members exist but identity/tenant mismatch),
+    "disabled" (warm_pool_enabled off), "lost_lease_race" (a peer dispatcher
+    won the SKIP-LOCKED row).
+    """
+    _pool_lease_miss_events.append((_utcnow(), reason))
+
+
+def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
+    """Return rolling funnel counts for the warm-pool dispatch path.
+
+    All counts cover the trailing ``window_hours`` (default 24h). ``pool_hit_rate``
+    is hits / (hits + cold dispatches), or None when no dispatch was recorded.
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    miss_by_reason: dict = {}
+    for ts, reason in _pool_lease_miss_events:
+        if ts >= cutoff:
+            miss_by_reason[reason] = miss_by_reason.get(reason, 0) + 1
+    hits = sum(1 for ts in _pool_lease_hit_events if ts >= cutoff)
+    cold = sum(1 for ts in _pool_cold_dispatch_events if ts >= cutoff)
+    total = hits + cold
+    return {
+        "window_hours": window_hours,
+        "pool_lease_hits": hits,
+        "cold_dispatches": cold,
+        "total_dispatches": total,
+        "pool_hit_rate": round(hits / total, 4) if total else None,
+        "lease_miss_by_reason": miss_by_reason,
+        "lease_miss_total": sum(miss_by_reason.values()),
     }
 
 

@@ -29,12 +29,13 @@ Agent VMs          Background workers
 
 ### Components
 
-- **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. It registers the API routers under `backend/app/routers/` and runs background workers:
+- **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. It registers the API routers under `backend/app/routers/` and runs background workers for orchestration, reaping, cleanup, digest precompute, secret reconciliation, and pipeline alerts:
   - `orchestrator_worker` — polls for QUEUED tasks every 10 s and provisions VMs; it
     also drives autonomous-research spawning each cycle via `_check_idle_research()`
     (there is no separate autonomous-research worker loop)
   - `reaper_service` — kills VMs that miss heartbeats (5-minute timeout, 30 s cadence)
   - `gcp_cleanup_service` — sweeps orphaned VMs every 15 min
+  - `secret_reconciliation_service` / `pipeline_alert_scan_service` / `digest_precompute_service` — keep runtime secrets, operator alerts, and digest cache state in sync
 
 - **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the WebSocket log stream.
 
@@ -56,18 +57,21 @@ cp .env.example .env
 # 2. Start PostgreSQL
 docker compose up -d db
 
+# 3. Apply backend migrations
+cd backend && bash run_migrations.sh
+
 # If you prefer containerized backend instead of uvicorn, `docker compose up -d` starts both `db` and `app`.
 
-# 3. Install backend dependencies and run the API (separate terminal)
+# 4. Install backend dependencies and run the API (separate terminal)
 cd backend
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8080
 
-# 4. In another terminal, start the UIs (launcher on :3000, admin on :3001)
+# 5. In another terminal, start the UIs (launcher on :3000, admin on :3001)
 npm install
 npm run dev
 
-# 5. Open http://localhost:3000 to launch tasks, or http://localhost:3001 for the admin dashboard
+# 6. Open http://localhost:3000 to launch tasks, or http://localhost:3001 for the admin dashboard
 ```
 
 ## Production Setup (GCP)

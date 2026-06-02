@@ -14,14 +14,18 @@ from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, _utcnow
+from app.models import (
+    Task,
+    TaskStatus,
+    _utcnow,
+    get_task_current_attempt_vm_cost_usd,
+)
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.task_locking import lock_project_or_429, with_design_doc_locked
@@ -33,7 +37,6 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_task_branch_namespace,
 )
-from app.vm_cost_rates import VM_COST_RATES
 
 logger = logging.getLogger(__name__)
 
@@ -50,47 +53,59 @@ async def cost_summary(
     days: int = Query(7, ge=1, le=365),
     current_user: dict = Depends(require_admin),
 ):
-    # VM cost rates are sourced from vm_cost_rates.py for e2-standard-2
-    ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # per second
-    SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600
-
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
-    duration_seconds = func.extract(
-        "epoch", Task.vm_stopped_at - Task.vm_provisioned_at
-    )
-    rate_expr = case((Task.vm_spot, SPOT_RATE), else_=ON_DEMAND_RATE)
-
-    rows = (
-        await session.execute(
-            select(
-                Task.provider,
-                Task.vm_spot,
-                func.count().label("count"),
-                func.sum(duration_seconds).label("total_seconds"),
-                func.sum(duration_seconds * rate_expr).label("estimated_cost"),
-            )
-            .where(
-                Task.created_at >= cutoff,
-                Task.vm_provisioned_at.is_not(None),
-                Task.vm_stopped_at.is_not(None),
-            )
-            .group_by(Task.provider, Task.vm_spot)
-        )
-    ).all()
-
     by_type: Dict[str, Any] = {}
     total_cost = 0.0
-    for row in rows:
-        key = f"{row.provider or 'unknown'}:{'spot' if row.vm_spot else 'on-demand'}"
-        estimated_cost = float(row.estimated_cost or 0.0)
-        by_type[key] = {
-            "count": row.count,
-            "total_seconds": float(row.total_seconds or 0.0),
-            "estimated_cost": estimated_cost,
-            "provider": row.provider,
-            "spot": row.vm_spot,
-        }
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.provider,
+                        Task.vm_spot,
+                        Task.vm_machine_type,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.created_at,
+                    )
+                )
+                .where(
+                    Task.created_at >= cutoff,
+                    Task.vm_provisioned_at.is_not(None),
+                    Task.vm_stopped_at.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for task in tasks:
+        key = f"{task.provider or 'unknown'}:{'spot' if task.vm_spot else 'on-demand'}"
+        duration_seconds = float(
+            (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
+        )
+        estimated_cost = get_task_current_attempt_vm_cost_usd(task)
+        row = by_type.setdefault(
+            key,
+            {
+                "count": 0,
+                "total_seconds": 0.0,
+                "estimated_cost": 0.0,
+                "provider": task.provider,
+                "spot": task.vm_spot,
+            },
+        )
+        row["count"] += 1
+        row["total_seconds"] += duration_seconds
+        row["estimated_cost"] += estimated_cost
         total_cost += estimated_cost
+
+    for row in by_type.values():
+        row["estimated_cost"] = float(row["estimated_cost"])
+        row["total_seconds"] = float(row["total_seconds"])
 
     return {
         "period_days": days,

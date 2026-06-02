@@ -325,3 +325,47 @@ async def test_warm_vm_state_clears_by_reason_histogram(client: AsyncClient):
     finally:
         _shared_state.warm_pin_clear_events.clear()
         _shared_state.warm_pin_clear_events.extend(saved_clears)
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_includes_pool_metrics(client: AsyncClient, db_session):
+    """The warm-vm-state payload exposes a pool_metrics block: enabled flag,
+    target/current size, idle count, projected idle cost, and the dispatch
+    funnel — sourced from the PoolVm registry + runtime config."""
+    from app.models import PoolVm, PoolVmState, Project, _utcnow
+    from datetime import timedelta
+
+    project = Project(name="Pool Metrics", user_id="test-user-pm")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    member = PoolVm(
+        vm_instance_id="vm-pm-idle-1",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        idle_since=_utcnow() - timedelta(seconds=120),
+    )
+    db_session.add(member)
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/warm-vm-state")
+    assert resp.status_code == 200
+    pool = resp.json()["pool_metrics"]
+    assert isinstance(pool, dict)
+    for key in (
+        "enabled",
+        "target_size",
+        "idle_ttl_secs",
+        "current_size",
+        "idle_count",
+        "projected_idle_cost_usd",
+        "funnel",
+    ):
+        assert key in pool, f"missing pool_metrics.{key}"
+    assert isinstance(pool["enabled"], bool)
+    # The idle member we just inserted is counted and accruing live cost.
+    assert pool["current_size"] >= 1
+    assert pool["idle_count"] >= 1
+    assert pool["projected_idle_cost_usd"] > 0
+    assert "pool_hit_rate" in pool["funnel"]

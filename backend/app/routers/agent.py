@@ -22,6 +22,7 @@ from app.auth import (
     verify_agent_jwt,
     create_agent_token,
     AGENT_TOKEN_TTL_HOURS,
+    VM_SCOPED_TOKEN_SCOPE,
 )
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
@@ -220,7 +221,28 @@ async def verify_agent_token(
     """
     payload = verify_agent_jwt(x_agent_token)
     task_id = payload.get("sub")
-    if not task_id:
+    # VM-scoped (taskless / warm-pool) token: a pool VM that has not yet claimed
+    # any task. It carries no task ``sub`` — only ``vm_instance_id`` + project
+    # scope, tagged ``token_scope == "vm"``. Accept it here (so the taskless
+    # endpoints vm-heartbeat / next-role can use it; /heartbeat and /claim still
+    # require a task ``sub`` and reject a bare VM-scoped token) and skip
+    # the task-binding / terminal-freshness checks below, which are meaningless
+    # without a task. The endpoints themselves still scope every action by the
+    # JWT's ``vm_instance_id``. The task-scoped path (``sub`` present, no
+    # ``token_scope``) is unchanged. A VM-scoped token MUST carry a
+    # vm_instance_id, or there is nothing to authorize against.
+    if payload.get("token_scope") == VM_SCOPED_TOKEN_SCOPE or not task_id:
+        if not payload.get("vm_instance_id"):
+            _log_agent_auth_reject(
+                "vm_scoped_token_missing_vm",
+                path=request.url.path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
+            raise HTTPException(
+                status_code=401, detail="vm_scoped_token_missing_vm"
+            )
         return payload
     token_vm = payload.get("vm_instance_id")
     # /next-role and /vm-heartbeat are reached AFTER a task has terminated
@@ -404,7 +426,7 @@ async def verify_agent_token(
 # internals / invalidation helper) call sites keep working unchanged.
 # ---------------------------------------------------------------------------
 
-from app.github_token_resolver import (  # noqa: F401
+from app.github_token_resolver import (  # noqa: F401,E402
     _GITHUB_TOKEN_TTL,
     _github_token_cache,
     _github_token_cache_lock,

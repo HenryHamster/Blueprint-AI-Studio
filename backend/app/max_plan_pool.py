@@ -2113,6 +2113,32 @@ async def release_max_plan_account(account_id: str):
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
 
 
+async def reserve_max_plan_account(account_id: str) -> bool:
+    """Increment active tasks for an account when a task starts.
+
+    Mirror of ``release_max_plan_account``: a warm-reuse claim runs a task on
+    the VM's boot LLM account but never goes through ``select_max_plan_account``
+    (which is the only other place that pre-increments ``active_tasks``). Without
+    this reservation the boot account's concurrency count stays too low until the
+    orchestrator's next per-cycle reconciliation re-bases it from the DB — a
+    sub-cycle window in which the account's caps can be silently overrun. The
+    reconciliation overwrites ``active_tasks`` from the DB each cycle, so this
+    in-memory bump is never double-counted; it only closes that window.
+
+    No-op (returns False) when the account is absent from the pool (e.g. local /
+    test VMs with no real boot account), so callers can reserve unconditionally.
+    Acquires ``_max_plan_pool_lock``.
+    """
+    if not account_id:
+        return False
+    async with _max_plan_pool_lock:
+        account = _account_by_id.get(str(account_id))
+        if account is None:
+            return False
+        account["active_tasks"] = int(account.get("active_tasks") or 0) + 1
+        return True
+
+
 async def disable_account_model(
     acct_id: str,
     model: str,

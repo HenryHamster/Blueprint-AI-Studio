@@ -20,7 +20,7 @@ import time
 import pytest
 from httpx import AsyncClient
 
-from app.auth import create_agent_token, verify_agent_jwt
+from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.efficiency_snapshot import (
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
@@ -173,6 +173,36 @@ async def test_backlog_reuse_config_gate_off_is_unchanged(
             headers={"x-agent-token": token},
         )
         assert resp.status_code == 204
+
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.QUEUED
+        assert backlog.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_pool_vm_scoped_token_excluded_from_backlog_reuse(
+    client: AsyncClient, db_session, mocker
+):
+    """An IDLE pool VM (VM-scoped token, no warm_pool_pin task) must NOT claim a
+    backlog task via the credential-agnostic backlog-reuse branch — that branch
+    bypasses the pool's account/provider/model lease gate. It gets 204 and the
+    backlog task stays QUEUED; only the orchestrator's strict pool lease may hand
+    a pool VM work."""
+    _patch_broadcast(mocker)
+    with _FlagGuard(backlog=True):
+        project = await _make_project(db_session, name="Pool Token Excluded")
+        vm_id = "agent-vm-pool-token"
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        # VM-scoped (taskless) token — what a freshly-booted pool VM carries.
+        token = create_vm_scoped_token(vm_id, str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 204, resp.text
 
         db_session.expire(backlog)
         await db_session.refresh(backlog)
@@ -1003,6 +1033,7 @@ def _clear_funnel_events(wbr):
     wbr._scan_skipped_file_conflict_events.clear()
     wbr._scan_skipped_provider_mismatch_events.clear()
     wbr._scan_saturated_events.clear()
+    wbr._completion_dependents_marked_events.clear()
 
 
 def test_funnel_counters_and_snapshot():
@@ -1034,6 +1065,26 @@ def test_funnel_counters_and_snapshot():
         _clear_funnel_events(wbr)
 
 
+def test_funnel_completion_dependents_marked():
+    """record_completion_dependents_marked sums the dependents proactively marked
+    by completion-side triggers within the window; non-positive counts no-op."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        wbr.record_completion_dependents_marked(2)
+        wbr.record_completion_dependents_marked(1)
+        # Non-positive counts must not register an event.
+        wbr.record_completion_dependents_marked(0)
+        wbr.record_completion_dependents_marked(-3)
+
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["completion_dependents_marked"] == 3
+        assert len(wbr._completion_dependents_marked_events) == 2
+    finally:
+        _clear_funnel_events(wbr)
+
+
 def test_funnel_claim_skipped_circuit_breaker():
     """record_claim_skipped('circuit_breaker_tripped') is tracked in the snapshot."""
     import app.warm_backlog_reuse as wbr
@@ -1046,6 +1097,64 @@ def test_funnel_claim_skipped_circuit_breaker():
         assert snap["claim_skipped_total"] == 1
     finally:
         _clear_funnel_events(wbr)
+
+
+def _clear_all_dropout_events(wbr):
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+
+
+def test_dominant_dropout_names_clear_leader():
+    """A reason that meets the volume/share/runner-up gate is named dominant,
+    with its share of the non-converting population; below the gate it is None."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_all_dropout_events(wbr)
+    try:
+        # 4 lost-claim-race vs 1 ceiling-release: race covers 4/5 (>=50%),
+        # >=2 events, and strictly outranks the runner-up -> dominant.
+        for _ in range(4):
+            wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_grace_ceiling_release()
+
+        result = wbr.compute_dominant_reuse_dropout()
+        assert result["dropout_total"] == 5
+        assert result["dropout_by_reason"]["claim_lost_claim_race"] == 4
+        assert result["dropout_by_reason"]["grace_ceiling_release"] == 1
+        dom = result["dominant_dropout"]
+        assert dom is not None
+        assert dom["reason"] == "claim_lost_claim_race"
+        assert dom["count"] == 4
+        assert dom["total"] == 5
+        assert dom["share"] == 0.8
+        assert "per-VM" in result["attribution_note"]
+    finally:
+        _clear_all_dropout_events(wbr)
+
+
+def test_dominant_dropout_none_on_even_split_and_empty():
+    """No leader is named on an even split (no clear dominant) or empty window."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_all_dropout_events(wbr)
+    try:
+        # Empty window -> total 0, no dominant.
+        empty = wbr.compute_dominant_reuse_dropout()
+        assert empty["dropout_total"] == 0
+        assert empty["dominant_dropout"] is None
+
+        # Even 2-vs-2 split: top does not strictly outrank runner-up -> None.
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_grace_idle_release()
+        wbr.record_grace_idle_release()
+        tied = wbr.compute_dominant_reuse_dropout()
+        assert tied["dropout_total"] == 4
+        assert tied["dominant_dropout"] is None
+    finally:
+        _clear_all_dropout_events(wbr)
 
 
 @pytest.mark.asyncio

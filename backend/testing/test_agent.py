@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 import time
 import uuid
 from pathlib import Path
@@ -6341,10 +6342,85 @@ async def test_failed_with_open_pr_spawn_failure_keeps_recovery_marker(
 
 
 @pytest.mark.asyncio
+async def test_failed_pool_served_task_feeds_pool_breaker(
+    client: AsyncClient, db_session, mocker
+):
+    """A FAILED task that was served by the warm pool feeds the pool-claim
+    circuit breaker.
+
+    Regression guard: the agent-reported FAILED path keys the breaker feed on
+    the exact origin stamped by the pool dispatch path. That stamp is
+    WARM_POOL_ORIGIN ("warm_pool", warm_pool.py / agent_warm_continuity.py),
+    NOT the literal "pool". A mismatch makes the feed dead code so the
+    breaker's primary trip mode (a bad pool image silently failing a stream of
+    tasks) can never fire. This test stamps the REAL origin and asserts the
+    failure is recorded.
+    """
+    import app.shared_state as ss
+    from app.warm_pool import WARM_POOL_ORIGIN
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="Pool Breaker Feed", user_id="test-user-pool-breaker")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-pool-breaker",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        # Stamp the warm-claim origin exactly as the pool dispatch path does.
+        context={"_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ss.warm_pool_claim_failure_events.clear()
+    try:
+        token = create_agent_token(str(task.id), "agent-vm-pool-breaker")
+        resp = await client.post(
+            "/api/agent/status",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "status": "FAILED",
+                "failure_category": "fatal",
+                "logs": "boom",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        # The pool-served FAILED task must have fed the pool-claim breaker.
+        assert ss.count_recent_pool_claim_failures() == 1, (
+            "FAILED task stamped warm_claim_origin=WARM_POOL_ORIGIN must record a "
+            "pool-claim failure — the breaker feed is keyed on the wrong literal"
+        )
+    finally:
+        ss.warm_pool_claim_failure_events.clear()
+
+
+@pytest.mark.asyncio
 async def test_failed_with_merged_pr_marks_completed(
     client: AsyncClient, db_session, mocker
 ):
     """PR merged out-of-band before agent reported FAILED → COMPLETED, not retry."""
+    from app.models import Alert
+
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
@@ -6360,17 +6436,22 @@ async def test_failed_with_merged_pr_marks_completed(
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"state": "closed", "merged": True}),
+        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
     )
 
-    project = Project(name="Merged PR Handoff", user_id="test-user-merged-pr")
+    project = Project(
+        name="Merged PR Handoff",
+        user_id="test-user-merged-pr",
+        integration_branch="main",
+        promotion_target="main",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
+        payloads=[{"type": "create", "prompt": "do work", "base_branch": "automain"}],
         vm_instance_id="agent-vm-merged-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -6396,10 +6477,201 @@ async def test_failed_with_merged_pr_marks_completed(
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "accepted_pr_merged"
+    await asyncio.sleep(0)
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is True
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    dispatch_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without_pr_merged(
+    client: AsyncClient, db_session, mocker
+):
+    """A merged PR on promotion_target must complete without marking the task landed on integration."""
+    from app.models import Alert, AlertSeverity
+
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
+    )
+
+    project = Project(
+        name="Merged Promotion PR Handoff",
+        user_id="test-user-merged-promotion-pr",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "do work", "base_branch": "automain"}
+        ],
+        vm_instance_id="agent-vm-merged-promotion-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4243",
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-merged-promotion-pr")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_merged"
+    await asyncio.sleep(0)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is None
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 4243
+
+
+@pytest.mark.asyncio
+async def test_failed_with_merged_pr_on_intermediate_staged_rollup_stays_evaluating(
+    client: AsyncClient, db_session, mocker
+):
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "release/candidate-1"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="Merged Intermediate Rollup Handoff",
+        user_id="test-user-merged-intermediate-rollup",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "rollup parent",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        vm_instance_id="agent-vm-merged-intermediate-rollup",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={"rollup_pr_number": 4244},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4244",
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-merged-intermediate-rollup")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_merged"
+    await asyncio.sleep(0)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert (task.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (task.latest_status_message or "")
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
 
 
 @pytest.mark.asyncio

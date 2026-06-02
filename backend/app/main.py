@@ -46,6 +46,7 @@ from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_debug import router as admin_debug_router
 from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
 from app.routers.admin_project_config import router as admin_project_config_router
+from app.routers.admin_warm_pool import router as admin_warm_pool_router
 from app.routers.agent import router as agent_router
 from app.routers.agent_github import router as agent_github_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
@@ -82,7 +83,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0131"
+EXPECTED_SCHEMA_REVISION = "0134"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -664,6 +665,7 @@ app.include_router(admin_settings_router)
 app.include_router(admin_debug_router)
 app.include_router(admin_pool_accounts_router)
 app.include_router(admin_project_config_router)
+app.include_router(admin_warm_pool_router)
 app.include_router(agent_router)
 app.include_router(agent_github_router)
 app.include_router(agent_strategic_fetch_router)

@@ -458,6 +458,32 @@ async def _compute_health_overview(
                 }
             )
 
+    # --- 4d. Warm-pool claim circuit breaker ---
+    if _shared_state.runtime_config.get("warm_pool_enabled", False):
+        if _shared_state.is_warm_pool_suppressed():
+            sup_until = _shared_state.warm_pool_suppressed_until
+            failures = _shared_state.count_recent_pool_claim_failures(3600)
+            threshold = _shared_state.runtime_config.get(
+                "warm_pool_failure_rate_threshold", 5
+            )
+            cooldown_min = (
+                _shared_state.runtime_config.get("warm_pool_cooldown_seconds", 1800)
+                // 60
+            )
+            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": "Warm-pool claim circuit breaker open — maintainer paused, dispatch falling back to cold provisioning",
+                    "hint": (
+                        f"{failures} pool-claim failure events in last hour exceeded threshold ({threshold}). "
+                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                    ),
+                    "task_ids": [],
+                    "category": "warm_pool_circuit_breaker",
+                }
+            )
+
     # --- 5. External dependency health ---
     failed_deps = external_health.get("failed_deps", [])
     if failed_deps:
@@ -855,6 +881,15 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
     suppressed_until = _shared_state.warm_continuity_suppressed_until
     backlog_cb_suppressed = _shared_state.is_warm_backlog_reuse_suppressed()
     backlog_suppressed_until = _shared_state.warm_backlog_reuse_suppressed_until
+    # Warm-pool claim breaker telemetry. is_warm_pool_suppressed() is called
+    # first so the deadline is re-evaluated against the live failure rate (the
+    # maintainer normally drives this each tick, but the health view should
+    # reflect a breaker that is tripping right now), then pool_breaker_state()
+    # snapshots the computed state for the diagnostics surface.
+    from app.warm_pool_maintainer import pool_breaker_state
+
+    _shared_state.is_warm_pool_suppressed()
+    pool_breaker = pool_breaker_state(_shared_state.runtime_config)
     return {
         "active_vms": active_vms_out,
         "warm_pin_metrics": {
@@ -889,6 +924,10 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                     "warm_backlog_reuse_failure_rate_threshold", 5
                 )
             ),
+            "pool_circuit_breaker_suppressed": bool(pool_breaker["suppressed"]),
+            "pool_suppressed_until": pool_breaker["suppressed_until"],
+            "pool_claim_failures_last_hour": pool_breaker["recent_failures_1h"],
+            "pool_failure_rate_threshold": pool_breaker["failure_rate_threshold"],
         },
         "warm_continuity_enabled": bool(
             _shared_state.runtime_config.get("warm_continuity_enabled", False)
@@ -901,8 +940,44 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         ),
         "chain_continuity_funnel": _get_chain_continuity_funnel(),
         "spawn_pin_funnel": _get_spawn_pin_funnel(),
-        "backlog_reuse_funnel": _get_backlog_reuse_funnel(),
+        "backlog_reuse_funnel": await _get_backlog_reuse_funnel(session),
+        "pool_metrics": await _get_pool_metrics(session),
     }
+
+
+async def _get_pool_metrics(session: AsyncSession) -> dict:
+    """Warm-pool sizing + idle-cost + dispatch-funnel snapshot for the operator panel.
+
+    Combines the runtime config (enabled flag, target size, idle TTL), the live
+    PoolVm registry aggregate (current size, idle count, projected idle cost —
+    banked + not-yet-settled accrual), and the in-memory pool-hit-vs-cold-dispatch
+    funnel. Best-effort: returns {} on any failure so a partial backend never
+    blanks the whole warm-VM panel.
+    """
+    try:
+        from app.efficiency_snapshot import compute_pool_idle_cost
+        from app.warm_backlog_reuse import get_pool_funnel_snapshot
+
+        cost = await compute_pool_idle_cost(session)
+        return {
+            "enabled": bool(
+                _shared_state.runtime_config.get("warm_pool_enabled", False)
+            ),
+            "target_size": int(
+                _shared_state.runtime_config.get("warm_pool_target_size", 2)
+            ),
+            "idle_ttl_secs": int(
+                _shared_state.runtime_config.get("warm_pool_idle_ttl_secs", 1800)
+            ),
+            "current_size": cost["pool_size"],
+            "idle_count": cost["idle_count"],
+            "projected_idle_cost_usd": cost["total_idle_cost_usd"],
+            "settled_idle_cost_usd": cost["settled_idle_cost_usd"],
+            "live_idle_cost_usd": cost["live_idle_cost_usd"],
+            "funnel": get_pool_funnel_snapshot(),
+        }
+    except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
+        return {}
 
 
 def _get_chain_continuity_funnel() -> dict:
@@ -923,11 +998,38 @@ def _get_spawn_pin_funnel() -> dict:
         return {}
 
 
-def _get_backlog_reuse_funnel() -> dict:
+async def _get_backlog_reuse_funnel(session: AsyncSession) -> dict:
     try:
-        from app.warm_backlog_reuse import get_reuse_funnel_snapshot
+        from app.efficiency_snapshot import DESIGN_DOC_KEY
+        from app.warm_backlog_reuse import (
+            compute_dominant_reuse_dropout,
+            get_reuse_funnel_snapshot,
+        )
 
-        return get_reuse_funnel_snapshot()
+        snap = get_reuse_funnel_snapshot()
+        snap.update(compute_dominant_reuse_dropout())
+        rows = (await session.execute(
+            select(Project).options(load_only(Project.id, Project.design_doc)).limit(500)
+        )).scalars().all()
+        buckets = []
+        for project in rows:
+            for entry in (
+                (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+            ).get("snapshots") or []:
+                block = entry.get("reuse_dropout")
+                if not isinstance(block, dict):
+                    continue
+                dominant = block.get("dominant_dropout") or {}
+                buckets.append(
+                    {
+                        "captured_at": entry.get("captured_at"),
+                        "dropout_total": block.get("dropout_total"),
+                        "dominant_reason": dominant.get("reason"),
+                        "dominant_share": dominant.get("share"),
+                    }
+                )
+        snap["trend"] = {"buckets": buckets[-90:]}
+        return snap
     except Exception:
         return {}
 

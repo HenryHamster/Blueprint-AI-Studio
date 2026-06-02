@@ -3,6 +3,8 @@
 import uuid
 from datetime import datetime, timedelta
 
+import pytest
+
 from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
@@ -10,6 +12,7 @@ from app.models import (
     Project,
     StrategicCycle,
     Task,
+    get_task_current_attempt_vm_cost_usd,
     get_task_total_vm_cost_usd_or_none,
 )
 
@@ -286,6 +289,18 @@ def test_get_task_total_vm_cost_or_none_returns_current_attempt_cost():
     result = get_task_total_vm_cost_usd_or_none(task)
     assert result is not None
     assert result > 0.0
+
+
+def test_get_task_current_attempt_vm_cost_uses_task_machine_type():
+    """Non-default machine types should price from their own rate entry."""
+    task = _make_task(
+        vm_provisioned_at=_T_START,
+        vm_stopped_at=_T_STOP,
+        vm_spot=False,
+        vm_machine_type="e2-standard-4",
+    )
+    result = get_task_current_attempt_vm_cost_usd(task)
+    assert result == pytest.approx(0.134 * 30 / 3600)
 
 
 def test_get_task_total_vm_cost_or_none_returns_banked_only_for_retried_task():

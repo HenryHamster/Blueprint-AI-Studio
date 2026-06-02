@@ -18,6 +18,7 @@ from sqlmodel import select
 from app.main import app
 from app.models import (
     AllowedUser,
+    Artifact,
     ArtifactType,
     Project,
     ProjectMember,
@@ -2756,6 +2757,134 @@ class TestNotificationConfigSettings:
             "/api/admin/settings", json={"warm_backlog_reuse_enabled": 1}
         )
         assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_warm_reuse_tuning_knobs_round_trip(self, client: AsyncClient):
+        """The warm-reuse tuning knobs are PATCHable and visible on GET."""
+        from app.shared_state import runtime_config as _rc
+
+        keys = (
+            "warm_pin_clear_rate_threshold",
+            "warm_continuity_cooldown_seconds",
+            "warm_backlog_reuse_failure_rate_threshold",
+            "warm_backlog_reuse_cooldown_seconds",
+            "warm_backlog_scan_limit",
+            "warm_backlog_teardown_defer_secs",
+        )
+        original = {key: _rc.get(key) for key in keys}
+        payload = {
+            "warm_pin_clear_rate_threshold": 12,
+            "warm_continuity_cooldown_seconds": 2400,
+            "warm_backlog_reuse_failure_rate_threshold": 7,
+            "warm_backlog_reuse_cooldown_seconds": 2400,
+            "warm_backlog_scan_limit": 17,
+            "warm_backlog_teardown_defer_secs": 30,
+        }
+        try:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            for key, expected in payload.items():
+                assert body[key] == expected
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={key: value for key, value in original.items() if value is not None},
+            )
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("warm_pin_clear_rate_threshold", 0),
+            ("warm_pin_clear_rate_threshold", 101),
+            ("warm_continuity_cooldown_seconds", 59),
+            ("warm_continuity_cooldown_seconds", 86401),
+            ("warm_backlog_reuse_failure_rate_threshold", 0),
+            ("warm_backlog_reuse_failure_rate_threshold", 101),
+            ("warm_backlog_reuse_cooldown_seconds", 59),
+            ("warm_backlog_reuse_cooldown_seconds", 86401),
+            ("warm_backlog_scan_limit", 0),
+            ("warm_backlog_scan_limit", 101),
+            ("warm_backlog_teardown_defer_secs", 4),
+            ("warm_backlog_teardown_defer_secs", 121),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_patch_warm_reuse_tuning_knobs_reject_out_of_bounds(
+        self, client: AsyncClient, field: str, bad_value: int
+    ):
+        """Out-of-range warm-reuse tuning values are rejected."""
+        resp = await client.patch("/api/admin/settings", json={field: bad_value})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_warm_pool_config_round_trip(self, client: AsyncClient):
+        """warm_pool_enabled / target_size / idle_ttl_secs PATCH, round-trip on
+        GET, and are independent of the other warm flags."""
+        from app.shared_state import runtime_config as _rc
+
+        keys = (
+            "warm_pool_enabled",
+            "warm_pool_target_size",
+            "warm_pool_idle_ttl_secs",
+            "warm_pool_idle_ttl_seconds",
+        )
+        original = {key: _rc.get(key) for key in keys}
+        payload = {
+            "warm_pool_enabled": True,
+            "warm_pool_target_size": 7,
+            "warm_pool_idle_ttl_secs": 1200,
+        }
+        try:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_enabled"] is True
+            assert body["warm_pool_target_size"] == 7
+            assert body["warm_pool_idle_ttl_secs"] == 1200
+            # TTL dual-key sync: the idle-reaper in warm_pool_maintainer.py reads
+            # the ``_seconds`` variant, so a PATCH to ``_secs`` MUST also write
+            # ``_seconds`` or operator TTL changes never reach the maintainer
+            # (regressed once — fix commit 560fd11). Assert the runtime_config
+            # value directly, not via GET (GET surfaces only the ``_secs`` key).
+            assert _rc.get("warm_pool_idle_ttl_seconds") == 1200
+            assert _rc.get("warm_pool_idle_ttl_secs") == 1200
+            # Independently switchable: flipping the pool flag must not touch the
+            # chain-continuity flag.
+            assert "warm_continuity_enabled" in body
+
+            # Boolean type-guard on the master switch.
+            bad = await client.patch(
+                "/api/admin/settings", json={"warm_pool_enabled": "true"}
+            )
+            assert bad.status_code == 400
+            bad2 = await client.patch(
+                "/api/admin/settings", json={"warm_pool_enabled": 1}
+            )
+            assert bad2.status_code == 400
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={k: v for k, v in original.items() if v is not None},
+            )
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("warm_pool_target_size", -1),
+            ("warm_pool_target_size", 51),
+            ("warm_pool_idle_ttl_secs", 59),
+            ("warm_pool_idle_ttl_secs", 86401),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_patch_warm_pool_config_reject_out_of_bounds(
+        self, client: AsyncClient, field: str, bad_value: int
+    ):
+        """Out-of-range warm-pool sizing values are rejected (target 0..50,
+        idle TTL 60..86400)."""
+        resp = await client.patch("/api/admin/settings", json={field: bad_value})
+        assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
@@ -5583,6 +5712,114 @@ class TestModifyTaskApplySeam:
         assert result["status"] == task.status
         assert "requires_approval" in result
 
+    @pytest.mark.asyncio
+    async def test_rollup_pr_approval_skips_pr_merged_on_promotion_target(
+        self, db_session, mocker
+    ):
+        """Human-approved rollup merges to promotion_target stay unqualified."""
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Rollup approval task",
+            payloads=[{"type": "research", "prompt": "rollup", "base_branch": "release/main"}],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 321},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+        changes: dict = {}
+        await _handle_rollup_pr_approval(task, task.context or {}, 321, db_session, changes)
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is None
+        assert changes["merged_pr"] == 321
+
+    @pytest.mark.asyncio
+    async def test_rollup_pr_approval_keeps_custom_staged_root_evaluating(
+        self, db_session, mocker
+    ):
+        """Human-approved custom staged rollup roots must await downstream landing."""
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Release rollup approval task",
+            payloads=[
+                {
+                    "type": "research",
+                    "prompt": "rollup",
+                    "base_branch": "release/candidate-1",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 654},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+        changes: dict = {}
+        await _handle_rollup_pr_approval(task, task.context or {}, 654, db_session, changes)
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("pr_merged") is None
+        assert "awaiting downstream landing" in (task.latest_status_message or "")
+        assert changes["merged_pr"] == 654
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_operator_triggers.py — Manual Operator Triggers
@@ -5624,6 +5861,265 @@ class TestClearWaveDeps:
         assert resp.status_code == 200
         assert resp.json()["cleared"] == 0
         assert resp.json()["total_queued"] == 0
+
+
+class TestBulkApprove:
+    @pytest.mark.asyncio
+    async def test_bulk_approve_critical_merge_skips_pr_merged_on_promotion_target(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Critical approval task",
+            payloads=[{"type": "create", "prompt": "danger", "base_branch": "release/main"}],
+            status=TaskStatus.COMPLETED,
+            requires_approval=True,
+            context={"touched_critical": True},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/123",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "approve", "task_ids": [str(task.id)]},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        assert task.requires_approval is False
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is None
+
+    @pytest.mark.asyncio
+    async def test_bulk_approve_rollup_keeps_custom_staged_root_evaluating(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Custom staged approval task",
+            payloads=[
+                {
+                    "type": "research",
+                    "prompt": "danger",
+                    "base_branch": "release/candidate-1",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            requires_approval=True,
+            context={"rollup_pr_number": 456, "touched_critical": True},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "approve", "task_ids": [str(task.id)]},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        assert task.requires_approval is False
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("pr_merged") is None
+        assert "awaiting downstream landing" in (task.latest_status_message or "")
+
+
+class TestTriggerRollup:
+    @pytest.mark.asyncio
+    async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(
+        self, db_session, mocker
+    ):
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "release/candidate-1",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/654",
+                "number": 654,
+            },
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        delete_branch_mock = mocker.patch(
+            "app.github.delete_branch", new_callable=AsyncMock
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        assert result["rollup_pr_number"] == 654
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("pr_merged") is None
+        assert (task.context or {}).get("rollup_pr_number") == 654
+        assert "awaiting downstream landing" in (task.latest_status_message or "")
+        delete_branch_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_already_merged_rollup_skips_pr_merged_on_promotion_target(
+        self, db_session, mocker
+    ):
+        from app.routers.admin_operator_triggers import trigger_rollup
+        from app.review_pipeline import SPAWN_REASON_ALREADY_MERGED, SPAWN_REASON_KEY
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "release/main",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        async def _mark_already_merged(*args, **kwargs):
+            source_task = args[0]
+            source_task.context = {
+                **(source_task.context or {}),
+                SPAWN_REASON_KEY: SPAWN_REASON_ALREADY_MERGED,
+            }
+            source_task.latest_status_message = "already merged upstream"
+            return None, False
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://github.com/owner/repo/pull/456", "number": 456},
+        )
+        mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new=_mark_already_merged,
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        assert result["rollup_pr_number"] == 456
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is None
 
 
 class TestGetProjectFindings:

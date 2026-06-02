@@ -1108,6 +1108,64 @@ export async function updateStagingBranchPrefixes(
   return res.json();
 }
 
+export interface ApprovalGateConfig {
+  infra_files: string[];
+  critical_files: string[];
+}
+
+export interface ApprovalGateConfigResponse {
+  project_id: string;
+  approval_gate_config: ApprovalGateConfig;
+  /** True when both lists are empty (freshly onboarded repo, never customized). */
+  is_default: boolean;
+}
+
+/**
+ * Validate a single approval-gate path against the same rules the API enforces
+ * (admin_project_config._validate_approval_gate_paths): no leading slash, no
+ * parent-directory traversal segment, and only `[A-Za-z0-9._-/]` characters
+ * (rejects shell metacharacters). Returns a human-readable error string, or
+ * `null` when the path is valid. Lets the editor surface feedback inline
+ * instead of only failing on submit.
+ */
+export function validateApprovalGatePath(path: string): string | null {
+  const trimmed = path.trim();
+  if (!trimmed) return 'Path must not be empty';
+  if (trimmed.startsWith('/')) return 'Path must be repo-relative (no leading "/")';
+  if (trimmed.split('/').includes('..')) return 'Path must not contain ".." traversal';
+  if (!/^[A-Za-z0-9._\-/]+$/.test(trimmed)) return 'Path may only contain letters, digits, and . _ - /';
+  return null;
+}
+
+export async function fetchApprovalGateConfig(
+  projectId: string,
+): Promise<ApprovalGateConfigResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/approval-gate-config`);
+  if (!res.ok) throw new Error(`Failed to fetch approval-gate config: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Partial update of the approval-gate file lists (owner-only on the server).
+ * Pass only the list(s) you want to change. Takes effect for agents
+ * immediately via the existing claim-response seam.
+ */
+export async function updateApprovalGateConfig(
+  projectId: string,
+  config: Partial<ApprovalGateConfig>,
+): Promise<ApprovalGateConfigResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/approval-gate-config`,
+    { method: 'PATCH', body: JSON.stringify(config) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to update approval-gate config: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update approval-gate config: ${res.status}`);
+  }
+  return res.json();
+}
+
 export interface NullBranchConfigEntry {
   id: string;
   name: string;

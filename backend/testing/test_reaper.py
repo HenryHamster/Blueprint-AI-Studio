@@ -9,6 +9,7 @@ failures.
 """
 
 import contextlib
+import asyncio
 import uuid as _uuid_mod
 import pytest
 import pytest_asyncio
@@ -432,7 +433,15 @@ async def test_provisioning_absolute_15min_timeout_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
     """PROVISIONING with started_at > 15min ago → orphaned (absolute ceiling)."""
-    project = await _make_project(reaper_db)
+    project = Project(
+        name="reaper-merged-main",
+        user_id="user1",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
@@ -4189,7 +4198,7 @@ async def test_reap_with_merged_pr_marks_completed(
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
-        return_value={"state": "closed", "merged": True},
+        return_value={"state": "closed", "merged": True, "base": {"ref": "main"}},
     )
     _spawn = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
@@ -4200,7 +4209,7 @@ async def test_reap_with_merged_pr_marks_completed(
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
-        payloads=[{"type": "create"}],
+        payloads=[{"type": "create", "base_branch": "automain"}],
         vm_instance_id="vm-merged-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -4226,6 +4235,172 @@ async def test_reap_with_merged_pr_marks_completed(
     assert t.status == TaskStatus.COMPLETED
     assert (t.context or {}).get("pr_merged") is True
     assert "#5555" in (t.latest_status_message or "")
+    alerts = (
+        (
+            await reaper_db.execute(select(Alert).where(Alert.task_id == t.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    _spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reap_with_merged_pr_on_distinct_promotion_target_alerts_without_pr_merged(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A merged PR on promotion_target must complete the task without setting pr_merged."""
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": True, "base": {"ref": "main"}},
+    )
+    _spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = Project(
+        name="reaper-promotion-guard",
+        user_id="user1",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "base_branch": "automain"}],
+        vm_instance_id="vm-merged-pr-promotion",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/5556",
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    loop = asyncio.get_running_loop()
+    tick = loop.create_future()
+    loop.call_soon(tick.set_result, None)
+    await tick
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.COMPLETED
+    assert (t.context or {}).get("pr_merged") is None
+    alerts = (
+        (
+            await reaper_db.execute(select(Alert).where(Alert.task_id == t.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 5556
+    _spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reap_with_merged_pr_on_intermediate_staged_rollup_stays_evaluating(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "closed",
+            "merged": True,
+            "base": {"ref": "release/candidate-1"},
+        },
+    )
+    _spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = Project(
+        name="reaper-intermediate-rollup",
+        user_id="user1",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "base_branch": "release/candidate-1"}],
+        vm_instance_id="vm-merged-pr-intermediate",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small", "rollup_pr_number": 5557},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/5557",
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    assert (t.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (t.latest_status_message or "")
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
     _spawn.assert_not_called()
 
 
@@ -6217,3 +6392,101 @@ async def test_orphan_loop_no_time_budget_when_disabled_processes_all(
     assert all(o.status == TaskStatus.QUEUED for o in orphans), (
         "with the budget disabled, all orphans must be reaped in one cycle"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _mark_landed_parent_dependents — completion-side warm-reuse trigger
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class _FakeParent:
+    """Minimal stand-in exposing only the ``status`` attribute the helper reads."""
+
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeGetSession:
+    """Session stub exposing only the async ``get`` the helper uses."""
+
+    def __init__(self, result):
+        self._result = result
+        self.got = []
+
+    async def get(self, _model, ident):
+        self.got.append(ident)
+        return self._result
+
+
+class TestMarkLandedParentDependents:
+    """The reaper's two rollup-trigger sites stamp the sticky ``_deps_satisfied``
+    marker on a landed parent's just-unblocked dependents — but ONLY when the
+    parent actually landed (status COMPLETED), and a failure never aborts the
+    reaper cycle."""
+
+    @pytest.mark.asyncio
+    async def test_marks_dependents_when_parent_completed(self, mocker):
+        from app.reaper import _mark_landed_parent_dependents
+
+        pid = _uuid_mod.uuid4()
+        parent = _FakeParent(TaskStatus.COMPLETED)
+        spy = mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        session = _FakeGetSession(parent)
+
+        await _mark_landed_parent_dependents(pid, session)
+
+        # Re-fetched the parent on the shared session, then delegated with it.
+        assert session.got == [pid]
+        spy.assert_awaited_once()
+        assert spy.await_args.args[0] is parent
+
+    @pytest.mark.asyncio
+    async def test_skips_when_parent_not_completed(self, mocker):
+        """A parent still EVALUATING (rollup did not land) must NOT be stamped —
+        the readiness signal is never loosened."""
+        from app.reaper import _mark_landed_parent_dependents
+
+        spy = mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+        )
+        await _mark_landed_parent_dependents(
+            _uuid_mod.uuid4(), _FakeGetSession(_FakeParent(TaskStatus.EVALUATING))
+        )
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_parent_id_none_or_missing(self, mocker):
+        from app.reaper import _mark_landed_parent_dependents
+
+        spy = mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+        )
+        # No parent id at all (e.g. a parentless child).
+        await _mark_landed_parent_dependents(None, _FakeGetSession(None))
+        # Parent row gone between trigger and re-fetch.
+        await _mark_landed_parent_dependents(_uuid_mod.uuid4(), _FakeGetSession(None))
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_swallows_delegate_failure(self, mocker):
+        """A failure in the marking pass must never abort the reaper cycle."""
+        from app.reaper import _mark_landed_parent_dependents
+
+        mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        )
+        # Must not raise.
+        assert (
+            await _mark_landed_parent_dependents(
+                _uuid_mod.uuid4(), _FakeGetSession(_FakeParent(TaskStatus.COMPLETED))
+            )
+            is None
+        )

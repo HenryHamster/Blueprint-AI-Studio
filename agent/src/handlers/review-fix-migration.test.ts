@@ -122,6 +122,42 @@ describe('buildMigrationConflictGuidance', () => {
     expect(out).not.toMatch(/backend\/alembic\/versions\/0052/);
   });
 
+  it('uses a custom schema-revision file/constant and does not leak Blueprint paths', () => {
+    const out = buildMigrationConflictGuidance(
+      {
+        detected: true,
+        prMigrations: ['svc/db/versions/0050_add_foo.py'],
+        baseNewMigrations: ['svc/db/versions/0051_merged.py'],
+      },
+      'svc/db/versions/',
+      'svc/app/config.py',
+      'SCHEMA_REV',
+    );
+    expect(out).toMatch(/SCHEMA_REV = "0052"/);
+    expect(out).toMatch(/svc\/app\/config\.py/);
+    expect(out).not.toMatch(/EXPECTED_SCHEMA_REVISION/);
+    expect(out).not.toMatch(/backend\/app\/main\.py/);
+  });
+
+  it('omits the schema-revision step and renumbers the test step to 4 when no gate is declared', () => {
+    const out = buildMigrationConflictGuidance(
+      {
+        detected: true,
+        prMigrations: ['svc/db/versions/0050_add_foo.py'],
+        baseNewMigrations: ['svc/db/versions/0051_merged.py'],
+      },
+      'svc/db/versions/',
+      '',
+    );
+    // No schema-revision step and no Blueprint file named.
+    expect(out).not.toMatch(/EXPECTED_SCHEMA_REVISION/);
+    expect(out).not.toMatch(/backend\/app\/main\.py/);
+    expect(out).not.toMatch(/Bump/);
+    // The final test step renumbers from 5 to 4.
+    expect(out).toMatch(/4\. Re-run the backend tests/);
+    expect(out).not.toMatch(/5\. Re-run the backend tests/);
+  });
+
   it('regression: default (no versionsDir) guidance is byte-for-byte unchanged', () => {
     const conflict = {
       detected: true,

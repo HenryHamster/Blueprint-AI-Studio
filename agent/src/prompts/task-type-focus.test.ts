@@ -68,6 +68,42 @@ describe('MIGRATE_TASK_FOCUS — content invariants', () => {
   });
 });
 
+describe('buildMigrateTaskFocus — per-project schema-revision layout', () => {
+  it('defaults reproduce MIGRATE_TASK_FOCUS byte-for-byte', async () => {
+    const { buildMigrateTaskFocus, MIGRATE_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(buildMigrateTaskFocus()).toBe(MIGRATE_TASK_FOCUS);
+    // getTaskTypeFocusBlock with no opts must still equal the const.
+    const { getTaskTypeFocusBlock } = await import('./task-type-focus.js');
+    expect(getTaskTypeFocusBlock('migrate')).toBe(MIGRATE_TASK_FOCUS);
+  });
+
+  it('uses a custom schema-revision file/constant and does not leak Blueprint paths', async () => {
+    const { buildMigrateTaskFocus } = await import('./task-type-focus.js');
+    const out = buildMigrateTaskFocus({ schemaRevisionFile: 'svc/app/cfg.py', schemaRevisionConst: 'SCHEMA_REV' });
+    expect(out).toContain('SCHEMA_REV');
+    expect(out).toContain('svc/app/cfg.py');
+    expect(out).not.toContain('EXPECTED_SCHEMA_REVISION');
+    expect(out).not.toContain('backend/app/main.py');
+  });
+
+  it('omits the schema-revision step entirely when no gate is declared', async () => {
+    const { buildMigrateTaskFocus } = await import('./task-type-focus.js');
+    const out = buildMigrateTaskFocus({ schemaRevisionFile: '' });
+    expect(out).not.toContain('EXPECTED_SCHEMA_REVISION');
+    expect(out).not.toContain('backend/app/main.py');
+    // Step 3 (schema-revision) drops out; the block ends after the affected-tests step.
+    expect(out).not.toMatch(/^3\. /m);
+  });
+
+  it('threads opts through getTaskTypeFocusBlock for migrate', async () => {
+    const { getTaskTypeFocusBlock } = await import('./task-type-focus.js');
+    const out = getTaskTypeFocusBlock('migrate', { schemaRevisionFile: 'svc/app/cfg.py', schemaRevisionConst: 'SCHEMA_REV' });
+    expect(out).toContain('SCHEMA_REV');
+    expect(out).toContain('svc/app/cfg.py');
+    expect(out).not.toContain('EXPECTED_SCHEMA_REVISION');
+  });
+});
+
 describe('REFACTOR_TASK_FOCUS — content invariants', () => {
   it('flags scope-drift as mandatory check', async () => {
     const { REFACTOR_TASK_FOCUS } = await import('./task-type-focus.js');

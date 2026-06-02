@@ -309,9 +309,9 @@ class TestMaxReviewIterations:
 # ── DB-backed helpers ─────────────────────────────────────────────────────────
 
 
-async def _make_db_project(db_session) -> Project:
+async def _make_db_project(db_session, **project_kwargs) -> Project:
     """Persist a project and return the refreshed instance."""
-    project = make_project()
+    project = make_project(**project_kwargs)
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -8166,6 +8166,12 @@ def _mock_merge_success_deps(mocker):
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True, "message": "ok"}),
     )
+    mocker.patch(
+        "app.github.submit_pr_review",
+        new=AsyncMock(return_value={"id": 1}),
+    )
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value=[]))
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
     mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     # Branch cleanup + playbook touch GitHub/DB — no-op them (they're guarded
@@ -8175,6 +8181,37 @@ def _mock_merge_success_deps(mocker):
         "app.review_learning.extract_review_feedback_to_playbook",
         new=AsyncMock(return_value=None),
     )
+
+
+def _mock_small_auto_merge_deps(mocker):
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "tiny diff"),
+    )
+    mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=1.0)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new=AsyncMock(
+            return_value={
+                "blocked": False,
+                "findings": [],
+                "summary": "ok",
+                "report": "",
+            }
+        ),
+    )
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new=AsyncMock(return_value={"merged": True, "message": "ok"}),
+    )
+    mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None))
 
 
 @pytest.mark.skipif(
@@ -8363,6 +8400,426 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(
 
     assert refetched_parent.status == TaskStatus.COMPLETED
     assert (refetched_parent.context or {}).get("pr_merged") is True
+
+
+@pytest.mark.asyncio
+async def test_small_auto_merge_to_distinct_promotion_target_alerts_without_pr_merged(
+    db_session, mocker
+):
+    import asyncio
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ArtifactType
+
+    _mock_small_auto_merge_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="automain",
+        promotion_target="main",
+        directions=[{"id": "dir-1"}],
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": "dir-1"},
+    )
+    await _persist(db_session, task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs="done",
+        pr_url="https://github.com/owner/repo/pull/5150",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(task.id, payload, _session_factory=_factory)
+    await asyncio.sleep(0)
+
+    async with _factory() as fresh:
+        refetched_task = await fresh.get(Task, task.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == task.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_task.status == TaskStatus.COMPLETED
+    assert (refetched_task.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 5150
+
+
+@pytest.mark.asyncio
+async def test_small_auto_merge_on_single_branch_sets_pr_merged(
+    db_session, mocker
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ArtifactType
+
+    _mock_small_auto_merge_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="main",
+        promotion_target="main",
+        directions=[{"id": "dir-1"}],
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": "dir-1"},
+    )
+    await _persist(db_session, task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs="done",
+        pr_url="https://github.com/owner/repo/pull/5151",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_task = await fresh.get(Task, task.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == task.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_task.status == TaskStatus.COMPLETED
+    assert (refetched_task.context or {}).get("pr_merged") is True
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_review_merge_to_distinct_promotion_target_alerts_without_pr_merged(
+    db_session, mocker
+):
+    import asyncio
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    _mock_merge_success_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6262,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 6262,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-promo-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+    await asyncio.sleep(0)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == parent.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_parent.status == TaskStatus.COMPLETED
+    assert (refetched_parent.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 6262
+
+
+def test_is_custom_staged_rollup_root_true_for_release_candidate_root():
+    from app.branch_resolution import is_custom_staged_rollup_root
+
+    project = make_project(
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={"_is_rollup_review": True, "rollup_pr_number": 6264},
+    )
+
+    assert (
+        is_custom_staged_rollup_root(parent, project, "release/candidate-1") is True
+    )
+
+
+def test_is_custom_staged_rollup_root_false_for_default_research_branch():
+    from app.branch_resolution import is_custom_staged_rollup_root
+
+    project = make_project(
+        integration_branch="automain",
+        promotion_target="release/main",
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={"rollup_pr_number": 4343},
+    )
+
+    assert is_custom_staged_rollup_root(parent, project, "research/c4-base") is False
+
+
+@pytest.mark.asyncio
+async def test_review_empty_pr_close_on_intermediate_staged_rollup_stays_evaluating(
+    db_session, mocker
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    mocker.patch(
+        "app.github.close_pull_request",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={"rollup_pr_number": 6265},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6265,
+                "branch": "release/rollup-stg",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 6265,
+                "branch": "release/rollup-stg",
+                "base_branch": "release/candidate-1",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+            }
+        },
+        latest_status_message="REQUEST_CHANGES",
+    )
+    review_task.vm_instance_id = f"agent-vm-empty-rollup-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="REQUEST_CHANGES",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == parent.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_parent.status == TaskStatus.EVALUATING
+    assert (refetched_parent.context or {}).get("pr_closed_empty") is True
+    assert (refetched_parent.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (
+        refetched_parent.latest_status_message or ""
+    )
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_review_merge_on_single_branch_sets_pr_merged(db_session, mocker):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    _mock_merge_success_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="main",
+        promotion_target="main",
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6263,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 6263,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-promo-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == parent.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_parent.status == TaskStatus.COMPLETED
+    assert (refetched_parent.context or {}).get("pr_merged") is True
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
 
 
 # ── Early-escalation operator Alerts ──────────────────────────────────────────

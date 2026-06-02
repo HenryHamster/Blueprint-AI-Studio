@@ -59,6 +59,42 @@ class Project(SQLModel, table=True):
   Onboarding slugifies it from the repo name; agent task branches are named
   `{namespace}/{prefix}-{hex}`. Tuned via `.../task-branch-namespace`.
 
+**`build_config`** — JSONB blob of dirs, commands, and git identity delivered to
+the agent in its claim response. Validated against the backend `BuildConfig`
+Pydantic schema (`backend/app/schemas.py`) both at onboarding
+(`build_config_override`) and via `PATCH /api/admin/projects/{id}/build-config`.
+Fields the schema does not declare are dropped at validation time, so a knob
+only round-trips to the agent if `BuildConfig` declares it.
+
+- `build_config.migration` — per-project **migration layout** for repos whose
+  Python project does not follow Blueprint's `backend/alembic/versions` +
+  `app/models` + `app/main.py` layout. Mirrors the agent's `MigrationConfig`
+  (`agent/src/utils/test-runners.ts`); the migrate handler consumes it through
+  `resolveMigrationLayout` (`agent/src/handlers/specialized.ts`). All sub-fields
+  are optional; an unset field falls back to the Blueprint default shown below:
+
+  | Sub-field | Meaning | Default when unset |
+  |-----------|---------|--------------------|
+  | `versions_dir` | Dir holding alembic version files | `<pythonDir>/alembic/versions` |
+  | `models_dir` | Dir/file holding the SQLModel/SQLAlchemy models | `<pythonDir>/app/models` |
+  | `alembic_cwd` | Working dir alembic runs from (where `alembic.ini` lives) | `<pythonDir>` |
+  | `schema_revision_file` | File declaring the schema-revision constant | `<pythonDir>/app/main.py` |
+  | `schema_revision_const` | Name of the schema-revision constant to bump | `EXPECTED_SCHEMA_REVISION` |
+
+  An **empty-string** `schema_revision_file` (`""`) is meaningful and preserved:
+  it signals "no schema-revision gate", so the migrate prompt omits the
+  revision-bump step entirely rather than falling back to the default file. Set
+  the whole object at onboard time via `build_config_override` and/or later via
+  the project build-config PATCH endpoint; omit it entirely and the agent uses
+  Blueprint's defaults.
+
+  > **Distinct from `Project.alembic_versions_path`** (the single-string
+  > `build_config.alembic_versions_path` knob): that field feeds only the
+  > backend-side migration-file guard (which paths require migration review),
+  > **not** the agent's `resolveMigrationLayout`. Set `build_config.migration`
+  > to relocate where the *agent* looks for migrations; the two are not
+  > interchangeable.
+
 **`approval_gate_config`** — shape `{"infra_files": [...], "critical_files": [...]}`.
 Read at PR time by `task_lifecycle_github_helpers._get_approval_gate_file_lists`
 to decide which changed files require human approval before merge. **When
@@ -209,6 +245,114 @@ class TaskHistory(SQLModel, table=True):
     action: str                    # "STATUS_CHANGE", "SPLIT", "SPAWNED_CHILD", "MODIFIED_PAYLOAD"
     details: Dict                  # Additional state at the time of the action (JSONB)
 ```
+
+---
+
+## Release Lifecycle Models
+
+These two models back the **qualify → promote release gate** that promotes work
+from a project's **integration branch** to its **promotion target** (the
+`integration_branch` / `promotion_target` fields on `Project`). They are
+repo-agnostic: a "version" is simply the span of the integration branch between
+two promotions. For Blueprint's own self-repo, the integration branch is
+`automain` and the promotion target is `main`; for an onboarded repo, substitute
+the branches you configured. See
+[ONBOARDING.md — The release model](ONBOARDING.md#5-the-release-model--how-a-change-reaches-production)
+for the operator-facing walkthrough.
+
+### ReleaseVersion
+
+One row per release "version" — the window of integration-branch work between
+two promotions. The strategic layer (and operator endpoints) drive its phase
+transitions; the release qualifier writes its qualification results.
+
+```python
+class ReleaseVersion(SQLModel, table=True):
+    id: UUID
+    project_id: UUID               # FK to Project (indexed)
+    version_number: int = 1        # Monotonically increasing per project (1-based)
+    phase: str = "build"           # build | stabilize (durable phases)
+    status: str = "open"           # open | promoted | abandoned
+    goal: str | None               # Snapshot of the version's intent when opened
+
+    opened_at: DateTime            # When this version opened
+    phase_changed_at: DateTime | None  # Stamped on build ↔ stabilize transitions
+    promoted_at: DateTime | None   # Stamped when status → "promoted"
+
+    base_sha: str | None           # Integration-branch HEAD when the version opened
+    promoted_sha: str | None       # Integration-branch HEAD at successful promotion
+
+    last_qualification: Dict | None    # Latest qualify result (OVERWRITTEN each run)
+    qualification_attempts: int = 0    # Total qualification runs on this version
+    phase_reasoning: str | None        # Strategic agent's reasoning for the phase
+
+    created_at: DateTime
+    updated_at: DateTime
+```
+
+**Lifecycle phases** (the version's place in the release pipeline):
+
+- **`build`** — normal feature work landing on the integration branch via the
+  two-flag merge gate.
+- **`stabilize`** — work-mix shifts to audit / cleanup / hardening before a
+  qualification run.
+- **qualify** and **promote** are *transient orchestrator operations*, not durable
+  `phase` values: a qualify run is reflected by `qualification_attempts` /
+  `last_qualification`, and a successful promotion is reflected by
+  `status="promoted"` + `promoted_at` + `promoted_sha`, after which the next
+  version opens.
+
+> Invariants: at most one row per project has `status="open"` at a time, and
+> `(project_id, version_number)` is unique.  `last_qualification` holds only the
+> **latest** run's result — the durable per-verdict history lives in
+> `QualificationVerdict` below.  (The model also carries several
+> `*_alerted_*` deduplication-anchor columns used by the calcification /
+> build-stall / stabilize-stall / promotion-readiness sweeps — see
+> `backend/app/models.py` for the full list.)
+
+### QualificationVerdict
+
+Immutable, append-only history of release-qualifier outcomes — **one row per
+finalized qualification run**, never overwritten. Because
+`ReleaseVersion.last_qualification` is overwritten on every run, this table is
+what lets the dry-run track record be retained and aggregated into a
+promotion-readiness recommendation (`release_qualifier.compute_promotion_readiness`).
+Writes are best-effort and never roll back a qualification or promotion.
+
+```python
+class QualificationVerdict(SQLModel, table=True):
+    id: UUID
+    project_id: UUID               # FK to Project (indexed)
+    release_version_id: UUID       # FK to ReleaseVersion (indexed)
+    candidate_sha: str | None      # Integration-branch HEAD SHA that was scored
+
+    confidence: float = 0.0        # Composite promotion confidence in [0, 1]
+    sub_scores: Dict | None        # Per-dimension: {audit, test_erosion, smoketest}
+    blocker: str | None            # Hard-blocker code, or NULL when none fired
+    audit_missing_reason: str | None   # Why the audit sub-score was unscoreable
+
+    would_promote: bool = False    # Did the candidate clear the threshold?
+    promotion_enabled: bool = False    # runtime_config["promotion_enabled"] at scoring
+    terminal_status: str = ""      # dry_run | not_promoted | promoted | promotion_failed
+    threshold: float | None        # The promotion threshold in force at scoring
+
+    started_at: DateTime | None    # When the qualification started
+    finalized_at: DateTime | None  # When it finalized
+    created_at: DateTime
+```
+
+**Terminal outcomes** (`terminal_status`):
+
+- **`dry_run`** — candidate would have promoted (or was scored) while
+  `promotion_enabled` was False; no actual promotion happened. This is the normal
+  outcome during the calibration window.
+- **`not_promoted`** — confidence did not clear the threshold (or a blocker fired).
+- **`promoted`** — confidence cleared the threshold with promotion enabled, and the
+  integration branch was promoted to the promotion target.
+- **`promotion_failed`** — promotion was attempted but the merge/promotion failed.
+
+Operators read this history via
+`GET /api/admin/projects/{project_id}/qualification-verdicts`.
 
 ---
 
