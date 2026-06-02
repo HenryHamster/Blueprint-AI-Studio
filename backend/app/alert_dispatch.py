@@ -477,6 +477,64 @@ async def _maybe_create_precondition_blocker_alert(
     )
 
 
+async def _maybe_create_cascade_cancel_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    prereq_task: "Task",
+    cancelled_count: int,
+) -> None:
+    """Create ONE deduplicated operator Alert when a failed prerequisite cancels dependents.
+
+    When a prerequisite task fails, the orchestrator cascade-cancels every
+    downstream dependent (and its non-terminal children) so impossible work is
+    never dispatched. That cancellation is otherwise silent — only the cancelled
+    tasks' status messages change. This surfaces the root cause ONCE: a single
+    WARNING alert naming the failed prerequisite and the number of dependent
+    tasks cancelled because of it, *regardless* of approval-gate settings.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)``. The failed
+    prerequisite's identity is encoded in the title, so a single root failure
+    that cascades through A→B→C raises exactly one alert, and a later dispatch
+    cycle that re-observes the same cascade does not spam a fresh alert. The
+    cancelled count lives in the message so a changing count never defeats dedup.
+    """
+    prereq_label = prereq_task.title or str(prereq_task.id)[:8]
+    title = f"Cascade cancel: prerequisite '{prereq_label}' failed"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    plural = "s" if cancelled_count != 1 else ""
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=(
+            f"Prerequisite task '{prereq_label}' "
+            f"({str(prereq_task.id)[:8]}) failed, cancelling {cancelled_count} "
+            f"dependent task{plural}. The downstream plan cannot proceed until "
+            f"the root failure is resolved."
+        ),
+        task_id=prereq_task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

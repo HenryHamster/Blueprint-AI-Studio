@@ -2975,6 +2975,182 @@ class TestWarmVMSkipProvision:
         )
 
     @pytest.mark.asyncio
+    async def test_cascade_cancel_raises_single_dedup_alert(
+        self, orch_warm_db, mocker
+    ):
+        """A failed prerequisite that cascade-cancels multiple dependents in
+        one dispatch pass raises exactly ONE operator alert naming the root
+        failure (not one-per-dependent), and a later pass does not duplicate it
+        (title-based dedup)."""
+        from sqlmodel import select as _select
+        from app.models import Alert, AlertSeverity
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        # The cascade-cancel helper binds broadcast_to_project at module load;
+        # patch it on alert_dispatch so the real WS/notify path is not exercised.
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Cascade Dedup", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="root prerequisite",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "root"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            # Two dependents that both fail their dependency on the same root.
+            for label in ("dependent-B", "dependent-C"):
+                dep = make_task(
+                    project_id=project.id,
+                    title=label,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "create", "prompt": label}],
+                    depends_on=[str(prereq.id)],
+                )
+                session.add(dep)
+            await session.commit()
+            project_id = project.id
+            prereq_id = prereq.id
+
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify:
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1, (
+                f"Expected exactly one cascade-cancel alert, got {len(alerts)}"
+            )
+            alert = alerts[0]
+            assert alert.severity == AlertSeverity.WARNING
+            assert "root prerequisite" in alert.title
+            assert alert.task_id == prereq_id
+            # Both dependents counted in the single alert.
+            assert "2 dependent task" in alert.message
+
+        # Add a THIRD dependent and re-run: title-based dedup means the existing
+        # undismissed alert is reused — no second alert is created.
+        async with orch_warm_db() as session2:
+            dep_d = make_task(
+                project_id=project_id,
+                title="dependent-D",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent-D"}],
+                depends_on=[str(prereq_id)],
+            )
+            session2.add(dep_d)
+            await session2.commit()
+
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify2:
+            alerts2 = (
+                (
+                    await verify2.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts2) == 1, (
+                "A second dispatch pass must not create a duplicate cascade "
+                f"alert (title dedup), got {len(alerts2)}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cascade_cancel_alert_counts_children(self, orch_warm_db, mocker):
+        """The cascade-cancel count includes a dependent's non-terminal children
+        that are cascade-cancelled along with it."""
+        from sqlmodel import select as _select
+        from app.models import Alert
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Cascade Children", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="root prerequisite",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "root"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            dependent = make_task(
+                project_id=project.id,
+                title="dependent-with-child",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(prereq.id)],
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+
+            # A non-terminal child of the dependent — PROVISIONING is excluded
+            # from the candidate scan but cascade-cancelled with its parent.
+            child = make_task(
+                project_id=project.id,
+                title="child-task",
+                status=TaskStatus.PROVISIONING,
+                payloads=[{"type": "create", "prompt": "child"}],
+                parent_task_id=dependent.id,
+            )
+            session.add(child)
+            await session.commit()
+            project_id = project.id
+
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify:
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1
+            # 1 dependent + 1 cascaded child = 2.
+            assert "2 dependent task" in alerts[0].message
+
+    @pytest.mark.asyncio
     async def test_ci_poll_merge_on_promotion_target_withholds_pr_merged(
         self, db_session
     ):
@@ -3414,3 +3590,188 @@ class TestWarmVMSkipProvision:
             )
             assert row is not None
             assert row.status == TaskStatus.QUEUED
+
+
+class TestClassifyStuckTasksSharedPolicy:
+    """The deadlock-breaker (``_classify_stuck_tasks``) shares the main path's
+    dependency-death semantics via ``_check_candidate_task_deps``:
+
+    - a genuinely FAILED prerequisite cascade-cancels the dependent (it is never
+      dispatched as impossible work);
+    - a SCOPE_EMPTY-cancelled prerequisite counts as satisfied (clear & dispatch);
+    - a requeue-cancelled prerequisite with a still-active replacement clone keeps
+      the dependent waiting (no premature dispatch, no cancel);
+    - only a TRUE cycle is cleared-and-dispatched.
+    """
+
+    async def _noop_verify(self, _task, _session):
+        return True
+
+    @pytest.mark.asyncio
+    async def test_all_failed_deps_cascade_cancel_not_dispatched(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckFail", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dep"}],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # The real prerequisite genuinely failed → cascade-cancel, NOT dead_deps
+        # (which would clear depends_on and dispatch the impossible work).
+        assert out == [(stuck.id, "cascade_cancel")]
+
+    @pytest.mark.asyncio
+    async def test_scope_empty_dep_is_satisfied(self, db_session):
+        from app.failure_classification import SCOPE_EMPTY
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckScopeEmpty", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dep"}],
+            status=TaskStatus.CANCELLED,
+            context={"failure_category": SCOPE_EMPTY},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # SCOPE_EMPTY is a deliberate "scope already covered" exit → satisfied, so
+        # the dependent is safe to clear-and-dispatch, never cascade-cancelled.
+        assert out == [(stuck.id, "dead_deps")]
+
+    @pytest.mark.asyncio
+    async def test_requeue_cancelled_dep_with_active_clone_waits(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckRequeue", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # The live replacement clone is still in flight (QUEUED).
+        clone = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "clone"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(clone)
+        await db_session.commit()
+        await db_session.refresh(clone)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dep"}],
+            status=TaskStatus.CANCELLED,
+            context={"_replaced_by_task_id": str(clone.id)},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # Replacement clone still running → wait/remap, neither dispatched nor
+        # cancelled prematurely.
+        assert out == []
+
+    @pytest.mark.asyncio
+    async def test_true_cycle_is_cleared_and_dispatched(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckCycle", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        a = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "a"}],
+            status=TaskStatus.QUEUED,
+        )
+        b = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "b"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([a, b])
+        await db_session.commit()
+        await db_session.refresh(a)
+        await db_session.refresh(b)
+
+        out = await _classify_stuck_tasks(
+            [a, b],
+            {a.id: {b.id}, b.id: {a.id}},
+            {a.id: a, b.id: b},
+            {a.id, b.id},
+            db_session,
+            self._noop_verify,
+        )
+        # A genuine A<->B cycle: both members cleared-and-dispatched.
+        assert sorted(reason for _, reason in out) == ["cycle", "cycle"]
+        assert {tid for tid, _ in out} == {a.id, b.id}

@@ -684,6 +684,145 @@ from app.orchestrator_health import (
 )
 
 
+async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -> int:
+    """Cancel a dependent whose prerequisite genuinely failed, cascading to its
+    non-terminal children, releasing any held account slot, and tearing down its VM.
+
+    Single source of truth shared by the main dispatch dependency check and the
+    deadlock-breaker sweep so both apply identical dependency-death policy — a task
+    whose real prerequisite failed is recognized once and cancelled, never
+    dispatched as impossible work.
+
+    Returns the number of tasks cancelled (the dependent itself plus its cascaded
+    children) so callers can accumulate a single deduplicated operator alert per
+    failed prerequisite. Returns 0 if the dependent row no longer exists.
+    """
+    from app.max_plan_pool import release_max_plan_account, get_task_llm_account_id
+    from app.vm_lifecycle import _ensure_vm_deleted
+    from app.alert_dispatch import _maybe_create_failure_alert
+
+    vm_id = None
+    cancelled_count = 0
+    async with AsyncSessionLocal() as cancel_session:
+        cancel_task = await cancel_session.get(Task, task_id)
+        if cancel_task is None:
+            return 0
+        vm_id = cancel_task.vm_instance_id
+        cancel_task.status = TaskStatus.CANCELLED
+        if cancel_task.vm_provisioned_at:
+            cancel_task.vm_stopped_at = _utcnow()
+        cancel_task.latest_status_message = "Cancelled: dependency task failed"
+        # Release account slot if held
+        cancel_acct = get_task_llm_account_id(cancel_task)
+        if cancel_acct and not (cancel_task.context or {}).get("_slot_released"):
+            await release_max_plan_account(cancel_acct)
+            cancel_task.context = {
+                **(cancel_task.context or {}),
+                "_slot_released": True,
+            }
+        cancel_session.add(cancel_task)
+        # Cascade cancel to children in non-terminal states
+        children = (
+            (
+                await cancel_session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == task_id,
+                        Task.status.not_in(
+                            [
+                                TaskStatus.COMPLETED,
+                                TaskStatus.FAILED,
+                                TaskStatus.CANCELLED,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for child in children:
+            child.status = TaskStatus.CANCELLED
+            if child.vm_provisioned_at:
+                child.vm_stopped_at = _utcnow()
+            child.latest_status_message = "Cancelled: parent dependency failed"
+            child_acct = get_task_llm_account_id(child)
+            if child_acct and not (child.context or {}).get("_slot_released"):
+                await release_max_plan_account(child_acct)
+                child.context = {**(child.context or {}), "_slot_released": True}
+            cancel_session.add(child)
+        await _maybe_create_failure_alert(
+            cancel_task,
+            cancel_session,
+            "Cascade cancelled: dependency task failed",
+        )
+        cancelled_count = 1 + len(children)
+        await cancel_session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "task_updated",
+        {"task_id": str(task_id), "status": TaskStatus.CANCELLED},
+    )
+    await _ensure_vm_deleted(vm_id, reason="dependency_cancelled")
+    logger.error(f"[ORCHESTRATOR] Cancelled task {task_id} — dependency failed")
+    return cancelled_count
+
+
+async def _apply_deadlock_classification(
+    classified, broadcast_to_project, eligible_ids, scan_label=""
+) -> int:
+    """Apply a :func:`_classify_stuck_tasks` result.
+
+    True cycles and satisfied-dead deps get ``depends_on`` cleared and become
+    dispatchable; a dependent whose real prerequisite genuinely failed is
+    cascade-cancelled (NOT dispatched) via the same policy the main check uses.
+    Returns the number of tasks acted on.
+    """
+    if not classified:
+        return 0
+    cancels: list[tuple] = []
+    acted = 0
+    all_ids = [tid for tid, _ in classified]
+    async with AsyncSessionLocal() as fix_session:
+        rows = await fix_session.execute(select(Task).where(Task.id.in_(all_ids)))
+        tasks_by_id = {t.id: t for t in rows.scalars().all()}
+        for task_id, reason in classified:
+            fix_task = tasks_by_id.get(task_id)
+            if reason == "cascade_cancel":
+                if fix_task:
+                    cancels.append((task_id, fix_task.project_id))
+                    acted += 1
+                continue
+            if fix_task:
+                if reason == "cycle":
+                    msg = f"Dependencies cleared: dependency cycle detected{scan_label}"
+                    tag = "cycle broken"
+                else:
+                    msg = (
+                        "Dependencies cleared: all deps satisfied/cancelled"
+                        f"{scan_label}"
+                    )
+                    tag = "dead deps cleared"
+                logger.warning(
+                    f"[ORCHESTRATOR] Breaking deadlock ({tag}{scan_label}): "
+                    f"clearing depends_on for task {task_id}"
+                )
+                fix_task.depends_on = []
+                fix_task.latest_status_message = msg
+                fix_session.add(fix_task)
+                await broadcast_to_project(
+                    str(fix_task.project_id),
+                    "task_updated",
+                    {"task_id": str(task_id), "status": "QUEUED", "message": msg},
+                )
+            eligible_ids.append(task_id)
+            acted += 1
+        await fix_session.commit()
+    # Cascade-cancel after the clear-commit so each cancel manages its own session.
+    for task_id, project_id in cancels:
+        await _cascade_cancel_dependent(task_id, project_id, broadcast_to_project)
+    return acted
+
+
 async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> int:
     """Completion-side trigger: when a task finishes and its PR has landed on the
     integration branch, proactively stamp the sticky ``_deps_satisfied`` readiness
@@ -859,6 +998,7 @@ async def orchestrator_worker():
     )
     from app.alert_dispatch import (
         _maybe_create_failure_alert,
+        _maybe_create_cascade_cancel_alert,
         _create_orchestrator_error_alerts,
     )
     from app.routers.agent_status import record_task_result
@@ -1576,6 +1716,15 @@ async def orchestrator_worker():
                         _dep_batch_session.expunge_all()
 
                 eligible_ids = []
+                # Accumulate cascade-cancel counts per failed prerequisite across
+                # this single dependency-resolution pass so a root failure that
+                # cascades through A→B→C raises exactly ONE operator alert per
+                # distinct failed prerequisite (flushed after the loop), rather
+                # than one alert per cancelled dependent.
+                _cascade_cancel_by_prereq: dict[uuid.UUID, dict] = {}
+                from app.failure_classification import (
+                    SCOPE_EMPTY as _SCOPE_EMPTY,
+                )
                 for task in candidate_tasks:
                     # Skip tasks held back due to retry_after hold (audit W1:
                     # ``retry_after_until`` is a column now, so a stale
@@ -1679,78 +1828,43 @@ async def orchestrator_worker():
                             )
 
                     if any_failed:
-                        # Use separate session to avoid polluting the main dispatch session
-                        async with AsyncSessionLocal() as cancel_session:
-                            cancel_task = await cancel_session.get(Task, task.id)
-                            if cancel_task:
-                                cancel_task.status = TaskStatus.CANCELLED
-                                if cancel_task.vm_provisioned_at:
-                                    cancel_task.vm_stopped_at = _utcnow()
-                                cancel_task.latest_status_message = (
-                                    "Cancelled: dependency task failed"
-                                )
-                                # Release account slot if held
-                                cancel_acct = get_task_llm_account_id(cancel_task)
-                                if cancel_acct and not (cancel_task.context or {}).get(
-                                    "_slot_released"
-                                ):
-                                    await release_max_plan_account(cancel_acct)
-                                    cancel_task.context = {
-                                        **(cancel_task.context or {}),
-                                        "_slot_released": True,
-                                    }
-                                cancel_session.add(cancel_task)
-                                # Cascade cancel to children in non-terminal states
-                                children = (
-                                    (
-                                        await cancel_session.execute(
-                                            select(Task).where(
-                                                Task.parent_task_id == task.id,
-                                                Task.status.not_in(
-                                                    [
-                                                        TaskStatus.COMPLETED,
-                                                        TaskStatus.FAILED,
-                                                        TaskStatus.CANCELLED,
-                                                    ]
-                                                ),
-                                            )
-                                        )
-                                    )
-                                    .scalars()
-                                    .all()
-                                )
-                                for child in children:
-                                    child.status = TaskStatus.CANCELLED
-                                    if child.vm_provisioned_at:
-                                        child.vm_stopped_at = _utcnow()
-                                    child.latest_status_message = (
-                                        "Cancelled: parent dependency failed"
-                                    )
-                                    child_acct = get_task_llm_account_id(child)
-                                    if child_acct and not (child.context or {}).get(
-                                        "_slot_released"
-                                    ):
-                                        await release_max_plan_account(child_acct)
-                                        child.context = {
-                                            **(child.context or {}),
-                                            "_slot_released": True,
-                                        }
-                                    cancel_session.add(child)
-                                await _maybe_create_failure_alert(
-                                    cancel_task,
-                                    cancel_session,
-                                    "Cascade cancelled: dependency task failed",
-                                )
-                                await cancel_session.commit()
-                        await broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.CANCELLED},
+                        # Single source of truth: same cascade-cancel policy the
+                        # deadlock-breaker sweep applies (its own session, child
+                        # cascade, slot release, VM teardown). Returns the number
+                        # of tasks cancelled (dependent + cascaded children).
+                        _cancelled_count = await _cascade_cancel_dependent(
+                            task.id, task.project_id, broadcast_to_project
                         )
-                        await _ensure_vm_deleted(task, reason="dependency_cancelled")
-                        logger.error(
-                            f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed"
+                        # Accumulate the cascade against the failed prerequisite
+                        # so a single deduplicated operator alert is raised once
+                        # after this dispatch pass. Re-derive the failed
+                        # prerequisite locally (mirrors _check_candidate_task_deps'
+                        # cancel decision: first terminal-failed dep that is not a
+                        # deliberate SCOPE_EMPTY no-op exit) so the heavily-tested
+                        # helper signature is untouched.
+                        _failed_prereq = next(
+                            (
+                                dt
+                                for dt in dep_tasks
+                                if dt.status
+                                in (
+                                    TaskStatus.FAILED,
+                                    TaskStatus.CANCELLED,
+                                )
+                                and (dt.context or {}).get("failure_category")
+                                != _SCOPE_EMPTY
+                            ),
+                            None,
                         )
+                        if _failed_prereq is not None:
+                            _entry = _cascade_cancel_by_prereq.setdefault(
+                                _failed_prereq.id,
+                                {
+                                    "prereq_task": _failed_prereq,
+                                    "count": 0,
+                                },
+                            )
+                            _entry["count"] += _cancelled_count
                     elif all_met:
                         # Durably stamp the sticky readiness marker so the cheap
                         # /next-role warm-backlog scan and the dispatch
@@ -1791,6 +1905,26 @@ async def orchestrator_worker():
                                     f"[ORCHESTRATOR] Failed to update dep wait message for task {task.id}"
                                 )
 
+                # Flush accumulated cascade-cancels: raise ONE deduplicated
+                # operator alert per distinct failed prerequisite that cancelled
+                # dependents during this dependency-resolution pass.
+                if _cascade_cancel_by_prereq:
+                    async with AsyncSessionLocal() as _cascade_alert_session:
+                        for _entry in _cascade_cancel_by_prereq.values():
+                            try:
+                                await _maybe_create_cascade_cancel_alert(
+                                    _cascade_alert_session,
+                                    _entry["prereq_task"].project_id,
+                                    _entry["prereq_task"],
+                                    _entry["count"],
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to raise cascade-cancel "
+                                    "alert for prereq %s",
+                                    _entry["prereq_task"].id,
+                                )
+
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
                 global _last_deadlock_check
                 now = time.time()
@@ -1820,59 +1954,37 @@ async def orchestrator_worker():
                             task_dep_uuids[stask.id] = dep_uuids
                             all_dep_ids.update(dep_uuids)
 
-                        dep_status: dict = {}
+                        dep_tasks_by_id: dict = {}
                         if all_dep_ids:
                             dep_rows = await session.execute(
                                 select(Task).where(Task.id.in_(all_dep_ids))
                             )
-                            for dep_task in dep_rows.scalars().all():
-                                dep_status[dep_task.id] = dep_task.status
+                            dep_tasks_by_id = {
+                                dt.id: dt for dt in dep_rows.scalars().all()
+                            }
 
-                        # True cycle detection — avoids false positives where a
-                        # stuck task waits on another that depends on an active task
-                        classified = _classify_stuck_tasks(
-                            stuck_tasks, task_dep_uuids, dep_status, stuck_ids
+                        # Cycle detection + shared dependency-death policy: a true
+                        # cycle clears depends_on and dispatches; a genuinely failed
+                        # prerequisite cascade-cancels the dependent instead of being
+                        # dispatched as impossible work (single source of truth with
+                        # the main per-candidate check via _check_candidate_task_deps).
+                        classified = await _classify_stuck_tasks(
+                            stuck_tasks,
+                            task_dep_uuids,
+                            dep_tasks_by_id,
+                            stuck_ids,
+                            session,
+                            _verify_pr_merged,
                         )
-                        if classified:
-                            async with AsyncSessionLocal() as fix_session:
-                                _classified_ids = [tid for tid, _ in classified]
-                                _classified_result = await fix_session.execute(
-                                    select(Task).where(Task.id.in_(_classified_ids))
-                                )
-                                _tasks_by_id = {
-                                    t.id: t for t in _classified_result.scalars().all()
-                                }
-                                for task_id, reason in classified:
-                                    fix_task = _tasks_by_id.get(task_id)
-                                    if fix_task:
-                                        if reason == "cycle":
-                                            msg = "Dependencies cleared: dependency cycle detected"
-                                            tag = "cycle broken"
-                                        else:
-                                            msg = "Dependencies cleared: all deps failed/cancelled"
-                                            tag = "dead deps cleared"
-                                        logger.warning(
-                                            f"[ORCHESTRATOR] Breaking deadlock ({tag}): "
-                                            f"clearing depends_on for task {task_id}"
-                                        )
-                                        fix_task.depends_on = []
-                                        fix_task.latest_status_message = msg
-                                        fix_session.add(fix_task)
-                                        await broadcast_to_project(
-                                            str(fix_task.project_id),
-                                            "task_updated",
-                                            {
-                                                "task_id": str(task_id),
-                                                "status": "QUEUED",
-                                                "message": msg,
-                                            },
-                                        )
-                                    eligible_ids.append(task_id)
-                                    narrow_broken += 1
-                                await fix_session.commit()
+                        narrow_broken += await _apply_deadlock_classification(
+                            classified, broadcast_to_project, eligible_ids
+                        )
 
                     # Broader scan: check QUEUED tasks older than 10 min with deps (not just candidate batch)
                     ten_min_ago = _utcnow() - timedelta(minutes=10)
+                    # Full rows (no load_only): the shared dependency-death policy
+                    # reads first_payload / context on both the stuck task and its
+                    # deps, so a partial projection would trip an async lazy-load.
                     broad_stmt = (
                         select(Task)
                         .where(
@@ -1880,11 +1992,6 @@ async def orchestrator_worker():
                             Task.created_at < ten_min_ago,
                             Task.requires_approval.is_(False),
                             Task.depends_on.isnot(None),
-                        )
-                        .options(
-                            load_only(
-                                Task.id, Task.depends_on, Task.status, Task.created_at
-                            )
                         )
                         .limit(100)
                     )
@@ -1914,60 +2021,29 @@ async def orchestrator_worker():
                             broad_task_dep_uuids[stask.id] = dep_uuids_b
                             all_dep_ids_broad.update(dep_uuids_b)
 
-                        broad_dep_status: dict = {}
+                        broad_dep_tasks_by_id: dict = {}
                         if all_dep_ids_broad:
                             broad_dep_rows = await session.execute(
-                                select(Task.id, Task.status).where(
-                                    Task.id.in_(all_dep_ids_broad)
-                                )
+                                select(Task).where(Task.id.in_(all_dep_ids_broad))
                             )
-                            broad_dep_status = {
-                                dep_id: dep_status
-                                for dep_id, dep_status in broad_dep_rows.all()
+                            broad_dep_tasks_by_id = {
+                                dt.id: dt for dt in broad_dep_rows.scalars().all()
                             }
 
-                        broad_classified = _classify_stuck_tasks(
+                        broad_classified = await _classify_stuck_tasks(
                             broad_stuck,
                             broad_task_dep_uuids,
-                            broad_dep_status,
+                            broad_dep_tasks_by_id,
                             broad_stuck_ids,
+                            session,
+                            _verify_pr_merged,
                         )
-                        if broad_classified:
-                            async with AsyncSessionLocal() as fix_session:
-                                _broad_ids = [tid for tid, _ in broad_classified]
-                                _broad_result = await fix_session.execute(
-                                    select(Task).where(Task.id.in_(_broad_ids))
-                                )
-                                _broad_tasks_by_id = {
-                                    t.id: t for t in _broad_result.scalars().all()
-                                }
-                                for task_id, reason in broad_classified:
-                                    fix_task = _broad_tasks_by_id.get(task_id)
-                                    if fix_task:
-                                        if reason == "cycle":
-                                            msg = "Dependencies cleared: dependency cycle detected (broad scan)"
-                                            tag = "cycle broken"
-                                        else:
-                                            msg = "Dependencies cleared: all deps failed/cancelled (broad scan)"
-                                            tag = "dead deps cleared"
-                                        logger.warning(
-                                            f"[ORCHESTRATOR] Breaking deadlock (broad scan, {tag}): "
-                                            f"clearing depends_on for task {task_id}"
-                                        )
-                                        fix_task.depends_on = []
-                                        fix_task.latest_status_message = msg
-                                        fix_session.add(fix_task)
-                                        await broadcast_to_project(
-                                            str(fix_task.project_id),
-                                            "task_updated",
-                                            {
-                                                "task_id": str(task_id),
-                                                "status": "QUEUED",
-                                                "message": msg,
-                                            },
-                                        )
-                                        broad_broken += 1
-                                await fix_session.commit()
+                        broad_broken += await _apply_deadlock_classification(
+                            broad_classified,
+                            broadcast_to_project,
+                            eligible_ids,
+                            scan_label=" (broad scan)",
+                        )
 
                     total_broken = narrow_broken + broad_broken
                     if total_broken > 0:
