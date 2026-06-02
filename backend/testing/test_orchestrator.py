@@ -2432,11 +2432,25 @@ class TestWarmVMSkipProvision:
         try:
             yield _Session
         finally:
+            # Best-effort teardown of a THROWAWAY in-memory engine.
+            #
+            # ``drop_all`` is removed deliberately: the in-memory SQLite DB lives
+            # only as long as the StaticPool connection, so disposing the engine
+            # discards it, and every fixture use builds a fresh engine + tables.
+            # Running ``drop_all`` on a freshly-created event loop while the
+            # pool's aiosqlite connection thread is still bound to the (now
+            # closed) setup loop intermittently races into ``RuntimeError: Event
+            # loop is closed`` -> ``sqlite3.OperationalError: database table is
+            # locked`` — an ERROR raised AT TEARDOWN that has blocked otherwise
+            # green PRs (incident 2026-06-02: PR #7154 — 1523 passing, failed
+            # only on this teardown race). Dispose only, and suppress any
+            # closed-loop teardown error (no correctness impact on a discarded
+            # DB). Mirrors conftest._dispose_production_engine_per_test.
+            import contextlib
 
             async def _teardown():
-                async with _engine.begin() as conn:
-                    await conn.run_sync(SQLModel.metadata.drop_all)
-                await _engine.dispose()
+                with contextlib.suppress(Exception):
+                    await _engine.dispose()
 
             loop = asyncio.new_event_loop()
             try:
