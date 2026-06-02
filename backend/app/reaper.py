@@ -1,4 +1,25 @@
-"""Background reaper service: detects and recovers orphaned/stale tasks."""
+"""Background reaper service: detects and recovers orphaned/stale tasks.
+
+The reaper runs every 30 seconds and is responsible for:
+
+1. **Heartbeat Timeout**: Monitors IN_PROGRESS tasks and marks them FAILED if their
+   last heartbeat exceeds the timeout window (default 5 minutes)
+2. **VM Cleanup**: Deletes VMs for timed-out tasks via GCP Compute Engine API
+3. **Preemption Detection**: Uses vm_lifecycle.is_orchestrator_initiated_delete() to
+   distinguish between:
+   - Orchestrator-initiated cleanup (expected; no metric impact)
+   - GCP Spot VM preemption (unexpected; increments spot_preemption_count)
+4. **Orphan Cleanup**: Periodically scans for VMs that exist in GCP but have no
+   corresponding PROVISIONING task (e.g., VMs left behind by crashed agents)
+
+Key Functions:
+- reaper_service() - Main polling loop (async, called by lifecycle)
+- _mark_task_failed_from_timeout() - Handles the transition of a timed-out task to FAILED
+- _cleanup_orphaned_vms() - Finds and deletes VMs without corresponding tasks
+
+The reaper is the primary safety net for task timeouts and VM resource cleanup. It
+prevents long-running agents from blocking the orchestrator's concurrency limits and
+ensures GCP VMs don't accumulate unnecessarily."""
 
 import asyncio
 import contextlib

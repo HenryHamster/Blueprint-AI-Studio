@@ -103,6 +103,16 @@ async def vm_heartbeat(
     the task identity. The orchestrator's provisioning loop consults
     `_shared_state.vm_last_heartbeat` to decide whether to skip
     cold-provisioning a fresh VM.
+
+    Doubles as the warm-pool readiness signal: a freshly-booted taskless
+    pool VM fires this heartbeat before it begins polling /next-role, which
+    is exactly the moment its agent is alive and ready to claim work — so a
+    CLEAN heartbeat promotes its PoolVm row from PROVISIONING to IDLE (via
+    :func:`warm_pool.promote_pool_vm_to_idle`), making it leasable by the
+    dispatch hook. A heartbeat carrying ``pre_claim_failure`` is the opposite
+    signal — the member's agent died in early boot — so it is RETIRED instead
+    of promoted, never handed to a real task (see the ``pre_claim_failure``
+    branch below).
     """
     if req.vm_instance_id != token.get("vm_instance_id"):
         raise HTTPException(status_code=403, detail="vm_instance_mismatch")
@@ -117,6 +127,33 @@ async def vm_heartbeat(
             req.pre_claim_failure,
         )
         _shared_state.record_pool_claim_failure("pre_claim_auth")
+        # A taskless pool member that died in early boot validation must NEVER be
+        # promoted to IDLE — a credential-broken VM that becomes leasable is handed
+        # to a real task that can never be claimed, turning an explained death into
+        # a downstream task timeout and defeating the pool. record_pool_claim_failure
+        # only feeds the circuit breaker; it does NOT touch the registry row, so we
+        # retire the member here so lease_idle_pool_vm (IDLE-only) can never select
+        # it and the reaper tears it down. Gated on is_warm_pool_enabled() so a dark
+        # pool acquires no DB session; best-effort so the liveness ping never 500s
+        # on a DB hiccup; a no-op for a non-pool VM (no PoolVm row). Returns early:
+        # the readiness-promotion block below is mutually exclusive with this path.
+        from app.warm_pool import is_warm_pool_enabled
+
+        if is_warm_pool_enabled():
+            from app.database import AsyncSessionLocal
+            from app.warm_pool import mark_pool_vm_retiring
+
+            try:
+                async with AsyncSessionLocal() as session:
+                    await mark_pool_vm_retiring(session, req.vm_instance_id)
+                    await session.commit()
+            except Exception:  # noqa: BLE001 — liveness must never 500 on a DB hiccup
+                logger.warning(
+                    "[WARM-POOL] heartbeat retire-on-pre-claim-failure failed for vm %s",
+                    req.vm_instance_id,
+                    exc_info=True,
+                )
+        return Response(status_code=204)
     if req.vm_image_name is not None or req.vm_image_build_ts is not None:
         from app.compute import record_vm_image
 
@@ -126,7 +163,9 @@ async def vm_heartbeat(
 
         record_vm_runtime_fingerprint(req.vm_instance_id, req.agent_runtime_fingerprint)
 
-    # Warm-pool readiness signal (efficiency direction d-5fd69fe1). A
+    # Warm-pool readiness signal (efficiency direction d-5fd69fe1). Reached only
+    # on a CLEAN heartbeat — the pre_claim_failure branch above returns early, so a
+    # member that died in early boot is retired here, never promoted. A
     # maintainer-booted pool member sits in PROVISIONING until something marks it
     # IDLE; the agent's EXISTING heartbeat IS that ready signal. Promote the
     # heartbeat's own VM (the token-verified id) PROVISIONING -> IDLE so

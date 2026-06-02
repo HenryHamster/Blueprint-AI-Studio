@@ -13,18 +13,14 @@ Covers:
 - _synthesize_memo_from_source_finding, build_blueprint_pr_* helpers
 """
 
-import asyncio
 import json
 import os
-import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from fastapi import HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import sessionmaker
 
 from app.task_completion import (
     _parse_plan_output,
@@ -38,7 +34,6 @@ from app.task_completion import (
     _record_remediation_outcome,
     _record_remediation_if_terminal,
     _record_project_remediation_outcome,
-    _persist_direction_field_update,
     build_blueprint_pr_footer,
     build_blueprint_pr_merge_summary_comment,
     patch_pr_body_with_blueprint_meta,
@@ -46,10 +41,7 @@ from app.task_completion import (
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
     _synthesize_memo_from_source_finding,
 )
-from app.strategic_constants import STRATEGIC_RATIONALE_MAX
-from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
-from app.task_completion import confirm_applied_playbook_entries
-from sqlalchemy import select as _sa_select
+from app.models import PoolVmState, Task, TaskStatus
 from testing.factories import make_project, make_task
 
 _USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
@@ -1973,6 +1965,174 @@ class TestUnlinkedRemediationSiblingPropagation:
         sibling = next(d for d in project.directions if d["id"] == "dir-2")
         assert sibling["status"] == "paused"
         assert "last_remediation_task_id" not in sibling
+
+
+# ── _release_pool_member_if_terminal ────────────────────────────────────────
+
+
+class TestReleasePoolMemberIfTerminal:
+    """A terminal task served by a warm-pool member returns it to IDLE
+    (COMPLETED) or retires it (FAILED/CANCELLED), instead of stranding it
+    LEASED against the pool budget until the orphan-lease reaper reclaims it."""
+
+    async def _lease_member_to_task(self, db_session, *, vm_id="vm-pool-rel"):
+        """Register an IDLE member, lease it to a fresh task, return (task, member)."""
+        from app.warm_pool import lease_idle_pool_vm, register_pool_vm
+
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(project_id=project.id, vm_instance_id=vm_id)
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        await register_pool_vm(
+            db_session,
+            vm_instance_id=vm_id,
+            project_id=project.id,
+            account_id="acct-1",
+            provider="anthropic",
+            state=PoolVmState.IDLE,
+        )
+        await db_session.commit()
+        member = await lease_idle_pool_vm(
+            db_session,
+            project_id=project.id,
+            account_id="acct-1",
+            provider="anthropic",
+            leased_task_id=task.id,
+        )
+        await db_session.commit()
+        assert member is not None and member.state == PoolVmState.LEASED
+        return task, member
+
+    async def _with_pool_enabled(self, enabled=True):
+        import app.shared_state as shared_state
+
+        prev = shared_state.runtime_config.get("warm_pool_enabled", False)
+        shared_state.runtime_config["warm_pool_enabled"] = enabled
+        return shared_state, prev
+
+    @pytest.mark.asyncio
+    async def test_completed_returns_member_to_idle(self, db_session):
+        from app.task_completion import _release_pool_member_if_terminal
+        from app.warm_pool import get_pool_vm
+
+        shared_state, prev = await self._with_pool_enabled()
+        try:
+            task, _ = await self._lease_member_to_task(db_session, vm_id="vm-done")
+            outcome = await _release_pool_member_if_terminal(
+                task, TaskStatus.COMPLETED, db_session
+            )
+            await db_session.commit()
+            assert outcome == "idle"
+            member = await get_pool_vm(db_session, "vm-done")
+            assert member.state == PoolVmState.IDLE
+            assert member.leased_task_id is None
+            assert member.lease_expires_at is None
+            # Idle banking preserved: a fresh idle window started on return.
+            assert member.idle_since is not None
+        finally:
+            shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    @pytest.mark.asyncio
+    async def test_failed_retires_member(self, db_session):
+        from app.task_completion import _release_pool_member_if_terminal
+        from app.warm_pool import get_pool_vm
+
+        shared_state, prev = await self._with_pool_enabled()
+        try:
+            task, _ = await self._lease_member_to_task(db_session, vm_id="vm-fail")
+            outcome = await _release_pool_member_if_terminal(
+                task, TaskStatus.FAILED, db_session
+            )
+            await db_session.commit()
+            assert outcome == "retiring"
+            member = await get_pool_vm(db_session, "vm-fail")
+            assert member.state == PoolVmState.RETIRING
+            assert member.leased_task_id is None
+        finally:
+            shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    @pytest.mark.asyncio
+    async def test_noop_when_pool_disabled(self, db_session):
+        from app.task_completion import _release_pool_member_if_terminal
+        from app.warm_pool import get_pool_vm
+
+        shared_state, prev = await self._with_pool_enabled(enabled=True)
+        try:
+            task, _ = await self._lease_member_to_task(db_session, vm_id="vm-off")
+            shared_state.runtime_config["warm_pool_enabled"] = False
+            outcome = await _release_pool_member_if_terminal(
+                task, TaskStatus.COMPLETED, db_session
+            )
+            await db_session.commit()
+            assert outcome is None
+            member = await get_pool_vm(db_session, "vm-off")
+            # Left untouched — still LEASED.
+            assert member.state == PoolVmState.LEASED
+        finally:
+            shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    @pytest.mark.asyncio
+    async def test_noop_when_member_leased_to_other_task(self, db_session):
+        """A vm_instance_id reused across tasks must not let one task's terminal
+        state reclaim a member leased to a different task."""
+        from app.task_completion import _release_pool_member_if_terminal
+        from app.warm_pool import get_pool_vm
+
+        shared_state, prev = await self._with_pool_enabled()
+        try:
+            task, _ = await self._lease_member_to_task(db_session, vm_id="vm-other")
+            # A different task points at the same vm_instance_id.
+            interloper = make_task(project_id=task.project_id, vm_instance_id="vm-other")
+            db_session.add(interloper)
+            await db_session.commit()
+            await db_session.refresh(interloper)
+            outcome = await _release_pool_member_if_terminal(
+                interloper, TaskStatus.COMPLETED, db_session
+            )
+            await db_session.commit()
+            assert outcome is None
+            member = await get_pool_vm(db_session, "vm-other")
+            assert member.state == PoolVmState.LEASED
+            assert member.leased_task_id == task.id
+        finally:
+            shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    @pytest.mark.asyncio
+    async def test_non_terminal_status_is_noop(self, db_session):
+        from app.task_completion import _release_pool_member_if_terminal
+
+        shared_state, prev = await self._with_pool_enabled()
+        try:
+            task, _ = await self._lease_member_to_task(db_session, vm_id="vm-inprog")
+            outcome = await _release_pool_member_if_terminal(
+                task, TaskStatus.IN_PROGRESS, db_session
+            )
+            assert outcome is None
+        finally:
+            shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    @pytest.mark.asyncio
+    async def test_wrapper_releases_member_for_non_remediation_task(self, db_session):
+        """_record_remediation_if_terminal reconciles the pool member even when the
+        task has no diagnosis/remediation linkage (the common pool-served case)."""
+        from app.warm_pool import get_pool_vm
+
+        shared_state, prev = await self._with_pool_enabled()
+        try:
+            task, _ = await self._lease_member_to_task(db_session, vm_id="vm-wrap")
+            # No diagnosis_task_id / direction_id / auto_remediation — the
+            # remediation body returns early, but the pool member must still
+            # be reconciled.
+            await _record_remediation_if_terminal(task, TaskStatus.COMPLETED, db_session)
+            await db_session.commit()
+            member = await get_pool_vm(db_session, "vm-wrap")
+            assert member.state == PoolVmState.IDLE
+        finally:
+            shared_state.runtime_config["warm_pool_enabled"] = prev
 
 
 # ── _synthesize_memo_from_source_finding ────────────────────────────────────

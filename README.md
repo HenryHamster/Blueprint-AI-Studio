@@ -187,6 +187,8 @@ Configure autonomous mode in the admin UI under Settings > Autonomous.
 
 Comprehensive documentation is available in the `docs/` directory:
 
+- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — Complete environment variable reference and configuration guide
+- **[TESTING_GUIDE.md](docs/TESTING_GUIDE.md)** — Testing strategies and best practices for backend, frontend, and agent
 - **[API_REFERENCE.md](docs/API_REFERENCE.md)** — Complete HTTP endpoint reference with request/response schemas
 - **[DATA_MODELS.md](docs/DATA_MODELS.md)** — Database schema, Pydantic DTOs, and data structure guide
 - **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions

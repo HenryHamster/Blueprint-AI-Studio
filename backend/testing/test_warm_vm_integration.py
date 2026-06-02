@@ -33,6 +33,7 @@ from httpx import AsyncClient
 from app.models import Project, PoolVmState, Task, TaskStatus
 from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
+from testing.conftest import TestingSessionLocal
 
 
 @pytest.mark.asyncio
@@ -556,11 +557,12 @@ def _warm_pool_enabled():
 async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
     client: AsyncClient, db_session, mocker
 ):
-    """End-to-end with the pool flag ON: maintainer provisions an idle member ->
-    dispatch hook leases it for a QUEUED task (no cold provision) -> the member's
-    agent claims it warm via /next-role (origin "warm_pool") -> the task
-    completes -> banked idle cost lands in the pool-inclusive cost axis, and the
-    reuse + pool-hit funnel telemetry reflect the warm start."""
+    """End-to-end with the pool flag ON: maintainer provisions a PROVISIONING
+    member -> boot heartbeat promotes PROVISIONING->IDLE -> dispatch hook leases
+    it for a QUEUED task (no cold provision) -> the member's agent claims it
+    warm via /next-role (origin "warm_pool") -> the task completes -> banked
+    idle cost lands in the pool-inclusive cost axis, and the reuse + pool-hit
+    funnel telemetry reflect the warm start."""
     from app.warm_pool import (
         WARM_POOL_PIN_KEY,
         get_pool_vm,
@@ -602,7 +604,7 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
         await db_session.commit()
         await db_session.refresh(task)
 
-        # ── Step 1: maintainer provisions ONE idle pool member. ─────────────────
+        # ── Step 1: maintainer provisions ONE PROVISIONING pool member. ────────
         pool_vm_id = f"agent-vm-pool-{uuid.uuid4().hex}"
 
         async def _registering_provision(session, project_id):
@@ -613,7 +615,9 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
                 account_id=acct,
                 provider=provider,
                 model=model,
-                state=PoolVmState.IDLE,
+                # Register in PROVISIONING state (the default); the boot heartbeat
+                # will promote it to IDLE.
+                state=PoolVmState.PROVISIONING,
             )
             await session.commit()
             return True
@@ -625,7 +629,33 @@ async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
         )
         assert totals["provisioned"] == 1
         member = await get_pool_vm(db_session, pool_vm_id)
+        assert member is not None and member.state == PoolVmState.PROVISIONING
+        assert member.idle_since is None
+
+        # ── Step 2: boot heartbeat promotes PROVISIONING -> IDLE. ──────────────
+        # A taskless pool VM boots with a VM-SCOPED token (no TASK_ID), mirroring
+        # build_taskless_agent_secret_manifest / compute.provision_pool_vm.
+
+        # Verify the pool is enabled at this point (inside the context manager).
+        from app.warm_pool import is_warm_pool_enabled
+        assert is_warm_pool_enabled() is True
+
+        pool_token = create_vm_scoped_token(pool_vm_id, str(project.id))
+        hb_resp = await client.post(
+            "/api/agent/vm-heartbeat",
+            json={"vm_instance_id": pool_vm_id},
+            headers={"x-agent-token": pool_token},
+        )
+        assert hb_resp.status_code == 204
+
+        # The endpoint committed via its own session. Read through a fresh session
+        # (the test's long-lived db_session holds a snapshot that may not see
+        # another connection's commit). This mirrors production: the dispatch hook
+        # gets a fresh session just like the heartbeat endpoint does.
+        async with TestingSessionLocal() as fresh_session:
+            member = await get_pool_vm(fresh_session, pool_vm_id)
         assert member is not None and member.state == PoolVmState.IDLE
+        assert member.idle_since is not None
 
         # Backdate idle_since so the IDLE->LEASED settle banks a measurable span.
         member.idle_since = datetime.utcnow() - timedelta(seconds=600)
