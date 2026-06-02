@@ -148,6 +148,7 @@ from app.release_scoring import (
     _classify_check_runs,
     _compute_audit_reconciliation,
     _extract_audit_findings,
+    _extract_excluded_audit_findings,
     _extract_smoketest_detail,  # noqa: F401 — re-exported for callers/tests
     _extract_test_erosion_detail,  # noqa: F401 — re-exported for callers/tests
     _fmt_sub_scores,
@@ -1314,6 +1315,11 @@ async def _finalize_qualification(
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
     audit_findings = _extract_audit_findings(audit_report)
+    # Carry the higher-severity findings the verification gate EXCLUDED from
+    # scoring — for display only, marked unverified — so an audit whose
+    # sub-score was inflated by dropped findings is rendered honestly instead of
+    # reading as clean. Never confirmed blockers.
+    excluded_audit_findings = _extract_excluded_audit_findings(audit_report)
     # Carry the specific test-erosion detail (deleted files / negative deltas)
     # so the agent can target it when test-erosion is the binding constraint,
     # the same way it sees audit_findings.
@@ -1403,6 +1409,7 @@ async def _finalize_qualification(
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
+        "excluded_audit_findings": excluded_audit_findings,
         "test_erosion_detail": test_erosion_detail,
         "smoketest_detail": smoketest_detail,
         "audit_missing_reason": audit_missing_reason,

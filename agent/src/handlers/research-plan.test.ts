@@ -1069,6 +1069,57 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('Audit findings: critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
   });
 
+  it('renders the excluded-audit-findings caveat and section when findings were excluded for lacking verification', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.93,
+        sub_scores: { audit: 0.98, test_erosion: 1.0, smoketest: 0.95 },
+        // Scored findings list is empty (all higher-severity findings excluded).
+        audit_findings: [],
+        excluded_audit_findings: [
+          { severity: 'high', summary: 'broken retry guard', unverified: 'true' },
+          { severity: 'critical', summary: 'unsafe release path', unverified: 'true' },
+          { severity: 'medium', summary: 'missing null check', unverified: 'true' },
+          { severity: 'medium', summary: 'second medium', unverified: 'true' },
+        ],
+        audit_reconciliation: {
+          model_reported_score: 0.70,
+          findings_derived_score: 0.98,
+          score_delta: 0.28,
+          excluded_findings_count: 4,
+        },
+      },
+    });
+    // Part (1): the audit-score caveat names the excluded count and the divergence.
+    expect(result).toContain('Audit score caveat: audit sub-score reflects only verified findings; 4 higher-severity findings excluded for lacking verification; model-reported audit 0.70 vs findings-derived 0.98 (Δ0.28)');
+    // Part (2): the excluded findings are rendered, clearly marked unverified, sorted most-severe first and capped at 3.
+    expect(result).toContain('Excluded audit findings (UNVERIFIED — not confirmed blockers): critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
+  });
+
+  it('omits the excluded-findings caveat and section when nothing was excluded', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        sub_scores: { audit: 0.74, test_erosion: 0.42, smoketest: 0.88 },
+        excluded_audit_findings: [],
+        audit_reconciliation: {
+          model_reported_score: 0.74,
+          findings_derived_score: 0.74,
+          score_delta: 0.0,
+          excluded_findings_count: 0,
+        },
+      },
+    });
+    expect(result).not.toContain('Audit score caveat:');
+    expect(result).not.toContain('Excluded audit findings');
+  });
+
   it('renders test-erosion detail (deleted files + negative deltas) when carried', () => {
     const result = buildVersionPhaseSection({
       version_number: 2,
@@ -1187,6 +1238,51 @@ describe('buildVersionPhaseSection', () => {
     });
     expect(result).toContain('sub-scores: audit=0.81, test_erosion=0.00, smoketest=0.62 (binding=test_file_deleted)');
     expect(result).not.toContain('binding=test_erosion=');
+  });
+
+  it('surfaces CI blocker provenance (state and detail) alongside the blocker code', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        blocker: 'ci_unresolved',
+        ci_resolution: {
+          state: 'PENDING',
+          resolved_sha: 'abc123',
+          detail: 'build not started',
+        },
+        sub_scores: {
+          audit: 0.9,
+          test_erosion: 0.9,
+          smoketest: 0.9,
+        },
+      },
+    });
+    expect(result).toContain('binding=ci_unresolved');
+    expect(result).toContain('state: PENDING');
+    expect(result).toContain('build not started');
+  });
+
+  it('surfaces audit blocker provenance (missing reason) alongside the blocker code', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        blocker: 'audit_missing',
+        audit_missing_reason: 'empty_report',
+        sub_scores: {
+          audit: null,
+          test_erosion: 0.9,
+          smoketest: 0.9,
+        },
+      },
+    });
+    expect(result).toContain('binding=audit_missing');
+    expect(result).toContain('reason: empty_report');
   });
 
   it('identifies a genuine low audit score as the binding constraint (smoketest disabled, no blocker)', () => {

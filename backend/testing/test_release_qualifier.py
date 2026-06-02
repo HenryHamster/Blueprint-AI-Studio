@@ -1559,6 +1559,123 @@ class TestExtractAuditFindings:
         )
 
 
+class TestExtractExcludedAuditFindings:
+    """_extract_excluded_audit_findings is the inverse of _extract_audit_findings:
+    it carries the higher-severity findings the verification gate DROPPED from
+    scoring, marked unverified, so an inflated audit sub-score is rendered
+    honestly instead of reading as a clean audit."""
+
+    def test_none_report_returns_empty(self):
+        assert rq._extract_excluded_audit_findings(None) == []
+
+    def test_no_findings_key_returns_empty(self):
+        assert rq._extract_excluded_audit_findings({"audit_score": 0.9}) == []
+
+    def test_unverified_high_finding_carried_marked_unverified(self):
+        """A high finding lacking a verification_note is excluded from scoring
+        AND from audit_findings — but IS carried here, marked unverified."""
+        report = {
+            "audit_score": 0.95,
+            "findings": [
+                {"severity": "high", "summary": "Speculative SQL injection."},
+            ],
+        }
+        out = rq._extract_excluded_audit_findings(report)
+        assert out == [
+            {
+                "severity": "high",
+                "summary": "Speculative SQL injection.",
+                "unverified": "true",
+            }
+        ]
+        # And it must NOT appear in the verified-findings list.
+        assert rq._extract_audit_findings(report) == []
+
+    def test_verified_high_finding_not_carried(self):
+        """A high finding WITH a substantive verification_note is scored (carried
+        by _extract_audit_findings) and so must NOT appear in the excluded list."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token baked into image.",
+                    "verification_note": (
+                        "Read infra/packer/agent.pkr.hcl lines 20-35: "
+                        "API token hardcoded in provisioner shell command."
+                    ),
+                }
+            ]
+        }
+        assert rq._extract_excluded_audit_findings(report) == []
+
+    def test_low_severity_never_excluded(self):
+        """Low/info severities never require verification, so they are never in
+        the excluded list even without a verification_note."""
+        report = {"findings": [{"severity": "low", "summary": "Minor style nit."}]}
+        assert rq._extract_excluded_audit_findings(report) == []
+
+    def test_all_verified_returns_empty(self):
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "Real medium issue.",
+                    "verification_note": "Read app/foo.py lines 1-20: confirmed.",
+                },
+                {"severity": "low", "summary": "Minor nit."},
+            ]
+        }
+        assert rq._extract_excluded_audit_findings(report) == []
+
+    def test_issues_key_fallback(self):
+        report = {"issues": [{"level": "medium", "title": "an unverified issue"}]}
+        out = rq._extract_excluded_audit_findings(report)
+        assert out == [
+            {
+                "severity": "medium",
+                "summary": "an unverified issue",
+                "unverified": "true",
+            }
+        ]
+
+    def test_sorted_most_severe_first(self):
+        report = {
+            "findings": [
+                {"severity": "medium", "summary": "medium one"},
+                {"severity": "critical", "summary": "critical one"},
+                {"severity": "high", "summary": "high one"},
+            ]
+        }
+        out = rq._extract_excluded_audit_findings(report)
+        assert [f["severity"] for f in out] == ["critical", "high", "medium"]
+
+    def test_caps_count(self):
+        report = {
+            "findings": [
+                {"severity": "high", "summary": f"high finding {i}"}
+                for i in range(rq._MAX_CARRIED_FINDINGS + 5)
+            ]
+        }
+        out = rq._extract_excluded_audit_findings(report)
+        assert len(out) == rq._MAX_CARRIED_FINDINGS
+        assert all(len(f["summary"]) <= rq._FINDING_SUMMARY_MAX for f in out)
+
+    def test_reconciliation_count_matches_excluded_list_length(self):
+        """The excluded list length must agree with the reconciliation count when
+        none are truncated by the cap."""
+        report = {
+            "audit_score": 0.9,
+            "findings": [
+                {"severity": "high", "summary": "unverified high"},
+                {"severity": "medium", "summary": "unverified medium"},
+                {"severity": "low", "summary": "low nit"},
+            ],
+        }
+        out = rq._extract_excluded_audit_findings(report)
+        recon = rq._compute_audit_reconciliation(report)
+        assert len(out) == recon["excluded_findings_count"] == 2
+
+
 class TestComputeAuditReconciliation:
     """_compute_audit_reconciliation surfaces divergence between the model's
     self-reported audit_score and the deterministic findings-derived score,
@@ -2958,6 +3075,62 @@ async def test_finalize_dry_run_when_promotion_disabled(db_session, mocker):
     await db_session.refresh(version)
     assert version.status == "open"
     assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_finalize_records_excluded_audit_findings(db_session, mocker):
+    """_finalize_qualification carries excluded (unverified higher-severity)
+    findings into last_qualification for display, while audit_findings still
+    omits them and the reconciliation count agrees."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            # Model self-reports a clean score; the only finding is an
+            # unverified high — excluded from scoring and audit_findings, but
+            # surfaced in excluded_audit_findings.
+            "audit_score": 1.0,
+            "findings": [
+                {"severity": "high", "summary": "Unverified injection risk."},
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    lq = version.last_qualification
+    # The unverified high finding is carried for display, marked unverified.
+    assert lq["excluded_audit_findings"] == [
+        {
+            "severity": "high",
+            "summary": "Unverified injection risk.",
+            "unverified": "true",
+        }
+    ]
+    # ...but it must NOT appear in the scored/actionable findings list.
+    assert lq["audit_findings"] == []
+    # ...and the reconciliation count agrees.
+    assert lq["audit_reconciliation"]["excluded_findings_count"] == 1
 
 
 @pytest.mark.asyncio

@@ -550,6 +550,67 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
     return out[:_MAX_CARRIED_FINDINGS]
 
 
+def _extract_excluded_audit_findings(
+    report: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    """Pull the higher-severity findings the verification gate EXCLUDED from scoring.
+
+    The inverse of ``_extract_audit_findings``: that function carries only
+    *verified* findings (those that affected the audit sub-score), deliberately
+    dropping higher-severity findings whose ``verification_note`` was absent or
+    too short.  That suppression is correct for scoring, but it leaves the
+    strategic agent looking at a near-perfect audit sub-score and an empty
+    findings list even when the audit reported several critical/high findings —
+    so the agent makes a "blanket audit assumption" and treats the dimension as
+    clean.
+
+    This carries those excluded findings into ``last_qualification`` for DISPLAY
+    ONLY, each marked ``unverified="true"`` so the agent surfaces the omitted
+    risk and can choose to investigate it — never treating them as confirmed
+    blockers.  Only severities in ``_SEVERITIES_REQUIRING_VERIFICATION`` can be
+    excluded (low/info are always counted), so the list is inherently
+    higher-severity.
+
+    Returns ``[]`` when the report has no excluded findings (all verified, only
+    low-severity, or no usable report).  Same cap, sort, and truncation as
+    ``_extract_audit_findings`` so the agent renderer stays uniform.
+    """
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("findings")
+    if not isinstance(raw, list) or not raw:
+        raw = report.get("issues")
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict[str, str]] = []
+    for f in raw:
+        if not isinstance(f, dict):
+            continue
+        sev = str(f.get("severity") or f.get("level") or "unknown").lower()
+        # Only higher-severity findings that the gate dropped for lacking a
+        # substantive verification_note belong here. Verified findings (and
+        # low/info, which never require verification) are carried by
+        # _extract_audit_findings instead.
+        if sev not in _SEVERITIES_REQUIRING_VERIFICATION:
+            continue
+        if _finding_is_verified(f, sev):
+            continue
+        summary = (
+            f.get("summary")
+            or f.get("description")
+            or f.get("title")
+            or f.get("text")
+            or ""
+        )
+        summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
+        if summary:
+            out.append({"severity": sev, "summary": summary, "unverified": "true"})
+
+    out.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
+    return out[:_MAX_CARRIED_FINDINGS]
+
+
 # Caps on the test-erosion / smoketest detail carried into last_qualification.
 # Kept small (mirroring _MAX_CARRIED_FINDINGS) so the version_phase block stays
 # under the strategic pack budget while still naming the specific blocker.

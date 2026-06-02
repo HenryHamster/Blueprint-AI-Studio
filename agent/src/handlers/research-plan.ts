@@ -459,6 +459,31 @@ const QUALIFICATION_SEVERITY_ORDER: Record<string, number> = {
   info: 6,
 };
 
+function formatBlockerProvenance(qualification: Record<string, unknown>, blocker: string): string | null {
+  // Surface the blocker's provenance when available. For CI blockers, include
+  // the resolution state/detail. For audit blockers, include the missing reason.
+  if (blocker.startsWith('ci_')) {
+    const ciResolution = qualification.ci_resolution;
+    if (ciResolution && typeof ciResolution === 'object' && !Array.isArray(ciResolution)) {
+      const ciRes = ciResolution as Record<string, unknown>;
+      const state = typeof ciRes.state === 'string' ? ciRes.state : null;
+      const detail = typeof ciRes.detail === 'string' ? ciRes.detail : null;
+      if (state || detail) {
+        const parts: string[] = [];
+        if (state) parts.push(`state: ${state}`);
+        if (detail) parts.push(detail);
+        return parts.join(', ');
+      }
+    }
+  } else if (blocker === 'audit_missing') {
+    const reason = typeof qualification.audit_missing_reason === 'string'
+      ? qualification.audit_missing_reason
+      : null;
+    if (reason) return `reason: ${reason}`;
+  }
+  return null;
+}
+
 function formatQualificationDetails(qualification: Record<string, unknown>): string[] {
   const lines: string[] = [];
 
@@ -496,12 +521,39 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
       let bindingClause: string | null = null;
       if (blocker) {
         // A hard blocker is the constraint regardless of the numeric minimum.
-        bindingClause = `binding=${blocker}`;
+        // Surface the blocker's provenance when available.
+        const provenance = formatBlockerProvenance(qualification, blocker);
+        bindingClause = provenance ? `binding=${blocker} (${provenance})` : `binding=${blocker}`;
       } else if (bindingKey !== null && bindingValue !== null) {
         bindingClause = `binding=${bindingKey}=${bindingValue.toFixed(2)}`;
       }
       const suffix = bindingClause ? ` (${bindingClause})` : '';
       lines.push(`  Qualification details: sub-scores: ${scoreBits.join(', ')}${suffix}`);
+    }
+  }
+
+  // Audit-score caveat — the audit sub-score reflects only *verified* findings;
+  // higher-severity findings lacking a substantive verification note were
+  // excluded from the score (their deductions never applied). Surface how many
+  // were excluded, and any material model-reported-vs-findings-derived score
+  // divergence the verdict already recorded, so the agent does not read an
+  // inflated audit sub-score as a clean audit.
+  const reconRaw = qualification.audit_reconciliation;
+  if (reconRaw && typeof reconRaw === 'object' && !Array.isArray(reconRaw)) {
+    const recon = reconRaw as Record<string, unknown>;
+    const excludedCount = typeof recon.excluded_findings_count === 'number'
+      ? recon.excluded_findings_count : 0;
+    if (excludedCount > 0) {
+      const bits: string[] = [
+        `audit sub-score reflects only verified findings; ${excludedCount} higher-severity finding${excludedCount === 1 ? '' : 's'} excluded for lacking verification`,
+      ];
+      const modelScore = typeof recon.model_reported_score === 'number' ? recon.model_reported_score : null;
+      const derivedScore = typeof recon.findings_derived_score === 'number' ? recon.findings_derived_score : null;
+      const delta = typeof recon.score_delta === 'number' ? recon.score_delta : null;
+      if (modelScore !== null && derivedScore !== null && delta !== null && delta >= 0.10) {
+        bits.push(`model-reported audit ${modelScore.toFixed(2)} vs findings-derived ${derivedScore.toFixed(2)} (Δ${delta.toFixed(2)})`);
+      }
+      lines.push(`  Audit score caveat: ${bits.join('; ')}`);
     }
   }
 
@@ -530,6 +582,39 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
       const findingBits = findings.map(f => `${f.severity}: ${f.summary}`);
       const tail = moreCount > 0 ? ` (+${moreCount} more)` : '';
       lines.push(`  Audit findings: ${findingBits.join('; ')}${tail}`);
+    }
+  }
+
+  // Excluded audit findings — higher-severity findings the verification gate
+  // dropped from scoring (and from `audit_findings`). Rendered explicitly as
+  // UNVERIFIED so the agent can investigate the omitted risk behind an inflated
+  // audit sub-score rather than assume the audit was clean. These are NOT
+  // confirmed blockers.
+  const excludedRaw = qualification.excluded_audit_findings;
+  if (Array.isArray(excludedRaw) && excludedRaw.length > 0) {
+    const excluded = excludedRaw
+      .map((finding, idx) => {
+        if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return null;
+        const rec = finding as Record<string, unknown>;
+        const severity = typeof rec.severity === 'string' ? rec.severity.trim() : '';
+        const summary = typeof rec.summary === 'string' ? rec.summary.trim() : '';
+        if (!severity || !summary) return null;
+        return {
+          severity,
+          summary,
+          order: QUALIFICATION_SEVERITY_ORDER[severity.toLowerCase()] ?? 99,
+          idx,
+        };
+      })
+      .filter((finding): finding is { severity: string; summary: string; order: number; idx: number } => finding !== null)
+      .sort((a, b) => (a.order - b.order) || (a.idx - b.idx))
+      .slice(0, 3);
+
+    if (excluded.length > 0) {
+      const moreCount = excludedRaw.length - excluded.length;
+      const excludedBits = excluded.map(f => `${f.severity}: ${f.summary}`);
+      const tail = moreCount > 0 ? ` (+${moreCount} more)` : '';
+      lines.push(`  Excluded audit findings (UNVERIFIED — not confirmed blockers): ${excludedBits.join('; ')}${tail}`);
     }
   }
 
