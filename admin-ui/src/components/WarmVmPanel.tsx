@@ -4,6 +4,7 @@ import { API_BASE_URL, apiFetch, authGet } from '../api';
 import { parseTimestamp } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics } from '../types/warmVm';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
+import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
 import { usePoller } from '../hooks/usePoller';
 
 const POLL_INTERVAL_MS = 10_000;
@@ -113,6 +114,8 @@ export function WarmVmPanel({ onViewTask }: Props) {
   const flagOn = data?.warm_continuity_enabled ?? false;
   const backlogReuseOn = data?.warm_backlog_reuse_enabled ?? false;
   const backlogClaims = data?.warm_pin_metrics.active_backlog_reuse_claims ?? 0;
+  const poolClaims = data?.warm_pin_metrics.active_pool_origin_claims ?? 0;
+  const poolShare = data?.warm_pin_metrics.pool_origin_share ?? null;
   const chainClaims = data?.warm_pin_metrics.active_chain_continuity_claims ?? 0;
   const pool = data?.pool_metrics;
   const poolOn = pool?.enabled ?? false;
@@ -231,6 +234,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
                 <span><span className="text-neutral-500">VMs</span>: <span className="font-mono text-neutral-300">{vmCount}</span></span>
                 <span><span className="text-neutral-500">warm chains</span>: <span className="font-mono text-neutral-300">{warmChains}</span></span>
                 <span><span className="text-neutral-500">backlog reuse</span>: <span className="font-mono text-sky-400">{backlogClaims}</span></span>
+                <span data-testid="pool-origin-claims"><span className="text-neutral-500">pool origin</span>: <span className="font-mono text-emerald-400">{poolClaims}</span>{poolShare !== null && <span className="text-neutral-500"> ({Math.round(poolShare * 100)}%)</span>}</span>
                 <span><span className="text-neutral-500">chain claims</span>: <span className="font-mono text-orange-400">{chainClaims}</span></span>
                 <span><span className="text-neutral-500">pinned queued</span>: <span className="font-mono text-neutral-300">{pinnedQueued}</span></span>
                 <span><span className="text-neutral-500">clears/hr</span>: <span className={`font-mono ${overThreshold ? 'text-red-400' : 'text-neutral-300'}`}>{clearsHour}</span></span>
@@ -257,6 +261,7 @@ export function WarmVmPanel({ onViewTask }: Props) {
                   <EffMetric label="cold-start p50" value={fmtEffSecs(efficiency.window_24h?.setup_p50_secs)} delta={efficiency.window_24h?.vs_prior_setup_p50_delta} lowerIsBetter />
                   <EffMetric label="reuse rate" value={fmtEffRate(efficiency.window_24h?.warm_reuse_rate)} delta={efficiency.window_24h?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
                   <EffMetric label="review cycles" value={fmtEffIter(efficiency.window_7d?.review_iter_median)} delta={efficiency.window_7d?.vs_prior_review_iter_median_delta} lowerIsBetter />
+                  <WarmStartOriginRow breakdown={efficiency.window_24h?.warm_start_origin_breakdown} />
                 </div>
               )}
 
@@ -553,7 +558,10 @@ function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: strin
             {cur.warm_start && cur.warm_claim_origin === 'backlog_reuse' && (
               <> · <span className="text-sky-400">backlog</span></>
             )}
-            {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.prior_role_vm_id && (
+            {cur.warm_start && cur.warm_claim_origin === 'warm_pool' && (
+              <> · <span className="text-emerald-400">pool</span></>
+            )}
+            {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.warm_claim_origin !== 'warm_pool' && cur.prior_role_vm_id && (
               <> · <span className="text-orange-400">chain</span></>
             )}
             {cur.warm_start && cur.prior_role_vm_id && (
@@ -625,7 +633,10 @@ function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string
               {cur.warm_start && cur.warm_claim_origin === 'backlog_reuse' && (
                 <> · <span className="text-sky-400">backlog</span></>
               )}
-              {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.prior_role_vm_id && (
+              {cur.warm_start && cur.warm_claim_origin === 'warm_pool' && (
+                <> · <span className="text-emerald-400">pool</span></>
+              )}
+              {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.warm_claim_origin !== 'warm_pool' && cur.prior_role_vm_id && (
                 <> · <span className="text-orange-400">chain</span></>
               )}
               {cur.warm_start && cur.prior_role_vm_id && (
@@ -686,6 +697,25 @@ function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string
         )}
       </td>
     </tr>
+  );
+}
+
+// Pool-vs-chain-vs-backlog split of warm starts over the 24h window, plus the
+// pool-origin share. Renders nothing when the backend omits the field (older
+// deploy) or there were no warm starts to attribute (null). Colors match the
+// in-flight claim conventions used elsewhere in the panel: pool=emerald,
+// backlog=sky, chain=orange.
+function WarmStartOriginRow({ breakdown }: { breakdown?: WarmStartOriginBreakdown | null }) {
+  if (!breakdown) return null;
+  const share = Math.round(breakdown.pool_origin_share * 100);
+  return (
+    <span data-testid="warm-start-origin-breakdown" className="w-full flex flex-wrap gap-x-3 gap-y-0.5">
+      <span className="text-neutral-500">warm by origin</span>:
+      <span><span className="text-neutral-500">pool</span> <span className="font-mono text-emerald-400">{breakdown.warm_pool}</span></span>
+      <span><span className="text-neutral-500">backlog</span> <span className="font-mono text-sky-400">{breakdown.backlog_reuse}</span></span>
+      <span><span className="text-neutral-500">chain</span> <span className="font-mono text-orange-400">{breakdown.chain_continuity}</span></span>
+      <span data-testid="warm-start-pool-share"><span className="text-neutral-500">pool share</span> <span className="font-mono text-emerald-400">{share}%</span></span>
+    </span>
   );
 }
 

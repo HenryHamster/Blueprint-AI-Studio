@@ -88,6 +88,20 @@ export async function handleVerifyTests(
         tests: [],
         output: (loop.failureSummary ?? 'Test runner setup failed.').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
       };
+    } else if (loop.noTestsExecuted) {
+      // A runner ran but no real tests executed — the detected command was a
+      // placeholder (e.g. the default `npm` "no test specified" script) or the
+      // suite collected zero tests. This is effectively a no-detectable-tests
+      // repo: report detected=false so the backend routes it to the documented
+      // proceed-without-checks fallback rather than recording a hard failure
+      // (placeholder exits non-zero) or a vacuous pass (empty suite exits zero).
+      sendLog(ws, 'Detected suite ran no real tests (placeholder/empty) — reporting detected=false (backend will fall back).\n');
+      result = {
+        detected: false,
+        passed: false,
+        tests: [],
+        output: 'Detected test command ran no real tests (placeholder or empty suite) — no real tests executed; falling back to proceed-without-checks.',
+      };
     } else {
       const passed = loop.passed;
       const message = passed ? 'suite passed' : 'test failures detected';

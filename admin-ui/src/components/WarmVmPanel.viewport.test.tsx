@@ -103,6 +103,51 @@ vi.mock('../api', () => ({
   API_BASE_URL: 'http://localhost:8000',
 }));
 
+// Return a real efficiency snapshot (with the warm-start origin breakdown) so
+// the new "warm by origin" row is rendered into the 375px overflow gate rather
+// than being skipped (which it would be when the hook returns null/empty).
+vi.mock('../hooks/useEfficiencySnapshot', () => ({
+  useEfficiencySnapshot: () => ({
+    computed_at: new Date().toISOString(),
+    window_24h: {
+      setup_p50_secs: 42.5,
+      setup_p95_secs: 88.2,
+      setup_sample_n: 20,
+      warm_reuse_rate: 0.6,
+      warm_reuse_sample_n: 10,
+      review_iter_median: 1,
+      review_iter_p95: 3,
+      review_iter_sample_n: 10,
+      vs_prior_setup_p50_delta: null,
+      vs_prior_warm_reuse_rate_delta: null,
+      vs_prior_review_iter_median_delta: null,
+      warm_start_origin_breakdown: {
+        warm_pool: 3,
+        backlog_reuse: 2,
+        chain_continuity: 5,
+        warm_total: 10,
+        pool_origin_share: 0.3,
+      },
+    },
+    window_7d: {
+      setup_p50_secs: null,
+      setup_p95_secs: null,
+      setup_sample_n: 0,
+      warm_reuse_rate: null,
+      warm_reuse_sample_n: 0,
+      review_iter_median: 2,
+      review_iter_p95: 4,
+      review_iter_sample_n: 5,
+      vs_prior_setup_p50_delta: null,
+      vs_prior_warm_reuse_rate_delta: null,
+      vs_prior_review_iter_median_delta: null,
+    },
+  }),
+  fmtEffSecs: (s: number | null | undefined) => (s == null ? '—' : `${s}s`),
+  fmtEffRate: (r: number | null | undefined) => (r == null ? '—' : `${Math.round(r * 100)}%`),
+  fmtEffIter: (n: number | null | undefined) => (n == null ? '—' : n.toFixed(1)),
+}));
+
 describe('WarmVmPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;

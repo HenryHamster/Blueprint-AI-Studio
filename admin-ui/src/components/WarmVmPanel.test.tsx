@@ -39,9 +39,12 @@ vi.mock('../api', () => ({
 }));
 
 // useEfficiencySnapshot hits the network on mount; stub it out so the panel
-// renders deterministically without an efficiency row.
+// renders deterministically. The returned value is held in a mutable cell so a
+// dedicated describe can inject a snapshot carrying warm_start_origin_breakdown
+// while the rest of the suite keeps the default (no efficiency row).
+const effCell = vi.hoisted(() => ({ value: null as unknown }));
 vi.mock('../hooks/useEfficiencySnapshot', () => ({
-  useEfficiencySnapshot: () => null,
+  useEfficiencySnapshot: () => effCell.value,
   fmtEffSecs: () => '—',
   fmtEffRate: () => '—',
   fmtEffIter: () => '—',
@@ -109,6 +112,69 @@ describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
     expect(backlogLabel.parentElement?.textContent).toContain('2');
     const chainLabel = screen.getByText('chain claims');
     expect(chainLabel.parentElement?.textContent).toContain('1');
+  });
+
+  test('renders pool-origin claim count and share as their own bucket', async () => {
+    const stateWithPoolOrigin: WarmVmStateResponse = {
+      ...baseState,
+      warm_pin_metrics: {
+        ...baseState.warm_pin_metrics,
+        active_warm_chains: 4,
+        active_backlog_reuse_claims: 1,
+        active_pool_origin_claims: 2,
+        active_chain_continuity_claims: 1,
+        pool_origin_share: 0.5,
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithPoolOrigin), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const poolChip = await screen.findByTestId('pool-origin-claims');
+    // Pool-origin count and its share render in the dedicated bucket.
+    expect(poolChip.textContent).toContain('pool origin');
+    expect(poolChip.textContent).toContain('2');
+    expect(poolChip.textContent).toContain('50%');
+    // Chain claims still render their own (now pool-excluded) count.
+    expect(screen.getByText('chain claims').parentElement?.textContent).toContain('1');
+  });
+
+  test('pool-origin current_task renders a pool label, not chain', async () => {
+    const stateWithPoolTask: WarmVmStateResponse = {
+      ...baseState,
+      active_vms: [
+        {
+          vm_instance_id: 'agent-vm-pool-1',
+          last_heartbeat: new Date().toISOString(),
+          is_alive: true,
+          current_task: {
+            id: 'task-pool-1',
+            title: 'feat: a pool-served task',
+            task_type: 'create',
+            status: 'IN_PROGRESS',
+            warm_start: true,
+            warm_claim_origin: 'warm_pool',
+            prior_role_vm_id: 'agent-vm-pool-1',
+            setup_secs: 1.4,
+            started_at: new Date().toISOString(),
+            pr_number: null,
+            project_id: 'proj-1',
+          },
+          warm_pinned_queued: [],
+          recent_completions: [],
+        },
+      ],
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithPoolTask), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    // The pool-origin task surfaces a "pool" label and NOT a "chain" label.
+    expect(screen.getAllByText('pool').length).toBeGreaterThan(0);
+    expect(screen.queryByText('chain')).toBeNull();
   });
 
   test('renders chain continuity funnel when present in response', async () => {
@@ -496,5 +562,100 @@ describe('WarmVmPanel — warm-pool toggle + pool metrics', () => {
 
     await screen.findByTestId('pool-metrics-row');
     expect(screen.queryByTestId('pool-account-mix-row')).toBeNull();
+  });
+});
+
+describe('WarmVmPanel — warm-start origin breakdown', () => {
+  const snapshotWithBreakdown = {
+    computed_at: new Date().toISOString(),
+    window_24h: {
+      setup_p50_secs: null,
+      setup_p95_secs: null,
+      setup_sample_n: 0,
+      warm_reuse_rate: 0.6,
+      warm_reuse_sample_n: 10,
+      review_iter_median: null,
+      review_iter_p95: null,
+      review_iter_sample_n: 0,
+      vs_prior_setup_p50_delta: null,
+      vs_prior_warm_reuse_rate_delta: null,
+      vs_prior_review_iter_median_delta: null,
+      warm_start_origin_breakdown: {
+        warm_pool: 3,
+        backlog_reuse: 2,
+        chain_continuity: 5,
+        warm_total: 10,
+        pool_origin_share: 0.3,
+      },
+    },
+    window_7d: {
+      setup_p50_secs: null,
+      setup_p95_secs: null,
+      setup_sample_n: 0,
+      warm_reuse_rate: null,
+      warm_reuse_sample_n: 0,
+      review_iter_median: null,
+      review_iter_p95: null,
+      review_iter_sample_n: 0,
+      vs_prior_setup_p50_delta: null,
+      vs_prior_warm_reuse_rate_delta: null,
+      vs_prior_review_iter_median_delta: null,
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(baseState), { status: 200 }),
+    );
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    effCell.value = null;
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('renders pool/backlog/chain counts and pool share when breakdown is present', async () => {
+    effCell.value = snapshotWithBreakdown;
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const row = await screen.findByTestId('warm-start-origin-breakdown');
+    // pool=emerald 3, backlog=sky 2, chain=orange 5.
+    expect(screen.getByText('pool').parentElement?.textContent).toContain('3');
+    expect(screen.getByText('backlog').parentElement?.textContent).toContain('2');
+    expect(screen.getByText('chain').parentElement?.textContent).toContain('5');
+    // pool_origin_share 0.3 → 30%.
+    expect(screen.getByTestId('warm-start-pool-share').textContent).toContain('30%');
+    expect(row.textContent).toContain('warm by origin');
+  });
+
+  test('does not render the breakdown row when the field is absent (older backend)', async () => {
+    effCell.value = {
+      ...snapshotWithBreakdown,
+      window_24h: {
+        ...snapshotWithBreakdown.window_24h,
+        warm_start_origin_breakdown: undefined,
+      },
+    };
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('warm-start-origin-breakdown')).toBeNull();
+  });
+
+  test('does not render the breakdown row when the field is null (no warm starts)', async () => {
+    effCell.value = {
+      ...snapshotWithBreakdown,
+      window_24h: {
+        ...snapshotWithBreakdown.window_24h,
+        warm_start_origin_breakdown: null,
+      },
+    };
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('warm-start-origin-breakdown')).toBeNull();
   });
 });

@@ -127,6 +127,67 @@ describe('handleVerifyTests', () => {
     expect(verdict.output).toContain('registry timeout');
   });
 
+  it('placeholder suite (failed but no real tests) → detected=false (proceed-without-checks fallback)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: true,
+      noTestsExecuted: true,
+      failureSummary: 'Error: no test specified',
+    });
+
+    await handleVerifyTests('t6', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.tests).toHaveLength(0);
+  });
+
+  it('empty-but-passing suite (no real tests) → detected=false, not a vacuous pass', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: true,
+      testFailuresDetected: false,
+      noTestsExecuted: true,
+    });
+
+    await handleVerifyTests('t7', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    expect(lastPostedPayload().status).toBe('COMPLETED');
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(false);
+    expect(verdict.passed).toBe(false);
+  });
+
+  it('real one-test pass (noTestsExecuted unset) → detected=true, passed=true', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });
+
+    await handleVerifyTests('t8', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(true);
+  });
+
+  it('real test failure (noTestsExecuted unset) → still detected=true, passed=false (verification not weakened)', async () => {
+    vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
+    vi.mocked(testFixLoop).mockResolvedValue({
+      passed: false,
+      testFailuresDetected: true,
+      failureSummary: 'AssertionError: expected 1 to equal 2',
+    });
+
+    await handleVerifyTests('t9', payload, task, 'tok', 'o', 'r', null, { value: '' });
+
+    const verdict = parsedVerdict();
+    expect(verdict.detected).toBe(true);
+    expect(verdict.passed).toBe(false);
+    expect(verdict.output).toContain('AssertionError');
+  });
+
   it('runs testFixLoop once with maxFixAttempts 0 (no fix loop)', async () => {
     vi.mocked(detectTestRunners).mockReturnValue([RUNNER]);
     vi.mocked(testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false });

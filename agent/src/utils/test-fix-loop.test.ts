@@ -1,0 +1,115 @@
+import { vi, describe, it, expect, beforeEach } from 'vitest';
+
+// Mock the IO surface of ../index.js so testFixLoop runs without spawning real
+// processes or touching the network. execFileAsync is the runner-invocation
+// seam we control per-test to simulate placeholder / empty / real suites.
+// vi.hoisted so the fn is initialized before the hoisted vi.mock factory runs.
+const { execFileAsync } = vi.hoisted(() => ({
+  execFileAsync: vi.fn<(cmd: string, args: string[], opts?: unknown) => Promise<string>>(),
+}));
+vi.mock('../index.js', () => ({
+  WORKSPACE: '/tmp/workspace',
+  sendLog: vi.fn(),
+  sendHeartbeatSync: vi.fn(),
+  execFileAsync,
+  errorFingerprint: (s: string) => s.slice(0, 64),
+  git: vi.fn(() => ''),
+}));
+
+// runClaudeCode must never be invoked for maxFixAttempts:0 runs — stub anyway.
+vi.mock('../providers/runners.js', () => ({
+  runClaudeCode: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('../fix-loop-events.js', () => ({
+  pushFixLoopEvent: vi.fn(),
+  fingerprintHash: (s: string) => s,
+}));
+
+vi.mock('./diff-detection.js', () => ({
+  captureDiffLines: vi.fn(() => null),
+  detectLoopDivergence: vi.fn(() => null),
+}));
+
+vi.mock('child_process', () => ({
+  execSync: vi.fn(() => ''),
+}));
+
+vi.mock('fs', () => ({
+  default: {
+    existsSync: vi.fn(() => true), // node_modules present → skip npm ci
+    readFileSync: vi.fn(() => ''),
+    unlinkSync: vi.fn(),
+  },
+}));
+
+import { testFixLoop } from './test-fix-loop.js';
+import type { TestRunner } from './test-runners.js';
+
+const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
+const statusRef = { value: '' };
+
+describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('placeholder command that exits non-zero → noTestsExecuted=true', async () => {
+    // npm "no test specified" placeholder: exits 1 with a no-tests signature.
+    execFileAsync.mockRejectedValue(
+      Object.assign(new Error('Command failed: npm test\nError: no test specified\nnpm ERR! Test failed.'), {}),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.noTestsExecuted).toBe(true);
+  });
+
+  it('empty suite that exits 0 → passed but noTestsExecuted=true (not a vacuous pass)', async () => {
+    execFileAsync.mockResolvedValue('collected 0 items\n\nno tests ran in 0.01s');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.noTestsExecuted).toBe(true);
+  });
+
+  it('a genuine test failure → noTestsExecuted is NOT set (real verification preserved)', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error('Command failed: npm test\nTests  1 failed | 2 passed (3)\nAssertionError: expected 1 to equal 2'),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.noTestsExecuted).toBe(false);
+  });
+
+  it('a genuine passing suite → noTestsExecuted is NOT set', async () => {
+    execFileAsync.mockResolvedValue('Tests  3 passed (3)\nTest Files  1 passed (1)');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.noTestsExecuted).toBe(false);
+  });
+});

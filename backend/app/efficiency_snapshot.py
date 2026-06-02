@@ -663,6 +663,57 @@ def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
     return round(warm / total, 4)
 
 
+def _compute_warm_start_origin_breakdown(
+    tasks: list[Task],
+) -> Optional[Dict[str, Any]]:
+    """Break the warm-start population down by claim origin over the window.
+
+    Reads ``context['_timing']['warm_claim_origin']`` for every task whose
+    ``_timing['warm_start'] is True`` and buckets it into one of three origins:
+    ``warm_pool`` (a pre-provisioned pool member served the dispatch),
+    ``backlog_reuse`` (a finishing VM picked up an unrelated QUEUED task from the
+    same project's backlog), and ``chain_continuity`` (the PR-chain follow-on
+    path, origin ``next_role_endpoint`` or legacy-unset).
+
+    The aggregate :func:`_compute_vm_reuse_rate` sums every origin into one
+    number; this companion isolates the POOL-ORIGIN share so an operator who
+    enables the pool can confirm it lifted reuse above the floor (the pool's
+    entire reason to exist) rather than reading lift that chain-continuity or
+    backlog-reuse actually contributed. Returns None when no warm starts exist
+    in the window (nothing to attribute). ``pool_origin_share`` is the pool
+    bucket as a fraction of all warm starts (``None`` only when ``warm_total``
+    is 0, which already returns None above).
+    """
+    from app.warm_pool import WARM_POOL_ORIGIN  # noqa: PLC0415
+
+    warm_pool = 0
+    backlog_reuse = 0
+    chain_continuity = 0
+    for t in tasks:
+        timing = (t.context or {}).get("_timing") or {}
+        if timing.get("warm_start") is not True:
+            continue
+        origin = timing.get("warm_claim_origin")
+        if origin == WARM_POOL_ORIGIN:
+            warm_pool += 1
+        elif origin == "backlog_reuse":
+            backlog_reuse += 1
+        else:
+            # "next_role_endpoint" or legacy-unset — the chain-continuity path.
+            chain_continuity += 1
+
+    warm_total = warm_pool + backlog_reuse + chain_continuity
+    if not warm_total:
+        return None
+    return {
+        "warm_pool": warm_pool,
+        "backlog_reuse": backlog_reuse,
+        "chain_continuity": chain_continuity,
+        "warm_total": warm_total,
+        "pool_origin_share": round(warm_pool / warm_total, 4),
+    }
+
+
 def _compute_median_api_calls_per_task(tasks: list[Task]) -> Optional[float]:
     counts: list[int] = []
     for t in tasks:
@@ -768,6 +819,11 @@ async def compute_current_axes(
         AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
         AXIS_VM_COLD_START_P50_MS: _compute_vm_cold_start_p50_ms(tasks),
         AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
+        # Per-origin companion to the aggregate vm_reuse_rate: isolates the
+        # pool-origin share of warm starts so an operator can confirm the pool
+        # (not chain-continuity/backlog-reuse) lifted reuse above the floor.
+        # Kept ALONGSIDE the immutable aggregate axis, like pool_metrics.
+        "warm_start_origin_breakdown": _compute_warm_start_origin_breakdown(tasks),
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
@@ -979,6 +1035,12 @@ async def read_baseline_with_drift(
         "cost_per_merged_pr_incl_pool_idle": latest.get(
             "cost_per_merged_pr_incl_pool_idle"
         ),
+        # Per-origin warm-start breakdown (pool vs chain-continuity vs backlog-
+        # reuse) + the pool-origin share, from the latest snapshot. Sits next to
+        # the pool idle cost and both cost-per-merged-PR figures so an operator
+        # can confirm BOTH halves of the goal — reuse lift above the floor AND no
+        # cost regression — from one place.
+        "warm_start_origin_breakdown": latest.get("warm_start_origin_breakdown"),
         # Cost-amortization companion: the latest snapshot's pool idle cost
         # against the live (instance-local) pool dispatch funnel, so operators
         # can see whether idle spend is being amortized by warm-start hits — the

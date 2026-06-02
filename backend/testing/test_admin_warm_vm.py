@@ -229,13 +229,80 @@ async def test_warm_vm_state_backlog_reuse_attribution(client: AsyncClient, db_s
         metrics = body["warm_pin_metrics"]
         assert metrics["active_backlog_reuse_claims"] >= 1
         # This warm-start task is backlog reuse, so it must NOT inflate the
-        # chain-continuity count, and the two partitions must never exceed the
-        # total warm-chain population.
+        # chain-continuity or pool-origin counts, and the three partitions must
+        # always sum to exactly the total warm-chain population.
         assert (
             metrics["active_backlog_reuse_claims"]
+            + metrics["active_pool_origin_claims"]
             + metrics["active_chain_continuity_claims"]
             == metrics["active_warm_chains"]
         )
+    finally:
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(saved_hb)
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_pool_origin_attribution(client: AsyncClient, db_session):
+    """A warm-pool-origin warm-start claim is attributed to its OWN bucket
+    (active_pool_origin_claims), not folded into chain continuity, and the
+    per-VM current_task exposes warm_claim_origin == 'warm_pool'."""
+    saved_hb = dict(_shared_state.vm_last_heartbeat)
+    _shared_state.vm_last_heartbeat.clear()
+
+    project = Project(name="Pool-Origin Test", user_id="test-user-789")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-pool-origin"
+    _shared_state.record_vm_heartbeat(vm_id)
+
+    current = Task(
+        project_id=project.id,
+        title="feat: a pool-served task",
+        payloads=[{"type": "create"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.utcnow(),
+        last_heartbeat=datetime.utcnow(),
+        context={
+            "_timing": {
+                "warm_start": True,
+                "warm_claim_origin": "warm_pool",
+                "prior_role_vm_id": vm_id,
+                "setup_secs": 1.4,
+            }
+        },
+    )
+    db_session.add(current)
+    await db_session.commit()
+    try:
+        resp = await client.get("/api/admin/warm-vm-state")
+        assert resp.status_code == 200
+        body = resp.json()
+        ours = next(
+            (v for v in body["active_vms"] if v["vm_instance_id"] == vm_id), None
+        )
+        assert ours is not None, f"vm {vm_id} missing from {body['active_vms']}"
+        cur = ours["current_task"]
+        assert cur is not None
+        assert cur["warm_start"] is True
+        assert cur["warm_claim_origin"] == "warm_pool"
+
+        metrics = body["warm_pin_metrics"]
+        assert metrics["active_pool_origin_claims"] >= 1
+        # Pool-origin claims must NOT be counted as chain continuity, and the
+        # three origin buckets must always sum to the total warm-chain count.
+        assert (
+            metrics["active_backlog_reuse_claims"]
+            + metrics["active_pool_origin_claims"]
+            + metrics["active_chain_continuity_claims"]
+            == metrics["active_warm_chains"]
+        )
+        # pool_origin_share is the pool fraction of all active warm chains.
+        assert metrics["pool_origin_share"] is not None
+        assert 0.0 <= metrics["pool_origin_share"] <= 1.0
     finally:
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(saved_hb)

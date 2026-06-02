@@ -1292,6 +1292,15 @@ async def get_pipeline_efficiency(
         s = sorted(values)
         return s[min(int(len(s) * p / 100), len(s) - 1)]
 
+    # Per-origin warm-start breakdown reuses the same helper that powers the
+    # project-scoped efficiency-axes view, so the pool-vs-chain-vs-backlog split
+    # shown next to ``warm_reuse_rate`` is computed identically (and over the
+    # same per-window task bucket). Imported locally to avoid widening this
+    # router's module-load import surface.
+    from app.efficiency_snapshot import (  # noqa: PLC0415
+        _compute_warm_start_origin_breakdown,
+    )
+
     def _metrics(bucket: list) -> Dict[str, Any]:
         timing_list = [(t.context or {}).get("_timing") or {} for t in bucket]
         cold = [
@@ -1313,6 +1322,13 @@ async def get_pipeline_efficiency(
             "setup_sample_n": len(cold),
             "warm_reuse_rate": round(warm_n / timed_n, 3) if timed_n else None,
             "warm_reuse_sample_n": timed_n,
+            # Pool-vs-chain-vs-backlog split of the warm-start population over
+            # this window, plus the pool-origin share. None when no warm starts
+            # in the window (nothing to attribute). Lets an operator see whether
+            # the pool — not chain-continuity/backlog-reuse — earned its idle cost.
+            "warm_start_origin_breakdown": _compute_warm_start_origin_breakdown(
+                bucket
+            ),
             "review_iter_median": _pct(iters, 50),
             "review_iter_p95": _pct(iters, 95),
             "review_iter_sample_n": len(iters),

@@ -6,9 +6,10 @@ export interface WarmVmCurrentTask {
   task_type: string;
   status: string;
   warm_start: boolean;
-  // "backlog_reuse" | "next_role_endpoint" | null (legacy/unset). Set by the
-  // server when a warm VM claims a task; distinguishes same-project backlog
-  // reuse from PR-chain continuity. See admin_health._compute_warm_vm_state.
+  // "warm_pool" | "backlog_reuse" | "next_role_endpoint" | null (legacy/unset).
+  // Set by the server when a warm VM claims a task; distinguishes pre-provisioned
+  // pool-origin claims from same-project backlog reuse and PR-chain continuity.
+  // See admin_health._compute_warm_vm_state.
   warm_claim_origin: string | null;
   prior_role_vm_id: string | null;
   setup_secs: number | null;
@@ -163,6 +164,13 @@ export interface WarmVmStateResponse {
     active_pinned_queued_total: number;
     active_warm_chains: number;
     active_backlog_reuse_claims: number;
+    // Pool-origin in-flight claims, isolated from chain-continuity (a
+    // pre-provisioned warm-pool member served the dispatch). Optional for
+    // backward compatibility with older backends that folded it into the
+    // chain-continuity bucket. pool_origin_share is the pool fraction of all
+    // active warm chains (null when there are no active warm chains).
+    active_pool_origin_claims?: number;
+    pool_origin_share?: number | null;
     active_chain_continuity_claims: number;
   };
   warm_continuity_enabled: boolean;

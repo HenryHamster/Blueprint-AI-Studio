@@ -351,3 +351,85 @@ async def test_warm_reuse_dropout_trend_reads_persisted_snapshots(client, db_ses
     assert buckets[0]["dropout_total"] == 5
     assert buckets[0]["dominant_reason"] == "claim_lost_claim_race"
     assert buckets[0]["dominant_share"] == 0.8
+
+
+@pytest.mark.asyncio
+async def test_pipeline_efficiency_includes_warm_start_origin_breakdown(
+    client, db_session
+):
+    """/pipeline-efficiency emits a per-origin warm-start breakdown per window,
+    bucketed by ``_timing.warm_claim_origin`` over the SAME tasks that produce
+    ``warm_reuse_rate``."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    def _warm(origin):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_timing": {"warm_start": True, "warm_claim_origin": origin}},
+        )
+
+    # 2 pool, 1 backlog, 1 chain (next_role_endpoint) within the 24h window.
+    db_session.add_all(
+        [
+            _warm("warm_pool"),
+            _warm("warm_pool"),
+            _warm("backlog_reuse"),
+            _warm("next_role_endpoint"),
+        ]
+    )
+    # 1 cold task: counts in the reuse denominator but not the warm breakdown.
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_timing": {"warm_start": False}},
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/pipeline-efficiency?project_id={project.id}")
+    assert resp.status_code == 200
+    bd = resp.json()["window_24h"]["warm_start_origin_breakdown"]
+    assert bd is not None
+    assert bd["warm_pool"] == 2
+    assert bd["backlog_reuse"] == 1
+    assert bd["chain_continuity"] == 1
+    assert bd["warm_total"] == 4
+    assert bd["pool_origin_share"] == round(2 / 4, 4)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_efficiency_breakdown_none_when_no_warm_starts(
+    client, db_session
+):
+    """With only cold tasks in the window, the breakdown is None (nothing to
+    attribute) while warm_reuse_rate stays computable."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(hours=1),
+            context={"_timing": {"warm_start": False}},
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/pipeline-efficiency?project_id={project.id}")
+    assert resp.status_code == 200
+    win = resp.json()["window_24h"]
+    assert win["warm_start_origin_breakdown"] is None
+    assert win["warm_reuse_rate"] == 0.0

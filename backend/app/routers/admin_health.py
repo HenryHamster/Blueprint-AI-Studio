@@ -863,11 +863,16 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         for t in in_progress_tasks
         if (t.context or {}).get("_timing", {}).get("warm_start") is True
     )
-    # Origin attribution: split the warm-start population into backlog-reuse
-    # claims (a VM picked up an unrelated QUEUED task from the same project's
-    # backlog) vs chain-continuity claims (the existing PR-chain follow-on
-    # path, origin "next_role_endpoint" or legacy unset). The two sum to
-    # active_warm_chains so operators can attribute the reuse lift.
+    # Origin attribution: split the warm-start population into three buckets —
+    # pool-origin claims (a pre-provisioned warm-pool member served the
+    # dispatch), backlog-reuse claims (a VM picked up an unrelated QUEUED task
+    # from the same project's backlog), and chain-continuity claims (the
+    # existing PR-chain follow-on path, origin "next_role_endpoint" or legacy
+    # unset). The three sum to active_warm_chains so operators can attribute the
+    # reuse lift — and the pool bucket is isolated rather than folded into
+    # chain-continuity (its entire reason to exist is measurable pool lift).
+    from app.warm_pool import WARM_POOL_ORIGIN
+
     active_backlog_reuse_claims = sum(
         1
         for t in in_progress_tasks
@@ -875,7 +880,21 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         and (t.context or {}).get("_timing", {}).get("warm_claim_origin")
         == "backlog_reuse"
     )
-    active_chain_continuity_claims = active_warm_chains - active_backlog_reuse_claims
+    active_pool_origin_claims = sum(
+        1
+        for t in in_progress_tasks
+        if (t.context or {}).get("_timing", {}).get("warm_start") is True
+        and (t.context or {}).get("_timing", {}).get("warm_claim_origin")
+        == WARM_POOL_ORIGIN
+    )
+    active_chain_continuity_claims = (
+        active_warm_chains - active_backlog_reuse_claims - active_pool_origin_claims
+    )
+    pool_origin_share = (
+        round(active_pool_origin_claims / active_warm_chains, 4)
+        if active_warm_chains
+        else None
+    )
 
     cb_suppressed = _shared_state.is_warm_continuity_suppressed()
     suppressed_until = _shared_state.warm_continuity_suppressed_until
@@ -904,7 +923,9 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             "active_pinned_queued_total": sum(len(v) for v in pinned_by_vm.values()),
             "active_warm_chains": active_warm_chains,
             "active_backlog_reuse_claims": active_backlog_reuse_claims,
+            "active_pool_origin_claims": active_pool_origin_claims,
             "active_chain_continuity_claims": active_chain_continuity_claims,
+            "pool_origin_share": pool_origin_share,
             "circuit_breaker_suppressed": cb_suppressed,
             "suppressed_until": suppressed_until.isoformat()
             if suppressed_until

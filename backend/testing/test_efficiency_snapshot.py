@@ -200,6 +200,124 @@ async def test_vm_reuse_rate_warm_without_column_or_provisioned(db_session):
 
 
 @pytest.mark.asyncio
+async def test_warm_start_origin_breakdown_per_origin_counts(db_session):
+    """The per-origin breakdown isolates the pool-origin share of warm starts
+    from chain-continuity and backlog-reuse, while leaving the aggregate
+    vm_reuse_rate intact. Mixes pool/backlog/chain warm starts plus a cold task.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    def _warm(origin):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=2),
+            vm_stopped_at=now,
+            context={
+                "_timing": {"warm_start": True, "warm_claim_origin": origin}
+            },
+        )
+
+    # 2 pool, 1 backlog, 1 chain (next_role_endpoint), 1 legacy-unset chain.
+    db_session.add(_warm("warm_pool"))
+    db_session.add(_warm("warm_pool"))
+    db_session.add(_warm("backlog_reuse"))
+    db_session.add(_warm("next_role_endpoint"))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=2),
+            vm_stopped_at=now,
+            context={"_timing": {"warm_start": True}},  # legacy-unset -> chain
+        )
+    )
+    # 1 cold task: participates in vm_reuse_rate denominator but NOT the warm
+    # breakdown (warm_start is False).
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            context={"_timing": {"warm_start": False}},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    bd = axes["warm_start_origin_breakdown"]
+    assert bd is not None
+    assert bd["warm_pool"] == 2
+    assert bd["backlog_reuse"] == 1
+    assert bd["chain_continuity"] == 2
+    assert bd["warm_total"] == 5
+    assert bd["pool_origin_share"] == round(2 / 5, 4)
+    # Aggregate reuse rate is intact and counts every warm origin: 5 warm / 6.
+    assert axes[AXIS_VM_REUSE_RATE] == round(5 / 6, 4)
+
+
+@pytest.mark.asyncio
+async def test_warm_start_origin_breakdown_none_when_no_warm(db_session):
+    """With only cold tasks the breakdown is None (no warm population to split)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            context={"_timing": {"warm_start": False}},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes["warm_start_origin_breakdown"] is None
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_surfaces_warm_start_origin_breakdown(db_session):
+    """read_baseline_with_drift surfaces the latest snapshot's per-origin
+    breakdown next to the pool idle cost and cost-per-merged-PR figures."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=2),
+            vm_stopped_at=now,
+            context={
+                "_timing": {"warm_start": True, "warm_claim_origin": "warm_pool"}
+            },
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    drift = await read_baseline_with_drift(db_session, project.id)
+    bd = drift["warm_start_origin_breakdown"]
+    assert bd is not None
+    assert bd["warm_pool"] == 1
+    assert bd["pool_origin_share"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_compute_current_axes_empty_returns_none(db_session):
     project = make_project()
     db_session.add(project)
