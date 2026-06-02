@@ -39,6 +39,7 @@ from app.warm_pool import (
     register_pool_vm,
 )
 from app.warm_pool_maintainer import (
+    evaluate_pool_cost_guard,
     reconcile_project_pool,
     retire_and_delete_pool_vm,
     run_pool_maintainer_cycle,
@@ -458,6 +459,78 @@ async def test_reconcile_skips_provision_when_suppressed(db_session, warm_pool_o
         suppressed=True,
     )
     assert summary["provisioned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cost_guard_drains_idle_and_skips_provision(db_session, warm_pool_on, mocker):
+    """When the cost guard is engaged, reconcile forces target 0 — every IDLE
+    member is drained and no provisioning happens, regardless of the configured
+    target."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    _runtime_config["warm_pool_target_size"] = 3
+    project = await _make_project(db_session)
+    idle = await _register(db_session, project, "agent-vm-guard", PoolVmState.IDLE)
+    idle.idle_since = _utcnow() - timedelta(seconds=300)
+    db_session.add(idle)
+    await db_session.commit()
+
+    async def _no_provision(session, project_id):
+        raise AssertionError("cost guard engaged — must not provision")
+
+    summary = await reconcile_project_pool(
+        db_session,
+        project.id,
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        dispatch_slots_remaining=10,
+        pool_budget_remaining=10,
+        stale_vm_ids=set(),
+        suppressed=False,
+        cost_guard_engaged=True,
+    )
+    assert summary["drained"] == 1
+    assert summary["provisioned"] == 0
+    assert await db_session.get(PoolVm, idle.id) is None
+
+
+@pytest.mark.asyncio
+async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool_on, mocker):
+    """Guard engages when there is real idle spend, enough dispatches, and a hit
+    rate below the floor — and disengages once the hit rate recovers."""
+    mocker.patch(
+        "app.efficiency_snapshot.compute_pool_idle_cost",
+        new_callable=mocker.AsyncMock,
+        return_value={"total_idle_cost_usd": 5.0},
+    )
+    snap = mocker.patch("app.warm_backlog_reuse.get_pool_funnel_snapshot")
+
+    # Low hit rate (2%) over 50 dispatches with $5 idle spend → engage.
+    snap.return_value = {"pool_hit_rate": 0.02, "total_dispatches": 50}
+    engaged = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
+    assert engaged["engaged"] is True
+    assert "below" in engaged["reason"]
+
+    # Healthy hit rate (40%) → disengage, provisioning resumes next tick.
+    snap.return_value = {"pool_hit_rate": 0.40, "total_dispatches": 50}
+    recovered = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
+    assert recovered["engaged"] is False
+
+
+@pytest.mark.asyncio
+async def test_evaluate_cost_guard_holds_below_min_dispatches(db_session, warm_pool_on, mocker):
+    """Guard stays disengaged on a thin sample even at a 0% hit rate — it must not
+    drain on noise before enough dispatches accumulate."""
+    mocker.patch(
+        "app.efficiency_snapshot.compute_pool_idle_cost",
+        new_callable=mocker.AsyncMock,
+        return_value={"total_idle_cost_usd": 5.0},
+    )
+    mocker.patch(
+        "app.warm_backlog_reuse.get_pool_funnel_snapshot",
+        return_value={"pool_hit_rate": 0.0, "total_dispatches": 3},
+    )
+    result = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
+    assert result["engaged"] is False
 
 
 @pytest.mark.asyncio
@@ -1033,3 +1106,323 @@ async def test_retire_adopts_stuck_retiring_row(db_session, warm_pool_on, mocker
     assert won is True
     mock_del.assert_awaited()
     assert await db_session.get(PoolVm, member.id) is None
+
+
+# ---------------------------------------------------------------------------
+# Demand-weighted provisioning across a project's account mix: the same small
+# idle pool must SPREAD across the accounts that have recent demand rather than
+# piling every member onto the first eligible account.
+# ---------------------------------------------------------------------------
+
+
+class _PoolAccounts:
+    """Seed several in-memory max-plan accounts under the test project owner
+    (``u-pool``, matching ``_make_project``) and tear them down afterward."""
+
+    def __init__(self, accounts):
+        # accounts: list of dicts merged onto a ready Anthropic-OAuth default.
+        self._specs = accounts
+
+    async def __aenter__(self):
+        from app.max_plan_pool import (
+            _account_by_id,
+            _max_plan_pool_lock,
+            _max_plan_pools,
+        )
+
+        self.accounts = []
+        async with _max_plan_pool_lock:
+            for spec in self._specs:
+                acct = {
+                    "user_id": "u-pool",
+                    "name": spec["id"],
+                    "enabled": True,
+                    "oauth_token": "tok",  # makes _account_runtime_ready True
+                    "provider": "anthropic",
+                    "auth_mode": "oauth",
+                    "active_tasks": 0,
+                    **spec,
+                }
+                _max_plan_pools.setdefault("u-pool", []).append(acct)
+                _account_by_id[str(acct["id"])] = acct
+                self.accounts.append(acct)
+        return self.accounts
+
+    async def __aexit__(self, *exc):
+        from app.max_plan_pool import (
+            _account_by_id,
+            _max_plan_pool_lock,
+            _max_plan_pools,
+        )
+
+        async with _max_plan_pool_lock:
+            for acct in self.accounts:
+                _account_by_id.pop(str(acct["id"]), None)
+            _max_plan_pools.pop("u-pool", None)
+        return False
+
+
+async def _make_task_for_account(db_session, project, account_id, status=TaskStatus.QUEUED):
+    """A demand-signal task whose context attributes it to ``account_id``."""
+    task = Task(
+        project_id=project.id,
+        title="demand",
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+        status=status,
+        context={"llm_account_id": account_id, "max_plan_account_id": account_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_reconcile_spreads_provision_across_demand_accounts(
+    db_session, warm_pool_on
+):
+    """Given QUEUED demand across three accounts and zero idle members, the
+    deficit is distributed across all three accounts — not piled onto one."""
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    for acct_id in ("acct-a", "acct-b", "acct-c"):
+        await _make_task_for_account(db_session, project, acct_id)
+
+    booted: dict = {}
+
+    async def _stub_provision(session, project_id, *, account_id=None):
+        booted[account_id] = booted.get(account_id, 0) + 1
+        return True
+
+    async with _PoolAccounts(
+        [{"id": "acct-a"}, {"id": "acct-b"}, {"id": "acct-c"}]
+    ):
+        summary = await reconcile_project_pool(
+            db_session,
+            project.id,
+            runtime_config=_runtime_config,
+            provision_fn=_stub_provision,
+            dispatch_slots_remaining=10,
+            pool_budget_remaining=10,
+            stale_vm_ids=set(),
+            suppressed=False,
+        )
+    # Total boots unchanged (deficit = target 3 - 0 idle), spread one per account.
+    assert summary["provisioned"] == 3
+    assert booted == {"acct-a": 1, "acct-b": 1, "acct-c": 1}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_boots_account_without_demand(db_session, warm_pool_on):
+    """An eligible account with NO recent demand is never booted; the deficit goes
+    to the demand-active account even when other accounts are ready."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Only acct-a has demand; acct-b is ready but idle in the mix.
+    await _make_task_for_account(db_session, project, "acct-a")
+
+    booted: dict = {}
+
+    async def _stub_provision(session, project_id, *, account_id=None):
+        booted[account_id] = booted.get(account_id, 0) + 1
+        return True
+
+    async with _PoolAccounts([{"id": "acct-a"}, {"id": "acct-b"}]):
+        summary = await reconcile_project_pool(
+            db_session,
+            project.id,
+            runtime_config=_runtime_config,
+            provision_fn=_stub_provision,
+            dispatch_slots_remaining=10,
+            pool_budget_remaining=10,
+            stale_vm_ids=set(),
+            suppressed=False,
+        )
+    assert summary["provisioned"] == 2
+    # All boots go to the only demand-active account; acct-b (no demand) is never chosen.
+    assert booted == {"acct-a": 2}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_deprioritizes_over_represented_account(db_session, warm_pool_on):
+    """An account already over-represented among current idle members is
+    deprioritized so the next boot broadens coverage to the under-served account."""
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Equal demand on both accounts...
+    await _make_task_for_account(db_session, project, "acct-a")
+    await _make_task_for_account(db_session, project, "acct-b")
+    # ...but acct-a already has 2 idle members → only 1 deficit slot, and it must
+    # go to the under-served acct-b.
+    await _register(db_session, project, "agent-vm-a1", PoolVmState.IDLE, account_id="acct-a")
+    await _register(db_session, project, "agent-vm-a2", PoolVmState.IDLE, account_id="acct-a")
+
+    booted: dict = {}
+
+    async def _stub_provision(session, project_id, *, account_id=None):
+        booted[account_id] = booted.get(account_id, 0) + 1
+        return True
+
+    async with _PoolAccounts([{"id": "acct-a"}, {"id": "acct-b"}]):
+        summary = await reconcile_project_pool(
+            db_session,
+            project.id,
+            runtime_config=_runtime_config,
+            provision_fn=_stub_provision,
+            dispatch_slots_remaining=10,
+            pool_budget_remaining=10,
+            stale_vm_ids=set(),
+            suppressed=False,
+        )
+    # Deficit is target 3 - 2 idle = 1, and it broadens to the under-served account.
+    assert summary["provisioned"] == 1
+    assert booted == {"acct-b": 1}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_at_cap_and_cooldown_accounts(db_session, warm_pool_on):
+    """At-cap and rate-limit-cooldown accounts are excluded from distribution; the
+    next eligible demand-active account is chosen instead."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    for acct_id in ("acct-cap", "acct-cool", "acct-ok"):
+        await _make_task_for_account(db_session, project, acct_id)
+
+    booted: dict = {}
+
+    async def _stub_provision(session, project_id, *, account_id=None):
+        booted[account_id] = booted.get(account_id, 0) + 1
+        return True
+
+    # acct-cap is at its concurrent cap; acct-cool is in rate-limit cooldown.
+    async with _PoolAccounts(
+        [
+            {"id": "acct-cap", "max_concurrent_tasks": 1, "active_tasks": 1},
+            {
+                "id": "acct-cool",
+                "disabled_models": {"claude-opus-4-8": {"at": _utcnow()}},
+            },
+            {"id": "acct-ok"},
+        ]
+    ):
+        summary = await reconcile_project_pool(
+            db_session,
+            project.id,
+            runtime_config=_runtime_config,
+            provision_fn=_stub_provision,
+            dispatch_slots_remaining=10,
+            pool_budget_remaining=10,
+            stale_vm_ids=set(),
+            suppressed=False,
+        )
+    assert summary["provisioned"] == 2
+    # Only the one bootable account is chosen — capped/cooldown accounts excluded.
+    assert booted == {"acct-ok": 2}
+    assert "acct-cap" not in booted and "acct-cool" not in booted
+
+
+@pytest.mark.asyncio
+async def test_reconcile_falls_back_to_greedy_without_account_context(
+    db_session, warm_pool_on
+):
+    """When demand carries no resolvable account (no llm_account_id in context),
+    reconcile falls back to the greedy provision call (no account_id kwarg)."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # QUEUED demand but NO account attribution in context.
+    await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    seen_account_kwarg = []
+
+    async def _stub_provision(session, project_id, *, account_id=None):
+        seen_account_kwarg.append(account_id)
+        return True
+
+    async with _PoolAccounts([{"id": "acct-a"}]):
+        summary = await reconcile_project_pool(
+            db_session,
+            project.id,
+            runtime_config=_runtime_config,
+            provision_fn=_stub_provision,
+            dispatch_slots_remaining=10,
+            pool_budget_remaining=10,
+            stale_vm_ids=set(),
+            suppressed=False,
+        )
+    assert summary["provisioned"] == 2
+    # Greedy fallback: account_id was never steered (all None).
+    assert seen_account_kwarg == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_demand_weighting_never_exceeds_global_target(db_session, warm_pool_on):
+    """Demand-weighting redistributes WHICH accounts warm, never HOW many: total
+    boots stay bounded by the global per-project target regardless of how much
+    multi-account demand exists."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Heavy demand across many accounts, far exceeding the target.
+    for acct_id in ("acct-a", "acct-b", "acct-c", "acct-d"):
+        await _make_task_for_account(db_session, project, acct_id)
+        await _make_task_for_account(db_session, project, acct_id)
+
+    total = {"n": 0}
+
+    async def _stub_provision(session, project_id, *, account_id=None):
+        total["n"] += 1
+        return True
+
+    async with _PoolAccounts(
+        [{"id": "acct-a"}, {"id": "acct-b"}, {"id": "acct-c"}, {"id": "acct-d"}]
+    ):
+        summary = await reconcile_project_pool(
+            db_session,
+            project.id,
+            runtime_config=_runtime_config,
+            provision_fn=_stub_provision,
+            dispatch_slots_remaining=10,
+            pool_budget_remaining=10,
+            stale_vm_ids=set(),
+            suppressed=False,
+        )
+    # Bounded by target (2), not by total demand (8).
+    assert summary["provisioned"] == 2
+    assert total["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_default_provision_fn_honors_requested_account(db_session, warm_pool_on, mocker):
+    """_default_pool_provision_fn boots the REQUESTED account when account_id is
+    given, and skips when that account is not eligible."""
+    boot_calls = []
+
+    async def _fake_provision_pool_vm(session, vm_instance_id, project_id, **kwargs):
+        boot_calls.append(kwargs.get("account_id"))
+
+        class _Member:
+            pass
+
+        return _Member()
+
+    mocker.patch("app.compute.provision_pool_vm", side_effect=_fake_provision_pool_vm)
+    project = await _make_project(db_session)
+
+    async with _PoolAccounts([{"id": "acct-a"}, {"id": "acct-b"}]):
+        ok = await _wpm._default_pool_provision_fn(
+            db_session, project.id, account_id="acct-b"
+        )
+    assert ok is True
+    assert boot_calls == ["acct-b"]
+
+    # Requesting an account that is not in the pool → no boot, returns False.
+    async with _PoolAccounts([{"id": "acct-a"}]):
+        ok2 = await _wpm._default_pool_provision_fn(
+            db_session, project.id, account_id="acct-missing"
+        )
+    assert ok2 is False

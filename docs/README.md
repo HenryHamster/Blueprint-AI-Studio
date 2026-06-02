@@ -103,6 +103,13 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Backup/restore procedures
   - Migration history
 
+- **[COMMON_PATTERNS.md](COMMON_PATTERNS.md)** — Frequently-used code patterns
+  - Database patterns (row locking, column loading, batch updates)
+  - API endpoint patterns (validation, rate limiting, WebSocket auth)
+  - Error handling (HTTP exceptions, callbacks)
+  - Async/await patterns (timeouts, session management)
+  - Testing patterns (fixtures, mocking, DB reset)
+
 - **[concurrency.md](concurrency.md)** — Concurrency patterns
   - Row-level locking (FOR UPDATE)
   - Async/await patterns
@@ -124,6 +131,7 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 - **Understand task lifecycle** → [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md)
 - **Debug a failed task** → [DEBUG_GUIDE.md](DEBUG_GUIDE.md)
 - **Configure a task with custom payload** → [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md)
+- **Use common code patterns** → [COMMON_PATTERNS.md](COMMON_PATTERNS.md) (row locking, API validation, async patterns, etc.)
 - **Add a new API endpoint** → [DEVELOPMENT_GUIDE.md — Adding an API Endpoint](DEVELOPMENT_GUIDE.md#adding-a-new-api-endpoint)
 - **Modify the database schema** → [DEVELOPMENT_GUIDE.md — Modifying the Database Schema](DEVELOPMENT_GUIDE.md#modifying-the-database-schema)
 - **Create a new task handler** → [DEVELOPMENT_GUIDE.md — Adding a Task Handler](DEVELOPMENT_GUIDE.md#adding-a-new-task-handler) + [AGENT_HANDLERS.md](AGENT_HANDLERS.md)
@@ -142,7 +150,9 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
 - API reference → [API_REFERENCE.md](API_REFERENCE.md)
 - Models & schema → [DATA_MODELS.md](DATA_MODELS.md)
 - Module guide → [BACKEND_MODULES.md](BACKEND_MODULES.md)
+- Common patterns → [COMMON_PATTERNS.md](COMMON_PATTERNS.md)
 - Development guide → [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) (Python section)
+- Environment variables → [../README.md — Configuration](../README.md#configuration)
 - Coding standards → [../CLAUDE.md](../CLAUDE.md)
 
 ### Agent (TypeScript)

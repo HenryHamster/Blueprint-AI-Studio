@@ -85,23 +85,43 @@ See [Deploy.md](Deploy.md) for full Cloud Run + GCP deployment instructions.
 
 ## Configuration
 
-| Variable | Description |
-|---|---|
-| `ANTHROPIC_API_KEY` | API key passed to agent VMs for Claude Code |
-| `ADMIN_API_KEY` | Shared key for admin UI authentication |
-| `AGENT_JWT_SECRET` | Secret used to sign short-lived agent JWTs |
-| `WS_TICKET_SECRET` | Secret used to mint WebSocket admission tickets |
-| `LOCAL_MODE` | `true` to run agents as local subprocesses |
-| `DATABASE_URL` | PostgreSQL connection string used by the backend |
-| `GITHUB_APP_ID` | GitHub App installation metadata used during auth flows |
-| `GITHUB_PRIVATE_KEY` | GitHub App private key used to sign installation tokens |
-| `GITHUB_WEBHOOK_SECRET` | Secret used to verify GitHub webhooks |
-| `GCP_PROJECT_ID` | GCP project for VM provisioning |
-| `ORCHESTRATOR_URL` | URL agents use to reach the orchestrator |
-| `MAX_CONCURRENT_VMS` | Maximum simultaneously running agent VMs (default 8) |
-| `MAX_PROVISION_SLOTS` | Maximum concurrent VM provision operations (default 10) |
+### Required Environment Variables
 
-See `.env.example` for the full list.
+| Variable | Description | Example |
+|---|---|---|
+| `ADMIN_API_KEY` | Shared API key for admin UI and server-to-server requests (must also set `VITE_ADMIN_API_KEY` to same value) | `my-secret-admin-key` |
+| `ANTHROPIC_API_KEY` | Claude API key passed to agent VMs for Claude Code (or leave empty if using local Claude login) | `sk-ant-...` |
+| `AGENT_JWT_SECRET` | Secret used to sign short-lived agent JWTs (min 32 chars, used internally) | `my-secret-jwt-key` |
+| `WS_TICKET_SECRET` | Secret used to mint WebSocket authentication tickets (min 32 chars) | `my-secret-ws-key` |
+| `DATABASE_URL` | PostgreSQL connection string: `postgresql+asyncpg://user:pass@host:port/dbname` | See Quick Start section |
+| `GITHUB_APP_ID` | GitHub App ID (see Deploy.md section 5 for setup) | `123456` |
+| `GITHUB_PRIVATE_KEY` | GitHub App private key in PEM format (multiline, URL-escaped) | `-----BEGIN RSA PRIVATE KEY-----...` |
+| `GITHUB_WEBHOOK_SECRET` | Secret used to verify GitHub webhook signatures | `my-webhook-secret` |
+
+### GCP Configuration (Required for Production)
+
+| Variable | Description | Default | Example |
+|---|---|---|---|
+| `GCP_PROJECT_ID` | GCP project ID for VM provisioning | — | `my-blueprint-project` |
+| `GCP_ZONE` | GCP zone for agent VMs | `us-central1-a` | `us-central1-c` |
+| `MACHINE_TYPE` | GCP machine type for agent VMs | `e2-standard-2` | `e2-standard-4`, `n2-standard-2` |
+| `VPC_NETWORK` | GCP VPC network name for agents | `agent-sandbox-vpc` | custom network name |
+| `VPC_SUBNET` | GCP subnet name within VPC | `agent-sandbox-subnet` | custom subnet name |
+| `AGENT_IMAGE_FAMILY` | GCP image family path for prebuilt agent image | — | `projects/my-project/global/images/family/blueprint-agent` |
+| `AGENT_SERVICE_ACCOUNT_EMAIL` | Service account email for agent VMs (zero default permissions) | — | `vpm-worker@my-project.iam.gserviceaccount.com` |
+
+### Optional Configuration
+
+| Variable | Description | Default |
+|---|---|---|
+| `LOCAL_MODE` | Run agents as local subprocesses (for development) instead of GCP VMs | `false` |
+| `ORCHESTRATOR_URL` | URL agents use to reach the orchestrator backend (for production/multi-region setup) | `http://localhost:8080` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS allowed origins (for frontend) | `http://localhost:3000,http://localhost:3001` |
+| `MAX_CONCURRENT_VMS` | Maximum simultaneously running agent VMs | `8` |
+| `MAX_PROVISION_SLOTS` | Maximum concurrent VM provision operations | `10` |
+| `VITE_ADMIN_API_KEY` | Frontend environment variable (must match `ADMIN_API_KEY`) | — |
+
+See `.env.example` for the complete template with all variables.
 
 ## How It Works
 

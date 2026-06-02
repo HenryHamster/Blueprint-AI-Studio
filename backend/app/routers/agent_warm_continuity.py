@@ -670,14 +670,90 @@ async def next_role(
         # row in this same transaction and finalizes it with its own origin.
         if pool_task is not None and (pool_task.context or {}).get(WARM_POOL_PIN_KEY):
             member = await get_pool_vm(session, req.vm_instance_id)
-            pool_boot_account = None
+            # The member's FROZEN boot identity (credentials baked into its boot
+            # manifest at provision time) lives on its PoolVm registry row.
+            member_boot = None
             if member is not None and member.account_id:
-                pool_boot_account = {
+                member_boot = {
                     "account_id": member.account_id,
                     "provider": member.provider,
                     "auth_mode": member.auth_mode,
                     "model": member.model,
                 }
+            # The RESOLVED account the task will run on was stamped into context
+            # by the dispatch pin (_pin_task_to_pool_vm). Under the account-agnostic
+            # lease this may DIFFER from the member's boot account — accounting must
+            # attribute to the resolved (run) account, and the agent must
+            # re-materialize its credentials before the role runs.
+            pctx = pool_task.context or {}
+            run_account_id = pctx.get("llm_account_id") or pctx.get(
+                "max_plan_account_id"
+            )
+            if run_account_id:
+                run_account = {
+                    "account_id": str(run_account_id),
+                    "provider": pctx.get("llm_provider"),
+                    "auth_mode": pctx.get("llm_auth_mode"),
+                    "model": pctx.get("llm_model"),
+                }
+            else:
+                # Account wildcard / local VM: no re-target, run on boot identity.
+                run_account = member_boot
+            # Re-target the agent's credentials when the resolved run account
+            # differs from the member's frozen boot identity. Without this the
+            # task would silently execute on the member's wrong frozen account
+            # (rate-limit / billing misattribution, 429 cascades). A mismatch can
+            # only arise when the lease was relaxed (operator enabled re-target),
+            # and emitting the manifest is exactly what keeps the relaxed lease
+            # safe — so this is unconditional on any detected mismatch.
+            secret_manifest = None
+            account_mismatch = (
+                run_account is not None
+                and member_boot is not None
+                and (
+                    run_account["account_id"] != member_boot["account_id"]
+                    or run_account.get("provider") != member_boot.get("provider")
+                    or run_account.get("model") != member_boot.get("model")
+                )
+            )
+            if account_mismatch:
+                from app.max_plan_pool import build_account_retarget_manifest
+
+                secret_manifest = build_account_retarget_manifest(
+                    run_account["account_id"],
+                    provider=run_account.get("provider"),
+                    auth_mode=run_account.get("auth_mode"),
+                    model=run_account.get("model"),
+                    task=pool_task,
+                    runtime_config=_shared_state.runtime_config,
+                )
+                if secret_manifest is None:
+                    # LANDS-TOGETHER INVARIANT: a relaxed (account-mismatched)
+                    # lease MUST re-materialize the resolved account's
+                    # credentials before the role runs. The manifest builder
+                    # returns None when the resolved account is unknown to the
+                    # in-memory pool (e.g. evicted/reloaded between dispatch and
+                    # claim). The lease is already relaxed + pinned by this
+                    # point, so we CANNOT honor the "leave on boot creds" promise
+                    # by continuing — finalizing here would run the task on the
+                    # member's WRONG frozen boot credentials (rate-limit / billing
+                    # misattribution, 429 cascades). Abort the warm claim: roll
+                    # back (releasing the FOR UPDATE lock, leaving the task
+                    # QUEUED untouched) and 204 so the orchestrator re-dispatches
+                    # it — cold once the warm-handoff deadline expires — on the
+                    # correct account.
+                    from app.warm_vm_state import record_pool_claim_failure
+
+                    record_pool_claim_failure("retarget_manifest_unavailable")
+                    logger.warning(
+                        "[NEXT-ROLE] Aborting warm_pool claim for task "
+                        f"{pool_task.id} on vm {req.vm_instance_id}: account "
+                        f"mismatch (boot={member_boot['account_id']} "
+                        f"run={run_account['account_id']}) but re-target manifest "
+                        "unavailable; falling back to cold dispatch"
+                    )
+                    await session.rollback()
+                    return Response(status_code=204)
             try:
                 result = await _finalize_warm_claim(
                     session,
@@ -685,16 +761,21 @@ async def next_role(
                     req.vm_instance_id,
                     origin=WARM_POOL_ORIGIN,
                     refresh_capable=vm_refresh_capable,
-                    boot_account=pool_boot_account,
+                    boot_account=run_account,
                 )
             except Exception:
                 from app.warm_vm_state import record_pool_claim_failure
 
                 record_pool_claim_failure("finalize_error")
                 raise
+            if secret_manifest is not None:
+                # Transient credential re-target grant; the agent re-materializes
+                # it BEFORE running the role. Not persisted anywhere.
+                result["secret_manifest"] = secret_manifest
             logger.info(
                 f"[NEXT-ROLE] Warm-start claim (warm_pool): task={result['task_id']} "
-                f"vm={req.vm_instance_id} project={token.get('project_id')}"
+                f"vm={req.vm_instance_id} project={token.get('project_id')} "
+                f"retarget={'yes' if secret_manifest is not None else 'no'}"
             )
             return result
 

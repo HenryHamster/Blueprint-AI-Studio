@@ -311,6 +311,31 @@ async def compute_pool_idle_cost(
     }
 
 
+def compute_pool_cost_amortization(
+    idle_cost_usd: float, funnel: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Cost-amortization view of the warm pool over the funnel's window.
+
+    Combines the warm-pool idle-cost accrual with the pool dispatch funnel so
+    operators can see whether idle spend is being amortized by warm-start hits —
+    the same two live signals the maintainer's cost-aware auto-drain guard acts
+    on (see ``app.warm_pool_maintainer.evaluate_pool_cost_guard``), surfaced
+    read-only here. ``cost_per_pool_hit_usd`` is the idle dollars spent per warm
+    start over the window (``None`` when no hit has landed yet — idle spend is
+    not being amortized at all).
+    """
+    hits = int(funnel.get("pool_lease_hits") or 0)
+    idle = round(float(idle_cost_usd or 0.0), 6)
+    return {
+        "window_hours": funnel.get("window_hours"),
+        "pool_idle_cost_usd": idle,
+        "pool_lease_hits": hits,
+        "pool_hit_rate": funnel.get("pool_hit_rate"),
+        "total_dispatches": funnel.get("total_dispatches", 0),
+        "cost_per_pool_hit_usd": round(idle / hits, 6) if hits else None,
+    }
+
+
 def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     """Total LLM token cost / merged PR count over the window. None when no merges."""
     total_cost = 0.0
@@ -802,7 +827,10 @@ async def read_baseline_with_drift(
     series of ``{captured_at, dominant_reason, dominant_share, dropout_total}``
     so an operator can confirm a widening change reduced the dominant leak.
     """
-    from app.warm_backlog_reuse import get_reuse_funnel_snapshot  # noqa: PLC0415
+    from app.warm_backlog_reuse import (  # noqa: PLC0415
+        get_pool_funnel_snapshot,
+        get_reuse_funnel_snapshot,
+    )
 
     project = await session.get(Project, project_id)
     if project is None:
@@ -875,6 +903,14 @@ async def read_baseline_with_drift(
         "pool_metrics": latest.get("pool_metrics"),
         "cost_per_merged_pr_incl_pool_idle": latest.get(
             "cost_per_merged_pr_incl_pool_idle"
+        ),
+        # Cost-amortization companion: the latest snapshot's pool idle cost
+        # against the live (instance-local) pool dispatch funnel, so operators
+        # can see whether idle spend is being amortized by warm-start hits — the
+        # same signal the maintainer's cost-aware auto-drain guard acts on.
+        "pool_cost_amortization": compute_pool_cost_amortization(
+            latest.get("pool_idle_cost_usd") or 0.0,
+            get_pool_funnel_snapshot(),
         ),
     }
 

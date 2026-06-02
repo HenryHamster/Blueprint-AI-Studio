@@ -23,14 +23,15 @@ and shared_state.vm_last_heartbeat so a regression in this flag's default
 or a stale heartbeat from a prior test won't pollute neighbours.
 """
 
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, Task, TaskStatus
-from app.auth import create_agent_token, verify_agent_jwt
+from app.models import Project, PoolVmState, Task, TaskStatus
+from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.review_pipeline import _spawn_pipeline_task
 
 
@@ -483,3 +484,620 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
             _runtime_config["warm_continuity_enabled"] = prior_warm_continuity
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
+# ---------------------------------------------------------------------------
+# Warm POOL: full flag-on lifecycle assembled end-to-end
+# ---------------------------------------------------------------------------
+# The pool pieces (lease, maintainer reconcile, idle sweep, idle cost, the
+# /next-role pool-claim branch, the dispatch funnel) each have unit coverage,
+# but no test wires the WHOLE funnel together with warm_pool_enabled ON:
+#   maintainer provisions an idle member  ->  the dispatch hook leases it for a
+#   newly-QUEUED task instead of cold-provisioning  ->  the member's agent
+#   claims it warm via /api/agent/next-role (origin "warm_pool")  ->  the task
+#   completes  ->  banked idle cost is carried into the pool-inclusive cost axis
+#   ->  the funnel + reuse telemetry reflect the warm start.
+# These tests drive that path through the REAL lease/claim/maintainer/idle-cost
+# code (mocking only the websocket broadcast), and also exercise the miss paths
+# (no compatible member / blacklisted account / circuit breaker tripped) so the
+# lease-miss-by-reason funnel and the cold-start fallback are verified. They are
+# ADDITIVE — they do not weaken or duplicate the per-piece unit tests.
+
+
+class _NoCloseSession:
+    """Wrap a test db_session so ``async with factory()`` yields it without
+    closing it (the fixture owns the session lifecycle)."""
+
+    def __init__(self, session):
+        self._session = session
+
+    async def __aenter__(self):
+        return self._session
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _factory_for(session):
+    return lambda: _NoCloseSession(session)
+
+
+@contextmanager
+def _warm_pool_enabled():
+    """Enable warm_pool_enabled, clear the pool circuit breaker, and reset the
+    dispatch funnel deques so a neighbour's state can't suppress the lease or
+    leak counts into our snapshot. runtime_config keys are restored by the
+    autouse reset_runtime_config fixture; the module-level deques/scalars here
+    are restored explicitly."""
+    import app.shared_state as ss
+    import app.warm_backlog_reuse as wbr
+    from app.shared_state import runtime_config as rc
+
+    prior_failures = list(ss.warm_pool_claim_failure_events)
+    prior_suppressed = ss.warm_pool_suppressed_until
+    rc["warm_pool_enabled"] = True
+    ss.warm_pool_claim_failure_events.clear()
+    ss.warm_pool_suppressed_until = None
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    try:
+        yield ss
+    finally:
+        ss.warm_pool_claim_failure_events.clear()
+        ss.warm_pool_claim_failure_events.extend(prior_failures)
+        ss.warm_pool_suppressed_until = prior_suppressed
+        wbr._pool_lease_hit_events.clear()
+        wbr._pool_cold_dispatch_events.clear()
+        wbr._pool_lease_miss_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_warm_pool_full_lifecycle_provision_lease_claim_cost(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end with the pool flag ON: maintainer provisions an idle member ->
+    dispatch hook leases it for a QUEUED task (no cold provision) -> the member's
+    agent claims it warm via /next-role (origin "warm_pool") -> the task
+    completes -> banked idle cost lands in the pool-inclusive cost axis, and the
+    reuse + pool-hit funnel telemetry reflect the warm start."""
+    from app.warm_pool import (
+        WARM_POOL_PIN_KEY,
+        get_pool_vm,
+        register_pool_vm,
+        try_pool_dispatch,
+    )
+    from app.warm_pool_maintainer import run_pool_maintainer_cycle
+    from app.warm_backlog_reuse import get_pool_funnel_snapshot, record_pool_lease_hit
+    from app.efficiency_snapshot import compute_pool_idle_cost
+    from app.shared_state import runtime_config as rc
+
+    mocker.patch(
+        "app.routers.agent_warm_continuity.broadcast_to_project",
+        new_callable=mocker.AsyncMock,
+    )
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool E2E", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # ── Pool sizing: a positive target + ample dispatch/pool budget. ────────
+        rc["warm_pool_target_size"] = 1
+        rc["warm_pool_max_vms"] = 20
+        rc["max_concurrent_vms"] = 10
+
+        # A newly-QUEUED task makes the project demand-active so the maintainer
+        # bootstraps its (zero-member) pool up to target via the deficit path.
+        acct, provider, model = "acct-warm-1", "anthropic", "claude-opus-4-8"
+        task = Task(
+            project_id=project.id,
+            title="Queued work to be served warm by the pool",
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # ── Step 1: maintainer provisions ONE idle pool member. ─────────────────
+        pool_vm_id = f"agent-vm-pool-{uuid.uuid4().hex}"
+
+        async def _registering_provision(session, project_id):
+            await register_pool_vm(
+                session,
+                vm_instance_id=pool_vm_id,
+                project_id=project_id,
+                account_id=acct,
+                provider=provider,
+                model=model,
+                state=PoolVmState.IDLE,
+            )
+            await session.commit()
+            return True
+
+        totals = await run_pool_maintainer_cycle(
+            runtime_config=rc,
+            provision_fn=_registering_provision,
+            session_factory=_factory_for(db_session),
+        )
+        assert totals["provisioned"] == 1
+        member = await get_pool_vm(db_session, pool_vm_id)
+        assert member is not None and member.state == PoolVmState.IDLE
+
+        # Backdate idle_since so the IDLE->LEASED settle banks a measurable span.
+        member.idle_since = datetime.utcnow() - timedelta(seconds=600)
+        db_session.add(member)
+        await db_session.commit()
+
+        # ── Step 2: dispatch hook leases the member for the QUEUED task. ────────
+        leased = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider=provider,
+            required_model=model,
+            required_account=acct,
+        )
+        assert leased is not None and leased.vm_instance_id == pool_vm_id
+        assert leased.state == PoolVmState.LEASED
+        # The task is pinned (still QUEUED) to the leased member; cold provision
+        # is skipped. Mirror orchestrator.py:2400-2422: commit, then record hit.
+        await db_session.commit()
+        record_pool_lease_hit()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id == pool_vm_id
+        assert (task.context or {}).get(WARM_POOL_PIN_KEY) is True
+        assert (task.context or {}).get("warm_target_vm_id") == pool_vm_id
+
+        # Idle cost accrued while the member sat IDLE was banked at lease time.
+        await db_session.refresh(leased)
+        assert (leased.idle_cost_banked or 0.0) > 0.0
+
+        # ── Step 3: the member's agent claims the task warm via /next-role. ─────
+        # A taskless pool VM boots with a VM-SCOPED token (no TASK_ID), mirroring
+        # build_taskless_agent_secret_manifest / compute.provision_pool_vm.
+        token = create_vm_scoped_token(pool_vm_id, str(project.id))
+        nr = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": pool_vm_id},
+            headers={"x-agent-token": token},
+        )
+        assert nr.status_code == 200, nr.text
+        body = nr.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(task.id)
+        assert body["warm_start"] is True
+
+        # ── Step 4: warm telemetry stamped; task bound IN_PROGRESS to the VM. ───
+        db_session.expire(task)
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS
+        assert task.vm_instance_id == pool_vm_id
+        assert task.vm_warm_start is True
+        timing = (task.context or {}).get("_timing", {})
+        assert timing.get("warm_start") is True
+        assert timing.get("warm_claim_origin") == "warm_pool"
+
+        # ── Step 5: the task completes. ─────────────────────────────────────────
+        task.status = TaskStatus.COMPLETED
+        db_session.add(task)
+        await db_session.commit()
+
+        # ── Step 6: idle cost carried into the pool-inclusive cost axis. ────────
+        cost = await compute_pool_idle_cost(db_session, project_id=project.id)
+        assert cost["settled_idle_cost_usd"] > 0.0
+        assert cost["total_idle_cost_usd"] > 0.0
+
+        # ── Step 7: funnel reflects the warm start (one hit, no cold). ──────────
+        funnel = get_pool_funnel_snapshot()
+        assert funnel["pool_lease_hits"] == 1
+        assert funnel["cold_dispatches"] == 0
+        assert funnel["pool_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_warm_pool_miss_paths_record_lease_miss_by_reason(
+    client: AsyncClient, db_session, mocker
+):
+    """Miss paths with the pool flag ON: the dispatch hook declines to lease and
+    records a typed lease-miss for each of (a) no compatible idle member, (b) a
+    blacklisted boot account, and (c) the circuit breaker tripped — so the
+    cold-start fallback fires and lease_miss_by_reason reflects each reason."""
+    from app.warm_pool import register_pool_vm, try_pool_dispatch
+    from app.warm_backlog_reuse import get_pool_funnel_snapshot
+
+    with _warm_pool_enabled() as ss:
+        project = Project(name="Warm Pool Miss", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # One IDLE member pinned to a specific account/provider/model.
+        acct, provider, model = "acct-miss-1", "anthropic", "claude-opus-4-8"
+        await register_pool_vm(
+            db_session,
+            vm_instance_id=f"agent-vm-miss-{uuid.uuid4().hex}",
+            project_id=project.id,
+            account_id=acct,
+            provider=provider,
+            model=model,
+            state=PoolVmState.IDLE,
+        )
+        await db_session.commit()
+
+        def _new_task():
+            t = Task(
+                project_id=project.id,
+                payloads=[
+                    {"type": "create", "prompt": "x", "base_branch": "automain"}
+                ],
+                status=TaskStatus.QUEUED,
+                context={"scope": "small"},
+            )
+            db_session.add(t)
+            return t
+
+        # (a) No COMPATIBLE idle member: required model differs from the member's.
+        t_a = _new_task()
+        await db_session.commit()
+        await db_session.refresh(t_a)
+        assert (
+            await try_pool_dispatch(
+                db_session,
+                t_a,
+                required_provider=provider,
+                required_model="claude-sonnet-4-6",
+                required_account=acct,
+            )
+            is None
+        )
+
+        # (b) Blacklisted boot account: the member's account is excluded.
+        t_b = _new_task()
+        await db_session.commit()
+        await db_session.refresh(t_b)
+        assert (
+            await try_pool_dispatch(
+                db_session,
+                t_b,
+                required_provider=provider,
+                required_model=model,
+                required_account=acct,
+                excluded_account_ids=[acct],
+            )
+            is None
+        )
+
+        # (c) Circuit breaker tripped: the pool is suppressed, no lease attempted.
+        ss.warm_pool_suppressed_until = datetime.utcnow() + timedelta(seconds=300)
+        t_c = _new_task()
+        await db_session.commit()
+        await db_session.refresh(t_c)
+        assert (
+            await try_pool_dispatch(
+                db_session,
+                t_c,
+                required_provider=provider,
+                required_model=model,
+                required_account=acct,
+            )
+            is None
+        )
+
+        # None of the misses pinned a task — all fall back to cold provision.
+        for t in (t_a, t_b, t_c):
+            await db_session.refresh(t)
+            assert t.status == TaskStatus.QUEUED
+            assert t.vm_instance_id is None
+
+        # The funnel recorded a typed miss for each reason and zero hits.
+        funnel = get_pool_funnel_snapshot()
+        assert funnel["pool_lease_hits"] == 0
+        by_reason = funnel["lease_miss_by_reason"]
+        assert by_reason.get("no_idle_member", 0) >= 2  # (a) + (b)
+        assert by_reason.get("suppressed", 0) >= 1  # (c)
+        assert funnel["lease_miss_total"] >= 3
+
+
+# ---------------------------------------------------------------------------
+# Warm POOL: downstream cost/metric accounting (cluster 2/2)
+# ---------------------------------------------------------------------------
+# Cluster 1 wired the happy-path funnel (provision -> lease -> warm claim ->
+# complete -> idle cost -> funnel) and the lease-miss-by-reason paths. These
+# additive tests cover the lifecycle stages DOWNSTREAM of the claim that cluster
+# 1 left unasserted, all through public APIs (no production edits):
+#   * the warm claim actually moves the efficiency reuse-rate axis to 1.0 AND the
+#     pool-inclusive cost axis exceeds the pool-exclusive one (idle spend is
+#     honestly folded in);
+#   * teardown of a stranded lease HARD-DELETES the member yet carries its banked
+#     idle cost into the durable PoolIdleCostLedger (spend survives the delete);
+#   * the cost-aware auto-drain guard BOTH blocks the dispatch-side lease (typed
+#     cost_guard miss) AND drains the idle member on the maintainer side.
+
+
+@pytest.mark.asyncio
+async def test_warm_pool_warm_claim_lifts_reuse_rate_axis(
+    client: AsyncClient, db_session, mocker
+):
+    """A pool-origin warm start moves the efficiency axes: vm_reuse_rate rises to
+    1.0 (the COMPLETED task's ``_timing.warm_start`` participates as a warm VM),
+    and ``cost_per_merged_pr_incl_pool_idle`` strictly exceeds the pool-exclusive
+    ``cost_per_merged_pr`` because the member's banked idle spend is folded into
+    the net-cost numerator. This is the enablement-confidence assertion cluster 1
+    did not make: the measured lift is genuinely pool-origin AND the idle cost is
+    accounted, not hidden."""
+    from app.warm_pool import register_pool_vm
+    from app.efficiency_snapshot import compute_current_axes, AXIS_VM_REUSE_RATE
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool Reuse Axis", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # A pool member carrying banked idle spend (the IDLE->LEASED settle banked
+        # it in production; we set it directly to keep the cost delta deterministic
+        # and idle_since=None so no live accrual perturbs the exact comparison).
+        member = await register_pool_vm(
+            db_session,
+            vm_instance_id=f"agent-vm-axis-{uuid.uuid4().hex}",
+            project_id=project.id,
+            account_id="acct-axis-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+        )
+        member.idle_since = None
+        member.idle_cost_banked = 0.02
+        db_session.add(member)
+
+        # A COMPLETED, merged task that was served WARM by the pool: it has a
+        # provisioned->stopped VM interval (so cost_per_merged_pr is computable),
+        # pr_merged (the merged denominator), and _timing.warm_start=True (the
+        # reuse-rate numerator).
+        now = datetime.utcnow()
+        task = Task(
+            project_id=project.id,
+            title="Warm-served merged task",
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            context={
+                "scope": "small",
+                "pr_merged": True,
+                "_timing": {
+                    "warm_start": True,
+                    "warm_claim_origin": "warm_pool",
+                },
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        axes = await compute_current_axes(db_session, project.id)
+
+        # Reuse-rate axis lifted to 1.0: the only participating VM was warm.
+        assert axes[AXIS_VM_REUSE_RATE] == 1.0
+
+        # Pool-inclusive cost strictly exceeds pool-exclusive cost: the $0.02 of
+        # banked idle spend is folded into the net numerator (0.12 vs 0.10).
+        cost_excl = axes["cost_per_merged_pr"]
+        cost_incl = axes["cost_per_merged_pr_incl_pool_idle"]
+        assert cost_excl is not None and cost_incl is not None
+        assert cost_incl > cost_excl
+        assert axes["pool_idle_cost_usd"] > 0.0
+
+
+@pytest.mark.asyncio
+async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
+    client: AsyncClient, db_session, mocker
+):
+    """A leased member whose handoff window expired after its task completed is
+    reclaimed by the idle reaper via ``pool_lease_orphaned``: the registry row is
+    HARD-DELETED, yet ``compute_pool_idle_cost`` still reports the member's banked
+    idle spend through the durable ``PoolIdleCostLedger`` carry-forward. Without
+    the carry-forward the delete would silently erase measured idle cost and the
+    pool-inclusive cost axis would undercount."""
+    from app.warm_pool import register_pool_vm, get_pool_vm, try_pool_dispatch
+    from app.warm_pool_maintainer import sweep_idle_pool_vms
+    from app.efficiency_snapshot import compute_pool_idle_cost
+    from app.shared_state import runtime_config as rc
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool Ledger", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        acct, provider, model = "acct-ledger-1", "anthropic", "claude-opus-4-8"
+        pool_vm_id = f"agent-vm-ledger-{uuid.uuid4().hex}"
+        member = await register_pool_vm(
+            db_session,
+            vm_instance_id=pool_vm_id,
+            project_id=project.id,
+            account_id=acct,
+            provider=provider,
+            model=model,
+            state=PoolVmState.IDLE,
+        )
+        # Backdate idle_since so the IDLE->LEASED settle banks a measurable span.
+        member.idle_since = datetime.utcnow() - timedelta(seconds=600)
+        db_session.add(member)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Lease the member (banks the idle cost), then drive the lease to the
+        # stranded-orphan state: the task completed but the handoff window expired.
+        leased = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider=provider,
+            required_model=model,
+            required_account=acct,
+        )
+        assert leased is not None
+        banked_at_lease = leased.idle_cost_banked or 0.0
+        assert banked_at_lease > 0.0
+
+        task.status = TaskStatus.COMPLETED
+        leased.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        db_session.add_all([task, leased])
+        await db_session.commit()
+
+        # The reaper reclaims the stranded lease. is_vm_alive False so the orphan
+        # predicate fires; _ensure_vm_deleted is the only mocked seam (no real GCP).
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=False)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        retired = await sweep_idle_pool_vms(
+            db_session, datetime.utcnow(), runtime_config=rc
+        )
+        assert retired == 1
+        delete_mock.assert_awaited_once()
+
+        # The registry row is gone (hard delete) ...
+        assert await get_pool_vm(db_session, pool_vm_id) is None
+
+        # ... but the banked idle spend survived via the durable ledger carry-forward.
+        cost = await compute_pool_idle_cost(db_session, project_id=project.id)
+        assert cost["retired_idle_cost_usd"] > 0.0
+        assert cost["settled_idle_cost_usd"] > 0.0
+        # Pool size now zero (the only member was reaped) yet spend is still counted.
+        assert cost["pool_size"] == 0
+        assert cost["total_idle_cost_usd"] >= banked_at_lease
+
+
+@pytest.mark.asyncio
+async def test_warm_pool_cost_guard_drains_and_blocks_lease(
+    client: AsyncClient, db_session, mocker
+):
+    """With idle spend that recent hits are NOT amortizing, the cost-aware
+    auto-drain guard engages on BOTH sides off the SAME live signals: the
+    dispatch-side ``try_pool_dispatch`` declines to lease (typed ``cost_guard``
+    miss, task falls back to cold) AND a maintainer tick forces the project's IDLE
+    target to 0 and drains the idle member. This is the unattended-cost protection
+    that lets an operator enable the dark pool without risking a cost-per-PR
+    regression."""
+    from app.warm_pool import register_pool_vm, get_pool_vm, try_pool_dispatch
+    from app.warm_pool_maintainer import run_pool_maintainer_cycle
+    from app.warm_backlog_reuse import (
+        get_pool_funnel_snapshot,
+        record_pool_cold_dispatch,
+    )
+    from app.efficiency_snapshot import compute_pool_idle_cost
+    from app.shared_state import runtime_config as rc
+
+    with _warm_pool_enabled():
+        project = Project(name="Warm Pool Cost Guard", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Cost-guard thresholds set EXPLICITLY so the test owns the engagement
+        # condition and doesn't perturb sibling assertions on the module-global
+        # runtime_config: trip on as few as 3 dispatches and a trivial idle floor.
+        rc["warm_pool_cost_guard_enabled"] = True
+        rc["warm_pool_cost_guard_min_hit_rate"] = 0.10
+        rc["warm_pool_cost_guard_min_dispatches"] = 3
+        rc["warm_pool_cost_guard_min_idle_cost_usd"] = 1e-9
+        rc["warm_pool_cost_guard_window_hours"] = 24
+        # Pool sizing so the maintainer would otherwise keep one idle member.
+        rc["warm_pool_target_size"] = 1
+        rc["warm_pool_max_vms"] = 20
+        rc["max_concurrent_vms"] = 10
+
+        acct, provider, model = "acct-guard-1", "anthropic", "claude-opus-4-8"
+        pool_vm_id = f"agent-vm-guard-{uuid.uuid4().hex}"
+        member = await register_pool_vm(
+            db_session,
+            vm_instance_id=pool_vm_id,
+            project_id=project.id,
+            account_id=acct,
+            provider=provider,
+            model=model,
+            state=PoolVmState.IDLE,
+        )
+        # Backdate idle_since so live idle-cost accrual clears the (trivial) floor.
+        member.idle_since = datetime.utcnow() - timedelta(seconds=600)
+        db_session.add(member)
+        await db_session.commit()
+
+        # Seed a low-hit-rate funnel: several cold dispatches, zero hits -> the
+        # guard's hit-rate floor is breached.
+        for _ in range(3):
+            record_pool_cold_dispatch()
+        idle_cost = await compute_pool_idle_cost(db_session)
+        assert idle_cost["total_idle_cost_usd"] > 0.0
+
+        # ── Dispatch side: the guard blocks the lease even though a COMPATIBLE
+        #    idle member exists; the miss is typed cost_guard and the task is
+        #    untouched (cold fallback).
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "x", "base_branch": "automain"}],
+            status=TaskStatus.QUEUED,
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        leased = await try_pool_dispatch(
+            db_session,
+            task,
+            required_provider=provider,
+            required_model=model,
+            required_account=acct,
+        )
+        assert leased is None
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        funnel = get_pool_funnel_snapshot()
+        assert funnel["lease_miss_by_reason"].get("cost_guard", 0) >= 1
+        assert funnel["pool_lease_hits"] == 0
+
+        # ── Maintainer side: a tick with the guard engaged forces target 0 and
+        #    drains the idle member (no provisioning). _ensure_vm_deleted is the
+        #    only mocked seam.
+        mocker.patch(
+            "app.warm_pool_maintainer._stale_pool_image_ids",
+            new_callable=mocker.AsyncMock,
+            return_value=set(),
+        )
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        # Suppress the cost-guard alert broadcast (deferred import in
+        # _maybe_emit_cost_guard_alert; best-effort + try/excepted, but keep it
+        # inert so no real WebSocket fan-out is attempted).
+        mocker.patch(
+            "app.broadcast.broadcast_to_project",
+            new_callable=mocker.AsyncMock,
+            create=True,
+        )
+        totals = await run_pool_maintainer_cycle(
+            runtime_config=rc,
+            session_factory=_factory_for(db_session),
+        )
+        assert totals["drained"] == 1
+        assert totals["provisioned"] == 0
+        delete_mock.assert_awaited()
+
+        # The idle member is gone, but its banked idle cost carried into the ledger.
+        assert await get_pool_vm(db_session, pool_vm_id) is None
+        cost = await compute_pool_idle_cost(db_session, project_id=project.id)
+        assert cost["retired_idle_cost_usd"] > 0.0

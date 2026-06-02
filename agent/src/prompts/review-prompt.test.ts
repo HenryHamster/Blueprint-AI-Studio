@@ -1,5 +1,30 @@
 import { describe, it, expect, vi } from 'vitest';
-import { buildTypeCheckInstructions } from './review-prompt.js';
+import {
+  buildTypeCheckInstructions,
+  buildReviewIterationPreamble,
+  REVIEW_DELTA_FOCUS_NOTE,
+} from './review-prompt.js';
+
+describe('buildReviewIterationPreamble — delta-focus gating', () => {
+  // Round 1 is the full-rigor full-PR pass; the delta-focus note (which scopes
+  // later rounds to the fixer's changes + unresolved set) must NOT appear then.
+  it('iteration 1 does not include the delta-focus note', () => {
+    const out = buildReviewIterationPreamble(1, 6, false, false);
+    expect(out).not.toContain('Delta-focus (iteration ≥2)');
+    expect(out).toContain('review iteration 1 of 6');
+  });
+
+  it('iteration ≥2 includes the delta-focus note verbatim', () => {
+    const out = buildReviewIterationPreamble(2, 6, false, false);
+    expect(out).toContain(REVIEW_DELTA_FOCUS_NOTE);
+    expect(out).toContain('only raise a NEW blocker if the delta introduced one');
+  });
+
+  it('a late iteration still includes the delta-focus note', () => {
+    const out = buildReviewIterationPreamble(5, 6, false, false);
+    expect(out).toContain('Delta-focus (iteration ≥2)');
+  });
+});
 
 describe('buildTypeCheckInstructions — lint scoping', () => {
   // Reproduces the bug fixed alongside this test: lint_cmd like 'mypy .' was

@@ -269,6 +269,78 @@ def build_agent_secret_manifest(
 POOL_MODE_ENV_VAR = "BLUEPRINT_POOL_MODE"
 
 
+def build_warm_claim_retarget_manifest(
+    *,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    oauth_token: str | None = None,
+    claude_config_json: str | None = None,
+    execution_mode: str | None = None,
+    provider_metadata: dict | None = None,
+    provider_settings: dict | None = None,
+) -> dict:
+    """Build a CREDENTIAL-ONLY secret manifest for re-targeting a warm-reused
+    agent VM to a DIFFERENT LLM account/provider at warm-claim time.
+
+    A warm VM (warm-pool member, chain VM, or backlog-reuse VM) boots with one
+    account's credentials frozen into its secret manifest. When a warm claim
+    runs a task whose RESOLVED account differs from that frozen boot identity,
+    the agent must re-materialize the resolved account's credentials BEFORE the
+    role runs — otherwise the task silently executes on the wrong account
+    (rate-limit / billing misattribution, 429 cascades).
+
+    Unlike :func:`build_agent_secret_manifest` /
+    :func:`build_taskless_agent_secret_manifest`, this emits NO agent token and
+    NO VM/task-identity env: the warm-claim response already rotates the JWT
+    (``agent_token``) and the VM keeps its ``VM_INSTANCE_ID``. The manifest
+    carries ONLY what changes on a re-target — the ``PROVIDER`` / ``AUTH_MODE``
+    / ``LLM_MODEL`` env, the ``LLM_SETTINGS`` / ``LLM_CLI_TRANSLATION``
+    translation, and the provider secret files. The credential plumbing is
+    shared with the cold-boot builders via :func:`_resolve_provider_materials`,
+    so a re-targeted VM ends up byte-identical (for the provider env + secret
+    files) to a cold VM booted on the resolved account.
+    """
+    materials = _resolve_provider_materials(
+        oauth_token=oauth_token,
+        claude_config_json=claude_config_json,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        provider_metadata=provider_metadata,
+        provider_settings=provider_settings,
+    )
+    env = {
+        "PROVIDER": materials.provider_name,
+        "AUTH_MODE": materials.auth_mode_value,
+    }
+    _apply_llm_env(
+        env,
+        model=model,
+        execution_mode=execution_mode,
+        provider_settings=provider_settings,
+        materials=materials,
+    )
+    return {
+        "env": env,
+        "files": [
+            {"path": item.path, "content": item.content, "mode": item.mode}
+            for item in materials.files
+        ],
+        "metadata": {
+            "provider": materials.provider_name,
+            "auth_mode": materials.auth_mode_value,
+            "model": model,
+            "execution_mode": execution_mode,
+            "provider_settings": provider_settings or None,
+            # Marks the manifest as a transient re-target grant (no task/VM
+            # identity) so the agent applies it as a credential swap, not a
+            # fresh cold boot.
+            "retarget": True,
+        },
+    }
+
+
 def build_taskless_agent_secret_manifest(
     *,
     vm_instance_id: str,
