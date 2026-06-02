@@ -2154,6 +2154,43 @@ describe('handleReview — rollup-PR guidance staging prefixes', () => {
     expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
   });
 
+  // ── Iteration gating: re-verifying rollup non-emptiness every round is pure
+  // overhead that pulls the reviewer into verification-only drift. By round 2
+  // the PR is already established as a real, non-empty rollup, so the guidance
+  // is injected only on iteration 1.
+  it('injects rollup guidance on iteration 1 for a rollup head', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-iter1',
+      { pr_number: 14, branch: 'research/iter1', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 1 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain(ROLLUP_MARKER);
+  });
+
+  it('does NOT inject rollup guidance on iteration 2 for a rollup head (already established non-empty)', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-iter2',
+      { pr_number: 15, branch: 'research/iter2', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 2 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
+  });
+
+  it('does NOT inject rollup guidance on a late iteration for a rollup head', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-iter5',
+      { pr_number: 16, branch: 'research/iter5', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 5 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
+  });
+
   it('fingerprint stays invariant to per-project staging prefixes (stable default)', () => {
     // The fingerprint must track template edits, not per-task config: a project
     // configuring custom prefixes must not fragment reviewer telemetry, so the
@@ -2164,6 +2201,72 @@ describe('handleReview — rollup-PR guidance staging prefixes', () => {
       { branch: 'research/abc', baseBranch: 'main' },
     );
     expect(customFp).toBe(baseFp);
+  });
+});
+
+// ── handleReview: delta-focus guidance for later iterations ──────────────────
+// Round 1 keeps the full-PR-diff full-rigor review (no delta-focus). From
+// iteration ≥2 the reviewer is told to focus on the changes since the last fix
+// commit plus the unresolved set, so it stops re-scanning the whole PR and
+// re-deriving already-handed-off issues ("verification-only" drift).
+describe('handleReview — delta-focus guidance (iteration ≥2)', () => {
+  const DELTA_MARKER = 'Delta-focus (iteration ≥2)';
+  const REVIEW_TASK = { title: 'Review', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  function lastReviewPrompt(): string {
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('does NOT emit delta-focus guidance on iteration 1 (full-rigor first pass preserved)', async () => {
+    await handleReview(
+      'task-delta-iter1',
+      { pr_number: 20, branch: 'feature/x', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 1 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(DELTA_MARKER);
+  });
+
+  it('does NOT emit delta-focus guidance when iteration is unset (defaults to 1)', async () => {
+    await handleReview(
+      'task-delta-default',
+      { pr_number: 21, branch: 'feature/x', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(DELTA_MARKER);
+  });
+
+  it('emits delta-focus guidance on iteration 2', async () => {
+    await handleReview(
+      'task-delta-iter2',
+      { pr_number: 22, branch: 'feature/x', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 2 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = lastReviewPrompt();
+    expect(prompt).toContain(DELTA_MARKER);
+    // Rigor-preserving framing: a genuinely-unresolved prior blocker or a NEW
+    // blocker the delta introduced still blocks merge.
+    expect(prompt).toContain('only raise a NEW blocker if the delta introduced one');
+    expect(prompt).toContain('Do NOT re-litigate already-addressed');
+  });
+
+  it('emits delta-focus guidance on a late iteration', async () => {
+    await handleReview(
+      'task-delta-iter5',
+      { pr_number: 23, branch: 'feature/x', base_branch: 'main' },
+      { ...REVIEW_TASK, context: { review_loop: { iteration: 5 } } },
+      'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain(DELTA_MARKER);
   });
 });
 
