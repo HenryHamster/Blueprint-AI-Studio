@@ -43,12 +43,15 @@ class TestClusterFilesByCochange:
         assert len(result) == 1
         assert sorted(result[0]) == ["a.py", "b.py"]
 
-    def test_files_below_threshold_split_into_separate_clusters(self):
+    def test_files_below_threshold_skip_decomposition(self):
+        # Below-threshold affinity merges nothing, so every file would be its own
+        # singleton — that is the over-spawn bug (one task per file), not a valid
+        # split. The function returns None (no real co-change structure) so the
+        # finding stays a single coherent task.
         result = cluster_files_by_cochange(
             ["a.py", "b.py"], {"a.py": {"b.py": 0.5}}, threshold=1.0
         )
-        assert result is not None
-        assert len(result) == 2
+        assert result is None
 
     def test_three_files_two_clusters(self):
         cochange = {

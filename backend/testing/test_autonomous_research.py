@@ -2895,7 +2895,10 @@ def test_cluster_files_by_cochange_merges_transitive_affinity():
 
 
 def test_cluster_files_by_cochange_ignores_below_threshold_scores():
-    """Affinity scores below 1.0 threshold don't merge files."""
+    """Affinity scores below the 1.0 threshold don't merge files — and with no
+    merge there is no real co-change structure, so decomposition is SKIPPED
+    (returns None) rather than fanning each file out as its own singleton task.
+    Returning [[a],[b]] here is the over-spawn bug in miniature."""
     from app.research_completion import _cluster_files_by_cochange
 
     idx = {
@@ -2903,8 +2906,21 @@ def test_cluster_files_by_cochange_ignores_below_threshold_scores():
         "b.py": {"a.py": 0.5},
     }
     clusters = _cluster_files_by_cochange(["a.py", "b.py"], idx)
-    assert clusters is not None
-    assert len(clusters) == 2
+    assert clusters is None
+
+
+def test_cluster_files_by_cochange_skips_when_only_external_affinity():
+    """Regression for the 2026-06-02 over-spawn (research a473833c: 1 finding ->
+    5 redundant '(cluster N/5)' tasks). A file IN the set has cochange data, but
+    only with files OUTSIDE the set, so union-find joins nothing and every file
+    is a singleton. The top-level affinity guard passes (one file has data), so
+    without the all-singletons rejection this fans out one task per file."""
+    from app.research_completion import _cluster_files_by_cochange
+
+    # a.py has recorded cochange data, but only with z.py (not in the set).
+    idx = {"a.py": {"z.py": 3.0}}
+    clusters = _cluster_files_by_cochange(["a.py", "b.py", "c.py"], idx)
+    assert clusters is None
 
 
 def test_cluster_files_by_toplevel_dir_requires_min_files_and_dirs():
