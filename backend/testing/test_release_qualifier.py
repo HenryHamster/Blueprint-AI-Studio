@@ -1511,6 +1511,53 @@ class TestExtractAuditFindings:
         # The blank-summary finding is dropped; the string one is kept.
         assert out == [{"severity": "unknown", "summary": "a plain string"}]
 
+    def test_blocker_warning_severities_sort_correctly_and_survive_cap(self):
+        """Blocker and warning severities must sort before lower-severity findings.
+
+        Regression guard: blocker (and warning) severities were missing from
+        _SEVERITY_RANK, causing them to sort last instead of first, and thus
+        be dropped by _MAX_CARRIED_FINDINGS cap before less-severe findings.
+        """
+        # Create a report with many low findings to trigger the cap, plus
+        # one blocker and one warning to verify they sort ahead and survive.
+        report = {
+            "findings": [
+                {"severity": "low", "summary": f"low finding {i}"}
+                for i in range(rq._MAX_CARRIED_FINDINGS)
+            ]
+            + [
+                {
+                    "severity": "blocker",
+                    "summary": "Critical blocker that must be fixed",
+                    "verification_note": "Read src/main.py lines 1-10: confirmed.",
+                },
+                {
+                    "severity": "warning",
+                    "summary": "Warning that should be visible",
+                    "verification_note": "Read src/config.py lines 20-30: confirmed.",
+                },
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        severities = [f["severity"] for f in out]
+
+        # Blocker should be first, warning should appear before any low findings
+        assert severities[0] == "blocker", (
+            "blocker finding must sort first (most severe)"
+        )
+        assert "warning" in severities, (
+            "warning finding must survive the cap and appear in carried findings"
+        )
+        blocker_idx = severities.index("blocker")
+        warning_idx = severities.index("warning")
+        low_indices = [i for i, s in enumerate(severities) if s == "low"]
+        assert blocker_idx < min(low_indices), (
+            "blocker must sort before all low findings"
+        )
+        assert warning_idx < min(low_indices), (
+            "warning must sort before all low findings"
+        )
+
 
 class TestComputeAuditReconciliation:
     """_compute_audit_reconciliation surfaces divergence between the model's
@@ -1659,6 +1706,115 @@ class TestScoreSmoketest:
         """A passing result with no individual tests scores 1.0."""
         result = {"passed": True, "tests": [], "suites": {}}
         assert rq._score_smoketest(result) == pytest.approx(1.0)
+
+
+class TestExtractTestErosionDetail:
+    def test_deleted_test_file_present(self):
+        """A deleted test file is carried as actionable detail."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_foo.py"],
+                "test_count_delta": 0,
+                "assertion_delta": 0,
+            }
+        }
+        detail = rq._extract_test_erosion_detail(report)
+        assert detail == {"deleted_test_files": ["testing/test_foo.py"]}
+
+    def test_negative_deltas_carried(self):
+        """Net-negative test/assertion deltas are carried; zero/positive ignored."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": [],
+                "test_count_delta": -2,
+                "assertion_delta": -5,
+            }
+        }
+        detail = rq._extract_test_erosion_detail(report)
+        assert detail == {"test_count_delta": -2, "assertion_delta": -5}
+
+    def test_clean_erosion_returns_none(self):
+        """No deletions and no negative delta yields None (nothing to carry)."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": [],
+                "test_count_delta": 3,
+                "assertion_delta": 10,
+            }
+        }
+        assert rq._extract_test_erosion_detail(report) is None
+
+    def test_computed_preferred_over_llm(self):
+        """computed_test_erosion is authoritative over the LLM's test_erosion."""
+        report = {
+            "computed_test_erosion": {"deleted_test_files": ["testing/test_real.py"]},
+            "test_erosion": {"deleted_test_files": ["testing/test_hallucinated.py"]},
+        }
+        detail = rq._extract_test_erosion_detail(report)
+        assert detail == {"deleted_test_files": ["testing/test_real.py"]}
+
+    def test_deleted_files_capped(self):
+        """Deleted-file list is capped with a truncation marker."""
+        files = [f"testing/test_{i}.py" for i in range(12)]
+        report = {"test_erosion": {"deleted_test_files": files}}
+        detail = rq._extract_test_erosion_detail(report)
+        assert len(detail["deleted_test_files"]) == rq._MAX_DELETED_TEST_FILES
+        assert detail["deleted_test_files_truncated"] == 12 - rq._MAX_DELETED_TEST_FILES
+
+    def test_non_dict_returns_none(self):
+        assert rq._extract_test_erosion_detail(None) is None
+        assert rq._extract_test_erosion_detail("nope") is None
+        assert rq._extract_test_erosion_detail({"test_erosion": "bad"}) is None
+
+
+class TestExtractSmoketestDetail:
+    def test_startup_suite_failure(self):
+        """A failed startup suite is named explicitly."""
+        result = {
+            "passed": False,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": False}},
+        }
+        detail = rq._extract_smoketest_detail(result)
+        assert detail["startup_failed"] is True
+        assert detail["failed_suite"] == "startup"
+
+    def test_failed_named_tests(self):
+        """Failing tests are carried by name with pass/total counts."""
+        result = {
+            "passed": False,
+            "tests": [
+                {"name": "a", "status": "pass"},
+                {"name": "b", "status": "fail"},
+                {"name": "c", "status": "fail"},
+            ],
+            "suites": {"startup": {"passed": True}},
+        }
+        detail = rq._extract_smoketest_detail(result)
+        assert detail["failed_tests"] == ["b", "c"]
+        assert detail["passed"] == 1
+        assert detail["total"] == 3
+
+    def test_failed_tests_capped(self):
+        """The failing-test list is capped with a truncation marker."""
+        tests = [{"name": f"t{i}", "status": "fail"} for i in range(12)]
+        result = {"tests": tests, "suites": {"startup": {"passed": True}}}
+        detail = rq._extract_smoketest_detail(result)
+        assert len(detail["failed_tests"]) == rq._MAX_FAILED_SMOKE_TESTS
+        assert detail["failed_tests_truncated"] == 12 - rq._MAX_FAILED_SMOKE_TESTS
+
+    def test_all_pass_returns_none(self):
+        """A clean smoketest yields None (nothing to carry)."""
+        result = {
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        }
+        assert rq._extract_smoketest_detail(result) is None
+
+    def test_non_dict_returns_none(self):
+        assert rq._extract_smoketest_detail(None) is None
+        assert rq._extract_smoketest_detail("nope") is None
 
 
 # ===========================================================================
@@ -2911,6 +3067,15 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         {"severity": "high", "summary": "Unsafe dependency pinning."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+    # Test-erosion detail is carried too: this fixture has positive deltas and
+    # no deleted files, so the clean dimension carries None (nothing to fix).
+    assert "test_erosion_detail" in version.last_qualification
+    assert version.last_qualification["test_erosion_detail"] is None
+    # Smoketest detail names the specific failing test so the agent can target it.
+    smoketest_detail = version.last_qualification["smoketest_detail"]
+    assert smoketest_detail["failed_tests"] == ["b"]
+    assert smoketest_detail["passed"] == 1
+    assert smoketest_detail["total"] == 2
 
 
 @pytest.mark.asyncio

@@ -140,12 +140,16 @@ from app.release_scoring import (
     _DEFAULT_POLICY,
     _FINDING_SUMMARY_MAX,  # noqa: F401
     _MAX_CARRIED_FINDINGS,  # noqa: F401
+    _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
+    _MAX_FAILED_SMOKE_TESTS,  # noqa: F401 — re-exported for callers/tests
     _SEVERITY_RANK,  # noqa: F401
     _audit_missing_reason,
     _clamp01,  # noqa: F401
     _classify_check_runs,
     _compute_audit_reconciliation,
     _extract_audit_findings,
+    _extract_smoketest_detail,  # noqa: F401 — re-exported for callers/tests
+    _extract_test_erosion_detail,  # noqa: F401 — re-exported for callers/tests
     _fmt_sub_scores,
     _score_audit,
     _score_smoketest,
@@ -1310,6 +1314,10 @@ async def _finalize_qualification(
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
     audit_findings = _extract_audit_findings(audit_report)
+    # Carry the specific test-erosion detail (deleted files / negative deltas)
+    # so the agent can target it when test-erosion is the binding constraint,
+    # the same way it sees audit_findings.
+    test_erosion_detail = _extract_test_erosion_detail(audit_report)
     audit_missing_reason = _audit_missing_reason(audit_report)
     if audit_missing_reason == "parseable_but_unscoreable":
         return await _handle_infra_failure(
@@ -1365,6 +1373,9 @@ async def _finalize_qualification(
             session, version, qual, "smoketest_report_missing"
         )
     smoketest_score = _score_smoketest(smoketest_result)
+    # Carry the specific smoketest-failure detail (failed suite / named tests)
+    # so the agent can target it when smoketest is the binding constraint.
+    smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
     # --- Compute the composite ---------------------------------------------
     composite = compute_composite(
@@ -1392,6 +1403,8 @@ async def _finalize_qualification(
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
+        "test_erosion_detail": test_erosion_detail,
+        "smoketest_detail": smoketest_detail,
         "audit_missing_reason": audit_missing_reason,
         "audit_reconciliation": audit_reconciliation,
     }

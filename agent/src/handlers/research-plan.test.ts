@@ -1043,6 +1043,8 @@ describe('buildVersionPhaseSection', () => {
   });
 
   it('renders sub-scores and audit findings for the current last_qualification, including the binding dimension', () => {
+    // No hard blocker and smoketest enabled (flag absent → enabled): the binding
+    // constraint is the lowest numeric sub-score.
     const result = buildVersionPhaseSection({
       version_number: 2,
       phase: 'stabilize',
@@ -1050,7 +1052,6 @@ describe('buildVersionPhaseSection', () => {
         status: 'not_promoted',
         confidence: 0.61,
         candidate_sha: 'abcdef0123456789',
-        blocker: 'test_file_deleted',
         sub_scores: {
           audit: 0.74,
           test_erosion: 0.42,
@@ -1066,6 +1067,145 @@ describe('buildVersionPhaseSection', () => {
     });
     expect(result).toContain('sub-scores: audit=0.74, test_erosion=0.42, smoketest=0.88 (binding=test_erosion=0.42)');
     expect(result).toContain('Audit findings: critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
+  });
+
+  it('renders test-erosion detail (deleted files + negative deltas) when carried', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.4,
+        test_erosion_detail: {
+          deleted_test_files: ['testing/test_foo.py', 'testing/test_bar.py'],
+          deleted_test_files_truncated: 3,
+          test_count_delta: -4,
+          assertion_delta: -12,
+        },
+      },
+    });
+    expect(result).toContain('Test erosion: deleted testing/test_foo.py, testing/test_bar.py (+3 more); -4 tests; -12 assertions');
+  });
+
+  it('renders smoketest detail (failed suite + named failing tests) when carried', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.4,
+        smoketest_detail: {
+          startup_failed: true,
+          failed_suite: 'startup',
+          failed_tests: ['boot_check', 'health_probe'],
+          failed_tests_truncated: 2,
+          passed: 1,
+          total: 5,
+        },
+      },
+    });
+    expect(result).toContain('Smoketest: startup suite failed; failed: boot_check, health_probe (+2 more)');
+  });
+
+  it('omits test-erosion and smoketest detail lines when absent', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        test_erosion_detail: null,
+        smoketest_detail: null,
+        sub_scores: { audit: 0.74, test_erosion: 0.42, smoketest: 0.88 },
+      },
+    });
+    expect(result).not.toContain('Test erosion:');
+    expect(result).not.toContain('Smoketest:');
+  });
+
+  it('excludes a disabled smoketest dimension from the sub-scores line and binding selection', () => {
+    // smoketest_enabled=false → the smoketest 0.0 is a placeholder, not a real
+    // low score. It must not appear in the sub-scores line, and must never be
+    // chosen as the binding constraint even though its placeholder is the min.
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'promoted',
+        confidence: 0.93,
+        smoketest_enabled: false,
+        sub_scores: {
+          audit: 0.95,
+          test_erosion: 1.0,
+          smoketest: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.95, test_erosion=1.00 (binding=audit=0.95)');
+    expect(result).not.toContain('smoketest=');
+    expect(result).not.toContain('binding=smoketest');
+  });
+
+  it('reports a hard CI blocker (smoketest disabled) as the binding constraint, not a numeric minimum', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        smoketest_enabled: false,
+        blocker: 'ci_not_green',
+        sub_scores: {
+          audit: 0.0,
+          test_erosion: 0.0,
+          smoketest: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('binding=ci_not_green');
+    // The numeric-minimum binding form must NOT appear under a hard blocker.
+    expect(result).not.toContain('binding=audit=');
+    expect(result).not.toContain('binding=test_erosion=');
+    // Disabled smoketest stays excluded from the rendered sub-scores.
+    expect(result).not.toContain('smoketest=');
+  });
+
+  it('reports a test_file_deleted blocker as the binding constraint even when smoketest is enabled', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        blocker: 'test_file_deleted',
+        sub_scores: {
+          audit: 0.81,
+          test_erosion: 0.0,
+          smoketest: 0.62,
+        },
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.81, test_erosion=0.00, smoketest=0.62 (binding=test_file_deleted)');
+    expect(result).not.toContain('binding=test_erosion=');
+  });
+
+  it('identifies a genuine low audit score as the binding constraint (smoketest disabled, no blocker)', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 6,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.55,
+        smoketest_enabled: false,
+        sub_scores: {
+          audit: 0.41,
+          test_erosion: 0.92,
+          smoketest: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.41, test_erosion=0.92 (binding=audit=0.41)');
+    expect(result).not.toContain('smoketest=');
   });
 
   it('renders a pending last_qualification and instructs the agent NOT to re-emit qualify_request', () => {

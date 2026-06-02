@@ -482,7 +482,21 @@ def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:
 _MAX_CARRIED_FINDINGS = 12
 _FINDING_SUMMARY_MAX = 280
 # Lower number sorts first (most severe). Unknown severities sort last.
-_SEVERITY_RANK = {"critical": 0, "high": 0, "medium": 1, "moderate": 1, "low": 2}
+# Order must match _AUDIT_DEDUCTIONS severity weighting:
+# - critical/blocker (0.30 deduction) = rank 0
+# - high (0.15 deduction) = rank 1
+# - medium/moderate/warning (0.07 deduction) = rank 2
+# - low/info (0.02 deduction) = rank 3
+_SEVERITY_RANK = {
+    "critical": 0,
+    "blocker": 0,
+    "high": 1,
+    "medium": 2,
+    "moderate": 2,
+    "warning": 2,
+    "low": 3,
+    "info": 3,
+}
 
 
 def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -534,6 +548,118 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
 
     out.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
     return out[:_MAX_CARRIED_FINDINGS]
+
+
+# Caps on the test-erosion / smoketest detail carried into last_qualification.
+# Kept small (mirroring _MAX_CARRIED_FINDINGS) so the version_phase block stays
+# under the strategic pack budget while still naming the specific blocker.
+_MAX_DELETED_TEST_FILES = 8
+_MAX_FAILED_SMOKE_TESTS = 8
+_DETAIL_NAME_MAX = 200
+
+
+def _extract_test_erosion_detail(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Pull a compact test-erosion detail from a RELEASE_AUDIT_REPORT.
+
+    ``_score_audit`` knows which test files were deleted and the net test /
+    assertion deltas while scoring, but discards them after deriving the number.
+    When test-erosion is the binding constraint the strategic agent then sees
+    only ``test_erosion=0.42`` with no indication of WHAT eroded.  This carries
+    the actionable detail (deleted files, negative deltas) into
+    ``last_qualification`` so the agent can scope a targeted remediation
+    (restore file X, recover the N removed assertions).
+
+    Mirrors the ``computed_test_erosion``-over-``test_erosion`` preference in
+    ``_score_audit``.  Returns ``None`` when there is no actionable erosion (no
+    deleted files and no negative delta) so a clean dimension adds nothing to
+    the payload.  ``deleted_test_files`` is capped at ``_MAX_DELETED_TEST_FILES``.
+    """
+    if not isinstance(report, dict):
+        return None
+
+    computed_erosion = report.get("computed_test_erosion")
+    erosion = computed_erosion if isinstance(computed_erosion, dict) else report.get(
+        "test_erosion"
+    )
+    if not isinstance(erosion, dict):
+        return None
+
+    detail: dict[str, Any] = {}
+
+    raw_deleted = erosion.get("deleted_test_files")
+    if isinstance(raw_deleted, list):
+        deleted = [str(p).strip()[:_DETAIL_NAME_MAX] for p in raw_deleted if str(p).strip()]
+        if deleted:
+            detail["deleted_test_files"] = deleted[:_MAX_DELETED_TEST_FILES]
+            if len(deleted) > _MAX_DELETED_TEST_FILES:
+                detail["deleted_test_files_truncated"] = len(deleted) - _MAX_DELETED_TEST_FILES
+
+    test_delta = erosion.get("test_count_delta")
+    if isinstance(test_delta, (int, float)) and not isinstance(test_delta, bool) and test_delta < 0:
+        detail["test_count_delta"] = int(test_delta) if float(test_delta).is_integer() else test_delta
+
+    assertion_delta = erosion.get("assertion_delta")
+    if (
+        isinstance(assertion_delta, (int, float))
+        and not isinstance(assertion_delta, bool)
+        and assertion_delta < 0
+    ):
+        detail["assertion_delta"] = (
+            int(assertion_delta) if float(assertion_delta).is_integer() else assertion_delta
+        )
+
+    return detail or None
+
+
+def _extract_smoketest_detail(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Pull a compact smoketest-failure detail from a SMOKETEST_RESULT.
+
+    ``_score_smoketest`` knows which suite failed startup and which named tests
+    failed, but reduces them to a pass-ratio.  When smoketest is the binding
+    constraint the strategic agent then sees only the number, not WHICH suite or
+    tests failed.  This carries the actionable detail into ``last_qualification``
+    so the agent can scope a targeted fix (repair the failing startup suite,
+    fix the named failing tests).
+
+    Returns ``None`` when nothing is failing (clean run adds nothing to the
+    payload).  ``failed_tests`` is capped at ``_MAX_FAILED_SMOKE_TESTS``.
+    """
+    if not isinstance(result, dict):
+        return None
+
+    detail: dict[str, Any] = {}
+
+    suites = result.get("suites")
+    if isinstance(suites, dict):
+        startup = suites.get("startup")
+        if isinstance(startup, dict) and startup.get("passed") is False:
+            detail["startup_failed"] = True
+            detail["failed_suite"] = "startup"
+        elif "failed_suite" not in detail:
+            for suite_name, suite in suites.items():
+                if isinstance(suite, dict) and suite.get("passed") is False:
+                    detail["failed_suite"] = str(suite_name).strip()[:_DETAIL_NAME_MAX]
+                    break
+
+    tests = result.get("tests")
+    if isinstance(tests, list) and tests:
+        failed = [
+            str(t.get("name") or "").strip()[:_DETAIL_NAME_MAX]
+            for t in tests
+            if isinstance(t, dict) and t.get("status") == "fail" and str(t.get("name") or "").strip()
+        ]
+        total = len(tests)
+        passed = sum(
+            1 for t in tests if isinstance(t, dict) and t.get("status") == "pass"
+        )
+        if failed:
+            detail["failed_tests"] = failed[:_MAX_FAILED_SMOKE_TESTS]
+            if len(failed) > _MAX_FAILED_SMOKE_TESTS:
+                detail["failed_tests_truncated"] = len(failed) - _MAX_FAILED_SMOKE_TESTS
+            detail["passed"] = passed
+            detail["total"] = total
+
+    return detail or None
 
 
 def _score_smoketest(result: dict[str, Any] | None) -> float | None:

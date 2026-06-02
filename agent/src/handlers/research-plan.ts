@@ -462,6 +462,20 @@ const QUALIFICATION_SEVERITY_ORDER: Record<string, number> = {
 function formatQualificationDetails(qualification: Record<string, unknown>): string[] {
   const lines: string[] = [];
 
+  // When the smoketest subsystem was disabled for the qualifying run it spawned
+  // no smoketest child, so its sub-score is an unconditional 0.0 placeholder —
+  // NOT a real low score. Mirror the backend (`smoketest_enabled` defaults True
+  // for legacy records that predate the flag) and exclude the dimension from
+  // both the rendered sub-scores and the binding determination when disabled.
+  const smoketestEnabled = qualification.smoketest_enabled !== false;
+  // A hard blocker (CI states, deleted test, missing audit, smoketest startup
+  // failure) forces the composite to zero — the named blocker, not a numeric
+  // minimum over placeholder scores, is the true constraint. Some blockers (CI
+  // states) map to no sub-score at all.
+  const blocker = typeof qualification.blocker === 'string' && qualification.blocker
+    ? qualification.blocker
+    : null;
+
   const subScoresRaw = qualification.sub_scores;
   if (subScoresRaw && typeof subScoresRaw === 'object' && !Array.isArray(subScoresRaw)) {
     const subScores = subScoresRaw as Record<string, unknown>;
@@ -469,6 +483,7 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
     let bindingKey: string | null = null;
     let bindingValue: number | null = null;
     for (const key of QUALIFICATION_SCORE_KEYS) {
+      if (key === 'smoketest' && !smoketestEnabled) continue;
       const value = typeof subScores[key] === 'number' ? subScores[key] : null;
       if (value === null) continue;
       scoreBits.push(`${key}=${value.toFixed(2)}`);
@@ -477,8 +492,16 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
         bindingValue = value;
       }
     }
-    if (scoreBits.length > 0 && bindingKey !== null && bindingValue !== null) {
-      lines.push(`  Qualification details: sub-scores: ${scoreBits.join(', ')} (binding=${bindingKey}=${bindingValue.toFixed(2)})`);
+    if (scoreBits.length > 0) {
+      let bindingClause: string | null = null;
+      if (blocker) {
+        // A hard blocker is the constraint regardless of the numeric minimum.
+        bindingClause = `binding=${blocker}`;
+      } else if (bindingKey !== null && bindingValue !== null) {
+        bindingClause = `binding=${bindingKey}=${bindingValue.toFixed(2)}`;
+      }
+      const suffix = bindingClause ? ` (${bindingClause})` : '';
+      lines.push(`  Qualification details: sub-scores: ${scoreBits.join(', ')}${suffix}`);
     }
   }
 
@@ -507,6 +530,59 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
       const findingBits = findings.map(f => `${f.severity}: ${f.summary}`);
       const tail = moreCount > 0 ? ` (+${moreCount} more)` : '';
       lines.push(`  Audit findings: ${findingBits.join('; ')}${tail}`);
+    }
+  }
+
+  // Test-erosion detail — the specific deleted test files / negative deltas
+  // behind a low (or hard-blocking) test-erosion sub-score, so the agent can
+  // scope "restore file X" / "recover N assertions" instead of blind cleanup.
+  const erosionRaw = qualification.test_erosion_detail;
+  if (erosionRaw && typeof erosionRaw === 'object' && !Array.isArray(erosionRaw)) {
+    const erosion = erosionRaw as Record<string, unknown>;
+    const bits: string[] = [];
+    const deleted = Array.isArray(erosion.deleted_test_files)
+      ? erosion.deleted_test_files.filter((p): p is string => typeof p === 'string' && p.trim() !== '')
+      : [];
+    if (deleted.length > 0) {
+      const moreDeleted = typeof erosion.deleted_test_files_truncated === 'number'
+        ? erosion.deleted_test_files_truncated : 0;
+      const tail = moreDeleted > 0 ? ` (+${moreDeleted} more)` : '';
+      bits.push(`deleted ${deleted.join(', ')}${tail}`);
+    }
+    if (typeof erosion.test_count_delta === 'number' && erosion.test_count_delta < 0) {
+      bits.push(`${erosion.test_count_delta} tests`);
+    }
+    if (typeof erosion.assertion_delta === 'number' && erosion.assertion_delta < 0) {
+      bits.push(`${erosion.assertion_delta} assertions`);
+    }
+    if (bits.length > 0) {
+      lines.push(`  Test erosion: ${bits.join('; ')}`);
+    }
+  }
+
+  // Smoketest detail — which suite / named tests failed behind a low (or
+  // hard-blocking) smoketest sub-score, so the agent can target the failing
+  // startup suite or the named tests instead of generic stabilize work.
+  const smokeRaw = qualification.smoketest_detail;
+  if (smokeRaw && typeof smokeRaw === 'object' && !Array.isArray(smokeRaw)) {
+    const smoke = smokeRaw as Record<string, unknown>;
+    const bits: string[] = [];
+    if (smoke.startup_failed === true) {
+      bits.push('startup suite failed');
+    } else if (typeof smoke.failed_suite === 'string' && smoke.failed_suite.trim()) {
+      bits.push(`suite ${smoke.failed_suite.trim()} failed`);
+    }
+    const failedTests = Array.isArray(smoke.failed_tests)
+      ? smoke.failed_tests.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+      : [];
+    if (failedTests.length > 0) {
+      const moreFailed = typeof smoke.failed_tests_truncated === 'number'
+        ? smoke.failed_tests_truncated : 0;
+      const tail = moreFailed > 0 ? ` (+${moreFailed} more)` : '';
+      bits.push(`failed: ${failedTests.join(', ')}${tail}`);
+    }
+    if (bits.length > 0) {
+      lines.push(`  Smoketest: ${bits.join('; ')}`);
     }
   }
 

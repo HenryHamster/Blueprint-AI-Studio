@@ -2195,10 +2195,14 @@ async def _spawn_strategic_review(
             "for active directions. Defer new feature directions — do not propose "
             "net-new feature work while the version is stabilizing."
         )
-        # When the last qualification carried audit findings, the audit sub-score
-        # is the binding constraint — point the agent at the specific findings so
-        # it creates a TARGETED direction (recommended_mode='audit') rather than
-        # doing blind generic cleanup that may never touch the actual blockers.
+        # When the last qualification carried audit findings, point the agent at
+        # the specific findings so it creates a TARGETED direction
+        # (recommended_mode='audit') rather than doing blind generic cleanup that
+        # may never touch the actual blockers.  Audit is NOT automatically the
+        # binding constraint just because it flagged findings — frame it as such
+        # only when audit is genuinely the limiting dimension; otherwise name the
+        # real constraint (a hard blocker, or a lower sub-score) so hardening is
+        # scoped at what actually blocks promotion.
         _last_qual = _open_version.last_qualification or {}
         _carried_findings = _last_qual.get("audit_findings")
         if isinstance(_carried_findings, list) and _carried_findings:
@@ -2207,12 +2211,57 @@ async def _spawn_strategic_review(
                 for f in _carried_findings[:5]
                 if isinstance(f, dict)
             )
+            # Determine the dimension that actually limits promotion.  A hard
+            # blocker forces confidence to zero regardless of sub-scores; with no
+            # blocker the binding dimension is the lowest active sub-score (the
+            # smoketest dimension is excluded when the subsystem was disabled —
+            # its 0.0 is a meaningless placeholder, not a real low score).
+            _blocker = _last_qual.get("blocker")
+            _sub_scores = _last_qual.get("sub_scores")
+            _smoke_enabled = bool(_last_qual.get("smoketest_enabled", True))
+            _binding_desc = "the audit sub-score is the binding constraint on promotion"
+            if _blocker:
+                _binding_desc = (
+                    f"a hard blocker ({_blocker}) is the binding constraint on "
+                    f"promotion — it forces confidence to zero regardless of the "
+                    f"sub-scores, so resolving it is the priority"
+                )
+            elif isinstance(_sub_scores, dict):
+                _active = {
+                    _k: _v
+                    for _k, _v in (
+                        ("audit", _sub_scores.get("audit")),
+                        ("test_erosion", _sub_scores.get("test_erosion")),
+                        *(
+                            (("smoketest", _sub_scores.get("smoketest")),)
+                            if _smoke_enabled
+                            else ()
+                        ),
+                    )
+                    if isinstance(_v, (int, float)) and not isinstance(_v, bool)
+                }
+                if _active:
+                    _binding_key = min(_active, key=lambda _k: _active[_k])
+                    if _binding_key == "audit":
+                        _binding_desc = (
+                            "the audit sub-score is the binding constraint on "
+                            "promotion"
+                        )
+                    else:
+                        _binding_desc = (
+                            f"the {_binding_key} sub-score "
+                            f"({_active[_binding_key]:.2f}) is the binding "
+                            f"constraint on promotion — it is lower than audit "
+                            f"({_active.get('audit', 0.0):.2f}), so audit is not "
+                            f"the limiting dimension even though it flagged "
+                            f"findings; address {_binding_key} alongside the "
+                            f"audit findings"
+                        )
             _stabilize_hint += (
                 f" The last qualification's audit flagged {len(_carried_findings)} "
                 f"finding(s) — full list in "
-                f"version_phase.last_qualification.audit_findings — and the audit "
-                f"sub-score is the binding constraint on promotion. Top "
-                f"findings: {_top}."
+                f"version_phase.last_qualification.audit_findings — and "
+                f"{_binding_desc}. Top findings: {_top}."
             )
             # Only audit/fundamentals-mode directions do remediation work; a
             # ship/pause direction that merely mentions the audit topic does

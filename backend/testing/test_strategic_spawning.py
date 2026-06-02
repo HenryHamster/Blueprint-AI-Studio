@@ -4356,6 +4356,151 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
         {"severity": "high", "summary": "Token baked into VM image."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+    # Audit (0.74) is the lowest active sub-score here, so it IS the binding
+    # constraint and the hint should frame it that way.
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+
+
+async def _spawn_and_get_stabilize_suffix(project, db_session):
+    """Helper: spawn a strategic review and return its prompt_suffix string."""
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    return tasks[0].payloads[0].get("prompt_suffix", "")
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
+    db_session, mocker, _lts_split_active
+):
+    """When audit flagged findings but test_erosion is the LOWER sub-score,
+    the hint must NOT claim audit is the binding constraint — it should point at
+    test_erosion as the real limiting dimension."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.6,
+            "blocker": None,
+            "sub_scores": {"audit": 0.80, "test_erosion": 0.42},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+    assert "test_erosion sub-score" in suffix
+    assert "audit is not the limiting dimension" in suffix
+    assert "the audit sub-score is the binding constraint on promotion" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
+    db_session, mocker, _lts_split_active
+):
+    """When a hard blocker fired, the hint must name the blocker as the binding
+    constraint rather than asserting audit (or any numeric sub-score) is."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.0,
+            "blocker": "ci_not_green",
+            "sub_scores": {"audit": 0.0, "test_erosion": 0.0},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+    assert "hard blocker (ci_not_green)" in suffix
+    assert "the audit sub-score is the binding constraint on promotion" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_excludes_disabled_smoketest_from_binding(
+    db_session, mocker, _lts_split_active
+):
+    """A disabled smoketest dimension carries a 0.0 placeholder that must not be
+    treated as the binding constraint — audit (the lowest REAL dimension) is."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.6,
+            "blocker": None,
+            "smoketest_enabled": False,
+            "sub_scores": {"audit": 0.55, "test_erosion": 0.90, "smoketest": 0.0},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+    # audit (0.55) is the lowest REAL dimension; the smoketest 0.0 placeholder
+    # must not win the binding determination.
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+    assert "smoketest sub-score" not in suffix
 
 
 @pytest.mark.asyncio
