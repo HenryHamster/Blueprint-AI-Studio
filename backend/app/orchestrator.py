@@ -2730,10 +2730,11 @@ async def orchestrator_worker():
                     if task.vm_dispatched_at is None:
                         task.vm_dispatched_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
-                    # Foundational scaffolding for vm_reuse_rate (efficiency
-                    # direction d-91d8dede). There is no warm pool today, so
-                    # every dispatch is a cold provision — TODO(warm-pool):
-                    # flip to True at the reuse path once pooling lands. See
+                    # Cold dispatch: this is a fresh provision, so vm_warm_start
+                    # is False. The warm-claim / backlog-reuse path stamps True
+                    # instead (routers/agent_warm_continuity._finalize_warm_claim),
+                    # which is also where the vm_reuse_rate signal
+                    # (context['_timing']['warm_start']) is written. See
                     # compute.provision_agent_vm for the corresponding marker.
                     task.vm_warm_start = False
                     # vm_spot must be written here — it's read by ~30 cost-rate sites

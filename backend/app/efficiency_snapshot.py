@@ -543,11 +543,14 @@ def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
     """warm / participating. None when no VMs participated.
 
     Reads ``context['_timing']['warm_start']`` — the same source the
-    ``/pipeline-efficiency`` endpoint uses. The ``vm_warm_start`` column is
-    only ever written ``False`` at cold-provision time; warm-claim and
-    next-role telemetry land in ``context['_timing']``, so reading the column
-    pinned this axis at 0%. A task participates when it has a non-empty
-    ``_timing`` dict OR a recorded ``vm_provisioned_at``.
+    ``/pipeline-efficiency`` endpoint uses, and the canonical signal stamped by
+    the warm-claim / backlog-reuse path
+    (``routers/agent_warm_continuity._finalize_warm_claim``). Cold dispatch
+    writes ``vm_warm_start=False``; the warm-claim path writes both
+    ``vm_warm_start=True`` and ``_timing['warm_start']=True``, so the column and
+    ``_timing`` now agree on warm tasks. The metric keys on ``_timing`` because
+    it is the agent-authoritative source. A task participates when it has a
+    non-empty ``_timing`` dict OR a recorded ``vm_provisioned_at``.
     """
     warm = 0
     total = 0

@@ -74,7 +74,7 @@ The endpoint requires an admin caller and is rate-limited to 10/min.
 | `github_owner` | ✅ | GitHub org/user (the wizard parses this from `owner/repo` or a full URL). |
 | `github_repo` | ✅ | Repository name. |
 | `name` | — | Display name. Defaults to `{owner}/{repo}` when omitted. |
-| `build_config_override` | — | A `BuildConfig`-shaped dict merged **on top of** auto-detection (override wins). The wizard does not send this today. |
+| `build_config_override` | — | A `BuildConfig`-shaped dict merged **on top of** auto-detection (override wins). This is where you can supply `build_config.migration` for a non-standard Python layout; omit it to fall back to Blueprint defaults. The wizard does not send this today. |
 | `promotion_target` | — | Promotion/LTS branch. The wizard's "Promotion target" input maps here; blank means "same as integration". |
 
 ### Fields the handler auto-derives (not operator input)
@@ -142,6 +142,15 @@ existing value. Notable knobs (see `BuildConfig` in `schemas.py`):
   (stale-branch cleanup prefixes and protected branches that must never be
   deleted/force-pushed)
 - `enable_self_improvement` — opt a non-self project into self-improvement mode
+- `migration` — agent-side migration-layout override for repos that do not use
+  Blueprint's default Python layout. Set it either in `build_config_override`
+  during onboarding or later via the project `build_config` PATCH endpoint.
+  Fields are all optional: `versions_dir`, `models_dir`, `alembic_cwd`,
+  `schema_revision_file`, `schema_revision_const`. Omit the object to use
+  Blueprint defaults (`backend/alembic/versions`, `app/models`, `app/main.py`);
+  an empty `schema_revision_file` remains a meaningful "no schema-revision gate"
+  signal. This is separate from `alembic_versions_path`, which only feeds the
+  backend migration-file guard.
 - `directories`, `env_vars`, `git_user_name`, `git_user_email`
 
 ### Automation opt-in

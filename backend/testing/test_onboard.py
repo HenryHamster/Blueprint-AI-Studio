@@ -397,6 +397,101 @@ class TestOnboardBranchConfig:
         assert bc["stale_branch_prefixes"] == []
 
 
+    @pytest.mark.asyncio
+    async def test_onboard_build_config_override_migration_survives_validation(
+        self, client: AsyncClient, db_session
+    ):
+        """An operator-supplied build_config.migration round-trips through onboard validation."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "migration-layout-repo",
+                    "build_config_override": {
+                        "migration": {
+                            "versions_dir": "src/db/versions",
+                            "models_dir": "src/db/models",
+                            "alembic_cwd": "src",
+                            # Empty string is the meaningful "no schema-revision gate" signal.
+                            "schema_revision_file": "",
+                            "schema_revision_const": "SCHEMA_REV",
+                        }
+                    },
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        bc = project.build_config or {}
+        # The whole migration object must survive — not be silently dropped by
+        # Pydantic's default extra-ignore behavior.
+        assert bc.get("migration") == {
+            "versions_dir": "src/db/versions",
+            "models_dir": "src/db/models",
+            "alembic_cwd": "src",
+            "schema_revision_file": "",
+            "schema_revision_const": "SCHEMA_REV",
+        }
+
+
+class TestBuildConfigMigrationSchema:
+    """Direct schema-level proof that BuildConfig accepts and round-trips `migration`."""
+
+    def test_migration_object_round_trips_through_model_dump(self):
+        from app.schemas import BuildConfig
+
+        validated = BuildConfig(
+            **{
+                "language": "python",
+                "migration": {
+                    "versions_dir": "src/db/versions",
+                    "schema_revision_file": "src/app/main.py",
+                    "schema_revision_const": "EXPECTED_SCHEMA_REVISION",
+                },
+            }
+        )
+        dumped = validated.model_dump(exclude_none=True)
+        assert dumped["migration"] == {
+            "versions_dir": "src/db/versions",
+            "schema_revision_file": "src/app/main.py",
+            "schema_revision_const": "EXPECTED_SCHEMA_REVISION",
+        }
+
+    def test_empty_schema_revision_file_is_preserved(self):
+        from app.schemas import BuildConfig
+
+        validated = BuildConfig(**{"migration": {"schema_revision_file": ""}})
+        dumped = validated.model_dump(exclude_none=True)
+        # '' is a meaningful "no schema-revision gate" signal — must NOT be coerced to None/dropped.
+        assert dumped["migration"] == {"schema_revision_file": ""}
+
+    def test_unset_migration_falls_back_to_no_key(self):
+        from app.schemas import BuildConfig
+
+        validated = BuildConfig(**{"language": "python"})
+        dumped = validated.model_dump(exclude_none=True)
+        # Unset migration → key absent → agent falls back to Blueprint defaults.
+        assert "migration" not in dumped
+
+
 class TestOnboardDefaultBranchErrors:
     @pytest.mark.asyncio
     async def test_onboard_github_non200_raises_502(

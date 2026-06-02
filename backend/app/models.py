@@ -814,10 +814,12 @@ class Task(SQLModel, table=True):
         default=None,
         sa_column=Column(Integer, nullable=True),
     )
-    # vm_warm_start is True when the VM was reused from a warm pool / cached
-    # image rather than freshly provisioned. There is no warm pool today, so
-    # all provisions write False — the column is foundational scaffolding so
-    # that vm_reuse_rate has a real signal once warm pooling lands.
+    # vm_warm_start is True when the VM was reused via a warm claim / backlog
+    # reuse path rather than freshly provisioned. Cold dispatch writes False
+    # (orchestrator.py); the warm-claim path writes True
+    # (routers/agent_warm_continuity._finalize_warm_claim). The efficiency
+    # vm_reuse_rate metric reads context['_timing']['warm_start'] as its source,
+    # which now agrees with this column on warm tasks.
     vm_warm_start: bool | None = Field(
         default=False,
         sa_column=Column(Boolean, nullable=True, server_default=text("false")),

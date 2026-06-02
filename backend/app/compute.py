@@ -443,11 +443,12 @@ async def provision_agent_vm(
     secret_version_name: Pre-computed Secret Manager version (from prepare_and_store_agent_secret).
         If provided, skips the internal secret build+store step.
     """
-    # TODO(warm-pool): efficiency direction d-91d8dede needs a vm_reuse_rate
-    # signal. Today every call here is a cold provision, so the dispatch site
-    # in orchestrator.py writes Task.vm_warm_start=False. When a warm-pool /
-    # image-reuse path lands here, fan out the True case at the reuse branch
-    # so vm_reuse_rate has a real signal to aggregate.
+    # Every call here is a fresh (cold) provision, so the dispatch site in
+    # orchestrator.py writes Task.vm_warm_start=False. Warm reuse never flows
+    # through this function: the warm-claim / backlog-reuse path reuses an
+    # existing VM and stamps Task.vm_warm_start=True in
+    # routers/agent_warm_continuity._finalize_warm_claim, which is also where
+    # the vm_reuse_rate signal (context['_timing']['warm_start']) is written.
     if payload_uri:
         validate_payload_uri(payload_uri)
     _ensure_image_family_valid()

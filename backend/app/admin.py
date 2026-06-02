@@ -700,12 +700,27 @@ async def bulk_action_tasks(
                     # would risk an inconsistency where the DB shows
                     # COMPLETED but the GitHub PR is still open.
                     if rollup_pr_number:
+                        from app.shared_state import (
+                            get_project_promotion_target as _get_project_promotion_target,
+                        )
+
+                        # Human-approval lane: like the single-task rollup approval
+                        # path (admin_task_mutations._handle_rollup_pr_approval), bulk
+                        # approve does NOT refuse a landing on the promotion target.
+                        # PR #7064 superseded the earlier hard-refuse (PR #6995) for
+                        # the human-approval lane: the operator has explicitly
+                        # approved this merge, so it proceeds and
+                        # classify_rollup_merge_outcome below decides the outcome —
+                        # a landing on a distinct promotion target leaves pr_merged
+                        # unset (so the rollup stays unqualified) without dead-ending
+                        # the approval. This keeps bulk and single-task approval
+                        # lanes behaviourally identical.
+
                         # Rollup PR approval: merge the rollup PR directly
                         try:
                             from app.routers.agent import get_github_token_for_task
                             from app.shared_state import (
                                 runtime_config as _runtime_config,
-                                get_project_promotion_target as _get_project_promotion_target,
                             )
                             from app.rollup_management import _cleanup_branches
                             from app.github import merge_pull_request, create_pr_comment

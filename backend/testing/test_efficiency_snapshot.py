@@ -73,9 +73,11 @@ async def test_compute_current_axes_values(db_session):
     await db_session.refresh(project)
 
     # Two merged tasks, one on-demand and one e2-standard-4. 1 cold (12s), 1 warm (no cold sample).
-    # Warm signal lives in context['_timing']['warm_start'] (the column is only
-    # ever written False at cold-provision time); the cold task participates in
-    # the denominator via its vm_provisioned_at.
+    # Warm signal lives in context['_timing']['warm_start'], the source
+    # _compute_vm_reuse_rate keys on; the cold task participates in the
+    # denominator via its vm_provisioned_at. (vm_warm_start is False on cold
+    # dispatch and True on warm claim, but the metric intentionally reads
+    # _timing.warm_start — the agent-authoritative source.)
     db_session.add(_make_efficient_task(project.id))
     db_session.add(
         _make_efficient_task(
