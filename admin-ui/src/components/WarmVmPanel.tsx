@@ -1,6 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
-import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject } from '../api';
+import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject, fetchEfficiencyAxes } from '../api';
+import type { PoolPayoffVerdict, PoolPayoffState } from '../api';
 import { parseTimestamp } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate, WarmPoolTargets } from '../types/warmVm';
 import type { Project } from '../types/project';
@@ -327,6 +328,13 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
                 />
               )}
 
+              {(pool?.project_allowlist?.length ?? 0) > 0 && (
+                <PoolPayoffVerdictRow
+                  projects={projects}
+                  allowlist={pool?.project_allowlist ?? []}
+                />
+              )}
+
               {pool && <PoolAccountMixRow pool={pool} />}
 
               <PoolHitRateEstimateRow data={data} targets={targets} onTargetSet={load} />
@@ -505,6 +513,108 @@ function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisable }: {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// Per-project warm-pool PAYOFF VERDICT. Fetches the efficiency-axes response
+// for each scoped project (pool.project_allowlist — normally one) and renders
+// the synthesized verdict the backend folds from the LIFT signals (pool-origin
+// warm-start share + dispatch-funnel hit rate) and the NO-regression signal
+// (idle-inclusive cost-per-merged-PR drift). Answers the bounded-enable
+// question — "did enabling the pool produce a measured reuse lift WITHOUT a
+// cost regression?" — in one place, next to the enable/disable/scope controls.
+// Degrades silently: a project whose backend omits `pool_payoff_verdict`
+// (older snapshot) simply contributes no badge.
+const PAYOFF_BADGE: Record<PoolPayoffState, { label: string; cls: string }> = {
+  PROVEN: { label: 'PROVEN', cls: 'text-emerald-400 border-emerald-500/40 bg-emerald-500/10' },
+  COST_REGRESSION: { label: 'COST REGRESSION', cls: 'text-red-400 border-red-500/40 bg-red-500/10' },
+  NO_LIFT: { label: 'NO LIFT', cls: 'text-amber-400 border-amber-500/40 bg-amber-500/10' },
+  INSUFFICIENT_DATA: { label: 'INSUFFICIENT DATA', cls: 'text-neutral-400 border-neutral-600/40 bg-neutral-700/20' },
+};
+
+function fmtPct(v: number | null | undefined): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  return `${Math.round(v * 100)}%`;
+}
+
+function fmtDrift(v: number | null | undefined): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  const sign = v > 0 ? '+' : '';
+  return `${sign}${v.toFixed(1)}%`;
+}
+
+function PoolPayoffVerdictRow({ projects, allowlist }: {
+  projects: Project[];
+  allowlist: string[];
+}) {
+  const [verdicts, setVerdicts] = useState<Record<string, PoolPayoffVerdict>>({});
+  const nameFor = (id: string) => projects.find((p) => p.id === id)?.name ?? id;
+  // Stable dependency key so the effect only refetches when the scoped set
+  // actually changes (not on every parent re-render that recreates the array).
+  const scopeKey = allowlist.join(',');
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = scopeKey ? scopeKey.split(',') : [];
+    void (async () => {
+      const next: Record<string, PoolPayoffVerdict> = {};
+      await Promise.all(
+        ids.map(async (id) => {
+          try {
+            const axes = await fetchEfficiencyAxes(id);
+            // Older backends omit the field — skip silently so the row degrades.
+            if (axes.pool_payoff_verdict) next[id] = axes.pool_payoff_verdict;
+          } catch {
+            // A per-project fetch failure must not blank the whole row.
+          }
+        }),
+      );
+      if (!cancelled) setVerdicts(next);
+    })();
+    return () => { cancelled = true; };
+  }, [scopeKey]);
+
+  const entries = allowlist.filter((id) => verdicts[id]);
+  if (entries.length === 0) return null;
+
+  return (
+    <div
+      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      data-testid="pool-payoff-verdict-row"
+    >
+      <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
+        Warm Pool Payoff
+      </span>
+      <div className="space-y-1.5">
+        {entries.map((id) => {
+          const v = verdicts[id];
+          const badge = PAYOFF_BADGE[v.state] ?? PAYOFF_BADGE.INSUFFICIENT_DATA;
+          const s = v.supporting;
+          return (
+            <div key={id} data-testid={`pool-payoff-${id}`} className="space-y-0.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono text-violet-300 break-all min-w-0">{nameFor(id)}</span>
+                <span
+                  data-testid={`pool-payoff-badge-${id}`}
+                  className={`font-bold px-1.5 py-0.5 rounded border leading-none ${badge.cls}`}
+                >
+                  {badge.label}
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-x-4 gap-y-0.5" data-testid={`pool-payoff-numbers-${id}`}>
+                <span><span className="text-neutral-500">pool hit rate</span>: <span className="font-mono text-neutral-300">{fmtPct(s.pool_hit_rate)}</span></span>
+                <span><span className="text-neutral-500">pool-origin share</span>: <span className="font-mono text-neutral-300">{fmtPct(s.pool_origin_share)}</span></span>
+                <span><span className="text-neutral-500">cost drift</span>: <span className="font-mono text-neutral-300">{fmtDrift(s.cost_drift_pct)}</span></span>
+                <span><span className="text-neutral-500">pool dispatches</span>: <span className="font-mono text-neutral-300">{s.total_pool_dispatches ?? '—'}</span></span>
+              </div>
+              <div className="text-neutral-500 italic" data-testid={`pool-payoff-action-${id}`}>
+                {v.recommended_action}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

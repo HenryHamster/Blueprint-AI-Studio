@@ -756,6 +756,31 @@ export interface EfficiencyAxis {
   history: EfficiencyHistoryPoint[];
 }
 
+// Per-project warm-pool payoff verdict: a single synthesized answer to "did
+// enabling the pool produce a measured reuse lift WITHOUT a cost regression?",
+// folded from the pool-origin warm-start share + dispatch-funnel hit rate (lift)
+// and the idle-inclusive cost-per-merged-PR drift (no-regression). Optional so
+// the panel degrades silently on an older backend that omits it.
+export type PoolPayoffState =
+  | 'PROVEN'
+  | 'COST_REGRESSION'
+  | 'NO_LIFT'
+  | 'INSUFFICIENT_DATA';
+
+export interface PoolPayoffVerdict {
+  state: PoolPayoffState;
+  supporting: {
+    pool_origin_share: number | null;
+    pool_warm_starts: number | null;
+    pool_hit_rate: number | null;
+    total_pool_dispatches: number | null;
+    cost_drift_pct: number | null;
+    cost_incl_idle_current: number | null;
+    cost_baseline: number | null;
+  };
+  recommended_action: string;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
@@ -765,6 +790,9 @@ export interface EfficiencyAxesResponse {
   // warm-reuse-vs-cost trend can chart true cost regression beside the headline
   // idle-exclusive cost line. Absent on older snapshots → optional.
   cost_per_merged_pr_incl_pool_idle_axis?: EfficiencyAxis;
+  // Synthesized warm-pool payoff verdict (see PoolPayoffVerdict). Optional so
+  // older backends that omit it degrade silently.
+  pool_payoff_verdict?: PoolPayoffVerdict;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {

@@ -32,6 +32,10 @@ const stateWithFunnel: WarmVmStateResponse = {
   },
 };
 
+// Mutable cell so the payoff-verdict describe can inject an efficiency-axes
+// response (optionally carrying pool_payoff_verdict) without affecting the rest
+// of the suite, which keeps the default (no verdict → row absent).
+const axesCell = vi.hoisted(() => ({ value: { axes: {} } as unknown }));
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
   authGet: vi.fn(async () => new Response(JSON.stringify(baseState), { status: 200 })),
@@ -42,6 +46,7 @@ vi.mock('../api', () => ({
     warm_pool_target_size_by_project: {},
   })),
   setWarmPoolTargetForProject: vi.fn(async () => ({})),
+  fetchEfficiencyAxes: vi.fn(async () => axesCell.value),
   API_BASE_URL: 'http://localhost:8000',
 }));
 
@@ -57,7 +62,7 @@ vi.mock('../hooks/useEfficiencySnapshot', () => ({
   fmtEffIter: () => '—',
 }));
 
-import { apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject } from '../api';
+import { apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject, fetchEfficiencyAxes } from '../api';
 import type { Project } from '../types/project';
 
 describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
@@ -920,5 +925,103 @@ describe('WarmVmPanel — per-project warm-pool scope control', () => {
     await waitFor(() => {
       expect(disableWarmPoolForProject).toHaveBeenCalledWith('proj-a');
     });
+  });
+});
+
+describe('WarmVmPanel — per-project warm-pool payoff verdict', () => {
+  const projects: Project[] = [
+    {
+      id: 'proj-a', name: 'Project Alpha', status: 'active', github_owner: 'o',
+      github_repo: 'alpha', autonomous_enabled: true, created_at: '2026-01-01',
+    },
+  ];
+
+  const stateScoped: WarmVmStateResponse = {
+    ...baseState,
+    pool_metrics: {
+      enabled: true,
+      target_size: 2,
+      current_size: 1,
+      idle_count: 1,
+      project_allowlist: ['proj-a'],
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateScoped), { status: 200 }),
+    );
+    axesCell.value = { axes: {} };
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    axesCell.value = { axes: {} };
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('renders the PROVEN badge, supporting numbers, and recommended action', async () => {
+    axesCell.value = {
+      axes: {},
+      pool_payoff_verdict: {
+        state: 'PROVEN',
+        supporting: {
+          pool_origin_share: 0.5,
+          pool_warm_starts: 8,
+          pool_hit_rate: 0.4,
+          total_pool_dispatches: 50,
+          cost_drift_pct: -2.0,
+          cost_incl_idle_current: 10,
+          cost_baseline: 10.2,
+        },
+        recommended_action: 'Keep the pool — consider widening scope.',
+      },
+    };
+    render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+
+    const badge = await screen.findByTestId('pool-payoff-badge-proj-a');
+    expect(badge.textContent).toBe('PROVEN');
+    const numbers = screen.getByTestId('pool-payoff-numbers-proj-a');
+    expect(numbers.textContent).toContain('40%'); // hit rate
+    expect(numbers.textContent).toContain('50%'); // pool-origin share
+    expect(numbers.textContent).toContain('-2.0%'); // cost drift
+    expect(screen.getByTestId('pool-payoff-action-proj-a').textContent).toContain(
+      'widening scope',
+    );
+    expect(fetchEfficiencyAxes).toHaveBeenCalledWith('proj-a');
+  });
+
+  test('renders the COST_REGRESSION badge for a regressed project', async () => {
+    axesCell.value = {
+      axes: {},
+      pool_payoff_verdict: {
+        state: 'COST_REGRESSION',
+        supporting: {
+          pool_origin_share: 0.5,
+          pool_warm_starts: 8,
+          pool_hit_rate: 0.4,
+          total_pool_dispatches: 50,
+          cost_drift_pct: 20.0,
+          cost_incl_idle_current: 12,
+          cost_baseline: 10,
+        },
+        recommended_action: 'Reduce the pool target or disable.',
+      },
+    };
+    render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+
+    const badge = await screen.findByTestId('pool-payoff-badge-proj-a');
+    expect(badge.textContent).toBe('COST REGRESSION');
+    expect(screen.getByTestId('pool-payoff-numbers-proj-a').textContent).toContain('+20.0%');
+  });
+
+  test('does not render the verdict row when the backend omits the field (older backend)', async () => {
+    axesCell.value = { axes: {} }; // no pool_payoff_verdict
+    render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+
+    await screen.findByTestId('warm-pool-scope-row');
+    expect(screen.queryByTestId('pool-payoff-verdict-row')).toBeNull();
   });
 });

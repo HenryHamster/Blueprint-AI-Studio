@@ -1940,6 +1940,377 @@ async def test_read_baseline_with_drift_includes_pool_cost_amortization(db_sessi
 
 
 # ---------------------------------------------------------------------------
+# Per-project warm-pool PAYOFF VERDICT
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    POOL_PAYOFF_COST_REGRESSION,
+    POOL_PAYOFF_INSUFFICIENT_DATA,
+    POOL_PAYOFF_MIN_POOL_DISPATCHES,
+    POOL_PAYOFF_NO_LIFT,
+    POOL_PAYOFF_PROVEN,
+    compute_pool_payoff_verdict,
+)
+
+
+def _cost_axis(current, baseline):
+    drift = None
+    if (
+        isinstance(current, (int, float))
+        and isinstance(baseline, (int, float))
+        and baseline != 0
+    ):
+        drift = round(((current - baseline) / baseline) * 100.0, 2)
+    return {"current": current, "baseline": baseline, "drift_pct": drift}
+
+
+def test_pool_payoff_verdict_proven():
+    """Serving warm starts above the floor AND cost within tolerance => PROVEN."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(10.0, 10.2),  # cost slightly BELOW baseline => no regression
+        {"pool_hit_rate": 0.4, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_PROVEN
+    assert verdict["supporting"]["pool_origin_share"] == 0.5
+    assert verdict["supporting"]["pool_hit_rate"] == 0.4
+    assert "widening" in verdict["recommended_action"].lower()
+
+
+def test_pool_payoff_verdict_cost_regression():
+    """Idle-inclusive cost materially above baseline => COST_REGRESSION, even
+    when the pool is serving warm starts."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(12.0, 10.0),  # +20% drift, well over the 5% tolerance
+        {"pool_hit_rate": 0.4, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_COST_REGRESSION
+    assert verdict["supporting"]["cost_drift_pct"] == 20.0
+    assert "disable" in verdict["recommended_action"].lower()
+
+
+def test_pool_payoff_verdict_no_lift():
+    """Cost not regressed but the pool is barely serving (hit rate AND
+    pool-origin share below the floor) => NO_LIFT."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 1, "pool_origin_share": 0.02},
+        _cost_axis(10.1, 10.0),  # +1% drift, within tolerance
+        {"pool_hit_rate": 0.01, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_NO_LIFT
+    assert "tune" in verdict["recommended_action"].lower()
+
+
+def test_pool_payoff_verdict_insufficient_data_no_baseline():
+    """No cost baseline to compare against => INSUFFICIENT_DATA."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(10.0, None),
+        {"pool_hit_rate": 0.4, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+
+
+def test_pool_payoff_verdict_insufficient_data_too_few_dispatches():
+    """Fewer pool dispatches than the minimum sample size => INSUFFICIENT_DATA,
+    even with a cost baseline present."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(10.0, 10.0),
+        {"pool_hit_rate": 0.4, "total_dispatches": POOL_PAYOFF_MIN_POOL_DISPATCHES - 1},
+    )
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+
+
+def test_pool_payoff_verdict_serving_via_origin_share_only():
+    """Hit rate below floor but pool-origin share above it still counts as
+    serving (the OR), so with cost in tolerance the verdict is PROVEN."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 6, "pool_origin_share": 0.3},
+        _cost_axis(10.0, 10.0),
+        {"pool_hit_rate": 0.05, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_PROVEN
+
+
+def test_pool_payoff_verdict_handles_none_inputs():
+    """None breakdown/funnel/axis must not raise — classify INSUFFICIENT_DATA."""
+    verdict = compute_pool_payoff_verdict(None, None, None)
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+    assert verdict["supporting"]["pool_origin_share"] is None
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_pool_payoff_verdict(db_session):
+    """read_baseline_with_drift surfaces a pool_payoff_verdict block of the
+    expected shape; a fresh project with no baseline/dispatches => INSUFFICIENT_DATA."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    assert "pool_payoff_verdict" in result
+    verdict = result["pool_payoff_verdict"]
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+    assert "supporting" in verdict
+    assert "recommended_action" in verdict
+
+
+# ---------------------------------------------------------------------------
+# Per-project warm-pool payoff TRANSITION ALERT
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from sqlmodel import select as _sql_select  # noqa: E402
+
+from app.efficiency_snapshot import (  # noqa: E402
+    LAST_ALERTED_PAYOFF_KEY,
+    POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
+    maybe_alert_pool_payoff_transition,
+)
+from app.models import Alert, AlertSeverity  # noqa: E402
+from app.shared_state import runtime_config as _runtime_config  # noqa: E402
+
+
+def _payoff_design_doc(
+    *,
+    incl_current,
+    cost_baseline,
+    warm_pool,
+    pool_origin_share,
+    hit_rate,
+    total_dispatches,
+):
+    """Build a design_doc whose latest snapshot drives a chosen payoff verdict.
+
+    read_baseline_with_drift reads the idle-inclusive cost drift off
+    ``cost_per_merged_pr_incl_pool_idle`` (current) vs the immutable
+    ``cost_per_merged_pr`` baseline, the lift off the persisted
+    ``warm_start_origin_breakdown`` + ``pool_dispatch_funnel``.
+    """
+    snap = {
+        "captured_at": _utcnow().isoformat(),
+        "cost_per_merged_pr_incl_pool_idle": incl_current,
+        "warm_start_origin_breakdown": {
+            "warm_pool": warm_pool,
+            "pool_origin_share": pool_origin_share,
+        },
+        "pool_dispatch_funnel": {
+            "pool_hit_rate": hit_rate,
+            "total_dispatches": total_dispatches,
+        },
+    }
+    return {
+        DESIGN_DOC_KEY: {
+            "baseline": {AXIS_COST_PER_MERGED_PR: cost_baseline},
+            "snapshots": [snap],
+        }
+    }
+
+
+async def _payoff_alerts(db_session, project_id):
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("Warm-pool payoff"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_cost_regression_fires_warning(db_session, mocker):
+    """A transition to COST_REGRESSION fires one WARNING carrying the numbers."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,  # +20% idle-inclusive drift, over the 5% tolerance
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired == POOL_PAYOFF_COST_REGRESSION
+
+    alerts = await _payoff_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "COST_REGRESSION" in alerts[0].title
+    # Supporting numbers must be embedded so the operator can act from the alert.
+    assert "20.00%" in alerts[0].message  # idle-inclusive cost drift
+    assert "0.4" in alerts[0].message  # pool hit rate
+    assert "8 warm starts" in alerts[0].message
+    bcast.assert_awaited()
+
+    # The marker advanced so a repeat tick is deduped (see next test's path).
+    await db_session.refresh(project)
+    assert (
+        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_PAYOFF_KEY]
+        == POOL_PAYOFF_COST_REGRESSION
+    )
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
+    """A second tick at the same verdict does not fire a second alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    second = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert first == POOL_PAYOFF_COST_REGRESSION
+    assert second is None  # deduped on the persisted marker
+    alerts = await _payoff_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_proven_with_volume_fires_info(db_session, mocker):
+    """PROVEN with warm-start volume at/above the floor fires an INFO alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=10.0,
+            cost_baseline=10.0,  # no cost regression
+            warm_pool=POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired == POOL_PAYOFF_PROVEN
+    alerts = await _payoff_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "PROVEN" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_proven_below_volume_floor_no_alert(
+    db_session, mocker
+):
+    """PROVEN but below the warm-start volume floor does NOT alert (too thin)."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=10.0,
+            cost_baseline=10.0,
+            warm_pool=POOL_PAYOFF_PROVEN_MIN_WARM_STARTS - 1,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_no_lift_no_alert(db_session, mocker):
+    """NO_LIFT (barely serving, cost in tolerance) is not alert-worthy."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=10.0,
+            cost_baseline=10.0,
+            warm_pool=1,
+            pool_origin_share=0.02,
+            hit_rate=0.01,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_insufficient_data_no_alert(db_session, mocker):
+    """INSUFFICIENT_DATA (too few pool dispatches to judge) is not alert-worthy."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=5,  # below POOL_PAYOFF_MIN_POOL_DISPATCHES
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_unscoped_project_no_alert(db_session, mocker):
+    """A project NOT in the warm-pool scope is never evaluated/alerted."""
+    import uuid as _uuid
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    # Scope the pool to some OTHER project so this one is out of scope.
+    _runtime_config["warm_pool_project_allowlist"] = [str(_uuid.uuid4())]
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+# ---------------------------------------------------------------------------
 # Pre-enable counterfactual warm-pool hit-rate estimate
 # ---------------------------------------------------------------------------
 

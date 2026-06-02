@@ -403,6 +403,103 @@ async def test_next_role_ignores_pool_pin_when_pool_disabled(db_session, client)
 
 
 # ---------------------------------------------------------------------------
+# Per-project scope gate: dispatch honors the same allowlist as the maintainer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_project_cold_dispatches_despite_idle_member(
+    db_session, warm_pool_on
+):
+    """A non-empty allowlist that EXCLUDES the task's project must block the lease
+    at dispatch time even though a compatible IDLE member is sitting in the pool —
+    the task falls through to the cold path exactly as if the pool were off for it
+    (an operator scope/Disable decision takes effect immediately, not after the
+    maintainer's next drain)."""
+    project = await _make_project(db_session, name="Out Of Scope")
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id="vm-oos", account_id="acct-1"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+    # Scope the pool to some OTHER project id — this task's project is excluded.
+    shared_state.runtime_config["warm_pool_project_allowlist"] = [
+        "00000000-0000-0000-0000-000000000099"
+    ]
+
+    leased = await _dispatch(db_session, task, account="acct-1")
+    assert leased is None
+    # Member stays IDLE (untouched), task not pinned → cold path.
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.IDLE
+    assert task.vm_instance_id is None
+    assert (task.context or {}).get(WARM_POOL_PIN_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_in_scope_project_still_leases(db_session, warm_pool_on):
+    """A non-empty allowlist that INCLUDES the task's project leases normally."""
+    project = await _make_project(db_session, name="In Scope")
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id="vm-inscope", account_id="acct-1"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+    shared_state.runtime_config["warm_pool_project_allowlist"] = [str(project.id)]
+
+    leased = await _dispatch(db_session, task, account="acct-1")
+    await db_session.commit()
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-inscope"
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.LEASED
+
+
+@pytest.mark.asyncio
+async def test_empty_allowlist_preserves_fleet_wide_leasing(db_session, warm_pool_on):
+    """An empty/unset allowlist keeps today's fleet-wide behavior: any project
+    with the master switch on leases normally (legacy semantics unchanged)."""
+    project = await _make_project(db_session, name="Fleet Wide")
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id="vm-fleet", account_id="acct-1"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+    # Default: warm_pool_project_allowlist unset (empty).
+    assert not shared_state.runtime_config.get("warm_pool_project_allowlist")
+
+    leased = await _dispatch(db_session, task, account="acct-1")
+    await db_session.commit()
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-fleet"
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.LEASED
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_miss_records_out_of_scope_reason(db_session, warm_pool_on):
+    """The out-of-scope skip is recorded in the dispatch funnel with the distinct
+    ``out_of_scope`` reason so observability stays honest about WHY a project
+    cold-dispatched."""
+    from app.warm_backlog_reuse import (
+        _pool_lease_miss_events,
+        get_pool_funnel_snapshot,
+    )
+
+    _pool_lease_miss_events.clear()
+    project = await _make_project(db_session, name="OOS Funnel")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-oos-funnel", account_id="acct-1"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+    shared_state.runtime_config["warm_pool_project_allowlist"] = [
+        "00000000-0000-0000-0000-000000000099"
+    ]
+
+    leased = await _dispatch(db_session, task, account="acct-1")
+    assert leased is None
+    snap = get_pool_funnel_snapshot()
+    assert snap["lease_miss_by_reason"].get("out_of_scope") == 1
+
+
+# ---------------------------------------------------------------------------
 # Account-agnostic lease + claim-time credential re-target
 # ---------------------------------------------------------------------------
 

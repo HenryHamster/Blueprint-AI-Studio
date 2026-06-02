@@ -136,6 +136,13 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
 
 DESIGN_DOC_KEY = "efficiency_baseline"
 
+# Sub-key under the efficiency_baseline container recording the last warm-pool
+# payoff verdict state we raised an operator alert for. The per-project
+# transition check (:func:`maybe_alert_pool_payoff_transition`) compares the
+# current verdict against this marker so it fires once per decision-boundary
+# crossing rather than every hourly tick.
+LAST_ALERTED_PAYOFF_KEY = "last_alerted_payoff_verdict"
+
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
@@ -407,6 +414,169 @@ def compute_pool_cost_amortization_by_account(
             "cost_per_pool_hit_usd": round(idle_cost / hits, 6) if hits else None,
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Per-project warm-pool PAYOFF VERDICT (direction d-… bounded-enable proof)
+# ---------------------------------------------------------------------------
+# The backend already assembles every signal needed to judge whether a bounded
+# single-project warm-pool enable paid off — the idle-inclusive cost-per-merged-
+# PR drift (NO-regression half) and the POOL-origin warm-start share + pool
+# dispatch-funnel hit rate (LIFT half). What it lacks is a single synthesized
+# answer. This classifier folds those raw numbers into one of four verdict
+# states with the supporting numbers and a recommended next action, so an
+# operator managing the pool sees the direction question — "did enabling the
+# pool produce a measured reuse lift WITHOUT a cost regression?" — answered in
+# one place instead of cross-referencing several figures and a trend chart.
+#
+# GROUNDING RULES (mirrors the codebase warnings in _compute_warm_start_origin_
+# breakdown and warm_pool_maintainer.evaluate_pool_cost_guard):
+#   * Read LIFT off the POOL-specific signals — the pool dispatch-funnel hit
+#     rate and the pool-origin SHARE of warm starts — NOT the aggregate
+#     vm_reuse_rate, which is contaminated by chain-continuity / backlog-reuse /
+#     fix-loop reruns.
+#   * Read NO-REGRESSION off the idle-inclusive cost-per-merged-PR drift versus
+#     the immutable pre-pool baseline (that axis already folds pool idle spend
+#     into the numerator, so its drift directly answers the cost question).
+# It is a PURE, DB-free synthesis over fields already on the efficiency-axes
+# response — no new data collection, schema, or migration — so the operator
+# gets a fresh judgment on demand (the cost side updates with the daily
+# snapshot, which is fine for a multi-day proven-over-the-window verdict).
+
+# Verdict states.
+POOL_PAYOFF_PROVEN = "PROVEN"
+POOL_PAYOFF_COST_REGRESSION = "COST_REGRESSION"
+POOL_PAYOFF_NO_LIFT = "NO_LIFT"
+POOL_PAYOFF_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+# Thresholds. The hit-rate floor and minimum dispatch sample size deliberately
+# mirror the warm-pool cost-guard defaults (warm_pool_cost_guard_min_hit_rate /
+# warm_pool_cost_guard_min_dispatches in warm_pool_maintainer) so the verdict's
+# "is the pool serving / do we have enough dispatches to judge" bar matches the
+# guard the maintainer actually drains on. The cost tolerance is a small slack
+# band on the idle-inclusive cost drift — within it, the pool has NOT regressed
+# cost per PR.
+POOL_PAYOFF_HIT_RATE_FLOOR = 0.10
+POOL_PAYOFF_ORIGIN_SHARE_FLOOR = 0.10
+POOL_PAYOFF_MIN_POOL_DISPATCHES = 20
+POOL_PAYOFF_COST_TOLERANCE_PCT = 5.0
+
+# Minimum pool-origin warm starts before a PROVEN verdict is worth an operator
+# alert. PROVEN on only a couple of warm starts is statistically thin — wait for
+# material volume before recommending a wider scope. COST_REGRESSION has no such
+# floor: a cost regression on a bounded enable is actionable immediately.
+POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
+
+
+def compute_pool_payoff_verdict(
+    origin_breakdown: Optional[Dict[str, Any]],
+    cost_incl_axis: Optional[Dict[str, Any]],
+    pool_funnel: Optional[Dict[str, Any]],
+    *,
+    hit_rate_floor: float = POOL_PAYOFF_HIT_RATE_FLOOR,
+    origin_share_floor: float = POOL_PAYOFF_ORIGIN_SHARE_FLOOR,
+    min_pool_dispatches: int = POOL_PAYOFF_MIN_POOL_DISPATCHES,
+    cost_tolerance_pct: float = POOL_PAYOFF_COST_TOLERANCE_PCT,
+) -> Dict[str, Any]:
+    """Synthesize the warm-pool payoff verdict for one project.
+
+    ``origin_breakdown`` is :func:`_compute_warm_start_origin_breakdown`'s output
+    (``pool_origin_share`` + per-origin counts) or ``None``. ``cost_incl_axis``
+    is the ``cost_per_merged_pr_incl_pool_idle_axis`` block
+    (``current``/``baseline``/``drift_pct``) or ``None``. ``pool_funnel`` is the
+    persisted ``pool_dispatch_funnel`` block (``pool_hit_rate`` +
+    ``total_dispatches``) or ``None``. Pure and DB-free so it is unit-testable
+    over synthetic axis inputs.
+
+    Returns ``{state, supporting, recommended_action}`` where ``state`` is one of
+    the ``POOL_PAYOFF_*`` constants and ``supporting`` carries the numbers the
+    classification was read off so the operator can see WHY.
+
+    Classification (checked in order):
+      * ``INSUFFICIENT_DATA`` — no cost baseline/current, or too few pool
+        dispatches to judge lift. Nothing to conclude yet; keep measuring.
+      * ``COST_REGRESSION`` — idle-inclusive cost per merged PR is materially
+        above the pre-pool baseline (``drift_pct`` over tolerance). The headline
+        stop signal regardless of lift: you are paying more per PR.
+      * ``NO_LIFT`` — the pool is barely serving (BOTH the funnel hit rate and
+        the pool-origin share below their floors) so idle spend is not being
+        amortized, even though cost has not (yet) materially regressed.
+      * ``PROVEN`` — the pool is measurably serving warm starts (hit rate OR
+        pool-origin share at/above floor) AND cost per merged PR is within
+        tolerance of the pre-pool baseline.
+    """
+    cost = cost_incl_axis or {}
+    cost_current = cost.get("current")
+    cost_baseline = cost.get("baseline")
+    cost_drift_pct = cost.get("drift_pct")
+
+    funnel = pool_funnel or {}
+    hit_rate = funnel.get("pool_hit_rate")
+    total_dispatches = int(funnel.get("total_dispatches") or 0)
+
+    breakdown = origin_breakdown or {}
+    pool_origin_share = breakdown.get("pool_origin_share")
+    pool_warm_starts = int(breakdown.get("warm_pool") or 0)
+
+    supporting = {
+        "pool_origin_share": pool_origin_share,
+        "pool_warm_starts": pool_warm_starts,
+        "pool_hit_rate": hit_rate,
+        "total_pool_dispatches": total_dispatches,
+        "cost_drift_pct": cost_drift_pct,
+        "cost_incl_idle_current": cost_current,
+        "cost_baseline": cost_baseline,
+    }
+
+    def _result(state: str, recommended_action: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "supporting": supporting,
+            "recommended_action": recommended_action,
+        }
+
+    # INSUFFICIENT_DATA: no baseline/snapshot to compare cost against, or too
+    # few pool dispatches to read lift off the funnel.
+    has_cost = (
+        isinstance(cost_current, (int, float))
+        and isinstance(cost_baseline, (int, float))
+        and cost_baseline != 0
+    )
+    if not has_cost or total_dispatches < min_pool_dispatches:
+        return _result(
+            POOL_PAYOFF_INSUFFICIENT_DATA,
+            "Keep measuring — not enough merged PRs, pool dispatches, or "
+            "baseline yet to judge payoff.",
+        )
+
+    # COST_REGRESSION: idle-inclusive cost per merged PR materially above the
+    # pre-pool baseline. The headline stop signal — flag it regardless of lift.
+    if isinstance(cost_drift_pct, (int, float)) and cost_drift_pct > cost_tolerance_pct:
+        return _result(
+            POOL_PAYOFF_COST_REGRESSION,
+            "Reduce the pool target or disable — idle-inclusive cost per merged "
+            "PR has regressed above the pre-pool baseline.",
+        )
+
+    # NO_LIFT: the pool is barely serving (hit rate AND pool-origin share both
+    # below floor) so idle spend is not being amortized.
+    serving = (isinstance(hit_rate, (int, float)) and hit_rate >= hit_rate_floor) or (
+        isinstance(pool_origin_share, (int, float))
+        and pool_origin_share >= origin_share_floor
+    )
+    if not serving:
+        return _result(
+            POOL_PAYOFF_NO_LIFT,
+            "Tune the pool target or disable — the pool is barely serving warm "
+            "starts, so idle spend is not being amortized.",
+        )
+
+    # PROVEN: measurably serving AND cost within tolerance of the baseline.
+    return _result(
+        POOL_PAYOFF_PROVEN,
+        "Keep the pool — it is serving warm starts without regressing cost per "
+        "merged PR. Consider widening scope.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1554,20 @@ async def read_baseline_with_drift(
             (latest.get("pool_metrics") or {}).get("by_account") or {},
             pool_funnel,
         ),
+        # Synthesized per-project warm-pool PAYOFF VERDICT: folds the LIFT half
+        # (pool-origin warm-start share + pool dispatch-funnel hit rate) and the
+        # NO-regression half (idle-inclusive cost-per-merged-PR drift vs. the
+        # immutable pre-pool baseline) into a single PROVEN / COST_REGRESSION /
+        # NO_LIFT / INSUFFICIENT_DATA answer with supporting numbers and a
+        # recommended action. Read off the POOL-specific signals, NOT the
+        # fix-loop-contaminated vm_reuse_rate (see compute_pool_payoff_verdict).
+        # Lift is read off the persisted snapshot funnel so it reflects the same
+        # multi-day window as the cost drift.
+        "pool_payoff_verdict": compute_pool_payoff_verdict(
+            latest.get("warm_start_origin_breakdown"),
+            cost_incl_pool_idle_axis,
+            latest.get("pool_dispatch_funnel"),
+        ),
     }
 
 
@@ -1440,6 +1624,100 @@ async def maybe_write_daily_snapshot(
     if not _last_run_due(container.get("last_run_at"), now):
         return None
     return await write_snapshot(session, project_id)
+
+
+async def maybe_alert_pool_payoff_transition(
+    session: AsyncSession, project_id: uuid.UUID
+) -> Optional[str]:
+    """Raise an operator Alert when a scoped project's warm-pool payoff verdict
+    crosses a decision boundary, deduplicated per project + verdict.
+
+    Closes the loop on a *bounded* warm-pool enable: a controlled single-project
+    enable otherwise relies on the operator remembering to come back and read the
+    payoff verdict off the warm-VM panel. This per-project check — run every
+    hourly snapshot tick, independent of the daily snapshot-write cadence — emits
+    a deduplicated Alert when the verdict transitions to ``COST_REGRESSION``
+    (WARNING; recommend reducing the target or disabling) or to ``PROVEN`` with
+    material warm-start volume (INFO; recommend considering a wider scope), so the
+    keep / widen / disable decision is driven without polling.
+
+    Reuses the verdict synthesized by :func:`read_baseline_with_drift` (which
+    folds in :func:`compute_pool_payoff_verdict`) rather than re-deriving
+    thresholds. ``NO_LIFT`` and ``INSUFFICIENT_DATA`` are not alert-worthy (the
+    operator should keep measuring / tune, not be paged). DISTINCT from the
+    silent fleet-wide cost-guard auto-drain in ``warm_pool_maintainer``: that
+    protects spend automatically; this informs a per-project strategic decision.
+
+    The transition edge is detected against ``last_alerted_payoff_verdict`` in the
+    efficiency-baseline container (locked read-modify-write, mirroring
+    :func:`write_snapshot`); the Alert title dedup is the cross-instance backstop.
+    Gated on :func:`app.warm_pool.is_project_warm_pool_scoped` so only the scoped
+    bounded-enable projects are evaluated. Returns the verdict state when an alert
+    fired, else ``None``.
+    """
+    from app.alert_dispatch import _maybe_create_pool_payoff_alert  # noqa: PLC0415
+    from app.models import AlertSeverity  # noqa: PLC0415
+    from app.task_locking import with_design_doc_locked  # noqa: PLC0415
+    from app.warm_pool import is_project_warm_pool_scoped  # noqa: PLC0415
+
+    if not is_project_warm_pool_scoped(project_id):
+        return None
+
+    drift = await read_baseline_with_drift(session, project_id)
+    verdict = drift.get("pool_payoff_verdict") or {}
+    state = verdict.get("state")
+    supporting = dict(verdict.get("supporting") or {})
+    recommended_action = verdict.get("recommended_action") or ""
+
+    # Decide alert-worthiness + severity. COST_REGRESSION always alerts; PROVEN
+    # only with material warm-start volume; NO_LIFT / INSUFFICIENT_DATA never.
+    if state == POOL_PAYOFF_COST_REGRESSION:
+        severity = AlertSeverity.WARNING
+    elif (
+        state == POOL_PAYOFF_PROVEN
+        and int(supporting.get("pool_warm_starts") or 0)
+        >= POOL_PAYOFF_PROVEN_MIN_WARM_STARTS
+    ):
+        severity = AlertSeverity.INFO
+    else:
+        return None
+
+    # Transition edge: only fire when the alert-worthy state differs from the
+    # last state we alerted on. Locked read-modify-write via the canonical
+    # design_doc helper so a concurrent snapshot writer cannot clobber the
+    # marker; the lock is held until the alert helper commits, so the marker
+    # advance and the Alert row land atomically.
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        if container.get(LAST_ALERTED_PAYOFF_KEY) == state:
+            return  # no transition — leave the marker untouched
+        container[LAST_ALERTED_PAYOFF_KEY] = state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = True
+
+    await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if not changed["fire"]:
+        return None
+
+    await _maybe_create_pool_payoff_alert(
+        project_id,
+        session,
+        verdict_state=state,
+        supporting=supporting,
+        recommended_action=recommended_action,
+        severity=severity,
+    )
+    logger.info(
+        "[POOL_PAYOFF_ALERT] project=%s verdict=%s severity=%s",
+        project_id,
+        state,
+        severity.value,
+    )
+    return state
 
 
 # ---------------------------------------------------------------------------

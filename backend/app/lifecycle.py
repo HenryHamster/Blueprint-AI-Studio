@@ -619,6 +619,7 @@ async def lifespan(app):
         """
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
+            maybe_alert_pool_payoff_transition,
             maybe_write_daily_snapshot,
         )
 
@@ -646,6 +647,31 @@ async def lifespan(app):
                                 "[EFFICIENCY_SNAPSHOT] project=%s error=%s",
                                 project_id,
                                 proj_exc,
+                            )
+                        # Warm-pool payoff transition alert: runs every hourly
+                        # tick (independent of the daily snapshot-write cadence)
+                        # so a scoped bounded-enable's verdict crossing a decision
+                        # boundary pages the operator promptly. Best-effort —
+                        # isolated try/except + commit so one project never blocks
+                        # the scan.
+                        try:
+                            fired = await maybe_alert_pool_payoff_transition(
+                                scan_session, project_id
+                            )
+                            await scan_session.commit()
+                            if fired is not None:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s pool-payoff "
+                                    "alert fired verdict=%s",
+                                    project_id,
+                                    fired,
+                                )
+                        except Exception as alert_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s payoff-alert error=%s",
+                                project_id,
+                                alert_exc,
                             )
             except asyncio.CancelledError:
                 raise

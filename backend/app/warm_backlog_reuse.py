@@ -802,9 +802,11 @@ def record_pool_lease_miss(reason: str, account: Optional[str] = None) -> None:
 
     reason should be one of: "no_idle_member" (pool empty / all leased),
     "no_compatible_member" (idle members exist but identity/tenant mismatch),
-    "disabled" (warm_pool_enabled off), "lost_lease_race" (a peer dispatcher
-    won the SKIP-LOCKED row). ``account`` is the resolved account id the lease
-    was attempted for; pass it to attribute the miss per account.
+    "disabled" (warm_pool_enabled off), "out_of_scope" (task project not in the
+    warm-pool allowlist — dispatch honors the same per-project scope the
+    maintainer enforces), "lost_lease_race" (a peer dispatcher won the
+    SKIP-LOCKED row). ``account`` is the resolved account id the lease was
+    attempted for; pass it to attribute the miss per account.
     """
     _pool_lease_miss_events.append((_utcnow(), reason, account))
 

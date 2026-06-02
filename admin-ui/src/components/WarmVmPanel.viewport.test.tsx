@@ -4,6 +4,7 @@ import { act } from 'react';
 import { WarmVmPanel } from './WarmVmPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 import type { WarmVmStateResponse } from '../types/warmVm';
+import type { Project } from '../types/project';
 
 const emptyState: WarmVmStateResponse = {
   active_vms: [],
@@ -107,6 +108,26 @@ vi.mock('../api', () => ({
     warm_pool_target_size_by_project: {},
   })),
   setWarmPoolTargetForProject: vi.fn(async () => ({})),
+  // Returns a payoff verdict so the per-project warm-pool payoff row renders
+  // into the 375px overflow gate (it is otherwise absent without a scoped pool).
+  fetchEfficiencyAxes: vi.fn(async () => ({
+    axes: {},
+    pool_payoff_verdict: {
+      state: 'COST_REGRESSION',
+      supporting: {
+        pool_origin_share: 0.45,
+        pool_warm_starts: 9,
+        pool_hit_rate: 0.42,
+        total_pool_dispatches: 64,
+        cost_drift_pct: 23.7,
+        cost_incl_idle_current: 12.4,
+        cost_baseline: 10.0,
+      },
+      recommended_action:
+        'Reduce the pool target or disable — idle-inclusive cost per merged ' +
+        'PR has regressed above the pre-pool baseline.',
+    },
+  })),
   API_BASE_URL: 'http://localhost:8000',
 }));
 
@@ -192,6 +213,44 @@ describe('WarmVmPanel — viewport regression', () => {
     expect(panelRoot).not.toBeNull();
     const rect = panelRoot!.getBoundingClientRect();
     expect(rect.right).toBeLessThanOrEqual(388); // 375px + 12px host padding + 1px tolerance
+  });
+
+  test('scoped warm-pool payoff verdict row renders without horizontal overflow at 375px', async () => {
+    const scopedState = {
+      ...populatedState,
+      pool_metrics: {
+        ...(populatedState as unknown as { pool_metrics: Record<string, unknown> }).pool_metrics,
+        project_allowlist: ['proj-overflow-0001-very-long-project-identifier'],
+      },
+    } as unknown as WarmVmStateResponse;
+    const projects: Project[] = [
+      {
+        id: 'proj-overflow-0001-very-long-project-identifier',
+        name: 'Project With A Deliberately Long Name To Stress The 375px Gate',
+        status: 'active', github_owner: 'o', github_repo: 'r',
+        autonomous_enabled: true, created_at: '2026-01-01',
+      },
+    ];
+    const { authGet } = await import('../api');
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify(scopedState), { status: 200 }),
+    );
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+      });
+      await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    });
+
+    const panelRoot = host?.firstElementChild as HTMLElement | null;
+    expect(panelRoot).not.toBeNull();
+    const rect = panelRoot!.getBoundingClientRect();
+    expect(rect.right).toBeLessThanOrEqual(388);
   });
 
   test('populated VMs + over-threshold clear-rate renders without horizontal overflow at 375px', async () => {

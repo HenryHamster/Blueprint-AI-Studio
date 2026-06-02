@@ -673,6 +673,19 @@ async def try_pool_dispatch(
     # the cold path on None without knowing the reason — only this helper does).
     from app.warm_backlog_reuse import record_pool_lease_miss
 
+    # Per-project scope gate (same check the maintainer + admin-seed enforce).
+    # The master switch above is the fleet kill-switch; this honors a BOUNDED
+    # enable — when an operator scopes the pool to specific projects (or removes
+    # one / clicks Disable), an out-of-scope task must fall to the cold path
+    # IMMEDIATELY, not keep leasing the project's lingering idle members until the
+    # maintainer's next reconcile drains them. Centralizing it here (alongside the
+    # master-switch check) covers every current and future caller. Empty/unset
+    # allowlist ⇒ fleet-wide (is_project_warm_pool_scoped returns True for all),
+    # so legacy behavior is byte-identical.
+    if not is_project_warm_pool_scoped(task.project_id):
+        record_pool_lease_miss("out_of_scope", account=required_account)
+        return None
+
     if is_warm_pool_suppressed():
         record_pool_lease_miss("suppressed")
         return None

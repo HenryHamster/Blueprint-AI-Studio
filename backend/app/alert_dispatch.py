@@ -420,6 +420,93 @@ async def _maybe_create_escalation_alert(
     )
 
 
+# Title prefix for the per-project warm-pool payoff-verdict transition alert.
+# The verdict state is appended to the prefix, so the dedup key
+# ``(project_id, title)`` is effectively per project + verdict — exactly one
+# alert per distinct verdict transition. Keep the prefix stable.
+_POOL_PAYOFF_ALERT_TITLE_PREFIX = "Warm-pool payoff"
+
+
+def _fmt_metric(value: "float | int | None", *, pct: bool = False) -> str:
+    """Render a supporting metric for the alert message ('n/a' when None)."""
+    if not isinstance(value, (int, float)):
+        return "n/a"
+    return f"{value:.2f}%" if pct else f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+async def _maybe_create_pool_payoff_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+    *,
+    verdict_state: str,
+    supporting: "dict",
+    recommended_action: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when a scoped project's warm-pool
+    payoff verdict crosses a decision boundary.
+
+    Closes the loop on a *bounded* warm-pool enable: when the per-project payoff
+    verdict transitions to ``COST_REGRESSION`` (idle-inclusive cost per merged PR
+    is materially above the pre-pool baseline) or to ``PROVEN`` with material
+    warm-start volume, the operator is alerted so the keep / widen / disable
+    decision is made without polling the warm-VM panel. DISTINCT from the silent,
+    cost-only, fleet-wide auto-drain guard (``warm_pool_maintainer``): that
+    protects spend automatically; this informs a per-project strategic decision.
+
+    The message carries the supporting numbers (pool hit rate, pool-origin
+    warm-start share, idle-inclusive cost drift vs. baseline) plus the
+    recommended action so the operator can act from the alert alone.
+
+    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` where the title
+    encodes the verdict state — so a verdict that persists across many ticks
+    raises exactly ONE alert, and a genuinely different verdict gets its own.
+    The supporting numbers live in the message so a drifting metric never
+    defeats dedup.
+    """
+    title = f"{_POOL_PAYOFF_ALERT_TITLE_PREFIX}: {verdict_state} on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        f"Warm-pool payoff verdict for project {project_id} is now "
+        f"{verdict_state}. Pool hit rate: "
+        f"{_fmt_metric(supporting.get('pool_hit_rate'))}; pool-origin warm-start "
+        f"share: {_fmt_metric(supporting.get('pool_origin_share'))} "
+        f"({int(supporting.get('pool_warm_starts') or 0)} warm starts over "
+        f"{int(supporting.get('total_pool_dispatches') or 0)} pool dispatches); "
+        f"idle-inclusive cost/PR drift: "
+        f"{_fmt_metric(supporting.get('cost_drift_pct'), pct=True)} "
+        f"(current {_fmt_metric(supporting.get('cost_incl_idle_current'))} vs "
+        f"baseline {_fmt_metric(supporting.get('cost_baseline'))}). "
+        f"{recommended_action}"
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=severity,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _maybe_create_precondition_blocker_alert(
     task: "Task",
     session: AsyncSession,
