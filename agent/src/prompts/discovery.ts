@@ -3,6 +3,7 @@ import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import { sendLog, WORKSPACE } from '../index.js';
 import type { BuildConfig } from '../index.js';
+import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
 export function buildFileTree(ws: WebSocket | null): string {
   try {
@@ -39,6 +40,55 @@ export function buildFileTree(ws: WebSocket | null): string {
     sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
     return '';
   }
+}
+
+// ── Greenfield (empty / near-empty repo) detection ──────────────────────────
+// Config/scaffolding files that do NOT count as real source. A repo containing
+// only these (plus dotfiles) is a fresh project to bootstrap, not a codebase to
+// read and improve. Extension-based so it is language-agnostic.
+const NON_SOURCE_EXT = /\.(md|markdown|json|ya?ml|toml|cfg|ini|txt|lock|lockb)$/i;
+// Common config/manifest basenames with no telling extension.
+const NON_SOURCE_BASENAMES = new Set([
+  'license', 'notice', 'authors', 'codeowners', 'dockerfile', 'makefile',
+  'procfile', '.gitignore', '.gitattributes', '.dockerignore', '.editorconfig',
+  '.npmrc', '.nvmrc', '.prettierrc', '.eslintrc',
+]);
+
+/**
+ * Counts the real source files in the cloned working tree, excluding
+ * config/scaffolding (lockfiles, *.md/*.json/*.yml/*.toml, dotfiles, common
+ * manifests). Reuses the same `git ls-files` enumeration as buildFileTree.
+ * Returns 0 on any failure (treated as no source).
+ */
+export function countSourceFiles(): number {
+  try {
+    const out = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' });
+    const files = out
+      .split('\n')
+      .filter(f => f && !f.includes('node_modules/') && !f.includes('dist/'));
+    let count = 0;
+    for (const f of files) {
+      const base = (f.split('/').pop() || f).toLowerCase();
+      // Dotfiles (e.g. .gitignore, .env) and dot-prefixed config are scaffolding.
+      if (base.startsWith('.')) continue;
+      if (NON_SOURCE_BASENAMES.has(base)) continue;
+      if (NON_SOURCE_EXT.test(base)) continue;
+      count++;
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * True when the working tree has effectively no source — only config and
+ * scaffolding — so the system should bootstrap the foundation from the project
+ * goal rather than assume an existing codebase. Gated by a single threshold
+ * constant (GREENFIELD_SOURCE_FILE_THRESHOLD).
+ */
+export function detectGreenfield(): boolean {
+  return countSourceFiles() <= GREENFIELD_SOURCE_FILE_THRESHOLD;
 }
 
 // ── Test Convention Extraction ───────────────────────────────────────────────

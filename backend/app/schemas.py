@@ -364,6 +364,16 @@ class OnboardPayload(BaseModel):
     name: str | None = None
     build_config_override: Dict[str, Any] | None = None
     promotion_target: str | None = None
+    # User's goal for this repo — a short statement of what Blueprint should
+    # achieve. Seeded at creation time into the project's strategic intent
+    # (problem_model.intent + a user conversation message) so the first
+    # strategic cycle reasons from the user's actual ask rather than a blank
+    # slate. Optional: an empty/omitted goal preserves today's behavior.
+    goal: str | None = Field(None, max_length=5000)
+    # Optional initial steering merged into the user-editable strategic-intent
+    # subset (only the ``context`` / ``constraints`` keys are applied; other
+    # keys are ignored by the seeding path). None/omitted is a no-op.
+    initial_steering: Dict[str, Any] | None = None
 
 
 # --- Pipeline Efficiency ---

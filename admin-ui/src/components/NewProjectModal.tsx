@@ -47,6 +47,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const [step, setStep] = useState<Step>(setupProject ? 'success' : 'repo');
   const [repoInput, setRepoInput] = useState('');
   const [projectName, setProjectName] = useState('');
+  const [goal, setGoal] = useState('');
+  const [initialSteering, setInitialSteering] = useState('');
   const [repoError, setRepoError] = useState('');
   const [submitError, setSubmitError] = useState('');
   const [createdProjectId, setCreatedProjectId] = useState(setupProject?.id ?? '');
@@ -140,12 +142,16 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
     setSubmitError('');
     try {
       const effectivePromotionTarget = promotionTargetInput.trim() || undefined;
+      const trimmedGoal = goal.trim();
+      const trimmedSteering = initialSteering.trim();
       const data = await onboardProject(
         parsed.owner,
         parsed.repo,
         projectName.trim() || undefined,
         undefined,
         effectivePromotionTarget,
+        trimmedGoal || undefined,
+        trimmedSteering ? { context: { notes: trimmedSteering } } : undefined,
       );
       const projectId = data.project_id;
       setCreatedProjectId(projectId);
@@ -381,6 +387,37 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   onChange={e => setProjectName(e.target.value)}
                   placeholder={parsed ? `${parsed.owner}/${parsed.repo}` : 'Defaults to owner/repo'}
                   className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                />
+              </div>
+
+              <div className="mb-4">
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                  Goal{' '}
+                  <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
+                </label>
+                <textarea
+                  value={goal}
+                  onChange={e => setGoal(e.target.value)}
+                  rows={2}
+                  placeholder="What do you want Blueprint to achieve on this repo?"
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
+                />
+                <p className="text-[9px] text-neutral-600 mt-1">
+                  Seeds the project's strategic intent so the first cycle reasons from your goal. Leave blank to skip.
+                </p>
+              </div>
+
+              <div className="mb-6">
+                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                  Initial Steering{' '}
+                  <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
+                </label>
+                <textarea
+                  value={initialSteering}
+                  onChange={e => setInitialSteering(e.target.value)}
+                  rows={2}
+                  placeholder="Constraints, priorities, or project context"
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
                 />
               </div>
 

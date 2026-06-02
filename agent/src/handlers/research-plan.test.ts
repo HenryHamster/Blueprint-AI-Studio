@@ -60,6 +60,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
 
 import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner } from '../index.js';
+import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import {
@@ -1675,6 +1676,65 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(script).toContain('_call "set_evidence_progress"');
     // Usage string advertises the new op.
     expect(script).toContain('set-evidence-progress <json-or-file>');
+  });
+});
+
+// ── handlePlan greenfield bootstrap-from-goal mode ───────────────────────────
+// On an empty / near-empty repo the plan prompt must gain an explicit greenfield
+// branch that decomposes "build the foundation for the goal" and overrides the
+// no-op path (absent source is NOT a valid no_op_reason). A populated repo must
+// be unaffected — no greenfield branch, standard no-op guidance intact.
+describe('handlePlan greenfield bootstrap mode', () => {
+  const GF_TASK_ID = 'gf-task-001';
+  const GF_GH_TOKEN = 'gh-token';
+  const GF_OWNER = 'owner';
+  const GF_REPO = 'repo';
+  const GF_WS = null;
+  const GF_STATUS_REF = () => ({ value: '' });
+  const GF_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const GF_PAYLOAD = { base_branch: 'main', prompt: 'build the thing' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  afterEach(() => {
+    // Restore the module-default so other suites see an empty tree.
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+  });
+
+  it('injects the greenfield foundation branch when the tree is config-only', async () => {
+    // git ls-files returns only config/scaffolding → 0 source files → greenfield.
+    vi.mocked(execFileSync).mockReturnValue(
+      'package.json\nREADME.md\ntsconfig.json\n.gitignore\npnpm-lock.yaml\n' as never,
+    );
+    await handlePlan(GF_TASK_ID, GF_PAYLOAD, GF_TASK, GF_GH_TOKEN, GF_OWNER, GF_REPO, GF_WS, GF_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('GREENFIELD MODE');
+    expect(p).toContain('build the foundation for the project goal');
+    // No-op path must be overridden: absent source is not a valid no-op here.
+    expect(p).toContain('GREENFIELD CAVEAT');
+    expect(p).toContain('is NOT a valid no_op_reason');
+    // Standard no-op guidance is still present (greenfield branch is additive).
+    expect(p).toContain('no_op_reason');
+  });
+
+  it('omits the greenfield branch and keeps standard no-op guidance on a populated repo', async () => {
+    // git ls-files returns many real source files → well above the threshold.
+    const sourceFiles = Array.from({ length: 20 }, (_, i) => `src/module${i}.ts`).join('\n');
+    vi.mocked(execFileSync).mockReturnValue(sourceFiles as never);
+    await handlePlan(GF_TASK_ID, GF_PAYLOAD, GF_TASK, GF_GH_TOKEN, GF_OWNER, GF_REPO, GF_WS, GF_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('GREENFIELD MODE');
+    expect(p).not.toContain('GREENFIELD CAVEAT');
+    // Standard no-op guidance is untouched.
+    expect(p).toContain('no_op_reason');
+    expect(p).toContain('Affirmative no-op');
   });
 });
 

@@ -16,7 +16,7 @@ import {
   extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, detectGreenfield, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -872,13 +872,24 @@ export async function handlePlan(
   const cochangeHintsSection = formatCochangeHints(task.direction_context as Record<string, unknown> | undefined);
   const decompositionOutcomesSection = formatDecompositionOutcomes(task.direction_context as Record<string, unknown> | undefined);
 
+  // Greenfield mode: when the cloned tree has effectively no source (only
+  // config/scaffolding), the plan agent must NOT treat absent code as "nothing
+  // to decompose". Mirror the research agent's "if the codebase is nearly empty"
+  // branch and decompose "build the foundation for <goal>" instead.
+  const isGreenfield = detectGreenfield();
+  const greenfieldBranch = isGreenfield ? `
+**GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).**
+Do NOT treat absent source as "nothing to decompose". This is a first-class bootstrap case: your job is to decompose **"build the foundation for the project goal"** into ordered implementation subtasks. Drive the foundation from the **Project Vision / goal above** and any design-doc specs — pick the structure, entry points, and core modules the goal requires, and order them so later subtasks build on earlier ones. An empty repo with a stated goal is NOT a valid no-op.
+
+` : '';
+
   const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${planRetryContext}${contextPrefix}${cochangeHintsSection}${decompositionOutcomesSection}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}
-
+${greenfieldBranch}
 Instructions:
-1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.
+1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.${isGreenfield ? ' (On a greenfield repo there is little to read — lean on the project goal and design-doc specs to decide the foundation.)' : ''}
 2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones. A single subtask that modifies 200+ lines across 5+ files is fine — the implementing agent is capable. Only split when subtasks are genuinely independent or have different risk profiles.
 3. Identify dependencies between subtasks — which must complete before others can start.
 4. Write clear, self-contained prompts for each subtask. Describe the PROBLEM and desired outcome — do not prescribe exact line numbers. The implementing agent has full repo access and will figure out the details.
@@ -919,7 +930,9 @@ If — and ONLY if — your exploration shows there is genuinely nothing to buil
   "no_op_reason": "Specific, verified reason (at least 30 chars) naming exactly what is already present / why no code subtasks are needed — cite the concrete files, symbols, or sibling work you checked, e.g. 'app/config.py already loads repo layout from settings.REPO_LAYOUT and shared_state.py:get_repo_root() derives all paths from it; no hardcoded layout remains to de-hardcode'."
 }
 
-The no_op_reason MUST be at least 30 characters and name the concrete evidence you verified. This is the ONLY clean way for a plan to complete with zero subtasks — an empty "subtasks" array WITHOUT a specific no_op_reason is treated as a failed plan. This is NOT a give-up path: only use it when you have actually VERIFIED the work is already done or genuinely needs no code change. If you simply could not figure out how to decompose the task, that is a real plan failure — let the agent exit non-zero rather than emitting a bogus no_op_reason.
+The no_op_reason MUST be at least 30 characters and name the concrete evidence you verified. This is the ONLY clean way for a plan to complete with zero subtasks — an empty "subtasks" array WITHOUT a specific no_op_reason is treated as a failed plan. This is NOT a give-up path: only use it when you have actually VERIFIED the work is already done or genuinely needs no code change. If you simply could not figure out how to decompose the task, that is a real plan failure — let the agent exit non-zero rather than emitting a bogus no_op_reason.${isGreenfield ? `
+
+GREENFIELD CAVEAT: on this empty/near-empty repo, "there is no source code to change" or "the codebase is empty" is NOT a valid no_op_reason. Absent source is exactly the signal to bootstrap — decompose "build the foundation for the goal" into ordered subtasks driven by the Project Vision / goal and any design-doc specs. Only emit a no-op here if the foundation the goal requires already exists on this branch.` : ''}
 
 Risk guidance:
 - risk=high: changes to auth flows, JWT/token handling, database models (models.py), Alembic migrations, core orchestration (main.py worker loops), VM provisioning (compute.py), any change that if wrong could cause data loss or security breach

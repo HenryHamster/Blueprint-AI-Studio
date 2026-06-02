@@ -24,6 +24,7 @@ from app.problem_model import (
     append_revision_log,
     append_self_reflection,
     apply_agent_update,
+    apply_user_intent_patch,
     archive_closed_gaps,
     is_empty,
     parse_problem_model,
@@ -414,6 +415,77 @@ def test_apply_agent_update_no_changes_still_logs():
     assert diff == {}
     assert len(new_raw["revision_log"]) == 1
     assert new_raw["revision_log"][0]["summary"] == "no structural changes"
+
+
+# ---------------------------------------------------------------------------
+# apply_user_intent_patch — the user-facing write path (onboarding + PATCH)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_user_intent_patch_seeds_goal_into_intent():
+    """Onboarding goal capture: an empty model gains the user's intent and
+    is attributed to the user."""
+    model = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Ship a CLI", "current_focus": "Ship a CLI"}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "Ship a CLI"
+    assert model.intent.current_focus == "Ship a CLI"
+    assert model.revision == 1
+    assert model.last_updated == "2026-06-02T12:00:00"
+    assert model.last_updated_by == "user"
+
+
+def test_apply_user_intent_patch_merges_steering_subset():
+    """Optional steering reaches the context / constraints subset."""
+    model = apply_user_intent_patch(
+        {"revision": 2, "intent": {"purpose": "x"}},
+        {
+            "context": {"project_type": "startup", "users": "early adopters"},
+            "constraints": ["No breaking changes"],
+        },
+        "2026-06-02T12:00:00",
+    )
+    assert model.context.project_type == "startup"
+    assert model.constraints == ["No breaking changes"]
+    # Existing intent is preserved when not in the patch.
+    assert model.intent.purpose == "x"
+    assert model.revision == 3
+
+
+def test_apply_user_intent_patch_empty_patch_is_valid_no_op_bump():
+    """An empty steering payload preserves content but still records a
+    user-attributed revision — today's skip-the-goal behavior."""
+    model = apply_user_intent_patch(
+        {"revision": 4, "intent": {"purpose": "kept"}},
+        {},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "kept"
+    assert model.revision == 5
+    assert model.last_updated_by == "user"
+
+
+def test_apply_user_intent_patch_rejects_agent_owned_fields():
+    """Users cannot overwrite gaps / capabilities / other agent-owned state."""
+    with pytest.raises(ValueError, match="agent-owned"):
+        apply_user_intent_patch(
+            None,
+            {"gaps": [{"id": "g-x", "name": "x"}]},
+            "2026-06-02T12:00:00",
+        )
+
+
+def test_apply_user_intent_patch_rejects_malformed_subset():
+    """A malformed value inside an allowed field still surfaces as a
+    ValidationError, not a silent persist."""
+    with pytest.raises(ValidationError):
+        apply_user_intent_patch(
+            None,
+            {"intent": {"purpose": 123}},  # purpose must be a str
+            "2026-06-02T12:00:00",
+        )
 
 
 # ---------------------------------------------------------------------------

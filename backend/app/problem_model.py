@@ -500,6 +500,60 @@ def _diff_summary(diff: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# User-editable intent updates
+# ---------------------------------------------------------------------------
+
+USER_EDITABLE_FIELDS = ("intent", "context", "constraints")
+"""Problem-model fields a human may write directly.
+
+Everything else (gaps, capabilities, friction, archived_gaps,
+pending_user_confirmation, revision_log, revision metadata) is agent-owned and
+must not be overwritten by user-facing write paths. The onboarding
+goal/steering capture seeds the user's strategic intent through this same
+subset (see ``admin_onboard._seed_strategic_intent``); future user-facing
+write paths should reuse it so the editable subset stays consistent.
+"""
+
+
+def apply_user_intent_patch(
+    current_raw: dict | None,
+    patch: dict[str, Any],
+    now_iso: str,
+) -> ProblemModel:
+    """Merge a user-supplied subset into the current problem model.
+
+    Only :data:`USER_EDITABLE_FIELDS` are accepted; any other key raises
+    :class:`ValueError` so callers can surface a 400 instead of silently
+    letting a user overwrite agent-owned state. Bumps the revision, stamps
+    ``last_updated``/``last_updated_by='user'``, and returns the validated
+    model (callers ``model_dump()`` it for JSONB persistence).
+
+    Used by ``admin_onboard._seed_strategic_intent`` to merge optional
+    onboarding steering; callers pre-filter to the editable subset when they
+    want unknown keys ignored rather than rejected.
+
+    An empty ``patch`` is a valid no-op edit (still a user-attributed
+    revision bump), preserving today's behavior for users who supply no
+    steering. Raises :class:`pydantic.ValidationError` if the merged result
+    is malformed.
+    """
+    invalid = sorted(set(patch) - set(USER_EDITABLE_FIELDS))
+    if invalid:
+        raise ValueError(
+            f"Cannot edit agent-owned problem_model fields: {invalid}. "
+            f"Editable fields: {sorted(USER_EDITABLE_FIELDS)}"
+        )
+    current = parse_problem_model(current_raw)
+    merged = current.model_dump()
+    merged.update(patch)
+    validated = ProblemModel.model_validate(merged)
+    validated.revision = current.revision + 1
+    validated.last_updated = now_iso
+    validated.last_updated_by = "user"
+    return validated
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,

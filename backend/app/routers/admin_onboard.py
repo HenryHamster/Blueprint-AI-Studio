@@ -17,7 +17,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter
-from app.models import Project, ProjectMember, ProjectStatus
+from app.models import Project, ProjectMember, ProjectStatus, ProjectMessage, MessageType
 from app.auth import get_current_user, require_admin
 from app.schemas import OnboardPayload
 from app.task_locking import with_design_doc_locked
@@ -195,6 +195,74 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
     return config
 
 
+def _seed_strategic_intent(
+    project: Project, goal: str | None, steering: Dict[str, Any] | None
+) -> ProjectMessage | None:
+    """Seed the user's onboarding goal into the project's strategic intent.
+
+    Blueprint's bootstrap reads the user's intent from two channels on the first
+    strategic cycle: ``problem_model.intent`` and the user-message conversation
+    thread. This writes the goal into BOTH so cycle 1 reasons from the user's
+    actual ask rather than a blank slate:
+
+    1. ``problem_model.intent.purpose`` + ``current_focus`` (with a
+       ``user_message`` provenance source), plus any optional steering merged
+       into the same user-editable ``context`` / ``constraints`` subset the
+       post-creation PATCH path accepts.
+    2. A returned ``from_type='user'`` ProjectMessage carrying the goal verbatim
+       so it lands in ``conversation_thread``.
+
+    Returns ``None`` and makes no changes when the goal is empty, preserving
+    today's behavior for users who skip it.
+    """
+    goal = (goal or "").strip()
+    if not goal:
+        return None
+
+    from pydantic import ValidationError
+    from app.problem_model import (
+        apply_user_intent_patch,
+        parse_problem_model,
+        Source,
+    )
+
+    message = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content=goal,
+    )
+
+    pm = parse_problem_model(project.problem_model)
+    pm.intent.purpose = goal
+    pm.intent.current_focus = goal
+    pm.intent.source = Source(
+        type="user_message", message_id=str(message.id), excerpt=goal[:120]
+    )
+    if steering:
+        # Reuse only the user-editable subset (context / constraints); ignore
+        # any agent-owned keys a caller might pass. Route the merge through the
+        # shared apply_user_intent_patch helper so steering is validated the
+        # same way the post-creation project-config edits are — a malformed
+        # value (e.g. a bare string where ProjectContext is expected) surfaces
+        # as a clean 400 rather than an unhandled ValidationError 500.
+        patch = {k: steering[k] for k in ("context", "constraints") if k in steering}
+        if patch:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            try:
+                pm = apply_user_intent_patch(pm.model_dump(), patch, now_iso)
+            except (ValueError, ValidationError) as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid initial_steering: {e}",
+                ) from e
+    pm.last_updated_by = "user"
+    project.problem_model = pm.model_dump()
+    flag_modified(project, "problem_model")
+
+    return message
+
+
 @router.post("/projects/onboard")
 @limiter.limit("10/minute")
 async def onboard_project(
@@ -358,6 +426,18 @@ async def onboard_project(
 
     await session.flush()
     await with_design_doc_locked(session, project.id, _seed_remediation_config)
+
+    # Seed the user's goal + optional steering into strategic intent so the
+    # first strategic cycle reasons from it. Read defensively: the OnboardPayload
+    # schema field lands via a sibling task, so until then this is a no-op.
+    seeded_message = _seed_strategic_intent(
+        project,
+        getattr(payload, "goal", None),
+        getattr(payload, "initial_steering", None),
+    )
+    if seeded_message is not None:
+        session.add(seeded_message)
+        session.add(project)
 
     await session.commit()
     await session.refresh(project)

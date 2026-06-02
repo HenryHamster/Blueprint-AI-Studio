@@ -20,7 +20,13 @@ from sqlalchemy import select
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskStatus, RECOMMENDED_MODE_META_KEY
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    ProjectMessage,
+    RECOMMENDED_MODE_META_KEY,
+)
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
@@ -5226,6 +5232,120 @@ class TestGetProjectIntegrationBranch:
         """
         project = _make_project(integration_branch="release", promotion_target="release")
         assert _shared_state.get_project_integration_branch(project) == "release"
+
+
+# ── Onboarding goal reaches the first strategic cycle's payload ─────────────────
+#
+# The New Project onboarding flow seeds the user's goal into BOTH channels the
+# strategic agent's bootstrap reads on cycle 1: problem_model.intent (purpose +
+# current_focus) and a from_type='user' ProjectMessage that lands in the
+# conversation thread. These tests lock in that the seeded intent and message
+# actually reach the spawned strategic-cycle payloads, and that an empty goal
+# leaves today's blank-slate behavior intact.
+
+_ONBOARD_GOAL = "Ship a self-serve billing portal for small teams"
+
+
+def _seeded_problem_model(goal: str) -> dict:
+    """Build a problem_model dict shaped exactly like onboarding's seed.
+
+    Mirrors admin_onboard._seed_strategic_intent: purpose + current_focus set
+    to the goal with a user_message provenance source, validated through the
+    real model so the test exercises the same payload the agent receives.
+    """
+    from app.problem_model import parse_problem_model, Source
+
+    pm = parse_problem_model(None)
+    pm.intent.purpose = goal
+    pm.intent.current_focus = goal
+    pm.intent.source = Source(type="user_message", excerpt=goal[:120])
+    pm.last_updated_by = "user"
+    return pm.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_seeded_goal_reaches_strategic_review_payload(db_session):
+    """Goal seeded at onboarding is visible to the first strategic_review cycle.
+
+    Asserts both bootstrap channels carry it: problem_model.intent.purpose and
+    the from_type='user' message in conversation_thread + open_messages.
+    """
+    project = _make_project(
+        vision={},  # blank-slate vision, as a freshly-onboarded project has
+        problem_model=_seeded_problem_model(_ONBOARD_GOAL),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id, from_type="user", content=_ONBOARD_GOAL
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # Channel 1: intent/purpose
+    assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    # Channel 2: user-message conversation history
+    thread_contents = [m["content"] for m in payload["conversation_thread"]]
+    assert _ONBOARD_GOAL in thread_contents
+    open_contents = [m["content"] for m in payload["open_messages"]]
+    assert _ONBOARD_GOAL in open_contents
+
+
+@pytest.mark.asyncio
+async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
+    """Goal seeded at onboarding is visible to the Phase-1 design_doc_update cycle."""
+    project = _make_project(
+        vision={},
+        problem_model=_seeded_problem_model(_ONBOARD_GOAL),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id, from_type="user", content=_ONBOARD_GOAL
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    open_contents = [m["content"] for m in payload["open_messages"]]
+    assert _ONBOARD_GOAL in open_contents
+
+
+@pytest.mark.asyncio
+async def test_empty_goal_leaves_strategic_payload_blank(db_session):
+    """A skipped goal preserves today's blank-slate behavior — no seeded
+    purpose and no seeded user message reach the strategic payload."""
+    project = _make_project(vision={}, problem_model={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # No purpose was seeded (empty/absent problem_model intent).
+    assert not (payload.get("problem_model") or {}).get("intent", {}).get("purpose")
+    assert payload["conversation_thread"] == []
+    assert payload["open_messages"] == []
 
 
 class TestParallelismHint:

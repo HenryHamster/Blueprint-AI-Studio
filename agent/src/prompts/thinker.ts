@@ -15,6 +15,7 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
       '3. Identify dependencies between subtasks — which must complete before others can start.',
       '4. Write clear, self-contained prompts for each subtask.',
       'Output EXACTLY one JSON block as the VERY LAST thing in your response:',
+      'GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).',
     );
   } else {
     blocks.push(

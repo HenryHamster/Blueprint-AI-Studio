@@ -5,9 +5,9 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient
 
 from app.main import app
-from app.models import Project
+from app.models import Project, ProjectMessage, ProjectStatus
 from app.auth import get_current_user, require_admin
-from app.routers.admin_onboard import _detect_build_config
+from app.routers.admin_onboard import _detect_build_config, _seed_strategic_intent
 
 TEST_USER_ID = "test-user-123"
 
@@ -869,6 +869,126 @@ class TestOnboardBranchBackfillIntegration:
         await db_session.refresh(project)
         assert project.integration_branch == "develop"
         assert project.promotion_target == "develop"
+
+
+class TestOnboardStrategicIntentSeed:
+    """The onboarding goal is seeded into both strategic-intent channels."""
+
+    def _new_project(self):
+        return Project(
+            name="acme/myrepo",
+            user_id=TEST_USER_ID,
+            status=ProjectStatus.DEPLOYING,
+            github_owner="acme",
+            github_repo="myrepo",
+        )
+
+    def test_goal_seeded_into_problem_model_intent(self):
+        """A goal populates intent.purpose + current_focus with user provenance."""
+        from app.problem_model import parse_problem_model
+
+        project = self._new_project()
+        goal = "Ship a self-serve billing portal"
+        msg = _seed_strategic_intent(project, goal, None)
+
+        pm = parse_problem_model(project.problem_model)
+        assert pm.intent.purpose == goal
+        assert pm.intent.current_focus == goal
+        assert pm.last_updated_by == "user"
+        assert pm.intent.source is not None
+        assert pm.intent.source.type == "user_message"
+        assert pm.intent.source.message_id == str(msg.id)
+
+    def test_goal_returns_user_conversation_message(self):
+        """The goal is also returned as a from_type='user' open ProjectMessage
+        so it lands in the strategic agent's conversation_thread on cycle 1."""
+        project = self._new_project()
+        goal = "Make onboarding capture the user's goal"
+        msg = _seed_strategic_intent(project, goal, None)
+
+        assert isinstance(msg, ProjectMessage)
+        assert msg.from_type == "user"
+        assert msg.content == goal
+        assert msg.status == "open"
+        assert msg.project_id == project.id
+
+    def test_empty_goal_is_a_noop(self):
+        """An empty/whitespace goal preserves today's blank-slate behavior."""
+        for goal in (None, "", "   "):
+            project = self._new_project()
+            assert _seed_strategic_intent(project, goal, None) is None
+            # problem_model untouched — still the column default (empty dict).
+            assert not project.problem_model
+
+    def test_steering_merges_into_user_editable_subset(self):
+        """Optional steering merges constraints/context; agent-owned keys ignored."""
+        from app.problem_model import parse_problem_model
+
+        project = self._new_project()
+        steering = {
+            "constraints": ["no breaking API changes"],
+            "context": {"project_type": "startup"},
+            "gaps": [{"id": "x", "name": "ignored"}],  # agent-owned -> dropped
+        }
+        _seed_strategic_intent(project, "Grow revenue", steering)
+
+        pm = parse_problem_model(project.problem_model)
+        assert pm.constraints == ["no breaking API changes"]
+        assert pm.context.project_type == "startup"
+        assert pm.gaps == []  # agent-owned steering key was not applied
+
+    def test_steering_ui_notes_shape_merges_into_context(self):
+        """The UI sends free-text steering as {'context': {'notes': <text>}} —
+        a real ProjectContext field — which must merge cleanly (regression for
+        the onboarding 500 when a bare string was sent for context)."""
+        from app.problem_model import parse_problem_model
+
+        project = self._new_project()
+        steering = {"context": {"notes": "Prioritize reliability over features"}}
+        _seed_strategic_intent(project, "Stabilize the platform", steering)
+
+        pm = parse_problem_model(project.problem_model)
+        assert pm.context.notes == "Prioritize reliability over features"
+
+    def test_malformed_steering_context_raises_400_not_500(self):
+        """A wrong-typed steering value (bare string where ProjectContext is
+        expected) must surface as a clean HTTP 400, not an unhandled
+        pydantic ValidationError that 500s the onboard transaction."""
+        from fastapi import HTTPException
+
+        project = self._new_project()
+        # This is the exact shape the pre-fix UI sent: a bare string for context.
+        steering = {"context": "just some free text"}
+        with pytest.raises(HTTPException) as exc_info:
+            _seed_strategic_intent(project, "Do the thing", steering)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_seeded_message_is_queryable_for_first_cycle(self, db_session):
+        """End-to-end: a seeded goal message persists as an open user message,
+        which is exactly what strategic_spawning selects for cycle 1."""
+        from sqlalchemy import select
+
+        project = self._new_project()
+        db_session.add(project)
+        await db_session.flush()
+
+        msg = _seed_strategic_intent(project, "Reach product-market fit", None)
+        db_session.add(msg)
+        db_session.add(project)
+        await db_session.commit()
+
+        rows = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_type == "user",
+                    ProjectMessage.status == "open",
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].content == "Reach product-market fit"
 
 
 class TestBuildConfigDetection:
