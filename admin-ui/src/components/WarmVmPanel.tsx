@@ -262,6 +262,8 @@ export function WarmVmPanel({ onViewTask }: Props) {
 
               {pool && <PoolMetricsRow pool={pool} />}
 
+              {pool && <PoolAccountMixRow pool={pool} />}
+
               {data.spawn_pin_funnel && (
                 <SpawnPinFunnelRow funnel={data.spawn_pin_funnel} />
               )}
@@ -350,6 +352,60 @@ function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {
           <span><span className="text-neutral-500">hit rate</span>: <span className="font-mono text-neutral-300">{hitRate === null || hitRate === undefined ? '—' : `${Math.round(hitRate * 100)}%`}</span></span>
         </>
       )}
+    </div>
+  );
+}
+
+// Per-account warm-pool cost-amortization, as joined server-side by
+// admin_health._get_pool_metrics -> cost_amortization_by_account. Defined
+// locally because the shared PoolMetrics type (admin-ui/src/types/warmVm.ts)
+// is owned by a sibling cluster; the field is read here via a widening cast so
+// this component stays within its single declared file. Older backends omit the
+// field entirely (cast yields undefined) and the row simply does not render.
+interface PoolAccountAmortization {
+  pool_idle_cost_usd: number;
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  cost_per_pool_hit_usd: number | null;
+}
+
+function PoolAccountMixRow({ pool }: { pool: PoolMetrics }) {
+  const byAccount = (pool as PoolMetrics & {
+    cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
+  }).cost_amortization_by_account ?? {};
+  // Busiest account first so the operator reads the heaviest dispatch mix on top.
+  const entries = Object.entries(byAccount).sort(
+    (a, b) => b[1].total_dispatches - a[1].total_dispatches,
+  );
+  if (entries.length === 0) return null;
+  return (
+    <div
+      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      data-testid="pool-account-mix-row"
+    >
+      <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
+        Warm Pool by Account
+      </span>
+      <div className="space-y-1">
+        {entries.map(([account, a]) => {
+          const hr = a.pool_hit_rate;
+          return (
+            <div
+              key={account}
+              className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5"
+              data-testid={`pool-account-${account}`}
+            >
+              <span className="font-mono text-violet-300 break-all min-w-0">{account}</span>
+              <span><span className="text-neutral-500">hit rate</span>: <span className="font-mono text-neutral-300">{hr === null || hr === undefined ? '—' : `${Math.round(hr * 100)}%`}</span></span>
+              <span><span className="text-neutral-500">warm</span>: <span className="font-mono text-emerald-400">{a.pool_lease_hits}</span><span className="text-neutral-600">/{a.total_dispatches}</span></span>
+              <span><span className="text-neutral-500">idle cost</span>: <span className="font-mono text-amber-400">{fmtUsd(a.pool_idle_cost_usd)}</span></span>
+              <span><span className="text-neutral-500">$/warm</span>: <span className="font-mono text-neutral-300">{fmtUsd(a.cost_per_pool_hit_usd ?? undefined)}</span></span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

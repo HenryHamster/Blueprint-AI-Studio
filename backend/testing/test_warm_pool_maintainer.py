@@ -106,10 +106,13 @@ def warm_pool_on():
             "warm_pool_heartbeat_stale_seconds",
             "warm_pool_failure_rate_threshold",
             "warm_pool_demand_window_minutes",
+            "warm_pool_project_allowlist",
             "max_concurrent_vms",
         ):
             if k in prior:
                 _runtime_config[k] = prior[k]
+            else:
+                _runtime_config.pop(k, None)
         _shared_state.warm_pool_suppressed_until = prior_deadline
         _shared_state.warm_pool_claim_failure_events.clear()
 
@@ -491,6 +494,124 @@ async def test_cost_guard_drains_idle_and_skips_provision(db_session, warm_pool_
     assert summary["drained"] == 1
     assert summary["provisioned"] == 0
     assert await db_session.get(PoolVm, idle.id) is None
+
+
+@pytest.mark.asyncio
+async def test_scoped_project_is_reconciled_to_target(db_session, warm_pool_on):
+    """A project IN the warm-pool allowlist is reconciled up to its configured
+    target — scoping does not suppress provisioning for the scoped project."""
+    _runtime_config["warm_pool_target_size"] = 2
+    project = await _make_project(db_session)
+    _runtime_config["warm_pool_project_allowlist"] = [str(project.id)]
+
+    calls = {"n": 0}
+
+    async def _stub_provision(session, project_id):
+        calls["n"] += 1
+        return True
+
+    summary = await reconcile_project_pool(
+        db_session,
+        project.id,
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        dispatch_slots_remaining=10,
+        pool_budget_remaining=10,
+        stale_vm_ids=set(),
+        suppressed=False,
+    )
+    # In scope + target 2 + zero members → provision the full deficit.
+    assert summary["provisioned"] == 2
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_unscoped_demand_active_project_provisions_zero(db_session, warm_pool_on):
+    """With a non-empty allowlist, a demand-active project that is NOT listed
+    provisions zero — every other project stays on the cold path while the pool
+    is rolled out to the scoped project(s) only."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Real dispatch demand, but the allowlist scopes the pool to a DIFFERENT project.
+    await _make_task(db_session, project, TaskStatus.QUEUED)
+    _runtime_config["warm_pool_project_allowlist"] = [str(uuid.uuid4())]
+
+    async def _no_provision(session, project_id):
+        raise AssertionError("unscoped project must not provision")
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        session_factory=_factory_for(db_session),
+    )
+    assert totals["provisioned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_scoped_project_seeded_members_not_drained(db_session, warm_pool_on, mocker):
+    """A scoped project's manually-seeded members are held at target, NOT drained
+    — the whole point of scoping (vs. the global-target-0 workaround that drains
+    seeded members on the next tick)."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    _runtime_config["warm_pool_target_size"] = 2
+    project = await _make_project(db_session)
+    _runtime_config["warm_pool_project_allowlist"] = [str(project.id)]
+    seeded = await _register(db_session, project, "agent-vm-seeded", PoolVmState.IDLE)
+    seeded.idle_since = _utcnow() - timedelta(seconds=500)
+    db_session.add(seeded)
+    await db_session.commit()
+
+    async def _no_provision(session, project_id):
+        return False
+
+    summary = await reconcile_project_pool(
+        db_session,
+        project.id,
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        dispatch_slots_remaining=10,
+        pool_budget_remaining=10,
+        stale_vm_ids=set(),
+        suppressed=False,
+    )
+    # In scope, 1 idle <= target 2 → no drain; the seeded member survives.
+    assert summary["drained"] == 0
+    assert await db_session.get(PoolVm, seeded.id) is not None
+
+
+@pytest.mark.asyncio
+async def test_unscoped_project_idle_members_are_drained(db_session, warm_pool_on, mocker):
+    """The contrast to the scoped case: an UNSCOPED project's idle members are
+    drained (effective target forced to 0) so narrowing the scope winds down
+    out-of-scope pools instead of leaking idle cost."""
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    _runtime_config["warm_pool_target_size"] = 2
+    project = await _make_project(db_session)
+    _runtime_config["warm_pool_project_allowlist"] = [str(uuid.uuid4())]
+    stray = await _register(db_session, project, "agent-vm-stray", PoolVmState.IDLE)
+    stray.idle_since = _utcnow() - timedelta(seconds=500)
+    db_session.add(stray)
+    await db_session.commit()
+
+    async def _no_provision(session, project_id):
+        raise AssertionError("unscoped project must not provision")
+
+    summary = await reconcile_project_pool(
+        db_session,
+        project.id,
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        dispatch_slots_remaining=10,
+        pool_budget_remaining=10,
+        stale_vm_ids=set(),
+        suppressed=False,
+    )
+    # Out of scope → target forced to 0 → the idle member is drained.
+    assert summary["drained"] == 1
+    assert await db_session.get(PoolVm, stray.id) is None
 
 
 @pytest.mark.asyncio

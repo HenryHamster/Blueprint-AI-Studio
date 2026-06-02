@@ -41,6 +41,7 @@ from app.warm_pool import (
     LIVE_POOL_STATES,
     count_idle_pool_vms,
     count_live_pool_vms,
+    is_project_warm_pool_scoped,
     is_warm_pool_enabled,
     list_pool_vms,
 )
@@ -76,8 +77,13 @@ async def seed_warm_pool(
     credential resolution and registry insertion stay centralized.
 
     Returns HTTP 409 when ``warm_pool_enabled`` is off (the pool is dark; nothing
-    to seed). When the circuit breaker is tripped or no credentialed account is
-    available, the reconcile path provisions zero members and ``seeded`` is 0.
+    to seed) or when the project is not in the warm-pool scope (allowlist): the
+    autonomous maintainer forces an unscoped project's target to 0 and drains it
+    on its next tick (see ``reconcile_project_pool``), so seeding it would be
+    immediately undone — the operator must add the project to
+    ``warm_pool_project_allowlist`` first. When the circuit breaker is tripped or
+    no credentialed account is available, the reconcile path provisions zero
+    members and ``seeded`` is 0.
 
     Response keys (additive-only): ``project_id``, ``seeded``, ``recycled``,
     ``drained``, ``reason``.
@@ -90,6 +96,20 @@ async def seed_warm_pool(
         raise HTTPException(
             status_code=409,
             detail="warm_pool_enabled is off — the warm pool is dark; nothing to seed",
+        )
+
+    # An unscoped project (the allowlist is non-empty and excludes it) is held at
+    # target 0 by the maintainer, which would drain anything seeded here on its
+    # next tick. Refuse with a clear 409 so the operator scopes the project in
+    # first, rather than seeing a confusing seeded:0 (or a seed that vanishes).
+    if not is_project_warm_pool_scoped(project_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "project is not in the warm-pool scope — add it to "
+                "warm_pool_project_allowlist before seeding, otherwise the "
+                "maintainer will drain the seeded members on its next tick"
+            ),
         )
 
     from app.shared_state import is_warm_pool_suppressed, runtime_config

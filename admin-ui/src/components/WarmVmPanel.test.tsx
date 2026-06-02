@@ -431,4 +431,70 @@ describe('WarmVmPanel — warm-pool toggle + pool metrics', () => {
     // The toggle still renders in its disabled (NO-POOL) state.
     expect(screen.getByText('NO-POOL')).toBeTruthy();
   });
+
+  test('renders per-account warm-pool mix with hit rate, dispatches, and idle cost', async () => {
+    const stateWithAccountMix = {
+      ...stateWithPool,
+      pool_metrics: {
+        ...stateWithPool.pool_metrics!,
+        // Mirrors backend cost_amortization_by_account (busiest account first
+        // is enforced by the component's sort, not the payload order).
+        cost_amortization_by_account: {
+          'acct-low': {
+            pool_idle_cost_usd: 0.04,
+            pool_lease_hits: 1,
+            cold_dispatches: 1,
+            total_dispatches: 2,
+            pool_hit_rate: 0.5,
+            cost_per_pool_hit_usd: 0.04,
+          },
+          'acct-busy': {
+            pool_idle_cost_usd: 0.2,
+            pool_lease_hits: 9,
+            cold_dispatches: 1,
+            total_dispatches: 10,
+            pool_hit_rate: 0.9,
+            cost_per_pool_hit_usd: 0.0222,
+          },
+          'acct-cold': {
+            pool_idle_cost_usd: 0.0,
+            pool_lease_hits: 0,
+            cold_dispatches: 0,
+            total_dispatches: 0,
+            pool_hit_rate: null, // no dispatch yet → em-dash, $/warm em-dash.
+            cost_per_pool_hit_usd: null,
+          },
+        },
+      },
+    } as unknown as WarmVmStateResponse;
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithAccountMix), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-account-mix-row');
+    // Busiest account sorts first.
+    const rows = screen.getAllByTestId(/^pool-account-acct-/);
+    expect(rows[0].getAttribute('data-testid')).toBe('pool-account-acct-busy');
+
+    const busy = screen.getByTestId('pool-account-acct-busy');
+    expect(busy.textContent).toContain('90%'); // 0.9 hit rate
+    expect(busy.textContent).toContain('9/10'); // warm/total dispatches
+    expect(busy.textContent).toContain('$0.20'); // idle cost
+
+    // Account with no dispatch yet shows em-dash hit rate and $/warm.
+    const cold = screen.getByTestId('pool-account-acct-cold');
+    expect(cold.textContent).toContain('—');
+  });
+
+  test('does not render per-account mix when cost_amortization_by_account is empty', async () => {
+    // stateWithPool carries pool_metrics but no per-account breakdown.
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithPool), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('pool-account-mix-row')).toBeNull();
+  });
 });

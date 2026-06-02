@@ -738,31 +738,57 @@ def compute_dominant_reuse_dropout(window_hours: int = 24) -> dict:
 # these as it decides between leasing an IDLE pool member (a "hit") and
 # cold-provisioning a fresh VM (a "cold dispatch"); get_pool_funnel_snapshot
 # rolls them up for the operator panel.
+#
+# Per-account-mix dimension (direction d-5fd69fe1, telemetry cluster): each
+# hit / cold / miss event carries the resolved account label of the dispatch
+# so an operator can answer, PER ACCOUNT, how many dispatches the pool served
+# warm vs cold and the per-account hit rate -- the judgment a controlled
+# enable's 'retire on success or pivot' decision depends on. The ``account``
+# argument is optional and defaults to None so existing call sites keep working
+# unchanged; un-attributed events bucket under ``_UNATTRIBUTED_ACCOUNT`` in the
+# per-account breakdown while still counting toward the fleet-wide totals.
 
-_pool_lease_hit_events: deque = deque(maxlen=500)
-_pool_cold_dispatch_events: deque = deque(maxlen=500)
-_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason)
+_pool_lease_hit_events: deque = deque(maxlen=500)  # (datetime, account)
+_pool_cold_dispatch_events: deque = deque(maxlen=500)  # (datetime, account)
+_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason, account)
+
+# Bucket label for dispatches recorded without a resolved account (e.g. legacy
+# call sites that have not yet been wired to pass identity).
+_UNATTRIBUTED_ACCOUNT = "unattributed"
 
 
-def record_pool_lease_hit() -> None:
-    """A queued task was served warm by leasing an IDLE pool member."""
-    _pool_lease_hit_events.append(_utcnow())
+def _account_label(account: Optional[str]) -> str:
+    return account or _UNATTRIBUTED_ACCOUNT
 
 
-def record_pool_cold_dispatch() -> None:
-    """A queued task cold-provisioned a VM (pool disabled, empty, or no match)."""
-    _pool_cold_dispatch_events.append(_utcnow())
+def record_pool_lease_hit(account: Optional[str] = None) -> None:
+    """A queued task was served warm by leasing an IDLE pool member.
+
+    ``account`` is the resolved account id the dispatch was served for; pass it
+    to attribute the warm claim in the per-account breakdown.
+    """
+    _pool_lease_hit_events.append((_utcnow(), account))
 
 
-def record_pool_lease_miss(reason: str) -> None:
+def record_pool_cold_dispatch(account: Optional[str] = None) -> None:
+    """A queued task cold-provisioned a VM (pool disabled, empty, or no match).
+
+    ``account`` is the resolved account id the dispatch was served for; pass it
+    to attribute the cold dispatch in the per-account breakdown.
+    """
+    _pool_cold_dispatch_events.append((_utcnow(), account))
+
+
+def record_pool_lease_miss(reason: str, account: Optional[str] = None) -> None:
     """The pool was consulted but no member could be leased.
 
     reason should be one of: "no_idle_member" (pool empty / all leased),
     "no_compatible_member" (idle members exist but identity/tenant mismatch),
     "disabled" (warm_pool_enabled off), "lost_lease_race" (a peer dispatcher
-    won the SKIP-LOCKED row).
+    won the SKIP-LOCKED row). ``account`` is the resolved account id the lease
+    was attempted for; pass it to attribute the miss per account.
     """
-    _pool_lease_miss_events.append((_utcnow(), reason))
+    _pool_lease_miss_events.append((_utcnow(), reason, account))
 
 
 def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
@@ -770,14 +796,54 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
 
     All counts cover the trailing ``window_hours`` (default 24h). ``pool_hit_rate``
     is hits / (hits + cold dispatches), or None when no dispatch was recorded.
+
+    ``by_account`` breaks the same funnel down by resolved account so an operator
+    can read, per account, the warm-claim / cold-dispatch counts, hit rate, and
+    lease-miss reasons during a controlled enable. Events recorded without an
+    account bucket under ``_UNATTRIBUTED_ACCOUNT``.
     """
     cutoff = _utcnow() - timedelta(hours=window_hours)
+
+    def _new_bucket() -> dict:
+        return {
+            "pool_lease_hits": 0,
+            "cold_dispatches": 0,
+            "lease_miss_by_reason": {},
+        }
+
+    by_account: dict = {}
     miss_by_reason: dict = {}
-    for ts, reason in _pool_lease_miss_events:
+    hits = 0
+    cold = 0
+    for ts, account in _pool_lease_hit_events:
+        if ts >= cutoff:
+            hits += 1
+            by_account.setdefault(_account_label(account), _new_bucket())[
+                "pool_lease_hits"
+            ] += 1
+    for ts, account in _pool_cold_dispatch_events:
+        if ts >= cutoff:
+            cold += 1
+            by_account.setdefault(_account_label(account), _new_bucket())[
+                "cold_dispatches"
+            ] += 1
+    for ts, reason, account in _pool_lease_miss_events:
         if ts >= cutoff:
             miss_by_reason[reason] = miss_by_reason.get(reason, 0) + 1
-    hits = sum(1 for ts in _pool_lease_hit_events if ts >= cutoff)
-    cold = sum(1 for ts in _pool_cold_dispatch_events if ts >= cutoff)
+            bucket = by_account.setdefault(_account_label(account), _new_bucket())
+            bucket["lease_miss_by_reason"][reason] = (
+                bucket["lease_miss_by_reason"].get(reason, 0) + 1
+            )
+
+    # Finalize each account bucket with its own totals + hit rate.
+    for bucket in by_account.values():
+        acct_total = bucket["pool_lease_hits"] + bucket["cold_dispatches"]
+        bucket["total_dispatches"] = acct_total
+        bucket["pool_hit_rate"] = (
+            round(bucket["pool_lease_hits"] / acct_total, 4) if acct_total else None
+        )
+        bucket["lease_miss_total"] = sum(bucket["lease_miss_by_reason"].values())
+
     total = hits + cold
     return {
         "window_hours": window_hours,
@@ -787,6 +853,7 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
         "pool_hit_rate": round(hits / total, 4) if total else None,
         "lease_miss_by_reason": miss_by_reason,
         "lease_miss_total": sum(miss_by_reason.values()),
+        "by_account": by_account,
     }
 
 

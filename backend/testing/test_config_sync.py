@@ -215,6 +215,60 @@ async def test_sync_applies_runtime_config_json():
         assert key in changed
 
 
+@pytest.mark.asyncio
+async def test_sync_applies_warm_pool_project_allowlist():
+    """The per-project warm-pool enablement scope (allowlist) must propagate
+    from the persisted runtime_config_json to every instance, normalized to a
+    sorted list of trimmed, non-empty string ids (dedup + CSV-tolerant), so the
+    maintainer and provisioning entrypoints across the fleet agree on which
+    projects the pool is scoped to."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={
+            # Mixed shapes: ints, blanks, dupes, whitespace — all normalized.
+            "warm_pool_project_allowlist": ["proj-b", " proj-a ", "proj-a", 7, ""],
+        },
+    )
+    _shared_state.runtime_config["warm_pool_project_allowlist"] = []
+
+    changed = await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["warm_pool_project_allowlist"] == [
+        "7",
+        "proj-a",
+        "proj-b",
+    ]
+    assert "warm_pool_project_allowlist" in changed
+
+
+@pytest.mark.asyncio
+async def test_sync_accepts_csv_warm_pool_project_allowlist():
+    """A comma-separated string is tolerated (mirrors the admin PATCH surface)
+    and an empty allowlist restores fleet-wide behavior."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={"warm_pool_project_allowlist": "proj-c, proj-d ,"},
+    )
+    _shared_state.runtime_config["warm_pool_project_allowlist"] = ["stale"]
+
+    await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["warm_pool_project_allowlist"] == [
+        "proj-c",
+        "proj-d",
+    ]
+
+
 # --- Dispatcher Cycle Log ---
 
 

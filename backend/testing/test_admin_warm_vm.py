@@ -361,6 +361,8 @@ async def test_warm_vm_state_includes_pool_metrics(client: AsyncClient, db_sessi
         "idle_count",
         "projected_idle_cost_usd",
         "funnel",
+        "idle_cost_by_account",
+        "cost_amortization_by_account",
     ):
         assert key in pool, f"missing pool_metrics.{key}"
     assert isinstance(pool["enabled"], bool)
@@ -369,3 +371,13 @@ async def test_warm_vm_state_includes_pool_metrics(client: AsyncClient, db_sessi
     assert pool["idle_count"] >= 1
     assert pool["projected_idle_cost_usd"] > 0
     assert "pool_hit_rate" in pool["funnel"]
+    assert "by_account" in pool["funnel"]
+    # Per-account idle cost attributes the unpinned idle member to the
+    # 'unattributed' bucket, and the amortization view emits a matching key so an
+    # operator can read per-account idle cost + hit rate together.
+    assert isinstance(pool["idle_cost_by_account"], dict)
+    assert "unattributed" in pool["idle_cost_by_account"]
+    assert "unattributed" in pool["cost_amortization_by_account"]
+    amort = pool["cost_amortization_by_account"]["unattributed"]
+    assert amort["pool_idle_cost_usd"] > 0
+    assert "pool_hit_rate" in amort

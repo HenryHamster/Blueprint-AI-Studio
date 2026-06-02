@@ -418,6 +418,17 @@ runtime_config: Dict = {
     # sibling tasks) lands and the flag is flipped. Independently switchable from
     # warm_continuity_enabled / warm_backlog_reuse_enabled.
     "warm_pool_enabled": False,
+    # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
+    # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
+    # where the maintainer reconciles every demand-active project once
+    # warm_pool_enabled is True. A NON-EMPTY list scopes ALL pool provisioning
+    # (the autonomous maintainer AND the demand-driven entrypoints) to exactly
+    # the listed project ids, so an operator can switch the pool on for ONE
+    # project, watch its lift and cost, then widen the scope — without flipping
+    # the whole fleet warm at once. warm_pool_enabled stays the outer
+    # kill-switch; this only narrows WHICH projects the enabled pool serves.
+    # Read by warm_pool.warm_pool_project_scope(); set via /api/admin/settings.
+    "warm_pool_project_allowlist": [],
     # Warm-pool maintainer / idle-reaper knobs (efficiency direction d-5fd69fe1).
     # All inert while warm_pool_enabled is False. Target size is the number of
     # IDLE pool members the maintainer keeps warm PER PROJECT that already has
@@ -850,6 +861,22 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_pool_enabled",
                         bool(config_json["warm_pool_enabled"]),
                     )
+                if "warm_pool_project_allowlist" in config_json:
+                    # Persisted per-project enablement scope. Normalize to a
+                    # sorted list of trimmed, non-empty string ids — mirroring
+                    # warm_pool.warm_pool_project_scope() / the admin PATCH
+                    # surface — so every instance agrees on the scoped set and a
+                    # garbage entry can't silently widen or corrupt the pool.
+                    raw_allow = config_json["warm_pool_project_allowlist"]
+                    if isinstance(raw_allow, str):
+                        raw_allow = raw_allow.split(",")
+                    if isinstance(raw_allow, (list, tuple, set)):
+                        _set(
+                            "warm_pool_project_allowlist",
+                            sorted(
+                                {str(p).strip() for p in raw_allow if str(p).strip()}
+                            ),
+                        )
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",

@@ -178,6 +178,69 @@ async def test_seed_provisions_up_to_target(
 
 
 @pytest.mark.asyncio
+async def test_seed_returns_409_when_project_not_in_scope(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled
+):
+    """A non-empty allowlist that excludes the project → clear 409, no provision.
+
+    The maintainer forces an unscoped project's target to 0 and would drain
+    anything seeded, so the endpoint refuses rather than seeding into a drain.
+    """
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    # Scope the pool to some OTHER project so project_owner is out of scope.
+    _runtime_config["warm_pool_project_allowlist"] = [str(uuid.uuid4())]
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
+    )
+    assert resp.status_code == 409, resp.text
+    rows = (
+        await db_session.execute(
+            select(PoolVm).where(PoolVm.project_id == project_owner.id)
+        )
+    ).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_seed_provisions_when_project_in_scope(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """A project explicitly listed in the allowlist seeds up to target normally."""
+    _runtime_config["warm_pool_target_size"] = 1
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_project_allowlist"] = [str(project_owner.id)]
+
+    async def _registering_provision(session, project_id):
+        member = await register_pool_vm(
+            session,
+            vm_instance_id=f"agent-vm-scoped-{uuid.uuid4().hex}",
+            project_id=project_id,
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+        )
+        session.add(member)
+        await session.commit()
+        return True
+
+    mocker.patch(
+        "app.routers.admin_warm_pool._default_pool_provision_fn",
+        new=_registering_provision,
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/seed"
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["seeded"] == 1
+
+
+@pytest.mark.asyncio
 async def test_seed_respects_pool_budget_ceiling(
     client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
 ):

@@ -269,7 +269,17 @@ async def compute_pool_idle_cost(
     forward is summed into ``settled_idle_cost_usd`` here so spend survives the
     delete — without it the metric would only ever see members that happen to
     still exist at snapshot time, undercounting by the bulk of pool idle cost.
+
+    ``by_account`` breaks idle cost down by the member's pinned ``account_id`` so
+    an operator can read which account's idle members drive cost during a
+    controlled enable. It covers LIVE members only (banked + live accrual of
+    rows that still exist); the ledger carry-forward of already-reaped members
+    cannot be attributed per account (``PoolIdleCostLedger`` carries no
+    ``account_id``), so it stays in the fleet-wide ``retired_idle_cost_usd`` and
+    is intentionally absent from the per-account totals.
     """
+    from app.warm_backlog_reuse import _account_label  # noqa: PLC0415
+
     stmt = select(PoolVm)
     if project_id is not None:
         stmt = stmt.where(PoolVm.project_id == project_id)
@@ -280,16 +290,43 @@ async def compute_pool_idle_cost(
     live = 0.0
     pool_size = 0
     idle_count = 0
+    by_account: Dict[str, Dict[str, Any]] = {}
+
+    def _bucket(member: PoolVm) -> Dict[str, Any]:
+        return by_account.setdefault(
+            _account_label(member.account_id),
+            {
+                "settled_idle_cost_usd": 0.0,
+                "live_idle_cost_usd": 0.0,
+                "member_count": 0,
+                "idle_count": 0,
+            },
+        )
+
     for m in members:
-        settled += m.idle_cost_banked or 0.0
+        banked = m.idle_cost_banked or 0.0
+        settled += banked
+        bucket = _bucket(m)
+        bucket["settled_idle_cost_usd"] += banked
         if m.state == PoolVmState.RETIRING:
             continue
         pool_size += 1
+        bucket["member_count"] += 1
         if m.state == PoolVmState.IDLE and m.idle_since is not None:
             idle_count += 1
             elapsed = (now - m.idle_since).total_seconds()
             if elapsed > 0:
-                live += idle_cost_usd(elapsed)
+                accrued = idle_cost_usd(elapsed)
+                live += accrued
+                bucket["live_idle_cost_usd"] += accrued
+                bucket["idle_count"] += 1
+
+    for bucket in by_account.values():
+        bucket["settled_idle_cost_usd"] = round(bucket["settled_idle_cost_usd"], 6)
+        bucket["live_idle_cost_usd"] = round(bucket["live_idle_cost_usd"], 6)
+        bucket["total_idle_cost_usd"] = round(
+            bucket["settled_idle_cost_usd"] + bucket["live_idle_cost_usd"], 6
+        )
 
     # Carry-forward: durable idle spend of members already reaped (rows deleted).
     ledger_stmt = select(
@@ -309,6 +346,7 @@ async def compute_pool_idle_cost(
         "retired_idle_cost_usd": round(retired_idle, 6),
         "live_idle_cost_usd": round(live, 6),
         "total_idle_cost_usd": round(settled + live, 6),
+        "by_account": by_account,
     }
 
 
@@ -335,6 +373,40 @@ def compute_pool_cost_amortization(
         "total_dispatches": funnel.get("total_dispatches", 0),
         "cost_per_pool_hit_usd": round(idle / hits, 6) if hits else None,
     }
+
+
+def compute_pool_cost_amortization_by_account(
+    idle_by_account: Dict[str, Any], funnel: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Per-account cost-amortization: join per-account pool idle cost with the
+    per-account dispatch funnel.
+
+    Lets an operator answer, PER ACCOUNT, how many dispatches the pool served
+    warm, the per-account hit rate, the per-account (live-member) idle cost, and
+    the idle dollars spent per warm start — the breakdown a controlled enable's
+    'retire on success or pivot' decision depends on. ``idle_by_account`` is the
+    ``by_account`` map from :func:`compute_pool_idle_cost`; ``funnel`` is
+    :func:`app.warm_backlog_reuse.get_pool_funnel_snapshot`. Accounts present on
+    only one side are still emitted (idle members but no dispatch yet, or
+    dispatches but no live member). ``cost_per_pool_hit_usd`` is ``None`` when
+    that account has no warm hit yet — its idle spend is not being amortized.
+    """
+    funnel_accounts = funnel.get("by_account") or {}
+    out: Dict[str, Any] = {}
+    for label in set(idle_by_account) | set(funnel_accounts):
+        idle = idle_by_account.get(label) or {}
+        fb = funnel_accounts.get(label) or {}
+        hits = int(fb.get("pool_lease_hits") or 0)
+        idle_cost = round(float(idle.get("total_idle_cost_usd") or 0.0), 6)
+        out[label] = {
+            "pool_idle_cost_usd": idle_cost,
+            "pool_lease_hits": hits,
+            "cold_dispatches": int(fb.get("cold_dispatches") or 0),
+            "total_dispatches": int(fb.get("total_dispatches") or 0),
+            "pool_hit_rate": fb.get("pool_hit_rate"),
+            "cost_per_pool_hit_usd": round(idle_cost / hits, 6) if hits else None,
+        }
+    return out
 
 
 def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
@@ -837,6 +909,8 @@ async def read_baseline_with_drift(
     if project is None:
         raise ValueError(f"Project {project_id} not found")
 
+    pool_funnel = get_pool_funnel_snapshot()
+
     container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
     snapshots = container.get("snapshots") or []
@@ -911,7 +985,16 @@ async def read_baseline_with_drift(
         # same signal the maintainer's cost-aware auto-drain guard acts on.
         "pool_cost_amortization": compute_pool_cost_amortization(
             latest.get("pool_idle_cost_usd") or 0.0,
-            get_pool_funnel_snapshot(),
+            pool_funnel,
+        ),
+        # Per-account-mix view: joins the latest snapshot's per-account idle cost
+        # with the per-account dispatch funnel so an operator can answer, PER
+        # ACCOUNT, warm-vs-cold dispatch counts, hit rate, idle cost, and cost
+        # per warm start during a controlled enable — pool lift is read off the
+        # funnel hit rate, NOT the fix-loop-contaminated vm_reuse_rate.
+        "pool_cost_amortization_by_account": compute_pool_cost_amortization_by_account(
+            (latest.get("pool_metrics") or {}).get("by_account") or {},
+            pool_funnel,
         ),
     }
 

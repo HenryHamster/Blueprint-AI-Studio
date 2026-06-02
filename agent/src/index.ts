@@ -1,6 +1,7 @@
 import { spawn, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import path from 'path';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
@@ -50,6 +51,7 @@ import {
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  refreshRuntimeState,
   getProviderRunner,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
@@ -60,6 +62,7 @@ import {
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  refreshRuntimeState,
   getProviderRunner,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
@@ -134,7 +137,11 @@ export { recordInitialOAuthAuthHash, ClaudeTimeoutError };
 
 /** Rotate OAuth credentials if changed, bound to the local apiPost. */
 export function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
-  return _rotateOAuthCredentialsIfChanged(taskId, apiPost);
+  return _rotateOAuthCredentialsIfChanged(taskId, apiPost).then(() => {
+    if (activeCredentialStateSource === 'boot' && bootCredentialSnapshot !== null) {
+      bootCredentialSnapshot = snapshotManagedCredentialState();
+    }
+  });
 }
 
 // ── Build configuration (from project settings, passed via claim response) ───
@@ -262,9 +269,223 @@ export function resolveBaseBranch(
 }
 
 
-function writePrivateFileSync(path: string, contents: string): void {
-  fs.writeFileSync(path, contents, { encoding: 'utf-8', mode: 0o600 });
-  try { fs.chmodSync(path, 0o600); } catch { /* best effort on non-POSIX filesystems */ }
+function writePrivateFileSync(path: string, contents: string, mode = 0o600): void {
+  fs.writeFileSync(path, contents, { encoding: 'utf-8', mode });
+  try { fs.chmodSync(path, mode); } catch { /* best effort on non-POSIX filesystems */ }
+}
+
+interface SecretManifestFile {
+  path: string;
+  content: string;
+  mode: number;
+}
+
+interface MaterializedCredentialState {
+  env: Record<string, string>;
+  files: SecretManifestFile[];
+}
+
+const MANAGED_LLM_ENV_KEYS = [
+  'PROVIDER',
+  'AUTH_MODE',
+  'LLM_MODEL',
+  'LLM_EXECUTION_MODE',
+  'LLM_SETTINGS',
+  'LLM_CLI_TRANSLATION',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'CODEX_HOME',
+  'GEMINI_API_KEY',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_LOCATION',
+  'GOOGLE_GENAI_USE_VERTEXAI',
+  'GEMINI_CLI_TRUST_WORKSPACE',
+];
+const IDENTITY_ENV_KEYS = new Set([
+  'AGENT_SECRET_TOKEN',
+  'TASK_ID',
+  'VM_INSTANCE_ID',
+  'ORCHESTRATOR_URL',
+  'PROJECT_ID',
+  'BLUEPRINT_POOL_MODE',
+]);
+const KNOWN_MANAGED_CREDENTIAL_FILE_PATHS = [
+  '/home/agent/.claude.json',
+  '/home/agent/.gemini/settings.json',
+  '/opt/agent/openai/auth.json',
+  '/opt/agent/gemini/sa.json',
+];
+
+let bootCredentialSnapshot: MaterializedCredentialState | null = null;
+let lastMaterializedCredentialPaths = new Set<string>();
+let activeCredentialStateSource: 'boot' | 'retarget' = 'boot';
+
+function parseSecretFileMode(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw > 0) return raw;
+  if (typeof raw === 'string' && /^[0-7]{3,4}$/.test(raw)) return parseInt(raw, 8);
+  return 0o600;
+}
+
+function ensureParentDirectorySync(filePath: string): void {
+  const parent = path.dirname(filePath);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(parent, 0o700); } catch { /* best effort on non-POSIX filesystems */ }
+}
+
+function clearManagedCredentialState(): void {
+  for (const key of MANAGED_LLM_ENV_KEYS) {
+    Reflect.deleteProperty(process.env, key);
+  }
+  const paths = new Set<string>([
+    ...KNOWN_MANAGED_CREDENTIAL_FILE_PATHS,
+    ...lastMaterializedCredentialPaths,
+  ]);
+  for (const filePath of paths) {
+    try { fs.unlinkSync(filePath); } catch { /* missing files are fine */ }
+  }
+  lastMaterializedCredentialPaths = new Set();
+}
+
+function snapshotManagedCredentialState(): MaterializedCredentialState {
+  const env: Record<string, string> = {};
+  for (const key of MANAGED_LLM_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  const files: SecretManifestFile[] = [];
+  for (const filePath of KNOWN_MANAGED_CREDENTIAL_FILE_PATHS) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      files.push({ path: filePath, content, mode: 0o600 });
+    } catch { /* absent files are normal for other providers */ }
+  }
+  return { env, files };
+}
+
+function materializeCredentialState(
+  state: MaterializedCredentialState,
+  source: 'boot' | 'retarget',
+): void {
+  clearManagedCredentialState();
+  for (const file of state.files) {
+    ensureParentDirectorySync(file.path);
+    writePrivateFileSync(file.path, file.content, file.mode);
+  }
+  for (const [key, value] of Object.entries(state.env)) {
+    process.env[key] = value;
+  }
+  lastMaterializedCredentialPaths = new Set(state.files.map(file => file.path));
+  activeCredentialStateSource = source;
+  refreshRuntimeState();
+  recordInitialOAuthAuthHash();
+}
+
+function toFailure(message: string): Error & { failureCategory: FailureCategory } {
+  const err = new Error(message) as Error & { failureCategory: FailureCategory };
+  err.failureCategory = 'reset_failed';
+  return err;
+}
+
+function normalizeSecretManifest(manifest: unknown, context: string): MaterializedCredentialState {
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    throw toFailure(`${context}: secret_manifest must be an object`);
+  }
+  const record = manifest as Record<string, unknown>;
+  const metadata = record.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw toFailure(`${context}: secret_manifest.metadata must be an object`);
+  }
+  if ((metadata as Record<string, unknown>).retarget !== true) {
+    throw toFailure(`${context}: secret_manifest.metadata.retarget must be true`);
+  }
+  for (const forbiddenKey of ['task_id', 'vm_instance_id', 'project_id', 'pool_mode']) {
+    if (Object.prototype.hasOwnProperty.call(metadata, forbiddenKey)) {
+      throw toFailure(`${context}: secret_manifest.metadata.${forbiddenKey} is not allowed`);
+    }
+  }
+  const envRaw = record.env;
+  if (!envRaw || typeof envRaw !== 'object' || Array.isArray(envRaw)) {
+    throw toFailure(`${context}: secret_manifest.env must be an object`);
+  }
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envRaw as Record<string, unknown>)) {
+    if (IDENTITY_ENV_KEYS.has(key)) {
+      throw toFailure(`${context}: secret_manifest.env.${key} is not allowed`);
+    }
+    if (typeof value !== 'string') {
+      throw toFailure(`${context}: secret_manifest.env.${key} must be a string`);
+    }
+    env[key] = value;
+  }
+  if (!env.PROVIDER || !env.AUTH_MODE) {
+    throw toFailure(`${context}: secret_manifest must include PROVIDER and AUTH_MODE`);
+  }
+  const filesRaw = record.files;
+  if (filesRaw !== undefined && !Array.isArray(filesRaw)) {
+    throw toFailure(`${context}: secret_manifest.files must be an array when present`);
+  }
+  const files: SecretManifestFile[] = [];
+  for (const [idx, item] of (filesRaw ?? []).entries()) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw toFailure(`${context}: secret_manifest.files[${idx}] must be an object`);
+    }
+    const file = item as Record<string, unknown>;
+    if (typeof file.path !== 'string' || !path.isAbsolute(file.path)) {
+      throw toFailure(`${context}: secret_manifest.files[${idx}].path must be an absolute path`);
+    }
+    if (typeof file.content !== 'string') {
+      throw toFailure(`${context}: secret_manifest.files[${idx}].content must be a string`);
+    }
+    files.push({
+      path: file.path,
+      content: file.content,
+      mode: parseSecretFileMode(file.mode),
+    });
+  }
+  return { env, files };
+}
+
+function captureBootCredentialSnapshot(): void {
+  if (bootCredentialSnapshot !== null) return;
+  bootCredentialSnapshot = snapshotManagedCredentialState();
+  lastMaterializedCredentialPaths = new Set(bootCredentialSnapshot.files.map(file => file.path));
+  activeCredentialStateSource = 'boot';
+}
+
+function materializeClaimCredentialState(
+  secretManifest: unknown,
+  context: string,
+): void {
+  if (secretManifest !== undefined) {
+    materializeCredentialState(normalizeSecretManifest(secretManifest, context), 'retarget');
+    return;
+  }
+  if (bootCredentialSnapshot === null) {
+    throw toFailure(`${context}: boot credential snapshot is unavailable`);
+  }
+  materializeCredentialState(bootCredentialSnapshot, 'boot');
+}
+
+export function _resetCredentialStateForTesting(): void {
+  bootCredentialSnapshot = null;
+  lastMaterializedCredentialPaths = new Set();
+  activeCredentialStateSource = 'boot';
+  refreshRuntimeState();
+}
+
+export function _captureBootCredentialSnapshotForTesting(): void {
+  captureBootCredentialSnapshot();
+}
+
+export function _materializeClaimCredentialStateForTesting(secretManifest?: unknown, context = 'test'): void {
+  materializeClaimCredentialState(secretManifest, context);
+}
+
+export function _getActiveCredentialStateSourceForTesting(): 'boot' | 'retarget' {
+  return activeCredentialStateSource;
 }
 
 /**
@@ -1098,7 +1319,11 @@ export async function bootstrapPoolMode(opts: PoolBootPollOptions): Promise<Poll
       ...(heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs } : {}),
     });
     if (result.action === 'claim') {
+      if (bootCredentialSnapshot === null) {
+        captureBootCredentialSnapshot();
+      }
       activateClaimedRole(result, 'reset_failed: pool-mode first claim');
+      materializeClaimCredentialState(result.secretManifest, 'reset_failed: pool-mode first claim');
       return result;
     }
     if (result.reason !== 'poll_timeout') return result;
@@ -2269,7 +2494,6 @@ export async function main() {
   startEventLoopLagMonitor();
   installExitMarkers();
 
-  const runner = getProviderRunner();
   log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
   log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
   log(`Agent source: ${import.meta.url}`);
@@ -2375,8 +2599,10 @@ export async function main() {
       // rather than failing a task it already owns. Snapshot the OAuth baseline
       // first so a refresh triggered by validation is detected; completeStartup
       // below is told the auth step is already done (authAlreadyValidated).
+      const bootRunner = getProviderRunner();
       recordInitialOAuthAuthHash();
-      await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
+      await validateProviderAuth(bootRunner, reportPreClaimFailure, process.env.LLM_MODEL);
+      captureBootCredentialSnapshot();
       log(`Pool mode enabled — polling for first task (max idle ${getPoolMaxIdleLifetimeMs()}ms)`);
       const poolResult = await bootstrapPoolMode({
         vmInstanceId,
@@ -2388,19 +2614,21 @@ export async function main() {
         return;
       }
       log(`Pool mode claimed first task: ${poolResult.taskId ?? ''}`);
+      const claimedRunner = getProviderRunner();
       const startupTaskId = process.env.TASK_ID || poolResult.taskId || '';
       const startupStatusRef = { value: 'Completing startup before claim replay' };
       if (startupTaskId) {
         startHeartbeat(startupTaskId, () => startupStatusRef.value);
       }
       try {
-        await completeStartup(runner, reportPreClaimFailure, startupTaskId, startupStatusRef, true);
+        await completeStartup(claimedRunner, reportPreClaimFailure, startupTaskId, startupStatusRef, true);
       } catch (startupErr) {
         stopHeartbeat();
         throw startupErr;
       }
     } else {
-      await completeStartup(runner, reportPreClaimFailure, PRE_CLAIM_TASK_ID);
+      await completeStartup(getProviderRunner(), reportPreClaimFailure, PRE_CLAIM_TASK_ID);
+      captureBootCredentialSnapshot();
     }
     for (;;) {
       let claimResult: RunRoleOnceResult;
@@ -2503,6 +2731,7 @@ export async function main() {
         err.failureCategory = 'reset_failed';
         throw err;
       }
+      materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
       // Reset succeeded — flip the warm-handoff flag so handlers'
       // prepareWorkspaceForRole reuses the workspace (preserving caches)
       // instead of wiping + re-cloning.

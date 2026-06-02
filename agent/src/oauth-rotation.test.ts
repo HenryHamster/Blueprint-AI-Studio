@@ -16,11 +16,15 @@ vi.mock('fs', () => ({
 }));
 
 import { recordInitialOAuthAuthHash, rotateOAuthCredentialsIfChanged, ClaudeTimeoutError } from './oauth-rotation.js';
+import { refreshRuntimeState } from './providers/runners.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
   mockExistsSync.mockReturnValue(false);
   mockReadFileSync.mockReset();
+  process.env.PROVIDER = 'openai';
+  process.env.AUTH_MODE = 'oauth';
+  refreshRuntimeState();
 });
 
 describe('ClaudeTimeoutError', () => {
@@ -60,6 +64,33 @@ describe('rotateOAuthCredentialsIfChanged', () => {
     expect(apiPostFn).toHaveBeenCalledWith(
       '/api/agent/credentials/rotate',
       expect.objectContaining({ task_id: 'task-1' }),
+    );
+  });
+
+  it('follows refreshed provider/auth runtime after a retarget', async () => {
+    process.env.PROVIDER = 'anthropic';
+    process.env.AUTH_MODE = 'api_key';
+    refreshRuntimeState();
+
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue('should-not-be-read');
+    const apiPostFn = vi.fn();
+    await rotateOAuthCredentialsIfChanged('task-anthropic', apiPostFn);
+    expect(apiPostFn).not.toHaveBeenCalled();
+    expect(mockReadFileSync).not.toHaveBeenCalled();
+
+    process.env.PROVIDER = 'openai';
+    process.env.AUTH_MODE = 'oauth';
+    refreshRuntimeState();
+
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync
+      .mockReturnValueOnce(Buffer.from('retargeted-token-data'))
+      .mockReturnValueOnce('retargeted-token-data');
+    await rotateOAuthCredentialsIfChanged('task-openai', apiPostFn);
+    expect(apiPostFn).toHaveBeenCalledWith(
+      '/api/agent/credentials/rotate',
+      expect.objectContaining({ task_id: 'task-openai' }),
     );
   });
 });

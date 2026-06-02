@@ -2759,6 +2759,73 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_warm_pool_project_allowlist_round_trip(
+        self, client: AsyncClient
+    ):
+        """warm_pool_project_allowlist accepts a list, normalizes a CSV string,
+        rejects bad shapes, and round-trips (sorted, de-duped) on GET.
+
+        Also exercises the maintainer contract: a scoped project is held at
+        target while an unscoped demand-active project is forced to drain-only,
+        and an empty allowlist restores fleet-wide behavior.
+        """
+        from app.shared_state import runtime_config as _rc
+        from app.warm_pool import (
+            is_project_warm_pool_scoped,
+            warm_pool_project_scope,
+        )
+
+        original = _rc.get("warm_pool_project_allowlist")
+        try:
+            # List input round-trips sorted + de-duped.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"warm_pool_project_allowlist": ["proj-b", "proj-a", "proj-a"]},
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_project_allowlist"] == ["proj-a", "proj-b"]
+            # The maintainer's scope helper agrees: scoped projects pass, an
+            # unscoped demand-active project does not.
+            assert is_project_warm_pool_scoped("proj-a") is True
+            assert is_project_warm_pool_scoped("proj-unscoped") is False
+
+            # CSV string is normalized into a clean list.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"warm_pool_project_allowlist": "proj-c, proj-d ,"},
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_project_allowlist"] == ["proj-c", "proj-d"]
+
+            # Empty list restores fleet-wide (legacy) mode: every project scoped.
+            resp = await client.patch(
+                "/api/admin/settings", json={"warm_pool_project_allowlist": []}
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_project_allowlist"] == []
+            assert warm_pool_project_scope() == set()
+            assert is_project_warm_pool_scoped("any-project") is True
+
+            # Bad shapes rejected (must not silently corrupt the allowlist).
+            bad = await client.patch(
+                "/api/admin/settings", json={"warm_pool_project_allowlist": 123}
+            )
+            assert bad.status_code == 400
+            bad2 = await client.patch(
+                "/api/admin/settings",
+                json={"warm_pool_project_allowlist": [{"id": "x"}]},
+            )
+            assert bad2.status_code == 400
+        finally:
+            if original is not None:
+                _rc["warm_pool_project_allowlist"] = original
+            else:
+                _rc.pop("warm_pool_project_allowlist", None)
+
+    @pytest.mark.asyncio
     async def test_patch_warm_reuse_tuning_knobs_round_trip(self, client: AsyncClient):
         """The warm-reuse tuning knobs are PATCHable and visible on GET."""
         from app.shared_state import runtime_config as _rc

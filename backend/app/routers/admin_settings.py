@@ -113,12 +113,27 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_continuity_cooldown_seconds",
         "warm_pin_clear_rate_threshold",
         "warm_pool_enabled",
+        "warm_pool_project_allowlist",
         "warm_pool_target_size",
         "warm_pool_idle_ttl_secs",
     }
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_warm_pool_allowlist(raw) -> set[str]:
+    """Coerce a warm-pool allowlist value to a set of trimmed, non-empty ids.
+
+    Mirrors ``warm_pool.warm_pool_project_scope`` so the admin surface and the
+    maintainer agree on what counts as "scoped": accepts a list or a single
+    scalar, stringifies every entry, and drops blanks.
+    """
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set)):
+        raw = [raw]
+    return {str(p).strip() for p in raw if str(p).strip()}
 
 
 def _build_provider_catalog(runtime_config: Dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
@@ -280,6 +295,11 @@ async def get_settings(
             _runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
         "warm_pool_enabled": bool(_runtime_config.get("warm_pool_enabled", False)),
+        "warm_pool_project_allowlist": sorted(
+            _normalize_warm_pool_allowlist(
+                _runtime_config.get("warm_pool_project_allowlist") or []
+            )
+        ),
         "warm_pool_target_size": int(
             _runtime_config.get("warm_pool_target_size", 2)
         ),
@@ -719,6 +739,31 @@ async def _apply_settings(
                 status_code=400, detail="warm_pool_enabled must be a boolean"
             )
         _runtime_config["warm_pool_enabled"] = val
+    if "warm_pool_project_allowlist" in payload:
+        raw = payload["warm_pool_project_allowlist"]
+        # Accept a JSON list, a comma-separated string, or a single id — the
+        # same shapes warm_pool.warm_pool_project_scope() tolerates. An empty
+        # allowlist means fleet-wide (legacy all-or-nothing); a non-empty one
+        # scopes provisioning to exactly the listed projects so the pool can be
+        # rolled out one project at a time.
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        if not isinstance(raw, list):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "warm_pool_project_allowlist must be a list of project ids "
+                    "(or a comma-separated string)"
+                ),
+            )
+        if not all(isinstance(p, (str, int)) for p in raw):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pool_project_allowlist entries must be strings or ints",
+            )
+        _runtime_config["warm_pool_project_allowlist"] = sorted(
+            _normalize_warm_pool_allowlist(raw)
+        )
     if "warm_pool_target_size" in payload:
         try:
             val = int(payload["warm_pool_target_size"])

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -96,6 +96,26 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
 }
 
 const initialPoolPriorTaskId = '00000000-0000-0000-0000-000000000000';
+
+beforeEach(() => {
+  process.env.PROVIDER = 'anthropic';
+  process.env.AUTH_MODE = 'oauth';
+  delete process.env.LLM_MODEL;
+  delete process.env.LLM_SETTINGS;
+  delete process.env.LLM_CLI_TRANSLATION;
+  delete process.env.LLM_EXECUTION_MODE;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.CODEX_API_KEY;
+  delete process.env.CODEX_HOME;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  delete process.env.GOOGLE_CLOUD_PROJECT;
+  delete process.env.GOOGLE_CLOUD_LOCATION;
+  _resetCredentialStateForTesting();
+  refreshRuntimeState();
+});
 
 // ── computeRefreshDelayMs ─────────────────────────────────────────────────────
 /** Build a minimal JWT with a given exp claim (no real signature needed). */
@@ -2905,6 +2925,126 @@ describe('bootstrapPoolMode', () => {
     expect(result).toEqual({ action: 'exit', reason: 'max_idle_lifetime_exceeded' });
     expect(pollOnce).toHaveBeenCalledTimes(2);
     expect(process.env.TASK_ID).toBeUndefined();
+  });
+
+  it('applies a retarget secret manifest before returning the first claimed task', async () => {
+    mockReadFileSync.mockImplementation((path: string, encoding?: string) => {
+      if (path === '/opt/agent/openai/auth.json' && encoding === undefined) {
+        return Buffer.from('{"tokens":{"access_token":"retargeted"}}');
+      }
+      throw new Error(`unexpected read ${path}`);
+    });
+    const pollOnce = vi.fn().mockResolvedValue({
+      action: 'claim',
+      taskId: 'pool-task-retarget',
+      agentToken: 'pool-jwt-retarget',
+      secretManifest: {
+        env: {
+          PROVIDER: 'openai',
+          AUTH_MODE: 'oauth',
+          LLM_MODEL: 'gpt-5.4',
+          CODEX_HOME: '/opt/agent/openai',
+          LLM_EXECUTION_MODE: 'default',
+        },
+        files: [
+          {
+            path: '/opt/agent/openai/auth.json',
+            content: '{"tokens":{"access_token":"retargeted"}}',
+            mode: '0600',
+          },
+        ],
+        metadata: { retarget: true, provider: 'openai', auth_mode: 'oauth' },
+      },
+    });
+
+    const result = await bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-retarget',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-retarget',
+      maxIdleLifetimeMs: 1_000,
+      pollWindowMs: 250,
+      pollOnce,
+    });
+
+    expect(result.action).toBe('claim');
+    expect(result.taskId).toBe('pool-task-retarget');
+    expect(result.agentToken).toBe('pool-jwt-retarget');
+    expect(result.secretManifest).toBeDefined();
+    expect(process.env.TASK_ID).toBe('pool-task-retarget');
+    expect(process.env.PROVIDER).toBe('openai');
+    expect(process.env.AUTH_MODE).toBe('oauth');
+    expect(process.env.CODEX_HOME).toBe('/opt/agent/openai');
+    expect(getProviderRunner().provider).toBe('openai');
+    expect(getProviderRunner().buildValidationCommand('gpt-5.4')?.command).toBe('codex');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('retarget');
+    expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
+      [
+        '/opt/agent/openai/auth.json',
+        '{"tokens":{"access_token":"retargeted"}}',
+        expect.objectContaining({ mode: 0o600 }),
+      ],
+    ]));
+    expect(mockReadFileSync).toHaveBeenCalledWith('/opt/agent/openai/auth.json');
+  });
+
+  it('restores the boot credential state when the next claim has no secret manifest', () => {
+    process.env.PROVIDER = 'anthropic';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-claude-token';
+    refreshRuntimeState();
+    _captureBootCredentialSnapshotForTesting();
+
+    _materializeClaimCredentialStateForTesting({
+      env: {
+        PROVIDER: 'openai',
+        AUTH_MODE: 'api_key',
+        OPENAI_API_KEY: 'retarget-openai-key',
+        CODEX_API_KEY: 'retarget-openai-key',
+      },
+      metadata: { retarget: true, provider: 'openai', auth_mode: 'api_key' },
+    }, 'test: retarget');
+
+    expect(process.env.PROVIDER).toBe('openai');
+    expect(process.env.OPENAI_API_KEY).toBe('retarget-openai-key');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('retarget');
+
+    _materializeClaimCredentialStateForTesting(undefined, 'test: restore-boot');
+
+    expect(process.env.PROVIDER).toBe('anthropic');
+    expect(process.env.AUTH_MODE).toBe('oauth');
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('boot-claude-token');
+    expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    expect(process.env.CODEX_API_KEY).toBeUndefined();
+    expect(getProviderRunner().provider).toBe('anthropic');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('boot');
+  });
+
+  it('fails hard on a malformed secret manifest instead of leaving prior credentials active', async () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-claude-token';
+    refreshRuntimeState();
+    const pollOnce = vi.fn().mockResolvedValue({
+      action: 'claim',
+      taskId: 'pool-task-bad-retarget',
+      agentToken: 'pool-jwt-bad-retarget',
+      secretManifest: {
+        env: { PROVIDER: 'openai', AUTH_MODE: 'oauth' },
+        files: [],
+        metadata: {},
+      },
+    });
+
+    await expect(bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-bad-retarget',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-bad-retarget',
+      maxIdleLifetimeMs: 1_000,
+      pollWindowMs: 250,
+      pollOnce,
+    })).rejects.toThrow('reset_failed: pool-mode first claim: secret_manifest.metadata.retarget must be true');
+
+    expect(process.env.TASK_ID).toBe('pool-task-bad-retarget');
+    expect(process.env.PROVIDER).toBe('anthropic');
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('boot-claude-token');
   });
 });
 

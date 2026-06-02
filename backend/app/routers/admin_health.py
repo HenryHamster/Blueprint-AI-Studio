@@ -953,12 +953,25 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
     banked + not-yet-settled accrual), and the in-memory pool-hit-vs-cold-dispatch
     funnel. Best-effort: returns {} on any failure so a partial backend never
     blanks the whole warm-VM panel.
+
+    ``idle_cost_by_account`` and ``cost_amortization_by_account`` carry the
+    per-account breakdown a controlled enable's 'retire on success or pivot'
+    decision depends on: which account's idle members drive cost, the per-account
+    warm-claim/lease-hit counts and hit rate, and the idle dollars spent per warm
+    start. The funnel already embeds its own ``by_account`` block; the
+    amortization view joins that with the per-account idle cost so an operator can
+    read both sides per account from one map.
     """
     try:
-        from app.efficiency_snapshot import compute_pool_idle_cost
+        from app.efficiency_snapshot import (
+            compute_pool_cost_amortization_by_account,
+            compute_pool_idle_cost,
+        )
         from app.warm_backlog_reuse import get_pool_funnel_snapshot
 
         cost = await compute_pool_idle_cost(session)
+        funnel = get_pool_funnel_snapshot()
+        idle_by_account = cost.get("by_account") or {}
         return {
             "enabled": bool(
                 _shared_state.runtime_config.get("warm_pool_enabled", False)
@@ -974,7 +987,11 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             "projected_idle_cost_usd": cost["total_idle_cost_usd"],
             "settled_idle_cost_usd": cost["settled_idle_cost_usd"],
             "live_idle_cost_usd": cost["live_idle_cost_usd"],
-            "funnel": get_pool_funnel_snapshot(),
+            "funnel": funnel,
+            "idle_cost_by_account": idle_by_account,
+            "cost_amortization_by_account": compute_pool_cost_amortization_by_account(
+                idle_by_account, funnel
+            ),
         }
     except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}

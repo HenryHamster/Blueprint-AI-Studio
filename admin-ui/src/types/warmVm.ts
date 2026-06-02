@@ -81,6 +81,18 @@ export interface SpawnPinFunnelSnapshot {
   skipped_total: number;
 }
 
+// Per-account slice of the pool dispatch funnel, as built by
+// warm_backlog_reuse.get_pool_funnel_snapshot -> by_account. Events recorded
+// without a resolved account fall under the _UNATTRIBUTED_ACCOUNT label.
+export interface PoolFunnelAccountBreakdown {
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  lease_miss_by_reason: Record<string, number>;
+  lease_miss_total: number;
+}
+
 export interface PoolFunnelSnapshot {
   window_hours: number;
   pool_lease_hits: number;
@@ -89,6 +101,35 @@ export interface PoolFunnelSnapshot {
   pool_hit_rate: number | null;
   lease_miss_by_reason: Record<string, number>;
   lease_miss_total: number;
+  // Per-account breakdown of the same funnel (omitted by older backends).
+  by_account?: Record<string, PoolFunnelAccountBreakdown>;
+}
+
+// Per-account warm-pool idle cost, as built by
+// efficiency_snapshot.compute_pool_idle_cost -> by_account. Covers LIVE members
+// only; the ledger carry-forward of already-reaped members is fleet-wide and
+// intentionally absent here (PoolIdleCostLedger carries no account_id).
+export interface PoolIdleCostAccountBreakdown {
+  settled_idle_cost_usd: number;
+  live_idle_cost_usd: number;
+  total_idle_cost_usd: number;
+  member_count: number;
+  idle_count: number;
+}
+
+// Per-account cost-amortization view, as built by
+// efficiency_snapshot.compute_pool_cost_amortization_by_account: joins the
+// per-account idle cost with the per-account dispatch funnel so an operator can
+// read warm-claim counts, hit rate, idle cost, and idle dollars per warm start
+// per account. cost_per_pool_hit_usd is null when that account has no warm hit
+// yet (its idle spend is not being amortized).
+export interface PoolAccountAmortization {
+  pool_idle_cost_usd: number;
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  cost_per_pool_hit_usd: number | null;
 }
 
 // Warm-pool sizing + idle-cost + dispatch-funnel snapshot. All fields optional
@@ -104,6 +145,12 @@ export interface PoolMetrics {
   settled_idle_cost_usd?: number;
   live_idle_cost_usd?: number;
   funnel?: PoolFunnelSnapshot;
+  // Per-account breakdowns for a controlled enable's 'retire or pivot'
+  // decision (omitted by older backends). idle_cost_by_account answers which
+  // account's idle members drive cost; cost_amortization_by_account joins that
+  // with the per-account dispatch funnel for per-account hit rate + $/warm.
+  idle_cost_by_account?: Record<string, PoolIdleCostAccountBreakdown>;
+  cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
 }
 
 export interface WarmVmStateResponse {

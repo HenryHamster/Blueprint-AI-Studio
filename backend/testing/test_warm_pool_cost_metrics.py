@@ -13,6 +13,7 @@ import pytest
 
 from app.efficiency_snapshot import (
     compute_current_axes,
+    compute_pool_cost_amortization_by_account,
     compute_pool_idle_cost,
     settle_pool_vm_idle_cost,
 )
@@ -77,6 +78,55 @@ def test_pool_funnel_snapshot_shape_and_math():
     assert snap["pool_hit_rate"] == 0.75
     assert snap["lease_miss_by_reason"] == {"no_idle_member": 2}
     assert snap["lease_miss_total"] == 2
+    # No account passed → everything buckets under "unattributed".
+    assert set(snap["by_account"]) == {"unattributed"}
+    assert snap["by_account"]["unattributed"]["pool_hit_rate"] == 0.75
+
+
+def test_pool_funnel_per_account_breakdown():
+    """by_account attributes hits/cold/miss + a per-account hit rate, so an
+    operator can read warm-vs-cold and the hit rate per account during a
+    controlled enable; the fleet-wide totals still aggregate across accounts."""
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    # acct-a: 3 warm hits, 1 cold → 75% per-account hit rate.
+    for _ in range(3):
+        record_pool_lease_hit("acct-a")
+    record_pool_cold_dispatch("acct-a")
+    # acct-b: 0 hits, 2 cold → 0% hit rate, plus a lease miss attributed to it.
+    record_pool_cold_dispatch("acct-b")
+    record_pool_cold_dispatch("acct-b")
+    record_pool_lease_miss("no_idle_member", "acct-b")
+    # legacy call site with no account → "unattributed" bucket.
+    record_pool_lease_hit()
+
+    snap = get_pool_funnel_snapshot()
+    # Fleet-wide totals aggregate across every account + the unattributed bucket.
+    assert snap["pool_lease_hits"] == 4
+    assert snap["cold_dispatches"] == 3
+    assert snap["total_dispatches"] == 7
+
+    by_account = snap["by_account"]
+    assert set(by_account) == {"acct-a", "acct-b", "unattributed"}
+
+    a = by_account["acct-a"]
+    assert a["pool_lease_hits"] == 3
+    assert a["cold_dispatches"] == 1
+    assert a["total_dispatches"] == 4
+    assert a["pool_hit_rate"] == 0.75
+
+    b = by_account["acct-b"]
+    assert b["pool_lease_hits"] == 0
+    assert b["cold_dispatches"] == 2
+    assert b["pool_hit_rate"] == 0.0
+    assert b["lease_miss_by_reason"] == {"no_idle_member": 1}
+    assert b["lease_miss_total"] == 1
+
+    u = by_account["unattributed"]
+    assert u["pool_lease_hits"] == 1
+    assert u["pool_hit_rate"] == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -275,3 +325,127 @@ async def test_compute_current_axes_includes_pool_idle_companion(db_session):
     # No merged tasks in this project → both cost metrics are None (no division).
     assert axes["cost_per_merged_pr"] is None
     assert axes["cost_per_merged_pr_incl_pool_idle"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-account-mix idle cost + amortization (telemetry cluster, d-5fd69fe1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_pool_idle_cost_by_account(db_session):
+    """by_account attributes live-member idle cost (banked + live accrual) to the
+    member's pinned account, so an operator can see which account's idle members
+    drive cost. A member with no account_id buckets under 'unattributed'."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    rate = get_fleet_vm_rate_per_second()
+
+    # acct-a: one IDLE member accruing live, one LEASED with banked cost.
+    db_session.add_all(
+        [
+            PoolVm(
+                vm_instance_id="vm-a-idle",
+                project_id=project.id,
+                account_id="acct-a",
+                state=PoolVmState.IDLE,
+                idle_since=now - timedelta(seconds=600),
+            ),
+            PoolVm(
+                vm_instance_id="vm-a-leased",
+                project_id=project.id,
+                account_id="acct-a",
+                state=PoolVmState.LEASED,
+                idle_cost_banked=0.05,
+            ),
+            # acct-b: a single IDLE member.
+            PoolVm(
+                vm_instance_id="vm-b-idle",
+                project_id=project.id,
+                account_id="acct-b",
+                state=PoolVmState.IDLE,
+                idle_since=now - timedelta(seconds=300),
+            ),
+            # no account_id → unattributed bucket.
+            PoolVm(
+                vm_instance_id="vm-none",
+                project_id=project.id,
+                state=PoolVmState.LEASED,
+                idle_cost_banked=0.01,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await compute_pool_idle_cost(db_session, project.id)
+    by_account = result["by_account"]
+    assert set(by_account) == {"acct-a", "acct-b", "unattributed"}
+
+    a = by_account["acct-a"]
+    assert a["member_count"] == 2
+    assert a["idle_count"] == 1
+    assert a["settled_idle_cost_usd"] == pytest.approx(0.05, abs=1e-6)
+    assert a["live_idle_cost_usd"] == pytest.approx(600 * rate, rel=1e-3)
+    assert a["total_idle_cost_usd"] == pytest.approx(0.05 + 600 * rate, rel=1e-3)
+
+    b = by_account["acct-b"]
+    assert b["member_count"] == 1
+    assert b["settled_idle_cost_usd"] == 0.0
+    assert b["live_idle_cost_usd"] == pytest.approx(300 * rate, rel=1e-3)
+
+    u = by_account["unattributed"]
+    assert u["settled_idle_cost_usd"] == pytest.approx(0.01, abs=1e-6)
+
+    # Per-account live totals reconcile with the fleet-wide live figure.
+    fleet_live = sum(v["live_idle_cost_usd"] for v in by_account.values())
+    assert fleet_live == pytest.approx(result["live_idle_cost_usd"], rel=1e-3)
+
+
+def test_compute_pool_cost_amortization_by_account_joins_idle_and_funnel():
+    """The join pairs per-account idle cost with per-account funnel hits so an
+    operator gets warm-vs-cold, hit rate, idle cost, and cost-per-warm-start per
+    account. Accounts present on only one side are still emitted."""
+    idle_by_account = {
+        "acct-a": {"total_idle_cost_usd": 6.0},
+        # acct-c has idle members but no dispatch landed for it yet.
+        "acct-c": {"total_idle_cost_usd": 2.0},
+    }
+    funnel = {
+        "by_account": {
+            "acct-a": {
+                "pool_lease_hits": 4,
+                "cold_dispatches": 1,
+                "total_dispatches": 5,
+                "pool_hit_rate": 0.8,
+            },
+            # acct-b had dispatches but no live idle member at snapshot time.
+            "acct-b": {
+                "pool_lease_hits": 0,
+                "cold_dispatches": 3,
+                "total_dispatches": 3,
+                "pool_hit_rate": 0.0,
+            },
+        }
+    }
+
+    out = compute_pool_cost_amortization_by_account(idle_by_account, funnel)
+    assert set(out) == {"acct-a", "acct-b", "acct-c"}
+
+    a = out["acct-a"]
+    assert a["pool_idle_cost_usd"] == 6.0
+    assert a["pool_lease_hits"] == 4
+    assert a["pool_hit_rate"] == 0.8
+    # 6.0 idle USD / 4 warm starts = 1.5 per hit.
+    assert a["cost_per_pool_hit_usd"] == 1.5
+
+    # Dispatches but no idle cost recorded → zero idle, hits present.
+    b = out["acct-b"]
+    assert b["pool_idle_cost_usd"] == 0.0
+    assert b["cost_per_pool_hit_usd"] is None
+    assert b["total_dispatches"] == 3
+
+    # Idle cost but no warm hit yet → spend not amortized.
+    c = out["acct-c"]
+    assert c["pool_idle_cost_usd"] == 2.0
+    assert c["pool_lease_hits"] == 0
+    assert c["cost_per_pool_hit_usd"] is None

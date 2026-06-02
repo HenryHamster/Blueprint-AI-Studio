@@ -59,7 +59,43 @@ const populatedState: WarmVmStateResponse = {
   warm_continuity_enabled: true,
   warm_backlog_reuse_enabled: true,
   next_role_poll_timeout_secs: 30,
-};
+  // Per-account warm-pool mix with a long account label to stress the 375px
+  // gate: the label must wrap (break-all) rather than force horizontal overflow.
+  pool_metrics: {
+    enabled: true,
+    target_size: 3,
+    current_size: 2,
+    idle_count: 1,
+    projected_idle_cost_usd: 0.18,
+    funnel: {
+      window_hours: 24,
+      pool_lease_hits: 6,
+      cold_dispatches: 2,
+      total_dispatches: 8,
+      pool_hit_rate: 0.75,
+      lease_miss_by_reason: {},
+      lease_miss_total: 0,
+    },
+    cost_amortization_by_account: {
+      'anthropic-prod-max-plan-account-0001-very-long-label': {
+        pool_idle_cost_usd: 0.12,
+        pool_lease_hits: 5,
+        cold_dispatches: 1,
+        total_dispatches: 6,
+        pool_hit_rate: 0.8333,
+        cost_per_pool_hit_usd: 0.024,
+      },
+      'anthropic-staging-overflow-account-0002': {
+        pool_idle_cost_usd: 0.06,
+        pool_lease_hits: 1,
+        cold_dispatches: 1,
+        total_dispatches: 2,
+        pool_hit_rate: 0.5,
+        cost_per_pool_hit_usd: 0.06,
+      },
+    },
+  },
+} as unknown as WarmVmStateResponse;
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),

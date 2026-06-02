@@ -92,6 +92,40 @@ def is_warm_pool_cross_provider_retarget_enabled() -> bool:
     )
 
 
+def warm_pool_project_scope() -> set[str]:
+    """Explicit allowlist of project IDs the warm pool is scoped to (as strings).
+
+    Read from the global ``warm_pool_project_allowlist`` runtime-config value,
+    which may be a JSON list, a comma-separated string, or a single id. An EMPTY
+    (or unset) allowlist means the pool is fleet-wide — the legacy all-or-nothing
+    behavior, preserved so flipping the master switch without a scope keeps
+    today's semantics. A NON-EMPTY allowlist scopes provisioning to exactly the
+    listed projects so an operator can enable the pool for one project, measure
+    its lift and cost, then widen the scope — while every other project stays on
+    the cold path. The master switch (``warm_pool_enabled``) remains the outer
+    kill-switch above this scope.
+    """
+    raw = _runtime_config.get("warm_pool_project_allowlist") or []
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    return {str(p).strip() for p in raw if str(p).strip()}
+
+
+def is_project_warm_pool_scoped(project_id) -> bool:
+    """True iff the warm pool may provision/maintain a pool for ``project_id``.
+
+    Returns True for EVERY project when :func:`warm_pool_project_scope` is empty
+    (fleet-wide legacy mode); otherwise True only for projects in the explicit
+    allowlist. The maintainer consults this so an unscoped project's pool target
+    is forced to 0 (no provisioning, idle members drained) while a scoped
+    project is held at its configured target.
+    """
+    scope = warm_pool_project_scope()
+    if not scope:
+        return True
+    return str(project_id) in scope
+
+
 async def register_pool_vm(
     session,
     *,

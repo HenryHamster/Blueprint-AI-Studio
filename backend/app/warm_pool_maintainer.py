@@ -45,6 +45,7 @@ from app.warm_pool import (
     count_idle_pool_vms,
     count_live_pool_vms,
     is_pool_vm_image_stale,
+    is_project_warm_pool_scoped,
     is_warm_pool_enabled,
 )
 
@@ -666,9 +667,18 @@ async def reconcile_project_pool(
     When ``cost_guard_engaged`` the effective IDLE target is forced to 0 so step 2
     drains every idle member, and provisioning (step 3) is paused — the
     cost-aware auto-drain. It reverses on the next tick the guard disengages.
+
+    The same target-0 forcing applies when this project is NOT in the warm-pool
+    scope (:func:`is_project_warm_pool_scoped`): an unscoped project provisions
+    nothing and any stray idle members are drained, so the pool can be rolled out
+    to one project at a time while every other project stays on the cold path.
+    A scoped project (or any project when the allowlist is empty) is reconciled
+    to its configured target, so its manually-seeded members are held, not drained.
     """
     summary = {"recycled": 0, "drained": 0, "provisioned": 0}
-    target = 0 if cost_guard_engaged else _pool_target_size(runtime_config)
+    in_scope = is_project_warm_pool_scoped(project_id)
+    drain_only = cost_guard_engaged or not in_scope
+    target = 0 if drain_only else _pool_target_size(runtime_config)
 
     # Lock-free candidate read: the recycle/drain mutations below go through
     # retire_and_delete_pool_vm, whose atomic compare-and-swap claim is the sole
@@ -730,7 +740,7 @@ async def reconcile_project_pool(
     #    across the accounts that actually have recent demand, instead of always
     #    the first eligible account. No concurrency slot is reserved for an idle
     #    member (preserved); per-account cost stays attributed to the boot account.
-    if suppressed or cost_guard_engaged:
+    if suppressed or drain_only:
         return summary
     deficit = target - live
     allowed = min(deficit, max(0, dispatch_slots_remaining), max(0, pool_budget_remaining))
