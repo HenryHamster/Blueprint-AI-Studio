@@ -107,7 +107,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "app/routers/admin_analytics.py" = ["BLE001"]
 # admin.py and github.py raise HTTPException inside except blocks to convert errors to HTTP responses
 "app/admin.py" = ["B904"]
-"app/github.py" = ["B904"]
+# E402: github.py is a thin facade that re-exports symbols from the extracted
+# github_* domain modules (github_auth/checks/issues/refs/pulls/merge_summary)
+# via deferred end-of-file imports placed after the core helpers to avoid
+# circular-import order issues — the same intentional pattern as main.py /
+# orchestrator.py above.
+"app/github.py" = ["B904", "E402"]
 # max_plan_pool.py hosts the account-pool background loops (recheck_disabled_accounts,
 # rate-limit/usage-cap persist-retry drains). Same log-and-continue policy: a transient
 # DB persist failure must be logged and retried, not crash the pool maintenance loop.
