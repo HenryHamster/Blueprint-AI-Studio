@@ -21,7 +21,7 @@ from typing import Optional
 
 from sqlalchemy import or_, select
 
-from app.models import Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -268,6 +268,12 @@ async def _eligible_backlog_ids(
     returned rows, so an empty backlog never pays for the IN_PROGRESS scan.
     """
     now = _utcnow()
+    # A paused project's backlog is never warm-claimable. Pause is a
+    # first-class persisted switch (distinct from terminal status and from
+    # autonomous_enabled) that blocks ALL new dispatch — the orchestrator's
+    # cold path filters it in its candidate query, and this idle-VM next-role
+    # reuse path must filter it identically so a paused project can't keep
+    # claiming warm VMs. The join is safe: project_id is a non-nullable FK.
     rows = (
         await session.execute(
             select(
@@ -278,10 +284,12 @@ async def _eligible_backlog_ids(
                 Task.account_id,
                 Task.model,
             )
+            .join(Project, Task.project_id == Project.id)
             .where(
                 Task.status == TaskStatus.QUEUED,
                 Task.project_id == project_id,
                 Task.requires_approval.is_(False),
+                Project.paused.is_(False),
                 or_(
                     Task.retry_after_until.is_(None),
                     Task.retry_after_until <= now,
@@ -450,9 +458,19 @@ async def select_backlog_reuse_candidate(
         return None
     result = await session.execute(
         select(Task)
-        .where(Task.id.in_(eligible), Task.status == TaskStatus.QUEUED)
+        .join(Project, Task.project_id == Project.id)
+        .where(
+            Task.id.in_(eligible),
+            Task.status == TaskStatus.QUEUED,
+            Project.paused.is_(False),
+        )
         .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
-        .with_for_update(skip_locked=True)
+        # of=Task locks ONLY the candidate Task row, not the joined Project
+        # row. All backlog candidates belong to one project, so locking the
+        # shared Project row would let skip_locked silently drop a claimable
+        # task whenever a sibling claim in the same project held it (mirrors
+        # agent_warm_continuity.py:750/:926).
+        .with_for_update(skip_locked=True, of=Task)
         .limit(1)
     )
     claimed = result.scalars().first()
@@ -1012,7 +1030,8 @@ def record_spawn_pin_skipped(reason: str) -> None:
     "breaker_tripped" (is_warm_continuity_suppressed() true),
     "caller_suppressed" (suppress_warm_handoff=True),
     "source_cold" (source task has no vm_instance_id),
-    "stale_source" (source heartbeat older than WARM_HANDOFF_WINDOW_SECS).
+    "stale_source" (source heartbeat older than WARM_HANDOFF_WINDOW_SECS),
+    "project_paused" (owning project is paused — no new dispatch on any path).
     """
     _spawn_pin_skipped_events.append((_utcnow(), reason))
 

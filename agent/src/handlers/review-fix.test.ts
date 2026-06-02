@@ -244,6 +244,48 @@ describe('review history feedback truncation — reviewer sees at least as much 
   });
 });
 
+// ── handleFix: operator steering reaches the fix prompt ─────────────────────
+describe('handleFix — operator steering (strategic_intent)', () => {
+  const histWithStructured = [{
+    iteration: 1,
+    feedback: 'address the issues',
+    issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
+  }];
+
+  it('prepends ## Operator Steering alongside the existing review context', async () => {
+    await handleFix(
+      'task-steering-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 7, prompt: 'address review' },
+      {
+        context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } },
+        strategic_intent: {
+          purpose: 'Build an autonomous coding studio.',
+          current_focus: 'Thread operator steering into tactical prompts.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Operator Steering');
+    expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
+    expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
+    // The steering section is additive — existing review context still present.
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
+  it('omits ## Operator Steering when strategic_intent is absent', async () => {
+    await handleFix(
+      'task-no-steering-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 8, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('## Operator Steering');
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+});
+
 // ── handleReview: scope-overflow replaces (not augments) scope preamble ─────
 describe('handleReview — scope overflow replaces scope-narrowed preamble', () => {
   const basePayload = {

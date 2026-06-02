@@ -126,6 +126,25 @@ export function synthesizeFailureHotspots(
     .map(([file, count]) => ({ file, count }));
 }
 
+// Render the operator's current strategic intent (purpose + current_focus) as
+// a distinct markdown section. Retained for the fix path (review-fix.ts), which
+// assembles its prompt manually and never calls buildContextPrefix. NOT called
+// inside buildContextPrefix itself — the canonical `## Strategic Intent` block
+// below already surfaces task.strategic_intent (purpose, current focus, context,
+// constraints), so calling this here too would double-render the same payload.
+// Returns '' when the payload is absent or empty so no bare header is emitted.
+export function formatStrategicIntent(intent: Record<string, unknown> | undefined): string {
+  if (!intent || typeof intent !== 'object') return '';
+  const lines: string[] = ['## Operator Steering'];
+  const currentFocus = strVal(intent.current_focus);
+  if (currentFocus) lines.push(`**Current focus:** ${currentFocus}`);
+  const purpose = strVal(intent.purpose);
+  if (purpose) lines.push(`**Purpose:** ${purpose}`);
+  if (lines.length === 1) return '';
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
 export function buildContextPrefix(task: Record<string, unknown>): string {
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];

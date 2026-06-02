@@ -373,6 +373,64 @@ async def test_eligibility_skips_dependency_and_file_conflict(db_session):
 
 
 @pytest.mark.asyncio
+async def test_paused_project_has_no_warm_claimable_backlog(db_session):
+    """A paused project's QUEUED backlog must not be warm-claimable on the
+    idle-VM next-role reuse path; resuming restores eligibility."""
+    project = await _make_project(db_session, name="Paused Backlog")
+    vm_id = "agent-vm-paused-backlog"
+
+    clean = await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+    # Baseline: eligible while the project is running.
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+
+    # Pause: the same backlog task is now ineligible on every reuse entry point.
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is False
+    assert (
+        await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+    )
+
+    # Resume: eligibility is restored with no other change.
+    project.paused = False
+    db_session.add(project)
+    await db_session.commit()
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == clean.id
+
+
+@pytest.mark.asyncio
+async def test_final_claim_rechecks_project_pause_with_stale_eligible_ids(
+    db_session, mocker
+):
+    """The final warm-claim lock re-checks Project.paused even if eligibility
+    was computed before the project was paused."""
+    project = await _make_project(db_session, name="Paused Claim Race")
+    vm_id = "agent-vm-paused-claim-race"
+    task = await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.warm_backlog_reuse._eligible_backlog_ids",
+        new_callable=mocker.AsyncMock,
+        return_value=[task.id],
+    )
+
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_dependency_ready_task_is_eligible_with_marker(db_session):
     """A dependency-bearing task whose deps the orchestrator already resolved
     (``context['_deps_satisfied']`` stamped) is warm-claimable, while an

@@ -10031,3 +10031,119 @@ async def test_undirected_guard_scoped_per_project(db_session):
     )
     assert await _undirected_research_recently_active(p1.id, db_session) is False
     assert await _undirected_research_recently_active(p2.id, db_session) is True
+
+
+@pytest.mark.asyncio
+async def test_idle_research_skips_paused_project(db_session, mocker):
+    """`_check_idle_research` must not spawn work for a paused project even when
+    autonomous_enabled is True and it has an active direction; a non-paused
+    sibling still spawns."""
+    from app.autonomous_research import _check_idle_research
+
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    # _check_idle_research opens its own ``async with AsyncSessionLocal()``
+    # session; bind it to the test's own db_session (via a no-op context
+    # manager) so it sees the rows committed below and never builds the
+    # production lazy engine in the test environment.
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _session_cm():
+        yield db_session
+
+    mocker.patch(
+        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
+    )
+
+    paused = Project(
+        name="Idle Paused",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=True,
+        directions=[_active_direction("d-paused01")],
+    )
+    active = Project(
+        name="Idle Active",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=False,
+        directions=[_active_direction("d-active01")],
+    )
+    db_session.add_all([paused, active])
+    await db_session.commit()
+    await db_session.refresh(paused)
+    await db_session.refresh(active)
+
+    # Clear the time-gate so the periodic check actually runs this call.
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+
+    spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
+    assert active.id in spawned_ids, "Non-paused project should spawn research"
+    assert paused.id not in spawned_ids, "Paused project must be skipped"
+
+
+@pytest.mark.asyncio
+async def test_post_merge_research_skips_paused_project(db_session, mocker):
+    """`_check_autonomous_research` (post-merge hook) must skip a paused project
+    while still spawning for a non-paused project on the same repo."""
+    from app.autonomous_research import _check_autonomous_research
+
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
+    )
+    # _check_autonomous_research opens its own ``async with
+    # AsyncSessionLocal()`` session; bind it to the test's own db_session so it
+    # sees the committed rows below.
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _session_cm():
+        yield db_session
+
+    mocker.patch(
+        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
+    )
+
+    owner, repo = "acme", "widgets"
+    paused = Project(
+        name="Merge Paused",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=True,
+        github_owner=owner,
+        github_repo=repo,
+    )
+    active = Project(
+        name="Merge Active",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=False,
+        github_owner=owner,
+        github_repo=repo,
+    )
+    db_session.add_all([paused, active])
+    await db_session.commit()
+    await db_session.refresh(paused)
+    await db_session.refresh(active)
+
+    await _check_autonomous_research(owner, repo)
+
+    spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
+    assert active.id in spawned_ids, "Non-paused project should spawn research"
+    assert paused.id not in spawned_ids, "Paused project must be skipped"

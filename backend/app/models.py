@@ -316,9 +316,20 @@ class Project(SQLModel, table=True):
     )
     # Toggle autonomous research/task generation
     autonomous_enabled: bool = Field(default=True)
+    # Operator pause switch. Distinct from ``autonomous_enabled`` (which only
+    # gates NEW autonomous spawning) and from terminal ``status`` (DRAFT →
+    # COMPLETED/FAILED/CANCELLED): while ``paused`` is True the orchestrator
+    # must not select or provision this project's QUEUED work on any dispatch
+    # path, and all autonomous spawn entry points skip it. In-flight
+    # PROVISIONING/IN_PROGRESS tasks are allowed to drain. Resuming
+    # (paused=False) restores normal dispatch with no re-configuration.
+    paused: bool = Field(default=False)
     # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
     # Set True when github_owner/github_repo matches Blueprint's own repo
     is_self_repo: bool = Field(default=False)
+    # Archived flag: durable, reversible "set aside" state so a project can be
+    # hidden without deletion. Server default false backfills existing rows.
+    archived: bool = Field(default=False)
     # Build configuration: onboarding seeds repo-derived defaults here, and
     # admin PATCH / re-detect preserves operator-owned branch/cleanup overrides.
     build_config: Dict[str, Any] | None = Field(
@@ -518,6 +529,19 @@ class Project(SQLModel, table=True):
         line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
         current = (self.running_update or "").rstrip()
         self.running_update = f"{current}\n{line}" if current else line
+
+    @classmethod
+    def not_archived(cls):
+        """Canonical "project is not archived" filter expression.
+
+        Archiving halts ALL of a project's work, so every project-selection
+        query that drives or surfaces work (orchestrator candidate dispatch,
+        autonomous schedulers, strategic-starvation and pipeline alert scans)
+        filters on this. Centralized here so the exclusion clause cannot drift
+        independently across call sites — production code and tests reference
+        the same predicate. Usage: ``select(...).where(Project.not_archived())``.
+        """
+        return cls.archived.is_(False)
 
     tasks: List["Task"] = Relationship(
         back_populates="project",

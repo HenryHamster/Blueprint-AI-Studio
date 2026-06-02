@@ -725,13 +725,30 @@ async def next_role(
     )
 
     if is_warm_pool_enabled() and not _shared_state.is_warm_pool_suppressed():
+        from app.models import Project
+
+        # A paused project's pool pin is never claimable. A stale pin created
+        # just before pause could otherwise still be claimed during drain;
+        # filter Project.paused for parity with the cold dispatch, backlog-reuse
+        # and chain-continuity paths so pause blocks work on EVERY dispatch
+        # path. The join is safe: project_id is a non-nullable FK.
         pool_filters = [
             Task.status == TaskStatus.QUEUED,
+            Project.paused.is_(False),
             Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id,
         ]
         if use_jsonb_has_key:
-            pool_filters.insert(1, Task.context.has_key("warm_target_vm_id"))
-        pool_stmt = select(Task).where(*pool_filters).with_for_update(skip_locked=True)
+            pool_filters.insert(2, Task.context.has_key("warm_target_vm_id"))
+        # Lock only the Task row (of=Task): the join to Project is purely a
+        # pause filter. Locking the shared Project row would let skip_locked
+        # silently drop a claimable task whenever a sibling claim in the same
+        # project held it.
+        pool_stmt = (
+            select(Task)
+            .join(Project, Task.project_id == Project.id)
+            .where(*pool_filters)
+            .with_for_update(skip_locked=True, of=Task)
+        )
         pool_task = (await session.execute(pool_stmt)).scalars().first()
         # Only claim genuine pool pins here; a chain pin (no warm_pool_pin marker)
         # falls through to the chain-continuity branch below, which re-finds the
@@ -866,16 +883,34 @@ async def next_role(
         and not _shared_state.is_warm_continuity_suppressed()
     )
     if warm_continuity_active:
+        from app.models import Project
+
         # Look up a QUEUED task pinned to this VM. Optional prior_pr_number
         # filter narrows further so a stray pin from an unrelated chain
         # doesn't get claimed.
-        warm_vm_filters = [Task.status == TaskStatus.QUEUED]
+        #
+        # A paused project's warm chain is never claimable: pause is a
+        # first-class persisted switch (distinct from terminal status and from
+        # autonomous_enabled) that blocks ALL new dispatch on EVERY path. The
+        # orchestrator's cold candidate query and the backlog-reuse path both
+        # filter Project.paused; the chain-continuity claim must filter it
+        # identically so a paused project's create->review->fix->... chain
+        # can't keep spawning and running new QUEUED work. The join is safe:
+        # project_id is a non-nullable FK.
+        warm_vm_filters = [
+            Task.status == TaskStatus.QUEUED,
+            Project.paused.is_(False),
+        ]
         if use_jsonb_has_key:
             warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
         warm_vm_filters.append(
             Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
         )
-        stmt = select(Task).where(*warm_vm_filters)
+        stmt = (
+            select(Task)
+            .join(Project, Task.project_id == Project.id)
+            .where(*warm_vm_filters)
+        )
         if req.prior_pr_number is not None:
             prior_pr_filters = []
             if use_jsonb_has_key:
@@ -884,7 +919,11 @@ async def next_role(
                 Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
             )
             stmt = stmt.where(*prior_pr_filters)
-        stmt = stmt.with_for_update(skip_locked=True)
+        # Lock only the Task row (of=Task): the join to Project is purely the
+        # pause filter; locking the shared Project row would let skip_locked
+        # silently drop a claimable task when a sibling claim in the same
+        # project held it.
+        stmt = stmt.with_for_update(skip_locked=True, of=Task)
 
         task = (await session.execute(stmt)).scalars().first()
 

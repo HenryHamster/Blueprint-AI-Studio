@@ -22,6 +22,7 @@ from app.models import (
     ArtifactType,
     Project,
     ProjectMember,
+    ProjectStatus,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -1467,6 +1468,398 @@ class TestDeleteProject:
         assert resp.status_code == 403
 
 
+class TestResetProject:
+    @pytest.mark.asyncio
+    async def test_reset_project_cancels_active_tasks_and_preserves_config(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Reset cancels/wipes active tasks, tears down VMs, keeps durable config."""
+        ensure_vm = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+        )
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="wedged")
+        project.directions = [{"text": "ship the thing"}]
+        project.vision = {"summary": "the grand vision"}
+        project.build_config = {"directories": [{"path": "./svc", "type": "node"}]}
+        flag_modified(project, "directions")
+        flag_modified(project, "vision")
+        flag_modified(project, "build_config")
+        await db_session.commit()
+        project_id = project.id
+
+        task = Task(
+            project_id=project_id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project_id}/reset")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["active_tasks_cancelled"] == 1
+        assert body["tasks_deleted"] == 1
+        # VM teardown reused the shared machinery.
+        assert ensure_vm.await_count == 1
+
+        # All task rows for the project are gone.
+        remaining = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert remaining == []
+
+        # Durable config survives and the project is runnable again.
+        refreshed = (
+            await db_session.execute(select(Project).where(Project.id == project_id))
+        ).scalar_one()
+        await db_session.refresh(refreshed)
+        assert refreshed.directions == [{"text": "ship the thing"}]
+        assert refreshed.vision == {"summary": "the grand vision"}
+        assert refreshed.build_config == {
+            "directories": [{"path": "./svc", "type": "node"}]
+        }
+        assert refreshed.status == ProjectStatus.DEPLOYING
+
+    @pytest.mark.asyncio
+    async def test_reset_project_runnable_end_state(
+        self, client: AsyncClient, db_session
+    ):
+        """After reset the project ends in a non-terminal, runnable status."""
+        project = await _make_project(db_session, name="endstate")
+        project.status = ProjectStatus.CANCELLED
+        await db_session.commit()
+        project_id = project.id
+
+        resp = await client.post(f"/api/admin/projects/{project_id}/reset")
+        assert resp.status_code == 200
+
+        refreshed = (
+            await db_session.execute(select(Project).where(Project.id == project_id))
+        ).scalar_one()
+        await db_session.refresh(refreshed)
+        assert refreshed.status == ProjectStatus.DEPLOYING
+        assert refreshed.status not in (
+            ProjectStatus.CANCELLED,
+            ProjectStatus.FAILED,
+            ProjectStatus.COMPLETED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reset_project_non_owner_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """Member-role (below owner) cannot reset a project."""
+        other = Project(name="Protected", user_id="other-99")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{other.id}/reset")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_reset_project_clears_in_memory_state(
+        self, client: AsyncClient, db_session
+    ):
+        """Reset pops the project's transient circuit-breaker / anomaly state."""
+        from app import anomaly_state
+
+        project = await _make_project(db_session, name="stateful")
+        pid = str(project.id)
+        other_pid = "keep-me"
+        anomaly_state.circuit_breakers[pid] = {"state": "OPEN"}
+        anomaly_state.circuit_breakers[other_pid] = {"state": "CLOSED"}
+        anomaly_state.autonomous_failure_counts[pid] = 7
+        anomaly_state.persistent_anomalies[pid] = {"CODE_ERROR": {}}
+        try:
+            resp = await client.post(f"/api/admin/projects/{project.id}/reset")
+            assert resp.status_code == 200
+            assert pid not in anomaly_state.circuit_breakers
+            assert pid not in anomaly_state.autonomous_failure_counts
+            assert pid not in anomaly_state.persistent_anomalies
+            # Other projects' state is untouched.
+            assert other_pid in anomaly_state.circuit_breakers
+        finally:
+            anomaly_state.circuit_breakers.pop(pid, None)
+            anomaly_state.circuit_breakers.pop(other_pid, None)
+            anomaly_state.autonomous_failure_counts.pop(pid, None)
+            anomaly_state.persistent_anomalies.pop(pid, None)
+
+
+class TestArchiveProject:
+    @pytest.mark.asyncio
+    async def test_archive_hides_project_from_default_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Archiving a project removes it from the default (active) list."""
+        project = await _make_project(db_session, name="to-archive")
+
+        # Present before archiving.
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        ids = {p["id"] for p in resp.json()["items"]}
+        assert str(project.id) in ids
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/archive")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "message": f"Project {project.id} archived",
+            "archived": True,
+        }
+
+        # Gone from the default list.
+        resp = await client.get("/api/admin/projects")
+        ids = {p["id"] for p in resp.json()["items"]}
+        assert str(project.id) not in ids
+
+    @pytest.mark.asyncio
+    async def test_archived_param_returns_only_archived_with_flag(
+        self, client: AsyncClient, db_session
+    ):
+        """archived=true returns the archived set; items carry the archived flag."""
+        active = await _make_project(db_session, name="active")
+        archived = await _make_project(db_session, name="archived")
+        resp = await client.post(f"/api/admin/projects/{archived.id}/archive")
+        assert resp.status_code == 200
+
+        resp = await client.get("/api/admin/projects?archived=true")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        ids = {p["id"] for p in items}
+        assert str(archived.id) in ids
+        assert str(active.id) not in ids
+        target = next(p for p in items if p["id"] == str(archived.id))
+        assert target["archived"] is True
+
+    @pytest.mark.asyncio
+    async def test_default_list_items_include_archived_false(
+        self, client: AsyncClient, db_session
+    ):
+        """Active list items expose archived=False (backward-compatible add)."""
+        project = await _make_project(db_session, name="plain")
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        target = next(
+            p for p in resp.json()["items"] if p["id"] == str(project.id)
+        )
+        assert target["archived"] is False
+
+    @pytest.mark.asyncio
+    async def test_unarchive_restores_to_default_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Unarchiving returns a project to the default list and clears the flag."""
+        project = await _make_project(db_session, name="round-trip")
+        await client.post(f"/api/admin/projects/{project.id}/archive")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/unarchive")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "message": f"Project {project.id} unarchived",
+            "archived": False,
+        }
+
+        resp = await client.get("/api/admin/projects")
+        ids = {p["id"] for p in resp.json()["items"]}
+        assert str(project.id) in ids
+
+    @pytest.mark.asyncio
+    async def test_archive_is_idempotent(self, client: AsyncClient, db_session):
+        """Archiving an already-archived project is a no-op success."""
+        project = await _make_project(db_session, name="idem")
+        r1 = await client.post(f"/api/admin/projects/{project.id}/archive")
+        r2 = await client.post(f"/api/admin/projects/{project.id}/archive")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r2.json()["archived"] is True
+
+    @pytest.mark.asyncio
+    async def test_archive_non_owner_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """Member-role (below owner) cannot archive a project."""
+        other = Project(name="Protected", user_id="other-99")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{other.id}/archive")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_unarchive_non_owner_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """Member-role (below owner) cannot unarchive a project."""
+        other = Project(name="Protected", user_id="other-99", archived=True)
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{other.id}/unarchive")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_archived_project_excluded_from_orchestrator_dispatch(
+        self, client: AsyncClient, db_session
+    ):
+        """An archived project's QUEUED tasks are filtered out of the
+        orchestrator candidate scan (work halts); unarchiving restores them.
+
+        The candidate filter references ``Project.not_archived()`` — the SAME
+        predicate the production orchestrator candidate-task query uses
+        (orchestrator.py) — so it cannot pass if that production predicate
+        drifts.
+        """
+        project = await _make_project(db_session, name="halt-dispatch")
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "research"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        candidate_filter = Task.project_id.in_(
+            select(Project.id).where(Project.not_archived())
+        )
+
+        # Eligible while active.
+        rows = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.QUEUED, candidate_filter
+                )
+            )
+        ).scalars().all()
+        assert task.id in {t.id for t in rows}
+
+        # Archiving removes the task from the candidate pool.
+        await client.post(f"/api/admin/projects/{project.id}/archive")
+        rows = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.QUEUED, candidate_filter
+                )
+            )
+        ).scalars().all()
+        assert task.id not in {t.id for t in rows}
+
+        # Unarchiving restores eligibility.
+        await client.post(f"/api/admin/projects/{project.id}/unarchive")
+        rows = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.QUEUED, candidate_filter
+                )
+            )
+        ).scalars().all()
+        assert task.id in {t.id for t in rows}
+
+    @pytest.mark.asyncio
+    async def test_archived_project_excluded_from_autonomous_spawning(
+        self, client: AsyncClient, db_session
+    ):
+        """An archived project spawns no autonomous research (work halts)."""
+        from app.autonomous_research import _spawn_research_task
+
+        project = await _make_project(db_session, name="halt-autonomous")
+        project.autonomous_enabled = True
+        project.archived = True
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _spawn_research_task(project, db_session)
+        assert result is None
+
+        # No task was created for the archived project.
+        count = len(
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_autonomous_idle_select_excludes_archived(
+        self, client: AsyncClient, db_session
+    ):
+        """The idle-research project select skips archived projects."""
+        active = await _make_project(db_session, name="idle-active")
+        active.autonomous_enabled = True
+        archived = await _make_project(db_session, name="idle-archived")
+        archived.autonomous_enabled = True
+        archived.archived = True
+        await db_session.commit()
+
+        # Uses Project.not_archived() — the SAME predicate _check_idle_research
+        # selects on in autonomous_research.py — so this cannot pass if the
+        # production exclusion drifts.
+        rows = (
+            await db_session.execute(
+                select(Project).where(
+                    Project.autonomous_enabled.is_(True),
+                    Project.not_archived(),
+                )
+            )
+        ).scalars().all()
+        ids = {p.id for p in rows}
+        assert active.id in ids
+        assert archived.id not in ids
+
+
+class TestResetProjectStateHelper:
+    def test_reset_project_state_clears_only_target(self):
+        """reset_project_state pops one project's keys, leaves others intact."""
+        from app import anomaly_state
+
+        target = "proj-target"
+        other = "proj-other"
+        anomaly_state.circuit_breakers[target] = {"state": "OPEN"}
+        anomaly_state.circuit_breakers[other] = {"state": "CLOSED"}
+        anomaly_state.autonomous_failure_counts[target] = 3
+        anomaly_state.persistent_anomalies[target] = {"X": {}}
+        try:
+            anomaly_state.reset_project_state(target)
+            assert target not in anomaly_state.circuit_breakers
+            assert target not in anomaly_state.autonomous_failure_counts
+            assert target not in anomaly_state.persistent_anomalies
+            assert other in anomaly_state.circuit_breakers
+            # Idempotent — second call is a no-op.
+            anomaly_state.reset_project_state(target)
+        finally:
+            anomaly_state.circuit_breakers.pop(target, None)
+            anomaly_state.circuit_breakers.pop(other, None)
+            anomaly_state.autonomous_failure_counts.pop(target, None)
+            anomaly_state.persistent_anomalies.pop(target, None)
+
+
 class TestAutonomousMode:
     @pytest.mark.asyncio
     async def test_pause_all_autonomous(self, client: AsyncClient, db_session):
@@ -1516,6 +1909,105 @@ class TestAutonomousMode:
             json={"wrong_field": True},
         )
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_pause_project(self, client: AsyncClient, db_session):
+        """Owner can pause a project; pause is independent of autonomous_enabled."""
+        project = await _make_project(db_session)
+        project.autonomous_enabled = True
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["paused"] is True
+
+        await db_session.refresh(project)
+        assert project.paused is True
+        # Pause must not touch the autonomous toggle.
+        assert project.autonomous_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_resume_project(self, client: AsyncClient, db_session):
+        """Owner can resume (unpause) a paused project."""
+        project = await _make_project(db_session)
+        project.paused = True
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["paused"] is False
+
+        await db_session.refresh(project)
+        assert project.paused is False
+
+    @pytest.mark.asyncio
+    async def test_pause_project_missing_field_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """Missing 'paused' key returns 400."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"wrong_field": True},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_pause_project_requires_owner(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-owner member cannot pause a project (owner-only mutation)."""
+        owner_project = Project(name="Owner Pause Project", user_id="other-owner")
+        db_session.add(owner_project)
+        await db_session.commit()
+        await db_session.refresh(owner_project)
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id="other-owner", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{owner_project.id}/pause",
+            json={"paused": True},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_paused_field_in_list_and_detail(
+        self, client: AsyncClient, db_session
+    ):
+        """The additive `paused` field appears in both list and detail responses."""
+        project = await _make_project(db_session, name="Paused Field Project")
+        project.paused = True
+        db_session.add(project)
+        await db_session.commit()
+
+        list_resp = await client.get("/api/admin/projects")
+        assert list_resp.status_code == 200
+        target = next(
+            p for p in list_resp.json()["items"] if p["id"] == str(project.id)
+        )
+        assert target["paused"] is True
+
+        detail_resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["paused"] is True
 
     @pytest.mark.asyncio
     async def test_get_autonomous_status(self, client: AsyncClient, db_session):

@@ -487,6 +487,177 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
         _shared_state.vm_last_heartbeat.update(prior_heartbeat)
 
 
+@pytest.mark.asyncio
+async def test_warm_vm_next_role_chain_continuity_blocked_when_paused(
+    client: AsyncClient, db_session, mocker
+):
+    """A paused project's warm chain-continuity claim must be blocked.
+
+    A QUEUED task pinned to a live VM via warm_target_vm_id (a chain pin, no
+    warm_pool_pin marker) is the create->review->fix->... handoff. While the
+    owning project is paused, /next-role must NOT claim it (204, task stays
+    QUEUED); resuming the project restores the claim. Pause blocks new dispatch
+    on EVERY path, not just the orchestrator's cold candidate query.
+    """
+    import app.shared_state as _shared_state
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch(
+        "app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+
+    prior_warm_continuity = _runtime_config.get("warm_continuity_enabled")
+    prior_heartbeat = dict(_shared_state.vm_last_heartbeat)
+    try:
+        _runtime_config["warm_continuity_enabled"] = True
+
+        project = Project(name="Warm-VM Paused Chain", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        source_vm_id = "agent-vm-warm-paused-chain"
+        source_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "pr_number": 8123}],
+            vm_instance_id=source_vm_id,
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(source_task)
+        # A QUEUED warm-pinned follow-on (chain pin: no warm_pool_pin marker).
+        deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+        pinned = Task(
+            project_id=project.id,
+            payloads=[{"type": "review", "pr_number": 8123, "branch": "feat/paused"}],
+            vm_instance_id=None,
+            status=TaskStatus.QUEUED,
+            context={
+                "warm_target_vm_id": source_vm_id,
+                "warm_target_pr": "8123",
+                "warm_handoff_deadline": deadline,
+            },
+        )
+        db_session.add(pinned)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+        await db_session.refresh(pinned)
+
+        token = create_agent_token(str(source_task.id), source_vm_id)
+        nr_json = {
+            "vm_instance_id": source_vm_id,
+            "prior_task_id": str(source_task.id),
+            "prior_pr_number": 8123,
+        }
+
+        # ── Paused: the chain-continuity claim must be declined (204) ───────────
+        project.paused = True
+        db_session.add(project)
+        await db_session.commit()
+
+        paused_resp = await client.post(
+            "/api/agent/next-role", json=nr_json, headers={"x-agent-token": token}
+        )
+        assert paused_resp.status_code == 204, paused_resp.text
+        # The pinned task is untouched — still QUEUED, no VM assigned.
+        db_session.expire(pinned)
+        await db_session.refresh(pinned)
+        assert pinned.status == TaskStatus.QUEUED
+        assert pinned.vm_instance_id is None
+
+        # ── Resume: the same pin is now claimable warm ─────────────────────────
+        project.paused = False
+        db_session.add(project)
+        await db_session.commit()
+
+        resumed_resp = await client.post(
+            "/api/agent/next-role", json=nr_json, headers={"x-agent-token": token}
+        )
+        assert resumed_resp.status_code == 200, resumed_resp.text
+        body = resumed_resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(pinned.id)
+        assert body["warm_start"] is True
+
+    finally:
+        if prior_warm_continuity is None:
+            _runtime_config.pop("warm_continuity_enabled", None)
+        else:
+            _runtime_config["warm_continuity_enabled"] = prior_warm_continuity
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
+@pytest.mark.asyncio
+async def test_spawn_pipeline_task_skips_warm_pin_when_project_paused(
+    db_session, mocker
+):
+    """Defense-in-depth: _spawn_pipeline_task must not set a warm-handoff pin
+    for a paused project's source task, even when the source is IN_PROGRESS
+    with a live VM. The follow-on is still spawned QUEUED (so resume can
+    dispatch it cold), but with no warm_target_vm_id pin and no warm VM."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    mocker.patch(
+        "app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+
+    prior_warm_continuity = _runtime_config.get("warm_continuity_enabled")
+    try:
+        _runtime_config["warm_continuity_enabled"] = True
+
+        project = Project(
+            name="Spawn Pin Paused", user_id="test-user-123", paused=True
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        source_vm_id = "agent-vm-spawn-pin-paused"
+        source_task = Task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "create",
+                    "pr_number": 8456,
+                    "branch": "feat/spawn-paused",
+                    "base_branch": "main",
+                    "prompt": "implement X",
+                }
+            ],
+            vm_instance_id=source_vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"scope": "small", "review_loop": {"iteration": 0}},
+        )
+        db_session.add(source_task)
+        await db_session.commit()
+        await db_session.refresh(source_task)
+
+        spawned, was_created = await _spawn_pipeline_task(
+            source_task,
+            "review",
+            db_session,
+            pr_number=8456,
+            branch="feat/spawn-paused",
+            base_branch="main",
+        )
+        assert was_created is True and spawned is not None
+        assert spawned.status == TaskStatus.QUEUED
+        # No warm pin: vm_instance_id is the source VM name (cold spawn default),
+        # and no warm_target_vm_id was stamped into context.
+        ctx = spawned.context or {}
+        assert "warm_target_vm_id" not in ctx
+        assert "warm_handoff_deadline" not in ctx
+
+    finally:
+        if prior_warm_continuity is None:
+            _runtime_config.pop("warm_continuity_enabled", None)
+        else:
+            _runtime_config["warm_continuity_enabled"] = prior_warm_continuity
+
+
 # ---------------------------------------------------------------------------
 # Warm POOL: full flag-on lifecycle assembled end-to-end
 # ---------------------------------------------------------------------------

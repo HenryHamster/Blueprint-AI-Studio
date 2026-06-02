@@ -35,6 +35,7 @@ export {
 } from './prompts/self-review.js';
 export {
   buildContextPrefix,
+  formatStrategicIntent,
   formatSelfReviewCalibrationSection,
   synthesizeSuccessPatterns,
   synthesizeFailureHotspots,

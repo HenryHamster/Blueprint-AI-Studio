@@ -3919,9 +3919,27 @@ async def _process_post_commit(
 
         if (
             project
+            and not project.autonomous_enabled
             and project.status != ProjectStatus.CANCELLED
             and executable_statuses
         ):
+            # 2026-06-02 fix: live autonomous projects must NEVER be flipped to a
+            # terminal status by this aggregation. Autonomous projects spawn work
+            # in waves on a timer; between one wave draining and the next being
+            # created there is a window where every task is briefly terminal. If
+            # that mix is all-{COMPLETED, CANCELLED} (common — tasks are routinely
+            # CANCELLED for benign reasons like dedup, scope-empty, supersession,
+            # graceful reassignment, and keep their VM id), the all-terminal branch
+            # below would flip the project to a terminal CANCELLED/COMPLETED/FAILED
+            # status. Because the autonomous engine selects work purely by the
+            # ``autonomous_enabled`` flag and never consults project status, the
+            # project keeps running while displaying a terminal status to the
+            # operator, and nothing ever moves it back. Terminal-status aggregation
+            # applies only to FINITE (non-autonomous) projects. The all-terminal
+            # guard below was originally meant to make this a no-op for autonomous
+            # projects, but the wave-drain window defeats it; gating on
+            # ``not autonomous_enabled`` is the correct, explicit fix.
+            #
             # 2026-05-05 fix: only transition project status when ALL executable
             # tasks are terminal. Previously the ``any FAILED`` branch fired
             # any time an old FAILED row sat in ``executable_statuses`` (which

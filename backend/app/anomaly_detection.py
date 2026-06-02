@@ -1368,7 +1368,10 @@ async def _expire_stale_proposals(session) -> int:
     project_ids = (
         (
             await session.execute(
-                select(Project.id).where(Project.autonomous_enabled.is_(True))
+                select(Project.id).where(
+                    Project.autonomous_enabled.is_(True),
+                    Project.not_archived(),
+                )
             )
         )
         .scalars()

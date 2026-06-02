@@ -1193,6 +1193,115 @@ export async function updateApprovalGateConfig(
   return res.json();
 }
 
+/**
+ * Owner-only project delete. The backend cascades to tasks/artifacts/history
+ * and, when `force` is true, bulk-cancels active tasks and tears down their VMs
+ * before removing the project. Without `force` the server refuses (409) if the
+ * project still has active tasks. Surfaces the server `detail` (403 permission,
+ * 409 active-tasks, 429 contention) as the thrown error message.
+ */
+export async function deleteProject(
+  projectId: string,
+  force = false,
+): Promise<{ message: string; active_tasks_cancelled: number }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}?force=${force}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to delete project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to delete project: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function resetProject(
+  projectId: string,
+): Promise<{ message: string; active_tasks_cancelled: number; tasks_deleted: number }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/reset`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to reset project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to reset project: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function setProjectPaused(
+  projectId: string,
+  paused: boolean,
+): Promise<{ paused: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/pause`,
+    { method: 'PATCH', body: JSON.stringify({ paused }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to update pause state: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update pause state: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Owner-only project archive. Sets `archived=True` so the project disappears
+ * from the active dashboard and stops generating/dispatching new work; all
+ * project data is retained for a later unarchive. Idempotent on the server.
+ * Surfaces the server `detail` (403 permission, etc.) as the thrown error.
+ */
+export async function archiveProject(
+  projectId: string,
+): Promise<{ message: string; archived: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/archive`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to archive project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to archive project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Owner-only project unarchive. Clears `archived` so the project reappears in
+ * the active list and regains normal eligibility. Idempotent on the server.
+ */
+export async function unarchiveProject(
+  projectId: string,
+): Promise<{ message: string; archived: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/unarchive`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to unarchive project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to unarchive project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Fetch the archived-only project set (the restore view). The active project
+ * list is fetched elsewhere (useProjectsState); this dedicated helper requests
+ * `GET /api/admin/projects?archived=true` and returns the lightweight `items`
+ * array. Each item carries `archived: true`.
+ */
+export async function fetchArchivedProjects(
+  limit = 100,
+): Promise<import('./types/project').Project[]> {
+  const res = await apiFetch(`/api/admin/projects?archived=true&limit=${limit}`);
+  if (!res.ok) throw new Error(`Failed to fetch archived projects: ${res.status}`);
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
 export interface NullBranchConfigEntry {
   id: string;
   name: string;

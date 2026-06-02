@@ -229,6 +229,117 @@ describe('ProjectDashboard — viewport regression', () => {
     localStorage.removeItem('projectDashboardCollapsed');
   });
 
+  test('owner delete confirmation fits and meets touch targets at 375px', async () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+
+    const projects = [
+      makeProject({ id: 'p1', name: 'Platform', status: 'DEPLOYING', my_role: 'owner' }),
+      makeProject({ id: 'p2', name: 'Mobile App', status: 'FAILED', my_role: 'owner', autonomous_enabled: false }),
+    ];
+
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectDashboard
+            projects={projects}
+            tasks={[]}
+            selectedProjectId={null}
+            onSelectProject={() => {}}
+            onProjectDeleted={() => {}}
+          />,
+        );
+      });
+      // Open the actions menu, then the delete confirmation, on the first card.
+      const actionsBtn = host?.querySelector('button[title="Project actions"]') as HTMLButtonElement | null;
+      expect(actionsBtn).not.toBeNull();
+      await act(async () => { actionsBtn?.click(); });
+      const deleteBtn = host?.querySelector('button[title="Delete project"]') as HTMLButtonElement | null;
+      expect(deleteBtn).not.toBeNull();
+      await act(async () => { deleteBtn?.click(); });
+      expect(host?.querySelector('button[title="Confirm delete"]')).not.toBeNull();
+    }, { selector: 'button[title="Confirm delete"], button[title="Cancel delete"]' });
+
+    localStorage.removeItem('projectDashboardCollapsed');
+  });
+
+  test('owner pause action and Paused pill fit and meet touch targets at 375px', async () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+
+    const projects = [
+      makeProject({ id: 'p1', name: 'Platform', status: 'active', my_role: 'owner', paused: true }),
+      makeProject({ id: 'p2', name: 'Mobile App', status: 'active', my_role: 'owner', autonomous_enabled: false }),
+    ];
+
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectDashboard
+            projects={projects}
+            tasks={[]}
+            selectedProjectId={null}
+            onSelectProject={() => {}}
+            onProjectPaused={() => {}}
+          />,
+        );
+      });
+      // The paused pill renders on the paused card.
+      expect(host?.textContent).toContain('Paused');
+      // Open the actions menu on the first card to surface the Resume action.
+      const actionsBtn = host?.querySelector('button[title="Project actions"]') as HTMLButtonElement | null;
+      expect(actionsBtn).not.toBeNull();
+      await act(async () => { actionsBtn?.click(); });
+      expect(host?.querySelector('button[title^="Resume project"]')).not.toBeNull();
+    }, { selector: 'button[title^="Resume project"], button[title^="Pause project"]' });
+
+    localStorage.removeItem('projectDashboardCollapsed');
+  });
+
+  test('owner archive confirmation fits and meets touch targets at 375px', async () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+
+    const projects = [
+      makeProject({ id: 'p1', name: 'Platform', status: 'DEPLOYING', my_role: 'owner' }),
+    ];
+
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectDashboard
+            projects={projects}
+            tasks={[]}
+            selectedProjectId={null}
+            onSelectProject={() => {}}
+            onProjectArchived={() => {}}
+          />,
+        );
+      });
+      const actionsBtn = host?.querySelector('button[title="Project actions"]') as HTMLButtonElement | null;
+      expect(actionsBtn).not.toBeNull();
+      await act(async () => { actionsBtn?.click(); });
+      const archiveBtn = host?.querySelector('button[title^="Archive project"]') as HTMLButtonElement | null;
+      expect(archiveBtn).not.toBeNull();
+      await act(async () => { archiveBtn?.click(); });
+      expect(host?.querySelector('button[title="Confirm archive"]')).not.toBeNull();
+    }, { selector: 'button[title="Confirm archive"], button[title="Cancel archive"]' });
+
+    localStorage.removeItem('projectDashboardCollapsed');
+  });
+
   test('text labels do not truncate silently at 375px', async () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
 

@@ -209,8 +209,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions
     from app.direction_lifecycle import _process_direction_lifecycle
 
-    # Guard: autonomous must be enabled
-    if not project.autonomous_enabled:
+    # Guard: autonomous must be enabled and the project must not be archived.
+    # Archiving halts all of a project's work, including autonomous spawning.
+    if not project.autonomous_enabled or project.archived:
         return
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
@@ -1784,6 +1785,10 @@ async def _check_autonomous_research(owner: str, repo: str):
                             Project.github_owner == owner,
                             Project.github_repo == repo,
                             Project.autonomous_enabled.is_(True),
+                            # A paused project must not spawn new autonomous
+                            # work even when autonomous_enabled is still True.
+                            Project.paused.is_(False),
+                            Project.not_archived(),
                         )
                     )
                 )
@@ -1853,7 +1858,14 @@ async def _check_idle_research():
             projects = (
                 (
                     await session.execute(
-                        select(Project).where(Project.autonomous_enabled.is_(True))
+                        select(Project).where(
+                            Project.autonomous_enabled.is_(True),
+                            # Skip paused projects: pause blocks ALL new work
+                            # (research, periodic, and residual remediation)
+                            # regardless of the autonomous_enabled toggle.
+                            Project.paused.is_(False),
+                            Project.not_archived(),
+                        )
                     )
                 )
                 .scalars()

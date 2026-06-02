@@ -773,7 +773,8 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
         (
             await session.execute(
                 select(Project.id, Project.created_at).where(
-                    Project.autonomous_enabled.is_(True)
+                    Project.autonomous_enabled.is_(True),
+                    Project.not_archived(),
                 )
             )
         )

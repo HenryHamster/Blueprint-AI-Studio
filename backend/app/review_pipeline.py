@@ -2222,6 +2222,16 @@ async def _spawn_pipeline_task(
         record_spawn_pin_skipped,
     )
 
+    # Defense-in-depth pause guard: never pin a warm-handoff to a paused
+    # project's VM. Pause blocks ALL new dispatch on every path; the
+    # chain-continuity claim site (agent_warm_continuity.py) already filters
+    # Project.paused, but skipping the pin here stops a paused project's
+    # create->review->fix->... chain from even creating the pin during drain.
+    from app.models import Project
+
+    source_project = await session.get(Project, source_task.project_id)
+    source_project_paused = bool(source_project and source_project.paused)
+
     record_spawn_attempt()
     if suppress_warm_handoff:
         record_spawn_pin_skipped("caller_suppressed")
@@ -2229,6 +2239,8 @@ async def _spawn_pipeline_task(
         record_spawn_pin_skipped("disabled")
     elif is_warm_continuity_suppressed():
         record_spawn_pin_skipped("breaker_tripped")
+    elif source_project_paused:
+        record_spawn_pin_skipped("project_paused")
     elif not source_task.vm_instance_id:
         record_spawn_pin_skipped("source_cold")
     else:

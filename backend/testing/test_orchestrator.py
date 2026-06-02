@@ -3433,6 +3433,223 @@ class TestWarmVMSkipProvision:
             assert row.status == TaskStatus.QUEUED
 
     @pytest.mark.asyncio
+    async def test_paused_project_queued_task_not_dispatched(
+        self, orch_warm_db, mocker
+    ):
+        """A QUEUED task owned by a paused project must NOT be dispatched:
+        provision_agent_vm is never called and the task stays QUEUED.
+
+        Uses the same cold-dispatch enabling mocks as the resume test below so
+        the ONLY thing keeping the task QUEUED is the project's paused flag."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Paused-Dispatch", user_id=_TEST_USER, paused=True
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # Paused project's work is never selected → no provision, still QUEUED.
+        prov_mock.assert_not_called()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"Paused project's task must stay QUEUED, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_project_paused_after_candidate_scan_not_dispatched(
+        self, orch_warm_db, mocker
+    ):
+        """Pausing after eligibility but before the final claim keeps the task
+        QUEUED and suppresses cold provision."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        paused_mid_cycle = False
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Paused-During-Dispatch", user_id=_TEST_USER, paused=False
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+                project_id = project.id
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            async def _pause_before_claim(
+                eligible_ids, candidate_tasks, runtime_config, session
+            ):
+                nonlocal paused_mid_cycle
+                async with orch_warm_db() as pause_session:
+                    paused = await pause_session.get(Project, project_id)
+                    assert paused is not None
+                    paused.paused = True
+                    pause_session.add(paused)
+                    await pause_session.commit()
+                paused_mid_cycle = True
+                return eligible_ids
+
+            mocker.patch(
+                "app.orchestrator.cap_pipeline_slots",
+                side_effect=_pause_before_claim,
+            )
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        assert paused_mid_cycle is True
+        prov_mock.assert_not_called()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"Mid-cycle pause must keep task QUEUED, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_resumed_project_queued_task_is_dispatched(
+        self, orch_warm_db, mocker
+    ):
+        """Resuming a project (paused True → False) restores dispatch: with the
+        same cold-dispatch setup, a previously-paused project's QUEUED task is
+        now selected and cold-provisioned (status → PROVISIONING)."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                # Start paused, then resume (flip to False) before dispatch.
+                project = make_project(
+                    name="Resumed-Dispatch", user_id=_TEST_USER, paused=True
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+                project.paused = False
+                session.add(project)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # Resume restored dispatch → the task left QUEUED for provisioning.
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING, (
+                f"Resumed project's task must be dispatched, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
     async def test_pool_dispatch_cold_fall_through_records_funnel(
         self, orch_warm_db, mocker
     ):

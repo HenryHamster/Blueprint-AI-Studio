@@ -95,6 +95,7 @@ from app.anomaly_state import (  # noqa: F401
     hydrate_persistent_anomalies,
     persist_anomaly_snapshot,
     persistent_anomalies,
+    reset_project_state,
     with_design_doc_locked,
 )
 

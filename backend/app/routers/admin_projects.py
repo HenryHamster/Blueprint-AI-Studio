@@ -25,6 +25,7 @@ from app.models import (
     Task,
     TaskStatus,
     Project,
+    ProjectStatus,
     ProjectMember,
     _utcnow,
     notify_tasks_terminated,
@@ -60,10 +61,17 @@ async def get_all_projects(
     request: Request,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    archived: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """List the caller's projects with lightweight columns and redacted config."""
+    """List the caller's projects with lightweight columns and redacted config.
+
+    By default archived projects are EXCLUDED so they disappear from the active
+    dashboard. Pass ``archived=true`` to fetch only the archived set (the UI's
+    restore view). The ``archived`` flag is returned per item so the frontend
+    can render archive state.
+    """
     # Select only lightweight columns — large JSONB (directions, vision, design_doc,
     # problem_model, self_reflection_log, running_update) are excluded here and
     # available via GET /api/admin/projects/{project_id}.
@@ -78,6 +86,8 @@ async def get_all_projects(
             Project.github_repo,
             Project.is_self_repo,
             Project.autonomous_enabled,
+            Project.paused,
+            Project.archived,
             Project.build_config,
             Project.sr_catch_rate_targets,
             Project.running_update_acknowledged_at,
@@ -87,7 +97,10 @@ async def get_all_projects(
             ProjectMember.role.label("my_role"),
         )
         .join(ProjectMember, ProjectMember.project_id == Project.id)
-        .where(ProjectMember.user_id == current_user["user_id"])
+        .where(
+            ProjectMember.user_id == current_user["user_id"],
+            Project.archived.is_(archived),
+        )
         .order_by(Project.created_at.desc())
         .limit(limit + 1)
         .offset(offset)
@@ -107,6 +120,8 @@ async def get_all_projects(
                 "github_repo": row.github_repo,
                 "is_self_repo": row.is_self_repo,
                 "autonomous_enabled": row.autonomous_enabled,
+                "paused": row.paused,
+                "archived": row.archived,
                 "build_config": _redact_build_config(
                     row.build_config or {}, row.my_role
                 ),
@@ -169,6 +184,7 @@ async def get_project(
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
         "autonomous_enabled": project.autonomous_enabled,
+        "paused": project.paused,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
         "approval_gate_config": project.approval_gate_config or {},
@@ -666,6 +682,170 @@ async def delete_project_admin(
     }
 
 
+@router.post("/projects/{project_id}/reset")
+@limiter.limit("10/minute")
+async def reset_project_admin(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Reset a wedged project to a clean, runnable state without deleting it.
+
+    Owner-only. Safely cancels and tears down any active tasks (reusing the
+    same machinery as force-delete), then deletes all of the project's task
+    and alert rows and clears transient runtime state (circuit breakers,
+    in-memory strategic failure counts, persistent anomalies). Durable
+    configuration — directions, vision, design doc, problem model, build
+    config, members — is preserved by construction (never touched). The
+    project is left in DEPLOYING so the orchestrator treats it as runnable.
+    """
+    # Role check first (404/403 before lock contention surfaces as 429), then
+    # acquire the Project row lock — same ordering as delete to close the
+    # heartbeat-arrives-mid-reset race.
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    project = await lock_project_or_429(session, project_id)
+
+    ACTIVE_STATUSES = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    # Bounded load for per-task VM cleanup; the bulk UPDATE below covers all
+    # matching rows regardless of this cap.
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+                .limit(1000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    cancelled_count = 0
+    if active_tasks:
+        # Cancel + tear down active tasks before deleting their rows, reusing
+        # the same safe cancellation/VM-teardown path as force-delete.
+        from app.vm_lifecycle import _ensure_vm_deleted
+
+        all_cancelled_ids = (
+            (
+                await session.execute(
+                    select(Task.id).where(
+                        Task.project_id == project_id,
+                        Task.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        result = await session.execute(
+            update(Task)
+            .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+            .values(
+                status=TaskStatus.CANCELLED,
+                latest_status_message="Project reset to clean",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        cancelled_count = result.rowcount
+        for task in active_tasks:
+            await _ensure_vm_deleted(task, reason="project_reset")
+        from app.jwt_revocation import emit_bulk_task_terminated_notify  # noqa: PLC0415
+
+        await emit_bulk_task_terminated_notify(session, all_cancelled_ids)
+        await session.commit()
+        notify_tasks_terminated(all_cancelled_ids)
+
+    # Wipe all task history + alerts for the project, then return it to a
+    # clean runnable state. Durable config columns are never touched.
+    from app.models import Alert
+
+    tasks_deleted = (
+        await session.execute(delete(Task).where(Task.project_id == project_id))
+    ).rowcount
+    await session.execute(delete(Alert).where(Alert.project_id == project_id))
+    project.status = ProjectStatus.DEPLOYING
+    session.add(project)
+    await session.commit()
+
+    # Clear transient in-memory runtime/recovery state through one named seam.
+    from app.anomaly_state import reset_project_state
+
+    reset_project_state(str(project_id))
+
+    # Evict from GitHub token cache so the next cycle re-fetches cleanly.
+    from app.routers.agent import _github_token_cache
+
+    _github_token_cache.pop(str(project_id), None)
+
+    return {
+        "message": f"Project {project_id} reset to clean",
+        "active_tasks_cancelled": cancelled_count,
+        "tasks_deleted": tasks_deleted,
+    }
+
+
+@router.post("/projects/{project_id}/archive")
+@limiter.limit("10/minute")
+async def archive_project_admin(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Archive a project: hide it from the active list and halt all its work.
+
+    Owner-only and idempotent. Archiving sets ``archived=True`` so the project
+    disappears from the default project list, the orchestrator stops dispatching
+    its queued tasks, and the autonomous scheduler stops generating new work.
+    All project data is retained so it can be unarchived back to normal
+    operation later.
+    """
+    # Role check first (404/403 before lock contention surfaces as 429), then
+    # acquire the Project row lock — same ordering as delete/reset.
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    project = await lock_project_or_429(session, project_id)
+    project.archived = True
+    session.add(project)
+    await session.commit()
+    return {"message": f"Project {project_id} archived", "archived": True}
+
+
+@router.post("/projects/{project_id}/unarchive")
+@limiter.limit("10/minute")
+async def unarchive_project_admin(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Unarchive a project: restore it to the active list and normal eligibility.
+
+    Owner-only and idempotent. Clears ``archived`` so the project reappears in
+    the default list and the orchestrator/autonomous scheduler resume treating
+    it as eligible for work.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    project = await lock_project_or_429(session, project_id)
+    project.archived = False
+    session.add(project)
+    await session.commit()
+    return {"message": f"Project {project_id} unarchived", "archived": False}
+
+
 @router.post("/autonomous/pause-all")
 @limiter.limit("10/minute")
 async def pause_all_autonomous(
@@ -792,6 +972,38 @@ async def toggle_autonomous(
     session.add(project)
     await session.commit()
     return {"autonomous_enabled": project.autonomous_enabled}
+
+
+@router.patch("/projects/{project_id}/pause")
+@limiter.limit("30/minute")
+async def set_project_paused(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Owner-only pause/resume switch for a project.
+
+    Pause is a first-class persisted state, separate from the
+    ``autonomous_enabled`` toggle and from terminal lifecycle ``status``.
+    While paused, the orchestrator selects no new QUEUED work for the project
+    on any dispatch path (cold or warm) and the autonomous spawn entry points
+    skip it; in-flight PROVISIONING/IN_PROGRESS tasks drain. Resuming restores
+    normal dispatch with no re-configuration. ``autonomous_enabled`` is left
+    untouched so the two toggles compose independently.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "paused" not in payload:
+        raise HTTPException(status_code=400, detail="'paused' field required")
+
+    project.paused = bool(payload["paused"])
+    session.add(project)
+    await session.commit()
+    return {"paused": project.paused}
 
 
 @router.get("/autonomous-status")

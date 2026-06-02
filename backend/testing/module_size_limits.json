@@ -6,7 +6,7 @@
     "task_completion_self_audit.py": 600,
     "task_lifecycle.py": 5750,
     "task_lifecycle_requeue.py": 750,
-    "orchestrator.py": 5500,
+    "orchestrator.py": 5600,
     "orchestrator_health.py": 500,
     "orchestrator_runtime_env.py": 400,
     "admin.py": 3200,
@@ -163,6 +163,6 @@
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 1650,
-    "api.ts": 1350
+    "api.ts": 1500
   }
 }

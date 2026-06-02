@@ -436,7 +436,8 @@ async def pipeline_alert_scan_service() -> None:
                     (
                         await _id_session.execute(
                             select(Project.id).where(
-                                Project.autonomous_enabled.is_(True)
+                                Project.autonomous_enabled.is_(True),
+                                Project.not_archived(),
                             )
                         )
                     )

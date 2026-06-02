@@ -130,7 +130,14 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     """
     mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
-    project = Project(name="Agent Status Test", user_id="test-user-123")
+    # Finite (non-autonomous) project: terminal-status aggregation only applies
+    # to finite projects — live autonomous projects are never flipped to a
+    # terminal status by task-completion aggregation (see task_lifecycle.py).
+    project = Project(
+        name="Agent Status Test",
+        user_id="test-user-123",
+        autonomous_enabled=False,
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -10439,6 +10446,77 @@ async def test_agent_claim_omits_vision_when_empty(client: AsyncClient, db_sessi
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     assert "vision" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_injects_strategic_intent(client: AsyncClient, db_session):
+    """The operator's current strategic intent (purpose + current_focus) is
+    surfaced on the claim response for tactical task types so tactical agents
+    align with what the operator is steering toward."""
+    project = Project(
+        name="Strategic Intent Inject Test",
+        user_id="test-user-intent",
+        problem_model={
+            "intent": {
+                "purpose": "Build an autonomous coding studio.",
+                "current_focus": "Thread operator steering into tactical prompts.",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Intent consumer",
+        payloads=[{"type": "fix", "prompt": "Fix the widget"}],
+        vm_instance_id="agent-vm-intent",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-intent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    intent = resp.json().get("strategic_intent")
+    assert intent is not None
+    assert intent["purpose"] == "Build an autonomous coding studio."
+    assert (
+        intent["current_focus"]
+        == "Thread operator steering into tactical prompts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_strategic_intent_when_empty(
+    client: AsyncClient, db_session
+):
+    """A greenfield project with empty intent gets no strategic_intent key."""
+    project = Project(
+        name="Empty Intent",
+        user_id="test-user-empty-intent",
+        problem_model={"intent": {"purpose": "", "current_focus": ""}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="No intent task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        vm_instance_id="agent-vm-nointent",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-nointent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "strategic_intent" not in resp.json()
 
 
 @pytest.mark.asyncio

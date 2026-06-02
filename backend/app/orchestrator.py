@@ -248,6 +248,40 @@ async def _lock_task_for_mutation(
         return task
 
 
+async def _lock_dispatchable_task_for_mutation(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+) -> Task | None:
+    """Lock a QUEUED task only if its project is still unpaused and unarchived.
+
+    The candidate scan and queued-task refresh both prefilter paused/archived
+    projects, but an operator can pause or archive a project in the narrow
+    window before the final dispatch claim. Re-check both flags in the same
+    ``SELECT .. FOR UPDATE SKIP LOCKED`` that acquires the task row so the
+    task cannot leave QUEUED after pause/archive lands.
+    """
+    stmt = (
+        select(Task)
+        .join(Project, Task.project_id == Project.id)
+        .where(
+            Task.id == task_id,
+            Task.status == TaskStatus.QUEUED,
+            Project.paused.is_(False),
+            Project.not_archived(),
+        )
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+    if task is None:
+        logger.info(
+            "[ORCHESTRATOR] dispatch for task %s deferred: row locked, status changed, or project paused",
+            task_id,
+        )
+    return task
+
+
 async def _lock_provisioning_task_for_vm(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -1597,9 +1631,24 @@ async def orchestrator_worker():
                 # if it's a deferred-loaded attribute (no async session bound).
                 candidate_stmt = (
                     select(Task)
+                    # Exclude tasks owned by an archived OR paused project — both
+                    # halt new dispatch of the project's QUEUED work. Pause is a
+                    # first-class persisted switch distinct from terminal status
+                    # and from autonomous_enabled: while paused, no new dispatch
+                    # (cold OR warm-pool) may select the project's work, though
+                    # in-flight PROVISIONING/IN_PROGRESS tasks drain. Filtering via
+                    # a project-id subquery (rather than a JOIN) keeps the
+                    # load_only/scalars() shape and the MissingGreenlet-safe
+                    # Task-only column set untouched.
                     .where(
                         Task.status == TaskStatus.QUEUED,
                         Task.requires_approval.is_(False),
+                        Task.project_id.in_(
+                            select(Project.id).where(
+                                Project.not_archived(),
+                                Project.paused.is_(False),
+                            )
+                        ),
                     )
                     .options(
                         load_only(
@@ -2173,9 +2222,12 @@ async def orchestrator_worker():
                 if eligible_ids:
                     dispatch_stmt = (
                         select(Task)
+                        .join(Project, Task.project_id == Project.id)
                         .where(
                             Task.id.in_(eligible_ids),
                             Task.status == TaskStatus.QUEUED,
+                            Project.paused.is_(False),
+                            Project.not_archived(),
                         )
                         .options(
                             load_only(
@@ -2379,12 +2431,7 @@ async def orchestrator_worker():
                         )
                         continue
 
-                    task = await _lock_task_for_mutation(
-                        session,
-                        _qt_id,
-                        allowed_statuses=(TaskStatus.QUEUED,),
-                        reason="dispatch",
-                    )
+                    task = await _lock_dispatchable_task_for_mutation(session, _qt_id)
                     if task is None:
                         continue
                     if task.requires_approval:
