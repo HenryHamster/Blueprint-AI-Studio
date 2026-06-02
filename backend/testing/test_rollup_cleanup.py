@@ -979,10 +979,10 @@ async def test_verify_pr_merged_success_close_on_single_branch_sets_pr_merged(
     assert result is True
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is True
-    assert (task.context or {}).get("landed_on_integration") is False
-    assert (task.context or {}).get("_non_merge_unblock_reason") == "pr_closed_success"
+    assert (task.context or {}).get("landed_on_integration") is True
+    assert (task.context or {}).get("_non_merge_unblock_reason") is None
     assert db_task_mock.context.get("pr_merged") is True
-    assert db_task_mock.context.get("landed_on_integration") is False
+    assert db_task_mock.context.get("landed_on_integration") is True
     assert db_task_mock.status == TaskStatus.COMPLETED
 
 

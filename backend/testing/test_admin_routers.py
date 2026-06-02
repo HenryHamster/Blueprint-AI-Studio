@@ -5763,6 +5763,39 @@ class TestModifyTaskApplySeam:
         assert changes["merged_pr"] == 321
 
     @pytest.mark.asyncio
+    async def test_merge_context_records_landed_signal_on_integration_merge(
+        self, db_session
+    ):
+        from app.admin_task_mutations import _merge_context_with_hotfix_non_landing
+
+        project = await _make_project(db_session)
+        project.integration_branch = "main"
+        project.promotion_target = "main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Integration merge task",
+            payloads=[{"type": "research", "prompt": "merge", "base_branch": "main"}],
+            status=TaskStatus.EVALUATING,
+            context={},
+        )
+
+        merged_context = _merge_context_with_hotfix_non_landing(
+            task,
+            project,
+            base_context={"rollup_pr_number": 123},
+            landed_branch="main",
+            record_pr_merged=True,
+        )
+
+        assert merged_context.get("pr_merged") is True
+        assert merged_context.get("landed_on_integration") is True
+        assert merged_context.get("_non_merge_unblock_reason") is None
+
+    @pytest.mark.asyncio
     async def test_rollup_pr_approval_keeps_custom_staged_root_evaluating(
         self, db_session, mocker
     ):

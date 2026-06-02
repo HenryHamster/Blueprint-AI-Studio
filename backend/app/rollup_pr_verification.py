@@ -259,18 +259,9 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                         merged_base_branch=merged_base_branch,
                         source="rollup_pr_verification.success_close",
                     )
+                    task.context = dict(_ctx)
                     if record_pr_merged:
-                        task.context = dict(_ctx)
-                        mark_unblocked_non_merge(
-                            task,
-                            reason=(
-                                "pr_closed_success"
-                                if _ctx.get("pr_closed_success")
-                                else "pr_closed_empty"
-                            ),
-                        )
-                    else:
-                        task.context = dict(_ctx)
+                        mark_landed_on_integration(task)
                     if task.status != TaskStatus.COMPLETED:
                         task.status = TaskStatus.COMPLETED
                     try:

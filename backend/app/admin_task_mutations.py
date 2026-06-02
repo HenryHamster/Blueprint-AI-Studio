@@ -25,7 +25,7 @@ from app.branch_resolution import (
     classify_rollup_merge_outcome,
     merged_pr_counts_as_integration_landing,
 )
-from app.landed_signal import mark_unblocked_non_merge
+from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
 from app.models import (
     Artifact,
     ArtifactType,
@@ -67,8 +67,20 @@ def _merge_context_with_hotfix_non_landing(
     record_pr_merged: bool,
 ) -> Dict[str, Any]:
     """Preserve merge-equivalent unblock semantics for hotfix promotion merges."""
+    task.context = dict(base_context)
+
     if record_pr_merged:
-        return {**base_context, "pr_merged": True}
+        if project is None:
+            return {**base_context, "pr_merged": True}
+
+        apply_merged_landed_signal(
+            task,
+            project,
+            base_branch=landed_branch,
+            hotfix_lane=_promotion_target_merge_allowed(task, landed_branch),
+            non_merge_reason="merged_pr_non_integration_branch",
+        )
+        return dict(task.context or {})
 
     if project is None or not _promotion_target_merge_allowed(task, landed_branch):
         return dict(base_context)
@@ -81,7 +93,6 @@ def _merge_context_with_hotfix_non_landing(
         landed_branch == promotion_target
         and landed_branch != integration_branch
     ):
-        task.context = dict(base_context)
         mark_unblocked_non_merge(
             task,
             reason="merged_pr_non_integration_branch",
