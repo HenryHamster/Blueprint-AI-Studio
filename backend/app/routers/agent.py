@@ -1964,6 +1964,19 @@ async def claim_task(
             None,
         )
         if direction:
+            # Operator/strategist-authored implementation constraints for whoever
+            # implements this direction (e.g. "Must not modify the public API
+            # surface"). Stored bounded (<=500 chars) by the strategic/admin write
+            # paths; re-cap defensively and only surface non-empty strings so
+            # directions without constraints add nothing to the claim response.
+            _impl_constraints_raw = (direction.get("context") or {}).get(
+                "implementation_constraints"
+            )
+            direction_implementation_constraints = (
+                _impl_constraints_raw.strip()[:500]
+                if isinstance(_impl_constraints_raw, str) and _impl_constraints_raw.strip()
+                else None
+            )
             history = direction.get("research_history", [])
             agg = direction.get("history_aggregate", {})
             total_merged = sum(e.get("prs_merged", 0) for e in history) + (
@@ -2339,6 +2352,10 @@ async def claim_task(
                     "top_first_review_issues": direction_top_first_review_issues,
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
+                if direction_implementation_constraints:
+                    response["direction_context"]["implementation_constraints"] = (
+                        direction_implementation_constraints
+                    )
                 if review_iteration_rolling_median is not None:
                     response["direction_context"]["review_iteration_rolling_median"] = (
                         review_iteration_rolling_median
@@ -2642,6 +2659,19 @@ async def claim_task(
             None,
         )
         if direction_for_decomp:
+            # Surface operator/strategist implementation constraints to the planner
+            # too, so decomposition respects them (e.g. "Must not modify the public
+            # API surface"). Same bounded, omit-when-empty contract as the
+            # create/fix/refactor branch above.
+            _plan_impl_constraints = (direction_for_decomp.get("context") or {}).get(
+                "implementation_constraints"
+            )
+            if isinstance(_plan_impl_constraints, str) and _plan_impl_constraints.strip():
+                if "direction_context" not in response:
+                    response["direction_context"] = {}
+                response["direction_context"]["implementation_constraints"] = (
+                    _plan_impl_constraints.strip()[:500]
+                )
             from app.playbook_learning import summarize_decomposition_outcomes
 
             decomposition_outcomes = summarize_decomposition_outcomes(

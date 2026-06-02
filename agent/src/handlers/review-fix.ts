@@ -886,6 +886,20 @@ export async function handleFix(
     // If currentMergeable is null/undefined (couldn't query), leave basePrompt alone.
   }
 
+  // Surface operator/strategist implementation constraints authored on the
+  // direction (e.g. "Must not modify the public API surface"). The fix path
+  // builds its prompt manually and bypasses buildContextPrefix, so wire the
+  // field in directly here. Bounded backend-side; omit cleanly when absent.
+  const fixImplConstraints = strVal(
+    (task.direction_context as Record<string, unknown> | undefined)?.implementation_constraints,
+  );
+  if (fixImplConstraints) {
+    enrichedPrompt =
+      `## Implementation Constraints\n` +
+      `The direction author set these constraints for whoever implements this work. Respect them:\n${fixImplConstraints}\n\n` +
+      enrichedPrompt;
+  }
+
   // Prepend parent context if this fix agent is part of a larger initiative
   const fixParentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   if (fixParentCtx?.parent_prompt) {

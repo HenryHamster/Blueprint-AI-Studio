@@ -211,6 +211,8 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (title) dcLines.push(`**Goal:** ${title}`);
     const priority = strVal(dirCtx.priority);
     if (priority) dcLines.push(`**Priority:** ${priority}`);
+    const implConstraints = strVal(dirCtx.implementation_constraints);
+    if (implConstraints) dcLines.push(`**Implementation constraints:** ${implConstraints}`);
     const narrative = dirCtx.narrative as Record<string, unknown> | undefined;
     if (narrative && typeof narrative === 'object') {
       const established = Array.isArray(narrative.established_findings)

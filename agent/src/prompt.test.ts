@@ -388,6 +388,31 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('Recent cycles');
   });
 
+  it('renders implementation constraints in Direction Context when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor internals',
+        priority: 'high',
+        implementation_constraints: 'Must not modify the public API surface.',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Implementation constraints:** Must not modify the public API surface.');
+  });
+
+  it('omits implementation constraints line when the field is absent or empty', () => {
+    const present = buildContextPrefix({
+      direction_context: { title: 'X', priority: 'low', implementation_constraints: '' },
+    });
+    expect(present).not.toContain('**Implementation constraints:**');
+    const missing = buildContextPrefix({
+      direction_context: { title: 'X', priority: 'low' },
+    });
+    expect(missing).not.toContain('**Implementation constraints:**');
+  });
+
   it('does not render direction_context section when direction_context is absent', () => {
     const task = {
       project_context: {

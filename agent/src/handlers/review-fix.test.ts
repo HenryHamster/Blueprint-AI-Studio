@@ -1292,6 +1292,36 @@ describe('handleFix — code-change helper guidance is in prompt', () => {
   });
 });
 
+describe('handleFix — direction implementation constraints', () => {
+  it('surfaces implementation_constraints from direction_context in the enriched prompt', async () => {
+    await handleFix(
+      'task-fix-impl-constraints',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      {
+        context: { scope: 'small' },
+        direction_context: { implementation_constraints: 'Must not modify the public API surface.' },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Implementation Constraints');
+    expect(prompt).toContain('Must not modify the public API surface.');
+  });
+
+  it('omits the Implementation Constraints section when direction_context has none', async () => {
+    await handleFix(
+      'task-fix-no-impl-constraints',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('## Implementation Constraints');
+  });
+});
+
 // ── handleFix: conflict marker + stale-premise detection ────────────────────
 describe('handleFix — conflict marker detection', () => {
   it('enriches the prompt with a CONFLICT MARKERS FOUND header when git grep finds markers', async () => {

@@ -3266,6 +3266,89 @@ async def test_claim_injects_direction_context_for_create_task(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_injects_implementation_constraints_in_direction_context(
+    client: AsyncClient, db_session
+):
+    """Claim surfaces direction context.implementation_constraints for a fix task."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    constraints = "Must not modify the public API surface; keep changes additive."
+    project = Project(name="Impl Constraints Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor internals",
+            "priority": "high",
+            "context": {"implementation_constraints": constraints},
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix the thing"}],
+        vm_instance_id="agent-vm-impl-constraints",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-impl-constraints")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json()["direction_context"]
+    assert dc["implementation_constraints"] == constraints
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_omits_implementation_constraints_when_unset(
+    client: AsyncClient, db_session
+):
+    """direction_context omits implementation_constraints when the direction sets none."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="No Impl Constraints Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Some direction",
+            "priority": "medium",
+            "context": {},
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Build the thing"}],
+        vm_instance_id="agent-vm-no-impl-constraints",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-impl-constraints")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context") or {}
+    assert "implementation_constraints" not in dc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_injects_scope_success_rates_in_direction_context(
     client: AsyncClient, db_session
 ):
