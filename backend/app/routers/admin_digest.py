@@ -829,6 +829,20 @@ async def _compute_digest(
         now=_now,
     )
 
+    # Outer review<->fix PR-cycle convergence verdict for the plain-language
+    # briefing. Read-only telemetry surfacing: reuse the same per-window aggregate
+    # and per-day trend the convergence widget shows so the narrative can state
+    # whether issue-churn is falling/rising and name the dominant remaining
+    # blocker. compute_narrative_summary gates the sentence on signal sufficiency
+    # (>=2 trend buckets carrying churn), mirroring its dominant-failure-class
+    # gating — thin windows get no convergence sentence.
+    outer_loop_convergence_summary = await get_outer_loop_convergence(
+        hours=hours, project_id=project_id, session=session
+    )
+    outer_loop_convergence_trend = await get_outer_loop_convergence_trend(
+        days=7, project_id=project_id, session=session
+    )
+
     narrative_summary = compute_narrative_summary(
         hours=hours,
         project_id=project_id,
@@ -849,6 +863,8 @@ async def _compute_digest(
         pr_count=pr_count,
         error_log_map=error_log_map,
         failed_tasks=failed_tasks,
+        outer_loop_convergence_summary=outer_loop_convergence_summary,
+        outer_loop_convergence_trend=outer_loop_convergence_trend,
     )
 
     _cost_econ = compute_digest_cost_economics(

@@ -261,6 +261,11 @@ export interface OuterLoopConvergenceTrendBucket {
 export interface OuterLoopConvergenceTrendResponse {
   days: number;
   buckets: OuterLoopConvergenceTrendBucket[];
+  // Canonical churn-trend direction computed by the backend
+  // (digest_metrics.compute_churn_direction). Consumed by the widget glyph so
+  // it can never disagree with the narrative's "Review/fix churn is X." verdict,
+  // which reads the same value. Optional for back-compat with older backends.
+  churn_direction?: 'falling' | 'rising' | 'flat';
 }
 
 export async function fetchOuterLoopConvergence(

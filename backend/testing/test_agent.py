@@ -223,6 +223,124 @@ async def test_agent_status_update_persists_runtime_identity(
 
 
 @pytest.mark.asyncio
+async def test_completed_teardown_defer_is_provider_aware_noop_single_provider(
+    client: AsyncClient, db_session, mocker, monkeypatch
+):
+    """Single-provider projects still warm-reuse: a COMPLETED VM defers teardown
+    when the project has eligible backlog work whose provider is compatible with
+    the VM's boot manifest.
+
+    Regression guard for the provider-aware teardown-defer in
+    update_agent_status: the eligibility check is now passed the completing
+    task's frozen boot identity (provider/account/model), but a fungible
+    (provider=None) backlog task — the dominant single-provider case — must NOT
+    be filtered out, so the VM is held for warm reuse exactly as before.
+    """
+    import app.shared_state as _ss
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mock_teardown = mocker.patch(
+        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
+    )
+    mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
+
+    project = Project(name="Provider-Aware Defer Noop", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Fungible (provider=None) backlog work — the dominant single-provider case.
+    backlog = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    completing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-defer-noop",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add_all([backlog, completing])
+    await db_session.commit()
+    await db_session.refresh(completing)
+
+    token = create_agent_token(str(completing.id), "agent-vm-defer-noop")
+    payload = {
+        "task_id": str(completing.id),
+        "status": "COMPLETED",
+        "logs": "done",
+        "provider": "anthropic",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    # VM held for warm reuse, NOT torn down on completion.
+    mock_teardown.assert_called_once_with("agent-vm-defer-noop")
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_completed_teardown_proceeds_when_backlog_provider_mismatch(
+    client: AsyncClient, db_session, mocker, monkeypatch
+):
+    """A COMPLETED VM whose only backlog work is pinned to a DIFFERENT provider
+    must NOT defer teardown — that work would run on the wrong frozen account, so
+    it should cold-dispatch and the idle VM should be torn down as before."""
+    import app.shared_state as _ss
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mock_teardown = mocker.patch(
+        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
+    )
+    mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
+
+    project = Project(name="Provider-Aware Defer Mismatch", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Backlog work pinned/recorded to a provider the boot VM cannot run.
+    backlog = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        provider="openai",
+    )
+    completing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-defer-mismatch",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add_all([backlog, completing])
+    await db_session.commit()
+    await db_session.refresh(completing)
+
+    token = create_agent_token(str(completing.id), "agent-vm-defer-mismatch")
+    payload = {
+        "task_id": str(completing.id),
+        "status": "COMPLETED",
+        "logs": "done",
+        "provider": "anthropic",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    # Incompatible backlog → no defer; VM torn down on completion.
+    mock_teardown.assert_not_called()
+    mock_delete.assert_called_once_with(
+        "agent-vm-defer-mismatch", reason="agent_completion"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_retry_is_idempotent(client: AsyncClient, db_session):
     """
     A second claim from the same VM shortly after a successful first claim must

@@ -187,13 +187,30 @@ Configure autonomous mode in the admin UI under Settings > Autonomous.
 
 Comprehensive documentation is available in the `docs/` directory:
 
-- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — Complete environment variable reference and configuration guide
-- **[TESTING_GUIDE.md](docs/TESTING_GUIDE.md)** — Testing strategies and best practices for backend, frontend, and agent
+### Core Architecture & Design
+- **[ARCHITECTURE_OVERVIEW.md](docs/codebase-analysis.md)** — High-level system design and component interactions
+- **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions
+
+### Task Execution & Lifecycle
+- **[TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)** — Task state machine, transitions, and lifecycle callbacks
+- **[PAYLOADS_AND_SCHEMAS.md](docs/PAYLOADS_AND_SCHEMAS.md)** — Task payload structure and validation for all task types
+
+### API & Integration
 - **[API_REFERENCE.md](docs/API_REFERENCE.md)** — Complete HTTP endpoint reference with request/response schemas
 - **[DATA_MODELS.md](docs/DATA_MODELS.md)** — Database schema, Pydantic DTOs, and data structure guide
-- **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions
 - **[AGENT_HANDLERS.md](docs/AGENT_HANDLERS.md)** — TypeScript task handler implementations and workflows
+
+### Frontend & UI
 - **[FRONTEND_COMPONENTS.md](docs/FRONTEND_COMPONENTS.md)** — React component guide with props and usage patterns
+
+### Operations & Debugging
+- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — Complete environment variable reference and configuration guide
+- **[TESTING_GUIDE.md](docs/TESTING_GUIDE.md)** — Testing strategies and best practices for backend, frontend, and agent
+- **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** — Troubleshooting failed tasks and interpreting logs
+- **[DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md)** — Local development setup and workflow
+- **[ONBOARDING.md](docs/ONBOARDING.md)** — Bringing a new repository under Blueprint management
+
+### Standards & Guidelines
 - **[CLAUDE.md](CLAUDE.md)** — Project-specific coding standards and file restrictions
 
 ---
@@ -269,35 +286,47 @@ Local mode runs agents as subprocess instead of GCP VMs. Full CI suite runs on P
 
 ## Troubleshooting
 
-### Task fails with "clone_failed"
+For detailed debugging guidance, see **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)**, which covers:
+- Common failure categories and how to diagnose them
+- Viewing task logs and interpreting error messages
+- Understanding failure classification
+- GCP VM inspection
+- Circuit breaker recovery
+- Performance profiling
 
-- Repo is private and agent token lacks access — grant OAuth token in admin settings
-- Repo doesn't exist or URL is wrong — check `github_owner`/`github_repo` in task payload
-- Network issue (rare in production) — reaper will auto-retry up to 3 times
+### Quick Fixes for Common Issues
 
-### Task hangs (no logs after 5 minutes)
+**Task fails with "clone_failed"**
+- Repo is private and agent token lacks access — grant OAuth token in Settings > GitHub
+- Repo doesn't exist or URL is wrong — verify `github_owner`/`github_repo` in task
+- Invalid GitHub token — reconnect OAuth in Settings
 
-- Agent VM hung or network partitioned — reaper kills VMs after 5-minute heartbeat timeout
-- Check agent logs in admin UI for the task — look for errors, timeouts, or blocked operations
-- In production, VMs auto-destruct after 1 hour as safety net
+**Task hangs (no logs after 5 minutes)**
+- Agent VM unresponsive — reaper kills VMs after 5-minute heartbeat timeout
+- Check **Logs** tab in task details for errors or timeouts
+- VMs auto-destruct after 1 hour as safety net
 
-### PR creation fails
+**PR creation fails**
+- Insufficient permissions — verify GitHub token has `pull_requests: read/write` scope
+- Branch doesn't exist — specify correct `base_branch` in task payload
+- Network timeout — retry task
 
-- Agent doesn't have permission to create PRs in this repo — check OAuth token scopes (need `pull_requests: read/write`)
-- PR title/body too long or contains unprintable characters — agent sanitizes before submission
-- Target branch doesn't exist — specify correct `base_branch` in task
+**Orchestrator won't start new tasks**
+- Circuit breaker tripped (too many failures) — click **Reset** in Project settings
+- Concurrency limit reached — increase `MAX_CONCURRENT_VMS` or wait for tasks to complete
+- Database unreachable — check `DATABASE_URL` connection string and database health
 
-### Orchestrator won't start new tasks
+**Fix loop stuck (task not progressing)**
+- Max iterations reached (default 5) — issue may be too complex; try simpler scope
+- Agent misunderstood the problem — check review findings in parent task
+- Missing tool or dependency — check VM logs, may need to rebuild agent image
 
-- Circuit breaker tripped due to repeated failures — check project status in admin UI
-- `MAX_CONCURRENT_VMS` limit reached — reduce concurrency or increase limit
-- Database unreachable — check `DATABASE_URL` connection string
+**Token expired or invalid**
+- GitHub token invalid — Settings > GitHub > **Reconnect**
+- Max plan account credentials invalid — Settings > re-authenticate
+- Agent JWT expired — rarely happens; restart the task
 
-### Memory/CPU limits
-
-- Default GCP VM is `e2-standard-2` (2 vCPU, 8 GB RAM) — sufficient for most tasks
-- Very large repos or heavy analysis may require larger machine — set `MACHINE_TYPE` in `.env`
-- In local mode, agent runs as subprocess — limited by host machine resources
+See **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** for comprehensive troubleshooting steps and additional scenarios.
 
 ---
 

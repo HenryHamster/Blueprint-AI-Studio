@@ -663,7 +663,10 @@ async def get_outer_loop_convergence_trend(
     churn total so the widget can trend whether issue-churn is becoming rare and
     work is converging (merging) rather than oscillating.
     """
-    from app.digest_metrics import compute_outer_loop_convergence  # noqa: PLC0415
+    from app.digest_metrics import (  # noqa: PLC0415
+        compute_churn_direction,
+        compute_outer_loop_convergence,
+    )
 
     cutoff = _utcnow() - timedelta(days=days)
 
@@ -751,7 +754,14 @@ async def get_outer_loop_convergence_trend(
             }
         )
 
-    return {"days": days, "buckets": buckets}
+    # Stamp the single canonical churn direction so the widget glyph and the
+    # narrative verdict (digest_metrics.compute_narrative_summary) read the SAME
+    # value rather than each re-deriving it client-/server-side.
+    return {
+        "days": days,
+        "buckets": buckets,
+        "churn_direction": compute_churn_direction(buckets),
+    }
 
 
 # Terminal-outcome / escalation reasons the chain drill-down can filter on. Kept

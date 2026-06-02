@@ -1814,7 +1814,24 @@ async def update_agent_status(
             try:
                 from app.warm_backlog_reuse import has_eligible_backlog_task
 
-                if await has_eligible_backlog_task(session, task.project_id, old_vm_id):
+                # Provider-aware teardown defer: a reused VM is locked to the
+                # LLM provider/account/model frozen into its boot manifest (the
+                # warm claim only mints a fresh JWT — it never re-materializes
+                # credentials). The completing task ran on that boot identity, so
+                # task.provider/account_id/model (set just above) ARE the VM's
+                # boot identity. Pass it through so we only hold the VM for
+                # backlog work it can actually run warm — a task pinned/recorded
+                # to a different provider cold-dispatches instead. NO-OP for
+                # single-provider projects (the dominant case): their queued
+                # tasks carry no divergent constraint, so nothing is filtered.
+                vm_boot = {
+                    "provider": task.provider,
+                    "account_id": task.account_id,
+                    "model": task.model,
+                }
+                if await has_eligible_backlog_task(
+                    session, task.project_id, old_vm_id, vm_boot=vm_boot
+                ):
                     from app.vm_lifecycle import schedule_deferred_backlog_teardown
                     from app.warm_backlog_reuse import (
                         record_teardown_defer,

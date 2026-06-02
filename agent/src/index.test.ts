@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, _setAgentTokenForTesting, main, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -2573,6 +2573,68 @@ describe('pollForNextRole', () => {
     expect(clearIntervalSpy).toHaveBeenCalled();
   });
 
+  it('surfaces secret_manifest on an account-divergent warm claim', async () => {
+    let call = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      call += 1;
+      if (call === 1) return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({
+          action: 'claim',
+          task_id: 'next-Z',
+          warm_start: true,
+          agent_token: 'rotated-jwt-Z',
+          secret_manifest: {
+            env: { PROVIDER: 'gemini', GEMINI_API_KEY: 'k' },
+            files: [{ path: '/home/agent/.gemini/settings.json', content: '{}', mode: '0600' }],
+          },
+        }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-3', priorTaskId: 't-3', priorPrNumber: null,
+      apiBase: 'http://api.test', agentJwt: 'jwt3',
+      pollIntervalMs: 10, timeoutMs: 1000, heartbeatIntervalMs: 200,
+    });
+    expect(result.action).toBe('claim');
+    expect(result.taskId).toBe('next-Z');
+    expect(result.agentToken).toBe('rotated-jwt-Z');
+    expect(result.secretManifest).toBeDefined();
+    expect(result.secretManifest?.env?.PROVIDER).toBe('gemini');
+    expect(result.secretManifest?.files?.[0]?.path).toBe('/home/agent/.gemini/settings.json');
+  });
+
+  it('leaves secretManifest undefined on a same-account claim (JWT-only path)', async () => {
+    let call = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      call += 1;
+      if (call === 1) return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      // Same-account claim: no secret_manifest field at all.
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'claim', task_id: 'next-S', warm_start: true, agent_token: 'jwt-s' }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-4', priorTaskId: 't-4', priorPrNumber: null,
+      apiBase: 'http://api.test', agentJwt: 'jwt4',
+      pollIntervalMs: 10, timeoutMs: 1000, heartbeatIntervalMs: 200,
+    });
+    expect(result.action).toBe('claim');
+    expect(result.taskId).toBe('next-S');
+    expect(result.agentToken).toBe('jwt-s');
+    expect(result.secretManifest).toBeUndefined();
+  });
+
   it('returns claim with undefined agentToken when backend omits it (deploy mismatch)', async () => {
     let call = 0;
     fetchMock.mockImplementation((input: unknown) => {
@@ -2705,6 +2767,74 @@ describe('pollForNextRole', () => {
       heartbeatIntervalMs: 200,
     });
     expect(result).toEqual({ action: 'exit', reason: 'recovered' });
+  });
+});
+
+// ── performWarmRetarget — account-divergent warm re-target ───────────────────
+describe('performWarmRetarget', () => {
+  afterEach(() => { __setWarmRetargetDepsForTesting(null); });
+
+  it('clears creds, materializes an augmented manifest, then re-execs (in order)', async () => {
+    const calls: string[] = [];
+    let captured: { manifest?: SecretManifest; envPath?: string } = {};
+    __setWarmRetargetDepsForTesting({
+      clearCreds: () => { calls.push('clear'); return Promise.resolve(); },
+      materialize: (m: SecretManifest, envPath: string) => { calls.push('materialize'); captured = { manifest: m, envPath }; },
+      reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+    });
+
+    const inputManifest: SecretManifest = {
+      env: { PROVIDER: 'openai', OPENAI_API_KEY: 'sk-xyz' },
+      files: [{ path: '/opt/agent/openai/auth.json', content: '{}', mode: '0600' }],
+    };
+    await performWarmRetarget(inputManifest, { rotatedJwt: 'ROT.JWT', taskId: 'task-42' });
+
+    // clear-then-write-then-reexec ordering is the credential-leakage guarantee.
+    expect(calls).toEqual(['clear', 'materialize', 'reexec']);
+    expect(captured.envPath).toBe('/etc/agent.env');
+    // The backend strips AGENT_SECRET_TOKEN; the agent re-injects the rotated JWT.
+    expect(captured.manifest?.env?.AGENT_SECRET_TOKEN).toBe('ROT.JWT');
+    expect(captured.manifest?.env?.TASK_ID).toBe('task-42');
+    expect(captured.manifest?.env?.BLUEPRINT_WARM_HANDOFF).toBe('1');
+    expect(captured.manifest?.env?.BLUEPRINT_REEXEC).toBe('1');
+    // Original provider env + files are preserved.
+    expect(captured.manifest?.env?.PROVIDER).toBe('openai');
+    expect(captured.manifest?.env?.OPENAI_API_KEY).toBe('sk-xyz');
+    expect(captured.manifest?.files).toEqual([{ path: '/opt/agent/openai/auth.json', content: '{}', mode: '0600' }]);
+    // The input manifest must not be mutated in place.
+    expect(inputManifest.env?.AGENT_SECRET_TOKEN).toBeUndefined();
+  });
+
+  it('does NOT materialize or re-exec when clearCreds throws (clear-then-write ordering held)', async () => {
+    const calls: string[] = [];
+    __setWarmRetargetDepsForTesting({
+      clearCreds: () => { calls.push('clear'); return Promise.reject(new Error('wipe-failed')); },
+      materialize: () => { calls.push('materialize'); },
+      reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+    });
+    await expect(performWarmRetarget({ env: {} }, { rotatedJwt: 'j', taskId: 't' }))
+      .rejects.toThrow('wipe-failed');
+    expect(calls).toEqual(['clear']);
+  });
+
+  it('default materialize invokes the real helper via sudo python3 against /etc/agent.env', async () => {
+    const execMock = vi.mocked(execFileSync);
+    execMock.mockClear();
+    // Override only clearCreds + reexec; materialize stays the real default so
+    // we exercise the sudo python3 invocation against the baked helper path.
+    __setWarmRetargetDepsForTesting({
+      clearCreds: () => Promise.resolve(),
+      reexec: () => Promise.resolve(),
+    });
+    await performWarmRetarget({ env: { PROVIDER: 'anthropic' } }, { rotatedJwt: 'j', taskId: 't' });
+
+    const sudoCall = execMock.mock.calls.find(
+      c => c[0] === 'sudo' && Array.isArray(c[1]) && c[1][0] === 'python3',
+    );
+    expect(sudoCall).toBeDefined();
+    const args = sudoCall?.[1] as string[];
+    expect(args).toContain(MATERIALIZE_SCRIPT_PATH);
+    expect(args[args.length - 1]).toBe('/etc/agent.env');
   });
 });
 

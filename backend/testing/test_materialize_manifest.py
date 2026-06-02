@@ -258,6 +258,73 @@ class TestNssBypass:
             materialize_manifest._lookup_uid_gid("definitely-not-a-real-user-2x4f6z8q")
 
 
+class TestReinvocationOverwrites:
+    """Warm-VM re-targeting re-invokes this helper on an ALREADY-provisioned
+    VM, so the env file and provider credential files already exist from the
+    boot manifest. A second invocation must OVERWRITE them (not append / not
+    fail) so the VM adopts the new account's credentials cleanly.
+    """
+
+    def test_env_file_is_overwritten_not_appended(self, tmp_path: Path):
+        env_out = tmp_path / "agent.env"
+        first = _write_manifest(tmp_path, env={"PROVIDER": "anthropic", "OLD": "1"})
+        assert materialize_manifest.main(["m", str(first), str(env_out)]) == 0
+        body1 = env_out.read_text(encoding="utf-8")
+        assert 'PROVIDER="anthropic"' in body1
+        assert 'OLD="1"' in body1
+
+        second = tmp_path / "manifest2.json"
+        second.write_text(
+            json.dumps({"env": {"PROVIDER": "gemini"}, "files": []}),
+            encoding="utf-8",
+        )
+        assert materialize_manifest.main(["m", str(second), str(env_out)]) == 0
+        body2 = env_out.read_text(encoding="utf-8")
+        # New value present, stale value from the first manifest gone.
+        assert 'PROVIDER="gemini"' in body2
+        assert "OLD=" not in body2
+        assert body2.count('PROVIDER=') == 1
+
+    def test_credential_file_is_overwritten_on_reinvocation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.setattr(
+            materialize_manifest,
+            "_lookup_uid_gid",
+            lambda _user: (
+                (os.getuid(), os.getgid()) if hasattr(os, "getuid") else (0, 0)
+            ),
+        )
+        cred = tmp_path / "creds" / "auth.json"
+        env_out = tmp_path / "agent.env"
+
+        first = _write_manifest(
+            tmp_path,
+            env={"A": "1"},
+            files=[{"path": str(cred), "content": "OLD-SECRET", "mode": "0600"}],
+        )
+        assert materialize_manifest.main(["m", str(first), str(env_out)]) == 0
+        assert cred.read_text(encoding="utf-8") == "OLD-SECRET"
+
+        second = tmp_path / "manifest2.json"
+        second.write_text(
+            json.dumps(
+                {
+                    "env": {"A": "2"},
+                    "files": [
+                        {"path": str(cred), "content": "NEW-SECRET", "mode": "0600"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Re-invoke against the now-existing file + parent dir.
+        assert materialize_manifest.main(["m", str(second), str(env_out)]) == 0
+        assert cred.read_text(encoding="utf-8") == "NEW-SECRET"
+        mode = os.stat(cred).st_mode & 0o777
+        assert mode == 0o600
+
+
 class TestCLIContract:
     def test_wrong_arg_count_returns_2(self):
         rc = materialize_manifest.main(["script"])

@@ -177,7 +177,7 @@ describe('OuterReviewLoopConvergenceWidget', () => {
     expect(text).toContain('9 PR cycles');
   });
 
-  test('surfaces a churn trend direction indicator', async () => {
+  test('surfaces a churn trend direction indicator for monotonic decrease', async () => {
     summaryPayload = POPULATED;
     const rendered = await renderWidget();
     root = rendered.root;
@@ -186,6 +186,91 @@ describe('OuterReviewLoopConvergenceWidget', () => {
     expect(text).toContain('churn trend');
     // TREND churn goes 2 -> 1 across buckets, i.e. falling.
     expect(text).toContain('falling');
+  });
+
+  test('churn direction reflects overall window trend, not just endpoints', async () => {
+    summaryPayload = POPULATED;
+    // Trend with high first buckets, low middle buckets, but high final spike.
+    // Overall trend is mostly falling despite the spike at the end.
+    const trendWithEndpointSpike = {
+      days: 7,
+      buckets: [
+        { date: '2026-05-01', pr_count: 4, convergence_rate: 0.5, escalation_total: 1, churn_total: 10, terminal_outcome_histogram: { merged: 2, rejected: 1, stuck: 1 }, incidence_counts: { churn: 10 }, incidence_rates: { churn: 2.5 } },
+        { date: '2026-05-02', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 8, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 8 }, incidence_rates: { churn: 1.6 } },
+        { date: '2026-05-03', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 6, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 6 }, incidence_rates: { churn: 1.2 } },
+        { date: '2026-05-04', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 4, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 4 }, incidence_rates: { churn: 0.8 } },
+        { date: '2026-05-05', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 2, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 2 }, incidence_rates: { churn: 0.4 } },
+        // Final spike: 8 churn (looks like rising if comparing only 10 vs 8), but window trend is falling
+        { date: '2026-05-06', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 8, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 8 }, incidence_rates: { churn: 1.6 } },
+      ],
+    };
+    fetchOuterLoopConvergenceTrendMock.mockImplementationOnce(async () => trendWithEndpointSpike);
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+    // Despite first=10 and last=8 (looks flat), the overall trend is falling (avg first half ≈ 8, avg second half ≈ 4.67)
+    expect(text).toContain('falling');
+  });
+
+  test('churn direction detects rising trend despite misleading endpoints', async () => {
+    summaryPayload = POPULATED;
+    // Trend with low first bucket, low final bucket, but rising in between.
+    // Overall trend is mostly rising despite low start/end.
+    const trendWithRisingMiddle = {
+      days: 7,
+      buckets: [
+        { date: '2026-05-01', pr_count: 4, convergence_rate: 0.5, escalation_total: 1, churn_total: 2, terminal_outcome_histogram: { merged: 2, rejected: 1, stuck: 1 }, incidence_counts: { churn: 2 }, incidence_rates: { churn: 0.5 } },
+        { date: '2026-05-02', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 8, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 8 }, incidence_rates: { churn: 1.6 } },
+        { date: '2026-05-03', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 9, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 9 }, incidence_rates: { churn: 1.8 } },
+        { date: '2026-05-04', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 10, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 10 }, incidence_rates: { churn: 2.0 } },
+        // Final drop: 3 churn (looks like falling if comparing only 2 vs 3), but window trend is rising
+        { date: '2026-05-05', pr_count: 5, convergence_rate: 0.8, escalation_total: 0, churn_total: 3, terminal_outcome_histogram: { merged: 4, rejected: 1 }, incidence_counts: { churn: 3 }, incidence_rates: { churn: 0.6 } },
+      ],
+    };
+    fetchOuterLoopConvergenceTrendMock.mockImplementationOnce(async () => trendWithRisingMiddle);
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+    // Despite first=2 and last=3 (looks flat), the overall trend is rising (avg first half ≈ 5, avg second half ≈ 7.3)
+    expect(text).toContain('rising');
+  });
+
+  test('prefers the backend-stamped churn_direction over local re-derivation', async () => {
+    summaryPayload = POPULATED;
+    // Buckets fall 2 -> 1 (local fallback would read "falling"), but the backend
+    // stamped churn_direction='rising' — the widget must render the canonical
+    // backend value so its glyph matches the narrative verdict.
+    fetchOuterLoopConvergenceTrendMock.mockImplementationOnce(async () => ({
+      ...TREND,
+      churn_direction: 'rising',
+    }));
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+    expect(text).toContain('churn trend');
+    expect(text).toContain('rising');
+    expect(text).not.toContain('falling');
+  });
+
+  test('churn direction returns flat for genuinely stable churn', async () => {
+    summaryPayload = POPULATED;
+    const flatTrend = {
+      days: 7,
+      buckets: [
+        { date: '2026-05-01', pr_count: 5, convergence_rate: 0.5, escalation_total: 1, churn_total: 5, terminal_outcome_histogram: { merged: 3, rejected: 1, stuck: 1 }, incidence_counts: { churn: 5 }, incidence_rates: { churn: 1.0 } },
+        { date: '2026-05-02', pr_count: 5, convergence_rate: 0.5, escalation_total: 1, churn_total: 5, terminal_outcome_histogram: { merged: 3, rejected: 1, stuck: 1 }, incidence_counts: { churn: 5 }, incidence_rates: { churn: 1.0 } },
+        { date: '2026-05-03', pr_count: 5, convergence_rate: 0.5, escalation_total: 1, churn_total: 5, terminal_outcome_histogram: { merged: 3, rejected: 1, stuck: 1 }, incidence_counts: { churn: 5 }, incidence_rates: { churn: 1.0 } },
+      ],
+    };
+    fetchOuterLoopConvergenceTrendMock.mockImplementationOnce(async () => flatTrend);
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+    expect(text).toContain('flat');
   });
 
   test('clicking a terminal-outcome chip opens the drill-down panel and lists chains', async () => {

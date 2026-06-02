@@ -57,7 +57,7 @@ vi.mock('os', () => ({
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
-import { resetForNextRole } from './reset.js';
+import { resetForNextRole, clearProviderCredentials } from './reset.js';
 import {
   registerChildPid,
   killAllChildren,
@@ -245,6 +245,40 @@ describe('resetForNextRole', () => {
       );
       const rmPath = fsPromisesMocks.rm.mock.calls[0]?.[0] as string;
       expect(rmPath).toMatch(/[\\/]home[\\/]agent[\\/]\.claude$/);
+    } finally {
+      if (priorHome === undefined) delete process.env.HOME;
+      else process.env.HOME = priorHome;
+    }
+  });
+
+  it('preserves boot-materialized provider credentials on the same-account fast path', async () => {
+    // Regression guard (review iter 1): resetForNextRole must NOT clear the
+    // account-scoped provider credential material. Same-account warm claims
+    // (chain continuity / backlog reuse, both default-ON) carry no
+    // secret_manifest, so performWarmRetarget never runs to re-materialize.
+    // Wiping ~/.claude.json (Claude Code onboarding bypass), ~/.gemini settings
+    // and the provider cred dirs here would leave role 2+ without config that
+    // nothing re-creates. Only the account-divergent path (performWarmRetarget)
+    // may clear these, and it re-materializes immediately afterwards.
+    const priorHome = process.env.HOME;
+    process.env.HOME = '/home/agent';
+    try {
+      await resetForNextRole({ workspace: '/ws', priorTaskId: 'X' });
+
+      const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+      // The ~/.claude SESSION dir wipe (step 3) is still expected...
+      expect(rmPaths).toContain('/home/agent/.claude');
+      // ...but NONE of the account-scoped provider credential paths.
+      expect(rmPaths).not.toContain('/etc/agent.env');
+      expect(rmPaths).not.toContain('/home/agent/.claude.json');
+      expect(rmPaths).not.toContain('/home/agent/.anthropic');
+      expect(rmPaths).not.toContain('/home/agent/.openai');
+      expect(rmPaths).not.toContain('/home/agent/.gemini');
+      // And the sudo fallback (env-file removal) must not be invoked either.
+      const sudoRm = execFileImpl.mock.calls.find(
+        (c) => c[0] === 'sudo' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'rm',
+      );
+      expect(sudoRm).toBeUndefined();
     } finally {
       if (priorHome === undefined) delete process.env.HOME;
       else process.env.HOME = priorHome;
@@ -451,5 +485,68 @@ describe('resetForNextRole', () => {
     const step1Log = logMessages.find((m) => m.includes('killAllChildren'));
     expect(step1Log).toBeDefined();
     expect(step1Log).not.toMatch(/unkillable/);
+  });
+});
+
+// ── clearProviderCredentials ─────────────────────────────────────────────────
+describe('clearProviderCredentials', () => {
+  let consoleErrorSpy: ConsoleSpy | null = null;
+
+  beforeEach(() => {
+    consoleErrorSpy = installConsoleSpy('error');
+    fsPromisesMocks.rm.mockReset();
+    execFileImpl.mockReset();
+    fsPromisesMocks.rm.mockResolvedValue(undefined);
+    execFileImpl.mockResolvedValue('');
+  });
+
+  afterEach(() => {
+    consoleErrorSpy?.mockRestore();
+    consoleErrorSpy = null;
+  });
+
+  it('removes the env file and every provider credential path via fs.promises.rm', async () => {
+    await clearProviderCredentials('/home/agent', '/etc/agent.env');
+
+    const rmCalls = fsPromisesMocks.rm.mock.calls;
+    const rmPaths = rmCalls.map((c) => c[0] as string);
+    expect(rmPaths).toContain('/etc/agent.env');
+    expect(rmPaths).toContain('/home/agent/.anthropic');
+    expect(rmPaths).toContain('/home/agent/.openai');
+    expect(rmPaths).toContain('/home/agent/.gemini');
+    expect(rmPaths).toContain('/home/agent/.claude.json');
+    // Every removal must be recursive + force so dirs and missing paths are fine.
+    for (const c of rmCalls) {
+      expect(c[1]).toEqual(expect.objectContaining({ recursive: true, force: true }));
+    }
+  });
+
+  it('falls back to `sudo rm -rf` when the agent user lacks permission (root-owned env file)', async () => {
+    fsPromisesMocks.rm.mockImplementation((p: string) => {
+      if (p === '/etc/agent.env') {
+        const err = new Error('permission denied') as NodeJS.ErrnoException;
+        err.code = 'EACCES';
+        return Promise.reject(err);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await clearProviderCredentials('/home/agent', '/etc/agent.env');
+
+    const sudoCall = execFileImpl.mock.calls.find((c) => c[0] === 'sudo');
+    expect(sudoCall).toBeDefined();
+    expect(sudoCall?.[1]).toEqual(['rm', '-rf', '/etc/agent.env']);
+  });
+
+  it('resolves (no throw) and logs when an unexpected rm error occurs', async () => {
+    fsPromisesMocks.rm.mockRejectedValue(new Error('something weird'));
+    await expect(clearProviderCredentials('/home/agent', '/etc/agent.env')).resolves.toBeUndefined();
+    expect(consoleErrorSpy).toHaveBeenCalled();
+  });
+
+  it('defaults the env path to /etc/agent.env when not provided', async () => {
+    await clearProviderCredentials('/home/agent');
+    const rmPaths = fsPromisesMocks.rm.mock.calls.map((c) => c[0] as string);
+    expect(rmPaths).toContain('/etc/agent.env');
   });
 });

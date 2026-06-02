@@ -321,15 +321,31 @@ function getBucketChurn(bucket: OuterLoopConvergenceTrendBucket): number {
 
 type ChurnDirection = 'falling' | 'rising' | 'flat';
 
-// Compare the first vs. last bucket's churn to answer "is churn falling?". This
-// is presentation of already-aggregated per-day churn_total, not client-side
-// re-derivation of any metric.
+// Back-compat FALLBACK only. The canonical churn direction is computed by the
+// backend (digest_metrics.compute_churn_direction) and delivered on the trend
+// response as `churn_direction`; the widget prefers that value (see the
+// consumption site below) so its glyph matches the narrative's "Review/fix churn
+// is X." verdict exactly. This local function is a byte-for-byte port of the same
+// first-half-vs-second-half average algorithm, used ONLY when an older backend
+// omits the field — both paths therefore yield identical directions and can
+// never diverge from the narrative.
 function getChurnDirection(buckets: OuterLoopConvergenceTrendBucket[]): ChurnDirection {
   if (buckets.length < 2) return 'flat';
-  const first = getBucketChurn(buckets[0]);
-  const last = getBucketChurn(buckets[buckets.length - 1]);
-  if (last < first) return 'falling';
-  if (last > first) return 'rising';
+
+  // Split into two halves and compare average churn per half
+  const midpoint = Math.ceil(buckets.length / 2);
+  const firstHalf = buckets.slice(0, midpoint);
+  const secondHalf = buckets.slice(midpoint);
+
+  const avgFirstHalf = firstHalf.reduce((sum, b) => sum + getBucketChurn(b), 0) / firstHalf.length;
+  const avgSecondHalf = secondHalf.reduce((sum, b) => sum + getBucketChurn(b), 0) / secondHalf.length;
+
+  // Small threshold (1%) to avoid flip-flopping on near-equal halves
+  const threshold = 0.01 * Math.max(avgFirstHalf, avgSecondHalf, 1);
+  const difference = avgSecondHalf - avgFirstHalf;
+
+  if (difference < -threshold) return 'falling';
+  if (difference > threshold) return 'rising';
   return 'flat';
 }
 
@@ -528,7 +544,10 @@ export function OuterReviewLoopConvergenceWidget({
   const latestBucket = trendData?.buckets.at(-1) ?? null;
   const trendBuckets = trendData?.buckets ?? [];
   const showTrend = trendBuckets.length >= 2;
-  const churnDirection = getChurnDirection(trendBuckets);
+  // Prefer the backend-computed canonical direction; fall back to the local
+  // (identical-algorithm) port only when an older backend omits the field.
+  const churnDirection: ChurnDirection =
+    trendData?.churn_direction ?? getChurnDirection(trendBuckets);
   const churnDirMeta = CHURN_DIRECTION_META[churnDirection];
 
   return (

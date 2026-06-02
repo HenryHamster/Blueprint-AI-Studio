@@ -8,6 +8,7 @@ queries off a passed-in ``AsyncSession``. They are imported (and re-exported) by
 """
 
 import logging
+import math
 import statistics
 import uuid
 from collections import defaultdict
@@ -1530,6 +1531,44 @@ def compute_digest_cost_economics(
     }
 
 
+def compute_churn_direction(buckets: List[Dict[str, Any]]) -> str:
+    """Canonical churn-trend direction for a list of per-day trend buckets.
+
+    Single source of truth shared by the narrative verdict
+    (compute_narrative_summary) and the dashboard widget glyph (consumed via
+    the ``churn_direction`` field on the trend endpoint). Both surfaces MUST
+    derive direction here so the lifted "Review/fix churn is X." sentence can
+    never contradict the rising/falling glyph rendered beside it.
+
+    Compares the first-half vs second-half AVERAGE of per-day churn (robust to
+    single-day endpoint anomalies) with a 1% threshold to avoid flip-flopping
+    on near-equal halves. Returns 'falling' | 'rising' | 'flat'.
+    """
+    if len(buckets) < 2:
+        return "flat"
+
+    def _bucket_churn(bucket: Dict[str, Any]) -> float:
+        incidence = bucket.get("incidence_counts") or {}
+        churn = incidence.get("churn")
+        if churn is None:
+            churn = bucket.get("churn_total")
+        return float(churn or 0)
+
+    midpoint = math.ceil(len(buckets) / 2)
+    first_half = buckets[:midpoint]
+    second_half = buckets[midpoint:]
+    avg_first = sum(_bucket_churn(b) for b in first_half) / len(first_half)
+    avg_second = sum(_bucket_churn(b) for b in second_half) / len(second_half)
+
+    threshold = 0.01 * max(avg_first, avg_second, 1)
+    difference = avg_second - avg_first
+    if difference < -threshold:
+        return "falling"
+    if difference > threshold:
+        return "rising"
+    return "flat"
+
+
 def compute_narrative_summary(
     *,
     hours: int,
@@ -1551,6 +1590,8 @@ def compute_narrative_summary(
     pr_count: int,
     error_log_map: Dict[str, str],
     failed_tasks: List[Task],
+    outer_loop_convergence_summary: Dict[str, Any] | None = None,
+    outer_loop_convergence_trend: Dict[str, Any] | None = None,
 ) -> str:
     """Build the human-readable digest narrative from precomputed metrics."""
     from app.failure_classification import (
@@ -1642,6 +1683,35 @@ def compute_narrative_summary(
                 _tax_msg = _taxonomy_msgs.get(_dom_cat)
                 if _tax_msg:
                     narrative_parts.append(_tax_msg)
+
+    if outer_loop_convergence_summary and outer_loop_convergence_trend:
+        buckets = outer_loop_convergence_trend.get("buckets") or []
+        # Consume the SINGLE canonical churn direction. In production the trend
+        # endpoint already stamps `churn_direction` via compute_churn_direction;
+        # when a caller passes raw buckets without it (e.g. unit tests) fall back
+        # to the SAME helper so the verdict can never diverge from the widget
+        # glyph, which derives from the identical algorithm.
+        churn_dir = outer_loop_convergence_trend.get("churn_direction")
+        if churn_dir not in {"falling", "rising", "flat"}:
+            churn_dir = compute_churn_direction(buckets)
+        if len(buckets) >= 2:
+            has_churn_signal = any(
+                (b.get("incidence_counts", {}).get("churn") or b.get("churn_total") or 0) > 0
+                for b in buckets
+            )
+            if has_churn_signal:
+                verdict = f"Review/fix churn is {churn_dir}"
+                dominant_blocker = outer_loop_convergence_summary.get("dominant_blocker")
+                if (
+                    dominant_blocker
+                    and dominant_blocker.get("count")
+                    and dominant_blocker.get("total")
+                ):
+                    verdict += (
+                        f"; the main blocker is {dominant_blocker['cause'].replace('_', ' ')}"
+                        f" ({dominant_blocker['count']}/{dominant_blocker['total']} non-converged PR chains)"
+                    )
+                narrative_parts.append(verdict + ".")
 
     if completed_count > 0:
         trend_prefix = ""

@@ -132,6 +132,10 @@ async def test_outer_loop_convergence_trend_buckets_each_cycle_on_its_own_day(
     assert buckets[day_2.strftime("%Y-%m-%d")]["pr_count"] == 1
     assert buckets[day_2.strftime("%Y-%m-%d")]["convergence_rate"] == 1.0
     assert buckets[day_2.strftime("%Y-%m-%d")]["escalation_total"] == 1
+    # The endpoint stamps the single canonical churn direction so the widget
+    # glyph and the narrative verdict read the same value rather than each
+    # re-deriving it.
+    assert data["churn_direction"] in {"falling", "rising", "flat"}
 
 
 @pytest.mark.asyncio
