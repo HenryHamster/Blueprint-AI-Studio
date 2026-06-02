@@ -25,6 +25,7 @@ from app.branch_resolution import (
     classify_rollup_merge_outcome,
     merged_pr_counts_as_integration_landing,
 )
+from app.landed_signal import mark_unblocked_non_merge
 from app.models import (
     Artifact,
     ArtifactType,
@@ -55,6 +56,39 @@ def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
     payload = task.first_payload or {}
     ctx = task.context or {}
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
+
+
+def _merge_context_with_hotfix_non_landing(
+    task: Task,
+    project: Project | None,
+    *,
+    base_context: Dict[str, Any],
+    landed_branch: str,
+    record_pr_merged: bool,
+) -> Dict[str, Any]:
+    """Preserve merge-equivalent unblock semantics for hotfix promotion merges."""
+    if record_pr_merged:
+        return {**base_context, "pr_merged": True}
+
+    if project is None or not _promotion_target_merge_allowed(task, landed_branch):
+        return dict(base_context)
+
+    from app.shared_state import get_project_promotion_target
+
+    promotion_target = get_project_promotion_target(project)
+    integration_branch = get_project_integration_branch(project)
+    if (
+        landed_branch == promotion_target
+        and landed_branch != integration_branch
+    ):
+        task.context = dict(base_context)
+        mark_unblocked_non_merge(
+            task,
+            reason="merged_pr_non_integration_branch",
+        )
+        return dict(task.context or {})
+
+    return dict(base_context)
 
 
 async def _block_admin_merge_for_branch_safety(
@@ -402,10 +436,13 @@ async def _handle_rollup_pr_approval(
                 if terminal_rollup_merge
                 else TaskStatus.EVALUATING
             )
-            task.context = {
-                **ctx,
-                **({"pr_merged": True} if record_pr_merged else {}),
-            }
+            task.context = _merge_context_with_hotfix_non_landing(
+                task,
+                _project,
+                base_context=ctx,
+                landed_branch=landed_branch,
+                record_pr_merged=record_pr_merged,
+            )
             if terminal_rollup_merge:
                 task.latest_status_message = (
                     f"Human-approved merge of rollup PR #{rollup_pr_number}"
@@ -637,10 +674,13 @@ async def _merge_critical_pr(
                 source="admin_task_mutations.critical_pr_approval",
             )
             task.status = TaskStatus.COMPLETED
-            task.context = {
-                **ctx,
-                **({"pr_merged": True} if record_pr_merged else {}),
-            }
+            task.context = _merge_context_with_hotfix_non_landing(
+                task,
+                _project,
+                base_context=ctx,
+                landed_branch=base_branch,
+                record_pr_merged=record_pr_merged,
+            )
             task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
             await create_pr_comment(
                 gh_token,

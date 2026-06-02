@@ -797,6 +797,7 @@ async def test_verify_pr_merged_no_artifact(cleanup_db, mocker):
     assert result is True
     assert task.context.get("pr_merged") is True
     assert task.context.get("landed_on_integration") is False
+    assert task.context.get("_non_merge_unblock_reason") == "rollup_no_pr_artifact"
     mock_get_pr.assert_not_called()
 
 
@@ -825,6 +826,7 @@ async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
     assert result is True
     assert task.context.get("pr_merged") is True
     assert task.context.get("landed_on_integration") is False
+    assert task.context.get("_non_merge_unblock_reason") == "verified_child_pr_merged"
 
 
 @pytest.mark.asyncio
@@ -977,7 +979,10 @@ async def test_verify_pr_merged_success_close_on_single_branch_sets_pr_merged(
     assert result is True
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is True
+    assert (task.context or {}).get("landed_on_integration") is False
+    assert (task.context or {}).get("_non_merge_unblock_reason") == "pr_closed_success"
     assert db_task_mock.context.get("pr_merged") is True
+    assert db_task_mock.context.get("landed_on_integration") is False
     assert db_task_mock.status == TaskStatus.COMPLETED
 
 
@@ -2881,6 +2886,8 @@ async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mock
     assert (child.context or {}).get("pr_merged") is True, (
         "Malformed pr_url must force-set pr_merged=True so rollup progresses"
     )
+    assert (child.context or {}).get("landed_on_integration") is False
+    assert (child.context or {}).get("_non_merge_unblock_reason") == "malformed_pr_url"
 
 
 # ── ci_waiting seed gate for the spawn-review path ────────────────────────────

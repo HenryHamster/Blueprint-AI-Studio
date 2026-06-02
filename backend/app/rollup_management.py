@@ -61,6 +61,7 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
+from app.landed_signal import mark_unblocked_non_merge
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
@@ -569,7 +570,7 @@ async def _check_and_trigger_rollup(
                 if not pr_art or not pr_art.pr_url:
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.
-                    c.context = {**(c.context or {}), "pr_merged": True}
+                    mark_unblocked_non_merge(c, reason="rollup_no_pr_artifact")
                     session.add(c)
                     logger.info(
                         f"[ROLLUP] Child {str(c.id)[:8]} has no PR artifact — marking as merged"
@@ -586,7 +587,7 @@ async def _check_and_trigger_rollup(
                         f"{str(c.id)[:8]} — cannot parse PR number; "
                         f"force-setting pr_merged=True so rollup progresses"
                     )
-                    c.context = {**(c.context or {}), "pr_merged": True}
+                    mark_unblocked_non_merge(c, reason="malformed_pr_url")
                     session.add(c)
                     continue
 
@@ -621,9 +622,9 @@ async def _check_and_trigger_rollup(
                             f"{respawn_count}x without merging — manual intervention required"
                         )
                     elif not gates_on:
+                        mark_unblocked_non_merge(c, reason="review_respawn_cap")
                         c.context = {
                             **(c.context or {}),
-                            "pr_merged": True,
                             "_rollup_skipped_reason": "review_respawn_cap",
                         }
                         session.add(c)
