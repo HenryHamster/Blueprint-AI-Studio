@@ -1815,6 +1815,46 @@ async def _spawn_strategic_review(
     _integration_branch = get_project_integration_branch(project)
     _promotion_target = get_project_promotion_target(project)
     if _integration_branch != _promotion_target:
+        # Deploy-model framing — present ONLY when the integration branch and the
+        # promotion target differ (the LTS split). In that topology the strategic
+        # model grounds on the integration branch, but only the promotion target is
+        # deployed and runs live, so code merged to the integration branch is NOT
+        # running until it is promoted. Without this the agent conflates "landed on
+        # the integration branch" with "live" and adopts plans that are structurally
+        # invalid for un-promoted code — enable-a-flag-and-measure-the-live-funnel,
+        # or hard-pivot-away-on-a-live-metric-miss. Incident 2026-06-02: the entire
+        # warm-pool was on automain only (0 hits on origin/main) yet g-vm-efficiency
+        # planned to enable account-retarget + MEASURE the LIVE pool funnel and HARD
+        # PIVOT on a miss — impossible until the version promotes. fr-staging-rollup-
+        # lag already teaches "a shipped badge is not an integration-branch landing";
+        # this is its sibling: "an integration-branch landing is not a deployment."
+        # When the two branches are equal (no split) merges deploy directly, so the
+        # framing is correctly omitted. Branch names are project-generic (never
+        # hardcoded) — resolved from the per-project integration/promotion columns.
+        _deploy_framing = (
+            "Deployment model — read before reasoning about runtime behavior or "
+            f"metrics. `{_integration_branch}` is the integration branch you ground "
+            f"on; only `{_promotion_target}` is deployed and runs live. Work merged "
+            f"to `{_integration_branch}` but not yet PROMOTED to "
+            f"`{_promotion_target}` is NOT running yet. Every live/runtime signal — "
+            "pool and VM-reuse funnels, hit rates, throughput, cost-per-merged-PR, "
+            "any 'is this capability moving its metric' read — reflects ONLY "
+            f"promoted+deployed `{_promotion_target}` code, never "
+            f"`{_integration_branch}`-only work. Consequences for a capability "
+            f"landed on `{_integration_branch}` but not promoted: (1) do NOT plan to "
+            "'enable a runtime flag and measure the live funnel' — there is nothing "
+            "live to measure; (2) do NOT pivot away from an approach because live "
+            "metrics look flat — flat is the expected reading for un-promoted code, "
+            f"not evidence the approach failed; (3) 'landed on `{_integration_branch}`' "
+            "means the code EXISTS to reason about and modify, NOT that it is in "
+            "effect. To make integration-branch runtime work actually testable and "
+            "measurable, promote it first."
+        )
+        prompt_suffix = (
+            f"{_deploy_framing}\n{prompt_suffix}"
+            if prompt_suffix
+            else _deploy_framing
+        )
         try:
             from app.release_version import (
                 count_merged_since,
