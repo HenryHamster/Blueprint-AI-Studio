@@ -91,6 +91,7 @@ async def _attempt_merge_with_retry_and_escalation(
         is_custom_staged_rollup_root,
         merged_pr_counts_as_integration_landing,
     )
+    from app.landed_signal import apply_merged_landed_signal
     from app.models import Project
     from app.shared_state import (
         get_project_integration_branch,
@@ -416,7 +417,16 @@ async def _attempt_merge_with_retry_and_escalation(
                                 )
                             )
                         if record_pr_merged:
-                            orig.context = {**(orig.context or {}), "pr_merged": True}
+                            apply_merged_landed_signal(
+                                orig,
+                                orig_project,
+                                base_branch=ci_base,
+                                hotfix_lane=bool(
+                                    (orig.first_payload or {}).get("hotfix")
+                                    or (orig.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):

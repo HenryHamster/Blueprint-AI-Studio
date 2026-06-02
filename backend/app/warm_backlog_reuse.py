@@ -360,6 +360,16 @@ _teardown_defers_events: deque = deque(maxlen=500)
 _next_role_polls_during_defer_events: deque = deque(maxlen=500)
 _warm_claims_succeeded_events: deque = deque(maxlen=500)
 _claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
+# Completion-side trigger stage: each entry is a (datetime, count) tuple, one
+# per COMPLETION event that proactively stamped ``_deps_satisfied`` on >=1
+# just-unblocked dependent (so the just-completed VM can warm-claim that
+# follow-on work inside its teardown-defer grace window rather than tearing
+# down cold while the dependent waits for a later dispatch scan). count is the
+# number of dependents marked by that event. Recorded by the completion-side
+# trigger that owns the marking (orchestrator/lifecycle/reaper termination
+# paths); surfaced here so the trigger's lift is visible alongside the
+# unresolved-dependency scan skips it is designed to drive down.
+_completion_dependents_marked_events: deque = deque(maxlen=500)  # (datetime, count)
 
 # Eligibility-scan skip-reason events. Each entry is a single _utcnow() per
 # poll where that reason fired (one or more rows skipped). This per-poll
@@ -447,6 +457,18 @@ def record_claim_skipped(reason: str) -> None:
     _claim_skipped_events.append((_utcnow(), reason))
 
 
+def record_completion_dependents_marked(count: int) -> None:
+    """Completion-side trigger: a finished task proactively stamped the sticky
+    ``_deps_satisfied`` readiness marker on *count* just-unblocked QUEUED
+    dependents, making them warm-claimable within the just-completed VM's
+    teardown-defer grace window instead of waiting for a later dispatch scan.
+
+    No-ops on a non-positive count so callers can record unconditionally.
+    """
+    if count and count > 0:
+        _completion_dependents_marked_events.append((_utcnow(), count))
+
+
 def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
     """Return rolling funnel counts for the warm-reuse claim pipeline.
 
@@ -470,6 +492,9 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         ),
         "warm_claims_succeeded": sum(
             1 for ts in _warm_claims_succeeded_events if ts >= cutoff
+        ),
+        "completion_dependents_marked": sum(
+            count for ts, count in _completion_dependents_marked_events if ts >= cutoff
         ),
         "claim_skipped_by_reason": skipped_by_reason,
         "claim_skipped_total": sum(skipped_by_reason.values()),

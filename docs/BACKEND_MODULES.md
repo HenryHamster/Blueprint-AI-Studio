@@ -1010,6 +1010,104 @@ Used by orchestrator to validate incoming task payloads before queueing.
 
 ---
 
+### CI & Merge Workflows
+
+#### `ci_completion.py`
+
+Processes CI check results for tasks waiting on CI.
+
+**Responsibilities:**
+- Poll or receive GitHub check-run status
+- Merge on success (via merge decision logic)
+- Spawn fix tasks on failure
+- Handle edge cases: merge conflicts, race conditions, abandoned PRs
+
+**Key functions:**
+- `handle_ci_completion()` — Main handler called from webhook or polling loop
+
+---
+
+#### `ci_merge_helpers.py`
+
+Handles merge decisions and conflict resolution.
+
+**Functions:**
+- `_review_approved()` — Validate the review loop reached approval
+- `_capture_merge_snapshot()` — Snapshot gate fields before releasing the row lock
+- `_relock_merge_task()` — Re-acquire the lock and re-validate against the snapshot
+- `_normalize_merge_error()` / `_is_deterministic_merge_error()` — Classify merge errors
+- `_post_merge_summary()` — Post the post-merge summary comment
+
+---
+
+### Monitoring & Alerting
+
+#### `alert_dispatch.py`
+
+Sends operator alerts for high-severity issues.
+
+**Triggers:**
+- Circuit breaker opened (repeated failures)
+- Zone exhaustion
+- GitHub rate limit exceeded
+- Provider quota reached
+
+**Delivery:** Webhook/Slack/email (via `notification_service`).
+
+---
+
+#### `anomaly_detection.py`
+
+Detects pipeline anomalies in real time.
+
+**Signals:**
+- Success rate drops below threshold
+- Token cost spike
+- Latency spike
+- Failure clustering
+
+**Response:**
+- Auto-throttle concurrency
+- Pause autonomous research
+- Create operator alert
+
+---
+
+#### `deploy_health.py`
+
+Monitors deployment health after a new release.
+
+**Checks:**
+- Error rate within baseline
+- Latency within baseline
+- No cascading failures
+
+**Actions:**
+- Mark deploy as STABLE when safe
+- Trigger rollback if unsafe
+
+---
+
+### Utilities & Helpers
+
+#### `admin.py`
+
+Admin-only endpoints and helpers (re-exported from main.py).
+
+---
+
+#### `admin_helpers.py`
+
+Utilities for admin operations (project config, user management).
+
+---
+
+#### `admin_task_mutations.py`
+
+Helpers for admin-triggered task operations (spawn, cancel, pause).
+
+---
+
 ## Testing Patterns
 
 ### `testing/conftest.py`
@@ -1041,14 +1139,35 @@ Test files mirror source structure:
 
 | Module | Purpose | Key Dependency |
 |--------|---------|-----------------|
+| **Core Infrastructure** | | |
 | main.py | FastAPI app + routes | schemas, models, orchestrator |
 | models.py | ORM/database schema | database.py |
 | database.py | Async PostgreSQL | SQLAlchemy |
+| schemas.py | Pydantic request/response DTOs | fastapi |
+| auth.py | Firebase, JWT, API key auth | firebase_admin |
+| **Orchestration** | | |
 | orchestrator.py | Task queue polling | task_lifecycle, compute |
-| compute.py | GCP VM lifecycle | google-cloud-compute |
-| task_lifecycle.py | State machine | models |
-| github.py | GitHub API client | httpx, async |
-| autonomous_research.py | Research task spawning | task_lifecycle, strategic_spawning |
-| branch_resolution.py | Per-project branch/promotion resolution | models |
-| failure_classification.py | Error categorization | — |
 | reaper.py | Heartbeat timeout handler | task_lifecycle, compute |
+| compute.py | GCP VM lifecycle | google-cloud-compute |
+| compute_manifest.py | Agent secret manifest building | models |
+| **Task Management** | | |
+| task_lifecycle.py | State machine | models |
+| task_completion.py | Terminal status handling | task_lifecycle |
+| ci_completion.py | CI result processing | github, task_lifecycle |
+| task_capabilities.py | Task type → handler mapping | — |
+| **GitHub & Repositories** | | |
+| github.py | GitHub API client | httpx, async |
+| branch_resolution.py | Per-project branch/promotion resolution | models |
+| **Autonomous Research** | | |
+| autonomous_research.py | Research task spawning | task_lifecycle, strategic_spawning |
+| strategic_spawning.py | Context building for strategic agent | models |
+| strategic_completion.py | Post-research processing | models |
+| direction_lifecycle.py | Direction state management | models |
+| **Monitoring & Diagnostics** | | |
+| failure_classification.py | Error categorization | — |
+| ci_merge_helpers.py | Merge decision logic | github, task_lifecycle |
+| alert_dispatch.py | Operator alert delivery | models |
+| anomaly_detection.py | Pipeline anomalies | models |
+| **Utilities** | | |
+| lifecycle.py | Background workers startup/shutdown | asyncio |
+| payload_schemas.py | Task payload validation | models |

@@ -35,6 +35,7 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.branch_resolution import classify_rollup_merge_outcome
+from app.landed_signal import apply_merged_landed_signal
 from app.shared_state import runtime_config as _runtime_config
 from app.shared_state import (
     record_pipeline_event,
@@ -817,6 +818,46 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
     if created:
         await session.commit()
     return created
+
+
+async def _mark_landed_parent_dependents(parent_id, session) -> None:
+    """Completion-side warm-reuse trigger for reaper-driven rollup landings.
+
+    The reaper re-triggers ``_check_and_trigger_rollup`` from two places — the
+    post-reap loop (a failed child whose surviving siblings complete the parent)
+    and the Step-3 stale-EVALUATING sweep. When that lands a parent's rollup PR
+    on the integration branch the parent transitions to COMPLETED and its QUEUED
+    dependents are unblocked, but — exactly as on the orchestrator's CI-completion
+    and the in-process merge paths — nothing here proactively stamps the sticky
+    ``_deps_satisfied`` readiness marker on those dependents. So a just-unblocked
+    sibling-to-sibling fan-out child stays unmarked until a later capacity-and-
+    window-bounded dispatch scan happens to reach it, and the warm VM polling for
+    follow-on work inside its teardown-defer grace window skips it and tears down
+    cold while the orchestrator cold-provisions a fresh VM for that very dependent.
+
+    Re-fetch the parent on the shared session (full row via ``session.get`` — no
+    partial projection, so no MissingGreenlet) and, ONLY if it has actually
+    landed (status COMPLETED), delegate to the single authoritative
+    ``_mark_dependents_warm_claimable``. That reuses the same GitHub-aware
+    dependency resolution the dispatch scan uses, runs in its own sessions, and
+    stamps only the ``"eligible"`` result — a dependent with any still-unresolved
+    or failed dependency continues to carry no marker and cold-dispatch exactly as
+    before. Adds no cold provisioning. Best-effort: a failure here never aborts the
+    reaper cycle.
+    """
+    if parent_id is None:
+        return
+    try:
+        from app.task_lifecycle import _mark_dependents_warm_claimable
+
+        parent = await session.get(Task, parent_id)
+        if parent is None or parent.status != TaskStatus.COMPLETED:
+            return
+        await _mark_dependents_warm_claimable(parent)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[REAPER] Dependent warm-claim marking failed for parent {parent_id}: {e}",
+        )
 
 
 async def reaper_service():
@@ -2075,10 +2116,16 @@ async def reaper_service():
                                     f"{_landed_branch}; awaiting downstream landing"
                                 )
                             if _record_pr_merged:
-                                task.context = {
-                                    **(task.context or {}),
-                                    "pr_merged": True,
-                                }
+                                apply_merged_landed_signal(
+                                    task,
+                                    _proj,
+                                    base_branch=_landed_branch,
+                                    hotfix_lane=bool(
+                                        (task.first_payload or {}).get("hotfix")
+                                        or (task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -2809,6 +2856,14 @@ async def reaper_service():
                                 await _check_and_trigger_rollup(
                                     task, session, progress_cb=_mark_reaper_progress
                                 )
+                                # Completion-side warm-reuse: if that landing
+                                # completed the parent rollup, stamp the
+                                # _deps_satisfied marker on the dependents it just
+                                # unblocked so a polling warm VM can claim them
+                                # before tearing down cold (see helper docstring).
+                                await _mark_landed_parent_dependents(
+                                    task.parent_task_id, session
+                                )
                             except Exception as e:
                                 logger.error(
                                     f"[REAPER] Rollup check failed for task {task.id}: {e}",
@@ -3155,6 +3210,16 @@ async def reaper_service():
                                             flag_modified(_nudged, "context")
                                             session.add(_nudged)
                                             await session.commit()
+                                    # Completion-side warm-reuse: if the sweep's
+                                    # rollup trigger landed this parent, stamp the
+                                    # _deps_satisfied marker on the dependents it
+                                    # just unblocked (see helper docstring) so a
+                                    # polling warm VM claims them before cold
+                                    # teardown rather than waiting for a later
+                                    # window-bounded dispatch scan.
+                                    await _mark_landed_parent_dependents(
+                                        parent_id, session
+                                    )
                             except Exception as e:  # noqa: BLE001
                                 logger.warning(
                                     f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",

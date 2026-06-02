@@ -662,6 +662,140 @@ from app.orchestrator_health import (
 )
 
 
+async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> int:
+    """Completion-side trigger: when a task finishes and its PR has landed on the
+    integration branch, proactively stamp the sticky ``_deps_satisfied`` readiness
+    marker on any QUEUED dependent whose dependencies now authoritatively resolve
+    as satisfied.
+
+    Without this, a just-unblocked dependent stays unmarked until a later
+    capacity-and-window-bounded dispatch scan happens to reach it, so the
+    just-completed task's warm VM — polling for follow-on work inside its
+    teardown-defer grace window — skips it and tears down cold, and the
+    orchestrator then cold-provisions a fresh VM for the very dependent the
+    completion just unblocked. Marking it here makes the obvious sibling-to-sibling
+    fan-out reusable in the saturated-fleet regime where reuse matters most.
+
+    The readiness signal is NOT loosened: this reuses the same authoritative,
+    GitHub-aware ``_check_candidate_task_deps`` resolution the dispatch scan uses,
+    and stamps only the ``"eligible"`` result — a dependent with any still-unresolved
+    or failed dependency continues to carry no marker and continue to cold-dispatch
+    and cascade-cancel exactly as before. Adds no cold provisioning.
+
+    Async hot-loop safety: dependents and their dependency rows are loaded with
+    full ``select(Task)`` (every column present, no partial projection) so the
+    downstream attribute reads inside ``_check_candidate_task_deps`` cannot trip a
+    MissingGreenlet. The eligibility pass performs no commits, so the attached rows
+    are never expired mid-iteration; the marker write happens afterwards in its own
+    session.
+    """
+    completed_id_str = str(completed_task.id)
+    project_id = completed_task.project_id
+    eligible_ids: list[uuid.UUID] = []
+    # Bound the candidate scan. ``depends_on`` is a JSON column filtered in Python
+    # below, so the cap is on the raw QUEUED-dependent pool, not the matched subset.
+    # Order deterministically (oldest first) so the bounded window is stable rather
+    # than nondeterministic, and surface a warning when it is saturated so the
+    # silent-drop of surplus dependents for a >cap fan-out is observable.
+    _DEPENDENT_SCAN_CAP = 100
+    async with AsyncSessionLocal() as dep_session:
+        dependents = (
+            (
+                await dep_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.requires_approval.is_(False),
+                        Task.project_id == project_id,
+                        Task.depends_on.isnot(None),
+                    )
+                    .order_by(Task.created_at)
+                    .limit(_DEPENDENT_SCAN_CAP)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(dependents) >= _DEPENDENT_SCAN_CAP:
+            logger.warning(
+                "[warm-reuse] _mark_unblocked_dependents hit the %d-dependent scan "
+                "cap for project %s after task %s; surplus QUEUED dependents are not "
+                "marked this pass and will fall back to the dispatch scan",
+                _DEPENDENT_SCAN_CAP,
+                project_id,
+                completed_id_str,
+            )
+        dependents = [
+            d
+            for d in dependents
+            if completed_id_str in (d.depends_on or [])
+            and not (d.context or {}).get("_deps_satisfied")
+        ]
+        if not dependents:
+            return 0
+        # Batch every dependency row across all dependents into one query.
+        per_dep_uuids: dict[uuid.UUID, list[uuid.UUID]] = {}
+        all_dep_uuids: set[uuid.UUID] = set()
+        for d in dependents:
+            du: list[uuid.UUID] = []
+            for raw in d.depends_on or []:
+                try:
+                    du.append(uuid.UUID(raw))
+                except (ValueError, AttributeError):
+                    continue
+            per_dep_uuids[d.id] = du
+            all_dep_uuids.update(du)
+        dep_by_id: dict[uuid.UUID, Task] = {}
+        if all_dep_uuids:
+            dep_by_id = {
+                dt.id: dt
+                for dt in (
+                    await dep_session.execute(
+                        select(Task).where(Task.id.in_(all_dep_uuids))
+                    )
+                )
+                .scalars()
+                .all()
+            }
+        for d in dependents:
+            du = per_dep_uuids[d.id]
+            dep_tasks = [dep_by_id[u] for u in du if u in dep_by_id]
+            result_str, _ = await _check_candidate_task_deps(
+                d, dep_tasks, du, dep_session, verify_pr_merged
+            )
+            if result_str == "eligible":
+                eligible_ids.append(d.id)
+    if not eligible_ids:
+        return 0
+    async with AsyncSessionLocal() as stamp_session:
+        for r in (
+            (
+                await stamp_session.execute(
+                    select(Task).where(Task.id.in_(eligible_ids))
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            if not (r.context or {}).get("_deps_satisfied"):
+                r.context = {**(r.context or {}), "_deps_satisfied": True}
+                stamp_session.add(r)
+        await stamp_session.commit()
+    # Surface the completion-side trigger's lift on the reuse funnel so operators
+    # can confirm the widening change is converting just-unblocked dependents into
+    # warm-claimable work. Best-effort: telemetry must never abort the completion
+    # cycle. Recorder no-ops on a non-positive count, but the early ``return 0``
+    # paths above carry no marked dependents, so this single call at the marked-some
+    # landing is the authoritative record for all three completion callers.
+    from app.warm_backlog_reuse import record_completion_dependents_marked
+
+    try:
+        record_completion_dependents_marked(len(eligible_ids))
+    except Exception:
+        logger.exception("[warm-reuse] completion_dependents_marked telemetry failed")
+    return len(eligible_ids)
+
+
 async def orchestrator_worker():
     """
     Background worker that polls for QUEUED tasks and provisions VMs.
@@ -2707,10 +2841,11 @@ async def orchestrator_worker():
                     if task.vm_dispatched_at is None:
                         task.vm_dispatched_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
-                    # Foundational scaffolding for vm_reuse_rate (efficiency
-                    # direction d-91d8dede). There is no warm pool today, so
-                    # every dispatch is a cold provision — TODO(warm-pool):
-                    # flip to True at the reuse path once pooling lands. See
+                    # Cold dispatch: this is a fresh provision, so vm_warm_start
+                    # is False. The warm-claim / backlog-reuse path stamps True
+                    # instead (routers/agent_warm_continuity._finalize_warm_claim),
+                    # which is also where the vm_reuse_rate signal
+                    # (context['_timing']['warm_start']) is written. See
                     # compute.provision_agent_vm for the corresponding marker.
                     task.vm_warm_start = False
                     # vm_spot must be written here — it's read by ~30 cost-rate sites
@@ -3743,11 +3878,13 @@ async def orchestrator_worker():
                                         _orch_ci_project
                                     )
                                 )
-                                await _apply_ci_merged_landed_signal(
-                                    ci_task,
-                                    session,
-                                    base_branch=_ci_base,
-                                    review_loop=ci_loop,
+                                _landed_on_integration = (
+                                    await _apply_ci_merged_landed_signal(
+                                        ci_task,
+                                        session,
+                                        base_branch=_ci_base,
+                                        review_loop=ci_loop,
+                                    )
                                 )
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = (
@@ -3766,6 +3903,28 @@ async def orchestrator_worker():
                                 logger.info(
                                     f"[CI] PR #{ci_pr_number} merged, marking task COMPLETED"
                                 )
+                                # Completion-side warm-reuse trigger: now that this
+                                # PR has landed on integration, proactively mark any
+                                # dependents it just unblocked as warm-claimable so
+                                # this task's warm VM can claim follow-on work inside
+                                # its teardown-defer grace window instead of tearing
+                                # down cold. Best-effort: a failure here must never
+                                # abort the CI completion cycle.
+                                if _landed_on_integration:
+                                    try:
+                                        _unblocked = await _mark_unblocked_dependents(
+                                            ci_task, _verify_pr_merged
+                                        )
+                                        if _unblocked:
+                                            logger.info(
+                                                f"[CI] PR #{ci_pr_number} unblocked "
+                                                f"{_unblocked} dependent(s) — marked warm-claimable"
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "[CI] dependent warm-claim marking failed "
+                                            f"for task {ci_task.id}"
+                                        )
                             else:
                                 # Closed without merge (human/bot intervention, not a self-close
                                 # reset — pending_reopen case handled above). Do NOT mark

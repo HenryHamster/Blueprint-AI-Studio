@@ -59,6 +59,42 @@ class Project(SQLModel, table=True):
   Onboarding slugifies it from the repo name; agent task branches are named
   `{namespace}/{prefix}-{hex}`. Tuned via `.../task-branch-namespace`.
 
+**`build_config`** — JSONB blob of dirs, commands, and git identity delivered to
+the agent in its claim response. Validated against the backend `BuildConfig`
+Pydantic schema (`backend/app/schemas.py`) both at onboarding
+(`build_config_override`) and via `PATCH /api/admin/projects/{id}/build-config`.
+Fields the schema does not declare are dropped at validation time, so a knob
+only round-trips to the agent if `BuildConfig` declares it.
+
+- `build_config.migration` — per-project **migration layout** for repos whose
+  Python project does not follow Blueprint's `backend/alembic/versions` +
+  `app/models` + `app/main.py` layout. Mirrors the agent's `MigrationConfig`
+  (`agent/src/utils/test-runners.ts`); the migrate handler consumes it through
+  `resolveMigrationLayout` (`agent/src/handlers/specialized.ts`). All sub-fields
+  are optional; an unset field falls back to the Blueprint default shown below:
+
+  | Sub-field | Meaning | Default when unset |
+  |-----------|---------|--------------------|
+  | `versions_dir` | Dir holding alembic version files | `<pythonDir>/alembic/versions` |
+  | `models_dir` | Dir/file holding the SQLModel/SQLAlchemy models | `<pythonDir>/app/models` |
+  | `alembic_cwd` | Working dir alembic runs from (where `alembic.ini` lives) | `<pythonDir>` |
+  | `schema_revision_file` | File declaring the schema-revision constant | `<pythonDir>/app/main.py` |
+  | `schema_revision_const` | Name of the schema-revision constant to bump | `EXPECTED_SCHEMA_REVISION` |
+
+  An **empty-string** `schema_revision_file` (`""`) is meaningful and preserved:
+  it signals "no schema-revision gate", so the migrate prompt omits the
+  revision-bump step entirely rather than falling back to the default file. Set
+  the whole object at onboard time via `build_config_override` and/or later via
+  the project build-config PATCH endpoint; omit it entirely and the agent uses
+  Blueprint's defaults.
+
+  > **Distinct from `Project.alembic_versions_path`** (the single-string
+  > `build_config.alembic_versions_path` knob): that field feeds only the
+  > backend-side migration-file guard (which paths require migration review),
+  > **not** the agent's `resolveMigrationLayout`. Set `build_config.migration`
+  > to relocate where the *agent* looks for migrations; the two are not
+  > interchangeable.
+
 **`approval_gate_config`** — shape `{"infra_files": [...], "critical_files": [...]}`.
 Read at PR time by `task_lifecycle_github_helpers._get_approval_gate_file_lists`
 to decide which changed files require human approval before merge. **When

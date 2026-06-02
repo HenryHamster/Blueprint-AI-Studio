@@ -55,6 +55,7 @@ from app.branch_resolution import (
     is_custom_staged_rollup_root,
     merged_pr_counts_as_integration_landing,
 )
+from app.landed_signal import apply_merged_landed_signal
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.rollup_locking import _lock_original_task, _OriginalTaskLockTimeout
 from app.notification_dispatch import (
@@ -287,6 +288,48 @@ async def _increment_research_spawn_count(
     flag_modified(project, "vision")
     session.add(project)
     return new_count
+
+
+async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
+    """Completion-side warm-reuse trigger for PRs that land on the integration
+    branch from inside ``_process_post_commit`` (the small-scope auto-merge and
+    review-approved merge paths).
+
+    The orchestrator's CI-completion path (cluster 1) already stamps the sticky
+    ``_deps_satisfied`` readiness marker on the dependents a landing unblocks,
+    but the in-process merge paths here are a second class of integration
+    landing that previously had no completion-side trigger: the just-unblocked
+    dependent stayed unmarked until a later capacity-and-window-bounded dispatch
+    scan happened to reach it, so ``landed_task``'s warm VM — polling for
+    follow-on work inside its teardown-defer grace window — skipped it and tore
+    down cold while the orchestrator cold-provisioned a fresh VM for that very
+    dependent.
+
+    Fully delegated to the single authoritative implementation in
+    ``orchestrator._mark_unblocked_dependents`` (same GitHub-aware dependency
+    resolution, its own sessions with no partial projection, and no loosening
+    of the readiness signal — only the ``"eligible"`` result is stamped). The
+    delegated call opens its own sessions, so it must run AFTER the caller has
+    committed and released its FOR UPDATE lock. Best-effort: any failure here
+    must never abort post-commit processing. Deferred import avoids a circular
+    import (orchestrator is a heavy module that is already loaded by call time).
+    """
+    try:
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.rollup_management import _verify_pr_merged
+
+        unblocked = await _mark_unblocked_dependents(landed_task, _verify_pr_merged)
+        if unblocked:
+            logger.info(
+                "[PIPELINE] Task %s landing unblocked %d dependent(s) — marked warm-claimable",
+                landed_task.id,
+                unblocked,
+            )
+    except Exception:
+        logger.exception(
+            "[PIPELINE] Dependent warm-claim marking failed for task %s",
+            landed_task.id,
+        )
 
 
 async def _process_post_commit(
@@ -931,10 +974,16 @@ async def _process_post_commit(
                                     )
                                 )
                             if _record_pr_merged:
-                                task.context = {
-                                    **(task.context or {}),
-                                    "pr_merged": True,
-                                }
+                                apply_merged_landed_signal(
+                                    task,
+                                    _project,
+                                    base_branch=base_branch,
+                                    hotfix_lane=bool(
+                                        (task.first_payload or {}).get("hotfix")
+                                        or (task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
                             session.add(task)
                             _t_ctx = task.context or {}
                             # Audit W1: auto_remediation is now a column.
@@ -955,6 +1004,12 @@ async def _process_post_commit(
                                     )
                             await session.commit()
                             await _cleanup_branches(task, session)
+                            # Completion-side warm-reuse trigger: the PR has
+                            # landed on integration and the lock is released, so
+                            # proactively mark any dependents this just unblocked
+                            # as warm-claimable for this task's teardown-defer VM.
+                            if _record_pr_merged:
+                                await _mark_dependents_warm_claimable(task)
                             logger.info(
                                 f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)"
                             )
@@ -2179,10 +2234,22 @@ async def _process_post_commit(
                                                 )
                                             )
                                         if _record_pr_merged:
-                                            orig.context = {
-                                                **(orig.context or {}),
-                                                "pr_merged": True,
-                                            }
+                                            apply_merged_landed_signal(
+                                                orig,
+                                                _orig_project,
+                                                base_branch=base_branch,
+                                                hotfix_lane=bool(
+                                                    (orig.first_payload or {}).get(
+                                                        "hotfix"
+                                                    )
+                                                    or (orig.context or {}).get(
+                                                        "hotfix"
+                                                    )
+                                                ),
+                                                non_merge_reason=(
+                                                    "merged_pr_non_integration_branch"
+                                                ),
+                                            )
                                         # If this was a rollup PR review, mark the
                                         # parent COMPLETED — but only if it is STILL
                                         # EVALUATING after the relock. A peer (e.g.
@@ -2323,6 +2390,13 @@ async def _process_post_commit(
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
+                                        # Completion-side warm-reuse trigger: the
+                                        # original task's PR has landed on
+                                        # integration and the lock is released —
+                                        # mark its just-unblocked dependents
+                                        # warm-claimable (see cluster 1 parity).
+                                        if _record_pr_merged:
+                                            await _mark_dependents_warm_claimable(orig)
                                         # Spawn a smoketest after rollup merges to the
                                         # promotion target. After Phase 1 (automain/LTS),
                                         # normal rollups target `automain`; only promotion
@@ -2918,12 +2992,24 @@ async def _process_post_commit(
                                         **(_orig.context or {}),
                                         "review_loop": _orig_loop,
                                         "pr_closed_empty": True,
-                                        **(
-                                            {"pr_merged": True}
-                                            if _record_pr_merged
-                                            else {}
-                                        ),
                                     }
+                                    if _record_pr_merged:
+                                        apply_merged_landed_signal(
+                                            _orig,
+                                            _orig_project,
+                                            base_branch=_landed_branch,
+                                            hotfix_lane=bool(
+                                                (_orig.first_payload or {}).get(
+                                                    "hotfix"
+                                                )
+                                                or (_orig.context or {}).get(
+                                                    "hotfix"
+                                                )
+                                            ),
+                                            non_merge_reason=(
+                                                "merged_pr_non_integration_branch"
+                                            ),
+                                        )
                                     flag_modified(_orig, "context")
                                     _orig.status = (
                                         TaskStatus.COMPLETED

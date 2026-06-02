@@ -257,6 +257,34 @@ class BuildConfigDirectoryEntry(BaseModel):
     install_cmd: str | None = None
 
 
+class MigrationConfig(BaseModel):
+    """Per-project Alembic/migration layout override.
+
+    Mirrors the agent-side ``MigrationConfig`` (agent/src/utils/test-runners.ts):
+    the migrate handler's ``resolveMigrationLayout`` consumes these fields so a
+    repo with a non-standard Python layout (e.g. migrations under
+    ``src/db/versions`` instead of ``backend/alembic/versions``) can run migrate
+    tasks. Every field is optional; an unset field falls back to Blueprint's
+    defaults (``backend/alembic/versions`` + ``app/models`` + ``app/main.py``
+    ``EXPECTED_SCHEMA_REVISION``).
+
+    This is DISTINCT from ``BuildConfig.alembic_versions_path`` (a single string
+    feeding only the backend-side migration-file guard); this object drives the
+    agent's full layout resolution.
+
+    Note: an explicit empty-string ``schema_revision_file`` is meaningful — it
+    signals "this repo has no schema-revision gate" and is preserved through
+    validation rather than coerced to None.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    versions_dir: str | None = None
+    models_dir: str | None = None
+    alembic_cwd: str | None = None
+    schema_revision_file: str | None = None
+    schema_revision_const: str | None = None
+
+
 class BuildConfig(BaseModel):
     """Schema for project build configuration."""
 
@@ -283,7 +311,14 @@ class BuildConfig(BaseModel):
     protected_branches: List[str] | None = None
     enable_self_improvement: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
+    # NOTE: this single string feeds only the backend-side migration-file guard;
+    # it is NOT the agent's full layout resolver — see ``migration`` below.
     alembic_versions_path: str | None = None
+    # Per-project migration-layout override consumed by the agent's migrate
+    # handler (resolveMigrationLayout). None means "use Blueprint defaults".
+    # Round-tripped unchanged through detect/save/PATCH so an operator-supplied
+    # build_config.migration actually reaches the agent's claim response.
+    migration: MigrationConfig | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"

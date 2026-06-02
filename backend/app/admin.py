@@ -68,7 +68,10 @@ from app.admin_task_mutations import (
     _handle_task_pr_approval,
     modify_task_apply,
 )
-from app.routers.admin_operator_triggers import router as _operator_triggers_router
+from app.routers.admin_operator_triggers import (  # noqa: F401
+    _record_failure_result,
+    router as _operator_triggers_router,
+)
 
 
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts

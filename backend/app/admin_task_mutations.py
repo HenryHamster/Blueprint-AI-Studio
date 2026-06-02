@@ -65,14 +65,12 @@ def _merge_context_with_hotfix_non_landing(
     base_context: Dict[str, Any],
     landed_branch: str,
     record_pr_merged: bool,
+    preserve_hotfix_non_landing: bool = True,
 ) -> Dict[str, Any]:
     """Preserve merge-equivalent unblock semantics for hotfix promotion merges."""
     task.context = dict(base_context)
 
     if record_pr_merged:
-        if project is None:
-            return {**base_context, "pr_merged": True}
-
         apply_merged_landed_signal(
             task,
             project,
@@ -82,7 +80,11 @@ def _merge_context_with_hotfix_non_landing(
         )
         return dict(task.context or {})
 
-    if project is None or not _promotion_target_merge_allowed(task, landed_branch):
+    if (
+        not preserve_hotfix_non_landing
+        or project is None
+        or not _promotion_target_merge_allowed(task, landed_branch)
+    ):
         return dict(base_context)
 
     from app.shared_state import get_project_promotion_target
@@ -453,6 +455,7 @@ async def _handle_rollup_pr_approval(
                 base_context=ctx,
                 landed_branch=landed_branch,
                 record_pr_merged=record_pr_merged,
+                preserve_hotfix_non_landing=False,
             )
             if terminal_rollup_merge:
                 task.latest_status_message = (
