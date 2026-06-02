@@ -881,13 +881,24 @@ async def test_first_review_approval_rate_computes_correctly():
             context={"pr_merged": False},
             created_at=now - timedelta(hours=1),
         ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            },
+            created_at=now - timedelta(hours=1),
+        ),
     ]
     session = _make_mock_session(tasks=tasks, project=make_project(directions=[]))
 
     result = await compute_pipeline_health_summary(session, project_id)
 
     fra = result["first_review_approval_rate"]
-    # 2 approved out of 3 eligible (create/refactor with pr_merged=True)
+    # 2 approved out of 3 eligible landed tasks.
     assert fra["overall"] == round(2 / 3, 2)
     assert fra["sample_size"] == 3
     assert "create" in fra["by_type"]
@@ -2352,6 +2363,34 @@ def test_scope_baselines_cancelled_counts_as_created_not_merged():
     assert result["summary"]["large"]["created"] == 2
     assert result["summary"]["large"]["merged"] == 1
     assert result["summary"]["large"]["merge_rate"] == 0.5
+
+
+def test_scope_baselines_exclude_non_merge_unblocks_from_merged_count():
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small", "pr_merged": True, "landed_on_integration": True},
+            created_at=now,
+        ),
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={
+                "scope": "small",
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            },
+            created_at=now,
+        ),
+    ]
+    result = _compute_scope_baselines(tasks, 30)
+
+    assert result["summary"]["small"]["created"] == 2
+    assert result["summary"]["small"]["merged"] == 1
 
 
 def test_scope_baselines_lookback_days_preserved_in_response():

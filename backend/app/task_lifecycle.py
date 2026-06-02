@@ -913,7 +913,23 @@ async def _process_post_commit(
                             merge_method=_pick_merge_method(task),
                         )
                         if merge_result.get("merged"):
-                            task.context = {**(task.context or {}), "pr_merged": True}
+                            from app.landed_signal import apply_merged_landed_signal
+
+                            project = (
+                                await session.get(Project, task.project_id)
+                                if task.project_id
+                                else None
+                            )
+                            apply_merged_landed_signal(
+                                task,
+                                project,
+                                base_branch=base_branch,
+                                hotfix_lane=bool(
+                                    (task.first_payload or {}).get("hotfix")
+                                    or (task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                             session.add(task)
                             _t_ctx = task.context or {}
                             # Audit W1: auto_remediation is now a column.
@@ -2096,12 +2112,27 @@ async def _process_post_commit(
                                         skip_locked=False,
                                     )
                                     if orig:
-                                        orig.context = {
-                                            **(orig.context or {}),
-                                            "pr_merged": True,
-                                        }
+                                        from app.landed_signal import (
+                                            apply_merged_landed_signal,
+                                        )
+
                                         _orig_project = await session.get(
                                             Project, orig.project_id
+                                        )
+                                        apply_merged_landed_signal(
+                                            orig,
+                                            _orig_project,
+                                            base_branch=base_branch,
+                                            hotfix_lane=bool(
+                                                (orig.first_payload or {}).get(
+                                                    "hotfix"
+                                                )
+                                                or (orig.context or {}).get("hotfix")
+                                                or review_loop.get("hotfix")
+                                            ),
+                                            non_merge_reason=(
+                                                "merged_pr_non_integration_branch"
+                                            ),
                                         )
                                         _orig_promotion_target = (
                                             _shared_state.get_project_promotion_target(

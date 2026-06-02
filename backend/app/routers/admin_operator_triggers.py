@@ -34,6 +34,7 @@ from app.admin_helpers import (
     _get_user_task_with_role,
 )
 from app import release_qualifier, release_version
+from app.landed_signal import apply_merged_landed_signal
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +269,17 @@ async def trigger_rollup(
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
             task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True, "rollup_pr_url": rollup_pr_url}
+            task.context = {**ctx, "rollup_pr_url": rollup_pr_url}
+            apply_merged_landed_signal(
+                task,
+                _project,
+                base_branch=target_branch,
+                hotfix_lane=bool(
+                    (task.first_payload or {}).get("hotfix")
+                    or (task.context or {}).get("hotfix")
+                ),
+                non_merge_reason="merged_pr_non_integration_branch",
+            )
             task.latest_status_message = f"Rollup PR auto-merged into {target_branch}"
             await delete_branch(gh_token, owner, repo, staging_branch)
         else:
@@ -310,7 +321,16 @@ async def trigger_rollup(
             if spawn_reason_code == SPAWN_REASON_ALREADY_MERGED:
                 # PR was already merged before review could spawn — terminal success.
                 task.status = TaskStatus.COMPLETED
-                task.context = {**(task.context or {}), "pr_merged": True}
+                apply_merged_landed_signal(
+                    task,
+                    _project,
+                    base_branch=target_branch,
+                    hotfix_lane=bool(
+                        (task.first_payload or {}).get("hotfix")
+                        or (task.context or {}).get("hotfix")
+                    ),
+                    non_merge_reason="merged_pr_non_integration_branch",
+                )
                 task.latest_status_message = (
                     f"Rollup PR #{rollup_pr_number} already merged"
                 )

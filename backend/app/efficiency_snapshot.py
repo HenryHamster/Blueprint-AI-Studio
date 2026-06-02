@@ -33,6 +33,7 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
+from app.landed_signal import has_merge_unblock_signal, is_merged_completion
 from app.models import (
     PoolIdleCostLedger,
     PoolVm,
@@ -194,7 +195,7 @@ def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
     merged = 0
     for t in tasks:
         total_cost += get_task_total_vm_cost_usd(t)
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+        if is_merged_completion(t):
             merged += 1
     return total_cost, merged
 
@@ -322,7 +323,7 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
             if pricing:
                 input_rate, output_rate = pricing
                 total_cost += input_tokens * input_rate + output_tokens * output_rate
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+        if is_merged_completion(t):
             merged += 1
     if not merged:
         return None
@@ -583,7 +584,7 @@ def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
             n = loop.get("iteration")
             if isinstance(n, int) and n >= 0:
                 iters.append(n)
-        elif ctx.get("pr_merged"):
+        elif has_merge_unblock_signal(t):
             # Review was skipped (e.g. auto-approved small diff) — counts as 0 iterations.
             # Excluding these tasks inflates the median whenever the pipeline gets more
             # efficient by skipping review, inverting the signal.

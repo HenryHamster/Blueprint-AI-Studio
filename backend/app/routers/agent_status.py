@@ -1956,6 +1956,11 @@ async def update_agent_status(
                     )
                     _gh_pr_state = _pr_data.get("state")
                     _gh_pr_merged = bool(_pr_data.get("merged"))
+                    _gh_pr_base_branch = (
+                        _pr_data.get("base", {}).get("ref")
+                        if isinstance(_pr_data.get("base"), dict)
+                        else None
+                    )
                 except Exception as _gh_exc:
                     # Mirror reaper behavior: assume open on transient GH failure
                     # so a brief outage doesn't strand the task as FAILED-forever.
@@ -1964,6 +1969,7 @@ async def update_agent_status(
                         f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open"
                     )
                     _gh_pr_state = "open"
+                    _gh_pr_base_branch = None
 
                 # Re-acquire FOR UPDATE on the same row for the final state
                 # transition. populate_existing=True forces SQLA to refresh
@@ -2047,7 +2053,26 @@ async def update_agent_status(
                     task.latest_status_message = (
                         f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
                     )
-                    task.context = {**(task.context or {}), "pr_merged": True}
+                    from app.landed_signal import apply_merged_landed_signal
+
+                    project = (
+                        await session.get(Project, task.project_id)
+                        if task.project_id
+                        else None
+                    )
+                    apply_merged_landed_signal(
+                        task,
+                        project,
+                        base_branch=_gh_pr_base_branch
+                        or (task.first_payload or {}).get("base_branch")
+                        or _get_project_integration_branch(project)
+                        or "",
+                        hotfix_lane=bool(
+                            (task.first_payload or {}).get("hotfix")
+                            or (task.context or {}).get("hotfix")
+                        ),
+                        non_merge_reason="merged_pr_non_integration_branch",
+                    )
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(

@@ -1041,3 +1041,5 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
     assert changes.get("merged_pr") == 4242
     await cleanup_db.refresh(task)
     assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is True
+    assert (task.context or {}).get("landed_on_integration") is False

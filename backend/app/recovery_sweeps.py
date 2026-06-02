@@ -697,6 +697,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     else:
                         gh_pr_state = "open"
                         gh_pr_merged = False
+                        gh_pr_base_branch: str | None = None
                         try:
                             from app.routers.agent import get_github_token_for_task
                             from app.github import get_pull_request
@@ -721,6 +722,11 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             )
                             gh_pr_state = pr_data.get("state") or "open"
                             gh_pr_merged = bool(pr_data.get("merged"))
+                            gh_pr_base_branch = (
+                                pr_data.get("base", {}).get("ref")
+                                if isinstance(pr_data.get("base"), dict)
+                                else None
+                            )
                         except Exception as gh_exc:
                             logger.warning(
                                 f"[EVAL TIMEOUT pr_check] Task {str(task.id)[:8]} "
@@ -733,7 +739,30 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             task.vm_instance_id = None
                             task.last_heartbeat = None
                             task.latest_status_message = f"Recovered _pr_state_check_pending: PR #{pr_num} merged out-of-band"
-                            _ctx2["pr_merged"] = True
+                            task.context = _ctx2
+                            from app.landed_signal import apply_merged_landed_signal
+                            from app.models import Project
+
+                            _project = (
+                                await session.get(Project, task.project_id)
+                                if task.project_id
+                                else None
+                            )
+                            apply_merged_landed_signal(
+                                task,
+                                _project,
+                                base_branch=gh_pr_base_branch
+                                or (task.first_payload or {}).get("base_branch")
+                                or _shared_state.get_project_integration_branch(
+                                    _project
+                                )
+                                or "",
+                                hotfix_lane=bool(
+                                    (task.first_payload or {}).get("hotfix")
+                                    or (task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                         elif gh_pr_state == "closed" and not gh_pr_merged:
                             task.status = TaskStatus.FAILED
                             task.vm_instance_id = None

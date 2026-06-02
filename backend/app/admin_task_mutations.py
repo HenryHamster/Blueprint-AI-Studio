@@ -38,6 +38,7 @@ from app.shared_state import (
     get_project_task_branch_namespace,
     resolve_task_branch as _resolve_task_branch,
 )
+from app.landed_signal import apply_merged_landed_signal
 
 logger = logging.getLogger(__name__)
 
@@ -393,7 +394,17 @@ async def _handle_rollup_pr_approval(
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
             task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True}
+            task.context = dict(ctx)
+            apply_merged_landed_signal(
+                task,
+                _project,
+                base_branch=base_branch or "",
+                hotfix_lane=bool(
+                    (task.first_payload or {}).get("hotfix")
+                    or (task.context or {}).get("hotfix")
+                ),
+                non_merge_reason="merged_pr_non_integration_branch",
+            )
             task.latest_status_message = (
                 f"Human-approved merge of rollup PR #{rollup_pr_number}"
             )
@@ -575,7 +586,7 @@ async def _handle_task_pr_approval(
 
     if ctx.get("touched_critical"):
         await _merge_critical_pr(
-            task, ctx, pr_number, branch, session, changes
+            task, ctx, pr_number, branch, base_branch, _project, session, changes
         )
     else:
         await _spawn_review_for_approved_task(
@@ -595,6 +606,8 @@ async def _merge_critical_pr(
     ctx: Dict[str, Any],
     pr_number: int,
     branch: str,
+    base_branch: str,
+    project: Project | None,
     session: AsyncSession,
     changes: Dict[str, Any],
 ) -> None:
@@ -607,7 +620,17 @@ async def _merge_critical_pr(
         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
         if merge_result.get("merged"):
             task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True}
+            task.context = dict(ctx)
+            apply_merged_landed_signal(
+                task,
+                project,
+                base_branch=base_branch or "",
+                hotfix_lane=bool(
+                    (task.first_payload or {}).get("hotfix")
+                    or (task.context or {}).get("hotfix")
+                ),
+                non_merge_reason="merged_pr_non_integration_branch",
+            )
             task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
             await create_pr_comment(
                 gh_token,

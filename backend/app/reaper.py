@@ -1705,6 +1705,7 @@ async def reaper_service():
                         )
                         io_gh_pr_state: str | None = None
                         io_gh_pr_merged: bool = False
+                        io_gh_pr_base_branch: str | None = None
                         if _has_pr_artifact and _pr_num:
                             try:
                                 from app.routers.agent import get_github_token_for_task
@@ -1720,6 +1721,11 @@ async def reaper_service():
                                 )
                                 io_gh_pr_state = _pr_data.get("state")
                                 io_gh_pr_merged = bool(_pr_data.get("merged"))
+                                io_gh_pr_base_branch = (
+                                    _pr_data.get("base", {}).get("ref")
+                                    if isinstance(_pr_data.get("base"), dict)
+                                    else None
+                                )
                             except Exception as _gh_exc:  # noqa: BLE001
                                 # GH API unreachable: fall back to "open" — handing off
                                 # to review pipeline is the safer default.
@@ -1729,6 +1735,7 @@ async def reaper_service():
                                     exc_info=True,
                                 )
                                 io_gh_pr_state = "open"
+                                io_gh_pr_base_branch = None
 
                         # ── RE-ACQUIRE FOR UPDATE FOR MUTATIONS ──────────────────
                         # All external I/O above is done. Re-acquire the FOR UPDATE
@@ -2045,7 +2052,26 @@ async def reaper_service():
                             task.latest_status_message = (
                                 f"Reaped mid-run; PR #{_pr_num} was merged out-of-band"
                             )
-                            task.context = {**(task.context or {}), "pr_merged": True}
+                            from app.landed_signal import apply_merged_landed_signal
+
+                            _project = (
+                                await session.get(Project, task.project_id)
+                                if task.project_id
+                                else None
+                            )
+                            apply_merged_landed_signal(
+                                task,
+                                _project,
+                                base_branch=io_gh_pr_base_branch
+                                or (task.first_payload or {}).get("base_branch")
+                                or _get_project_integration_branch(_project)
+                                or "",
+                                hotfix_lane=bool(
+                                    (task.first_payload or {}).get("hotfix")
+                                    or (task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),

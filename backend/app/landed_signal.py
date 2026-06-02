@@ -21,6 +21,11 @@ integration branch" signal used by analytics.
 
 import logging
 
+from sqlalchemy import and_, cast, func, or_
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql import ColumnElement
+
 from app.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,41 @@ def is_unblocked_completion(task: Task) -> bool:
     return task.status == TaskStatus.COMPLETED and has_merge_unblock_signal(task)
 
 
+def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:
+    """SQL predicate for rows that truly landed on the integration branch.
+
+    Mirrors :func:`has_landed_signal`, including the legacy fallback for rows
+    that predate ``landed_on_integration`` and the explicit opt-out marker for
+    merge-equivalent non-landings.
+    """
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    if dialect_name == "sqlite":
+        landed = func.json_extract(Task.context, f"$.{LANDED_ON_INTEGRATION_KEY}")
+        pr_merged = func.json_extract(Task.context, f"$.{LANDED_SIGNAL_KEY}")
+        non_merge_reason = func.json_extract(
+            Task.context, f"$.{NON_MERGE_UNBLOCK_REASON_KEY}"
+        )
+        return or_(
+            landed == True,  # noqa: E712
+            and_(
+                landed.is_(None),
+                pr_merged == True,  # noqa: E712
+                non_merge_reason.is_(None),
+            ),
+        )
+
+    landed_true = Task.context.op("@>")(cast({LANDED_ON_INTEGRATION_KEY: True}, JSONB))
+    legacy_pr_merged = Task.context.op("@>")(cast({LANDED_SIGNAL_KEY: True}, JSONB))
+    return or_(
+        landed_true,
+        and_(
+            legacy_pr_merged,
+            ~Task.context.has_key(LANDED_ON_INTEGRATION_KEY),  # noqa: W601
+            ~Task.context.has_key(NON_MERGE_UNBLOCK_REASON_KEY),  # noqa: W601
+        ),
+    )
+
+
 def mark_landed_on_integration(task: Task) -> None:
     """Stamp the landed signal for a PR that merged onto the integration branch.
 
@@ -116,6 +156,7 @@ def apply_merged_landed_signal(
     *,
     base_branch: str,
     hotfix_lane: bool,
+    non_merge_reason: str | None = None,
 ) -> bool:
     """Guarded write path for a merged PR.
 
@@ -126,9 +167,9 @@ def apply_merged_landed_signal(
 
     Returns True iff the merged PR landed on the integration branch.
 
-    This is the single guarded write path the CI-merge sites converge on
-    (``orchestrator._apply_ci_merged_landed_signal`` and
-    ``ci_completion`` rollup-original propagation).
+    When *non_merge_reason* is provided, merged PRs that landed somewhere other
+    than the integration branch are still marked as merge-equivalent rollup
+    unblocks via :func:`mark_unblocked_non_merge`.
     """
     from app.branch_resolution import _signal_blocking_project_branch_configuration
     from app.shared_state import (
@@ -159,4 +200,6 @@ def apply_merged_landed_signal(
         )
     if landed_on_integration:
         mark_landed_on_integration(task)
+    elif non_merge_reason:
+        mark_unblocked_non_merge(task, reason=non_merge_reason)
     return landed_on_integration

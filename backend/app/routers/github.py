@@ -410,13 +410,26 @@ async def github_webhook(
                         )
                     task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
                     affected_tasks = []
+                    merged_base_branch = (
+                        data.get("pull_request", {}).get("base", {}).get("ref") or ""
+                    )
                     for art in pr_artifacts:
                         pr_task = task_map.get(art.task_id)
                         if pr_task and not (pr_task.context or {}).get("pr_merged"):
-                            pr_task.context = {
-                                **(pr_task.context or {}),
-                                "pr_merged": True,
-                            }
+                            from app.landed_signal import apply_merged_landed_signal
+
+                            apply_merged_landed_signal(
+                                pr_task,
+                                project,
+                                base_branch=merged_base_branch
+                                or (pr_task.first_payload or {}).get("base_branch")
+                                or "",
+                                hotfix_lane=bool(
+                                    (pr_task.first_payload or {}).get("hotfix")
+                                    or (pr_task.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                             session.add(pr_task)
                             affected_tasks.append(pr_task)
                             logger.info(

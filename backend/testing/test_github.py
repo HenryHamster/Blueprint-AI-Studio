@@ -1486,7 +1486,12 @@ async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, m
 
 
 def _make_pr_merged_payload(
-    owner: str, repo: str, pr_number: int, body: str = ""
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str = "",
+    *,
+    base_branch: str = "main",
 ) -> bytes:
     """Build a minimal pull_request closed+merged webhook payload."""
     return json.dumps(
@@ -1496,6 +1501,7 @@ def _make_pr_merged_payload(
                 "number": pr_number,
                 "merged": True,
                 "body": body,
+                "base": {"ref": base_branch},
             },
             "repository": {
                 "full_name": f"{owner}/{repo}",
@@ -1648,6 +1654,74 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
 
     await db_session.refresh(task)
     assert task.context.get("pr_merged") is True
+    assert task.context.get("landed_on_integration") is True
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_non_integration_branch_sets_explicit_non_merge_marker(
+    client, db_session, mocker
+):
+    """Webhook merge propagation keeps the rollup-unblock bit but marks
+    non-integration merges as explicit non-landings."""
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Staging Merge",
+        user_id="user1",
+        github_owner="stageorg",
+        github_repo="stagerepo",
+        integration_branch="main",
+        promotion_target="release",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Stage-only merge",
+        payloads=[{"type": "create", "prompt": "do it", "base_branch": "staging"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/stageorg/stagerepo/pull/56",
+        )
+    )
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload(
+        "stageorg", "stagerepo", 56, base_branch="staging"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is True
+    assert task.context.get("landed_on_integration") is False
+    assert task.context.get("_non_merge_unblock_reason") == (
+        "merged_pr_non_integration_branch"
+    )
 
 
 @pytest.mark.asyncio

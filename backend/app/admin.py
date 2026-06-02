@@ -70,6 +70,7 @@ from app.routers.admin_operator_triggers import (
     router as _operator_triggers_router,
     _record_failure_result,
 )
+from app.landed_signal import apply_merged_landed_signal
 
 
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
@@ -716,8 +717,25 @@ async def bulk_action_tasks(
                                 gh_token, owner, repo, rollup_pr_number
                             )
                             if merge_result.get("merged"):
+                                _project = await session.get(Project, task.project_id)
+                                base_branch = (
+                                    (task.first_payload or {}).get("base_branch")
+                                    or get_project_integration_branch(_project)
+                                )
                                 task.status = TaskStatus.COMPLETED
-                                task.context = {**ctx, "pr_merged": True}
+                                task.context = dict(ctx)
+                                apply_merged_landed_signal(
+                                    task,
+                                    _project,
+                                    base_branch=base_branch or "",
+                                    hotfix_lane=bool(
+                                        (task.first_payload or {}).get("hotfix")
+                                        or (task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason=(
+                                        "merged_pr_non_integration_branch"
+                                    ),
+                                )
                                 task.latest_status_message = f"Human-approved merge of rollup PR #{rollup_pr_number}"
                                 await create_pr_comment(
                                     gh_token,
@@ -884,7 +902,23 @@ async def bulk_action_tasks(
                                     )
                                     if merge_result.get("merged"):
                                         task.status = TaskStatus.COMPLETED
-                                        task.context = {**ctx, "pr_merged": True}
+                                        task.context = dict(ctx)
+                                        apply_merged_landed_signal(
+                                            task,
+                                            _project,
+                                            base_branch=base_branch or "",
+                                            hotfix_lane=bool(
+                                                (task.first_payload or {}).get(
+                                                    "hotfix"
+                                                )
+                                                or (task.context or {}).get(
+                                                    "hotfix"
+                                                )
+                                            ),
+                                            non_merge_reason=(
+                                                "merged_pr_non_integration_branch"
+                                            ),
+                                        )
                                         task.latest_status_message = (
                                             f"Human-approved merge of PR #{pr_number}"
                                         )
