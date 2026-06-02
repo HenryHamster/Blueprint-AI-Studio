@@ -64,4 +64,27 @@ describe('SystemStatusCard', () => {
     render(<SystemStatusCard digest={digest} loading={false} />);
     expect(screen.getByText(/3 exits/)).toBeInTheDocument();
   });
+
+  it('surfaces the review/fix convergence verdict as its own line when signal exists', () => {
+    const digest = createMockDigest({
+      narrative_summary:
+        'Pipeline is healthy. Review/fix churn is falling, with stale-review-context the dominant blocker on 4 non-converged chains. Two directions advanced.',
+    });
+    render(<SystemStatusCard digest={digest} loading={false} />);
+    const verdict = screen.getByLabelText('Review/fix convergence verdict');
+    expect(verdict).toHaveTextContent(
+      'Review/fix churn is falling, with stale-review-context the dominant blocker on 4 non-converged chains.',
+    );
+    // The verdict sentence is lifted out of the surrounding prose paragraph.
+    expect(screen.getByText(/Pipeline is healthy\. Two directions advanced\./)).toBeInTheDocument();
+  });
+
+  it('suppresses the convergence verdict line on thin windows (no churn sentence)', () => {
+    const digest = createMockDigest({
+      narrative_summary: 'Pipeline is healthy. Two directions advanced.',
+    });
+    render(<SystemStatusCard digest={digest} loading={false} />);
+    expect(screen.queryByLabelText('Review/fix convergence verdict')).not.toBeInTheDocument();
+    expect(screen.getByText('Pipeline is healthy. Two directions advanced.')).toBeInTheDocument();
+  });
 });

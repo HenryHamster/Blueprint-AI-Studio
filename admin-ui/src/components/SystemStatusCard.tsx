@@ -21,12 +21,27 @@ interface SystemStatusCardProps {
   loading: boolean;
 }
 
+// The backend bakes a review/fix convergence verdict into narrative_summary,
+// already gated on churn-signal sufficiency (see
+// digest_metrics.compute_narrative_summary). The sentence always starts with
+// "Review/fix churn is" and runs to the next period. We lift it out of the
+// prose so the headline churn verdict reads as its own line on the status
+// card instead of being buried mid-paragraph. On thin windows the backend
+// emits no such sentence, so nothing extra is surfaced.
+const CONVERGENCE_VERDICT_RE = /Review\/fix churn is[^.]*\./;
+
 export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
   const cycle = digest?.latest_cycle ?? null;
   const memoExits = digest?.memo_pathway_exits ?? 0;
   const memoEverCited = digest?.memo_ever_cited ?? null;
   const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
+
+  const narrative = digest?.narrative_summary ?? '';
+  const convergenceVerdict = narrative.match(CONVERGENCE_VERDICT_RE)?.[0] ?? null;
+  const prose = convergenceVerdict
+    ? narrative.replace(CONVERGENCE_VERDICT_RE, '').replace(/\s{2,}/g, ' ').trim()
+    : narrative;
 
   return (
     <section>
@@ -38,8 +53,16 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
           <p className="text-neutral-500 text-xs">No recent activity</p>
         ) : (
           <>
-            {digest?.narrative_summary && (
-              <p className="text-sm text-neutral-300 leading-relaxed">{digest.narrative_summary}</p>
+            {prose && (
+              <p className="text-sm text-neutral-300 leading-relaxed">{prose}</p>
+            )}
+            {convergenceVerdict && (
+              <p
+                className="text-xs font-medium text-amber-300/90 leading-relaxed mt-1.5"
+                aria-label="Review/fix convergence verdict"
+              >
+                {convergenceVerdict}
+              </p>
             )}
             {cycle && (
               <>
