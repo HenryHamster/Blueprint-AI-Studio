@@ -98,6 +98,165 @@ def _detect_issue_churn(history: list) -> tuple[bool, list[int]]:
     return (non_decreasing or no_net_progress, counts)
 
 
+# ── Early non-convergence escalation (whack-a-mole / drift detection) ─────────
+# The stuck-cycle / standoff / churn detectors all MISS the whack-a-mole shape:
+#   • stuck/standoff need the SAME issue re-raised; whack-a-mole flags different
+#     sibling sites each round, so they never fire.
+#   • churn only fires on NON-DECREASING counts, so a shrinking-but-never-zero
+#     sequence like [3, 2, 2, 1, 1] slips through and grinds all 16 rounds.
+# This detector catches three shapes the others miss and escalates to the
+# operator at iteration K (≈8) instead of grinding to MAX_REVIEW_FIX_ITERATIONS:
+#   (1) PLATEAU: over the last N rounds the actionable (CRITICAL+MAJOR) count is
+#       low-but-nonzero and never reaches 0 (slow whittling that never lands).
+#   (2) VERIFICATION-ONLY DRIFT: M consecutive REQUEST_CHANGES rounds produce no
+#       genuinely-NEW issue description (the reviewer is re-checking, not finding
+#       new defects — convergence has effectively stalled).
+#   (3) ONE-AT-A-TIME DISCLOSURE: the total DISTINCT issue-descriptions seen
+#       across the whole loop greatly exceeds any single round's count (the
+#       reviewer is disclosing the issue-class one site per round).
+EARLY_NONCONVERGENCE_ESCALATE_AT = 8  # K: iteration to escalate on a hit.
+EARLY_NONCONVERGENCE_PLATEAU_WINDOW = 4  # N: rounds inspected for a plateau.
+# A plateau round count above 0 and at/below this is "low-but-nonzero".
+EARLY_NONCONVERGENCE_PLATEAU_MAX_COUNT = 3
+EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS = 3  # M: consecutive no-new-issue rounds.
+# One-at-a-time multiplier: distinct-descriptions-total >= this * max-single-round
+# (with a small absolute floor) signals serial disclosure of one issue-class.
+EARLY_NONCONVERGENCE_DISCLOSURE_RATIO = 3
+EARLY_NONCONVERGENCE_DISCLOSURE_MIN_DISTINCT = 5
+
+
+def _rejection_round_counts(history: list) -> list[int]:
+    """CRITICAL+MAJOR issue count for each REQUEST_CHANGES round, in order."""
+    counts: list[int] = []
+    for entry in history or []:
+        if not isinstance(entry, dict):
+            continue
+        verdict = (entry.get("verdict") or "").upper()
+        # Skip APPROVE rows; count only rejection rounds (REQUEST_CHANGES,
+        # REJECT, or rows that simply carry issues without an explicit verdict).
+        if verdict == "APPROVE":
+            continue
+        counts.append(_critical_major_count(entry))
+    return counts
+
+
+def _distinct_rejection_descriptions(history: list) -> set[str]:
+    """Set of normalized CRITICAL+MAJOR descriptions across all rejection rounds."""
+    distinct: set[str] = set()
+    for entry in history or []:
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("verdict") or "").upper() == "APPROVE":
+            continue
+        for issue in entry.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            if (issue.get("severity") or "").upper() not in ("CRITICAL", "MAJOR"):
+                continue
+            desc = (issue.get("description") or "").strip()
+            if not desc:
+                continue
+            norm = " ".join(_FEEDBACK_TOKEN_RE.findall(desc.lower()))
+            if norm:
+                distinct.add(norm)
+    return distinct
+
+
+def detect_early_nonconvergence(history: list) -> tuple[bool, str]:
+    """Detect the whack-a-mole / drift non-convergence shape the stuck-cycle,
+    standoff, and churn detectors all miss.
+
+    Returns ``(should_escalate, reason)``. The caller decides WHETHER to act on
+    it based on the current iteration (escalate at K). This function only
+    classifies the trajectory shape; it does not read iteration state.
+    """
+    rejection_counts = _rejection_round_counts(history)
+    # Need a few rejection rounds before any trajectory shape is meaningful.
+    if len(rejection_counts) < EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS:
+        return (False, "")
+
+    # (1) PLATEAU: last N rounds all low-but-nonzero (never reaches 0). The
+    # churn detector misses this because the counts are (weakly) decreasing.
+    window = rejection_counts[-EARLY_NONCONVERGENCE_PLATEAU_WINDOW:]
+    if len(window) >= EARLY_NONCONVERGENCE_PLATEAU_WINDOW and all(
+        0 < c <= EARLY_NONCONVERGENCE_PLATEAU_MAX_COUNT for c in window
+    ):
+        return (
+            True,
+            f"plateau: last {len(window)} rounds low-but-nonzero {window} "
+            f"(never reached 0)",
+        )
+
+    # (2) VERIFICATION-ONLY DRIFT: the last M rejection rounds introduce no
+    # genuinely-new issue description (each round's normalized descriptions are
+    # a subset of what earlier rounds already raised). Convergence has stalled —
+    # the reviewer is re-verifying, not finding new defects.
+    rejection_entries = [
+        e
+        for e in (history or [])
+        if isinstance(e, dict) and (e.get("verdict") or "").upper() != "APPROVE"
+    ]
+    if len(rejection_entries) > EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS:
+
+        def _norm_descs(entry: dict) -> set[str]:
+            out: set[str] = set()
+            for issue in entry.get("issues") or []:
+                if not isinstance(issue, dict):
+                    continue
+                if (issue.get("severity") or "").upper() not in ("CRITICAL", "MAJOR"):
+                    continue
+                desc = (issue.get("description") or "").strip()
+                if desc:
+                    norm = " ".join(_FEEDBACK_TOKEN_RE.findall(desc.lower()))
+                    if norm:
+                        out.add(norm)
+            return out
+
+        recent = rejection_entries[-EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS:]
+        earlier = rejection_entries[: -EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS]
+        seen_before: set[str] = set()
+        for e in earlier:
+            seen_before |= _norm_descs(e)
+        no_new_each_round = True
+        for e in recent:
+            descs = _norm_descs(e)
+            # A round with structured issues none of which are new = no progress.
+            if descs and not (descs - seen_before):
+                seen_before |= descs
+                continue
+            if descs:  # at least one genuinely new issue this round
+                no_new_each_round = False
+                break
+            # No structured issues this round — can't confirm drift, bail.
+            no_new_each_round = False
+            break
+        if no_new_each_round:
+            return (
+                True,
+                f"verification-only drift: last "
+                f"{EARLY_NONCONVERGENCE_VERIFY_DRIFT_ROUNDS} rounds raised no "
+                f"genuinely-new issue",
+            )
+
+    # (3) ONE-AT-A-TIME DISCLOSURE: total distinct descriptions across the loop
+    # greatly exceeds any single round's count — the reviewer is disclosing the
+    # issue-class one site per round.
+    distinct_total = len(_distinct_rejection_descriptions(history))
+    max_single_round = max(rejection_counts) if rejection_counts else 0
+    if (
+        distinct_total >= EARLY_NONCONVERGENCE_DISCLOSURE_MIN_DISTINCT
+        and max_single_round > 0
+        and distinct_total >= EARLY_NONCONVERGENCE_DISCLOSURE_RATIO * max_single_round
+    ):
+        return (
+            True,
+            f"one-at-a-time disclosure: {distinct_total} distinct issues across "
+            f"the loop vs max {max_single_round}/round",
+        )
+
+    return (False, "")
+
+
 def _repeating_issue_descriptions(
     history: list, window: int = ISSUE_CHURN_WINDOW, min_occurrences: int = 2
 ) -> list[str]:
@@ -138,6 +297,141 @@ def _format_repeating_issues_section(history: list) -> str:
         "Repeating issues from prior iterations (prioritize breaking the cycle "
         "on these exact issues):\n" + bullets + "\n\n"
     )
+
+
+# ── FIX-ALL-OCCURRENCES directive (whack-a-mole prevention) ───────────────────
+# The dominant waste source in the review→fix loop is "whack-a-mole": the
+# reviewer flags ONE instance of a file-spanning pattern (e.g. a deprecated
+# call, a naive timestamp, an unguarded access), the fix agent migrates exactly
+# that line — pushed there by the narrow-focus guardrails — and the next review
+# finds the next sibling site. Each round costs a full review+fix VM cycle.
+#
+# When the flagged issues look like instances of a SINGLE issue-class, we inject
+# a directive telling the fix agent to grep for and fix EVERY occurrence in this
+# pass. This is "completing the fix", not incidental refactoring, so it is
+# explicitly reconciled with the narrow-focus rules below.
+
+# Minimum count of CRITICAL/MAJOR issues sharing one normalized description stem
+# to treat them as a single file-spanning class.
+FIX_ALL_MIN_SHARED_STEM = 2
+# Description stem length (leading normalized tokens) used to group issues into
+# a class. Short enough to catch "Use X instead of Y in foo" / "...in bar" as
+# one class, long enough not to collapse genuinely-distinct issues.
+FIX_ALL_STEM_TOKENS = 5
+
+# Pattern cues in issue text that explicitly signal a file-spanning class even
+# when only one instance is enumerated (reviewers often say "this is one of
+# several" rather than listing them all).
+_FIX_ALL_PATTERN_CUES = (
+    "one instance of a pattern",
+    "every other call site",
+    "all instances",
+    "other call sites",
+    "elsewhere",
+    "same pattern",
+    "throughout the",
+    "across the",
+    "in several places",
+    "multiple places",
+    "rest of the",
+    "remaining call sites",
+)
+
+_FIX_ALL_OCCURRENCES_DIRECTIVE = (
+    "🔁 FIX ALL OCCURRENCES: the findings above are instances of a SINGLE "
+    "issue-class that spans the repo, not isolated one-off bugs. Before "
+    "./done, grep the repo for EVERY occurrence of this pattern (not just the "
+    "exact file:line cited) and fix them ALL in this pass — a partial "
+    "migration will be re-flagged on the next review and waste an entire "
+    "iteration. Migrating the sibling call sites of THIS flagged class is "
+    "IN SCOPE: it completes the fix, it is not the incidental refactoring the "
+    "narrow-focus guidance warns against. Where this directive and a "
+    "narrow-focus rule conflict, this directive wins FOR SITES OF THE FLAGGED "
+    "CLASS specifically — fully migrate the class, while still leaving "
+    "unrelated cleanups/refactors for follow-up tasks.\n\n"
+)
+
+# Marker substring used to detect, downstream in _spawn_pipeline_task, that the
+# fix-prompt builder already injected the fix-all directive — so the
+# narrow-focus prefixes can append a reconciliation clause instead of silently
+# contradicting it.
+_FIX_ALL_DIRECTIVE_MARKER = "FIX ALL OCCURRENCES"
+
+# Reconciliation clause appended to a narrow-focus prefix when the fix-all
+# directive is also active. Makes the precedence explicit so the fix agent
+# doesn't read "avoid modifying files not referenced by the issues" as a veto
+# on migrating the flagged class's sibling sites.
+_FIX_ALL_NARROW_FOCUS_RECONCILE = (
+    "(Exception: a FIX-ALL-OCCURRENCES directive is also active below. "
+    "Migrating EVERY site of the flagged issue-class is in scope and takes "
+    "precedence over the 'avoid modifying files not referenced by the issues' "
+    "rule for those sites — that is completing the fix, not the incidental "
+    "refactoring this guidance restricts.)\n\n"
+)
+
+
+def _reconcile_narrow_focus_with_fix_all(prefix: str, fix_prompt: str | None) -> str:
+    """Append the fix-all reconciliation clause to ``prefix`` when the fix
+    prompt already carries the fix-all directive. No-op otherwise."""
+    if fix_prompt and _FIX_ALL_DIRECTIVE_MARKER in fix_prompt:
+        return prefix + _FIX_ALL_NARROW_FOCUS_RECONCILE
+    return prefix
+
+
+def _normalized_issue_stem(description: str, stem_tokens: int) -> str:
+    """Leading ``stem_tokens`` normalized tokens of an issue description.
+
+    Tokenizes the same way as the stuck-cycle / repeating-issue helpers
+    (``_FEEDBACK_TOKEN_RE``) so a class like "Use timezone-aware datetime in
+    foo" / "...in bar" collapses to a shared stem regardless of trailing
+    file/symbol differences.
+    """
+    if not description:
+        return ""
+    tokens = _FEEDBACK_TOKEN_RE.findall(description.lower())
+    return " ".join(tokens[:stem_tokens])
+
+
+def detect_fix_all_issue_class(issues: list | None) -> bool:
+    """True when the reviewer's flagged issues look like instances of ONE
+    file-spanning issue-class — the signal to inject the fix-all-occurrences
+    directive into the fix prompt.
+
+    Triggers when EITHER:
+      • ≥ ``FIX_ALL_MIN_SHARED_STEM`` CRITICAL/MAJOR issues share a normalized
+        description stem (the same fix applied at several sites), OR
+      • any issue's description contains a pattern cue ("all instances",
+        "other call sites", "elsewhere", …) explicitly stating the finding is
+        one of several.
+
+    Minor-only sets and a single unrelated issue do NOT trigger — the directive
+    must not turn an isolated nit into a repo-wide grep mandate.
+    """
+    if not issues:
+        return False
+    stem_counts: dict[str, int] = {}
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        if (issue.get("severity") or "").lower() not in ("critical", "major"):
+            continue
+        desc = (issue.get("description") or "").strip()
+        if not desc:
+            continue
+        low = desc.lower()
+        if any(cue in low for cue in _FIX_ALL_PATTERN_CUES):
+            return True
+        stem = _normalized_issue_stem(desc, FIX_ALL_STEM_TOKENS)
+        if stem:
+            stem_counts[stem] = stem_counts.get(stem, 0) + 1
+    return any(c >= FIX_ALL_MIN_SHARED_STEM for c in stem_counts.values())
+
+
+def fix_all_occurrences_directive() -> str:
+    """The directive text injected into the fix prompt when
+    ``detect_fix_all_issue_class`` fires. Exposed as a function so callers don't
+    import the private constant directly."""
+    return _FIX_ALL_OCCURRENCES_DIRECTIVE
 
 
 def compute_drift_signal(
