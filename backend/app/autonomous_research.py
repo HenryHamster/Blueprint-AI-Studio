@@ -46,11 +46,73 @@ from app.playbook_learning import (
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
 
+# Title/text for undirected (cross-cutting) research. Centralised so the spawn
+# site and the dedup guard below can never drift apart.
+CROSS_CUTTING_DIRECTION_TEXT = "Cross-cutting codebase analysis"
+CROSS_CUTTING_RESEARCH_TITLE = f"Research: {CROSS_CUTTING_DIRECTION_TEXT}"
+
 
 def _get_spawn_lock(project_id: str) -> asyncio.Lock:
     if project_id not in _spawn_locks:
         _spawn_locks[project_id] = asyncio.Lock()
     return _spawn_locks[project_id]
+
+
+async def _undirected_research_recently_active(project_id, session) -> bool:
+    """True when a cross-cutting (undirected) research task is already active or
+    was spawned within the cooldown window.
+
+    The undirected spawn fires from two re-triggering paths: the completion-based
+    modulo counter (``research_spawn_count % undirected_research_frequency``,
+    which stays on the trigger until a research COMPLETES) and the
+    ``chosen_directions``-empty fallback (which re-fires every idle cycle when the
+    few active directions are busy). Without a guard these spawn back-to-back
+    near-identical cross-cutting analyses whose findings then dedupe to ~0 tasks
+    (incident 2026-06-02: d551b034 / b8f1eb8c / a473833c — 3 in ~13 min, the
+    middle cancelled, d551b034's 4 actionable findings all deduped to zero).
+
+    Mirrors the strategic-spawn active+cooldown guard: (a) the active-state check
+    blocks piling a second analysis on top of a running one; (b) the cooldown
+    blocks the cancel/complete-then-instantly-respawn loop regardless of the
+    prior task's terminal state. Set ``undirected_research_cooldown_minutes`` <= 0
+    to disable the cooldown leg.
+    """
+    active = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.title == CROSS_CUTTING_RESEARCH_TITLE,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+            )
+        )
+    ).scalar() or 0
+    if active > 0:
+        return True
+    cooldown_minutes = _runtime_config.get("undirected_research_cooldown_minutes", 60)
+    if cooldown_minutes <= 0:
+        return False
+    cutoff = _utcnow() - timedelta(minutes=cooldown_minutes)
+    recent = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.title == CROSS_CUTTING_RESEARCH_TITLE,
+                Task.created_at >= cutoff,
+            )
+        )
+    ).scalar() or 0
+    return recent > 0
 
 
 async def _spawn_research_task(project: Project, session: AsyncSession):
@@ -1041,6 +1103,26 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if is_undirected:
         directions_to_spawn = [None]  # Undirected replaces directed for this cycle
 
+    # Guard the cross-cutting (undirected) spawn against the re-trigger loop.
+    # directions_to_spawn collapses to [None] both from the modulo `is_undirected`
+    # trigger and from the chosen_directions-empty fallback (which fires nearly
+    # every idle cycle when the few active directions are busy). If a cross-cutting
+    # research is already active or was spawned within the cooldown, skip this
+    # cycle entirely rather than pile on a near-identical analysis whose findings
+    # would only dedupe to ~0 tasks. (See _undirected_research_recently_active.)
+    if directions_to_spawn == [None] and await _undirected_research_recently_active(
+        project.id, session
+    ):
+        logger.info(
+            f"[AUTONOMOUS] Skipping cross-cutting research spawn for project "
+            f"{project.id} — an undirected research task is already active or was "
+            f"spawned within the cooldown window."
+        )
+        # Spawn nothing this cycle (rather than pile on a redundant analysis).
+        # Fall through to the normal commit so any pending session state from
+        # this cycle (e.g. an anomaly-adjustment Alert added above) still lands.
+        directions_to_spawn = []
+
     spawned_tasks = []
     for chosen_direction in directions_to_spawn:
         _mode = normalized_recommended_mode(chosen_direction)
@@ -1223,7 +1305,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         if chosen_direction is None:
             if anomalies:
                 research_payload["anomaly_signals"] = anomalies
-            direction_text = "Cross-cutting codebase analysis"
+            direction_text = CROSS_CUTTING_DIRECTION_TEXT
             logger.info(
                 f"[AUTONOMOUS] Spawning UNDIRECTED research cycle (cycle #{research_spawn_count})"
             )

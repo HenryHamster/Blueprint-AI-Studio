@@ -3372,6 +3372,101 @@ async def test_strategic_api_accumulates_direction_ids(db_session, mocker):
         app.dependency_overrides.pop(verify_agent_token, None)
 
 
+async def _retire_one_direction(db_session, mocker, active_ids):
+    """Seed a project with the given active direction ids, retire the first via
+    the strategic API, and return the response JSON."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    existing = [
+        {
+            "id": did,
+            "text": f"Direction {did}",
+            "status": "active",
+            "priority": "medium",
+            "notes": [],
+            "research_history": [],
+        }
+        for did in active_ids
+    ]
+    project = Project(
+        name=f"P-retire-floor-{len(active_ids)}",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=existing,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            r = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "retire_direction",
+                    "task_id": task_id,
+                    "data": {"direction_id": active_ids[0], "rationale": "obsolete"},
+                },
+            )
+        assert r.status_code == 200, r.text
+        return r.json()
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_warns_when_dropping_below_parallelism_floor(
+    db_session, mocker
+):
+    """Retiring down to 2 active directions surfaces a non-blocking parallelism
+    warning (the retire still succeeds)."""
+    body = await _retire_one_direction(db_session, mocker, ["d-a", "d-b", "d-c"])
+    assert body["status"] == "ok"  # retire is not blocked
+    warnings = body.get("warnings") or []
+    assert any(
+        "parallel" in w.lower() and "2 active" in w for w in warnings
+    ), warnings
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_no_warning_when_floor_preserved(db_session, mocker):
+    """Retiring while 3 active directions remain emits no parallelism warning."""
+    body = await _retire_one_direction(
+        db_session, mocker, ["d-a", "d-b", "d-c", "d-d"]
+    )
+    assert body["status"] == "ok"
+    warnings = body.get("warnings") or []
+    assert not any("parallel" in w.lower() for w in warnings), warnings
+
+
 @pytest.mark.asyncio
 async def test_strategic_api_create_direction_rejects_missing_structured_fields(
     db_session, mocker
