@@ -118,6 +118,20 @@ def _patch_github(
     merge_mock = mocker.patch(
         "app.github.merge_pull_request", new=AsyncMock(**merge_kwargs)
     )
+    # Safe defaults for the step-6/7 lookups so the blocked path never makes a
+    # real network call. Tests that exercise conflict / CI-failure override these.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"mergeable_state": "clean", "head": {"sha": "deadbeef"}}
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "pending", "conclusion": None, "details": []}
+        ),
+    )
     return create_mock, merge_mock
 
 
@@ -326,9 +340,9 @@ async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_resolver(
 
 @pytest.mark.asyncio
 async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
-    """A non-merge that is NOT a conflict (e.g. pending required checks —
-    mergeable_state "blocked") stays in the "blocked" path and does NOT spawn
-    a resolution task (a conflict resolver can't fix a checks block)."""
+    """A non-merge that is NOT a conflict and whose CI is still PENDING (not
+    red) stays in the "blocked" path and does NOT spawn any remediation task —
+    a pending build clears itself next cycle; there is nothing to fix yet."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -337,7 +351,20 @@ async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"number": 78, "mergeable_state": "blocked"}),
+        new=AsyncMock(
+            return_value={
+                "number": 78,
+                "mergeable_state": "blocked",
+                "head": {"sha": "abc123"},
+            }
+        ),
+    )
+    # CI still in progress (not red) → not auto-fixable.
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "in_progress", "conclusion": None, "details": []}
+        ),
     )
 
     result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
@@ -347,6 +374,106 @@ async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
     tasks = await _tasks_for(db_session, project.id)
     resolvers = [t for t in tasks if (t.first_payload or {}).get("type") == "create"]
     assert len(resolvers) == 0
+
+
+@pytest.mark.asyncio
+async def test_open_backmerge_pr_ci_red_spawns_ci_fix_task(db_session, mocker):
+    """A back-merge that merges cleanly (no conflict) but whose CI is RED on the
+    merged tree spawns a CI-fix task — the systemic auto-remediation for a
+    semantic merge break the textual conflict resolver can't see."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 91, "html_url": "http://pr/91"},
+        merge_return={"merged": False, "message": "Repository rule violations found"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "number": 91,
+                "mergeable_state": "blocked",  # not "dirty" → not a conflict
+                "head": {"sha": "cafe123"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {"name": "CI / Backend (shard 6)", "status": "completed", "conclusion": "failure"},
+                    {"name": "CI / Backend (shard 1)", "status": "completed", "conclusion": "success"},
+                ],
+            }
+        ),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    assert result["status"] == "ci_failure"
+    tasks = await _tasks_for(db_session, project.id)
+    fixers = [
+        t for t in tasks if (t.context or {}).get("backmerge_ci_failure") is True
+    ]
+    assert len(fixers) == 1, "exactly one CI-fix task should be spawned"
+    fixer = fixers[0]
+    # Inherits the merge-method=merge gate + unified dedup marker.
+    assert fixer.context["backmerge_conflict"] is True
+    assert fixer.context["failed_checks"] == ["CI / Backend (shard 6)"]
+    assert fixer.priority == hb._RESOLUTION_PRIORITY
+    assert (fixer.first_payload or {}).get("base_branch") == "automain"
+    assert "CI / Backend (shard 6)" in (fixer.first_payload or {}).get("prompt", "")
+    # An operator-visible Alert was also raised.
+    alerts = await _alerts_for(db_session, project.id)
+    assert any("blocked by CI" in (a.title or "") for a in alerts)
+
+
+@pytest.mark.asyncio
+async def test_open_backmerge_pr_ci_red_no_duplicate_remediation(db_session, mocker):
+    """A second CI-red back-merge attempt does not spawn a duplicate fix task —
+    the project-wide back-merge-remediation dedup covers conflict + CI-fix."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 92, "html_url": "http://pr/92"},
+        merge_return={"merged": False, "message": "Repository rule violations found"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "number": 92,
+                "mergeable_state": "blocked",
+                "head": {"sha": "beef456"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {"name": "CI / Backend", "status": "completed", "conclusion": "failure"},
+                ],
+            }
+        ),
+    )
+
+    r1 = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+    await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    assert r1["status"] == "ci_failure"
+    tasks = await _tasks_for(db_session, project.id)
+    fixers = [t for t in tasks if (t.context or {}).get("backmerge_ci_failure") is True]
+    assert len(fixers) == 1, "the dedup must prevent a duplicate CI-fix task"
 
 
 @pytest.mark.asyncio
