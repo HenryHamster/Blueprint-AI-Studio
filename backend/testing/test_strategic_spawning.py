@@ -5214,7 +5214,13 @@ async def test_on_main_mirrors_on_automain_without_lts_split(db_session):
     """With no LTS split (integration branch == promotion target), on_main equals
     on_automain and undeployed_directions is empty — there is no 'landed but not
     deployed' state when merges deploy directly."""
-    project = _make_project(vision={"purpose": "test"})  # default branches: main == main
+    # No LTS split: integration branch IS the promotion target. _make_project now
+    # defaults to a split (automain/main), so request matching branches explicitly.
+    project = _make_project(
+        vision={"purpose": "test"},
+        integration_branch="main",
+        promotion_target="main",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
