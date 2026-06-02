@@ -5,7 +5,7 @@ import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, runClaudeCode,
   getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
-  resolveBaseBranch,
+  resolveBaseBranch, resolveTaskBranchNamespace,
 } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import {
@@ -258,7 +258,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     : '';
   const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
-  const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
+  const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions(taskTypeKey);
