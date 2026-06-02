@@ -35,6 +35,10 @@ from sqlmodel import select
 import app.shared_state as _shared_state
 from app import services
 from app.branch_resolution import classify_rollup_merge_outcome
+from app.landed_signal import (
+    apply_merged_landed_signal,
+    mark_landed_on_integration,
+)
 from app.models import (
     Task,
     TaskStatus,
@@ -766,7 +770,24 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                     "awaiting downstream landing"
                                 )
                             if record_pr_merged:
-                                _ctx2["pr_merged"] = True
+                                # Route through the guarded landed-signal writer
+                                # so analytics get the integration-vs-promotion
+                                # distinction (mirrors agent_status.py /
+                                # reaper.py). Stage _ctx2 onto the task first so
+                                # the helper layers on top, then read it back —
+                                # _ctx2 is committed unconditionally below.
+                                task.context = _ctx2
+                                apply_merged_landed_signal(
+                                    task,
+                                    _proj,
+                                    base_branch=landed_branch,
+                                    hotfix_lane=bool(
+                                        (task.first_payload or {}).get("hotfix")
+                                        or _ctx2.get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
+                                _ctx2 = dict(task.context or {})
                         elif gh_pr_state == "closed" and not gh_pr_merged:
                             task.status = TaskStatus.FAILED
                             task.vm_instance_id = None
@@ -931,7 +952,14 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                     f"Strand recovery: conflict/CI-fix PR "
                                     f"#{_strand_pr} merged out-of-band"
                                 )
-                                task.context = {**ctx, "pr_merged": True}
+                                # The APPROVED original's work landed on the
+                                # integration branch via its conflict/CI-fix
+                                # child's merged PR, so stamp the canonical
+                                # integration-landing signal (preserves the
+                                # prior bare ``pr_merged=True`` analytics
+                                # meaning while routing through the helper).
+                                task.context = dict(ctx)
+                                mark_landed_on_integration(task)
                                 flag_modified(task, "context")
                                 session.add(task)
                                 await session.commit()

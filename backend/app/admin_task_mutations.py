@@ -449,13 +449,21 @@ async def _handle_rollup_pr_approval(
                 if terminal_rollup_merge
                 else TaskStatus.EVALUATING
             )
+            # The hotfix lane is intentionally allowed to merge to the promotion
+            # target (see _promotion_target_merge_allowed). When it does, the
+            # work never landed on the integration branch, so record_pr_merged
+            # is False — but it must still unblock the rollup as a
+            # merge-equivalent non-landing. Preserve that hotfix unblock here so
+            # the hotfix path stamps pr_merged=True / landed_on_integration=False
+            # while the non-hotfix promotion-target landing stays unqualified
+            # (pr_merged unset).
             task.context = _merge_context_with_hotfix_non_landing(
                 task,
                 _project,
                 base_context=ctx,
                 landed_branch=landed_branch,
                 record_pr_merged=record_pr_merged,
-                preserve_hotfix_non_landing=False,
+                preserve_hotfix_non_landing=True,
             )
             if terminal_rollup_merge:
                 task.latest_status_message = (

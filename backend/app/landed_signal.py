@@ -106,8 +106,10 @@ def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:
         landed_true,
         and_(
             legacy_pr_merged,
-            ~Task.context.has_key(LANDED_ON_INTEGRATION_KEY),  # noqa: W601
-            ~Task.context.has_key(NON_MERGE_UNBLOCK_REASON_KEY),  # noqa: W601
+            # ``has_key`` here is SQLAlchemy's JSONB ``?`` operator, not the
+            # removed dict method.
+            ~Task.context.has_key(LANDED_ON_INTEGRATION_KEY),
+            ~Task.context.has_key(NON_MERGE_UNBLOCK_REASON_KEY),
         ),
     )
 
