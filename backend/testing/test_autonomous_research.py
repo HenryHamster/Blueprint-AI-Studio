@@ -402,6 +402,68 @@ async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mock
     assert len(result.scalars().all()) == 0
 
 
+@pytest.mark.asyncio
+async def test_all_paused_skip_log_distinguishes_cooling_from_wedge(db_session, mocker):
+    """The all-paused skip log must not read as a starvation wedge when a non-paused
+    direction is merely cooling down. When an eligible-but-cooling direction exists,
+    the log reports the temporarily-filtered count distinctly from a true all-paused
+    state (so an operator / the system's own diagnosis doesn't chase a phantom wedge)."""
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    info_spy = mocker.patch("app.autonomous_research.logger.info")
+    project = Project(
+        name="Paused + Cooling",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {
+                **_active_direction("d-paused03", "Paused residual"),
+                "recommended_mode": "pause",
+            },
+            {
+                # Non-paused but freshly researched → filtered out by the cooldown in
+                # _process_direction_lifecycle, so it never reaches active_directions.
+                **_active_direction("d-cooling01", "Recently researched, cooling"),
+                "recommended_mode": "fundamentals",
+                "last_researched_at": (
+                    datetime.utcnow() - timedelta(minutes=2)
+                ).isoformat(),
+            },
+        ],
+        vision={"purpose": "test"},  # no stale strategic task → force_strategic False
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    # Reconstruct every logged message (handles both %-style and pre-formatted calls).
+    rendered = []
+    for c in info_spy.call_args_list:
+        a = c.args
+        try:
+            rendered.append(a[0] % a[1:] if len(a) > 1 else str(a[0]))
+        except Exception:  # defensive: never let log-render break the test
+            rendered.append(str(a[0]))
+    msg = "\n".join(rendered)
+
+    assert "skipping tactical research" in msg
+    assert "NOT a wedge" in msg, (
+        f"a cooling non-paused direction must be reported as not-a-wedge; got:\n{msg}"
+    )
+    assert "d-cooling01" in msg, "the temporarily-filtered direction id should be named"
+    # And nothing was spawned — we genuinely hit the skip path.
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. _spawn_research_task — Active Research Guard
 # ─────────────────────────────────────────────────────────────────────────────

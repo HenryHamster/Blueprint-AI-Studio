@@ -362,6 +362,7 @@ async def open_backmerge_pr(
     #    land and wasn't flagged a conflict, fetch the PR and treat
     #    ``mergeable_state == "dirty"`` as a conflict too.
     is_conflict = bool(merge_result.get("conflict"))
+    pr_detail: dict[str, Any] | None = None
     if not is_conflict:
         try:
             pr_detail = await github.get_pull_request(
@@ -396,9 +397,44 @@ async def open_backmerge_pr(
         )
         return {"status": "conflict", "pr_url": pr_url}
 
-    # 7. Any other non-merge (405 — checks/reviews block).  _raise_blocked_alert
-    #    escalates: always for a one-shot caller, once-deduped for the periodic
-    #    reconciler — so a persistently stuck back-merge surfaces without a storm.
+    # 7a. Non-conflict block where CI is RED on the merged tree. A back-merge can
+    #    merge TEXTUALLY clean (no conflict) yet fail CI — a *semantic* merge
+    #    break: e.g. `main` references a symbol the integration branch's refactor
+    #    moved/renamed/removed, so the 3-way text merge succeeds but the result
+    #    doesn't import/pass. The textual conflict resolver (step 6) never sees
+    #    this. It IS auto-remediable, so spawn a CI-fix task that re-does the
+    #    merge on a branch, makes CI green, and PRs back to the integration
+    #    branch — mirroring the conflict path so no human is needed.
+    failed_checks = await _backmerge_failed_checks(
+        token, owner, repo, pr_number, project_id, pr_detail=pr_detail
+    )
+    if failed_checks is not None:
+        logger.warning(
+            "[BACKMERGE] back-merge PR #%s for project %s is mergeable but CI is "
+            "RED (%s) — spawning a CI-fix task",
+            pr_number,
+            project_id,
+            ", ".join(failed_checks[:5]) or "unknown checks",
+        )
+        await _handle_ci_failure(
+            session,
+            project_id,
+            pr_number,
+            pr_url,
+            hotfix_task_id_str,
+            trigger_desc,
+            failed_checks=failed_checks,
+            project=project,
+            message=str(msg),
+            periodic=periodic,
+        )
+        return {"status": "ci_failure", "pr_url": pr_url}
+
+    # 7b. Any other non-merge — checks still PENDING, or a reviews-only gate, or
+    #    an unknown block. NOT auto-fixable (no failure to fix), so escalate:
+    #    _raise_blocked_alert always alerts a one-shot caller, once-deduped for
+    #    the periodic reconciler — a persistently stuck back-merge surfaces
+    #    without a storm, and a pending build clears itself next cycle.
     logger.warning(
         "[BACKMERGE] back-merge PR #%s for project %s did not merge: %s",
         pr_number,
@@ -738,6 +774,282 @@ async def _spawn_resolution_task(
         _RESOLUTION_PRIORITY,
         _RESOLUTION_TASK_TYPE,
         pr_number,
+    )
+    return task
+
+
+async def _backmerge_failed_checks(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: uuid.UUID,
+    *,
+    pr_detail: dict[str, Any] | None = None,
+) -> list[str] | None:
+    """Return the failing check names when the back-merge PR's CI is RED, else None.
+
+    ``None`` means "not a fixable CI failure" — a green/pending build, a
+    no-checks repo, a reviews-only block, or ANY lookup error. The error case is
+    deliberately fail-SAFE: a transient GitHub hiccup must never spawn a CI-fix
+    task on a back-merge that is merely waiting on a pending build (or healthy).
+    A non-``None`` list means a completed build with at least one failed check;
+    the names are surfaced in the fix task's prompt.
+    """
+    from app.ci_resolution import _CI_RED, _classify_check_runs
+
+    head_sha = ((pr_detail or {}).get("head") or {}).get("sha")
+    if not head_sha:
+        try:
+            fresh = await github.get_pull_request(
+                token, owner, repo, pr_number, project_id=str(project_id)
+            )
+            head_sha = ((fresh or {}).get("head") or {}).get("sha")
+        except Exception as exc:  # noqa: BLE001 — fail-safe to "not a CI failure"
+            logger.debug(
+                "[BACKMERGE] could not resolve head SHA for PR #%s: %s", pr_number, exc
+            )
+            return None
+    if not head_sha:
+        return None
+    try:
+        checks = await github.get_check_runs_cached(
+            token, owner, repo, head_sha, project_id=str(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-safe to "not a CI failure"
+        logger.debug(
+            "[BACKMERGE] could not read check-runs for PR #%s: %s", pr_number, exc
+        )
+        return None
+    if _classify_check_runs(checks) != _CI_RED:
+        return None
+    return [
+        d.get("name") or "?"
+        for d in (checks.get("details") or [])
+        if (d.get("conclusion") or "")
+        in ("failure", "cancelled", "timed_out", "action_required")
+    ]
+
+
+async def _handle_ci_failure(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    pr_number: int,
+    pr_url: str,
+    hotfix_task_id: str | None,
+    trigger_desc: str,
+    *,
+    failed_checks: list[str],
+    message: str,
+    periodic: bool,
+    project: Project | None = None,
+) -> None:
+    """Raise a CI-blocked Alert and (if no back-merge remediation is open) spawn a CI-fix task.
+
+    Mirrors :func:`_handle_conflict` exactly — same advisory-lock serialization
+    and the SAME project-wide dedup (:func:`_resolution_task_already_open`),
+    which works because the CI-fix task carries ``backmerge_conflict=True`` too.
+    That unifies the guard: a conflict-resolution task already in flight will
+    also do the full ``git merge origin/main`` and surface this CI failure, so
+    we never stack a second remediation; and once a CI-fix task is open the
+    conflict path dedups against it as well.
+    """
+    try:
+        lock_acquired = (
+            await session.execute(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"blueprint:backmerge_ci_fix:{project_id}"},
+            )
+        ).scalar()
+    except Exception as _lock_err:  # noqa: BLE001 — non-PG backend: fall through to dedup
+        lock_acquired = True
+        logger.debug(
+            "[BACKMERGE] advisory lock unavailable (%s) — using read-committed dedup",
+            _lock_err,
+        )
+    if not lock_acquired:
+        logger.info(
+            "[BACKMERGE] CI-fix advisory lock not acquired for project %s — "
+            "concurrent caller is mid-spawn; returning without spawning",
+            project_id,
+        )
+        return
+
+    already_open = await _resolution_task_already_open(session, project_id)
+    if periodic and already_open:
+        logger.info(
+            "[BACKMERGE] back-merge CI failure for project %s — a remediation "
+            "task is already open; periodic reconciler stays quiet",
+            project_id,
+        )
+        return
+
+    integration_branch, promotion_target = _lts_branch_names(project)
+    checks_str = ", ".join(failed_checks[:5]) or "required checks"
+    trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=f"Back-merge blocked by CI: {promotion_target} -> {integration_branch}",
+        message=(
+            f"The automated {promotion_target} -> {integration_branch} back-merge "
+            f"(PR #{pr_number}{trigger_clause}) merges cleanly but CI is red on the "
+            f"merged result ({checks_str}) — a semantic merge break. A CI-fix task "
+            f"has been spawned. Until {integration_branch} absorbs {promotion_target}, "
+            f"the next {integration_branch} -> {promotion_target} promotion will conflict."
+        ),
+    )
+    session.add(alert)
+    await session.flush()
+
+    spawned_task: Task | None = None
+    if already_open:
+        logger.info(
+            "[BACKMERGE] a back-merge remediation task is already open for "
+            "project %s — not spawning a duplicate CI-fix task",
+            project_id,
+        )
+    else:
+        spawned_task = await _spawn_ci_fix_task(
+            session,
+            project_id,
+            pr_number,
+            pr_url,
+            hotfix_task_id,
+            trigger_desc,
+            failed_checks=failed_checks,
+            project=project,
+        )
+
+    await _broadcast_alert(project_id, alert)
+    if spawned_task is not None:
+        await broadcast_to_project(
+            str(project_id),
+            "task_updated",
+            {"task_id": str(spawned_task.id), "status": TaskStatus.QUEUED},
+        )
+
+
+async def _spawn_ci_fix_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    pr_number: int,
+    pr_url: str,
+    hotfix_task_id: str | None,
+    trigger_desc: str,
+    *,
+    failed_checks: list[str],
+    project: Project | None = None,
+) -> Task:
+    """Create + queue a high-priority task to fix a CI-red (but clean-merging) back-merge.
+
+    Same task type / priority / branch as :func:`_spawn_resolution_task`, and it
+    also sets ``context["backmerge_conflict"] = True`` so it inherits the
+    merge-method=merge gate (the fix PR must merge, not squash, so ``main`` stays
+    a parent of ``automain``) and the unified dedup. ``backmerge_ci_failure`` and
+    the failing-check list are recorded for traceability.
+    """
+    integration_branch, promotion_target = _lts_branch_names(project)
+    trigger_clause = f" ({trigger_desc})" if trigger_desc else ""
+    checks_str = ", ".join(failed_checks) or "required checks"
+    prompt = (
+        f"The automated `{promotion_target} -> {integration_branch}` back-merge PR #{pr_number} "
+        f"({pr_url or 'no URL'}) MERGES CLEANLY (no conflict markers) but FAILS CI on the "
+        f"merged result, so the orchestrator cannot land it and `{integration_branch}` will "
+        f"not absorb `{promotion_target}`{trigger_clause}.\n\n"
+        f"Failing checks: {checks_str}.\n\n"
+        f"This is almost always a SEMANTIC merge break: the 3-way text merge succeeded, but "
+        f"`{promotion_target}` added or changed code that references a symbol `{integration_branch}` "
+        f"moved, renamed, split into a sub-module, or deleted in a refactor — so the merged "
+        f"tree imports/builds/tests differently than either side alone. There are NO conflicts "
+        f"to resolve; the fix is to make the merged code consistent again.\n\n"
+        f"## What to do\n"
+        f"1. From a fresh branch off `{integration_branch}`, run `git merge origin/{promotion_target}` "
+        f"(it merges cleanly — do not manufacture conflicts).\n"
+        f"2. Reproduce the failure that the failing check covers (e.g. the backend test suite "
+        f"for a `CI / Backend` shard) and read the ACTUAL error.\n"
+        f"3. Fix the root cause on the merged tree: find where `{integration_branch}`'s refactor "
+        f"moved/renamed the symbol that `{promotion_target}`'s code now references, and update the "
+        f"merged-in code to match the new structure (fix the import, call the relocated "
+        f"function, adjust to a changed signature). Prefer making the code robust (e.g. a "
+        f"local import) over reverting either side.\n"
+        f"4. Re-run until the failing check is green, push, and open a PR back to "
+        f"`{integration_branch}` so the orchestrator can land it.\n\n"
+        f"## Guardrails\n"
+        f"- This is a normal {integration_branch}-targeted task, NOT a hotfix.\n"
+        f"- Do NOT delete or skip the failing tests to go green — they are catching a real "
+        f"break in the merged result. Fix the code.\n"
+        f"- Preserve BOTH intents: do not discard `{promotion_target}`'s change or "
+        f"`{integration_branch}`'s refactor; only reconcile where they interact.\n"
+        f"- If a check is genuinely failing for an infra/flaky reason (not a defect on the "
+        f"merged tree), say so in the PR body rather than masking it.\n"
+        f"- In the PR body, name each failing check and the merged-tree fix you applied."
+    )
+
+    payload: dict[str, Any] = {
+        "type": _RESOLUTION_TASK_TYPE,
+        "prompt": prompt,
+        "base_branch": integration_branch,
+    }
+    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
+        _RESOLUTION_TASK_TYPE
+    )
+    if type_model:
+        payload["model"] = type_model
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
+        _RESOLUTION_TASK_TYPE
+    )
+    if type_effort:
+        payload["effort"] = type_effort
+    payload = validate_internal_payload(payload, "hotfix_backmerge:ci_fix_task")
+
+    task = Task(
+        project_id=project_id,
+        title=f"Fix back-merge CI failure: {promotion_target} -> {integration_branch}",
+        description=(
+            f"The automated {promotion_target} -> {integration_branch} back-merge PR #{pr_number} "
+            f"merges cleanly but CI is red on the merged result ({checks_str}); fix it on "
+            f"{integration_branch} so the next promotion does not conflict."
+        ),
+        priority=_RESOLUTION_PRIORITY,
+        payloads=[payload],
+        context={
+            # backmerge_conflict=True gives the merge-method=merge gate + unified
+            # dedup; backmerge_ci_failure is the traceability/flavor marker.
+            "backmerge_conflict": True,
+            "backmerge_ci_failure": True,
+            "failed_checks": failed_checks,
+            "hotfix_task_id": hotfix_task_id,
+            "backmerge_pr_number": pr_number,
+            "backmerge_pr_url": pr_url,
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "BACKMERGE_CI_FAILURE",
+                "priority": _RESOLUTION_PRIORITY,
+                "backmerge_pr_number": pr_number,
+                "failed_checks": failed_checks,
+                "hotfix_task_id": hotfix_task_id,
+            },
+        )
+    )
+    logger.warning(
+        "[BACKMERGE] spawned CI-fix task %s (priority=%d, type=%s) for back-merge "
+        "PR #%s — failing: %s",
+        task.id,
+        _RESOLUTION_PRIORITY,
+        _RESOLUTION_TASK_TYPE,
+        pr_number,
+        checks_str,
     )
     return task
 

@@ -656,9 +656,36 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         # counter never advances → directions never re-evaluated → permanent
         # starvation deadlock. Mirrors the `not active_directions and not
         # force_strategic` guard above so the backstop reaches the paused case too.
-        logger.info(
-            "[AUTONOMOUS] skipping tactical research: all active directions recommended_mode=pause"
-        )
+        #
+        # Log clarity: `active_directions` here is the post-lifecycle list, which
+        # has ALREADY excluded directions filtered by cooldown / in-flight work /
+        # hold. So "all of these are paused" does NOT mean the project is wedged —
+        # a non-paused direction that is merely cooling down (e.g. just had a
+        # productive research cycle) is invisible to this check. Distinguish the
+        # two so an operator (or this system's own diagnosis) doesn't read a
+        # normal cooldown gap as a starvation wedge.
+        _eligible_ids = {d.get("id") for d in active_directions}
+        _filtered_non_paused = [
+            d
+            for d in (project.directions or [])
+            if d.get("status") == "active"
+            and not is_pause_mode(d)
+            and d.get("id") not in _eligible_ids
+        ]
+        if _filtered_non_paused:
+            logger.info(
+                "[AUTONOMOUS] skipping tactical research: the %d active direction(s) "
+                "eligible this cycle are all recommended_mode=pause, but %d non-paused "
+                "direction(s) are temporarily filtered (cooldown / in-flight / hold) — "
+                "NOT a wedge, they resume when their cooldown elapses: %s",
+                len(active_directions),
+                len(_filtered_non_paused),
+                ", ".join(str(d.get("id")) for d in _filtered_non_paused[:5]),
+            )
+        else:
+            logger.info(
+                "[AUTONOMOUS] skipping tactical research: all active directions recommended_mode=pause"
+            )
         return
 
     # When all active directions are saturated, skip tactical research — a strategic
