@@ -125,6 +125,35 @@ async def vm_heartbeat(
         from app.compute import record_vm_runtime_fingerprint
 
         record_vm_runtime_fingerprint(req.vm_instance_id, req.agent_runtime_fingerprint)
+
+    # Warm-pool readiness signal (efficiency direction d-5fd69fe1). A
+    # maintainer-booted pool member sits in PROVISIONING until something marks it
+    # IDLE; the agent's EXISTING heartbeat IS that ready signal. Promote the
+    # heartbeat's own VM (the token-verified id) PROVISIONING -> IDLE so
+    # try_pool_dispatch can lease it. GATED on is_warm_pool_enabled() FIRST so
+    # when the pool is dark (the default) this path acquires NO DB session and
+    # issues NO query — preserving today's zero-DB heartbeat for the live
+    # chain-continuity / backlog-reuse VMs that also hit this endpoint at
+    # 600/min/VM. Best-effort: a DB hiccup must never fail the liveness ping, so
+    # any error is swallowed (the next heartbeat retries). Idempotent: after the
+    # first beat the member is IDLE so the conditional UPDATE matches 0 rows.
+    from app.warm_pool import is_warm_pool_enabled
+
+    if is_warm_pool_enabled():
+        from app.database import AsyncSessionLocal
+        from app.warm_pool import promote_pool_vm_to_idle
+
+        try:
+            async with AsyncSessionLocal() as session:
+                await promote_pool_vm_to_idle(session, req.vm_instance_id)
+                await session.commit()
+        except Exception:  # noqa: BLE001 — liveness must never 500 on a DB hiccup
+            logger.warning(
+                "[WARM-POOL] heartbeat IDLE-promotion failed for vm %s",
+                req.vm_instance_id,
+                exc_info=True,
+            )
+
     return Response(status_code=204)
 
 

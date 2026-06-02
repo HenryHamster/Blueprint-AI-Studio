@@ -23,7 +23,7 @@ import uuid
 from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import PoolVm, PoolVmState, Task
@@ -397,6 +397,43 @@ async def lease_idle_pool_vm(
         member.lease_expires_at,
     )
     return member
+
+
+async def promote_pool_vm_to_idle(session, vm_instance_id: str) -> bool:
+    """Atomically flip a PROVISIONING member to IDLE on its first ready signal.
+
+    The agent's EXISTING POST /api/agent/vm-heartbeat is the readiness signal: a
+    booted pool VM polling /next-role fires this heartbeat, and the handler calls
+    here to make the member leasable. This is an atomic, conditional Core UPDATE
+    — NOT a read-then-write — that flips ONLY a member currently in PROVISIONING::
+
+        UPDATE poolvm SET state='IDLE', idle_since=<now>
+        WHERE vm_instance_id=:id AND state='PROVISIONING'
+
+    The ``state == PROVISIONING`` predicate is the WHOLE correctness guard:
+      - a concurrent promotion can never double-apply (the loser matches 0 rows);
+      - a LEASED (mid-task) or RETIRING (mid-teardown) member is never flipped
+        back to leasable — only a PROVISIONING member is touched;
+      - repeated heartbeats are idempotent: once the member is IDLE the UPDATE
+        matches 0 rows, so ``idle_since`` is never spuriously reset.
+
+    Only ``state`` and ``idle_since`` are set; ``leased_task_id`` /
+    ``lease_expires_at`` are deliberately NOT cleared here (those lease-binding
+    semantics belong to the release path, :func:`mark_pool_vm_idle`). Unlike
+    ``mark_pool_vm_idle`` this is conditional, so it is safe to call on the shared
+    heartbeat path: a chain/backlog VM (no PoolVm row) or an already-IDLE/LEASED/
+    RETIRING member is a no-op. Returns True iff a PROVISIONING member was flipped.
+    The caller owns the transaction (commit).
+    """
+    result = await session.execute(
+        update(PoolVm)
+        .where(
+            PoolVm.vm_instance_id == vm_instance_id,
+            PoolVm.state == PoolVmState.PROVISIONING,
+        )
+        .values(state=PoolVmState.IDLE, idle_since=_utcnow())
+    )
+    return bool(result.rowcount)
 
 
 async def mark_pool_vm_idle(session, vm_instance_id: str) -> Optional[PoolVm]:
