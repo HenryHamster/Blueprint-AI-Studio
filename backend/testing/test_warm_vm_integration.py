@@ -977,7 +977,17 @@ async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
         assert cost["settled_idle_cost_usd"] > 0.0
         # Pool size now zero (the only member was reaped) yet spend is still counted.
         assert cost["pool_size"] == 0
-        assert cost["total_idle_cost_usd"] >= banked_at_lease
+        # ``total_idle_cost_usd`` is rounded to 6 dp by ``compute_pool_idle_cost``,
+        # while ``banked_at_lease`` is the raw, unrounded ``idle_cost_banked``. When
+        # the banked value's 7th decimal rounds *down* (e.g. 0.0111674 -> 0.011167)
+        # the rounded metric lands a hair below the raw value, so a bare ``>=``
+        # against the unrounded number is a timing-sensitive flake (the banked cost
+        # tracks elapsed idle seconds, which shifts with shard load). Compare against
+        # the banked value rounded to the metric's own precision: this still asserts
+        # the carry-forward preserved the banked spend (any genuinely lost spend
+        # would drop the rounded total below the rounded banked value) without
+        # tripping on sub-microdollar rounding.
+        assert cost["total_idle_cost_usd"] >= round(banked_at_lease, 6)
 
 
 @pytest.mark.asyncio
