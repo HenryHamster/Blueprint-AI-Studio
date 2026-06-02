@@ -2101,8 +2101,10 @@ async def select_llm_runtime_for_task(
     return None
 
 
-async def release_max_plan_account(account_id: str):
-    """Decrement active tasks for an account when a task finishes."""
+async def release_max_plan_account(
+    account_id: str, *, revert_daily_task_count: bool = False
+):
+    """Decrement active tasks for an account when a task finishes or aborts."""
     async with _max_plan_pool_lock:
         account = _account_by_id.get(account_id)
         if account:
@@ -2111,6 +2113,11 @@ async def release_max_plan_account(account_id: str):
                     f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}"
                 )
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
+            if revert_daily_task_count:
+                account["daily_task_count"] = max(
+                    0, int(account.get("daily_task_count") or 0) - 1
+                )
+                _pending_cap_persists.add(account_id)
 
 
 async def reserve_max_plan_account(account_id: str) -> bool:

@@ -1262,7 +1262,9 @@ async def orchestrator_worker():
                             )
                             acct_id = get_task_llm_account_id(fresh_t)
                             if acct_id:
-                                await release_max_plan_account(acct_id)
+                                await release_max_plan_account(
+                                    acct_id, revert_daily_task_count=True
+                                )
                             session.add(fresh_t)
                             await _maybe_create_failure_alert(
                                 fresh_t,
@@ -1280,7 +1282,9 @@ async def orchestrator_worker():
                         # Release Max Plan account slot before requeueing
                         acct_id = get_task_llm_account_id(fresh_t)
                         if acct_id:
-                            await release_max_plan_account(acct_id)
+                            await release_max_plan_account(
+                                acct_id, revert_daily_task_count=True
+                            )
                         # Cancel any lingering coroutine reference
                         zombie = _provision_coroutines.pop(str(t.id), None)
                         if zombie and not zombie.done():
@@ -2677,7 +2681,8 @@ async def orchestrator_worker():
                                 # loop-local account_id (only assigned later, below).
                                 if runtime_selection and runtime_selection.account:
                                     await release_max_plan_account(
-                                        runtime_selection.account["id"]
+                                        runtime_selection.account["id"],
+                                        revert_daily_task_count=True,
                                     )
                                 await session.rollback()
                                 # session.rollback() expires every session-bound
@@ -2741,7 +2746,8 @@ async def orchestrator_worker():
                         # not the loop-local account_id (assigned later, below).
                         if runtime_selection and runtime_selection.account:
                             await release_max_plan_account(
-                                runtime_selection.account["id"]
+                                runtime_selection.account["id"],
+                                revert_daily_task_count=True,
                             )
                         await session.rollback()
                         continue
@@ -3079,7 +3085,9 @@ async def orchestrator_worker():
                         traceback.print_exc()
                         # Release the pre-incremented slot on commit failure
                         if account_id:
-                            await release_max_plan_account(account_id)
+                            await release_max_plan_account(
+                                account_id, revert_daily_task_count=True
+                            )
                         task.context = clear_task_llm_runtime_context(task.context)
                         await session.rollback()
                         continue
@@ -3254,7 +3262,10 @@ async def orchestrator_worker():
                             # Always release the Max Plan account slot on failure, even if an
                             # exception escapes the try/except above (e.g. from record_task_result)
                             if not success and acct_id_for_release:
-                                await release_max_plan_account(acct_id_for_release)
+                                await release_max_plan_account(
+                                    acct_id_for_release,
+                                    revert_daily_task_count=True,
+                                )
                         if not success:
                             provision_err = get_provision_error(vm_id)
                             logger.error(

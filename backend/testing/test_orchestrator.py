@@ -3807,6 +3807,10 @@ class TestWarmVMSkipProvision:
         # account carried on the resolved selection, not a loop-local variable.
         assert release_spy.await_count == 1
         assert release_spy.await_args.args[0] == "acct-pool-1"
+        # Abandon path: the daily-usage increment pre-reserved during selection
+        # must also be reverted, not just the concurrency slot — otherwise the
+        # daily counter durably over-counts and trips the cap prematurely.
+        assert release_spy.await_args.kwargs.get("revert_daily_task_count") is True
 
         async with orch_warm_db() as verify:
             row = (
@@ -3877,6 +3881,9 @@ class TestWarmVMSkipProvision:
         assert not prov_mock.called
         assert release_spy.await_count == 1
         assert release_spy.await_args.args[0] == "acct-pool-1"
+        # Abandon path: revert the pre-reserved daily-usage increment too, so a
+        # held-off dispatch leaves daily_task_count exactly where it was.
+        assert release_spy.await_args.kwargs.get("revert_daily_task_count") is True
 
         async with orch_warm_db() as verify:
             row = (

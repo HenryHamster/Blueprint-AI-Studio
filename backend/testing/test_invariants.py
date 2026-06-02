@@ -777,6 +777,57 @@ class TestNoRawBindDialectIdiom:
             "Offenders:\n" + "\n".join(offenders)
         )
 
+    def test_no_two_line_bind_dialect_split(self):
+        """Catch the two-line split form the single-line regex misses.
+
+        The footgun can evade ``test_no_raw_session_bind_dialect_in_app_code``
+        by spreading the access across two lines: assign a session's ``.bind``
+        (or ``get_bind()``) to a local, then read ``.dialect`` off that local on
+        a later line. This whole-file scan flags any local assigned from
+        ``<x>.bind`` / ``<x>.get_bind()`` whose ``.dialect`` is read anywhere in
+        the same file. Legitimate non-dialect uses of ``.bind`` (e.g. handing the
+        engine to a sub-session factory) never read ``.dialect`` off the local,
+        so they are not flagged.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # database.py *defines* resolve_dialect_name (the one legitimate site).
+        allow_list = {"database.py"}
+        # A local assigned from a session's bind: ``<var> = <expr>.bind`` or
+        # ``<var> = <expr>.get_bind(...)``.
+        assign_re = re.compile(
+            r"^\s*(\w+)\s*=\s*[\w.]+\.(?:bind\b|get_bind\s*\()", re.MULTILINE
+        )
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py") or fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    text = f.read()
+                for m in assign_re.finditer(text):
+                    var = m.group(1)
+                    line = text[m.start() : text.find("\n", m.start())]
+                    if line.lstrip().startswith("#") or "# noqa" in line:
+                        continue
+                    # Flag only when ``.dialect`` is read off this same local —
+                    # that is what distinguishes the footgun from a benign
+                    # ``.bind`` use that just forwards the engine.
+                    if re.search(rf"\b{re.escape(var)}\.dialect\b", text):
+                        lineno = text.count("\n", 0, m.start()) + 1
+                        rel = os.path.relpath(fpath, app_dir)
+                        offenders.append(f"  {rel}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "Found a two-line `.bind` → `.dialect` split in backend/app/.\n"
+            "A local assigned from a session's `.bind`/`get_bind()` whose "
+            "`.dialect` is read later is the same None-bind footgun in disguise "
+            "(incident PR #7099). Resolve the dialect via "
+            "app.database.resolve_dialect_name(session) instead.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
 
 # ── Base-branch fallback hardening ─────────────────────────────────────────
 

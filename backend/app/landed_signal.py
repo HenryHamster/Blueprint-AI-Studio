@@ -26,6 +26,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
+from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus
 
 logger = logging.getLogger(__name__)
@@ -84,20 +85,12 @@ def landed_signal_predicate(session: AsyncSession) -> ColumnElement[bool]:
     that predate ``landed_on_integration`` and the explicit opt-out marker for
     merge-equivalent non-landings.
     """
-    bind = session.bind
-    if bind is None:
-        # Async sessions created from a sessionmaker can expose a None ``bind``
-        # attribute even though the session still resolves an engine. The bare
-        # ``else "postgresql"`` idiom then mistakes a SQLite test connection for
-        # Postgres and emits the ``@>`` JSONB operator, which SQLite rejects
-        # ("unrecognized token: @"). ``get_bind()`` resolves the actual engine
-        # the query will execute on (reflecting SQLite vs Postgres correctly,
-        # independent of the env), so the right branch is chosen.
-        try:
-            bind = session.get_bind()
-        except Exception:  # noqa: BLE001 — fall back to the prod default below
-            bind = None
-    dialect_name = bind.dialect.name if bind is not None else "postgresql"
+    # Async sessions created from a sessionmaker can expose a None ``bind``
+    # attribute even though the session still resolves an engine. Routing through
+    # the centralised resolver keeps the None-bind-safe resolution (``.bind`` →
+    # ``get_bind()`` → ``"postgresql"`` default) in exactly one place so the
+    # SQLite branch is chosen correctly on a SQLite-bound session.
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         landed = func.json_extract(Task.context, f"$.{LANDED_ON_INTEGRATION_KEY}")
         pr_merged = func.json_extract(Task.context, f"$.{LANDED_SIGNAL_KEY}")

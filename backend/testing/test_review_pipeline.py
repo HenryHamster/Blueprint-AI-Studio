@@ -10184,6 +10184,47 @@ def test_pr_number_match_picks_sqlite_branch_on_none_bind_session():
         engine.sync_engine.dispose()
 
 
+def test_landed_signal_predicate_picks_sqlite_branch_on_none_bind_session():
+    """Regression for the None-bind dialect footgun in ``landed_signal``.
+
+    ``landed_signal_predicate`` builds a dialect-conditional predicate (SQLite
+    ``json_extract`` vs Postgres ``@>``). It now resolves the dialect through the
+    centralised ``resolve_dialect_name`` resolver rather than hand-rolling the
+    ``.bind`` → ``get_bind()`` → ``"postgresql"`` logic inline. This asserts a
+    None-bind session whose ``get_bind()`` resolves SQLite still selects the
+    ``json_extract`` branch (not the Postgres ``@>`` form).
+    """
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.landed_signal import landed_signal_predicate
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        # The footgun condition: .bind is None, but get_bind() resolves SQLite.
+        session = MagicMock()
+        session.bind = None
+        session.get_bind.return_value = engine
+        assert session.get_bind().dialect.name == "sqlite"
+
+        expr = landed_signal_predicate(session)
+        compiled = str(expr).lower()
+        assert "json_extract" in compiled, (
+            "None-bind SQLite session must select the json_extract branch — "
+            "the old idiom defaulted to the Postgres @> JSONB branch. "
+            f"Got: {compiled}"
+        )
+        assert "@>" not in compiled
+    finally:
+        engine.sync_engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_pr_number_match_matches_seeded_pr_number_end_to_end(db_session):
     """Functional companion: against the real test engine, ``_pr_number_match``

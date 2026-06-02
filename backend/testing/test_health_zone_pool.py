@@ -21,6 +21,7 @@ from app.max_plan_pool import (
     _account_by_id,
     _max_plan_pool_lock,
     _pending_rl_persists,
+    _pending_cap_persists,
     _account_available_for_model,
     _account_state_for_model,
     cascade_disabled_models,
@@ -80,16 +81,20 @@ def clean_max_plan_pool():
     orig_pools = {k: list(v) for k, v in _max_plan_pools.items()}
     orig_by_id = dict(_account_by_id)
     orig_pending = list(_pending_rl_persists)
+    orig_cap_pending = set(_pending_cap_persists)
     _max_plan_pools.clear()
     _account_by_id.clear()
     _pending_rl_persists.clear()
+    _pending_cap_persists.clear()
     yield
     _max_plan_pools.clear()
     _account_by_id.clear()
     _pending_rl_persists.clear()
+    _pending_cap_persists.clear()
     _max_plan_pools.update(orig_pools)
     _account_by_id.update(orig_by_id)
     _pending_rl_persists.extend(orig_pending)
+    _pending_cap_persists.update(orig_cap_pending)
 
 
 @pytest.fixture()
@@ -754,6 +759,111 @@ class TestMaxPlanAccountPool:
         _add_to_pool({"id": "a1", "name": "acct", "enabled": True, "active_tasks": 2})
         await release_max_plan_account("does-not-exist")
         assert _account_by_id["a1"]["active_tasks"] == 2
+
+    # ── daily_task_count revert on abandon vs. completion ────────────────────
+    # A dispatch ABANDONED after account selection must fully undo the reservation
+    # (active_tasks AND daily_task_count). A genuine task COMPLETION reverts only
+    # the concurrency slot — its daily usage is real and must stand.
+
+    @pytest.mark.asyncio
+    async def test_release_reverts_daily_task_count_on_abandon(
+        self, clean_max_plan_pool
+    ):
+        """An abandoned dispatch (revert_daily_task_count=True) undoes BOTH the
+        concurrency slot and the pre-reserved daily-usage increment, and marks the
+        account dirty so the corrected value is re-persisted."""
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "acct",
+                "enabled": True,
+                "active_tasks": 3,
+                "daily_task_count": 5,
+            }
+        )
+        await release_max_plan_account("a1", revert_daily_task_count=True)
+        assert _account_by_id["a1"]["active_tasks"] == 2
+        assert _account_by_id["a1"]["daily_task_count"] == 4
+        assert "a1" in _pending_cap_persists
+
+    @pytest.mark.asyncio
+    async def test_release_keeps_daily_task_count_on_completion(
+        self, clean_max_plan_pool
+    ):
+        """A genuine completion (default revert_daily_task_count=False) reverts only
+        the concurrency slot; the daily-usage increment stays counted."""
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "acct",
+                "enabled": True,
+                "active_tasks": 3,
+                "daily_task_count": 5,
+            }
+        )
+        await release_max_plan_account("a1")
+        assert _account_by_id["a1"]["active_tasks"] == 2
+        assert _account_by_id["a1"]["daily_task_count"] == 5
+
+    @pytest.mark.asyncio
+    async def test_release_daily_task_count_floors_at_zero(self, clean_max_plan_pool):
+        """Reverting the daily counter never drives it negative."""
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "acct",
+                "enabled": True,
+                "active_tasks": 1,
+                "daily_task_count": 0,
+            }
+        )
+        await release_max_plan_account("a1", revert_daily_task_count=True)
+        assert _account_by_id["a1"]["daily_task_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_select_then_abandon_leaves_daily_task_count_unchanged(
+        self, clean_max_plan_pool
+    ):
+        """Selection pre-reserves daily_task_count; abandoning the dispatch must
+        leave the counter exactly where it was before selection (no durable
+        over-count that would trip the daily cap prematurely)."""
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "acct",
+                "enabled": True,
+                "active_tasks": 0,
+                "daily_task_count": 7,
+            }
+        )
+        chosen = await select_max_plan_account(_TEST_USER)
+        assert chosen is not None and chosen["id"] == "a1"
+        # selection pre-reserved both counters
+        assert _account_by_id["a1"]["active_tasks"] == 1
+        assert _account_by_id["a1"]["daily_task_count"] == 8
+        await release_max_plan_account("a1", revert_daily_task_count=True)
+        assert _account_by_id["a1"]["active_tasks"] == 0
+        assert _account_by_id["a1"]["daily_task_count"] == 7
+
+    @pytest.mark.asyncio
+    async def test_select_then_complete_leaves_daily_task_count_incremented(
+        self, clean_max_plan_pool
+    ):
+        """A task that actually runs leaves daily_task_count incremented by one
+        after completion, while the concurrency slot is released."""
+        _add_to_pool(
+            {
+                "id": "a1",
+                "name": "acct",
+                "enabled": True,
+                "active_tasks": 0,
+                "daily_task_count": 7,
+            }
+        )
+        await select_max_plan_account(_TEST_USER)
+        await release_max_plan_account("a1")
+        assert _account_by_id["a1"]["active_tasks"] == 0
+        assert _account_by_id["a1"]["daily_task_count"] == 8
 
     @pytest.mark.asyncio
     async def test_recheck_disabled_accounts_re_enables_after_30min_cooldown(
