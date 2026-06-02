@@ -1125,7 +1125,15 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     mocker.patch(
         "app.github.get_pull_request",
         new_callable=AsyncMock,
+        # No bot author + no approval/supersession markers → FIX A must keep FAILED.
         return_value={"merged": False, "state": "closed"},
+    )
+    # No CHANGES_REQUESTED review, but also no positive cleanup signal — the
+    # FIX A non-rejection classifier requires BOTH, so this stays FAILED.
+    mocker.patch(
+        "app.github.get_pull_request_reviews",
+        new_callable=AsyncMock,
+        return_value=[],
     )
     mocker.patch(
         "app.failure_classification.classify_failure",
@@ -1150,6 +1158,169 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     assert task.context.get("pr_closed_unmerged") is True
     assert "55" in task.latest_status_message
     mock_alert.assert_called_once()
+
+
+# ── FIX A: non-rejection PR-close → CANCELLED ──────────────────────────────
+
+
+def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews):
+    """Common mocks for the closed-unmerged FIX A tests: token, PR fetch,
+    reviews fetch, and a captured write_session so callers can assert the
+    persisted terminal state. Returns (write_session, alert_mock)."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value=pr_data,
+    )
+    mocker.patch(
+        "app.github.get_pull_request_reviews",
+        new_callable=AsyncMock,
+        return_value=reviews,
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert",
+        new_callable=AsyncMock,
+    )
+    db_task_mock = MagicMock()
+    db_task_mock.context = {}
+    ctx, write_session = _make_write_session_mock(db_task=db_task_mock)
+    write_session.get = AsyncMock(return_value=db_task_mock)
+    # _verify_pr_merged lives in app.rollup_pr_verification and writes via that
+    # module's AsyncSessionLocal binding — patch there, not in rollup_management
+    # (matches every other _verify_pr_merged test in this file). Patching the
+    # wrong module let the real session run, which returned db_task=None against
+    # the rollback-isolated fixture DB and silently skipped the failure alert.
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
+    return write_session, alert_mock
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_after_approve_lands_cancelled_no_alert(
+    cleanup_db, mocker
+):
+    """FIX A: a PR closed-unmerged that was previously APPROVED (review_loop.
+    review_approved=True) and has no CHANGES_REQUESTED review is a cleanup /
+    supersession close → CANCELLED with failure_detail=pr_closed_non_rejection,
+    NO failure alert."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        context={"review_loop": {"review_approved": True, "pr_number": 55}},
+    )
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={"merged": False, "state": "closed", "user": {"login": "human"}},
+        reviews=[{"state": "APPROVED"}],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.CANCELLED
+    assert task.context.get("failure_detail") == "pr_closed_non_rejection"
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_by_bot_no_review_lands_cancelled(cleanup_db, mocker):
+    """FIX A: a Blueprint-bot-authored PR closed-unmerged with no review at all
+    (housekeeping close) lands CANCELLED, no alert."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.CANCELLED
+    assert task.context.get("failure_detail") == "pr_closed_non_rejection"
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_with_changes_requested_stays_failed(
+    cleanup_db, mocker
+):
+    """GUARDRAIL: a CHANGES_REQUESTED review is a genuine rejection — even on a
+    bot-authored PR, the task stays FAILED + alert."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    mocker.patch(
+        "app.failure_classification.classify_failure", return_value="CODE_ERROR"
+    )
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[{"state": "CHANGES_REQUESTED"}, {"state": "APPROVED"}],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.FAILED, (
+        "CHANGES_REQUESTED is a genuine rejection — must stay FAILED"
+    )
+    assert task.context.get("failure_detail") != "pr_closed_non_rejection"
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_closed_with_pr_rejected_marker_stays_failed(
+    cleanup_db, mocker
+):
+    """GUARDRAIL: an explicit pr_rejected marker forces FAILED even with a
+    bot author and no CHANGES_REQUESTED review (the reviews lookup is short-
+    circuited by the marker)."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(
+        cleanup_db, project.id, context={"pr_rejected": True}
+    )
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/55")
+
+    mocker.patch(
+        "app.failure_classification.classify_failure", return_value="CODE_ERROR"
+    )
+    _, alert_mock = _mock_verify_pr_closed_deps(
+        mocker,
+        pr_data={
+            "merged": False,
+            "state": "closed",
+            "user": {"login": "blueprint-app[bot]", "type": "Bot"},
+        },
+        reviews=[],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.FAILED
+    assert task.context.get("failure_detail") != "pr_closed_non_rejection"
+    alert_mock.assert_called_once()
 
 
 @pytest.mark.asyncio

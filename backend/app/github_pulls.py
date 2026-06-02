@@ -261,6 +261,51 @@ async def get_pull_request(
     return response.json()
 
 
+async def get_pull_request_reviews(
+    token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    project_id: str | None = None,
+) -> list[dict]:
+    """Fetch the human/bot review submissions on a PR (state APPROVED /
+    CHANGES_REQUESTED / COMMENTED / DISMISSED).
+
+    Used by the rollup PR-verify path to distinguish a genuine review rejection
+    (any submission with state == CHANGES_REQUESTED) from a non-rejection
+    cleanup/supersession close. Best-effort: returns ``[]`` on any non-200 so a
+    transient GitHub hiccup never *masks* a rejection — the caller treats an
+    empty result as "no recorded CHANGES_REQUESTED" only in combination with
+    the other non-genuine signals (bot-close / supersession), and the genuine
+    DB markers (pr_rejected / review_cap_exhausted) still force FAILED.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        headers,
+        params={"per_page": 100},
+        project_id=project_id,
+    )
+    if response.status_code == 401:
+        raise HTTPException(
+            status_code=401,
+            detail="GitHub authentication failed (401 Unauthorized) — token may be expired or revoked",
+        )
+    if response.status_code != 200:
+        logger.warning(
+            f"Failed to list reviews for PR #{pr_number} "
+            f"(status={response.status_code}); treating as no recorded reviews"
+        )
+        return []
+    data = response.json()
+    return data if isinstance(data, list) else []
+
+
 async def get_open_pull_requests(
     token: str, owner: str, repo: str, base: str | None = None
 ) -> list[dict]:

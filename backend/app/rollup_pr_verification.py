@@ -283,6 +283,72 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                             f"{task.id}: {_sc_err}"
                         )
                     return True
+                # FIX A: a closed-unmerged PR with NO genuine review rejection
+                # (no CHANGES_REQUESTED review, no pr_rejected/review_cap_exhausted
+                # marker) AND a recognized cleanup/supersession signal (approved-
+                # then-closed, supersession/de-scope marker, or Blueprint-bot
+                # authorship) is housekeeping, not a failure. Land it CANCELLED
+                # with failure_detail='pr_closed_non_rejection' and skip the
+                # failure alert so a non-failure neither dings direction health
+                # nor pages the operator. GUARDRAIL: _pr_closed_is_non_rejection
+                # returns False on ANY genuine-rejection signal or absence of a
+                # cleanup signal, so the genuine FAILED path below is preserved.
+                # Imported locally: rollup_management imports this module at load
+                # time, so a top-level import here would be circular.
+                from app.rollup_management import _pr_closed_is_non_rejection
+
+                if await _pr_closed_is_non_rejection(
+                    task, pr_data, pr_number, session
+                ):
+                    logger.info(
+                        f"[PR_VERIFY] Task {task.id} PR #{pr_number} closed without "
+                        f"merging with no genuine rejection — treating as a "
+                        f"cleanup/supersession close (CANCELLED, no alert)"
+                    )
+                    from app.failure_classification import (
+                        SCOPE_EMPTY,
+                        persist_failure_category,
+                    )
+
+                    task.context = {
+                        **(task.context or {}),
+                        "pr_closed_unmerged": True,
+                        "failure_detail": "pr_closed_non_rejection",
+                    }
+                    task.status = TaskStatus.CANCELLED
+                    task.latest_status_message = (
+                        f"PR #{pr_number} closed without merging "
+                        f"(no rejection — cleanup/supersession)"
+                    )
+                    # SCOPE_EMPTY-class: the desired change landed elsewhere or
+                    # the PR was de-scoped — an INFRA/no-op class, not a code
+                    # defect. The failure_detail marker is what direction metrics
+                    # key on (direction_outcomes._is_non_genuine_cancelled).
+                    persist_failure_category(task, SCOPE_EMPTY)
+                    try:
+                        async with AsyncSessionLocal() as write_session:
+                            db_task = await write_session.get(Task, task.id)
+                            if db_task:
+                                db_task.context = {
+                                    **(db_task.context or {}),
+                                    "pr_closed_unmerged": True,
+                                    "failure_detail": "pr_closed_non_rejection",
+                                    "failure_category": SCOPE_EMPTY,
+                                }
+                                db_task.status = TaskStatus.CANCELLED
+                                db_task.latest_status_message = (
+                                    f"PR #{pr_number} closed without merging "
+                                    f"(no rejection — cleanup/supersession)"
+                                )
+                                write_session.add(db_task)
+                                await write_session.commit()
+                    except Exception as _nr_err:
+                        logger.warning(
+                            f"[PR_VERIFY] Failed to persist pr_closed_non_rejection "
+                            f"for task {task.id}: {_nr_err}"
+                        )
+                    # Skip _maybe_create_failure_alert by design — non-genuine.
+                    return True
                 logger.warning(
                     f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected"
                 )

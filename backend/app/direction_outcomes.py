@@ -17,6 +17,8 @@ from app.failure_stage import _derive_failure_stage
 from app.failure_classification import (
     CODE_ERROR,
     INFRA_CLASSES,
+    REASSIGNED,
+    SCOPE_EMPTY,
     SCOPE_OVERFLOW,
     TAXONOMY_CODE_DEFECT,
     TAXONOMY_INFRA_RELATED,
@@ -59,11 +61,44 @@ def _is_review_cap_exhausted(task: Task) -> bool:
     return (task.context or {}).get("failure_detail") == "review_cap_exhausted"
 
 
+# CANCELLED failure_detail markers that represent a non-genuine outcome — work
+# that landed elsewhere, was approved-then-capped, or was superseded — NOT a
+# code/review failure the direction is responsible for. Counting these dings
+# direction health and can trip false auto-pause / diagnosis. See FIX A
+# (pr_closed_non_rejection) and FIX D (cap_exhausted_after_approve).
+_NON_GENUINE_CANCELLED_DETAILS = frozenset(
+    {
+        "pr_closed_non_rejection",
+        "cap_exhausted_after_approve",
+    }
+)
+
+
+def _is_non_genuine_cancelled(task: Task) -> bool:
+    """True when a CANCELLED task represents a non-genuine outcome that must not
+    count against direction health.
+
+    Covers (a) cascade kills (see ``_is_cascade_cancelled``), (b) the new
+    review/rollup non-genuine markers (``pr_closed_non_rejection``,
+    ``cap_exhausted_after_approve``), and (c) REASSIGNED / SCOPE_EMPTY handoffs
+    that land CANCELLED rather than FAILED. A genuine code/review failure never
+    carries any of these signals, so this never hides a real regression.
+    """
+    if task.status != TaskStatus.CANCELLED:
+        return False
+    if _is_cascade_cancelled(task):
+        return True
+    ctx = task.context or {}
+    if ctx.get("failure_detail") in _NON_GENUINE_CANCELLED_DETAILS:
+        return True
+    return ctx.get("failure_category") in (REASSIGNED, SCOPE_EMPTY)
+
+
 def _counts_as_failure(task: Task) -> bool:
     """Terminal status that represents a genuine failure for direction metrics."""
     if task.status == TaskStatus.FAILED:
         return True
-    return task.status == TaskStatus.CANCELLED and not _is_cascade_cancelled(task)
+    return task.status == TaskStatus.CANCELLED and not _is_non_genuine_cancelled(task)
 
 
 def is_autonomous_merge(task: Task) -> bool:

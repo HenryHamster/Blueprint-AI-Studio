@@ -147,6 +147,100 @@ def _is_pipeline_task_stale(task: Task) -> bool:
     return task.started_at < threshold
 
 
+async def _cap_exhausted_after_approve(
+    orig: Task,
+    source_task: Task,
+    resolved_original_id: str,
+    pr_number: int,
+    session: AsyncSession,
+) -> bool:
+    """FIX D: decide whether the review-fix cap was hit on an ALREADY-APPROVED
+    PR (a benign non-convergence on the merge mechanics, e.g. repeated rebase /
+    CI-flap churn after sign-off) rather than a genuine unresolved review
+    rejection.
+
+    Returns True when the last recorded verdict is APPROVE / clean:
+      • the parent (``orig``) or the source task carries
+        ``review_loop.review_approved == True`` (or legacy verdict == APPROVE);
+      • the most recent chain review task recorded
+        ``blueprint_review_verdict == 'APPROVE'``;
+      • the latest iteration has ZERO outstanding CHANGES_REQUESTED issues.
+
+    GUARDRAIL: any outstanding CHANGES_REQUESTED on the latest iteration (a
+    genuine non-convergence) → returns False so the caller keeps today's
+    FAILED + CODE_ERROR path.
+    """
+    from sqlalchemy import select
+
+    # (1) Outstanding CHANGES_REQUESTED on the latest iteration is a hard veto —
+    # check it FIRST so an approval flag from an earlier round can never override
+    # a later unresolved rejection.
+    for t in (orig, source_task):
+        rl = (t.context or {}).get("review_loop") or {}
+        if rl.get("verdict") == "REJECT" or rl.get("review_changes_requested"):
+            return False
+        history = rl.get("review_history") or []
+        if history:
+            last = history[-1] or {}
+            if (last.get("verdict") or "").upper() in (
+                "REJECT",
+                "CHANGES_REQUESTED",
+            ):
+                return False
+            if last.get("issues"):
+                return False
+
+    # (2) Parent / source approval flag.
+    for t in (orig, source_task):
+        rl = (t.context or {}).get("review_loop") or {}
+        if rl.get("review_approved") is True or rl.get("verdict") == "APPROVE":
+            return True
+        if (t.context or {}).get("blueprint_review_verdict") == "APPROVE":
+            return True
+
+    # (3) Most recent chain review task's recorded verdict.
+    try:
+        review_rows = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == orig.project_id,
+                        Task.status.in_(
+                            [TaskStatus.COMPLETED, TaskStatus.EVALUATING]
+                        ),
+                    )
+                    .order_by(Task.completed_at.desc().nullslast())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for rt in review_rows:
+            rp = rt.first_payload or {}
+            if rp.get("type") != "review":
+                continue
+            if rp.get("pr_number") != pr_number:
+                continue
+            r_orig = rp.get("original_task_id") or ""
+            if r_orig and r_orig != resolved_original_id:
+                continue
+            verdict = (rt.context or {}).get("blueprint_review_verdict")
+            if verdict == "APPROVE":
+                return True
+            if verdict in ("REJECT", "CHANGES_REQUESTED"):
+                return False
+            # First matching chain review with a non-APPROVE/non-REJECT verdict
+            # is inconclusive; keep scanning older ones.
+    except Exception as _vq_err:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion verdict lookup failed for PR #{pr_number}: "
+            f"{_vq_err}"
+        )
+
+    return False
+
+
 async def _handle_cap_exhaustion(
     source_task: Task,
     resolved_original_id: str,
@@ -197,16 +291,106 @@ async def _handle_cap_exhaustion(
         )
         return
 
-    already_handled = (
-        orig.status == TaskStatus.FAILED
-        and (orig.context or {}).get("failure_detail") == "review_cap_exhausted"
+    already_handled = orig.status in (
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ) and (orig.context or {}).get("failure_detail") in (
+        "review_cap_exhausted",
+        "cap_exhausted_after_approve",
     )
     if already_handled:
         logger.info(
             f"[PIPELINE] Cap re-triggered for PR #{pr_number} — orig {resolved_original_id[:8]} "
-            f"already FAILED with review_cap_exhausted, skipping side effects"
+            f"already terminal with {(orig.context or {}).get('failure_detail')}, "
+            f"skipping side effects"
         )
         await session.commit()
+        return
+
+    # FIX D: if the cap was exhausted on an already-APPROVED PR (benign merge-
+    # mechanics churn after sign-off, not an unresolved review rejection), land
+    # CANCELLED with failure_detail='cap_exhausted_after_approve' and do NOT
+    # record CODE_ERROR — that would falsely ding the account/direction for a
+    # non-failure. GUARDRAIL: _cap_exhausted_after_approve returns False on any
+    # outstanding CHANGES_REQUESTED, preserving today's FAILED + CODE_ERROR path
+    # for genuine non-convergence.
+    if await _cap_exhausted_after_approve(
+        orig, source_task, resolved_original_id, pr_number, session
+    ):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        logger.info(
+            f"[PIPELINE] Cap reached for PR #{pr_number} AFTER approval — landing "
+            f"orig {resolved_original_id[:8]} CANCELLED (cap_exhausted_after_approve), "
+            f"no CODE_ERROR recorded"
+        )
+        orig.status = TaskStatus.CANCELLED
+        orig.latest_status_message = (
+            f"Review-fix cap reached ({iterations} iterations, {cap_label}) after "
+            f"approval — PR #{pr_number} auto-closed (no rejection)"
+        )
+        ctx = dict(orig.context or {})
+        ctx["failure_detail"] = "cap_exhausted_after_approve"
+        ctx["review_cap_iterations"] = iterations
+        # NB: deliberately NOT setting pr_rejected — this was an approved PR.
+        orig.context = ctx
+        flag_modified(orig, "context")
+        session.add(orig)
+        try:
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(after-approve): failed to commit orig "
+                f"{resolved_original_id[:8]}: {e}",
+                exc_info=True,
+            )
+            return
+        # Best-effort: still close the GitHub PR and record the terminal
+        # outcome for direction state, but as a SUCCESS-shaped (non-failure)
+        # signal — skip record_task_result/record_direction_result failure dings
+        # and the failure alert.
+        try:
+            from app.task_completion import _record_remediation_if_terminal
+
+            await _record_remediation_if_terminal(
+                orig, TaskStatus.CANCELLED, session
+            )
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(after-approve): remediation record "
+                f"failed for PR #{pr_number}: {e}"
+            )
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+            try:
+                await create_pr_comment(
+                    gh_token,
+                    owner,
+                    repo,
+                    pr_number,
+                    f"Auto-closed: review-fix cap reached ({iterations} iterations, "
+                    f"{cap_label}) after approval — no outstanding changes requested. "
+                    f"Work was signed off; closing as superseded.",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve): comment failed on PR "
+                    f"#{pr_number}: {e}"
+                )
+            closed = await close_pull_request(
+                gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+            )
+            if closed:
+                logger.info(
+                    f"[PIPELINE] Closed PR #{pr_number} after approved-cap exhaustion "
+                    f"({iterations} iterations)"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(after-approve): PR close failed for "
+                f"#{pr_number}: {e}"
+            )
         return
 
     orig.status = TaskStatus.FAILED
