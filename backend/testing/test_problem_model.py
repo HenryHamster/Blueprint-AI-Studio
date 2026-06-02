@@ -493,6 +493,115 @@ def test_apply_agent_update_no_changes_still_logs():
 
 
 # ---------------------------------------------------------------------------
+# apply_agent_update — operator-seeded intent preservation
+# ---------------------------------------------------------------------------
+
+
+def _operator_seeded_current() -> dict:
+    """A problem-model as the onboarding seed leaves it: operator purpose with
+    a user_message source, operator context/constraints, last_updated_by=user."""
+    return {
+        "revision": 1,
+        "last_updated_by": "user",
+        "intent": {
+            "purpose": "Ship a reliable billing system.",
+            "current_focus": "Ship a reliable billing system.",
+            "source": {"type": "user_message", "message_id": "m-1", "excerpt": "Ship..."},
+        },
+        "context": {"project_type": "startup", "users": "SMBs"},
+        "constraints": ["No PII in logs", "GDPR compliant"],
+    }
+
+
+def test_apply_agent_update_preserves_operator_intent_when_omitted():
+    """Agent omits intent/context/constraints entirely → operator values kept."""
+    current = _operator_seeded_current()
+    proposed: dict = {"gaps": [{"id": "g1", "name": "x", "status": "active"}]}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["context"]["project_type"] == "startup"
+    assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant"]
+
+
+def test_apply_agent_update_preserves_operator_intent_when_blanked():
+    """Agent sends empty purpose / blank context / empty constraints → kept."""
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "", "current_focus": "Wire up Stripe webhooks."},
+        "context": {},
+        "constraints": [],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["context"]["project_type"] == "startup"
+    assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant"]
+    # Agent-owned current_focus advances freely.
+    assert new_raw["intent"]["current_focus"] == "Wire up Stripe webhooks."
+
+
+def test_apply_agent_update_preserved_purpose_not_reported_as_intent_changed():
+    """Honest diff: when only the purpose is preserved (current_focus
+    unchanged), the carry-forward must NOT register as intent_changed."""
+    current = _operator_seeded_current()
+    proposed = {
+        # Same current_focus the seed wrote; only purpose is blanked.
+        "intent": {"purpose": "", "current_focus": "Ship a reliable billing system."},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert "intent_changed" not in diff
+
+
+def test_apply_agent_update_allows_explicit_operator_intent_change():
+    """A genuine non-empty agent change to purpose still applies + bumps rev."""
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "Pivot to a usage-metering platform.", "current_focus": ""},
+        "context": {"project_type": "product"},
+        "constraints": ["SOC2"],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Pivot to a usage-metering platform."
+    assert new_raw["context"]["project_type"] == "product"
+    assert new_raw["constraints"] == ["SOC2"]
+    assert new_raw["revision"] == 2
+    assert diff.get("intent_changed") is True
+
+
+def test_apply_agent_update_advances_agent_owned_fields_with_intent_preserved():
+    """Agent advances current_focus / gaps while purpose is preserved."""
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "", "current_focus": "Phase 2: invoicing."},
+        "gaps": [{"id": "g-new", "name": "invoicing", "status": "active"}],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["current_focus"] == "Phase 2: invoicing."
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-new"}
+    assert diff["gaps_opened"] == ["g-new"]
+
+
+def test_apply_agent_update_does_not_preserve_agent_authored_intent():
+    """When prior purpose was agent-authored (no user source), a blank proposed
+    purpose is NOT resurrected — only operator-owned words are protected."""
+    current = {
+        "revision": 2,
+        "last_updated_by": "agent",
+        "intent": {
+            "purpose": "Agent-derived purpose.",
+            "current_focus": "focus",
+            "source": {"type": "agent_observation"},
+        },
+    }
+    proposed = {"intent": {"purpose": "", "current_focus": "next"}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == ""
+
+
+# ---------------------------------------------------------------------------
 # apply_user_intent_patch — the user-facing write path (onboarding + PATCH)
 # ---------------------------------------------------------------------------
 

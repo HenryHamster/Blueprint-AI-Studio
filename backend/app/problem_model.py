@@ -563,6 +563,67 @@ def apply_user_intent_patch(
     return validated
 
 
+def _context_is_blank(context: ProjectContext) -> bool:
+    """True when every ``ProjectContext`` field is empty/unset.
+
+    Used to detect when an agent's proposed model carries a default-blank
+    context that would silently erase operator-seeded environmental framing.
+    """
+    return context.model_dump(exclude_none=True) == {}
+
+
+def _preserve_operator_intent(current: ProblemModel, proposed: ProblemModel) -> None:
+    """Carry operator-seeded strategic intent forward when the agent's
+    proposed model omits or blanks it.
+
+    The operator seeds ``intent.purpose`` (with a ``user_message`` source),
+    ``context``, and ``constraints`` at onboarding via
+    ``admin_onboard._seed_strategic_intent`` (the same user-editable subset
+    :func:`apply_user_intent_patch` accepts). A strategic agent that submits a
+    full ``set_problem_model`` replacement can accidentally drop these fields,
+    silently erasing the operator's words from the next worker/plan prompt's
+    Strategic Intent section.
+
+    This fills operator-owned fields back from ``current`` whenever ``proposed``
+    leaves them empty, mutating ``proposed`` in place. It does NOT block a
+    genuine, non-empty agent change to an operator-owned field — that still
+    applies and still bumps the revision. The agent-owned ``current_focus``
+    advances freely and is never preserved here.
+
+    The escape hatch for an agent that genuinely intends to *change*
+    operator-owned intent is the ``pending_user_confirmation`` channel
+    (``type='intent_change'``), not a silent overwrite — see
+    :class:`PendingConfirmation`.
+    """
+    # ``intent.purpose`` is operator-owned only when the prior change was
+    # attributed to a user message; agent-authored purposes may be retired.
+    purpose_was_operator = (
+        current.intent.source is not None
+        and current.intent.source.type == "user_message"
+    )
+    if (
+        purpose_was_operator
+        and current.intent.purpose.strip()
+        and not proposed.intent.purpose.strip()
+    ):
+        proposed.intent.purpose = current.intent.purpose
+        # Restore the operator provenance unless the agent supplied its own.
+        if proposed.intent.source is None:
+            proposed.intent.source = current.intent.source
+
+    # ``context`` / ``constraints`` are operator-owned when the prior model was
+    # last written by the user (the onboarding seed stamps last_updated_by).
+    operator_owned = purpose_was_operator or current.last_updated_by == "user"
+    if (
+        operator_owned
+        and not _context_is_blank(current.context)
+        and _context_is_blank(proposed.context)
+    ):
+        proposed.context = current.context.model_copy(deep=True)
+    if operator_owned and current.constraints and not proposed.constraints:
+        proposed.constraints = list(current.constraints)
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,
@@ -572,8 +633,10 @@ def apply_agent_update(
 
     Validates ``proposed_raw`` through :class:`ProblemModel`, bumps the
     revision and timestamp, preserves existing ``archived_gaps`` and
-    ``revision_log``, auto-archives any gaps that are now closed or
-    abandoned, and appends a revision-log entry summarizing the change.
+    ``revision_log``, carries forward operator-seeded strategic intent the
+    agent omitted or blanked (see :func:`_preserve_operator_intent`),
+    auto-archives any gaps that are now closed or abandoned, and appends a
+    revision-log entry summarizing the change.
 
     Returns a tuple of ``(new_raw_dict, diff_summary)``:
       - ``new_raw_dict`` is ready for JSONB persistence on ``project.problem_model``
@@ -581,6 +644,14 @@ def apply_agent_update(
 
     Raises :class:`pydantic.ValidationError` if ``proposed_raw`` is malformed.
     Callers should catch and keep the current state on validation failure.
+
+    Operator intent is protected, not frozen: a genuine, explicit, non-empty
+    agent change to ``intent.purpose`` / ``context`` / ``constraints`` still
+    applies and still bumps the revision. An agent that genuinely intends to
+    *change* operator-owned intent should route that through the
+    ``pending_user_confirmation`` channel (``type='intent_change'``) rather
+    than overwriting it silently. Only blanks/omissions are filled back, so a
+    merely-preserved purpose never registers as ``intent_changed``.
 
     Note: concurrent user edits are not yet merged carefully. If the DB
     revision advanced while the cycle ran, the agent's write will overwrite
@@ -596,6 +667,10 @@ def apply_agent_update(
 
     proposed.archived_gaps = list(current.archived_gaps) + list(proposed.archived_gaps)
     proposed.revision_log = list(current.revision_log)
+
+    # Carry operator-seeded intent forward before computing the diff so a
+    # merely-preserved purpose is not falsely reported as intent_changed.
+    _preserve_operator_intent(current, proposed)
 
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed

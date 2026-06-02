@@ -227,6 +227,8 @@ Write the full updated problem_model as JSON to \`/tmp/problem_model_${p.taskId}
 
 # Problem model shape (quick reference)
 
+**Operator intent ownership:** The operator seeds \`intent.purpose\` and \`context\`/\`constraints\` at onboarding and may update them later. These are operator-owned — **do NOT blank them** even if you think they should change. If the model is replaced and these fields are omitted or emptied, the platform preserves the prior operator values. \`intent.current_focus\` is agent-owned and SHOULD advance as the project completes phases. If you genuinely believe the operator's purpose or steering should change, do NOT silently overwrite them — instead queue a \`pending_user_confirmation\` entry with \`type: "intent_change"\` proposing the change and asking for operator confirmation.
+
 - intent: {purpose, current_focus, source?}
 - context: {project_type, users, team, deploy_cadence, notes}
 - constraints: [string]

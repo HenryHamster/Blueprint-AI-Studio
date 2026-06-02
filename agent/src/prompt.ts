@@ -16,6 +16,7 @@ export {
   countSourceFiles,
   detectGreenfield,
   isGreenfieldRepo,
+  verifyCloneDelivered,
   extractTestConventions,
   discoverRelatedTests,
   extractModuleInterfaces,

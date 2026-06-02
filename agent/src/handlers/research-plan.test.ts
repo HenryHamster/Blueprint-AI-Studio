@@ -35,7 +35,15 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('child_process', () => ({
-  execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  // Route `git rev-parse` (HEAD and origin/<branch>) to a single stable sha so
+  // verifyCloneDelivered sees a resolvable HEAD that matches its remote tracking
+  // ref; every other git call returns empty output, which the handlers tolerate
+  // via try/catch. Suites that need a specific tree override this per-test.
+  execFileSync: vi.fn((_file: string, args?: unknown) => {
+    const a = Array.isArray(args) ? (args as string[]) : [];
+    if (a[0] === 'rev-parse') return 'deadbeefcafe0000';
+    return Buffer.from('');
+  }),
 }));
 
 vi.mock('../workspacePrep.js', () => ({
@@ -872,12 +880,20 @@ describe('buildEmptyRepoGuidance', () => {
     expect(buildEmptyRepoGuidance({ repo_is_empty: '' })).toBe('');
   });
 
-  it('returns the bootstrap paragraph when repo_is_empty is falsy but the live clone is near-empty', () => {
-    // Previously-divergent case: durable signal absent, but the live full-clone
-    // scan catches a lightly-scaffolded repo. Both handlers now agree on this.
+  it('returns the bootstrap paragraph when repo_is_empty is absent but the live clone is near-empty', () => {
+    // Durable signal absent → the live full-clone scan catches a
+    // lightly-scaffolded repo. Both handlers agree on this.
     setEmptyClone();
-    const out = buildEmptyRepoGuidance({ repo_is_empty: false });
+    const out = buildEmptyRepoGuidance({});
     expect(out).toContain('If the codebase is nearly empty');
+  });
+
+  it('returns empty string when repo_is_empty is explicitly false but the live clone is near-empty', () => {
+    // The durable signal is authoritative: a durable "non-empty" reading paired
+    // with an empty live tree is a clone problem (handled by verifyCloneDelivered),
+    // NOT a greenfield repo. It must never silently produce bootstrap guidance.
+    setEmptyClone();
+    expect(buildEmptyRepoGuidance({ repo_is_empty: false })).toBe('');
   });
 });
 
@@ -1917,8 +1933,13 @@ describe('handlePlan greenfield bootstrap mode', () => {
   });
 
   afterEach(() => {
-    // Restore the module-default so other suites see an empty tree.
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    // Restore the module-default so other suites see an empty tree but
+    // verifyCloneDelivered still resolves a HEAD (rev-parse → stable sha).
+    vi.mocked(execFileSync).mockImplementation((_file: string, args?: unknown) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (a[0] === 'rev-parse') return 'deadbeefcafe0000' as never;
+      return Buffer.from('') as never;
+    });
   });
 
   it('injects the greenfield foundation branch when the tree is config-only', async () => {

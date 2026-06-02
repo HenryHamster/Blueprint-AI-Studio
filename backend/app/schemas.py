@@ -313,12 +313,16 @@ class BuildConfig(BaseModel):
     # Deterministic empty/near-empty repo signal, computed at onboarding from
     # the already-fetched root + first-level subdirectory listings during
     # build-config detection (see ``admin_onboard._classify_repo_emptiness``).
-    # True when the repo has at most the greenfield source-file threshold after
-    # excluding docs/config/data files, dotfiles, and common manifests. Keep
-    # this count-based rule aligned with the agent's prompt-time detector so
-    # research/plan bootstrap guidance and the durable onboarding signal agree.
-    # Default False so pre-existing projects (and any repo with detected source)
-    # degrade gracefully.
+    # True ONLY when the repo read SUCCEEDED and was COMPLETE and the repo has
+    # at most the greenfield source-file threshold after excluding
+    # docs/config/data files, dotfiles, and common manifests. If any listing
+    # needed for that determination failed to fetch (root or first-level
+    # subdirectory), the read is incomplete and this degrades to False
+    # (treat-as-non-empty) — emptiness is never inferred from a partial read.
+    # Keep this count-based rule aligned with the agent's prompt-time detector
+    # so research/plan bootstrap guidance and the durable onboarding signal
+    # agree. Default False so pre-existing projects (and any repo with detected
+    # source) degrade gracefully.
     repo_is_empty: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;

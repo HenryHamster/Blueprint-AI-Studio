@@ -16,7 +16,7 @@ import {
   extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, configureAgentPermissions,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -933,6 +933,11 @@ export async function handlePlan(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
+  // Positively confirm the clone delivered the expected tree before any
+  // greenfield conclusion is drawn below — a successful-but-empty clone of a
+  // repo the durable signal says is NOT empty must fail loudly, not be
+  // misread as a greenfield bootstrap.
+  verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
@@ -1111,6 +1116,11 @@ export async function handleResearch(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
   });
+  // Positively confirm the clone delivered the expected tree before the
+  // greenfield/empty-repo guidance gate runs — a successful-but-empty clone of
+  // a repo the durable signal says is NOT empty must fail loudly, not be
+  // misread as greenfield.
+  verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode as string, 'research');

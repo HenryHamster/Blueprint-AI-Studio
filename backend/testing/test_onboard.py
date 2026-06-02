@@ -1287,6 +1287,79 @@ class TestBuildConfigDetection:
 
         assert config["repo_is_empty"] is False
 
+    @pytest.mark.asyncio
+    async def test_detect_build_config_not_empty_when_subdir_fetch_fails(self):
+        """A failed subdir fetch must not yield repo_is_empty=True.
+
+        Regression: a monorepo whose real source lives under subdirectories
+        (backend/, agent/, ...) was classified greenfield when a transient
+        subdir listing error left the partial listing looking empty.
+        """
+        root_files = [
+            {"name": "README.md", "type": "file"},
+            {"name": "backend", "type": "dir"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        # The backend/ subdir listing fails to fetch.
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 502
+        subdir_resp.json.return_value = {}
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["repo_is_empty"] is False
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_not_empty_when_root_fetch_fails(self):
+        """A failed root fetch must not yield a greenfield signal."""
+        root_resp = MagicMock()
+        root_resp.status_code = 502
+        root_resp.json.return_value = {}
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config.get("repo_is_empty") is not True
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_empty_when_all_subdir_fetches_succeed(self):
+        """A fully-read, genuinely empty repo still classifies as greenfield."""
+        root_files = [
+            {"name": "README.md", "type": "file"},
+            {"name": "docs", "type": "dir"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        # docs/ fetched successfully and contains no real source.
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 200
+        subdir_resp.json.return_value = [
+            {"name": "guide.md", "type": "file"},
+        ]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["repo_is_empty"] is True
+
 
 class TestMaybeRefreshEmptyBuildConfig:
     """Auto-refresh of an empty stored build_config once a repo gains structure."""
@@ -1602,3 +1675,14 @@ class TestClassifyRepoEmptiness:
             {"name": "README.md", "type": "file"},
         ]
         assert _classify_repo_emptiness(items) is True
+
+    def test_incomplete_listing_is_not_empty(self):
+        """An incomplete read can never be classified as greenfield."""
+        # Even an empty fetched listing degrades to not-empty when the read
+        # was incomplete (a subdir fetch failed).
+        assert _classify_repo_emptiness([], listing_complete=False) is False
+
+    def test_incomplete_listing_overrides_below_threshold(self):
+        """Below-threshold source + incomplete read => still not empty."""
+        items = [{"name": "README.md", "type": "file"}]
+        assert _classify_repo_emptiness(items, listing_complete=False) is False

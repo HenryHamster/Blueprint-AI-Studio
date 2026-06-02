@@ -103,18 +103,30 @@ def _is_real_source_file(name: str) -> bool:
     return True
 
 
-def _classify_repo_emptiness(root_items: list[Dict[str, Any]]) -> bool:
+def _classify_repo_emptiness(
+    root_items: list[Dict[str, Any]], listing_complete: bool = True
+) -> bool:
     """Classify a repo as empty / near-empty from fetched contents listings.
 
-    Returns True when the repository has at most
-    ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across the fetched
-    root listing and the already-fetched first-level subdirectory listings.
-    Documentation/config/data files, dotfiles, and common manifests are not
-    counted as source.
+    Returns True ONLY when the repository was read successfully and completely
+    AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across
+    the fetched root listing and the already-fetched first-level subdirectory
+    listings. Documentation/config/data files, dotfiles, and common manifests
+    are not counted as source.
+
+    ``listing_complete`` is the positive confirmation that every listing needed
+    to make this determination was fetched. When it is False (e.g. a
+    first-level subdirectory listing failed to fetch), emptiness is
+    indeterminate and this returns False (treat-as-non-empty) — a repo whose
+    real source lives in a subdirectory we could not read must never be
+    bootstrapped as greenfield on a transient fetch error.
 
     ``root_items`` is the raw GitHub ``contents/`` listings already fetched by
     :func:`_detect_build_config`, so it adds zero GitHub cost.
     """
+    if not listing_complete:
+        return False
+
     source_file_count = 0
     for item in root_items:
         if not isinstance(item, dict):
@@ -179,6 +191,10 @@ async def _detect_build_config(
     directories: list[Dict[str, Any]] = []
     languages: list[str] = []
     source_items: list[Dict[str, Any]] = list(root_listing)
+    # Positive confirmation that every listing needed for the emptiness
+    # determination was fetched. Any failed first-level subdirectory fetch
+    # flips this to False so the repo is not falsely classified as greenfield.
+    listing_complete = True
 
     # Detect Python project
     if (
@@ -248,6 +264,14 @@ async def _detect_build_config(
             params=params,
         )
         if sub_resp.status_code != 200:
+            # We could not fully read this subdirectory. Record the incomplete
+            # read so emptiness classification degrades to "not empty" rather
+            # than silently concluding greenfield over a partial listing.
+            logger.warning(
+                f"[ONBOARD] Failed to list subdir {subdir} for {owner}/{repo}: "
+                f"{sub_resp.status_code}; treating repo read as incomplete"
+            )
+            listing_complete = False
             continue
         sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
         source_items.extend(sub_listing)
@@ -299,7 +323,9 @@ async def _detect_build_config(
         # + first-level subdirectory listings (zero extra GitHub cost). Must
         # stay aligned with agent/src/prompts/discovery.ts and the threshold in
         # agent/src/constants.ts.
-        "repo_is_empty": _classify_repo_emptiness(source_items),
+        "repo_is_empty": _classify_repo_emptiness(
+            source_items, listing_complete=listing_complete
+        ),
     }
 
     return config
