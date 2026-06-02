@@ -482,6 +482,7 @@ async def detect_project_build_config(
 
     from pydantic import ValidationError
 
+    from app.build_config_detection import apply_operator_build_config_overrides
     from app.github import get_repo_installation_token
     from app.routers.admin_onboard import _detect_build_config
     from app.schemas import BuildConfig as BuildConfigSchema
@@ -497,36 +498,9 @@ async def detect_project_build_config(
         token, project.github_owner, project.github_repo
     )
 
-    existing = project.build_config or {}
-    if existing.get("git_user_email"):
-        detected["git_user_email"] = existing["git_user_email"]
-    if existing.get("git_user_name"):
-        detected["git_user_name"] = existing["git_user_name"]
-    if "env_vars" in existing:
-        detected["env_vars"] = existing["env_vars"]
-    if "enable_fresh_reviewer" in existing:
-        detected["enable_fresh_reviewer"] = existing["enable_fresh_reviewer"]
-    if "enable_parallel_review" in existing:
-        detected["enable_parallel_review"] = existing["enable_parallel_review"]
-    if "enable_parallel_fix" in existing:
-        detected["enable_parallel_fix"] = existing["enable_parallel_fix"]
-    # Per-project branch/PR naming overrides are user-set and not detectable
-    # from repo contents; preserve them across re-detect so operators do not
-    # lose deliberate customization.
-    if "task_branch_namespace" in existing:
-        detected["task_branch_namespace"] = existing["task_branch_namespace"]
-    if "task_branch_prefix" in existing:
-        detected["task_branch_prefix"] = existing["task_branch_prefix"]
-    if "pr_title_prefix" in existing:
-        detected["pr_title_prefix"] = existing["pr_title_prefix"]
-    if "staging_branch_prefixes" in existing:
-        detected["staging_branch_prefixes"] = existing["staging_branch_prefixes"]
-    if "stale_branch_prefixes" in existing:
-        detected["stale_branch_prefixes"] = existing["stale_branch_prefixes"]
-    if "protected_branches" in existing:
-        detected["protected_branches"] = existing["protected_branches"]
-    if "enable_self_improvement" in existing:
-        detected["enable_self_improvement"] = existing["enable_self_improvement"]
+    detected = apply_operator_build_config_overrides(
+        detected, project.build_config or {}
+    )
 
     try:
         validated = BuildConfigSchema(**detected) if detected else BuildConfigSchema()

@@ -89,6 +89,21 @@ The `onboard_project` handler in `admin_onboard.py` derives the rest:
   `package.json`, `go.mod`, `Cargo.toml`, etc., and seeds per-directory
   install/lint/build/test commands. The detected dict is validated against the
   `BuildConfig` schema before being stored.
+- **`build_config.repo_is_empty`** is a **deterministic empty/near-empty repo
+  signal** computed by `_classify_repo_emptiness` from the same root listing
+  `_detect_build_config` already fetched (zero extra GitHub cost). It is `True`
+  when the repo has no source directories and every root file is a recognized
+  non-source scaffolding/config file (`README*`, `LICENSE*`, `CONTRIBUTING*`,
+  `CODE_OF_CONDUCT*`, `.gitignore`, `.gitattributes`, CI/editor dotfiles; the
+  `.github`/`.git` dirs are ignored), else `False`. It is surfaced on the agent
+  claim response as the top-level `repo_is_empty` field, where the research/plan
+  prompt uses it to gate the "nearly empty → bootstrap the foundation from the
+  goal" guidance — greenfield agents reliably get it; mature-repo agents stop
+  seeing it as noise. This is distinct from `first_task_on_repo` (a playbook-count
+  proxy): `repo_is_empty` reflects actual source presence. Re-detecting build
+  config (`POST /projects/{id}/detect-build-config`) refreshes the value, so once
+  a greenfield repo is scaffolded the signal flips to `False`. Pre-existing
+  projects without the field degrade gracefully to falsy.
 - **`task_branch_namespace`** is **slugified from the repo name** by
   `_derive_task_branch_namespace` (lowercased, non-alphanumerics → `-`, capped at
   40 chars) and stored inside `build_config`. Agent task branches are then named

@@ -879,6 +879,67 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_session):
+    """The claim response surfaces build_config.repo_is_empty as top-level repo_is_empty.
+
+    This is the deterministic empty-repo signal computed at onboarding; the agent
+    research prompt gates bootstrap-from-goal guidance on it.
+    """
+    project_empty = Project(
+        name="Empty Repo",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="greenfield",
+        build_config={"repo_is_empty": True},
+        design_doc={"vision": "greenfield project"},
+    )
+    db_session.add(project_empty)
+    await db_session.commit()
+    await db_session.refresh(project_empty)
+
+    task_empty = Task(
+        project_id=project_empty.id,
+        payloads=[{"type": "research", "prompt": "do something"}],
+        vm_instance_id="agent-vm-empty-1",
+    )
+    db_session.add(task_empty)
+    await db_session.commit()
+    await db_session.refresh(task_empty)
+
+    token = create_agent_token(str(task_empty.id), "agent-vm-empty-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert resp.json()["repo_is_empty"] is True
+
+    # A project without the signal (older onboarding / detected source) → False.
+    project_mature = Project(
+        name="Mature Repo",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="established",
+        build_config={"language": "python"},
+        design_doc={"vision": "established project"},
+    )
+    db_session.add(project_mature)
+    await db_session.commit()
+    await db_session.refresh(project_mature)
+
+    task_mature = Task(
+        project_id=project_mature.id,
+        payloads=[{"type": "research", "prompt": "do something"}],
+        vm_instance_id="agent-vm-mature-1",
+    )
+    db_session.add(task_mature)
+    await db_session.commit()
+    await db_session.refresh(task_mature)
+
+    token2 = create_agent_token(str(task_mature.id), "agent-vm-mature-1")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+    assert resp2.json()["repo_is_empty"] is False
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_enable_self_improvement_driven_by_build_config(
     client: AsyncClient, db_session
 ):

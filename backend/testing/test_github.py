@@ -1680,6 +1680,87 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_pr_merged_on_integration_triggers_build_config_refresh(
+    client, db_session, mocker
+):
+    """A merge onto the integration branch invokes the empty-build_config
+    auto-refresh with the landed project."""
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Refresh On Land",
+        user_id="user1",
+        github_owner="refreshorg",
+        github_repo="refreshrepo",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload_bytes = _make_pr_merged_payload(
+        "refreshorg", "refreshrepo", 71, base_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    refresh_mock.assert_awaited_once()
+    assert refresh_mock.await_args.args[0].id == project.id
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_on_non_integration_branch_skips_build_config_refresh(
+    client, db_session, mocker
+):
+    """A merge onto a non-integration (staging/promotion) branch must NOT
+    invoke the auto-refresh."""
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="No Refresh Off Integration",
+        user_id="user1",
+        github_owner="skiporg",
+        github_repo="skiprepo",
+        integration_branch="develop",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload_bytes = _make_pr_merged_payload(
+        "skiporg", "skiprepo", 72, base_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    refresh_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_pr_merged_to_distinct_promotion_target_alerts_without_pr_merged(
     client, db_session, mocker
 ):

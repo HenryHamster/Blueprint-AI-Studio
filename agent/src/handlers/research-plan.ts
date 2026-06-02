@@ -833,6 +833,24 @@ export function buildPortfolioComposition(
   return lines.join('\n');
 }
 
+/**
+ * Bootstrap-from-goal research guidance, gated on the deterministic
+ * onboarding-time empty-repo signal (`task.repo_is_empty`, persisted as
+ * `build_config.repo_is_empty`).
+ *
+ * Returns the "nearly empty codebase → bootstrap the foundation" paragraph
+ * ONLY when the repo was classified empty/near-empty at onboarding. Mature-repo
+ * agents (`repo_is_empty` falsy) get `''`, so the guidance stops appearing as
+ * noise in every research prompt. The leading blank line keeps spacing when the
+ * paragraph is interpolated between other mission bullets.
+ */
+export function buildEmptyRepoGuidance(task: Record<string, unknown>): string {
+  if (!task.repo_is_empty) return '';
+  return `\n**If the codebase is nearly empty** (few source files, mostly config/scaffolding): this is
+normal for new projects. Use the design doc specs and the project's config files to create
+foundational structure. Output a large-scope finding that bootstraps the target system.\n`;
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1258,6 +1276,7 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
 
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
   const researchPrompt = `${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
@@ -1275,10 +1294,7 @@ full codebase and wrote that spec to fit the existing stack. Follow its approach
 choices, and integration points. You should still explore the codebase to verify the spec
 makes sense, but don't redesign from scratch when a spec exists.
 
-**If the codebase is nearly empty** (few source files, mostly config/scaffolding): this is
-normal for new projects. Use the design doc specs and the project's config files to create
-foundational structure. Output a large-scope finding that bootstraps the target system.
-
+${researchEmptyRepoGuidance}
 **If a direction targets something EXISTING** (the design document shows it as partial, functional,
 or mature): your job is to IMPROVE it. Find specific, high-impact changes — missing capabilities,
 broken assumptions, architectural bottlenecks, or small fixes that prevent cascade failures.

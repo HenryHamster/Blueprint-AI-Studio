@@ -458,6 +458,22 @@ async def github_webhook(
                             mutated_tasks = True
                     if mutated_tasks:
                         await session.commit()
+                    # Once a bootstrapped repo gains a project structure on its
+                    # integration branch, refresh an empty build_config so
+                    # verification commands exist without a manual admin step.
+                    # Best-effort + idempotent (cheap in-memory directories
+                    # guard); skip staging/rollup merges by gating on the
+                    # integration branch.
+                    if pr_base_branch and pr_base_branch == (
+                        get_project_integration_branch(project)
+                    ):
+                        from app.build_config_detection import (
+                            maybe_refresh_empty_build_config,
+                        )
+
+                        await maybe_refresh_empty_build_config(
+                            project, session, ref=pr_base_branch
+                        )
                     if affected_tasks:
                         from app.rollup_management import _check_and_trigger_rollup
 

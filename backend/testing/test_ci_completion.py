@@ -1782,6 +1782,67 @@ async def test_orig_task_gets_pr_merged_flag_on_success(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_integration_landing_triggers_build_config_refresh(db_session, mocker):
+    """When a feature task's PR lands on the integration branch, the empty
+    build_config auto-refresh runs against the landed project."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Refresh on integration landing",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="scaffolded",
+        integration_branch="main",
+        build_config={"language": "python", "directories": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        context={},
+        vm_instance_id="agent-vm-orig-refresh",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    refresh_mock.assert_awaited_once()
+    # Called with the landed project and the integration branch ref.
+    assert refresh_mock.await_args.args[0].id == project.id
+    assert refresh_mock.await_args.kwargs.get("ref") == "main"
+
+
+@pytest.mark.asyncio
 async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
     db_session, mocker
 ):

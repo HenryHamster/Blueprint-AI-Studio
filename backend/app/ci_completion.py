@@ -444,6 +444,24 @@ async def _attempt_merge_with_retry_and_escalation(
                                 )
                         _orig_session.add(orig)
                         await _orig_session.commit()
+                        # Once a bootstrapped repo gains a project structure on
+                        # its integration branch, refresh an empty build_config
+                        # so verification commands exist without a manual step.
+                        # Best-effort + idempotent (cheap in-memory guard).
+                        if (
+                            record_pr_merged
+                            and orig_project is not None
+                            and ci_base == _integration_branch
+                        ):
+                            from app.build_config_detection import (
+                                maybe_refresh_empty_build_config,
+                            )
+
+                            await maybe_refresh_empty_build_config(
+                                orig_project,
+                                _orig_session,
+                                ref=_integration_branch,
+                            )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True

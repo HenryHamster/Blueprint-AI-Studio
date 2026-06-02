@@ -7,7 +7,11 @@ from httpx import AsyncClient
 from app.main import app
 from app.models import Project, ProjectMessage, ProjectStatus
 from app.auth import get_current_user, require_admin
-from app.routers.admin_onboard import _detect_build_config, _seed_strategic_intent
+from app.routers.admin_onboard import (
+    _detect_build_config,
+    _classify_repo_emptiness,
+    _seed_strategic_intent,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -1081,3 +1085,354 @@ class TestBuildConfigDetection:
                 assert test_cmd.startswith("python3 -m pytest"), (
                     f"pytest test_cmd must use 'python3 -m pytest'; got {test_cmd!r}"
                 )
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_forwards_ref_to_every_request(self):
+        """When ``ref`` is provided it is forwarded as params={'ref': ...} to
+        every GitHub contents call (root listing + each subdir)."""
+        root_files = [
+            {"name": "backend", "type": "dir"},
+        ]
+        subdir_files = [
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 200
+        subdir_resp.json.return_value = subdir_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
+        ) as mock_req:
+            await _detect_build_config(
+                "fake-token", "owner", "repo", ref="feature-x"
+            )
+
+        assert mock_req.call_count == 2
+        for call in mock_req.call_args_list:
+            assert call.kwargs.get("params") == {"ref": "feature-x"}
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_omits_params_when_no_ref(self):
+        """Regression guard: ref=None must send no params (default-branch
+        behavior identical to before the ref parameter was added)."""
+        root_files = [
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ) as mock_req:
+            await _detect_build_config("fake-token", "owner", "repo")
+
+        assert mock_req.call_count == 1
+        assert mock_req.call_args.kwargs.get("params") is None
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_sets_repo_is_empty_for_readme_only(self):
+        """A repo with only a README is classified empty → repo_is_empty True."""
+        root_files = [
+            {"name": "README.md", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["repo_is_empty"] is True
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_sets_repo_is_empty_false_for_source(self):
+        """A repo with a source manifest is classified non-empty → repo_is_empty False."""
+        root_files = [
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["repo_is_empty"] is False
+
+
+class TestMaybeRefreshEmptyBuildConfig:
+    """Auto-refresh of an empty stored build_config once a repo gains structure."""
+
+    @staticmethod
+    def _detected_with_directories():
+        return {
+            "language": "python",
+            "directories": [
+                {
+                    "path": "backend",
+                    "type": "python",
+                    "test_cmd": "python3 -m pytest",
+                }
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_refreshes_when_directories_empty(self, db_session):
+        """Empty stored directories + repo now has a manifest => config refreshed."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Bootstrap",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="bootstrap-repo",
+            integration_branch="develop",
+            build_config={"language": "python", "directories": []},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=self._detected_with_directories(),
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is True
+        # Detection ran against the project's integration branch.
+        mock_detect.assert_awaited_once()
+        assert mock_detect.await_args.kwargs.get("ref") == "develop"
+        await db_session.refresh(project)
+        dirs = (project.build_config or {}).get("directories")
+        assert dirs and dirs[0]["path"] == "backend"
+
+    @pytest.mark.asyncio
+    async def test_noop_when_directories_already_populated(self, db_session):
+        """Populated directories => return immediately with NO GitHub call."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Configured",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="configured-repo",
+            integration_branch="develop",
+            build_config={
+                "language": "python",
+                "directories": [{"path": ".", "type": "python"}],
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+            ) as mock_token,
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is False
+        mock_detect.assert_not_awaited()
+        mock_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_preserves_operator_overrides(self, db_session):
+        """Operator-set fields survive the auto-refresh."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Overrides",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="overrides-repo",
+            integration_branch="develop",
+            build_config={
+                "language": "python",
+                "directories": [],
+                "env_vars": {"FOO": "bar"},
+                "task_branch_namespace": "team-x",
+                "protected_branches": ["main", "release"],
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value=self._detected_with_directories(),
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is True
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+        assert bc.get("env_vars") == {"FOO": "bar"}
+        assert bc.get("task_branch_namespace") == "team-x"
+        assert bc.get("protected_branches") == ["main", "release"]
+        assert (bc.get("directories") or [{}])[0].get("path") == "backend"
+
+    @pytest.mark.asyncio
+    async def test_detection_empty_leaves_config_unchanged(self, db_session):
+        """Detection finding no directories => config untouched, no crash, no commit."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        original = {"language": "python", "directories": []}
+        project = Project(
+            name="StillEmpty",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="still-empty-repo",
+            integration_branch="develop",
+            build_config=dict(original),
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is False
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("directories") == []
+
+    @pytest.mark.asyncio
+    async def test_swallows_detection_exception(self, db_session):
+        """A detection failure is logged and swallowed, never raised."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Boom",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="boom-repo",
+            integration_branch="develop",
+            build_config={"language": "python", "directories": []},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("github down"),
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is False
+
+
+class TestClassifyRepoEmptiness:
+    """Unit tests for the pure _classify_repo_emptiness helper."""
+
+    def test_truly_empty_repo(self):
+        assert _classify_repo_emptiness([]) is True
+
+    def test_readme_and_license_only(self):
+        items = [
+            {"name": "README.md", "type": "file"},
+            {"name": "LICENSE", "type": "file"},
+        ]
+        assert _classify_repo_emptiness(items) is True
+
+    def test_ci_and_config_dotfiles_only(self):
+        items = [
+            {"name": ".github", "type": "dir"},
+            {"name": ".gitignore", "type": "file"},
+            {"name": ".editorconfig", "type": "file"},
+            {"name": "CONTRIBUTING.md", "type": "file"},
+            {"name": "CODE_OF_CONDUCT.md", "type": "file"},
+        ]
+        assert _classify_repo_emptiness(items) is True
+
+    def test_source_directory_makes_non_empty(self):
+        items = [
+            {"name": "README.md", "type": "file"},
+            {"name": "src", "type": "dir"},
+        ]
+        assert _classify_repo_emptiness(items) is False
+
+    def test_source_manifest_makes_non_empty(self):
+        items = [
+            {"name": "README.md", "type": "file"},
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        assert _classify_repo_emptiness(items) is False
+
+    def test_arbitrary_source_file_makes_non_empty(self):
+        items = [
+            {"name": "main.py", "type": "file"},
+        ]
+        assert _classify_repo_emptiness(items) is False
+
+    def test_git_dir_ignored(self):
+        items = [
+            {"name": ".git", "type": "dir"},
+            {"name": "README.md", "type": "file"},
+        ]
+        assert _classify_repo_emptiness(items) is True
+
+    def test_malformed_items_skipped(self):
+        items = [
+            "not-a-dict",
+            {"type": "file"},  # no name
+            {"name": "", "type": "file"},
+            {"name": "README.md", "type": "file"},
+        ]
+        assert _classify_repo_emptiness(items) is True

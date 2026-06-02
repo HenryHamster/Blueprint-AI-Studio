@@ -1124,6 +1124,132 @@ class TestUpdateProjectOwnerOnlyFields:
         assert (project.build_config or {}).get("task_branch_prefix") == "bot/"
         assert (project.build_config or {}).get("pr_title_prefix") == "[bot] "
 
+    @pytest.mark.asyncio
+    async def test_detect_build_config_refreshes_repo_is_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-detect overwrites a stale repo_is_empty once the repo is scaffolded.
+
+        A project onboarded empty (repo_is_empty True) should flip to False on
+        re-detect when detection now finds source — repo_is_empty is NOT in the
+        operator-preserve set, so a fresh detection value wins.
+        """
+        project = await _make_project(db_session, name="Detect Repo Emptiness")
+        project.github_owner = "acme"
+        project.github_repo = "scaffolded-repo"
+        project.build_config = {"repo_is_empty": True}
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python", "repo_is_empty": False},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/detect-build-config"
+            )
+
+        assert resp.status_code == 200
+        build_config = resp.json().get("build_config") or {}
+        assert build_config.get("repo_is_empty") is False
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("repo_is_empty") is False
+
+
+class TestApplyOperatorBuildConfigOverrides:
+    """Unit coverage for the shared override-preservation helper."""
+
+    def test_preserves_all_operator_fields(self):
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"language": "typescript", "directories": []}
+        existing = {
+            "git_user_email": "bot@example.com",
+            "git_user_name": "Bot",
+            "env_vars": {"TOKEN": "secret"},
+            "enable_fresh_reviewer": True,
+            "enable_parallel_review": True,
+            "enable_parallel_fix": False,
+            "task_branch_namespace": "agents",
+            "task_branch_prefix": "bot/",
+            "pr_title_prefix": "[bot] ",
+            "staging_branch_prefixes": ["staging/"],
+            "stale_branch_prefixes": ["old/"],
+            "protected_branches": ["main"],
+            "enable_self_improvement": True,
+        }
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        # Detected fields untouched.
+        assert merged["language"] == "typescript"
+        # Every operator-owned field carried forward.
+        assert merged["git_user_email"] == "bot@example.com"
+        assert merged["git_user_name"] == "Bot"
+        assert merged["env_vars"] == {"TOKEN": "secret"}
+        assert merged["enable_fresh_reviewer"] is True
+        assert merged["enable_parallel_review"] is True
+        assert merged["enable_parallel_fix"] is False
+        assert merged["task_branch_namespace"] == "agents"
+        assert merged["task_branch_prefix"] == "bot/"
+        assert merged["pr_title_prefix"] == "[bot] "
+        assert merged["staging_branch_prefixes"] == ["staging/"]
+        assert merged["stale_branch_prefixes"] == ["old/"]
+        assert merged["protected_branches"] == ["main"]
+        assert merged["enable_self_improvement"] is True
+
+    def test_preserves_empty_list_branch_overrides(self):
+        """Empty-list branch overrides are present-keyed, so they survive."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"protected_branches": ["main"], "stale_branch_prefixes": ["x/"]}
+        existing = {
+            "staging_branch_prefixes": [],
+            "stale_branch_prefixes": [],
+            "protected_branches": [],
+        }
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        assert merged["staging_branch_prefixes"] == []
+        assert merged["stale_branch_prefixes"] == []
+        assert merged["protected_branches"] == []
+
+    def test_falsey_git_identity_not_preserved(self):
+        """git_user_* use a truthy check, so empty values do not override."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"language": "go"}
+        existing = {"git_user_email": "", "git_user_name": ""}
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        assert "git_user_email" not in merged
+        assert "git_user_name" not in merged
+
+    def test_empty_existing_is_noop(self):
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"language": "rust", "directories": []}
+        merged = apply_operator_build_config_overrides(detected, {})
+        assert merged == {"language": "rust", "directories": []}
+
 
 class TestBuildConfigLintWarnings:
     """Operator-visible warnings when build_config.directories[*].lint_cmd

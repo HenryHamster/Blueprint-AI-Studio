@@ -43,13 +43,95 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
     return slug[:40] if slug else "project"
 
 
-async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, Any]:
+# Root files that do NOT count as source code — their presence alone does not
+# make a repo "non-empty". Matched case-insensitively by stem-prefix (e.g.
+# "README.md", "LICENSE.txt") or exact name for the dotfiles. Source manifests
+# (pyproject.toml, package.json, go.mod, Cargo.toml, etc.) are deliberately
+# absent so a scaffolded repo is correctly classified as non-empty.
+_NON_SOURCE_FILE_PREFIXES = (
+    "readme",
+    "license",
+    "licence",
+    "contributing",
+    "code_of_conduct",
+    "changelog",
+    "authors",
+    "notice",
+    "security",
+)
+_NON_SOURCE_EXACT_FILES = frozenset(
+    {
+        ".gitignore",
+        ".gitattributes",
+        ".editorconfig",
+        ".gitmodules",
+        ".dockerignore",
+        ".npmrc",
+        ".nvmrc",
+        ".prettierrc",
+        ".eslintrc",
+        ".pre-commit-config.yaml",
+    }
+)
+# Root directories that are infrastructure/metadata, not source code.
+_NON_SOURCE_DIRS = frozenset({".github", ".git", ".circleci", ".gitlab"})
+
+
+def _classify_repo_emptiness(root_items: list[Dict[str, Any]]) -> bool:
+    """Classify a repo as empty / near-empty from its root contents listing.
+
+    Returns True when the repository contains no source directories and every
+    root file is a recognized non-source scaffolding/config file (README,
+    LICENSE, CONTRIBUTING, CI/editor dotfiles, etc.). Returns False as soon as
+    any source directory or any unrecognized (i.e. likely source) root file is
+    present.
+
+    ``root_items`` is the raw GitHub ``contents/`` listing (each item a dict
+    with ``name`` and ``type``). Designed to run on the listing already fetched
+    by :func:`_detect_build_config`, so it adds zero GitHub cost.
+    """
+    for item in root_items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        item_type = item.get("type")
+
+        if item_type == "dir":
+            if name.lower() in _NON_SOURCE_DIRS:
+                continue
+            # Any non-infrastructure directory implies source structure.
+            return False
+
+        # File: must be a recognized non-source file, else treat as source.
+        lowered = name.lower()
+        if lowered in _NON_SOURCE_EXACT_FILES:
+            continue
+        if lowered.startswith(".") and "." not in lowered[1:]:
+            # Bare config dotfiles (e.g. ".env", ".tool-versions") are scaffolding.
+            continue
+        if any(lowered.startswith(prefix) for prefix in _NON_SOURCE_FILE_PREFIXES):
+            continue
+        # Unrecognized root file — assume it is (or accompanies) source code.
+        return False
+
+    return True
+
+
+async def _detect_build_config(
+    token: str, owner: str, repo: str, ref: str | None = None
+) -> Dict[str, Any]:
     """Auto-detect build configuration by inspecting the repo's root files.
 
     The detector is intentionally shallow: it looks at the repository root and
     one level of subdirectories to seed directory-specific install/lint/build
     commands, then returns a BuildConfig-shaped dict that onboarding can merge
     with operator overrides.
+
+    When ``ref`` is provided, every GitHub contents API call targets that
+    branch/ref instead of the repository's default branch. When ``ref`` is
+    None the requests are identical to the default-branch behavior.
     """
     from app.github import _github_request
 
@@ -58,6 +140,9 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    # Only attach ?ref=... when a ref was requested, so default-branch
+    # detection issues byte-identical requests to before.
+    params = {"ref": ref} if ref is not None else None
 
     # Fetch root directory listing
     resp = await _github_request(
@@ -65,6 +150,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         f"https://api.github.com/repos/{owner}/{repo}/contents/",
         headers,
         max_retries=2,
+        params=params,
     )
     if resp.status_code != 200:
         logger.warning(
@@ -143,6 +229,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             f"https://api.github.com/repos/{owner}/{repo}/contents/{subdir}",
             headers,
             max_retries=1,
+            params=params,
         )
         if sub_resp.status_code != 200:
             continue
@@ -190,6 +277,12 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         "directories": directories,
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
+        # Deterministic empty/near-empty signal from the root listing already
+        # fetched above (zero extra GitHub cost). Gates the research prompt's
+        # bootstrap-from-goal guidance on real code presence.
+        "repo_is_empty": _classify_repo_emptiness(
+            [item for item in resp.json() if isinstance(item, dict)]
+        ),
     }
 
     return config

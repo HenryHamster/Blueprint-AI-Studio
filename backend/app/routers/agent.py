@@ -1862,6 +1862,13 @@ async def claim_task(
             if k.startswith("playbook/")
         )
         response["first_task_on_repo"] = total_playbook_count == 0
+        # Deterministic empty/near-empty repo signal persisted at onboarding
+        # (build_config.repo_is_empty). Distinct from first_task_on_repo (a
+        # playbook-count proxy): this reflects actual source presence, so the
+        # research prompt can gate bootstrap-from-goal guidance on real code.
+        response["repo_is_empty"] = bool(
+            (project_for_playbook.build_config or {}).get("repo_is_empty")
+        )
         if playbook_entries:
             response["playbook"] = playbook_entries
             # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response

@@ -79,6 +79,7 @@ import {
   buildMemoCitationsSection,
   resolveMemoHandles,
   buildEfficiencySnapshotSection,
+  buildEmptyRepoGuidance,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -826,6 +827,27 @@ describe('buildPortfolioComposition', () => {
     expect(out).not.toContain('CONCENTRATION RISK');
     expect(out).not.toContain('In-flight scope mix');
     expect(out).not.toContain('System coverage');
+  });
+});
+
+describe('buildEmptyRepoGuidance', () => {
+  it('returns the bootstrap paragraph when repo_is_empty is truthy', () => {
+    const out = buildEmptyRepoGuidance({ repo_is_empty: true });
+    expect(out).toContain('If the codebase is nearly empty');
+    expect(out).toContain('bootstraps the target system');
+  });
+
+  it('returns empty string when repo_is_empty is false', () => {
+    expect(buildEmptyRepoGuidance({ repo_is_empty: false })).toBe('');
+  });
+
+  it('returns empty string when repo_is_empty is absent', () => {
+    expect(buildEmptyRepoGuidance({})).toBe('');
+  });
+
+  it('returns empty string for non-boolean falsy values', () => {
+    expect(buildEmptyRepoGuidance({ repo_is_empty: 0 })).toBe('');
+    expect(buildEmptyRepoGuidance({ repo_is_empty: '' })).toBe('');
   });
 });
 
