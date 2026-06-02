@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
@@ -83,7 +84,6 @@ from app.review_loop_convergence import (
     _EARLY_REPEATING_ISSUES_PREFIX,
     _MID_BUDGET_NARROW_FOCUS_PREFIX,
     _SCOPE_PRESSURE_HARD_CAP_PREFIX,
-    _handle_cap_exhaustion,
     _is_pipeline_task_stale,
     _set_review_loop_terminal_outcome,
 )
@@ -266,6 +266,7 @@ def _is_rollup_chain_source(source_task: "Task") -> bool:
 WARM_HANDOFF_WINDOW_SECS = 240
 
 
+
 def _max_review_iterations(task: Task, direction_data: dict | None = None) -> int:
     """Scope-aware review-fix iteration limit, optionally reduced for low-quality directions.
 
@@ -334,6 +335,511 @@ def _max_review_iterations(task: Task, direction_data: dict | None = None) -> in
         limit = max(limit - prior_consumed // 2, 3)
 
     return min(limit, MAX_REVIEW_FIX_ITERATIONS)
+
+
+async def _cap_exhausted_after_approve(
+    orig: Task,
+    source_task: Task,
+    resolved_original_id: str,
+    pr_number: int,
+    session: AsyncSession,
+) -> bool:
+    """FIX D: decide whether the review-fix cap was hit on an ALREADY-APPROVED
+    PR (a benign non-convergence on the merge mechanics, e.g. repeated rebase /
+    CI-flap churn after sign-off) rather than a genuine unresolved review
+    rejection.
+
+    Returns True when the last recorded verdict is APPROVE / clean:
+      • the parent (``orig``) or the source task carries
+        ``review_loop.review_approved == True`` (or legacy verdict == APPROVE);
+      • the most recent chain review task recorded
+        ``blueprint_review_verdict == 'APPROVE'``;
+      • the latest iteration has ZERO outstanding CHANGES_REQUESTED issues.
+
+    GUARDRAIL: any outstanding CHANGES_REQUESTED on the latest iteration (a
+    genuine non-convergence) → returns False so the caller keeps today's
+    FAILED + CODE_ERROR path.
+    """
+    # (1) Outstanding CHANGES_REQUESTED on the latest iteration is a hard veto —
+    # check it FIRST so an approval flag from an earlier round can never override
+    # a later unresolved rejection.
+    for t in (orig, source_task):
+        rl = (t.context or {}).get("review_loop") or {}
+        if rl.get("verdict") == "REJECT" or rl.get("review_changes_requested"):
+            return False
+        history = rl.get("review_history") or []
+        if history:
+            last = history[-1] or {}
+            if (last.get("verdict") or "").upper() in (
+                "REJECT",
+                "CHANGES_REQUESTED",
+            ):
+                return False
+            if last.get("issues"):
+                return False
+
+    # (2) Parent / source approval flag.
+    for t in (orig, source_task):
+        rl = (t.context or {}).get("review_loop") or {}
+        if rl.get("review_approved") is True or rl.get("verdict") == "APPROVE":
+            return True
+        if (t.context or {}).get("blueprint_review_verdict") == "APPROVE":
+            return True
+
+    # (3) Most recent chain review task's recorded verdict.
+    try:
+        review_rows = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.project_id == orig.project_id,
+                        Task.status.in_(
+                            [TaskStatus.COMPLETED, TaskStatus.EVALUATING]
+                        ),
+                    )
+                    .order_by(Task.completed_at.desc().nullslast())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for rt in review_rows:
+            rp = rt.first_payload or {}
+            if rp.get("type") != "review":
+                continue
+            if rp.get("pr_number") != pr_number:
+                continue
+            r_orig = rp.get("original_task_id") or ""
+            if r_orig and r_orig != resolved_original_id:
+                continue
+            verdict = (rt.context or {}).get("blueprint_review_verdict")
+            if verdict == "APPROVE":
+                return True
+            if verdict in ("REJECT", "CHANGES_REQUESTED"):
+                return False
+            # First matching chain review with a non-APPROVE/non-REJECT verdict
+            # is inconclusive; keep scanning older ones.
+    except Exception as _vq_err:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion verdict lookup failed for PR #{pr_number}: "
+            f"{_vq_err}"
+        )
+
+    return False
+
+
+async def _pr_is_preservable_on_cap(
+    orig: Task,
+    pr_number: int,
+    session: AsyncSession,
+) -> bool:
+    """FIX #3b: decide whether a capped rollup PR is worth PRESERVING (left open
+    for hand-merge) rather than destroyed (closed + FAILED + CODE_ERROR).
+
+    A PR is preservable only when it carries real, mergeable work:
+      • it is a rollup PR (rollup chains aggregate already-completed subtask work
+        — discarding the whole PR over review-loop non-convergence throws away
+        merged-elsewhere siblings), AND
+      • it is NON-EMPTY (``changed_files > 0`` — a branch rebased flat has
+        nothing to hand-merge), AND
+      • it is NOT a genuine merge conflict (``mergeable_state != 'dirty'`` — a
+        conflicted PR cannot be hand-merged without rework, so closing it is
+        correct).
+
+    GUARDRAIL: a genuinely broken/empty/conflicted PR returns False so the
+    caller keeps today's close+FAIL path. On any GitHub lookup failure we also
+    return False — when in doubt, fall back to the safe (destructive) path.
+    """
+    is_rollup = (orig.context or {}).get("_is_rollup_review") is True or (
+        orig.context or {}
+    ).get("_rollup_retries") is not None
+    if not is_rollup:
+        rollup_pr = (orig.context or {}).get("rollup_pr_number")
+        if rollup_pr and rollup_pr == pr_number:
+            is_rollup = True
+    if not is_rollup:
+        return False
+    try:
+        from app.github import get_pull_request
+        from app.routers.agent import get_github_token_for_task
+
+        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+        pr = await get_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: preservability lookup failed for PR "
+            f"#{pr_number}: {e} — falling back to close+FAIL"
+        )
+        return False
+    if (pr.get("state") or "").lower() != "open":
+        return False
+    if (pr.get("changed_files") or 0) <= 0:
+        return False
+    # 'dirty' = genuine merge conflict per GitHub. Any other state (clean,
+    # unstable, blocked, behind) is hand-mergeable. 'unknown'/None means GitHub
+    # hasn't computed it yet — treat conservatively as NOT preservable so we
+    # don't leave a possibly-conflicted PR dangling open.
+    mergeable_state = (pr.get("mergeable_state") or "").lower()
+    return mergeable_state not in ("dirty", "", "unknown")
+
+
+async def _handle_cap_exhaustion(
+    source_task: Task,
+    resolved_original_id: str,
+    pr_number: int,
+    iterations: int,
+    session: AsyncSession,
+    *,
+    scope: str,
+) -> None:
+    """Terminal handler when the review-fix iteration cap is hit.
+
+    Transitions the create task (``orig``) to FAILED with
+    failure_detail=review_cap_exhausted, closes the GitHub PR, and fires an
+    approval alert. Idempotent — safe to re-enter on the same orig without
+    duplicating side effects.
+
+    Why FAILED instead of COMPLETED+requires_approval:
+    The prior behaviour left the create task COMPLETED and relied on
+    requires_approval=True as a terminal signal, but rollup_management's
+    stale-unmerged respawn loop doesn't check that flag — it kept re-entering
+    the cap path every 10 min indefinitely. Marking FAILED routes the task
+    through the standard failure → partial-rollup path.
+
+    ``scope`` is either "global" (cross-chain) or "per-chain" — used only for
+    human-readable messages.
+    """
+    from app.failure_classification import CODE_ERROR, persist_failure_category
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.github import close_pull_request, create_pr_comment
+    from app.routers.agent import get_github_token_for_task
+    from app.routers.agent_status import record_task_result
+    from app.shared_state import record_direction_result
+    from sqlalchemy.orm.attributes import flag_modified
+
+    cap_label = "global" if scope == "global" else "per-chain"
+    source_task.latest_status_message = f"Review-fix cap reached for PR #{pr_number} ({iterations} iterations, {cap_label})"
+    session.add(source_task)
+
+    try:
+        orig = await session.get(Task, uuid.UUID(resolved_original_id))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to load orig {resolved_original_id[:8]}: {e}"
+        )
+        return
+    if orig is None:
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: orig {resolved_original_id[:8]} not found"
+        )
+        return
+
+    already_handled = orig.status in (
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ) and (orig.context or {}).get("failure_detail") in (
+        "review_cap_exhausted",
+        "cap_exhausted_after_approve",
+        "review_cap_preserved_for_handmerge",
+    )
+    if already_handled:
+        logger.info(
+            f"[PIPELINE] Cap re-triggered for PR #{pr_number} — orig {resolved_original_id[:8]} "
+            f"already terminal with {(orig.context or {}).get('failure_detail')}, "
+            f"skipping side effects"
+        )
+        await session.commit()
+        return
+
+    # FIX D: if the cap was exhausted on an already-APPROVED PR (benign merge-
+    # mechanics churn after sign-off, not an unresolved review rejection), land
+    # CANCELLED with failure_detail='cap_exhausted_after_approve' and do NOT
+    # record CODE_ERROR — that would falsely ding the account/direction for a
+    # non-failure. GUARDRAIL: _cap_exhausted_after_approve returns False on any
+    # outstanding CHANGES_REQUESTED, preserving today's FAILED + CODE_ERROR path
+    # for genuine non-convergence.
+    if await _cap_exhausted_after_approve(
+        orig, source_task, resolved_original_id, pr_number, session
+    ):
+        logger.info(
+            f"[PIPELINE] Cap reached for PR #{pr_number} AFTER approval — landing "
+            f"orig {resolved_original_id[:8]} CANCELLED (cap_exhausted_after_approve), "
+            f"no CODE_ERROR recorded"
+        )
+        orig.status = TaskStatus.CANCELLED
+        orig.latest_status_message = (
+            f"Review-fix cap reached ({iterations} iterations, {cap_label}) after "
+            f"approval — PR #{pr_number} auto-closed (no rejection)"
+        )
+        ctx = dict(orig.context or {})
+        ctx["failure_detail"] = "cap_exhausted_after_approve"
+        ctx["review_cap_iterations"] = iterations
+        # NB: deliberately NOT setting pr_rejected — this was an approved PR.
+        orig.context = ctx
+        flag_modified(orig, "context")
+        session.add(orig)
+        try:
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(after-approve): failed to commit orig "
+                f"{resolved_original_id[:8]}: {e}",
+                exc_info=True,
+            )
+            return
+        # Best-effort: still close the GitHub PR and record the terminal
+        # outcome for direction state, but as a SUCCESS-shaped (non-failure)
+        # signal — skip record_task_result/record_direction_result failure dings
+        # and the failure alert.
+        try:
+            from app.task_completion import _record_remediation_if_terminal
+
+            await _record_remediation_if_terminal(
+                orig, TaskStatus.CANCELLED, session
+            )
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(after-approve): remediation record "
+                f"failed for PR #{pr_number}: {e}"
+            )
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+            try:
+                await create_pr_comment(
+                    gh_token,
+                    owner,
+                    repo,
+                    pr_number,
+                    f"Auto-closed: review-fix cap reached ({iterations} iterations, "
+                    f"{cap_label}) after approval — no outstanding changes requested. "
+                    f"Work was signed off; closing as superseded.",
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"[PIPELINE] Cap-exhaustion(after-approve): comment failed on PR "
+                    f"#{pr_number}: {e}"
+                )
+            closed = await close_pull_request(
+                gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+            )
+            if closed:
+                logger.info(
+                    f"[PIPELINE] Closed PR #{pr_number} after approved-cap exhaustion "
+                    f"({iterations} iterations)"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(after-approve): PR close failed for "
+                f"#{pr_number}: {e}"
+            )
+        return
+
+    # FIX #3b: PRESERVE WORK ON CAP. When the cap is hit on REQUEST_CHANGES for a
+    # NON-EMPTY, conflict-free ROLLUP PR, the prior behaviour (close PR + FAIL +
+    # CODE_ERROR) destroyed salvageable aggregated work over review-loop
+    # non-convergence. Instead, leave the PR OPEN and flag the orig
+    # requires_approval so an operator can hand-merge it. The orig still lands
+    # terminal (FAILED routes through the partial-rollup path and stops the
+    # stale-unmerged respawn loop, per the docstring above) but with a distinct
+    # failure_detail, NO CODE_ERROR, NO pr_rejected, and NO PR close.
+    # GUARDRAIL: _pr_is_preservable_on_cap returns False for empty / conflicted /
+    # non-rollup PRs (and on any GitHub lookup failure) → those keep today's
+    # close+FAIL+CODE_ERROR path below.
+    if await _pr_is_preservable_on_cap(orig, pr_number, session):
+        logger.info(
+            f"[PIPELINE] Cap reached for PR #{pr_number} on a non-empty, "
+            f"conflict-free rollup — PRESERVING work: leaving PR open + flagging "
+            f"orig {resolved_original_id[:8]} requires_approval for hand-merge "
+            f"(no CODE_ERROR, no PR close)"
+        )
+        orig.status = TaskStatus.FAILED
+        # Always flag requires_approval here regardless of the global gate — the
+        # whole point of preservation is to route this to a human; without the
+        # flag the open PR would dangle with no owner.
+        orig.requires_approval = True
+        orig.latest_status_message = (
+            f"Review-fix cap reached ({iterations} iterations, {cap_label}) — "
+            f"PR #{pr_number} LEFT OPEN with mergeable work; manual hand-merge "
+            f"required (not auto-closed)"
+        )
+        ctx = dict(orig.context or {})
+        ctx["failure_detail"] = "review_cap_preserved_for_handmerge"
+        ctx["review_cap_iterations"] = iterations
+        ctx["pr_preserved_for_handmerge"] = True
+        # NB: deliberately NOT setting pr_rejected / CODE_ERROR — the work is
+        # salvageable, not a code failure, and the PR is NOT closed.
+        orig.context = ctx
+        flag_modified(orig, "context")
+        session.add(orig)
+        try:
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): failed to commit orig "
+                f"{resolved_original_id[:8]}: {e}",
+                exc_info=True,
+            )
+            return
+        try:
+            from app.task_completion import _record_remediation_if_terminal
+
+            await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): remediation record failed "
+                f"for PR #{pr_number}: {e}"
+            )
+        # Leave a PR comment so the operator knows it was left open on purpose.
+        # Do NOT close the PR.
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+            await create_pr_comment(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                f"Review-fix cap reached ({iterations} iterations, {cap_label}). "
+                f"This PR has mergeable work and no genuine conflict, so it was "
+                f"LEFT OPEN for manual hand-merge rather than auto-closed. "
+                f"Operator review required.",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): comment failed on PR "
+                f"#{pr_number}: {e}"
+            )
+        # Surface for the operator via the normal failure-alert channel — this
+        # IS a manual-intervention event even though the work is salvageable.
+        try:
+            await _maybe_create_failure_alert(
+                orig,
+                session,
+                f"PR #{pr_number} hit review-fix cap ({iterations} iterations, "
+                f"{cap_label}) — left open with mergeable work, hand-merge required",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): alert failed for PR "
+                f"#{pr_number}: {e}"
+            )
+        return
+
+    orig.status = TaskStatus.FAILED
+    # The approval gate is discretionary: only raise it when require_approval_gates
+    # is enabled. With gates off the operator has opted out of manual gating, so the
+    # capped child still FAILs (terminal → routes through the normal partial-rollup
+    # path) but we must NOT set requires_approval. Otherwise rollup_management
+    # escalates this child's flag onto the parent (rollup_management.py ~1086) and
+    # services.py's 2h approval-gate timeout then FAILs the otherwise-healthy parent,
+    # discarding its already-merged siblings.
+    if _runtime_config.get("require_approval_gates", True):
+        orig.requires_approval = True
+    orig.latest_status_message = (
+        f"Review-fix cycle reached limit ({iterations} iterations, {cap_label}) — "
+        f"PR #{pr_number} auto-closed, manual review required"
+    )
+    persist_failure_category(orig, CODE_ERROR)
+    ctx = dict(orig.context or {})
+    ctx["failure_detail"] = "review_cap_exhausted"
+    ctx["review_cap_iterations"] = iterations
+    ctx["pr_rejected"] = True
+    ctx["pr_rejection_note"] = (
+        f"Auto-closed by Blueprint: review-fix cap exhausted after {iterations} iterations"
+    )
+    orig.context = ctx
+    flag_modified(orig, "context")
+    session.add(orig)
+    try:
+        await session.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to commit orig {resolved_original_id[:8]}: {e}",
+            exc_info=True,
+        )
+        return
+
+    # Surface cap-exhaustion to deploy_monitoring + direction health tracking.
+    # Without this, cap failures bypass per-type failure gates and anomaly detection.
+    record_task_result(
+        success=False,
+        failure_class=CODE_ERROR,
+        task_id=str(orig.id),
+        task_type=(orig.first_payload or {}).get("type", ""),
+    )
+    _direction_id = str((orig.context or {}).get("direction_id") or "")
+    if _direction_id:
+        record_direction_result(
+            _direction_id,
+            success=False,
+            failure_class=CODE_ERROR,
+            project_id=str(orig.project_id) if orig.project_id else "",
+        )
+
+    # Cap exhaustion bypasses the normal status-update handler; call
+    # _record_remediation_if_terminal directly to keep direction state consistent.
+    try:
+        from app.task_completion import _record_remediation_if_terminal
+
+        await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+        await session.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to record remediation outcome for PR #{pr_number}: {e}"
+        )
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+        try:
+            fingerprint = ((orig.context or {}).get("failure_fingerprints") or [None])[
+                0
+            ]
+            fingerprint_note = (
+                f"\n\nFailure fingerprint: `{fingerprint}`" if fingerprint else ""
+            )
+            await create_pr_comment(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                f"Auto-closed: review-fix cap reached ({iterations} iterations, {cap_label}). "
+                f"Manual review required.{fingerprint_note}",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion: failed to comment on PR #{pr_number}: {e}"
+            )
+        closed = await close_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+        )
+        if closed:
+            logger.info(
+                f"[PIPELINE] Closed PR #{pr_number} after cap exhaustion ({iterations} iterations)"
+            )
+        else:
+            logger.warning(
+                f"[PIPELINE] close_pull_request returned False for PR #{pr_number}"
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to close PR #{pr_number}: {e}",
+            exc_info=True,
+        )
+
+    try:
+        await _maybe_create_failure_alert(
+            orig,
+            session,
+            f"PR #{pr_number} hit review-fix cap ({iterations} iterations, {cap_label}) — "
+            f"auto-closed, manual review required",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: failed to create alert for PR #{pr_number}: {e}"
+        )
 
 
 SPAWN_REASON_KEY = "_last_pipeline_spawn_reason"
@@ -956,7 +1462,7 @@ async def _spawn_pipeline_task(
     # ``payloads`` for the SQLite branch), so seq-scan is acceptable for
     # tests. Postgres production path is the source of truth and gets the
     # index acceleration.
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         pr_number_match = (
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number

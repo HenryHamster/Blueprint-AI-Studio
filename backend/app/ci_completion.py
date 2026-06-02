@@ -48,6 +48,7 @@ from app.models import Task, TaskStatus, _utcnow
 logger = logging.getLogger(__name__)
 
 
+
 async def _attempt_merge_with_retry_and_escalation(
     task: Task,
     gh_token: str,

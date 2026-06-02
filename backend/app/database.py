@@ -23,6 +23,52 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 logger = logging.getLogger(__name__)
 
 
+def resolve_dialect_name(session: AsyncSession) -> str:
+    """Return the SQL dialect name (``"postgresql"`` / ``"sqlite"`` / ...) of
+    the engine a query on ``session`` will actually run against.
+
+    Footgun this guards against
+    ---------------------------
+    The naive idiom
+
+        dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+
+    is a latent bug. An ``AsyncSession`` created from an ``async_sessionmaker``
+    (i.e. every ``AsyncSessionLocal()`` background session, and FastAPI request
+    sessions) exposes a **None ``.bind``** even though it resolves a concrete
+    engine lazily at execute-time. The idiom therefore silently defaults to
+    ``"postgresql"`` and emits Postgres-only SQL (e.g. the ``@>`` JSONB
+    containment operator, ``jsonb`` casts, ``SET LOCAL statement_timeout``) even
+    when the session is bound to **SQLite** — which blows up with
+    ``sqlite3.OperationalError: unrecognized token: "@"`` on SQLite-based CI
+    runs. A ``--postgres``-only test run never trips it (the dialect genuinely
+    is Postgres), so it slips past local testing (triggering incident: PR
+    #7099). Variants without the ``if session.bind`` None guard are worse still
+    — they raise ``AttributeError`` on the None bind.
+
+    Resolution order
+    ----------------
+    1. ``session.bind.dialect.name`` when ``session.bind`` is not None — this
+       preserves today's behaviour for sessions that have an explicit bind, so
+       all currently-passing tests are unaffected.
+    2. ``session.get_bind().dialect.name`` otherwise — ``get_bind()`` resolves
+       the ACTUAL engine the query will execute against (SQLite vs Postgres),
+       independent of environment, which is exactly the None-bind case the
+       idiom got wrong.
+    3. ``"postgresql"`` (the production default) only if ``get_bind()`` itself
+       raises (e.g. no engine configured at all).
+    """
+    bind = session.bind
+    if bind is not None:
+        return bind.dialect.name
+    try:
+        return session.get_bind().dialect.name
+    except Exception:  # noqa: BLE001 — any bind-resolution failure must
+        # degrade to the prod default rather than crash a query path; the
+        # fallback IS the contract, so the catch is intentionally broad.
+        return "postgresql"
+
+
 def _asyncpg_ssl_arg(value: str | None) -> object | None:
     """Map a SQLAlchemy/libpq SSL hint to an asyncpg ``ssl=`` connect kwarg.
 
