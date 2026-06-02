@@ -132,6 +132,150 @@ async def _hold_rollup_for_branch_safety(
     logger.error("[ROLLUP] %s", detail)
 
 
+# ── FIX A: non-rejection PR-close classification ──────────────────────────
+# A Blueprint rollup/create PR can be closed without merging for two very
+# different reasons:
+#   • GENUINE REJECTION — a reviewer requested changes, the review-fix cap was
+#     exhausted, or the agent's work was deemed unmergeable. These MUST stay
+#     FAILED + alert so direction health and the operator see the real signal.
+#   • NON-GENUINE CLEANUP / SUPERSESSION — the work already landed via a sibling
+#     PR, a parent/sibling rollup de-scoped this PR, or the Blueprint bot closed
+#     it as part of housekeeping. The desired outcome is (effectively) achieved
+#     or the task is moot, so failing it false-fails a non-failure and can
+#     cascade a rollup parent into a partial-failure finalize.
+# This helper decides between the two. It is conservative: ANY genuine-rejection
+# signal forces the FAILED path, and a non-genuine verdict additionally REQUIRES
+# at least one positive cleanup/supersession signal — absence of signal is never
+# treated as non-genuine.
+
+_GENUINE_REJECTION_CTX_MARKERS = ("pr_rejected", "review_cap_exhausted")
+
+
+def _ctx_has_genuine_rejection_marker(ctx: dict | None) -> bool:
+    """True when task context carries an explicit genuine-rejection marker.
+
+    ``pr_rejected`` is set by the review pipeline on a real CHANGES_REQUESTED /
+    manual-close rejection; ``review_cap_exhausted`` (set as failure_detail by
+    ``_handle_cap_exhaustion``) is a review-quality non-convergence. Either one
+    forces the FAILED path regardless of any cleanup signal.
+    """
+    if not ctx:
+        return False
+    if ctx.get("pr_rejected") is True:
+        return True
+    return ctx.get("failure_detail") in _GENUINE_REJECTION_CTX_MARKERS
+
+
+def _ctx_review_was_approved(ctx: dict | None) -> bool:
+    """True when the DB shows this PR was approved before the close.
+
+    Reads the parent's ``review_loop.review_approved`` flag and the legacy
+    ``verdict == 'APPROVE'`` / ``blueprint_review_verdict == 'APPROVE'`` forms.
+    An approved-then-closed-unmerged PR is, by definition, not a rejection — the
+    change was signed off and the close means the work landed (or was de-scoped)
+    elsewhere.
+    """
+    if not ctx:
+        return False
+    review_loop = ctx.get("review_loop") or {}
+    if review_loop.get("review_approved") is True:
+        return True
+    if review_loop.get("verdict") == "APPROVE":
+        return True
+    return ctx.get("blueprint_review_verdict") == "APPROVE"
+
+
+def _ctx_has_supersession_signal(task: "Task") -> bool:
+    """True when context / status message marks this PR as superseded or
+    de-scoped by a sibling/parent rollup (a recognized cleanup signal)."""
+    ctx = task.context or {}
+    if ctx.get("superseded") or ctx.get("pr_superseded") or ctx.get("descoped"):
+        return True
+    blob = " ".join(
+        str(ctx.get(k) or "")
+        for k in ("pr_close_reason", "close_reason", "rollup_descope_reason")
+    )
+    msg = (task.latest_status_message or "") + " " + blob
+    return "superseded" in msg.lower() or "de-scoped" in msg.lower()
+
+
+def _pr_author_is_blueprint_bot(pr_data: dict | None) -> bool:
+    """True when the PR was authored by the Blueprint GitHub App (a ``[bot]``
+    account). Blueprint creates all rollup/create PRs through its installation
+    token, so a bot-authored PR closed-unmerged with no rejection marker is a
+    housekeeping close, not a human rejection. GitHub does not expose the close
+    *actor* on the PR object, so bot *authorship* is the available proxy."""
+    if not pr_data:
+        return False
+    user = pr_data.get("user") or {}
+    login = (user.get("login") or "").lower()
+    return user.get("type") == "Bot" or login.endswith("[bot]")
+
+
+async def _pr_closed_is_non_rejection(
+    task: "Task",
+    pr_data: dict,
+    pr_number: int,
+    session: AsyncSession,
+) -> bool:
+    """Decide whether a closed-unmerged PR was a NON-genuine close (→ CANCELLED)
+    rather than a genuine rejection (→ FAILED).
+
+    Returns True only when ALL of the following hold:
+      1. No genuine-rejection DB marker (pr_rejected / review_cap_exhausted).
+      2. No GitHub review with state == CHANGES_REQUESTED.
+      3. At least one positive cleanup/supersession signal:
+           • the PR was approved before the close, or
+           • a supersession / de-scope marker, or
+           • the PR is Blueprint-bot-authored (housekeeping close).
+
+    GUARDRAIL: any CHANGES_REQUESTED review, or any genuine-rejection marker, or
+    the absence of every cleanup signal → returns False so the caller keeps the
+    FAILED path. A failed reviews lookup is treated as "no recorded
+    CHANGES_REQUESTED" but can NEVER on its own flip the verdict, because a
+    positive cleanup signal is still required.
+    """
+    from app.github import get_pull_request_reviews
+    from app.routers.agent import get_github_token_for_task
+
+    ctx = task.context or {}
+
+    # (1) Genuine-rejection markers always win.
+    if _ctx_has_genuine_rejection_marker(ctx):
+        return False
+
+    # (2) Live CHANGES_REQUESTED check — a real reviewer rejection.
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        reviews = await get_pull_request_reviews(
+            gh_token, owner, repo, pr_number, project_id=str(task.project_id)
+        )
+        if any(
+            (r or {}).get("state") == "CHANGES_REQUESTED" for r in (reviews or [])
+        ):
+            logger.info(
+                f"[PR_VERIFY] Task {task.id} PR #{pr_number} closed-unmerged has a "
+                f"CHANGES_REQUESTED review — genuine rejection, keeping FAILED"
+            )
+            return False
+    except Exception as _rev_err:
+        # Best-effort: a transient reviews lookup failure must never MASK a
+        # rejection. We continue, but the positive-signal requirement below
+        # still gates the non-genuine verdict.
+        logger.warning(
+            f"[PR_VERIFY] Task {task.id} PR #{pr_number} reviews lookup failed "
+            f"({type(_rev_err).__name__}: {_rev_err}); requiring an explicit "
+            f"cleanup signal before treating the close as non-rejection"
+        )
+
+    # (3) Require at least one positive cleanup/supersession signal.
+    if _ctx_review_was_approved(ctx):
+        return True
+    if _ctx_has_supersession_signal(task):
+        return True
+    return _pr_author_is_blueprint_bot(pr_data)
+
+
 async def _dispatch_rollup_approval_alert(
     parent: Task, session: AsyncSession, reason: str, pr_number: int | None = None
 ) -> None:

@@ -2412,3 +2412,138 @@ async def test_pr_state_check_consumer_intermediate_rollup_stays_evaluating(
     )
     assert alerts == []
     dispatch_mock.assert_not_called()
+
+
+# ── EVALUATING-STRAND BACKSTOP ─────────────────────────────────────────────
+
+
+def _mock_strand_github(mocker, *, pr_state, pr_merged, reviews=None):
+    """Mock the GitHub calls the strand backstop makes (token + PR fetch, and
+    the FIX A reviews fetch used on the closed-not-merged path)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The strand backstop lives in app.recovery_sweeps and broadcasts via
+    # ``services.broadcast_to_project`` (a binding separate from
+    # app.broadcast.broadcast_to_project), so patch it there too.
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": pr_state, "merged": pr_merged, "user": {}},
+    )
+    mocker.patch(
+        "app.github.get_pull_request_reviews",
+        new_callable=AsyncMock,
+        return_value=reviews or [],
+    )
+
+
+async def _make_strand_task(eval_db, *, pr_number, extra_ctx=None):
+    """A non-rollup review task stranded in EVALUATING with a conflict-fix
+    spawned (the historical strand)."""
+    project = Project(name="Strand Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    ctx = {
+        "review_loop": {
+            "pr_number": pr_number,
+            "conflict_fix_spawned": str(uuid.uuid4()),
+        },
+    }
+    if extra_ctx:
+        ctx.update(extra_ctx)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": pr_number, "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        context=ctx,
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_strand_backstop_completes_on_merged_pr(eval_db, mocker):
+    """A stranded (non-rollup) review with conflict_fix_spawned whose PR has
+    MERGED out-of-band is terminalized COMPLETED."""
+    _mock_strand_github(mocker, pr_state="closed", pr_merged=True)
+    task = await _make_strand_task(eval_db, pr_number=8801)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, (
+        f"Strand whose PR merged must become COMPLETED, got {task.status}"
+    )
+    assert (task.context or {}).get("pr_merged") is True
+
+
+@pytest.mark.asyncio
+async def test_strand_backstop_leaves_open_pr_evaluating(eval_db, mocker):
+    """GUARDRAIL: a stranded review whose PR is still OPEN must be LEFT in
+    EVALUATING — never completed while the PR is open."""
+    _mock_strand_github(mocker, pr_state="open", pr_merged=False)
+    task = await _make_strand_task(eval_db, pr_number=8802)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING, (
+        f"Open-PR strand must stay EVALUATING, got {task.status}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strand_backstop_terminalizes_closed_unmerged_pr(eval_db, mocker):
+    """A stranded review whose PR was CLOSED without merging is terminalized
+    (here: genuine — no cleanup signal, no CHANGES_REQUESTED → FAILED)."""
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    _mock_strand_github(mocker, pr_state="closed", pr_merged=False, reviews=[])
+    task = await _make_strand_task(eval_db, pr_number=8803)
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    assert task.status in (TaskStatus.FAILED, TaskStatus.CANCELLED), (
+        f"Closed-unmerged strand must be terminalized, got {task.status}"
+    )
+    # No cleanup signal + no CHANGES_REQUESTED → defaults to the genuine FAILED arm.
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("pr_closed_unmerged") is True
+
+
+@pytest.mark.asyncio
+async def test_strand_backstop_skips_rollup_parent(eval_db, mocker):
+    """GUARDRAIL: a real rollup PARENT (_is_rollup_review=True) with a
+    conflict-fix spawned must NOT be touched by the strand backstop — its own
+    merge gate owns it. Even with the PR reported merged, the parent is left for
+    ci_completion to promote (the backstop must not race it)."""
+    # PR reported merged, but the rollup-parent guard must skip the backstop.
+    _mock_strand_github(mocker, pr_state="closed", pr_merged=True)
+    task = await _make_strand_task(
+        eval_db,
+        pr_number=8804,
+        extra_ctx={"_is_rollup_review": True, "rollup_pr_number": 8804},
+    )
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(task)
+    # The strand backstop is skipped for rollup parents; the parent stays
+    # EVALUATING (no children terminal, not yet at the hard-timeout backstop).
+    assert task.status == TaskStatus.EVALUATING, (
+        f"Rollup parent must be skipped by the strand backstop, got {task.status}"
+    )
+    assert not (task.context or {}).get("pr_merged")

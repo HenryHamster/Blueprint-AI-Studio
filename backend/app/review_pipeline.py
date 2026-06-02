@@ -207,12 +207,50 @@ MAX_REVIEW_FIX_ITERATIONS = 16
 # (global_cap / per_chain_cap) keeps resolving to MAX_REVIEW_FIX_ITERATIONS
 # instead of collapsing to the medium-scope base cap (incident: PR #6061
 # auto-closed at iter 12 because the rollup tag was stripped at iter 1).
+#
+# ``_is_rollup_review`` is DELIBERATELY NOT propagated. It is the authoritative
+# PARENT-ONLY marker that ``rollup_state._is_rollup_parent_awaiting_merge``
+# short-circuits on (it returns True the instant the flag is set). Propagating
+# it onto child review/fix tasks made every child *look* like a rollup parent
+# awaiting merge, so the EVALUATING terminalization paths (orchestrator /
+# ci_completion) skipped them and a child whose PR actually merged stranded in
+# EVALUATING forever (the conflict_fix_spawned latch was never cleared). The
+# cap policy below no longer relies on the child carrying the flag: it detects a
+# rollup chain via ``_rollup_retries`` AND the propagated ``rollup_pr_number`` +
+# ``review_loop.pr_number`` lineage (see ``_is_rollup_chain_source``), both of
+# which children DO carry, so the elevated cap still holds across iterations.
 _PROPAGATE_UNDERSCORE_KEYS = frozenset(
     {
-        "_is_rollup_review",
         "_rollup_retries",
     }
 )
+
+
+def _is_rollup_chain_source(source_task: "Task") -> bool:
+    """True when ``source_task`` belongs to a rollup PR chain — used for cap
+    policy and same-PR dedup scoping.
+
+    Recognises a rollup chain WITHOUT requiring the child to carry the
+    parent-only ``_is_rollup_review`` flag (which is no longer propagated, see
+    ``_PROPAGATE_UNDERSCORE_KEYS``):
+      • the parent's own ``_is_rollup_review`` flag (parent spawning the first
+        review/fix), or
+      • ``_rollup_retries`` (set on conflict-retry chains), or
+      • the propagated rollup lineage: ``rollup_pr_number`` set AND
+        ``review_loop.pr_number`` pointing at that same rollup PR — exactly what
+        every spawned child of a rollup review/fix carries.
+    """
+    ctx = source_task.context or {}
+    if ctx.get("_is_rollup_review") is True:
+        return True
+    if ctx.get("_rollup_retries") is not None:
+        return True
+    rollup_pr = ctx.get("rollup_pr_number")
+    if rollup_pr:
+        review_loop_pr = (ctx.get("review_loop") or {}).get("pr_number")
+        if review_loop_pr and review_loop_pr == rollup_pr:
+            return True
+    return False
 
 # Phase 2c (warm-VM continuity): how long after a source task's last heartbeat
 # (or its completion) the warm-VM pin is honored on the spawned task. After
@@ -773,7 +811,7 @@ async def _spawn_pipeline_task(
     # each pass ``original_task_id=str(parent.id)`` — different chains, but the
     # SAME rollup PR. Gate dedup on PR-number only in that case so we don't
     # double-spawn review/fix for the shared PR.
-    is_rollup_source = bool((source_task.context or {}).get("_is_rollup_review"))
+    is_rollup_source = _is_rollup_chain_source(source_task)
     superseded_stale_task = False
     active_pipeline = (
         (
@@ -1144,9 +1182,7 @@ async def _spawn_pipeline_task(
     # Rollup reviews accumulate iterations across retry attempts — always use the max cap
     # so transient review failures don't permanently block rollup merges. Detection uses
     # context flags set authoritatively by rollup_management when spawning review/fix tasks.
-    is_rollup = (source_task.context or {}).get("_is_rollup_review") is True or (
-        source_task.context or {}
-    ).get("_rollup_retries") is not None
+    is_rollup = _is_rollup_chain_source(source_task)
     global_cap = MAX_REVIEW_FIX_ITERATIONS if is_rollup else base_cap
     if pr_iterations >= global_cap:
         logger.warning(

@@ -5942,6 +5942,57 @@ async def test_external_api_requeue_sets_exponential_backoff(
 
 
 @pytest.mark.asyncio
+async def test_reassigned_lands_cancelled_no_retry_no_alert(
+    client: AsyncClient, db_session, mocker
+):
+    """FIX H: a REASSIGNED outcome (agent gracefully self-terminated because the
+    task was superseded/reassigned/deauthed) must land CANCELLED on first
+    detection — NOT retry, NOT FAILED, NOT fire a failure alert — mirroring the
+    SCOPE_EMPTY->CANCELLED precedent."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    project = Project(name="Reassigned Test", user_id="test-user-reassigned")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-reassigned",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reassigned")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "reassigned",
+        "logs": "Task reassigned/deauthorized — agent self-terminating",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.CANCELLED, (
+        f"REASSIGNED must land CANCELLED, not {task.status} — it is a graceful "
+        f"handoff, not a code failure"
+    )
+    assert task.status != TaskStatus.QUEUED, "REASSIGNED must not retry"
+    assert (task.context or {}).get("failure_category") == "REASSIGNED"
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_external_api_permanent_auth_failure_does_not_requeue(
     client: AsyncClient, db_session, mocker
 ):
