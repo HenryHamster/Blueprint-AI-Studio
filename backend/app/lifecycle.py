@@ -171,6 +171,65 @@ async def _seed_initial_admin():
                 )
 
 
+async def _leader_lock_keepalive_tick(leader_session) -> str:
+    """Run one leader-lock keepalive iteration and report the outcome.
+
+    The background-leader advisory lock is SESSION-scoped: it lives on
+    ``leader_session``'s connection for the whole process lifetime. If that
+    connection dies (network blip, Cloud SQL failover, idle TCP reaped, an
+    ``idle_in_transaction``/statement timeout), Postgres releases the lock and a
+    peer's non-leader watchdog grabs it — which forces this instance into the
+    "prior leader died" respawn loop. This tick keeps the connection warm and,
+    on failure, tries to re-acquire the lock on a fresh pooled connection.
+
+    Always COMMITs after touching the session so the connection is left merely
+    *idle* (lock still held) rather than *idle in transaction* — the latter is
+    what ``idle_in_transaction_session_timeout`` kills.
+
+    Returns one of:
+      * ``"held"``       — ping succeeded, the lock is still held;
+      * ``"reacquired"`` — ping failed but the lock was re-acquired on a fresh
+        connection (a transient blip, no peer took over);
+      * ``"lost"``       — ping failed and a peer now owns the lock;
+      * ``"error"``      — ping failed and the re-acquire attempt also errored.
+
+    The caller hard-exits on ``"lost"``/``"error"`` so Cloud Run respawns this
+    instance through clean leader election rather than running on lost
+    leadership. Kept module-level (not a closure) so it is unit-testable.
+    """
+    try:
+        await leader_session.execute(_text("SELECT 1"))
+        await leader_session.commit()
+        return "held"
+    except Exception as ka_exc:  # any failure here means the connection is suspect
+        logger.warning(
+            "[MONITOR] Leader-lock keepalive ping failed (%s); re-acquiring lock",
+            ka_exc,
+        )
+    # Ping failed → the connection (and the session-scoped lock) is likely gone.
+    # Reset the session so the next execute checks out a fresh pooled connection.
+    try:
+        await leader_session.rollback()
+    except Exception as rb_exc:  # best-effort session reset
+        logger.debug("[MONITOR] keepalive rollback no-op: %s", rb_exc)
+    try:
+        reacquired = bool(
+            (
+                await leader_session.execute(
+                    _text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": _BACKGROUND_LOCK_ID},
+                )
+            ).scalar()
+        )
+        await leader_session.commit()
+    except Exception as reacq_exc:
+        # Operational (DB unreachable), not a code fault — the message plus the
+        # caller's hard-exit are the signal; a full traceback is just noise.
+        logger.error("[MONITOR] Leader-lock re-acquire failed: %s", reacq_exc)  # noqa: TRY400
+        return "error"
+    return "reacquired" if reacquired else "lost"
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
@@ -261,6 +320,26 @@ async def lifespan(app):
         is_leader = True
         await leader_session.aclose()
         leader_session = None
+
+    if leader_session is not None:
+        # pg_try_advisory_lock is SESSION-scoped (not the _xact_ variant), so the
+        # lock is held until the connection closes — it SURVIVES a COMMIT. Commit
+        # now to close the transaction the SELECT auto-opened. Otherwise
+        # leader_session sits *idle in transaction* for the whole process
+        # lifetime and Postgres' ``idle_in_transaction_session_timeout`` (60s, set
+        # in database.py) terminates the connection — silently releasing the
+        # advisory lock and triggering the "prior leader died" respawn loop. A
+        # committed connection that is merely idle (no open transaction) is exempt
+        # from that timeout, so the lock stays held. The keepalive task (started
+        # below on the leader) keeps the connection warm and recovers the lock if
+        # the connection is ever dropped anyway.
+        try:
+            await leader_session.commit()
+        except Exception as _lock_commit_exc:  # keepalive recovers a bad connection
+            logger.warning(
+                "[STARTUP] Leader lock-session commit failed (continuing): %s",
+                _lock_commit_exc,
+            )
 
     _shared_state.is_leader = is_leader
 
@@ -1018,6 +1097,29 @@ async def lifespan(app):
                 )
                 await asyncio.sleep(10)  # Brief pause before retrying
 
+    # Leader-lock keepalive: re-assert ownership of the session-scoped advisory
+    # lock so a dropped connection can't silently hand leadership to a peer (the
+    # "prior leader died" respawn loop). See _leader_lock_keepalive_tick.
+    _LEADER_KEEPALIVE_SECONDS = float(os.getenv("LEADER_KEEPALIVE_SECONDS", "30"))
+
+    async def _leader_lock_keepalive():
+        while True:
+            await asyncio.sleep(_LEADER_KEEPALIVE_SECONDS)
+            outcome = await _leader_lock_keepalive_tick(leader_session)
+            if outcome in ("lost", "error"):
+                logger.warning(
+                    "[MONITOR] Leader advisory lock %s; hard-exiting so Cloud Run "
+                    "respawns through clean leader election",
+                    "lost to a peer" if outcome == "lost" else "unrecoverable",
+                )
+                os._exit(0)
+
+    leader_keepalive_task = (
+        asyncio.create_task(_leader_lock_keepalive())
+        if leader_session is not None
+        else None
+    )
+
     monitor_task = asyncio.create_task(_monitor_background_tasks())
 
     yield
@@ -1041,6 +1143,8 @@ async def lifespan(app):
         notification_retry_task,
         monitor_task,
     ]
+    if leader_keepalive_task is not None:
+        tasks_to_cancel.append(leader_keepalive_task)
     for t in tasks_to_cancel:
         t.cancel()
     try:
