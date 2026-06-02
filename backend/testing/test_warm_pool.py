@@ -34,6 +34,7 @@ from app.warm_pool import (
     mark_pool_vm_idle,
     mark_pool_vm_retiring,
     pool_vm_cleanup_exemptions,
+    promote_pool_vm_to_idle,
     register_pool_vm,
     release_pool_vm,
 )
@@ -440,6 +441,224 @@ def test_task_bound_manifest_still_has_task_binding():
     payload = verify_agent_jwt(env["AGENT_SECRET_TOKEN"])
     assert payload["sub"] == str(task_id)
     assert payload.get("token_scope") is None
+
+
+# ---------------------------------------------------------------------------
+# PROVISIONING -> IDLE readiness promotion (the pool's load-bearing blocker):
+# the agent's existing /vm-heartbeat is the ready signal that makes a booted
+# pool member leasable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promote_pool_vm_to_idle_flips_provisioning(db_session):
+    """A PROVISIONING member is flipped to IDLE (with an idle_since stamp) and
+    becomes leasable; the helper reports it acted (True)."""
+    project = await _make_project(db_session, name="Promote Provisioning")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-prov",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+
+    acted = await promote_pool_vm_to_idle(db_session, "vm-prov")
+    await db_session.commit()
+    assert acted is True
+
+    member = await get_pool_vm(db_session, "vm-prov")
+    assert member.state == PoolVmState.IDLE
+    assert member.idle_since is not None
+    # Lease binding is untouched by the promote (no spurious clear).
+    assert member.leased_task_id is None
+
+    # Now leasable.
+    leased = await lease_idle_pool_vm(
+        db_session, project_id=project.id, account_id="acct-1"
+    )
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-prov"
+
+
+@pytest.mark.asyncio
+async def test_promote_pool_vm_to_idle_noop_on_leased(db_session):
+    """A LEASED (mid-task) member is NEVER flipped back to leasable — the
+    PROVISIONING predicate guards it. Lease binding is preserved."""
+    project = await _make_project(db_session, name="Promote Leased")
+    task_id = uuid.uuid4()
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-leased",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+    leased = await lease_idle_pool_vm(
+        db_session, project_id=project.id, account_id="acct-1", leased_task_id=task_id
+    )
+    await db_session.commit()
+    assert leased.state == PoolVmState.LEASED
+
+    acted = await promote_pool_vm_to_idle(db_session, "vm-leased")
+    await db_session.commit()
+    assert acted is False
+
+    member = await get_pool_vm(db_session, "vm-leased")
+    assert member.state == PoolVmState.LEASED
+    assert member.leased_task_id == task_id
+
+
+@pytest.mark.asyncio
+async def test_promote_pool_vm_to_idle_noop_on_retiring(db_session):
+    """A RETIRING (mid-teardown) member is NEVER flipped back to leasable."""
+    project = await _make_project(db_session, name="Promote Retiring")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-retire",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.RETIRING,
+    )
+    await db_session.commit()
+
+    acted = await promote_pool_vm_to_idle(db_session, "vm-retire")
+    await db_session.commit()
+    assert acted is False
+
+    member = await get_pool_vm(db_session, "vm-retire")
+    assert member.state == PoolVmState.RETIRING
+
+
+@pytest.mark.asyncio
+async def test_promote_pool_vm_to_idle_noop_on_unknown_vm(db_session):
+    """Promoting an unknown VM (e.g. a chain/backlog VM with no PoolVm row) is a
+    safe no-op on the shared heartbeat path."""
+    acted = await promote_pool_vm_to_idle(db_session, "ghost-vm")
+    await db_session.commit()
+    assert acted is False
+
+
+@pytest.mark.asyncio
+async def test_promote_pool_vm_to_idle_idempotent(db_session):
+    """Repeated promotions/heartbeats keep the member IDLE with no error and do
+    NOT reset idle_since after the first flip."""
+    project = await _make_project(db_session, name="Promote Idempotent")
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-idem",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+
+    assert await promote_pool_vm_to_idle(db_session, "vm-idem") is True
+    await db_session.commit()
+    member = await get_pool_vm(db_session, "vm-idem")
+    first_idle_since = member.idle_since
+    assert first_idle_since is not None
+
+    # Second beat: already IDLE, so the conditional UPDATE matches 0 rows and the
+    # idle_since stamp is unchanged.
+    assert await promote_pool_vm_to_idle(db_session, "vm-idem") is False
+    await db_session.commit()
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.IDLE
+    assert member.idle_since == first_idle_since
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_promotes_provisioning_member_when_enabled(
+    client, db_session
+):
+    """End-to-end: with the pool enabled, a PROVISIONING member whose VM POSTs
+    /api/agent/vm-heartbeat becomes IDLE and is then leasable. The client request
+    commits in its own session, so we refresh to read the post-commit state."""
+    project = await _make_project(db_session, name="HB Promote Enabled")
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-hb-prov",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+
+    tok = create_vm_scoped_token("vm-hb-prov", str(project.id))
+    prev = shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        shared_state.runtime_config["warm_pool_enabled"] = True
+        resp = await client.post(
+            "/api/agent/vm-heartbeat",
+            json={"vm_instance_id": "vm-hb-prov"},
+            headers={"X-Agent-Token": tok},
+        )
+        assert resp.status_code == 204
+    finally:
+        shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    # Re-read post-commit state from the test session. The heartbeat promoted
+    # the member on its OWN connection (a separate AsyncSessionLocal), so end the
+    # test session's current transaction first — that guarantees the read below
+    # starts a fresh snapshot which observes the cross-connection commit, rather
+    # than a snapshot pinned before the POST (the source of cross-connection
+    # read flakiness under non-READ-COMMITTED isolation).
+    await db_session.commit()
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.IDLE
+    assert member.idle_since is not None
+
+    leased = await lease_idle_pool_vm(
+        db_session, project_id=project.id, account_id="acct-1"
+    )
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-hb-prov"
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_inert_when_pool_disabled(client, db_session):
+    """With the pool disabled (default), /vm-heartbeat performs NO promotion / no
+    PoolVm mutation — the member stays PROVISIONING (preserving today's zero-DB
+    heartbeat for the live chain/backlog VMs that also hit this endpoint)."""
+    project = await _make_project(db_session, name="HB Inert Disabled")
+    member = await register_pool_vm(
+        db_session,
+        vm_instance_id="vm-hb-dark",
+        project_id=project.id,
+        account_id="acct-1",
+        provider="anthropic",
+        state=PoolVmState.PROVISIONING,
+    )
+    await db_session.commit()
+
+    tok = create_vm_scoped_token("vm-hb-dark", str(project.id))
+    prev = shared_state.runtime_config.get("warm_pool_enabled", False)
+    try:
+        shared_state.runtime_config["warm_pool_enabled"] = False
+        resp = await client.post(
+            "/api/agent/vm-heartbeat",
+            json={"vm_instance_id": "vm-hb-dark"},
+            headers={"X-Agent-Token": tok},
+        )
+        assert resp.status_code == 204
+    finally:
+        shared_state.runtime_config["warm_pool_enabled"] = prev
+
+    # Same fresh-snapshot read as the enabled case (consistency): the disabled
+    # heartbeat must leave the member untouched, so the post-POST read must
+    # observe the latest committed state rather than a pre-POST snapshot.
+    await db_session.commit()
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.PROVISIONING
+    assert member.idle_since is None
 
 
 # ---------------------------------------------------------------------------

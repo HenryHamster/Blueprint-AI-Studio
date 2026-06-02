@@ -241,6 +241,63 @@ async def _cap_exhausted_after_approve(
     return False
 
 
+async def _pr_is_preservable_on_cap(
+    orig: Task,
+    pr_number: int,
+    session: AsyncSession,
+) -> bool:
+    """FIX #3b: decide whether a capped rollup PR is worth PRESERVING (left open
+    for hand-merge) rather than destroyed (closed + FAILED + CODE_ERROR).
+
+    A PR is preservable only when it carries real, mergeable work:
+      • it is a rollup PR (rollup chains aggregate already-completed subtask work
+        — discarding the whole PR over review-loop non-convergence throws away
+        merged-elsewhere siblings), AND
+      • it is NON-EMPTY (``changed_files > 0`` — a branch rebased flat has
+        nothing to hand-merge), AND
+      • it is NOT a genuine merge conflict (``mergeable_state != 'dirty'`` — a
+        conflicted PR cannot be hand-merged without rework, so closing it is
+        correct).
+
+    GUARDRAIL: a genuinely broken/empty/conflicted PR returns False so the
+    caller keeps today's close+FAIL path. On any GitHub lookup failure we also
+    return False — when in doubt, fall back to the safe (destructive) path.
+    """
+    is_rollup = (orig.context or {}).get("_is_rollup_review") is True or (
+        orig.context or {}
+    ).get("_rollup_retries") is not None
+    if not is_rollup:
+        rollup_pr = (orig.context or {}).get("rollup_pr_number")
+        if rollup_pr and rollup_pr == pr_number:
+            is_rollup = True
+    if not is_rollup:
+        return False
+    try:
+        from app.github import get_pull_request
+        from app.routers.agent import get_github_token_for_task
+
+        gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+        pr = await get_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[PIPELINE] Cap-exhaustion: preservability lookup failed for PR "
+            f"#{pr_number}: {e} — falling back to close+FAIL"
+        )
+        return False
+    if (pr.get("state") or "").lower() != "open":
+        return False
+    if (pr.get("changed_files") or 0) <= 0:
+        return False
+    # 'dirty' = genuine merge conflict per GitHub. Any other state (clean,
+    # unstable, blocked, behind) is hand-mergeable. 'unknown'/None means GitHub
+    # hasn't computed it yet — treat conservatively as NOT preservable so we
+    # don't leave a possibly-conflicted PR dangling open.
+    mergeable_state = (pr.get("mergeable_state") or "").lower()
+    return mergeable_state not in ("dirty", "", "unknown")
+
+
 async def _handle_cap_exhaustion(
     source_task: Task,
     resolved_original_id: str,
@@ -297,6 +354,7 @@ async def _handle_cap_exhaustion(
     ) and (orig.context or {}).get("failure_detail") in (
         "review_cap_exhausted",
         "cap_exhausted_after_approve",
+        "review_cap_preserved_for_handmerge",
     )
     if already_handled:
         logger.info(
@@ -389,6 +447,99 @@ async def _handle_cap_exhaustion(
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"[PIPELINE] Cap-exhaustion(after-approve): PR close failed for "
+                f"#{pr_number}: {e}"
+            )
+        return
+
+    # FIX #3b: PRESERVE WORK ON CAP. When the cap is hit on REQUEST_CHANGES for a
+    # NON-EMPTY, conflict-free ROLLUP PR, the prior behaviour (close PR + FAIL +
+    # CODE_ERROR) destroyed salvageable aggregated work over review-loop
+    # non-convergence. Instead, leave the PR OPEN and flag the orig
+    # requires_approval so an operator can hand-merge it. The orig still lands
+    # terminal (FAILED routes through the partial-rollup path and stops the
+    # stale-unmerged respawn loop, per the docstring above) but with a distinct
+    # failure_detail, NO CODE_ERROR, NO pr_rejected, and NO PR close.
+    # GUARDRAIL: _pr_is_preservable_on_cap returns False for empty / conflicted /
+    # non-rollup PRs (and on any GitHub lookup failure) → those keep today's
+    # close+FAIL+CODE_ERROR path below.
+    if await _pr_is_preservable_on_cap(orig, pr_number, session):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        logger.info(
+            f"[PIPELINE] Cap reached for PR #{pr_number} on a non-empty, "
+            f"conflict-free rollup — PRESERVING work: leaving PR open + flagging "
+            f"orig {resolved_original_id[:8]} requires_approval for hand-merge "
+            f"(no CODE_ERROR, no PR close)"
+        )
+        orig.status = TaskStatus.FAILED
+        # Always flag requires_approval here regardless of the global gate — the
+        # whole point of preservation is to route this to a human; without the
+        # flag the open PR would dangle with no owner.
+        orig.requires_approval = True
+        orig.latest_status_message = (
+            f"Review-fix cap reached ({iterations} iterations, {cap_label}) — "
+            f"PR #{pr_number} LEFT OPEN with mergeable work; manual hand-merge "
+            f"required (not auto-closed)"
+        )
+        ctx = dict(orig.context or {})
+        ctx["failure_detail"] = "review_cap_preserved_for_handmerge"
+        ctx["review_cap_iterations"] = iterations
+        ctx["pr_preserved_for_handmerge"] = True
+        # NB: deliberately NOT setting pr_rejected / CODE_ERROR — the work is
+        # salvageable, not a code failure, and the PR is NOT closed.
+        orig.context = ctx
+        flag_modified(orig, "context")
+        session.add(orig)
+        try:
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): failed to commit orig "
+                f"{resolved_original_id[:8]}: {e}",
+                exc_info=True,
+            )
+            return
+        try:
+            from app.task_completion import _record_remediation_if_terminal
+
+            await _record_remediation_if_terminal(orig, TaskStatus.FAILED, session)
+            await session.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): remediation record failed "
+                f"for PR #{pr_number}: {e}"
+            )
+        # Leave a PR comment so the operator knows it was left open on purpose.
+        # Do NOT close the PR.
+        try:
+            gh_token, owner, repo = await get_github_token_for_task(orig.id, session)
+            await create_pr_comment(
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                f"Review-fix cap reached ({iterations} iterations, {cap_label}). "
+                f"This PR has mergeable work and no genuine conflict, so it was "
+                f"LEFT OPEN for manual hand-merge rather than auto-closed. "
+                f"Operator review required.",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): comment failed on PR "
+                f"#{pr_number}: {e}"
+            )
+        # Surface for the operator via the normal failure-alert channel — this
+        # IS a manual-intervention event even though the work is salvageable.
+        try:
+            await _maybe_create_failure_alert(
+                orig,
+                session,
+                f"PR #{pr_number} hit review-fix cap ({iterations} iterations, "
+                f"{cap_label}) — left open with mergeable work, hand-merge required",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[PIPELINE] Cap-exhaustion(preserve): alert failed for PR "
                 f"#{pr_number}: {e}"
             )
         return

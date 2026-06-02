@@ -37,6 +37,7 @@ from app.spawn_calibration import (
 # app.review_pipeline keep working unchanged.
 from app.review_heuristics import (  # noqa: F401
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
+    EARLY_NONCONVERGENCE_ESCALATE_AT,
     ISSUE_CHURN_WINDOW,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_DEFAULT,
     STUCK_CYCLE_ISSUE_SIMILARITY_THRESHOLD_MEDIUM,
@@ -55,9 +56,13 @@ from app.review_heuristics import (  # noqa: F401
     _FEEDBACK_TOKEN_RE,
     _format_repeating_issues_section,
     _is_test_file,
+    _reconcile_narrow_focus_with_fix_all,
     _repeating_issue_descriptions,
     _stuck_thresholds,
     compute_drift_signal,
+    detect_early_nonconvergence,
+    detect_fix_all_issue_class,
+    fix_all_occurrences_directive,
     should_auto_approve_diff,
     should_auto_approve_small_diff,
 )
@@ -341,6 +346,11 @@ SPAWN_REASON_ALREADY_MERGED = "already_merged"
 SPAWN_REASON_DEFERRED = "deferred_cross_type"
 SPAWN_REASON_CAP = "cap_exhausted"
 SPAWN_REASON_STUCK = "stuck_cycle"
+# Early non-convergence escalation: the review-fix loop is whittling/drifting
+# (shrinking-but-never-zero count, verification-only drift, or one-at-a-time
+# disclosure) and was escalated to the operator at iteration K rather than
+# grinding to the full cap. Distinct from stuck_cycle (same issue re-raised).
+SPAWN_REASON_NONCONVERGENCE = "early_nonconvergence"
 # Two consecutive same-type pipeline tasks failed with an identical failure
 # fingerprint — the agent's code edits aren't moving the failure shape, which
 # is the signature of a precondition gap (missing system lib, baseline lint
@@ -1557,6 +1567,84 @@ async def _spawn_pipeline_task(
             session.add(source_task)
             return (None, False)
 
+        # Early non-convergence escalation: catches the whack-a-mole / drift
+        # shape the stuck-cycle, standoff, and churn detectors all MISS — a
+        # shrinking-but-never-zero issue count, verification-only drift, or
+        # one-at-a-time disclosure. The existing detectors require the SAME
+        # issue re-raised (stuck/standoff) or NON-decreasing counts (churn), so
+        # a sequence like [3, 2, 2, 1, 1] grinds all the way to the cap. We
+        # escalate to the operator at iteration K instead of burning the full
+        # budget. Only fires from iteration K onward so a normally-converging
+        # loop (which lands APPROVE well before K) is never escalated early.
+        if (
+            task_type == "fix"
+            and iteration >= EARLY_NONCONVERGENCE_ESCALATE_AT
+        ):
+            should_escalate, nonconvergence_reason = detect_early_nonconvergence(
+                new_review_history
+            )
+            if should_escalate:
+                logger.warning(
+                    f"[PIPELINE] Early non-convergence for PR #{pr_number} at "
+                    f"iteration {iteration} (cap {per_chain_cap}): "
+                    f"{nonconvergence_reason}. Escalating to operator instead of "
+                    f"grinding to cap."
+                )
+                try:
+                    nc_orig = await session.get(
+                        Task, uuid.UUID(resolved_original_id)
+                    )
+                    if nc_orig:
+                        # Discretionary gate, same as stuck-cycle: only
+                        # approval-gate when require_approval_gates is on.
+                        if _runtime_config.get("require_approval_gates", True):
+                            nc_orig.requires_approval = True
+                        nc_orig.latest_status_message = (
+                            f"Review-fix loop not converging "
+                            f"({nonconvergence_reason}) after {iteration} "
+                            f"iterations — escalated for manual review at "
+                            f"iteration {iteration} rather than grinding to cap."
+                        )
+                        session.add(nc_orig)
+                        await session.commit()
+                        try:
+                            import asyncio as _asyncio
+                            from app.notification_dispatch import (
+                                dispatch_external_notification,
+                            )
+
+                            _asyncio.ensure_future(  # noqa: RUF006
+                                dispatch_external_notification(
+                                    nc_orig.project_id,
+                                    "APPROVAL_NEEDED",
+                                    {
+                                        "task_id": str(nc_orig.id),
+                                        "task_title": nc_orig.title
+                                        or str(nc_orig.id)[:8],
+                                        "pr_number": pr_number,
+                                        "iteration": iteration,
+                                        "reason": (
+                                            "Review-fix loop not converging — "
+                                            f"{nonconvergence_reason}"
+                                        ),
+                                    },
+                                )
+                            )
+                        except Exception as _ne:  # noqa: BLE001
+                            logger.warning(
+                                f"[NOTIFY] APPROVAL_NEEDED dispatch setup "
+                                f"failed: {_ne}"
+                            )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"[PIPELINE] Failed to escalate non-convergence on "
+                        f"{resolved_original_id}: {e}",
+                        exc_info=True,
+                    )
+                _set_spawn_reason(source_task, SPAWN_REASON_NONCONVERGENCE)
+                session.add(source_task)
+                return (None, False)
+
         # Issue-churn detection: complements stuck-cycle above. If total
         # CRITICAL+MAJOR count fails to decrease across the last
         # ISSUE_CHURN_WINDOW iterations (even though the specific issues are
@@ -1588,6 +1676,9 @@ async def _spawn_pipeline_task(
                 window=ISSUE_CHURN_WINDOW, counts=churn_counts
             )
             narrow_prefix += _format_repeating_issues_section(new_review_history)
+            narrow_prefix = _reconcile_narrow_focus_with_fix_all(
+                narrow_prefix, fix_prompt
+            )
             payload_data["prompt"] = narrow_prefix + (payload_data.get("prompt") or "")
             fix_prompt = narrow_prefix + (fix_prompt or "")
         elif (
@@ -1600,6 +1691,7 @@ async def _spawn_pipeline_task(
                 iteration=iteration, cap=per_chain_cap
             )
             mid_prefix += _format_repeating_issues_section(new_review_history)
+            mid_prefix = _reconcile_narrow_focus_with_fix_all(mid_prefix, fix_prompt)
             logger.info(
                 f"[PIPELINE] Mid-budget narrow-focus directive for PR #{pr_number} "
                 f"(iteration {iteration}/{per_chain_cap})."
@@ -1674,6 +1766,9 @@ async def _spawn_pipeline_task(
                     count=_util_for_pressure["non_test_file_count"],
                     budget=_util_for_pressure["budget"],
                     pct=util_pct,
+                )
+                hard_prefix = _reconcile_narrow_focus_with_fix_all(
+                    hard_prefix, fix_prompt
                 )
                 payload_data["prompt"] = hard_prefix + (
                     payload_data.get("prompt") or ""
