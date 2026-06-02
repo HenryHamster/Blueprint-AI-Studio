@@ -82,7 +82,14 @@ jobs:
         # Agent VMs lack libatk/libnss/libxkbcommon by default; CI gets a
         # clean ubuntu-latest each run so we install on every job.
         working-directory: ./admin-ui
-        run: npx playwright install --with-deps chromium
+        run: |
+          for i in 1 2 3; do
+            npx playwright install --with-deps chromium && exit 0
+            echo "::warning::playwright install failed (attempt $i/3) — retrying"
+            sleep $((i * 10))
+          done
+          echo "::error::playwright install failed after 3 attempts"
+          exit 1
 
       - name: Build (tsc + vite)
         id: build
@@ -190,28 +197,54 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: test_blueprint
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test -d test_blueprint"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
+    # PostgreSQL is started manually (in the first step) instead of as a
+    # `services:` container so we can retry the Docker Hub image pull. A
+    # service-container pull only auto-retries 3x over ~45s; a Docker Hub blip
+    # (registry-1.docker.io connection timeouts) lasting longer than that fails
+    # the whole shard during job-setup, before any step runs — a pure-infra
+    # flake that the orchestrator used to misread as a code failure and burn a
+    # cold fix-VM on. The retry loop below absorbs it. Connectivity is identical:
+    # postgres binds host :5432 via --network host and tests reach localhost:5432.
     env:
       TEST_DB_URL: postgresql+asyncpg://test:test@localhost:5432/test_blueprint
     steps:
       - uses: actions/checkout@v4
 
+      - name: Start PostgreSQL (pull with retry)
+        run: |
+          for i in 1 2 3 4 5; do
+            docker pull postgres:15 && break
+            echo "::warning::postgres:15 pull failed (attempt $i/5) — backing off"
+            sleep $((i * 10))
+          done
+          docker run -d --name postgres --network host \
+            -e POSTGRES_USER=test \
+            -e POSTGRES_PASSWORD=test \
+            -e POSTGRES_DB=test_blueprint \
+            postgres:15
+          for i in $(seq 1 30); do
+            if docker exec postgres pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
+              echo "PostgreSQL ready after $i check(s)"
+              break
+            fi
+            sleep 2
+          done
+          if ! docker exec postgres pg_isready -U test -d test_blueprint >/dev/null 2>&1; then
+            echo "::error::PostgreSQL did not become ready"
+            docker logs postgres || true
+            exit 1
+          fi
+
       - name: Build backend image
         run: |
           cp CLAUDE.md backend/CLAUDE.md
+          # python:3.11-slim is pulled from Docker Hub — pre-pull it with retry so
+          # the same registry blip that hits postgres can't fail the build either.
+          for i in 1 2 3; do
+            docker pull python:3.11-slim && break
+            echo "::warning::python:3.11-slim pull failed (attempt $i/3) — retrying"
+            sleep $((i * 10))
+          done
           docker build -t blueprint-backend-test ./backend
 
       - name: Verify app imports
