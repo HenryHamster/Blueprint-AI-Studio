@@ -1822,6 +1822,16 @@ async def _apply_settings(
                     "warm_pool_enabled": bool(
                         _runtime_config.get("warm_pool_enabled", False)
                     ),
+                    # Persist the per-project enablement scope so a per-project
+                    # enable (via /warm-pool/enable or the raw PATCH) survives a
+                    # Cloud Run restart. runtime_config_state.sync_* reads this key
+                    # back on boot; without it the in-memory allowlist reverts to
+                    # the [] (fleet-wide) default and the controlled scope is lost.
+                    "warm_pool_project_allowlist": sorted(
+                        _normalize_warm_pool_allowlist(
+                            _runtime_config.get("warm_pool_project_allowlist") or []
+                        )
+                    ),
                     "warm_pool_target_size": int(
                         _runtime_config.get("warm_pool_target_size", 2)
                     ),

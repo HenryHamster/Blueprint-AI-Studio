@@ -35,6 +35,8 @@ const stateWithFunnel: WarmVmStateResponse = {
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
   authGet: vi.fn(async () => new Response(JSON.stringify(baseState), { status: 200 })),
+  enableWarmPoolForProject: vi.fn(async () => ({})),
+  disableWarmPoolForProject: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
 }));
 
@@ -50,7 +52,8 @@ vi.mock('../hooks/useEfficiencySnapshot', () => ({
   fmtEffIter: () => '—',
 }));
 
-import { apiFetch, authGet } from '../api';
+import { apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject } from '../api';
+import type { Project } from '../types/project';
 
 describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
   beforeEach(() => {
@@ -657,5 +660,94 @@ describe('WarmVmPanel — warm-start origin breakdown', () => {
 
     await screen.findByText('backlog reuse');
     expect(screen.queryByTestId('warm-start-origin-breakdown')).toBeNull();
+  });
+});
+
+describe('WarmVmPanel — per-project warm-pool scope control', () => {
+  const projects: Project[] = [
+    {
+      id: 'proj-a', name: 'Project Alpha', status: 'active', github_owner: 'o',
+      github_repo: 'alpha', autonomous_enabled: true, created_at: '2026-01-01',
+    },
+    {
+      id: 'proj-b', name: 'Project Beta', status: 'active', github_owner: 'o',
+      github_repo: 'beta', autonomous_enabled: true, created_at: '2026-01-01',
+    },
+  ];
+
+  const stateScoped: WarmVmStateResponse = {
+    ...baseState,
+    pool_metrics: {
+      enabled: true,
+      target_size: 2,
+      current_size: 1,
+      idle_count: 1,
+      project_allowlist: ['proj-a'],
+    },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateScoped), { status: 200 }),
+    );
+    (enableWarmPoolForProject as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    (disableWarmPoolForProject as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('does not render the scope row when no projects are passed', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} />);
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('warm-pool-scope-row')).toBeNull();
+  });
+
+  test('renders scoped projects from the allowlist and a picker of candidates', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+
+    await screen.findByTestId('warm-pool-scope-row');
+    // proj-a is scoped → shows by name with a disable button.
+    const scoped = screen.getByTestId('warm-pool-scoped-proj-a');
+    expect(scoped.textContent).toContain('Project Alpha');
+    expect(screen.getByTestId('warm-pool-disable-proj-a')).toBeTruthy();
+    // proj-b is NOT scoped → available in the enable picker only.
+    const select = screen.getByTestId('warm-pool-scope-select') as HTMLSelectElement;
+    const optionValues = Array.from(select.options).map((o) => o.value);
+    expect(optionValues).toContain('proj-b');
+    expect(optionValues).not.toContain('proj-a');
+  });
+
+  test('Enable calls enableWarmPoolForProject for the selected project and refetches', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+
+    await screen.findByTestId('warm-pool-scope-row');
+    const select = screen.getByTestId('warm-pool-scope-select');
+    fireEvent.change(select, { target: { value: 'proj-b' } });
+    fireEvent.click(screen.getByTestId('warm-pool-enable-btn'));
+
+    await waitFor(() => {
+      expect(enableWarmPoolForProject).toHaveBeenCalledWith('proj-b');
+    });
+    // Refetches state after the mutation (initial load + post-enable reload).
+    await waitFor(() => {
+      expect((authGet as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  test('Disable calls disableWarmPoolForProject for the scoped project', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} projects={projects} />);
+
+    await screen.findByTestId('warm-pool-scope-row');
+    fireEvent.click(screen.getByTestId('warm-pool-disable-proj-a'));
+
+    await waitFor(() => {
+      expect(disableWarmPoolForProject).toHaveBeenCalledWith('proj-a');
+    });
   });
 });

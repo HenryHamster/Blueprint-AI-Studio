@@ -146,6 +146,10 @@ export interface PoolMetrics {
   settled_idle_cost_usd?: number;
   live_idle_cost_usd?: number;
   funnel?: PoolFunnelSnapshot;
+  // Current per-project enablement scope (sorted project ids). An empty array
+  // means the pool is fleet-wide (legacy all-or-nothing). Omitted by older
+  // backends. The panel renders each scoped project with a disable control.
+  project_allowlist?: string[];
   // Per-account breakdowns for a controlled enable's 'retire or pivot'
   // decision (omitted by older backends). idle_cost_by_account answers which
   // account's idle members drive cost; cost_amortization_by_account joins that

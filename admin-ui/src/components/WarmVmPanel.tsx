@@ -1,8 +1,9 @@
 import { useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
-import { API_BASE_URL, apiFetch, authGet } from '../api';
+import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject } from '../api';
 import { parseTimestamp } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics } from '../types/warmVm';
+import type { Project } from '../types/project';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
 import { usePoller } from '../hooks/usePoller';
@@ -42,9 +43,12 @@ function shortVm(id: string): string {
 
 interface Props {
   onViewTask?: (taskId: string) => void;
+  // Optional so existing mounts/tests keep working. When provided, the panel
+  // renders a per-project warm-pool enable/disable scope control.
+  projects?: Project[];
 }
 
-export function WarmVmPanel({ onViewTask }: Props) {
+export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(STORAGE_KEY) === 'true');
   const [data, setData] = useState<WarmVmStateResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -100,6 +104,43 @@ export function WarmVmPanel({ onViewTask }: Props) {
       } else {
         await load();
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlipping(false);
+    }
+  }, [load]);
+
+  const enableProject = useCallback(async (projectId: string, projectName: string) => {
+    const ok = window.confirm(
+      `ENABLE the warm pool for "${projectName}"?\n\n` +
+      `Scopes the pool to this project, turns the master switch on, and warms ` +
+      `the first members. Other scoped projects are unaffected.`
+    );
+    if (!ok) return;
+    setFlipping(true);
+    try {
+      await enableWarmPoolForProject(projectId);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlipping(false);
+    }
+  }, [load]);
+
+  const disableProject = useCallback(async (projectId: string, projectName: string) => {
+    const ok = window.confirm(
+      `DISABLE the warm pool for "${projectName}"?\n\n` +
+      `Drains this project's pool members and removes it from scope. Other ` +
+      `enabled projects keep their pool — the master switch only turns off if ` +
+      `this is the last scoped project.`
+    );
+    if (!ok) return;
+    setFlipping(true);
+    try {
+      await disableWarmPoolForProject(projectId);
+      await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -267,6 +308,16 @@ export function WarmVmPanel({ onViewTask }: Props) {
 
               {pool && <PoolMetricsRow pool={pool} />}
 
+              {projects.length > 0 && (
+                <WarmPoolScopeRow
+                  projects={projects}
+                  allowlist={pool?.project_allowlist ?? []}
+                  busy={flipping}
+                  onEnable={enableProject}
+                  onDisable={disableProject}
+                />
+              )}
+
               {pool && <PoolAccountMixRow pool={pool} />}
 
               {data.spawn_pin_funnel && (
@@ -356,6 +407,92 @@ function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {
           <span><span className="text-neutral-500">cold</span>: <span className="font-mono text-neutral-300">{funnel.cold_dispatches}</span></span>
           <span><span className="text-neutral-500">hit rate</span>: <span className="font-mono text-neutral-300">{hitRate === null || hitRate === undefined ? '—' : `${Math.round(hitRate * 100)}%`}</span></span>
         </>
+      )}
+    </div>
+  );
+}
+
+// Per-project warm-pool enable/disable control. Lets an operator scope the pool
+// to ONE project (enable), see the currently-scoped set, and remove a project
+// (disable) — the safe one-project-at-a-time rollout lever. Reads the current
+// scope from pool_metrics.project_allowlist (empty = fleet-wide). Renders only
+// when the parent passes a projects list.
+function WarmPoolScopeRow({ projects, allowlist, busy, onEnable, onDisable }: {
+  projects: Project[];
+  allowlist: string[];
+  busy: boolean;
+  onEnable: (projectId: string, projectName: string) => void;
+  onDisable: (projectId: string, projectName: string) => void;
+}) {
+  const [selected, setSelected] = useState('');
+  const scopedIds = new Set(allowlist);
+  const nameFor = (id: string) => projects.find((p) => p.id === id)?.name ?? id;
+  // Candidates for enable: projects not already scoped.
+  const candidates = projects.filter((p) => !scopedIds.has(p.id));
+  // Show the scoped set straight from the allowlist so an id with no matching
+  // project (e.g. a project not visible to this user) still renders + is removable.
+  return (
+    <div
+      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      data-testid="warm-pool-scope-row"
+    >
+      <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
+        Warm Pool Scope
+      </span>
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <select
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+          disabled={busy || candidates.length === 0}
+          data-testid="warm-pool-scope-select"
+          className="bg-neutral-800 border border-neutral-700 rounded px-1.5 py-0.5 text-[10px] text-neutral-200 max-w-[180px] disabled:opacity-50"
+        >
+          <option value="">{candidates.length === 0 ? 'all projects scoped' : 'Select project…'}</option>
+          {candidates.map((p) => (
+            <option key={p.id} value={p.id}>{p.name}</option>
+          ))}
+        </select>
+        <button
+          onClick={() => { if (selected) onEnable(selected, nameFor(selected)); }}
+          disabled={busy || !selected}
+          data-testid="warm-pool-enable-btn"
+          className={
+            'bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30' +
+            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (busy || !selected ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
+          }
+        >
+          Enable
+        </button>
+      </div>
+      {allowlist.length === 0 ? (
+        <span className="text-neutral-600 italic">
+          No projects scoped — enabling the pool scopes it to your chosen project.
+        </span>
+      ) : (
+        <div className="space-y-0.5">
+          {allowlist.map((id) => (
+            <div
+              key={id}
+              className="flex items-center gap-2"
+              data-testid={`warm-pool-scoped-${id}`}
+            >
+              <span className="font-mono text-violet-300 break-all min-w-0">{nameFor(id)}</span>
+              <button
+                onClick={() => onDisable(id, nameFor(id))}
+                disabled={busy}
+                data-testid={`warm-pool-disable-${id}`}
+                className={
+                  'bg-neutral-700/40 border border-neutral-600/40 text-neutral-300 hover:bg-neutral-700/60' +
+                  ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+                  (busy ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
+                }
+              >
+                Disable
+              </button>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

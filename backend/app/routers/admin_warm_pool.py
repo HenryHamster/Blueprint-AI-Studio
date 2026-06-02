@@ -20,10 +20,25 @@ the claim circuit breaker all stay in ONE place:
   :func:`warm_pool_maintainer.retire_and_delete_pool_vm`, so idle cost is banked
   to ``PoolIdleCostLedger`` and the GCP VM + pre-staged secret are cleaned up.
 
+A higher-level ENABLE / DISABLE pair builds on the same machinery to give an
+operator a single, safe, one-project-at-a-time rollout lever:
+
+* ENABLE scopes the warm-pool allowlist to the chosen project, forces the master
+  switch on, establishes a sensible per-project target if none is configured, and
+  warms the first members — all persisted via the durable settings path
+  (:func:`admin_settings._apply_settings`) so the enable survives a restart, then
+  the SAME seed reconcile as above.
+* DISABLE drains the project's live members and removes it from the allowlist. The
+  KEY SAFETY PROPERTY: removing the project never disables the pool for peers that
+  are still scoped. Only when the project was the LAST explicitly-scoped one (the
+  allowlist would become empty, which means fleet-wide) does DISABLE also flip the
+  master switch off — so dropping the final project can never silently flip the
+  whole fleet warm.
+
 Backward-compatibility: these are NEW routes, so no existing contract changes.
 The JSON response keys (``seeded`` / ``drained`` / ``recycled`` / ``reason`` /
-``project_id``) are ADDITIVE-ONLY — future fields may be added, but existing
-keys will not be renamed or removed.
+``project_id`` / ``enabled`` / ``project_allowlist``) are ADDITIVE-ONLY — future
+fields may be added, but existing keys will not be renamed or removed.
 """
 
 import logging
@@ -44,6 +59,7 @@ from app.warm_pool import (
     is_project_warm_pool_scoped,
     is_warm_pool_enabled,
     list_pool_vms,
+    warm_pool_project_scope,
 )
 from app.warm_pool_maintainer import (
     _default_pool_provision_fn,
@@ -60,6 +76,98 @@ router = APIRouter(
     tags=["admin-warm-pool"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+async def _seed_project_pool(
+    session: AsyncSession, project_id: uuid.UUID, user_id: str
+) -> dict:
+    """Top a project's warm pool up to target via the production reconcile path.
+
+    Shared by the manual SEED route and the ENABLE route. Mirrors
+    ``run_pool_maintainer_cycle``'s budget accounting (dispatch-slot + pool-budget
+    headroom) so a manual seed can never breach a ceiling the autonomous path
+    respects, and routes provisioning through ``_default_pool_provision_fn``. Does
+    NOT check ``warm_pool_enabled`` / scope — callers gate that themselves (SEED
+    refuses a dark/unscoped pool; ENABLE has just turned both on).
+
+    Returns the additive-only seed response dict.
+    """
+    from app.shared_state import is_warm_pool_suppressed, runtime_config
+
+    max_concurrent = int(runtime_config.get("max_concurrent_vms", 0) or 0)
+    pool_max = _pool_max_vms(runtime_config)
+    active_tasks = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.status.in_(
+                        [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                    )
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    idle_pool = await count_idle_pool_vms(session)
+    live_pool = await count_live_pool_vms(session)
+    dispatch_slots_remaining = max(0, max_concurrent - active_tasks - idle_pool)
+    pool_budget_remaining = max(0, pool_max - live_pool)
+    stale_vm_ids = await _stale_pool_image_ids()
+
+    summary = await reconcile_project_pool(
+        session,
+        project_id,
+        runtime_config=runtime_config,
+        provision_fn=_default_pool_provision_fn,
+        dispatch_slots_remaining=dispatch_slots_remaining,
+        pool_budget_remaining=pool_budget_remaining,
+        stale_vm_ids=stale_vm_ids,
+        suppressed=is_warm_pool_suppressed(),
+    )
+    logger.info(
+        "[WARM-POOL] operator seed project=%s by user=%s summary=%s",
+        project_id,
+        user_id,
+        summary,
+    )
+    return {
+        "project_id": str(project_id),
+        "seeded": summary["provisioned"],
+        "recycled": summary["recycled"],
+        "drained": summary["drained"],
+        "reason": "ok" if summary["provisioned"] else "no_provision_headroom_or_at_target",
+    }
+
+
+async def _drain_project_pool(
+    session: AsyncSession, project_id: uuid.UUID, user_id: str, *, reason: str
+) -> int:
+    """Retire every live (PROVISIONING/IDLE/LEASED) warm-pool member for a project.
+
+    Shared by the manual DRAIN route and the DISABLE route. Retires through the
+    existing ``retire_and_delete_pool_vm`` teardown so idle cost is banked to the
+    ledger and the GCP VM + pre-staged secret are cleaned up. A member a peer
+    leased or is already tearing down between the scan and the claim is skipped
+    (the atomic compare-and-swap loses), so the returned count covers only members
+    THIS call retired. Returns the number drained.
+    """
+    members = await list_pool_vms(session, project_id=project_id)
+    live_members = [m for m in members if m.state in LIVE_POOL_STATES]
+    drained = 0
+    for member in live_members:
+        if await retire_and_delete_pool_vm(session, member, reason=reason):
+            drained += 1
+    logger.info(
+        "[WARM-POOL] operator %s project=%s by user=%s drained=%d of %d live",
+        reason,
+        project_id,
+        user_id,
+        drained,
+        len(live_members),
+    )
+    return drained
 
 
 @router.post("/projects/{project_id}/warm-pool/seed")
@@ -112,57 +220,7 @@ async def seed_warm_pool(
             ),
         )
 
-    from app.shared_state import is_warm_pool_suppressed, runtime_config
-
-    # Mirror run_pool_maintainer_cycle's budget accounting so a manual seed can
-    # never breach a ceiling the autonomous path would respect. A new pool VM
-    # occupies a real GCP slot, so headroom = max_concurrent_vms - task-bound VMs
-    # - idle pool members; the pool budget is warm_pool_max_vms - live members.
-    max_concurrent = int(runtime_config.get("max_concurrent_vms", 0) or 0)
-    pool_max = _pool_max_vms(runtime_config)
-    active_tasks = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(Task)
-                .where(
-                    Task.status.in_(
-                        [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                    )
-                )
-            )
-        ).scalar()
-        or 0
-    )
-    idle_pool = await count_idle_pool_vms(session)
-    live_pool = await count_live_pool_vms(session)
-    dispatch_slots_remaining = max(0, max_concurrent - active_tasks - idle_pool)
-    pool_budget_remaining = max(0, pool_max - live_pool)
-    stale_vm_ids = await _stale_pool_image_ids()
-
-    summary = await reconcile_project_pool(
-        session,
-        project_id,
-        runtime_config=runtime_config,
-        provision_fn=_default_pool_provision_fn,
-        dispatch_slots_remaining=dispatch_slots_remaining,
-        pool_budget_remaining=pool_budget_remaining,
-        stale_vm_ids=stale_vm_ids,
-        suppressed=is_warm_pool_suppressed(),
-    )
-    logger.info(
-        "[WARM-POOL] operator seed project=%s by user=%s summary=%s",
-        project_id,
-        current_user["user_id"],
-        summary,
-    )
-    return {
-        "project_id": str(project_id),
-        "seeded": summary["provisioned"],
-        "recycled": summary["recycled"],
-        "drained": summary["drained"],
-        "reason": "ok" if summary["provisioned"] else "no_provision_headroom_or_at_target",
-    }
+    return await _seed_project_pool(session, project_id, current_user["user_id"])
 
 
 @router.post("/projects/{project_id}/warm-pool/drain")
@@ -187,17 +245,141 @@ async def drain_warm_pool(
         project_id, current_user["user_id"], session, "owner"
     )
 
-    members = await list_pool_vms(session, project_id=project_id)
-    live_members = [m for m in members if m.state in LIVE_POOL_STATES]
-    drained = 0
-    for member in live_members:
-        if await retire_and_delete_pool_vm(session, member, reason="operator_drain"):
-            drained += 1
+    drained = await _drain_project_pool(
+        session, project_id, current_user["user_id"], reason="operator_drain"
+    )
+    return {"project_id": str(project_id), "drained": drained}
+
+
+@router.post("/projects/{project_id}/warm-pool/enable")
+async def enable_warm_pool_for_project(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Enable the warm pool for ONE project and warm its first members.
+
+    The safe, discoverable one-project-at-a-time rollout lever. In a single
+    action this:
+
+    * scopes ``warm_pool_project_allowlist`` to include this project (so the pool
+      serves exactly the scoped set, not the whole fleet);
+    * forces the master switch ``warm_pool_enabled`` on;
+    * establishes a sensible per-project target (``warm_pool_target_size``) if
+      none is configured (0/unset → 2), and otherwise keeps the operator's value;
+    * seeds the first members up to that target.
+
+    The scope + master-switch + target writes go through the durable settings path
+    (:func:`admin_settings._apply_settings`, under ``runtime_config_lock``) so the
+    enable is validated, persisted to ``DeploymentState`` and survives a restart;
+    the seed reuses the existing reconcile machinery so the fleet/dispatch budget
+    ceilings, credential resolution and idle-cost banking all still apply.
+
+    Because enable always writes a NON-EMPTY allowlist, it can never produce the
+    riskiest state (master-on with an empty allowlist = fleet-wide).
+
+    Response keys (additive-only): the seed keys (``project_id``, ``seeded``,
+    ``recycled``, ``drained``, ``reason``) plus ``enabled`` and
+    ``project_allowlist`` (the resulting scope).
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    from app.routers.admin_settings import _apply_settings
+    from app.shared_state import runtime_config, runtime_config_lock
+
+    async with runtime_config_lock:
+        scope = warm_pool_project_scope()
+        scope.add(str(project_id))
+        payload: dict = {
+            "warm_pool_enabled": True,
+            "warm_pool_project_allowlist": sorted(scope),
+        }
+        # Establish a sensible target only when none is configured; otherwise keep
+        # the operator's existing per-project target untouched.
+        if int(runtime_config.get("warm_pool_target_size", 0) or 0) <= 0:
+            payload["warm_pool_target_size"] = 2
+        await _apply_settings(payload, session, runtime_config)
+
     logger.info(
-        "[WARM-POOL] operator drain project=%s by user=%s drained=%d of %d live",
+        "[WARM-POOL] operator enable project=%s by user=%s allowlist=%s",
+        project_id,
+        current_user["user_id"],
+        sorted(warm_pool_project_scope()),
+    )
+
+    summary = await _seed_project_pool(session, project_id, current_user["user_id"])
+    return {
+        **summary,
+        "enabled": is_warm_pool_enabled(),
+        "project_allowlist": sorted(warm_pool_project_scope()),
+    }
+
+
+@router.post("/projects/{project_id}/warm-pool/disable")
+async def disable_warm_pool_for_project(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Disable the warm pool for ONE project, draining its members.
+
+    Removes the project from ``warm_pool_project_allowlist`` and drains every live
+    member through the existing teardown path (idle cost banked to the ledger).
+
+    KEY SAFETY PROPERTY: this must NEVER turn the pool off for peers that are still
+    scoped. The master switch (``warm_pool_enabled``) is left ON whenever any other
+    project remains in the allowlist. It is flipped OFF only when this project was
+    the LAST explicitly-scoped one — i.e. the allowlist would otherwise become
+    empty, which means fleet-wide; flipping the switch off instead keeps removing
+    the final project from silently warming the whole fleet. When the pool is
+    already in fleet-wide mode (the allowlist was empty), the master switch is left
+    untouched so peers are unaffected.
+
+    Idempotent: draining an empty / unscoped project returns ``drained: 0``.
+
+    Response keys (additive-only): ``project_id``, ``drained``, ``enabled``,
+    ``project_allowlist`` (the resulting scope).
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    from app.routers.admin_settings import _apply_settings
+    from app.shared_state import runtime_config, runtime_config_lock
+
+    drained = await _drain_project_pool(
+        session, project_id, current_user["user_id"], reason="operator_disable"
+    )
+
+    async with runtime_config_lock:
+        scope = warm_pool_project_scope()
+        # was_scoped is only meaningful when the allowlist was non-empty: an empty
+        # allowlist is fleet-wide, where there is no per-project scope to remove.
+        was_scoped = bool(scope) and str(project_id) in scope
+        scope.discard(str(project_id))
+        payload: dict = {"warm_pool_project_allowlist": sorted(scope)}
+        # Only when we removed the LAST explicitly-scoped project (non-empty → now
+        # empty) do we flip the master switch off, so an empty allowlist never
+        # silently reverts to fleet-wide. Peers in a still-non-empty allowlist keep
+        # the pool enabled.
+        if was_scoped and not scope:
+            payload["warm_pool_enabled"] = False
+        await _apply_settings(payload, session, runtime_config)
+
+    logger.info(
+        "[WARM-POOL] operator disable project=%s by user=%s drained=%d allowlist=%s enabled=%s",
         project_id,
         current_user["user_id"],
         drained,
-        len(live_members),
+        sorted(warm_pool_project_scope()),
+        is_warm_pool_enabled(),
     )
-    return {"project_id": str(project_id), "drained": drained}
+
+    return {
+        "project_id": str(project_id),
+        "drained": drained,
+        "enabled": is_warm_pool_enabled(),
+        "project_allowlist": sorted(warm_pool_project_scope()),
+    }

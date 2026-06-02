@@ -27,7 +27,7 @@ from app.models import (
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
-from app.warm_pool import register_pool_vm
+from app.warm_pool import register_pool_vm, warm_pool_project_scope
 from testing.factories import make_membership
 
 
@@ -374,3 +374,235 @@ async def test_drain_empty_pool_is_noop(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["drained"] == 0
+
+
+# ---------------------------------------------------------------------------
+# ENABLE
+# ---------------------------------------------------------------------------
+
+
+def _registering_provision_factory():
+    """Return a provision stub that registers an IDLE PoolVm (no real GCP boot)."""
+
+    async def _registering_provision(session, project_id):
+        member = await register_pool_vm(
+            session,
+            vm_instance_id=f"agent-vm-enable-{uuid.uuid4().hex}",
+            project_id=project_id,
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+        )
+        session.add(member)
+        await session.commit()
+        return True
+
+    return _registering_provision
+
+
+@pytest.mark.asyncio
+async def test_enable_denied_for_non_member_project(
+    client: AsyncClient, db_session, foreign_project, warm_pool_enabled
+):
+    resp = await client.post(
+        f"/api/admin/projects/{foreign_project.id}/warm-pool/enable"
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_enable_scopes_project_sets_master_and_seeds(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """ENABLE flips the master switch on, scopes the allowlist to exactly the
+    chosen project (from a fleet-wide/empty start), and seeds up to target."""
+    # Prove enable flips the master switch ON from OFF.
+    _runtime_config["warm_pool_enabled"] = False
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_project_allowlist"] = []
+
+    mocker.patch(
+        "app.routers.admin_warm_pool._default_pool_provision_fn",
+        new=_registering_provision_factory(),
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["enabled"] is True
+    # Fleet-wide (empty) allowlist is now scoped to EXACTLY this project.
+    assert data["project_allowlist"] == [str(project_owner.id)]
+    assert data["seeded"] == 2
+    # In-memory config reflects the scope + master switch.
+    assert _runtime_config["warm_pool_enabled"] is True
+    assert str(project_owner.id) in warm_pool_project_scope()
+    rows = (
+        await db_session.execute(
+            select(PoolVm).where(PoolVm.project_id == project_owner.id)
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_enable_is_additive_to_existing_scope(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """ENABLE adds the project to an existing non-empty allowlist (peers kept)."""
+    peer = str(uuid.uuid4())
+    _runtime_config["warm_pool_target_size"] = 1
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_project_allowlist"] = [peer]
+
+    mocker.patch(
+        "app.routers.admin_warm_pool._default_pool_provision_fn",
+        new=_registering_provision_factory(),
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_allowlist"] == sorted([peer, str(project_owner.id)])
+    # The pre-existing peer is preserved in the scope.
+    assert peer in warm_pool_project_scope()
+
+
+@pytest.mark.asyncio
+async def test_enable_establishes_default_target_when_unset(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """A 0 target gets a sensible default (2) so enabling actually warms members."""
+    _runtime_config["warm_pool_target_size"] = 0
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_project_allowlist"] = []
+
+    mocker.patch(
+        "app.routers.admin_warm_pool._default_pool_provision_fn",
+        new=_registering_provision_factory(),
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
+    )
+    assert resp.status_code == 200, resp.text
+    assert _runtime_config["warm_pool_target_size"] == 2
+    assert resp.json()["seeded"] == 2
+
+
+# ---------------------------------------------------------------------------
+# DISABLE
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_disable_denied_for_non_member_project(
+    client: AsyncClient, db_session, foreign_project
+):
+    resp = await client.post(
+        f"/api/admin/projects/{foreign_project.id}/warm-pool/disable"
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_disable_drains_and_removes_from_scope_peers_stay_enabled(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """DISABLE drains the project's members and removes it from scope WITHOUT
+    turning the pool off for a peer that is still scoped (the key safety prop)."""
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    peer = str(uuid.uuid4())
+    _runtime_config["warm_pool_enabled"] = True
+    _runtime_config["warm_pool_project_allowlist"] = sorted(
+        [str(project_owner.id), peer]
+    )
+
+    await _register(db_session, project_owner, "agent-vm-dis1", PoolVmState.IDLE)
+    await _register(
+        db_session, project_owner, "agent-vm-dis2", PoolVmState.PROVISIONING
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/disable"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["drained"] == 2
+    # Peer keeps the pool enabled.
+    assert data["enabled"] is True
+    assert str(project_owner.id) not in data["project_allowlist"]
+    assert peer in data["project_allowlist"]
+    assert _runtime_config["warm_pool_enabled"] is True
+
+    remaining = (
+        await db_session.execute(
+            select(PoolVm).where(
+                PoolVm.project_id == project_owner.id,
+                PoolVm.state.in_(
+                    (PoolVmState.IDLE, PoolVmState.PROVISIONING, PoolVmState.LEASED)
+                ),
+            )
+        )
+    ).scalars().all()
+    assert remaining == []
+
+
+@pytest.mark.asyncio
+async def test_disable_last_scoped_project_flips_master_off(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """Removing the LAST explicitly-scoped project flips the master switch off so
+    the empty allowlist never silently reverts to fleet-wide."""
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.compute.get_stale_image_vms", return_value=[])
+
+    _runtime_config["warm_pool_enabled"] = True
+    _runtime_config["warm_pool_project_allowlist"] = [str(project_owner.id)]
+
+    await _register(db_session, project_owner, "agent-vm-last", PoolVmState.IDLE)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/disable"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["drained"] == 1
+    assert data["enabled"] is False
+    assert data["project_allowlist"] == []
+    assert _runtime_config["warm_pool_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_disable_in_fleetwide_mode_leaves_master_untouched(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled
+):
+    """In fleet-wide mode (empty allowlist) disabling one project must NOT flip the
+    master switch off — that would disable every peer."""
+    _runtime_config["warm_pool_enabled"] = True
+    _runtime_config["warm_pool_project_allowlist"] = []
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/disable"
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["drained"] == 0
+    # Master switch stays ON — peers are unaffected.
+    assert data["enabled"] is True
+    assert data["project_allowlist"] == []
+    assert _runtime_config["warm_pool_enabled"] is True

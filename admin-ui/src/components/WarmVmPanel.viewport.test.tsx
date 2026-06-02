@@ -100,6 +100,8 @@ const populatedState: WarmVmStateResponse = {
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
   authGet: vi.fn(async () => new Response(JSON.stringify(emptyState), { status: 200 })),
+  enableWarmPoolForProject: vi.fn(async () => ({})),
+  disableWarmPoolForProject: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
 }));
 

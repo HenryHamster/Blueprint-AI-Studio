@@ -803,7 +803,7 @@ export default function App() {
 
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 
-      <WarmVmPanel onViewTask={handleViewTask} />
+      <WarmVmPanel onViewTask={handleViewTask} projects={s.projects} />
 
 
       {s.error && (

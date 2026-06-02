@@ -989,6 +989,7 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             compute_pool_idle_cost,
         )
         from app.warm_backlog_reuse import get_pool_funnel_snapshot
+        from app.warm_pool import warm_pool_project_scope
 
         cost = await compute_pool_idle_cost(session)
         funnel = get_pool_funnel_snapshot()
@@ -997,6 +998,11 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             "enabled": bool(
                 _shared_state.runtime_config.get("warm_pool_enabled", False)
             ),
+            # Current per-project enablement scope (sorted ids). Empty list means
+            # the pool is fleet-wide (legacy all-or-nothing). The operator panel
+            # renders this as the set of currently-scoped projects, each with a
+            # disable control.
+            "project_allowlist": sorted(warm_pool_project_scope()),
             "target_size": int(
                 _shared_state.runtime_config.get("warm_pool_target_size", 2)
             ),

@@ -1205,6 +1205,30 @@ export async function backfillProjectBranches(projectId: string): Promise<unknow
   return res.json();
 }
 
+// Enable the warm pool for a single project: scopes the allowlist to it, forces
+// the master switch on, establishes a sensible target, and warms first members.
+// Backs POST /api/admin/projects/{id}/warm-pool/enable.
+export async function enableWarmPoolForProject(projectId: string): Promise<unknown> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/warm-pool/enable`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to enable warm pool: ${res.status}`);
+  return res.json();
+}
+
+// Disable the warm pool for a single project: drains its members and removes it
+// from the allowlist without affecting peers that are still scoped.
+// Backs POST /api/admin/projects/{id}/warm-pool/disable.
+export async function disableWarmPoolForProject(projectId: string): Promise<unknown> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/warm-pool/disable`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to disable warm pool: ${res.status}`);
+  return res.json();
+}
+
 export interface SrDisagreementTask {
   task_id: string;
   title: string;
