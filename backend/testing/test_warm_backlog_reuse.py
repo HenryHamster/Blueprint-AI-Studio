@@ -639,6 +639,7 @@ def _clear_funnel_events(wbr):
     wbr._scan_skipped_pinned_vm_events.clear()
     wbr._scan_skipped_file_conflict_events.clear()
     wbr._scan_saturated_events.clear()
+    wbr._completion_dependents_marked_events.clear()
 
 
 def test_funnel_counters_and_snapshot():
@@ -666,6 +667,26 @@ def test_funnel_counters_and_snapshot():
         assert snap["claim_skipped_total"] == 3
         assert snap["claim_skipped_by_reason"]["no_eligible"] == 2
         assert snap["claim_skipped_by_reason"]["lost_claim_race"] == 1
+    finally:
+        _clear_funnel_events(wbr)
+
+
+def test_funnel_completion_dependents_marked():
+    """record_completion_dependents_marked sums the dependents proactively marked
+    by completion-side triggers within the window; non-positive counts no-op."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        wbr.record_completion_dependents_marked(2)
+        wbr.record_completion_dependents_marked(1)
+        # Non-positive counts must not register an event.
+        wbr.record_completion_dependents_marked(0)
+        wbr.record_completion_dependents_marked(-3)
+
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["completion_dependents_marked"] == 3
+        assert len(wbr._completion_dependents_marked_events) == 2
     finally:
         _clear_funnel_events(wbr)
 

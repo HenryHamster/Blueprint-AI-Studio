@@ -6392,3 +6392,101 @@ async def test_orphan_loop_no_time_budget_when_disabled_processes_all(
     assert all(o.status == TaskStatus.QUEUED for o in orphans), (
         "with the budget disabled, all orphans must be reaped in one cycle"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _mark_landed_parent_dependents — completion-side warm-reuse trigger
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class _FakeParent:
+    """Minimal stand-in exposing only the ``status`` attribute the helper reads."""
+
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeGetSession:
+    """Session stub exposing only the async ``get`` the helper uses."""
+
+    def __init__(self, result):
+        self._result = result
+        self.got = []
+
+    async def get(self, _model, ident):
+        self.got.append(ident)
+        return self._result
+
+
+class TestMarkLandedParentDependents:
+    """The reaper's two rollup-trigger sites stamp the sticky ``_deps_satisfied``
+    marker on a landed parent's just-unblocked dependents — but ONLY when the
+    parent actually landed (status COMPLETED), and a failure never aborts the
+    reaper cycle."""
+
+    @pytest.mark.asyncio
+    async def test_marks_dependents_when_parent_completed(self, mocker):
+        from app.reaper import _mark_landed_parent_dependents
+
+        pid = _uuid_mod.uuid4()
+        parent = _FakeParent(TaskStatus.COMPLETED)
+        spy = mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        session = _FakeGetSession(parent)
+
+        await _mark_landed_parent_dependents(pid, session)
+
+        # Re-fetched the parent on the shared session, then delegated with it.
+        assert session.got == [pid]
+        spy.assert_awaited_once()
+        assert spy.await_args.args[0] is parent
+
+    @pytest.mark.asyncio
+    async def test_skips_when_parent_not_completed(self, mocker):
+        """A parent still EVALUATING (rollup did not land) must NOT be stamped —
+        the readiness signal is never loosened."""
+        from app.reaper import _mark_landed_parent_dependents
+
+        spy = mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+        )
+        await _mark_landed_parent_dependents(
+            _uuid_mod.uuid4(), _FakeGetSession(_FakeParent(TaskStatus.EVALUATING))
+        )
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_when_parent_id_none_or_missing(self, mocker):
+        from app.reaper import _mark_landed_parent_dependents
+
+        spy = mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+        )
+        # No parent id at all (e.g. a parentless child).
+        await _mark_landed_parent_dependents(None, _FakeGetSession(None))
+        # Parent row gone between trigger and re-fetch.
+        await _mark_landed_parent_dependents(_uuid_mod.uuid4(), _FakeGetSession(None))
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_swallows_delegate_failure(self, mocker):
+        """A failure in the marking pass must never abort the reaper cycle."""
+        from app.reaper import _mark_landed_parent_dependents
+
+        mocker.patch(
+            "app.task_lifecycle._mark_dependents_warm_claimable",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        )
+        # Must not raise.
+        assert (
+            await _mark_landed_parent_dependents(
+                _uuid_mod.uuid4(), _FakeGetSession(_FakeParent(TaskStatus.COMPLETED))
+            )
+            is None
+        )

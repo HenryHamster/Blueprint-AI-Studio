@@ -289,6 +289,48 @@ async def _increment_research_spawn_count(
     return new_count
 
 
+async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
+    """Completion-side warm-reuse trigger for PRs that land on the integration
+    branch from inside ``_process_post_commit`` (the small-scope auto-merge and
+    review-approved merge paths).
+
+    The orchestrator's CI-completion path (cluster 1) already stamps the sticky
+    ``_deps_satisfied`` readiness marker on the dependents a landing unblocks,
+    but the in-process merge paths here are a second class of integration
+    landing that previously had no completion-side trigger: the just-unblocked
+    dependent stayed unmarked until a later capacity-and-window-bounded dispatch
+    scan happened to reach it, so ``landed_task``'s warm VM — polling for
+    follow-on work inside its teardown-defer grace window — skipped it and tore
+    down cold while the orchestrator cold-provisioned a fresh VM for that very
+    dependent.
+
+    Fully delegated to the single authoritative implementation in
+    ``orchestrator._mark_unblocked_dependents`` (same GitHub-aware dependency
+    resolution, its own sessions with no partial projection, and no loosening
+    of the readiness signal — only the ``"eligible"`` result is stamped). The
+    delegated call opens its own sessions, so it must run AFTER the caller has
+    committed and released its FOR UPDATE lock. Best-effort: any failure here
+    must never abort post-commit processing. Deferred import avoids a circular
+    import (orchestrator is a heavy module that is already loaded by call time).
+    """
+    try:
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.rollup_management import _verify_pr_merged
+
+        unblocked = await _mark_unblocked_dependents(landed_task, _verify_pr_merged)
+        if unblocked:
+            logger.info(
+                "[PIPELINE] Task %s landing unblocked %d dependent(s) — marked warm-claimable",
+                landed_task.id,
+                unblocked,
+            )
+    except Exception:
+        logger.exception(
+            "[PIPELINE] Dependent warm-claim marking failed for task %s",
+            landed_task.id,
+        )
+
+
 async def _process_post_commit(
     task_id: uuid.UUID,
     payload: AgentStatusPayload,
@@ -955,6 +997,12 @@ async def _process_post_commit(
                                     )
                             await session.commit()
                             await _cleanup_branches(task, session)
+                            # Completion-side warm-reuse trigger: the PR has
+                            # landed on integration and the lock is released, so
+                            # proactively mark any dependents this just unblocked
+                            # as warm-claimable for this task's teardown-defer VM.
+                            if _record_pr_merged:
+                                await _mark_dependents_warm_claimable(task)
                             logger.info(
                                 f"[PIPELINE] Auto-merged PR #{pr_number} into {base_branch} (small scope, intermediate)"
                             )
@@ -2323,6 +2371,13 @@ async def _process_post_commit(
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
+                                        # Completion-side warm-reuse trigger: the
+                                        # original task's PR has landed on
+                                        # integration and the lock is released —
+                                        # mark its just-unblocked dependents
+                                        # warm-claimable (see cluster 1 parity).
+                                        if _record_pr_merged:
+                                            await _mark_dependents_warm_claimable(orig)
                                         # Spawn a smoketest after rollup merges to the
                                         # promotion target. After Phase 1 (automain/LTS),
                                         # normal rollups target `automain`; only promotion

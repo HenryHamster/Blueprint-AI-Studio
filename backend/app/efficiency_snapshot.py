@@ -650,6 +650,8 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
+    from app.warm_backlog_reuse import compute_dominant_reuse_dropout  # noqa: PLC0415
+
     tasks = await _load_recent_tasks(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
 
@@ -676,6 +678,12 @@ async def compute_current_axes(
         "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
         "pool_metrics": pool_metrics,
         "cost_per_merged_pr_incl_pool_idle": cost_incl_pool_idle,
+        # Durable snapshot of the warm-reuse drop-out ranking. The live funnel
+        # counters are in-memory and reset on every deploy/restart (frequent on
+        # Cloud Run); folding the ranked breakdown into the daily snapshot makes
+        # the dominant drop-out survive restarts and trendable day over day
+        # (surfaced via read_baseline_with_drift -> the warm-VM admin view).
+        "reuse_dropout": compute_dominant_reuse_dropout(),
     }
 
 
@@ -786,6 +794,13 @@ async def read_baseline_with_drift(
     counters (see :func:`app.warm_backlog_reuse.get_reuse_funnel_snapshot`).
     These counters are in-memory and instance-local; they reset on restart and
     are not stored in the efficiency baseline snapshot.
+
+    ``reuse_dropout`` is the latest *persisted* warm-reuse drop-out ranking
+    (see :func:`app.warm_backlog_reuse.compute_dominant_reuse_dropout`), folded
+    into each daily snapshot so it survives the restarts that wipe
+    ``reuse_funnel``. ``reuse_dropout_trend`` is the oldest-first day-over-day
+    series of ``{captured_at, dominant_reason, dominant_share, dropout_total}``
+    so an operator can confirm a widening change reduced the dominant leak.
     """
     from app.warm_backlog_reuse import get_reuse_funnel_snapshot  # noqa: PLC0415
 
@@ -797,6 +812,25 @@ async def read_baseline_with_drift(
     baseline = container.get("baseline") or {}
     snapshots = container.get("snapshots") or []
     latest = snapshots[-1] if snapshots else {}
+
+    # Durable warm-reuse drop-out: the latest persisted ranking plus a day-over-
+    # day trend of the dominant reason / its share / the drop-out total, so an
+    # operator can confirm a widening change reduced the dominant leak even
+    # across the restarts that wipe the in-memory ``reuse_funnel`` counters.
+    reuse_dropout_trend = [
+        {
+            "captured_at": snap.get("captured_at"),
+            "dominant_reason": (
+                (snap.get("reuse_dropout") or {}).get("dominant_dropout") or {}
+            ).get("reason"),
+            "dominant_share": (
+                (snap.get("reuse_dropout") or {}).get("dominant_dropout") or {}
+            ).get("share"),
+            "dropout_total": (snap.get("reuse_dropout") or {}).get("dropout_total"),
+        }
+        for snap in snapshots
+        if snap.get("reuse_dropout")
+    ]
 
     axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
@@ -830,6 +864,11 @@ async def read_baseline_with_drift(
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
         "reuse_funnel": get_reuse_funnel_snapshot(),
+        # Durable (restart-surviving) warm-reuse drop-out ranking from the latest
+        # snapshot, plus its day-over-day trend. Unlike ``reuse_funnel`` above
+        # (live in-memory counters), these persist in the efficiency snapshot.
+        "reuse_dropout": latest.get("reuse_dropout"),
+        "reuse_dropout_trend": reuse_dropout_trend,
         # Warm-pool idle cost from the latest snapshot, plus the net-cost
         # companion that folds it into cost_per_merged_pr (see compute_current_axes).
         "pool_idle_cost_usd": latest.get("pool_idle_cost_usd"),

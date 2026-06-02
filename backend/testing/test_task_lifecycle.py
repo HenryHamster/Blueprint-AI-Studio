@@ -29,6 +29,7 @@ from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
     _increment_research_spawn_count,
+    _mark_dependents_warm_claimable,
     _requeue_parent_task,
     _merge_with_retry,
     _comment_with_retry,
@@ -4368,8 +4369,8 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-from sqlalchemy import text as _sa_text
-from sqlalchemy.exc import (
+from sqlalchemy import text as _sa_text  # noqa: E402
+from sqlalchemy.exc import (  # noqa: E402
     IntegrityError as _IntegrityError,
     PendingRollbackError as _PendingRollbackError,
 )
@@ -4872,3 +4873,59 @@ class TestResolveFallbackVerdict:
     def test_no_verdict_returns_none(self):
         assert _resolve_fallback_verdict("just some unrelated log output") is None
         assert _resolve_fallback_verdict("") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _mark_dependents_warm_claimable — completion-side warm-reuse trigger
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMarkDependentsWarmClaimable:
+    """The in-process merge paths (small-scope auto-merge, review-approved merge)
+    delegate to the single authoritative orchestrator implementation to stamp the
+    sticky ``_deps_satisfied`` readiness marker on dependents a landing unblocks,
+    so the just-completed task's warm VM can claim follow-on work inside its
+    teardown-defer grace window. The wrapper must (1) delegate with the landed
+    task + the GitHub-aware PR-merge verifier, and (2) never let a failure abort
+    post-commit processing."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_orchestrator_with_landed_task(self, tl_db, mocker):
+        session, _ = tl_db
+        project = await _make_project(session)
+        landed = await _make_task(
+            session, project.id, task_type="research", status=TaskStatus.COMPLETED
+        )
+
+        spy = mocker.patch(
+            "app.orchestrator._mark_unblocked_dependents",
+            new_callable=AsyncMock,
+            return_value=2,
+        )
+        verifier = object()
+        mocker.patch("app.rollup_management._verify_pr_merged", verifier)
+
+        await _mark_dependents_warm_claimable(landed)
+
+        spy.assert_awaited_once()
+        # The landed task and the authoritative PR-merge verifier are forwarded.
+        assert spy.await_args.args[0] is landed
+        assert spy.await_args.args[1] is verifier
+
+    @pytest.mark.asyncio
+    async def test_swallows_delegate_failure(self, tl_db, mocker):
+        """A failure in the marking pass must never abort post-commit work."""
+        session, _ = tl_db
+        project = await _make_project(session)
+        landed = await _make_task(
+            session, project.id, task_type="research", status=TaskStatus.COMPLETED
+        )
+
+        mocker.patch(
+            "app.orchestrator._mark_unblocked_dependents",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        )
+
+        # Must not raise.
+        assert await _mark_dependents_warm_claimable(landed) is None

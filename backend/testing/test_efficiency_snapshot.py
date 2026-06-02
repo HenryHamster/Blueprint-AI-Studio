@@ -1577,3 +1577,53 @@ async def test_read_baseline_with_drift_includes_reuse_funnel(db_session):
     # On a fresh instance all counters start at zero.
     assert funnel["completed_vms_with_eligible_backlog"] == 0
     assert funnel["warm_claims_succeeded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_snapshot_persists_reuse_dropout_and_surfaces_trend(db_session):
+    """write_snapshot must fold the dominant reuse drop-out into the durable
+    snapshot, and read_baseline_with_drift must surface the latest ranking plus
+    a day-over-day trend that survives the in-memory funnel reset."""
+    import app.warm_backlog_reuse as wbr
+
+    # Clear the process-global rolling funnel deques, then seed a clear leader:
+    # 5 file-conflict scan skips dominate the non-converting population.
+    for dq in (
+        wbr._scan_skipped_depends_on_events,
+        wbr._scan_skipped_pinned_vm_events,
+        wbr._scan_skipped_file_conflict_events,
+        wbr._scan_saturated_events,
+        wbr._grace_idle_release_events,
+        wbr._grace_ceiling_release_events,
+        wbr._claim_skipped_events,
+    ):
+        dq.clear()
+    for _ in range(5):
+        wbr.record_scan_skipped_file_conflict()
+    wbr.record_grace_idle_release()
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    snapshot = await write_snapshot(db_session, project.id)
+    # The drop-out ranking is persisted in the snapshot body (survives restart).
+    assert snapshot["reuse_dropout"]["dominant_dropout"]["reason"] == "scan_file_conflict"
+    assert snapshot["reuse_dropout"]["dominant_dropout"]["count"] == 5
+
+    # Simulate a deploy/restart wiping the in-memory funnel counters.
+    for dq in (
+        wbr._scan_skipped_file_conflict_events,
+        wbr._grace_idle_release_events,
+    ):
+        dq.clear()
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    # Latest persisted ranking is still surfaced despite the wiped live funnel.
+    assert result["reuse_dropout"]["dominant_dropout"]["reason"] == "scan_file_conflict"
+    trend = result["reuse_dropout_trend"]
+    assert len(trend) == 1
+    assert trend[0]["dominant_reason"] == "scan_file_conflict"
+    assert trend[0]["dominant_share"] == result["reuse_dropout"]["dominant_dropout"]["share"]
+    assert trend[0]["dropout_total"] == 6

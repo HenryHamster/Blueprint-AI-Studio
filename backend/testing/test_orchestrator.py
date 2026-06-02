@@ -2353,6 +2353,156 @@ class TestPersistDepsSatisfied:
         assert sentinel.call_count == 0
 
 
+class TestMarkUnblockedDependents:
+    """Completion-side trigger: when a task finishes and its PR lands on the
+    integration branch, the orchestrator proactively stamps ``_deps_satisfied``
+    on the QUEUED dependents it just unblocked, so the just-completed task's warm
+    VM can claim that follow-on work inside its teardown-defer grace window
+    instead of tearing down cold. The marker stays authoritative — only deps that
+    resolve ``eligible`` are stamped; a dependent with any unresolved dep is left
+    unmarked."""
+
+    @staticmethod
+    async def _verify_true(_task, _session):
+        return True
+
+    @pytest.mark.asyncio
+    async def test_marks_ready_dependent_after_completion(self, db_session, mocker):
+        from app.orchestrator import _mark_unblocked_dependents
+
+        project = make_project(name="Unblock", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(completed)
+        await db_session.commit()
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "follow-on"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(completed.id)],
+            context={"scope": "small"},
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 1
+
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        # The just-unblocked dependent is now warm-claimable...
+        assert dependent.context.get("_deps_satisfied") is True
+        # ...without clobbering pre-existing context.
+        assert dependent.context.get("scope") == "small"
+
+    @pytest.mark.asyncio
+    async def test_marking_records_completion_funnel_telemetry(
+        self, db_session, mocker
+    ):
+        """The completion-side trigger surfaces its lift on the reuse funnel: a
+        production call to ``_mark_unblocked_dependents`` that stamps N dependents
+        must record N onto ``completion_dependents_marked`` (not stay a dead 0)."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.warm_backlog_reuse import get_reuse_funnel_snapshot
+
+        project = make_project(name="Unblock Telemetry", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(completed)
+        await db_session.commit()
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "follow-on"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        before = get_reuse_funnel_snapshot()["completion_dependents_marked"]
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 1
+        after = get_reuse_funnel_snapshot()["completion_dependents_marked"]
+        assert after == before + 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_mark_dependent_with_unresolved_dep(
+        self, db_session, mocker
+    ):
+        """Signal is NOT loosened: a dependent that also waits on a still-QUEUED
+        sibling stays unmarked, so it continues to cold-dispatch exactly as before."""
+        from app.orchestrator import _mark_unblocked_dependents
+
+        project = make_project(name="Unblock Partial", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep-a"}],
+            status=TaskStatus.COMPLETED,
+        )
+        still_pending = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep-b"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([completed, still_pending])
+        await db_session.commit()
+        await db_session.refresh(completed)
+        await db_session.refresh(still_pending)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "follow-on"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(completed.id), str(still_pending.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 0
+
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert dependent.context.get("_deps_satisfied") is None
+
+
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker
     silently shadows the module-level X for the *entire* function, which then
