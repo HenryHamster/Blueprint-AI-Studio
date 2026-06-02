@@ -1542,15 +1542,25 @@ export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
  *  (mirrors the backend's ``get_project_task_branch_namespace`` resolver). */
 export const TASK_BRANCH_NAMESPACE_DEFAULT = 'blueprint';
 
-/** Resolve the per-project task-branch namespace from a build config.
- *  Mirrors the backend ``get_project_task_branch_namespace``: use the
- *  per-project ``task_branch_namespace`` when set, else the canonical
- *  Blueprint default.  Callers thread the result into {@link deriveTaskBranch}
- *  rather than relying on a hidden default. */
+/** Resolve the per-project task-branch namespace from a raw task record.
+ *  Reads ``task.build_config.task_branch_namespace`` DIRECTLY — deliberately
+ *  NOT via {@link resolveBuildConfig}, which returns undefined for a project
+ *  with no build directories (greenfield / docs-only external repos). Routing
+ *  the namespace through that resolver silently dropped it and defaulted every
+ *  branch to "blueprint/...", diverging from the orchestrator-derived branch
+ *  and orphaning the PR (the namespace-divergence bug). Namespace resolution
+ *  must NOT depend on the directories gate. The slug is validated ([a-z0-9-],
+ *  matching the backend ``_derive_task_branch_namespace`` slugifier); an absent
+ *  or malformed value falls back to the canonical Blueprint default. Mirrors
+ *  the backend ``get_project_task_branch_namespace``. Callers thread the result
+ *  into {@link deriveTaskBranch} rather than relying on a hidden default. */
 export function resolveTaskBranchNamespace(
-  buildConfig: { task_branch_namespace?: string } | null | undefined,
+  task: Record<string, unknown> | null | undefined,
 ): string {
-  return buildConfig?.task_branch_namespace || TASK_BRANCH_NAMESPACE_DEFAULT;
+  const buildConfig = task?.build_config as Record<string, unknown> | undefined;
+  const ns = buildConfig?.task_branch_namespace;
+  if (typeof ns === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(ns)) return ns;
+  return TASK_BRANCH_NAMESPACE_DEFAULT;
 }
 
 /** Return the canonical git branch name for a task.
@@ -1769,6 +1779,7 @@ export async function setupWorkspace(
   owner: string, repo: string, ghToken: string, baseBranch: string,
   branchPrefix: string, taskId: string,
   ws: WebSocket | null, statusRef: { value: string },
+  taskBranchNamespace: string,
   buildConfig?: BuildConfig
 ): Promise<{ workBranch: string; shortId: string }> {
   statusRef.value = `Cloning ${owner}/${repo}...`;
@@ -1798,7 +1809,9 @@ export async function setupWorkspace(
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const namespace = resolveTaskBranchNamespace(buildConfig);
+  // Namespace is resolved by the caller (from the raw task) and threaded in, so
+  // it survives an empty build_config.directories (resolveBuildConfig → undefined).
+  const namespace = taskBranchNamespace;
   const workBranch = `${namespace}/${branchPrefix}-${shortId}`;
   // Clean up stale remote branch from previous attempt (requeue scenario).
   // CRITICAL: if the stale branch has an open PR, deleting it auto-closes the PR
