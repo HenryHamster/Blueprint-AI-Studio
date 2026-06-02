@@ -1704,7 +1704,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # self-repair apparatus (autonomous_research_investigations) was deleted; the
 # residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_residual import (
+from app.autonomous_research_residual import (  # noqa: E402
     _spawn_residual_fingerprint_remediation,
 )
 
