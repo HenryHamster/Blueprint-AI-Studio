@@ -16,6 +16,7 @@ import uuid
 import logging
 
 from app.database import get_session
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.shared_state import (
     get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
@@ -34,7 +35,6 @@ from app.admin_helpers import (
     _get_user_task_with_role,
 )
 from app import release_qualifier, release_version
-from app.landed_signal import apply_merged_landed_signal
 
 logger = logging.getLogger(__name__)
 
@@ -268,19 +268,38 @@ async def trigger_rollup(
     if is_target_intermediate:
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
-            task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "rollup_pr_url": rollup_pr_url}
-            apply_merged_landed_signal(
+            (
+                record_pr_merged,
+                terminal_rollup_merge,
+                landed_branch,
+            ) = await classify_rollup_merge_outcome(
                 task,
                 _project,
-                base_branch=target_branch,
-                hotfix_lane=bool(
-                    (task.first_payload or {}).get("hotfix")
-                    or (task.context or {}).get("hotfix")
-                ),
-                non_merge_reason="merged_pr_non_integration_branch",
+                session,
+                pr_number=rollup_pr_number,
+                merged_base_branch=target_branch,
+                source="admin_operator_triggers.rollup_auto_merge",
             )
-            task.latest_status_message = f"Rollup PR auto-merged into {target_branch}"
+            task.status = (
+                TaskStatus.COMPLETED
+                if terminal_rollup_merge
+                else TaskStatus.EVALUATING
+            )
+            task.context = {
+                **ctx,
+                **({"pr_merged": True} if record_pr_merged else {}),
+                "rollup_pr_number": rollup_pr_number,
+                "rollup_pr_url": rollup_pr_url,
+            }
+            if terminal_rollup_merge:
+                task.latest_status_message = (
+                    f"Rollup PR auto-merged into {landed_branch}"
+                )
+            else:
+                task.latest_status_message = (
+                    f"Rollup PR auto-merged into {landed_branch}; awaiting "
+                    "downstream landing"
+                )
             await delete_branch(gh_token, owner, repo, staging_branch)
         else:
             task.latest_status_message = (
@@ -319,21 +338,36 @@ async def trigger_rollup(
             spawn_reason_code = (task.context or {}).get(SPAWN_REASON_KEY)
             spawn_reason_msg = task.latest_status_message
             if spawn_reason_code == SPAWN_REASON_ALREADY_MERGED:
-                # PR was already merged before review could spawn — terminal success.
-                task.status = TaskStatus.COMPLETED
-                apply_merged_landed_signal(
+                (
+                    record_pr_merged,
+                    terminal_rollup_merge,
+                    landed_branch,
+                ) = await classify_rollup_merge_outcome(
                     task,
                     _project,
-                    base_branch=target_branch,
-                    hotfix_lane=bool(
-                        (task.first_payload or {}).get("hotfix")
-                        or (task.context or {}).get("hotfix")
-                    ),
-                    non_merge_reason="merged_pr_non_integration_branch",
+                    session,
+                    pr_number=rollup_pr_number,
+                    merged_base_branch=target_branch,
+                    source="admin_operator_triggers.rollup_already_merged",
                 )
-                task.latest_status_message = (
-                    f"Rollup PR #{rollup_pr_number} already merged"
+                task.status = (
+                    TaskStatus.COMPLETED
+                    if terminal_rollup_merge
+                    else TaskStatus.EVALUATING
                 )
+                task.context = {
+                    **(task.context or {}),
+                    **({"pr_merged": True} if record_pr_merged else {}),
+                }
+                if terminal_rollup_merge:
+                    task.latest_status_message = (
+                        f"Rollup PR #{rollup_pr_number} already merged"
+                    )
+                else:
+                    task.latest_status_message = (
+                        f"Rollup PR #{rollup_pr_number} already merged into "
+                        f"{landed_branch}; awaiting downstream landing"
+                    )
             elif spawn_reason_code in (SPAWN_REASON_DEFERRED, SPAWN_REASON_DEDUP):
                 # Recoverable: a sibling task is in-flight on the same PR. Keep
                 # the parent EVALUATING so the orchestrator retries review-spawn

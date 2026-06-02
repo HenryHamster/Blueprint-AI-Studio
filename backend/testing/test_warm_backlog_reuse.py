@@ -684,6 +684,64 @@ def test_funnel_claim_skipped_circuit_breaker():
         _clear_funnel_events(wbr)
 
 
+def _clear_all_dropout_events(wbr):
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+
+
+def test_dominant_dropout_names_clear_leader():
+    """A reason that meets the volume/share/runner-up gate is named dominant,
+    with its share of the non-converting population; below the gate it is None."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_all_dropout_events(wbr)
+    try:
+        # 4 lost-claim-race vs 1 ceiling-release: race covers 4/5 (>=50%),
+        # >=2 events, and strictly outranks the runner-up -> dominant.
+        for _ in range(4):
+            wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_grace_ceiling_release()
+
+        result = wbr.compute_dominant_reuse_dropout()
+        assert result["dropout_total"] == 5
+        assert result["dropout_by_reason"]["claim_lost_claim_race"] == 4
+        assert result["dropout_by_reason"]["grace_ceiling_release"] == 1
+        dom = result["dominant_dropout"]
+        assert dom is not None
+        assert dom["reason"] == "claim_lost_claim_race"
+        assert dom["count"] == 4
+        assert dom["total"] == 5
+        assert dom["share"] == 0.8
+        assert "per-VM" in result["attribution_note"]
+    finally:
+        _clear_all_dropout_events(wbr)
+
+
+def test_dominant_dropout_none_on_even_split_and_empty():
+    """No leader is named on an even split (no clear dominant) or empty window."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_all_dropout_events(wbr)
+    try:
+        # Empty window -> total 0, no dominant.
+        empty = wbr.compute_dominant_reuse_dropout()
+        assert empty["dropout_total"] == 0
+        assert empty["dominant_dropout"] is None
+
+        # Even 2-vs-2 split: top does not strictly outrank runner-up -> None.
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_grace_idle_release()
+        wbr.record_grace_idle_release()
+        tied = wbr.compute_dominant_reuse_dropout()
+        assert tied["dropout_total"] == 4
+        assert tied["dominant_dropout"] is None
+    finally:
+        _clear_all_dropout_events(wbr)
+
+
 @pytest.mark.asyncio
 async def test_funnel_warm_claim_increments_succeeded(
     client: AsyncClient, db_session, mocker

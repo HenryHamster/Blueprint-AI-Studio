@@ -22,6 +22,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.models import (
     Alert,
     AlertSeverity,
@@ -1944,6 +1945,7 @@ async def update_agent_status(
 
                 _gh_pr_state: str | None = None
                 _gh_pr_merged: bool = False
+                _gh_pr_base_branch: str | None = None
                 try:
                     from app.routers.agent import get_github_token_for_task
                     from app.github import get_pull_request
@@ -1956,11 +1958,7 @@ async def update_agent_status(
                     )
                     _gh_pr_state = _pr_data.get("state")
                     _gh_pr_merged = bool(_pr_data.get("merged"))
-                    _gh_pr_base_branch = (
-                        _pr_data.get("base", {}).get("ref")
-                        if isinstance(_pr_data.get("base"), dict)
-                        else None
-                    )
+                    _gh_pr_base_branch = (_pr_data.get("base") or {}).get("ref")
                 except Exception as _gh_exc:
                     # Mirror reaper behavior: assume open on transient GH failure
                     # so a brief outage doesn't strand the task as FAILED-forever.
@@ -1969,7 +1967,6 @@ async def update_agent_status(
                         f"{type(_gh_exc).__name__}: {_gh_exc} — assuming open"
                     )
                     _gh_pr_state = "open"
-                    _gh_pr_base_branch = None
 
                 # Re-acquire FOR UPDATE on the same row for the final state
                 # transition. populate_existing=True forces SQLA to refresh
@@ -2040,39 +2037,44 @@ async def update_agent_status(
                 # the spawn succeeds.
                 _ctx = dict(task.context or {})
                 if _gh_pr_state == "closed" and _gh_pr_merged:
+                    _proj = await session.get(Project, task.project_id)
                     logger.info(
                         f"[AGENT_STATUS] Task {task.id} reported FAILED but PR #{_pr_num} was merged "
-                        f"out-of-band — marking COMPLETED"
+                        f"out-of-band — classifying landing"
+                    )
+                    (
+                        _record_pr_merged,
+                        _terminal_rollup_merge,
+                        _landed_branch,
+                    ) = await classify_rollup_merge_outcome(
+                        task,
+                        _proj,
+                        session,
+                        pr_number=_pr_num,
+                        merged_base_branch=_gh_pr_base_branch,
+                        source="agent_status.failed_pr_recovery",
                     )
                     _ctx.pop("_pr_state_check_pending", None)
                     task.context = _ctx
                     flag_modified(task, "context")
-                    task.status = TaskStatus.COMPLETED
+                    task.status = (
+                        TaskStatus.COMPLETED
+                        if _terminal_rollup_merge
+                        else TaskStatus.EVALUATING
+                    )
                     task.vm_instance_id = None
                     task.last_heartbeat = None
-                    task.latest_status_message = (
-                        f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
-                    )
-                    from app.landed_signal import apply_merged_landed_signal
-
-                    project = (
-                        await session.get(Project, task.project_id)
-                        if task.project_id
-                        else None
-                    )
-                    apply_merged_landed_signal(
-                        task,
-                        project,
-                        base_branch=_gh_pr_base_branch
-                        or (task.first_payload or {}).get("base_branch")
-                        or _get_project_integration_branch(project)
-                        or "",
-                        hotfix_lane=bool(
-                            (task.first_payload or {}).get("hotfix")
-                            or (task.context or {}).get("hotfix")
-                        ),
-                        non_merge_reason="merged_pr_non_integration_branch",
-                    )
+                    if _terminal_rollup_merge:
+                        task.latest_status_message = (
+                            f"Reported FAILED; PR #{_pr_num} was merged out-of-band"
+                        )
+                    else:
+                        task.latest_status_message = (
+                            f"Reported FAILED; PR #{_pr_num} merged into "
+                            f"{_landed_branch}; awaiting downstream landing"
+                        )
+                    if _record_pr_merged:
+                        task.context = {**(task.context or {}), "pr_merged": True}
                     session.add(task)
                     await session.commit()
                     await broadcast_to_project(

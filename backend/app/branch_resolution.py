@@ -6,10 +6,12 @@ populate the corresponding columns. Re-exported from :mod:`app.shared_state` as
 a thin facade so existing importers are unaffected. Behaviour-preserving.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict
 
 from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 
 from app.runtime_config_state import runtime_config
 
@@ -547,6 +549,265 @@ def get_project_promotion_target(project) -> str:
         fallback_branch="main",
     )
     return "main"
+
+
+_PROMOTION_TARGET_LANDING_ALERT_TITLE = (
+    "Merged PR landed on promotion target before integration"
+)
+
+
+def _promotion_target_landing_reason(
+    *,
+    pr_label: str,
+    landed_branch: str,
+    integration_branch: str,
+    source: str,
+) -> str:
+    return (
+        f"{pr_label} landed on {landed_branch!r} via {source}, which matches "
+        f"promotion_target and is distinct from integration_branch "
+        f"{integration_branch!r}. The merge does not count as landing on the "
+        "integration trunk, so pr_merged was left unset."
+    )
+
+
+async def _create_promotion_target_landing_alert(
+    task: Any,
+    session,
+    *,
+    pr_number: int | None,
+    landed_branch: str,
+    integration_branch: str,
+    source: str,
+) -> None:
+    from app.broadcast import broadcast_to_project
+    from app.models import Alert, AlertSeverity
+    from app.notification_dispatch import dispatch_external_notification
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == getattr(task, "id", None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == _PROMOTION_TARGET_LANDING_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+
+    pr_label = f"PR #{pr_number}" if pr_number is not None else "A merged PR"
+    reason = _promotion_target_landing_reason(
+        pr_label=pr_label,
+        landed_branch=landed_branch,
+        integration_branch=integration_branch,
+        source=source,
+    )
+    alert = Alert(
+        project_id=getattr(task, "project_id"),
+        severity=AlertSeverity.ERROR,
+        title=_PROMOTION_TARGET_LANDING_ALERT_TITLE,
+        message=reason,
+        task_id=getattr(task, "id", None),
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(getattr(task, "project_id")),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+    )
+
+    try:
+        ctx = getattr(task, "context", None) or {}
+        payload = getattr(task, "first_payload", None) or {}
+        pr_url = (
+            ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
+        )
+        if not pr_url and pr_number is not None:
+            repo_full = ctx.get("repo_full_name") or ctx.get("repo") or ""
+            if repo_full:
+                pr_url = f"https://github.com/{repo_full}/pull/{pr_number}"
+        raw_critical = (
+            ctx.get("critical_files") or ctx.get("_pr_changed_files") or []
+        )
+        critical_files = (
+            [f for f in raw_critical if isinstance(f, str)][:10]
+            if isinstance(raw_critical, list)
+            else []
+        )
+        direction_text = (
+            ctx.get("direction_text") or payload.get("direction_text") or ""
+        )
+        scope = ctx.get("scope") or payload.get("scope") or ""
+        asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                getattr(task, "project_id"),
+                "APPROVAL_NEEDED",
+                {
+                    "task_id": str(getattr(task, "id", "")),
+                    "task_title": getattr(task, "title", None)
+                    or str(getattr(task, "id", ""))[:8],
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "approval_reason": reason,
+                    "pr_url": pr_url,
+                    "critical_files": critical_files,
+                    "direction_id": ctx.get("direction_id") or "",
+                    "direction_text": direction_text[:200],
+                    "scope": scope,
+                },
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[NOTIFY] promotion-target APPROVAL_NEEDED dispatch setup failed: %s",
+            exc,
+        )
+
+
+def resolve_pr_landing_branch(
+    task: Any, project, *, merged_base_branch: str | None = None
+) -> str:
+    """Return the branch a merged PR actually landed on for ``pr_merged`` decisions.
+
+    Prefer the authoritative GitHub/webhook base branch when available. Fall back
+    to the task's review-loop / payload base_branch so recovery paths still make a
+    deterministic decision when the API payload omits ``base.ref``.
+    """
+    if merged_base_branch:
+        return merged_base_branch
+    ctx = getattr(task, "context", None) or {}
+    review_loop = ctx.get("review_loop") or {}
+    branch = review_loop.get("base_branch")
+    if branch:
+        return branch
+    payload = getattr(task, "first_payload", None) or {}
+    branch = payload.get("base_branch")
+    if branch:
+        return branch
+    return get_project_integration_branch(project)
+
+
+def is_custom_staged_rollup_root(task: Any, project, base_branch: str | None) -> bool:
+    """True when a rollup/root task landed on a configured custom staging branch.
+
+    The deferred-downstream semantics only apply to projects that replaced the
+    default ``research/`` / ``plan/`` staging prefixes with a custom family
+    such as ``release/``. Default Blueprint research/plan review merges keep
+    their historical terminal behavior.
+    """
+    if project is None or not getattr(project, "is_staging_branch", None):
+        return False
+    if not project.is_staging_branch(base_branch):
+        return False
+    if project.staging_branch_prefixes == ("research/", "plan/"):
+        return False
+
+    ctx = getattr(task, "context", None) or {}
+    if ctx.get("rollup_pr_number") or bool(ctx.get("_is_rollup_review")):
+        return True
+
+    payload = getattr(task, "first_payload", None) or {}
+    return payload.get("type") in {"research", "plan"}
+
+
+async def classify_rollup_merge_outcome(
+    task: Any,
+    project,
+    session,
+    *,
+    pr_number: int | None,
+    merged_base_branch: str | None = None,
+    source: str,
+) -> tuple[bool, bool, str]:
+    """Return ``(record_pr_merged, terminal_rollup_merge, landed_branch)``.
+
+    Custom staged rollup roots stay non-terminal when they land on an
+    intermediate staging branch. Promotion-target landings are terminal but do
+    not count as integration landings when promotion and integration differ.
+    """
+    landed_branch = resolve_pr_landing_branch(
+        task, project, merged_base_branch=merged_base_branch
+    )
+    if is_custom_staged_rollup_root(task, project, landed_branch) and project is not None:
+        integration_branch = get_project_integration_branch(project)
+        promotion_target = get_project_promotion_target(project)
+        landed_on_integration = landed_branch == integration_branch
+        landed_on_promotion = landed_branch == promotion_target
+        if not landed_on_integration and landed_on_promotion:
+            await merged_pr_counts_as_integration_landing(
+                task,
+                project,
+                session,
+                pr_number=pr_number,
+                merged_base_branch=landed_branch,
+                source=source,
+            )
+        return (
+            landed_on_integration,
+            landed_on_integration or landed_on_promotion,
+            landed_branch,
+        )
+
+    return (
+        await merged_pr_counts_as_integration_landing(
+            task,
+            project,
+            session,
+            pr_number=pr_number,
+            merged_base_branch=landed_branch,
+            source=source,
+        ),
+        True,
+        landed_branch,
+    )
+
+
+async def merged_pr_counts_as_integration_landing(
+    task: Any,
+    project,
+    session,
+    *,
+    pr_number: int | None,
+    merged_base_branch: str | None = None,
+    source: str,
+) -> bool:
+    """Return whether a merged PR should set ``context['pr_merged']``.
+
+    The one disallowed case is a merge that landed on the project's configured
+    ``promotion_target`` while that branch is distinct from the resolved
+    ``integration_branch``. In that case an ERROR alert is raised so operators
+    see the out-of-band promotion landing immediately, and callers must leave
+    ``pr_merged`` unset.
+    """
+    if project is None or session is None:
+        return True
+
+    integration_branch = get_project_integration_branch(project)
+    promotion_target = get_project_promotion_target(project)
+    landed_branch = resolve_pr_landing_branch(
+        task, project, merged_base_branch=merged_base_branch
+    )
+    if landed_branch != promotion_target or promotion_target == integration_branch:
+        return True
+
+    await _create_promotion_target_landing_alert(
+        task,
+        session,
+        pr_number=pr_number,
+        landed_branch=landed_branch,
+        integration_branch=integration_branch,
+        source=source,
+    )
+
+    logger.error(
+        "[PR_BRANCH_GUARD] Task %s PR #%s landed on promotion target %s "
+        "(integration=%s) via %s; leaving pr_merged unset",
+        getattr(task, "id", None),
+        pr_number,
+        landed_branch,
+        integration_branch,
+        source,
+    )
+    return False
 
 
 def is_single_branch_project(project) -> bool:

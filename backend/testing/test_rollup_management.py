@@ -975,10 +975,33 @@ async def test_admin_task_merge_to_promotion_target_returns_409(cleanup_db):
 
 
 @pytest.mark.asyncio
-async def test_admin_rollup_merge_to_promotion_target_returns_409(cleanup_db):
-    """Approving a rollup merge whose base == promotion (distinct from
-    integration) returns 409 and leaves requires_approval=True without merging."""
+async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
+    cleanup_db, mocker
+):
+    """A human-approved rollup merge whose base == promotion (distinct from
+    integration) PROCEEDS rather than dead-ending with a 409 (PR #7064 superseded
+    the earlier hard-refuse of PR #6995 for the human-approval lane). The merge
+    lands but stays unqualified: pr_merged is left unset and the out-of-band
+    promotion-target alert is raised. The autonomous rollup path still holds such
+    landings for approval first; this handler IS that approval."""
     from app.admin_task_mutations import _handle_rollup_pr_approval
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mock_merge = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "message": "ok"},
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
 
     project = await _make_distinct_branch_project(cleanup_db)
     task = await _make_task(
@@ -993,13 +1016,14 @@ async def test_admin_rollup_merge_to_promotion_target_returns_409(cleanup_db):
     cleanup_db.add(task)
     await cleanup_db.commit()
 
-    with pytest.raises(HTTPException) as exc_info:
-        await _handle_rollup_pr_approval(task, task.context or {}, 4242, cleanup_db, {})
+    changes: dict = {}
+    await _handle_rollup_pr_approval(task, task.context or {}, 4242, cleanup_db, changes)
 
-    assert exc_info.value.status_code == 409
-    assert "promotion target" in exc_info.value.detail
+    mock_merge.assert_awaited_once()
+    assert changes.get("merged_pr") == 4242
     await cleanup_db.refresh(task)
-    assert task.requires_approval is True
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is None
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from sqlmodel import select
 
 import app.shared_state as _shared_state
 from app import services
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.models import (
     Task,
     TaskStatus,
@@ -697,7 +698,6 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     else:
                         gh_pr_state = "open"
                         gh_pr_merged = False
-                        gh_pr_base_branch: str | None = None
                         try:
                             from app.routers.agent import get_github_token_for_task
                             from app.github import get_pull_request
@@ -722,11 +722,6 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             )
                             gh_pr_state = pr_data.get("state") or "open"
                             gh_pr_merged = bool(pr_data.get("merged"))
-                            gh_pr_base_branch = (
-                                pr_data.get("base", {}).get("ref")
-                                if isinstance(pr_data.get("base"), dict)
-                                else None
-                            )
                         except Exception as gh_exc:
                             logger.warning(
                                 f"[EVAL TIMEOUT pr_check] Task {str(task.id)[:8]} "
@@ -735,34 +730,43 @@ async def _check_evaluating_timeouts(progress_cb=None):
                             )
 
                         if gh_pr_state == "closed" and gh_pr_merged:
-                            task.status = TaskStatus.COMPLETED
-                            task.vm_instance_id = None
-                            task.last_heartbeat = None
-                            task.latest_status_message = f"Recovered _pr_state_check_pending: PR #{pr_num} merged out-of-band"
-                            task.context = _ctx2
-                            from app.landed_signal import apply_merged_landed_signal
                             from app.models import Project
 
-                            _project = (
-                                await session.get(Project, task.project_id)
-                                if task.project_id
-                                else None
-                            )
-                            apply_merged_landed_signal(
+                            _proj = await session.get(Project, task.project_id)
+                            (
+                                record_pr_merged,
+                                terminal_rollup_merge,
+                                landed_branch,
+                            ) = await classify_rollup_merge_outcome(
                                 task,
-                                _project,
-                                base_branch=gh_pr_base_branch
-                                or (task.first_payload or {}).get("base_branch")
-                                or _shared_state.get_project_integration_branch(
-                                    _project
-                                )
-                                or "",
-                                hotfix_lane=bool(
-                                    (task.first_payload or {}).get("hotfix")
-                                    or (task.context or {}).get("hotfix")
+                                _proj,
+                                session,
+                                pr_number=pr_num,
+                                merged_base_branch=(pr_data.get("base") or {}).get(
+                                    "ref"
                                 ),
-                                non_merge_reason="merged_pr_non_integration_branch",
+                                source="services._check_evaluating_timeouts",
                             )
+                            task.status = (
+                                TaskStatus.COMPLETED
+                                if terminal_rollup_merge
+                                else TaskStatus.EVALUATING
+                            )
+                            task.vm_instance_id = None
+                            task.last_heartbeat = None
+                            if terminal_rollup_merge:
+                                task.latest_status_message = (
+                                    f"Recovered _pr_state_check_pending: PR "
+                                    f"#{pr_num} merged out-of-band"
+                                )
+                            else:
+                                task.latest_status_message = (
+                                    f"Recovered _pr_state_check_pending: PR "
+                                    f"#{pr_num} merged into {landed_branch}; "
+                                    "awaiting downstream landing"
+                                )
+                            if record_pr_merged:
+                                _ctx2["pr_merged"] = True
                         elif gh_pr_state == "closed" and not gh_pr_merged:
                             task.status = TaskStatus.FAILED
                             task.vm_instance_id = None

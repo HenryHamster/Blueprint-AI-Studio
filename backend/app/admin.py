@@ -50,10 +50,8 @@ from app.models import (
 from app.auth import get_current_user
 from app.task_locking import task_lock
 
-from app.broadcast import broadcast_to_project
 from app.payload_schemas import (
     TaskType,
-    validate_internal_payload,
     validate_task_payload,
 )
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
@@ -65,12 +63,12 @@ from app.admin_helpers import (  # noqa: F401
     _get_user_task,
     _get_user_task_with_role,
 )
-from app.admin_task_mutations import modify_task_apply
-from app.routers.admin_operator_triggers import (
-    router as _operator_triggers_router,
-    _record_failure_result,
+from app.admin_task_mutations import (
+    _handle_rollup_pr_approval,
+    _handle_task_pr_approval,
+    modify_task_apply,
 )
-from app.landed_signal import apply_merged_landed_signal
+from app.routers.admin_operator_triggers import router as _operator_triggers_router
 
 
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
@@ -686,6 +684,7 @@ async def bulk_action_tasks(
                 ):
                     ctx = task.context or {}
                     rollup_pr_number = ctx.get("rollup_pr_number")
+                    approval_changes: Dict[str, Any] = {}
 
                     # Round 3 M10 — operator-response latency contract:
                     # The rollup-PR approval branch performs external GitHub
@@ -700,297 +699,21 @@ async def bulk_action_tasks(
                     # would risk an inconsistency where the DB shows
                     # COMPLETED but the GitHub PR is still open.
                     if rollup_pr_number:
-                        # Rollup PR approval: merge the rollup PR directly
-                        try:
-                            from app.routers.agent import get_github_token_for_task
-                            from app.shared_state import (
-                                runtime_config as _runtime_config,
-                                get_project_promotion_target as _get_project_promotion_target,
-                            )
-                            from app.rollup_management import _cleanup_branches
-                            from app.github import merge_pull_request, create_pr_comment
-
-                            gh_token, owner, repo = await get_github_token_for_task(
-                                task.id, session
-                            )
-                            merge_result = await merge_pull_request(
-                                gh_token, owner, repo, rollup_pr_number
-                            )
-                            if merge_result.get("merged"):
-                                _project = await session.get(Project, task.project_id)
-                                base_branch = (
-                                    (task.first_payload or {}).get("base_branch")
-                                    or get_project_integration_branch(_project)
-                                )
-                                task.status = TaskStatus.COMPLETED
-                                task.context = dict(ctx)
-                                apply_merged_landed_signal(
-                                    task,
-                                    _project,
-                                    base_branch=base_branch or "",
-                                    hotfix_lane=bool(
-                                        (task.first_payload or {}).get("hotfix")
-                                        or (task.context or {}).get("hotfix")
-                                    ),
-                                    non_merge_reason=(
-                                        "merged_pr_non_integration_branch"
-                                    ),
-                                )
-                                task.latest_status_message = f"Human-approved merge of rollup PR #{rollup_pr_number}"
-                                await create_pr_comment(
-                                    gh_token,
-                                    owner,
-                                    repo,
-                                    rollup_pr_number,
-                                    "**Blueprint Review Pipeline**: Human-approved rollup merge.",
-                                )
-                                logger.info(
-                                    f"[ADMIN] Bulk-approved rollup merge of PR #{rollup_pr_number}"
-                                )
-                                session.add(task)
-                                await session.commit()
-                                await _cleanup_branches(task, session)
-                                _project = await session.get(Project, task.project_id)
-                                base_branch = (task.first_payload).get(
-                                    "base_branch"
-                                ) or get_project_integration_branch(_project)
-                                _promotion_target = _get_project_promotion_target(
-                                    _project
-                                )
-                                if (
-                                    base_branch == _promotion_target
-                                    and _runtime_config.get("smoketest_enabled")
-                                ):
-                                    try:
-                                        type_model = (
-                                            _runtime_config.get(
-                                                "task_type_models", {}
-                                            ).get("smoketest")
-                                            or None
-                                        )
-                                        type_effort = (
-                                            _runtime_config.get(
-                                                "task_type_efforts", {}
-                                            ).get("smoketest")
-                                            or None
-                                        )
-                                        health_check_urls = (
-                                            _runtime_config.get("health_check_urls")
-                                            or []
-                                        )
-                                        smoketest_task = Task(
-                                            project_id=task.project_id,
-                                            title=f"Smoketest after rollup merge to {base_branch}",
-                                            description=f"Post-merge health checks for {owner}/{repo}@{base_branch}",
-                                            payloads=[
-                                                validate_internal_payload(
-                                                    {
-                                                        "type": "smoketest",
-                                                        "base_branch": base_branch,
-                                                        **(
-                                                            {"model": type_model}
-                                                            if type_model
-                                                            else {}
-                                                        ),
-                                                        **(
-                                                            {"effort": type_effort}
-                                                            if type_effort
-                                                            else {}
-                                                        ),
-                                                        **(
-                                                            {
-                                                                "health_check_urls": health_check_urls
-                                                            }
-                                                            if health_check_urls
-                                                            else {}
-                                                        ),
-                                                    },
-                                                    "admin:bulk_rollup_smoketest",
-                                                )
-                                            ],
-                                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                                            status=TaskStatus.QUEUED,
-                                            created_by="ORCHESTRATOR",
-                                        )
-                                        session.add(smoketest_task)
-                                        await session.commit()
-                                        await session.refresh(smoketest_task)
-                                        history_st = TaskHistory(
-                                            task_id=smoketest_task.id,
-                                            action="SPAWNED",
-                                            details={
-                                                "spawned_by": "ADMIN_BULK_ROLLUP_MERGE",
-                                                "base_branch": base_branch,
-                                            },
-                                        )
-                                        session.add(history_st)
-                                        await session.commit()
-                                        await broadcast_to_project(
-                                            str(task.project_id),
-                                            "task_updated",
-                                            {
-                                                "task_id": str(smoketest_task.id),
-                                                "status": TaskStatus.QUEUED,
-                                            },
-                                        )
-                                        logger.info(
-                                            f"[SMOKETEST] Spawned smoketest task {smoketest_task.id} after bulk rollup merge to {base_branch}"
-                                        )
-                                    except Exception as e:  # noqa: BLE001
-                                        logger.warning(
-                                            f"[SMOKETEST] Failed to spawn smoketest after bulk rollup merge: {e}",
-                                            exc_info=True,
-                                        )
-                            else:
-                                task.latest_status_message = f"Approved but rollup merge failed: {merge_result.get('message', 'unknown')}"
-                                logger.error(
-                                    f"[ADMIN] Bulk-approved rollup merge of PR #{rollup_pr_number} failed: {merge_result.get('message')}"
-                                )
-                        except Exception as e:
-                            task.latest_status_message = (
-                                f"Approved but rollup merge failed: {str(e)[:200]}"
-                            )
-                            logger.error(
-                                f"[ADMIN] Bulk-approved rollup merge failed: {e}",
-                                exc_info=True,
-                            )
-                    else:
-                        artifact = (
-                            (
-                                await session.execute(
-                                    select(Artifact).where(
-                                        Artifact.task_id == task.id,
-                                        Artifact.artifact_type
-                                        == ArtifactType.PULL_REQUEST,
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .first()
+                        await _handle_rollup_pr_approval(
+                            task,
+                            ctx,
+                            rollup_pr_number,
+                            session,
+                            approval_changes,
                         )
-                        if artifact and artifact.pr_url:
-                            pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-                            task_payload = task.first_payload
-                            _project = await session.get(Project, task.project_id)
-                            branch = _resolve_task_branch(
-                                task, get_project_task_branch_namespace(_project)
-                            )
-                            base_branch = task_payload.get(
-                                "base_branch"
-                            ) or get_project_integration_branch(_project)
-
-                            if ctx.get("touched_critical"):
-                                try:
-                                    from app.routers.agent import (
-                                        get_github_token_for_task,
-                                    )
-                                    from app.github import (
-                                        merge_pull_request,
-                                        create_pr_comment,
-                                        delete_branch,
-                                    )
-
-                                    (
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                    ) = await get_github_token_for_task(
-                                        task.id, session
-                                    )
-                                    merge_result = await merge_pull_request(
-                                        gh_token, owner, repo, pr_number
-                                    )
-                                    if merge_result.get("merged"):
-                                        task.status = TaskStatus.COMPLETED
-                                        task.context = dict(ctx)
-                                        apply_merged_landed_signal(
-                                            task,
-                                            _project,
-                                            base_branch=base_branch or "",
-                                            hotfix_lane=bool(
-                                                (task.first_payload or {}).get(
-                                                    "hotfix"
-                                                )
-                                                or (task.context or {}).get(
-                                                    "hotfix"
-                                                )
-                                            ),
-                                            non_merge_reason=(
-                                                "merged_pr_non_integration_branch"
-                                            ),
-                                        )
-                                        task.latest_status_message = (
-                                            f"Human-approved merge of PR #{pr_number}"
-                                        )
-                                        await create_pr_comment(
-                                            gh_token,
-                                            owner,
-                                            repo,
-                                            pr_number,
-                                            "**Blueprint Review Pipeline**: Human-approved merge (security-critical files).",
-                                        )
-                                        try:
-                                            await delete_branch(
-                                                gh_token, owner, repo, branch
-                                            )
-                                        except Exception:
-                                            logger.exception(
-                                                f"[ADMIN] Failed to delete branch {branch} after merge"
-                                            )
-                                        logger.info(
-                                            f"[ADMIN] Bulk-approved merge of PR #{pr_number} (critical files)"
-                                        )
-                                    else:
-                                        task.latest_status_message = f"Approved but merge failed: {merge_result.get('message', 'unknown')}"
-                                        logger.error(
-                                            f"[ADMIN] Bulk-approved merge of PR #{pr_number} failed: {merge_result.get('message')}"
-                                        )
-                                except Exception as e:
-                                    task.latest_status_message = (
-                                        f"Approved but merge failed: {str(e)[:200]}"
-                                    )
-                                    logger.error(
-                                        f"[ADMIN] Bulk-approved merge failed: {e}",
-                                        exc_info=True,
-                                    )
-                            else:
-                                from app.review_pipeline import _spawn_pipeline_task
-
-                                original_prompt = task_payload.get(
-                                    "prompt", task.description or ""
-                                )
-                                review_task, _was_created = await _spawn_pipeline_task(
-                                    task,
-                                    "review",
-                                    session,
-                                    pr_number,
-                                    branch,
-                                    base_branch,
-                                    original_prompt=original_prompt,
-                                    original_task_id=str(task.id),
-                                )
-                                if not review_task:
-                                    task.requires_approval = True
-                                    task.status = TaskStatus.FAILED
-                                    if task.vm_provisioned_at:
-                                        task.vm_stopped_at = _utcnow()
-                                    task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
-                                    from app.failure_classification import (
-                                        persist_failure_category,
-                                    )
-
-                                    persist_failure_category(task, "AGENT_TIMEOUT")
-                                    _record_failure_result(task, "AGENT_TIMEOUT")
-                                    session.add(task)
-                                    await session.commit()
-                                    results.append(
-                                        {
-                                            "task_id": raw_id,
-                                            "status": "error",
-                                            "error": "Iteration cap reached",
-                                        }
-                                    )
-                                    continue
+                    else:
+                        await _handle_task_pr_approval(
+                            task,
+                            ctx,
+                            {},
+                            session,
+                            approval_changes,
+                        )
 
                 history = TaskHistory(
                     task_id=task.id,

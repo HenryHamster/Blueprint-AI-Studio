@@ -497,6 +497,81 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
     }
 
 
+# Gate for naming a single dominant reuse drop-out. Mirrors the
+# dominant-blocker gating in digest_metrics: a reason is named the leader only
+# when it is present at meaningful volume (>=2 events), covers at least half the
+# non-converting population, AND strictly outranks the runner-up (an even split
+# names no leader). Below the gate, dominant_dropout is None.
+_DOMINANT_DROPOUT_MIN_COUNT = 2
+_DOMINANT_DROPOUT_MIN_SHARE = 0.5
+
+# Human-readable funnel keys that represent a completed-VM-with-eligible-backlog
+# failing to convert to a warm claim, mapped to a ranking reason label. Each is
+# an independent rolling event stream (per-poll or per-occurrence), NOT a per-VM
+# record, so the ranking reflects event magnitude over the window rather than
+# exact per-VM causation (stated in attribution_note below).
+_DROPOUT_REASON_KEYS = (
+    ("grace_idle_releases", "grace_idle_release"),
+    ("grace_ceiling_releases", "grace_ceiling_release"),
+    ("scan_polls_with_depends_on_skip", "scan_depends_on"),
+    ("scan_polls_with_pinned_vm_skip", "scan_pinned_vm"),
+    ("scan_polls_with_file_conflict_skip", "scan_file_conflict"),
+    ("scan_polls_saturated", "scan_saturated"),
+)
+
+
+def compute_dominant_reuse_dropout(window_hours: int = 24) -> dict:
+    """Rank where warm-reuse leaks and name the single dominant drop-out.
+
+    Derives a per-reason drop-out breakdown from the rolling reuse funnel
+    (``get_reuse_funnel_snapshot``): every per-claim skip reason plus the
+    grace-window releases and eligibility-scan skips that prevented a completed
+    VM with eligible backlog from converting to a warm claim. The dominant
+    drop-out is named only when one reason clearly dominates the non-converting
+    population (see the gating constants); otherwise ``dominant_dropout`` is
+    None. Suitable for daily persistence (efficiency snapshot) and admin
+    surfacing so a widening change can be confirmed to reduce the leader.
+    """
+    snap = get_reuse_funnel_snapshot(window_hours)
+    dropout_by_reason: dict = {}
+    for reason, count in (snap.get("claim_skipped_by_reason") or {}).items():
+        if count:
+            dropout_by_reason[f"claim_{reason}"] = count
+    for key, reason in _DROPOUT_REASON_KEYS:
+        count = snap.get(key) or 0
+        if count:
+            dropout_by_reason[reason] = count
+
+    total = sum(dropout_by_reason.values())
+    dominant = None
+    if total > 0:
+        ranked = sorted(dropout_by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_reason, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= _DOMINANT_DROPOUT_MIN_COUNT
+            and top_count / total >= _DOMINANT_DROPOUT_MIN_SHARE
+            and top_count > second_count
+        ):
+            dominant = {
+                "reason": top_reason,
+                "count": top_count,
+                "total": total,
+                "share": round(top_count / total, 3),
+            }
+    return {
+        "window_hours": window_hours,
+        "dropout_by_reason": dropout_by_reason,
+        "dropout_total": total,
+        "dominant_dropout": dominant,
+        "attribution_note": (
+            "Drop-out reasons are independent rolling event-stream counts, not "
+            "per-VM-linked records; the ranking reflects event magnitude over "
+            "the window rather than exact per-VM causation."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Warm-POOL dispatch funnel observability counters (direction d-5fd69fe1)
 # ---------------------------------------------------------------------------

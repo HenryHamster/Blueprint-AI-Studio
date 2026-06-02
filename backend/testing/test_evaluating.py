@@ -10,6 +10,7 @@ Covers _check_evaluating_timeouts() and _check_and_trigger_rollup() edge cases:
   - Unmerged-PR verification triggers rollup path
 """
 
+import asyncio
 import uuid
 
 import pytest
@@ -2163,3 +2164,251 @@ async def test_pr_state_check_consumer_respawn_success_clears_marker(
     assert not (parent.context or {}).get("_pr_state_check_pending"), (
         "consumer must clear the marker on confirmed re-spawn success"
     )
+
+
+@pytest.mark.asyncio
+async def test_pr_state_check_consumer_merged_promotion_target_alerts_without_pr_merged(
+    eval_db, mocker
+):
+    """Merged promotion-target recovery completes the task but must not mark it landed on integration."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    async def _passthrough_bounded(coro, *_a, **_k):
+        return await coro
+
+    mocker.patch("app.services._bounded", side_effect=_passthrough_bounded)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "main"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="PR-state consumer promotion merge",
+        user_id="user-consumer-promotion",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do work",
+                "base_branch": "automain",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_pr_state_check_pending": True,
+            "review_loop": {"pr_number": 9092, "base_branch": "automain"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+    await asyncio.sleep(0)
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is None
+    assert not (parent.context or {}).get("_pr_state_check_pending")
+    alerts = (
+        (
+            await eval_db.execute(select(Alert).where(Alert.task_id == parent.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 9092
+
+
+@pytest.mark.asyncio
+async def test_pr_state_check_consumer_same_branch_merge_sets_pr_merged(
+    eval_db, mocker
+):
+    """Same-branch projects still treat a merged PR as landed on integration."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    async def _passthrough_bounded(coro, *_a, **_k):
+        return await coro
+
+    mocker.patch("app.services._bounded", side_effect=_passthrough_bounded)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "main"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="PR-state consumer same-branch merge",
+        user_id="user-consumer-same-branch",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do work",
+                "base_branch": "automain",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_pr_state_check_pending": True,
+            "review_loop": {"pr_number": 9093, "base_branch": "automain"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+    await asyncio.sleep(0)
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is True
+    alerts = (
+        (
+            await eval_db.execute(select(Alert).where(Alert.task_id == parent.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    dispatch_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pr_state_check_consumer_intermediate_rollup_stays_evaluating(
+    eval_db, mocker
+):
+    """Merged custom staged rollup roots must await downstream landing."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.services.broadcast_to_project", new_callable=AsyncMock, create=True
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    async def _passthrough_bounded(coro, *_a, **_k):
+        return await coro
+
+    mocker.patch("app.services._bounded", side_effect=_passthrough_bounded)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "release/candidate-1"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="PR-state consumer intermediate rollup",
+        user_id="user-consumer-intermediate",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "do work",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={
+            "_pr_state_check_pending": True,
+            "rollup_pr_number": 9094,
+            "review_loop": {"pr_number": 9094, "base_branch": "release/candidate-1"},
+        },
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    await _check_evaluating_timeouts()
+    await asyncio.sleep(0)
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("pr_merged") is None
+    assert not (parent.context or {}).get("_pr_state_check_pending")
+    assert "awaiting downstream landing" in (parent.latest_status_message or "")
+    alerts = (
+        (
+            await eval_db.execute(select(Alert).where(Alert.task_id == parent.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    dispatch_mock.assert_not_called()

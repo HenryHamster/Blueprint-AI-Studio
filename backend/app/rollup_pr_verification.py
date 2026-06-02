@@ -22,13 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.landed_signal import has_merge_unblock_signal, mark_unblocked_non_merge
 from app.models import (
     Task,
     Artifact,
     TaskStatus,
     ArtifactType,
+    Project,
 )
+from app.branch_resolution import merged_pr_counts_as_integration_landing
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +106,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
     from app.routers.agent import get_github_token_for_task
     from app.github import get_pull_request
 
-    if has_merge_unblock_signal(task):
+    if (task.context or {}).get("pr_merged"):
         return True
 
     # Negative-result cache: when a batch of sibling children completes in
@@ -139,7 +140,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
         # Treat as "done" so it doesn't block rollup.
         # Cache in context so partial-rollup path (which checks context.pr_merged directly)
         # doesn't see this task as "unmerged".
-        mark_unblocked_non_merge(task, reason="no_pr_artifact")
+        task.context = {**(task.context or {}), "pr_merged": True}
         return True
     if artifact and artifact.pr_url:
         # Shape-validate before parsing. Production incident 2026-05-06: a
@@ -185,27 +186,41 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 )
                 pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
             if pr_data.get("merged"):
-                # A rollup child PR merges into the rollup *staging* branch, not
-                # the integration branch — so this is a non-merge unblock, not an
-                # integration landing.
-                # Update in-memory first so caller sees the change even if DB write fails
-                mark_unblocked_non_merge(task, reason="rollup_child_pr_merged_to_staging")
-                # Persist to DB in separate session (best-effort — may fail if caller
-                # holds FOR UPDATE lock on this row, but in-memory update is sufficient
-                # for the current rollup cycle)
-                try:
-                    async with AsyncSessionLocal() as write_session:
-                        db_task = await write_session.get(Task, task.id)
-                        if db_task:
-                            mark_unblocked_non_merge(
-                                db_task, reason="rollup_child_pr_merged_to_staging"
-                            )
-                            write_session.add(db_task)
-                            await write_session.commit()
-                except Exception as write_err:
-                    logger.warning(
-                        f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}"
-                    )
+                project = (
+                    await session.get(Project, task.project_id)
+                    if task.project_id is not None
+                    else None
+                )
+                merged_base_branch = (pr_data.get("base") or {}).get("ref")
+                record_pr_merged = await merged_pr_counts_as_integration_landing(
+                    task,
+                    project,
+                    session,
+                    pr_number=pr_number,
+                    merged_base_branch=merged_base_branch,
+                    source="rollup_pr_verification.verify_pr_merged",
+                )
+                if record_pr_merged:
+                    # Update in-memory first so caller sees the change even if DB write
+                    # fails.
+                    task.context = {**(task.context or {}), "pr_merged": True}
+                    # Persist to DB in separate session (best-effort — may fail if
+                    # caller holds FOR UPDATE lock on this row, but in-memory update is
+                    # sufficient for the current rollup cycle).
+                    try:
+                        async with AsyncSessionLocal() as write_session:
+                            db_task = await write_session.get(Task, task.id)
+                            if db_task:
+                                db_task.context = {
+                                    **(db_task.context or {}),
+                                    "pr_merged": True,
+                                }
+                                write_session.add(db_task)
+                                await write_session.commit()
+                    except Exception as write_err:
+                        logger.warning(
+                            f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}"
+                        )
                 return True
             # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
             if pr_data.get("state") == "closed" and not pr_data.get("merged"):
@@ -229,16 +244,36 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                         f"merging, but marked as a deliberate success-close (work "
                         f"landed elsewhere) — completing instead of failing"
                     )
-                    mark_unblocked_non_merge(task, reason="deliberate_success_close")
+                    merged_base_branch = (pr_data.get("base") or {}).get("ref")
+                    project = (
+                        await session.get(Project, task.project_id)
+                        if task.project_id is not None
+                        else None
+                    )
+                    record_pr_merged = await merged_pr_counts_as_integration_landing(
+                        task,
+                        project,
+                        session,
+                        pr_number=pr_number,
+                        merged_base_branch=merged_base_branch,
+                        source="rollup_pr_verification.success_close",
+                    )
+                    task.context = (
+                        {**_ctx, "pr_merged": True}
+                        if record_pr_merged
+                        else dict(_ctx)
+                    )
                     if task.status != TaskStatus.COMPLETED:
                         task.status = TaskStatus.COMPLETED
                     try:
                         async with AsyncSessionLocal() as write_session:
                             db_task = await write_session.get(Task, task.id)
                             if db_task:
-                                mark_unblocked_non_merge(
-                                    db_task, reason="deliberate_success_close"
-                                )
+                                if record_pr_merged:
+                                    db_task.context = {
+                                        **(db_task.context or {}),
+                                        "pr_merged": True,
+                                    }
                                 if db_task.status != TaskStatus.COMPLETED:
                                     db_task.status = TaskStatus.COMPLETED
                                 write_session.add(db_task)
