@@ -9478,3 +9478,109 @@ async def test_direction_reasoning_memos_absent_when_no_memos(db_session, mocker
     assert "direction_reasoning_memos" not in payload, (
         "direction_reasoning_memos should not be present when no memos exist"
     )
+
+
+# ── Undirected (cross-cutting) research spawn guard ──────────────────────────
+
+
+async def _add_cross_cutting_research(session, project_id, *, status, age_minutes=0):
+    """Insert a cross-cutting research task with the canonical title."""
+    from app.autonomous_research import CROSS_CUTTING_RESEARCH_TITLE
+
+    t = Task(
+        project_id=project_id,
+        title=CROSS_CUTTING_RESEARCH_TITLE,
+        description="x",
+        payloads=[{"type": "research", "prompt": "x"}],
+        status=status,
+        created_by="ORCHESTRATOR",
+    )
+    session.add(t)
+    await session.commit()
+    if age_minutes:
+        # Backdate created_at to test the cooldown leg (set after insert so the
+        # default timestamp doesn't override it).
+        t.created_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        session.add(t)
+        await session.commit()
+    return t
+
+
+@pytest.mark.asyncio
+async def test_undirected_guard_false_when_none_exist(db_session):
+    from app.autonomous_research import _undirected_research_recently_active
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _undirected_research_recently_active(project.id, db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_undirected_guard_true_when_active(db_session):
+    from app.autonomous_research import _undirected_research_recently_active
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_cross_cutting_research(
+        db_session, project.id, status=TaskStatus.IN_PROGRESS
+    )
+    assert await _undirected_research_recently_active(project.id, db_session) is True
+
+
+@pytest.mark.asyncio
+async def test_undirected_guard_cooldown_blocks_recent_terminal(db_session):
+    """A recently-CANCELLED cross-cutting task still blocks (cooldown leg) — this
+    is the cancel/complete-then-instantly-respawn loop the guard prevents."""
+    from app.autonomous_research import _undirected_research_recently_active
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_cross_cutting_research(
+        db_session, project.id, status=TaskStatus.CANCELLED, age_minutes=10
+    )
+    # cooldown default is 60 min, so a 10-min-old terminal task still blocks.
+    assert await _undirected_research_recently_active(project.id, db_session) is True
+
+
+@pytest.mark.asyncio
+async def test_undirected_guard_allows_after_cooldown(db_session):
+    """A terminal cross-cutting task older than the cooldown no longer blocks."""
+    from app.autonomous_research import _undirected_research_recently_active
+
+    project = Project(name="P", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _add_cross_cutting_research(
+        db_session, project.id, status=TaskStatus.COMPLETED, age_minutes=120
+    )
+    assert await _undirected_research_recently_active(project.id, db_session) is False
+
+
+@pytest.mark.asyncio
+async def test_undirected_guard_scoped_per_project(db_session):
+    """An active cross-cutting task in another project does not block this one."""
+    from app.autonomous_research import _undirected_research_recently_active
+
+    p1 = Project(name="P1", user_id="test-user-123")
+    p2 = Project(name="P2", user_id="test-user-123")
+    db_session.add_all([p1, p2])
+    await db_session.commit()
+    await db_session.refresh(p1)
+    await db_session.refresh(p2)
+
+    await _add_cross_cutting_research(
+        db_session, p2.id, status=TaskStatus.IN_PROGRESS
+    )
+    assert await _undirected_research_recently_active(p1.id, db_session) is False
+    assert await _undirected_research_recently_active(p2.id, db_session) is True
