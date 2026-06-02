@@ -5242,3 +5242,90 @@ class TestParallelismHint:
         hint = _build_parallelism_hint(1, max_concurrent_vms=0, max_active_directions=10)
         assert hint
         assert "VMs at once" not in hint  # no concrete VM count when capacity unknown
+
+
+# ── Deploy-model framing (integration-branch landing ≠ deployment) ────────────
+
+
+async def _spawn_strategic_review_payload(project, session) -> dict:
+    """Run a strategy-only cycle and return the spawned strategic_review payload."""
+    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
+    _shared_state.runtime_config["architecture_review_frequency"] = 3
+    try:
+        await _spawn_research_task(project, session)
+    finally:
+        _shared_state.runtime_config["architecture_review_frequency"] = old
+    result = await session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
+    payload = tasks[0].payloads[0]
+    assert payload["type"] == "strategic_review", payload["type"]
+    return payload
+
+
+@pytest.mark.asyncio
+async def test_deploy_framing_present_when_integration_and_promotion_differ(db_session):
+    """When the integration branch and promotion target differ (the LTS split),
+    the strategic payload carries the deploy-model framing so the agent does not
+    treat 'landed on the integration branch' as 'deployed/live'."""
+    project = _make_project(
+        vision={"_strategic_cycle_count": 1, "_research_spawn_count": 5},
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload = await _spawn_strategic_review_payload(project, db_session)
+    suffix = payload.get("prompt_suffix") or ""
+    assert "Deployment model" in suffix, "deploy framing missing from prompt_suffix"
+    # Both sides of the split are named, using the project's real branch names.
+    assert "`automain`" in suffix and "`main`" in suffix
+    # The operative warnings that defuse the enable-and-measure / hard-pivot trap.
+    assert "not yet PROMOTED" in suffix
+    assert "nothing live to measure" in suffix
+
+
+@pytest.mark.asyncio
+async def test_deploy_framing_absent_when_branches_equal(db_session):
+    """A single-branch project (integration branch == promotion target) deploys
+    merges directly, so the deploy-model framing must NOT appear — it would be
+    actively misleading there."""
+    project = _make_project(
+        vision={"_strategic_cycle_count": 1, "_research_spawn_count": 5},
+        integration_branch="main",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload = await _spawn_strategic_review_payload(project, db_session)
+    suffix = payload.get("prompt_suffix") or ""
+    assert "Deployment model" not in suffix, (
+        "deploy framing must be omitted when integration branch == promotion target"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deploy_framing_uses_project_branch_names_not_hardcoded(db_session):
+    """The framing is project-generic: it interpolates the project's own
+    integration/promotion branch names and never hardcodes Blueprint's
+    'automain'/'main' literals."""
+    project = _make_project(
+        vision={"_strategic_cycle_count": 1, "_research_spawn_count": 5},
+        integration_branch="staging",
+        promotion_target="release",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload = await _spawn_strategic_review_payload(project, db_session)
+    suffix = payload.get("prompt_suffix") or ""
+    assert "Deployment model" in suffix
+    assert "`staging`" in suffix and "`release`" in suffix
+    # No Blueprint-specific branch literals leak into a non-Blueprint project.
+    assert "automain" not in suffix
+    assert "`main`" not in suffix
