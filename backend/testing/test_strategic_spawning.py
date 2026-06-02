@@ -5206,6 +5206,224 @@ async def test_on_automain_false_when_rollup_not_merged(db_session):
     assert merges[0]["on_automain"] is False
 
 
+# ── on_main / undeployed_directions + deployment_state block ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_main_mirrors_on_automain_without_lts_split(db_session):
+    """With no LTS split (integration branch == promotion target), on_main equals
+    on_automain and undeployed_directions is empty — there is no 'landed but not
+    deployed' state when merges deploy directly."""
+    project = _make_project(vision={"purpose": "test"})  # default branches: main == main
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "rollup_pr_number": 42},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+    child = Task(
+        project_id=project.id,
+        title="Child fix",
+        description="child",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    by_title = {m["pr_title"]: m for m in result["merges"]}
+    # on_main == on_automain when there is no split.
+    assert by_title["Child fix"]["on_main"] == by_title["Child fix"]["on_automain"] is True
+    # No split → nothing can be "landed but not deployed".
+    assert result["undeployed_directions"] == []
+
+
+@pytest.mark.asyncio
+async def test_undeployed_directions_lists_integration_only_merges(db_session, mocker):
+    """Under an LTS split, a merge reachable from the integration branch but NOT
+    from the promotion target is surfaced in undeployed_directions, grouped by
+    direction."""
+    from unittest.mock import AsyncMock
+
+    # Integration-branch ancestry True, promotion-target ancestry False.
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "deadbeefcafe"}),
+    )
+    # is_ancestor_of(token, owner, repo, sha, branch, project_id=...) — branch is a[4].
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=lambda *a, **k: a[4] == "automain"),
+    )
+
+    project = _make_project(
+        integration_branch="automain",
+        promotion_target="main",
+        directions=[{"id": "d-x", "status": "active", "text": "warm pool reuse"}],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Wire warm pool ready signal",
+        description="root merge on automain only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 7, "direction_id": "d-x"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merge = result["merges"][0]
+    assert merge["on_automain"] is True
+    assert merge["on_main"] is False
+    undeployed = result["undeployed_directions"]
+    assert len(undeployed) == 1
+    assert undeployed[0]["direction_id"] == "d-x"
+    assert undeployed[0]["direction_text"] == "warm pool reuse"
+    assert "Wire warm pool ready signal" in undeployed[0]["merge_titles"]
+
+
+@pytest.mark.asyncio
+async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
+    """The strategic payload carries a deployment_state block under an LTS split:
+    deployed SHA/status from DeploymentState, the promoted vs open version, and
+    automain_ahead_of_main derived from un-promoted merged work."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion, DeploymentState
+
+    await _ensure_releaseversion_table(db_session)
+    _patch_spawning_deps(mocker)
+
+    project = _make_project(
+        is_self_repo=True,
+        integration_branch="automain",
+        promotion_target="main",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="promoted",
+            opened_at=now - timedelta(days=10),
+            promoted_at=now - timedelta(days=2),
+            promoted_sha="promotedsha0001",
+        )
+    )
+    db_session.add(
+        ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="build",
+            status="open",
+            opened_at=now - timedelta(hours=1),
+        )
+    )
+    # A merged task during the open (un-promoted) version → ahead of main.
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Merged during v2",
+            description="x",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True},
+            updated_at=now,
+        )
+    )
+    # Live deployed state (self-repo container tracker).
+    db_session.add(
+        DeploymentState(
+            id=1,
+            current_sha="deadbeefcafe9999",
+            current_revision="rev-123",
+            status="STABLE",
+        )
+    )
+    await db_session.commit()
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+
+    ds = payload.get("deployment_state")
+    assert ds is not None, "deployment_state block missing under an LTS split"
+    assert ds["integration_branch"] == "automain"
+    assert ds["promotion_target"] == "main"
+    assert ds["deployed_sha"] == "deadbeefcafe"  # DeploymentState.current_sha, 12-char
+    assert ds["deploy_status"] == "STABLE"
+    assert ds["promoted_version"] == 1
+    assert ds["open_version"] == 2
+    assert ds["open_status"] == "open"
+    assert ds["tasks_merged_unpromoted"] >= 1
+    assert ds["automain_ahead_of_main"] is True
+
+
+@pytest.mark.asyncio
+async def test_deployment_state_absent_without_lts_split(db_session, mocker):
+    """A single-branch project (integration branch == promotion target) emits no
+    deployment_state block — there is no integration-vs-deployed distinction."""
+    await _ensure_releaseversion_table(db_session)
+    _patch_spawning_deps(mocker)
+
+    project = _make_project(
+        is_self_repo=True,
+        integration_branch="trunk",
+        promotion_target="trunk",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    )
+    assert "deployment_state" not in payload
+
+
 @pytest.mark.asyncio
 async def test_rolling_rates_exclude_rollup_children(db_session):
     """Rollup children (parent_task_id set) are not counted as merged in rolling_rates.

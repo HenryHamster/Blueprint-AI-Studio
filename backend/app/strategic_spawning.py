@@ -607,6 +607,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
+    # What is actually deployed (running live on the promotion target) vs what
+    # has merged to the integration branch but is not yet promoted. High
+    # priority: it is load-bearing for every runtime-metric judgment, and small.
+    "deployment_state": {"priority": "high"},
     # Citable memo digest — terminal reasoning artifacts spawned from dropped research
     # findings. Medium priority so it survives typical payload pressure; the summarize_fn
     # trims memos and excerpts so it degrades gracefully (fewer memos / shorter text)
@@ -961,7 +965,9 @@ async def _build_recent_interventions(
     _gh_owner_ss: str | None = None
     _gh_repo_ss: str | None = None
     _integration_branch_ss = get_project_integration_branch(project)
+    _promotion_target_ss = get_project_promotion_target(project)
     _automain_verified: dict[uuid.UUID, bool] = {}
+    _on_main_verified: dict[uuid.UUID, bool] = {}
 
     try:
         from app import github as _github_ss
@@ -1033,6 +1039,24 @@ async def _build_recent_interventions(
                 # (compare API indeterminate). Only True confirms the change
                 # landed; False and None are both degrade-safe NOT-landed.
                 _automain_verified[_t.id] = _is_anc is True
+
+                # Deployed signal: also test reachability from the promotion
+                # target. on_automain=True & on_main=False is exactly "landed on
+                # the integration branch but NOT yet promoted" — i.e. not running
+                # live. Reuses the already-fetched merge SHA, so it adds only one
+                # compare call per already-verified PR, and only when there is an
+                # LTS split (otherwise the two branches are identical and
+                # on_main == on_automain).
+                if _promotion_target_ss != _integration_branch_ss:
+                    _is_anc_main = await _github_ss.is_ancestor_of(
+                        _gh_token_ss,
+                        _gh_owner_ss,
+                        _gh_repo_ss,
+                        _merge_sha,
+                        _promotion_target_ss,
+                        project_id=str(project.id),
+                    )
+                    _on_main_verified[_t.id] = _is_anc_main is True
             except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
                 logger.debug(
                     "[STRATEGIC] ancestry check failed for task %s (pr=%s): %s",
@@ -1054,6 +1078,16 @@ async def _build_recent_interventions(
         if task.parent_task_id is None:
             return False
         return _parent_pr_merged.get(task.parent_task_id, False)
+
+    def _on_main(task: Task) -> bool:
+        # No LTS split: the integration branch IS the promotion target, so
+        # landing on one is landing on the other.
+        if _promotion_target_ss == _integration_branch_ss:
+            return _on_automain(task)
+        # Verified reachable from the promotion target = promoted (deploying / on
+        # the live branch). Fail-closed to False when unverified — un-promoted
+        # work must never be reported as deployed.
+        return _on_main_verified.get(task.id, False)
 
     # For rollups: look up child titles so the agent sees what actually
     # shipped instead of "Rollup of 4 subtasks" + a title.
@@ -1108,6 +1142,7 @@ async def _build_recent_interventions(
                 "hours_ago": hours_ago,
                 "body": body,
                 "on_automain": _on_automain(t),
+                "on_main": _on_main(t),
             }
         )
 
@@ -1181,12 +1216,42 @@ async def _build_recent_interventions(
             active_by_scope[scope] = 0
         active_by_scope[scope] += 1
 
+    # Directions whose shipped work has landed on the integration branch but is
+    # NOT yet on the promotion target (promoted) — the capabilities whose
+    # live/runtime metrics cannot move until the version promotes. The concrete
+    # companion to the deploy-model framing. Only populated when the promotion
+    # target was actually verifiable (creds present + an LTS split), so a
+    # credential gap never manufactures false "undeployed" noise.
+    undeployed_directions: list[dict[str, Any]] = []
+    if (
+        _gh_token_ss
+        and _gh_owner_ss
+        and _gh_repo_ss
+        and _promotion_target_ss != _integration_branch_ss
+    ):
+        _undeployed_by_dir: dict[str, dict[str, Any]] = {}
+        for _m in merges_out:
+            if _m.get("on_automain") and not _m.get("on_main"):
+                _did = _m.get("direction_id") or "_unattributed"
+                _slot = _undeployed_by_dir.setdefault(
+                    _did,
+                    {
+                        "direction_id": _m.get("direction_id"),
+                        "direction_text": _m.get("direction_text") or "",
+                        "merge_titles": [],
+                    },
+                )
+                if len(_slot["merge_titles"]) < 5:
+                    _slot["merge_titles"].append(_m.get("pr_title") or "")
+        undeployed_directions = list(_undeployed_by_dir.values())
+
     result: dict[str, Any] = {
         "merges": merges_out,
         "rolling_rates": rolling_rates,
         "per_direction_delta": per_direction_delta,
         "active_by_scope": active_by_scope,
         "lookback_days": lookback_days,
+        "undeployed_directions": undeployed_directions,
     }
     if _strategic_cutoff:
         result["hours_since_last_strategic"] = round(
@@ -2047,6 +2112,132 @@ async def _spawn_strategic_review(
                 )
         except Exception:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
+    # Deployment-state block — only under an LTS split (integration branch !=
+    # promotion target). Grounds the deploy-model framing in concrete numbers:
+    # what is actually DEPLOYED (running live on the promotion target) vs what
+    # has merged to the integration branch but is NOT yet promoted, so the agent
+    # never reads a flat live/runtime metric for un-promoted code as evidence an
+    # approach failed (incident 2026-06-02: the warm-pool was on automain only,
+    # 0 on main, yet g-vm-efficiency planned to measure its LIVE funnel). The
+    # deployed-vs-promoted SHAs are surfaced separately so a promote→rollout lag
+    # (or a ROLLED_BACK/HALTED status) is visible rather than conflated.
+    # Best-effort — never block the payload build.
+    _deployment_state_block: dict | None = None
+    if _integration_branch != _promotion_target:
+        try:
+            from app.models import DeploymentState
+            from app.release_version import (
+                recent_closed_versions as _recent_closed_for_deploy,
+            )
+
+            _tasks_merged_unpromoted = (
+                (_version_phase_block or {}).get("tasks_merged_this_version") or 0
+            )
+            # Latest promoted version (rows are newest-first; the first promoted
+            # one is the most recent promotion = highest version_number).
+            _promoted_v = None
+            try:
+                for _cv in await _recent_closed_for_deploy(
+                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                ):
+                    if _cv.status == "promoted":
+                        _promoted_v = _cv
+                        break
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] promoted-version lookup failed; continuing"
+                )
+            # Deployed SHA: the orchestrator's own DeploymentState tracks the live
+            # self-repo container. For a non-self-repo project it is meaningless,
+            # so fall back to the latest promoted SHA (their deploy follows
+            # promotion, not this orchestrator's container).
+            _deployed_sha: str | None = None
+            _deployed_revision: str | None = None
+            _deploy_status: str | None = None
+            if getattr(project, "is_self_repo", False):
+                try:
+                    _ds = await session.get(DeploymentState, 1)
+                    if _ds is not None:
+                        _deployed_sha = _ds.current_sha or None
+                        _deployed_revision = _ds.current_revision or None
+                        _deploy_status = _ds.status
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] DeploymentState read failed; continuing"
+                    )
+            if not _deployed_sha and _promoted_v is not None:
+                _deployed_sha = _promoted_v.promoted_sha
+            _undeployed_dirs = (
+                (recent_interventions or {}).get("undeployed_directions") or []
+            )
+            # automain_ahead_of_main: reliable from DB alone (open, un-promoted
+            # version carrying merged work), refined by the GitHub-verified
+            # per-direction list when available.
+            _open_unpromoted = (
+                _open_version is not None and _open_version.status == "open"
+            )
+            _automain_ahead = bool(_undeployed_dirs) or (
+                _open_unpromoted and _tasks_merged_unpromoted > 0
+            )
+            _deployment_state_block = {
+                "integration_branch": _integration_branch,
+                "promotion_target": _promotion_target,
+                "deployed_sha": (_deployed_sha or "")[:12] or None,
+                "deployed_revision": _deployed_revision,
+                "deploy_status": _deploy_status,
+                "promoted_version": (
+                    _promoted_v.version_number if _promoted_v else None
+                ),
+                "promoted_sha": (
+                    (_promoted_v.promoted_sha or "")[:12] or None
+                    if _promoted_v
+                    else None
+                ),
+                "open_version": (
+                    _open_version.version_number if _open_version else None
+                ),
+                "open_phase": _open_version.phase if _open_version else None,
+                "open_status": _open_version.status if _open_version else None,
+                "tasks_merged_unpromoted": _tasks_merged_unpromoted,
+                "automain_ahead_of_main": _automain_ahead,
+                **(
+                    {"undeployed_directions": _undeployed_dirs}
+                    if _undeployed_dirs
+                    else {}
+                ),
+            }
+            # Grounded deploy line — only when there is genuinely un-promoted
+            # work. Self-contained (does not depend on the general deploy-model
+            # framing) so it lands value independently: it points the agent at
+            # the deployment_state block and names the un-promoted directions, so
+            # a flat live metric for them is not read as failure.
+            if _automain_ahead:
+                _open_n = _open_version.version_number if _open_version else "?"
+                _deploy_line = (
+                    f"Deployment status (see `deployment_state`): v{_open_n} is open "
+                    f"and NOT promoted to `{_promotion_target}`; "
+                    f"{_tasks_merged_unpromoted} merged change(s) sit on "
+                    f"`{_integration_branch}` only and are not running live yet."
+                )
+                if _undeployed_dirs:
+                    _ids = ", ".join(
+                        str(d.get("direction_id") or "?") for d in _undeployed_dirs[:6]
+                    )
+                    _deploy_line += (
+                        f" Directions with undeployed runtime work: {_ids}. Their "
+                        f"live/runtime metrics cannot move until v{_open_n} promotes "
+                        f"— do not read a flat metric for them as evidence the "
+                        f"approach failed."
+                    )
+                prompt_suffix = (
+                    f"{prompt_suffix}\n{_deploy_line}"
+                    if prompt_suffix
+                    else _deploy_line
+                )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] deployment_state block build failed; continuing"
+            )
     # Citable memo digest: terminal reasoning artifacts spawned from dropped
     # research findings since the previous cycle. Surfaced so the reviewer can
     # cite memos by task_id. Low priority in the pack schema — dropped first
@@ -2494,6 +2685,11 @@ async def _spawn_strategic_review(
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
+            **(
+                {"deployment_state": _deployment_state_block}
+                if _deployment_state_block
+                else {}
+            ),
             **({"memo_citations": memo_citations} if memo_citations else {}),
             **(
                 {"past_retirement_critiques": _past_critiques}
