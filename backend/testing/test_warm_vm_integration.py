@@ -977,7 +977,12 @@ async def test_warm_pool_teardown_carries_idle_cost_into_ledger(
         assert cost["settled_idle_cost_usd"] > 0.0
         # Pool size now zero (the only member was reaped) yet spend is still counted.
         assert cost["pool_size"] == 0
-        assert cost["total_idle_cost_usd"] >= banked_at_lease
+        # compute_pool_idle_cost rounds the aggregate to 6 dp (sub-microdollar),
+        # while banked_at_lease is the raw unrounded per-lease value — so compare
+        # at the same 6-dp precision the production metric reports. Asserting the
+        # rounded total against the unrounded banked value spuriously fails
+        # whenever banked's 7th decimal rounds down (e.g. 0.011168 >= 0.0111683).
+        assert cost["total_idle_cost_usd"] >= round(banked_at_lease, 6)
 
 
 @pytest.mark.asyncio
