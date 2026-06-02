@@ -51,6 +51,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnElement
 
+from app.database import resolve_dialect_name
 from app.models import ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -230,7 +231,7 @@ def _pr_merged_predicate(session: AsyncSession) -> ColumnElement[bool]:
     throughout admin.py / rollup_management.py is ``context["pr_merged"] = True``;
     there is no string ``"true"`` form to accommodate.
     """
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         return func.json_extract(Task.context, "$.pr_merged") == True  # noqa: E712
     return Task.context.op("@>")(cast({"pr_merged": True}, JSONB))

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.github import post_pipeline_merge_summary_comment as post_merge_summary_comment  # noqa: F401
 from app.models import Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
@@ -2106,7 +2107,7 @@ async def _spawn_pipeline_task(
     # ``payloads`` for the SQLite branch), so seq-scan is acceptable for
     # tests. Postgres production path is the source of truth and gets the
     # index acceleration.
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         pr_number_match = (
             func.json_extract(Task.payloads, "$[0].pr_number") == pr_number

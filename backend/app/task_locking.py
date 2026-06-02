@@ -40,6 +40,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.database import resolve_dialect_name
 from app.models import DeploymentState, Project, Task
 
 logger = logging.getLogger(__name__)
@@ -232,8 +233,7 @@ async def acquire_pr_spawn_lock(session: AsyncSession, pr_number: int) -> None:
         pr_number: Integer PR number. Cast to int for the int8 advisory
             key; numbers up to 2**63-1 are valid keys.
     """
-    bind = session.bind
-    if bind is None or bind.dialect.name != "postgresql":
+    if resolve_dialect_name(session) != "postgresql":
         return
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:pr)"),

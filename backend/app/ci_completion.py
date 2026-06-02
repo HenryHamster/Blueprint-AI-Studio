@@ -30,6 +30,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
 from app.vm_cost_rates import get_vm_rate_per_second
 
@@ -45,7 +46,7 @@ def _pr_number_match(session, pr_number: int):
     JSON_QUOTE-double-quotes ints on SQLite and never matches.
     See review_pipeline.py:_spawn_pipeline_task for the canonical pattern.
     """
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     if dialect_name == "sqlite":
         return func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
     return Task.payloads[0]["pr_number"].as_string() == str(pr_number)

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
     Task,
@@ -125,7 +125,7 @@ async def _compute_health_overview(
     # the 120s global statement_timeout so a slow query releases its pooled
     # connection quickly rather than starving the shared pool; the cache layer
     # serves the last good result on timeout. Postgres-only.
-    if session.bind.dialect.name == "postgresql":
+    if resolve_dialect_name(session) == "postgresql":
         await session.execute(text("SET LOCAL statement_timeout = '30s'"))
     now = _utcnow()
     actionable_issues: List[Dict[str, Any]] = []

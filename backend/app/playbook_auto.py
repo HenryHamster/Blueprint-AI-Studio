@@ -33,6 +33,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity
 from app.playbook_lifecycle import (
@@ -225,7 +226,7 @@ async def _maybe_auto_playbook(
     # async sessions. Limit caps the per-project scan; a project that hit
     # the cap had >200 same-signature failures in window and the playbook
     # entry already triggers well below that threshold.
-    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    dialect_name = resolve_dialect_name(session)
     where_clauses = [
         Task.project_id == task.project_id,
         Task.status.in_([TaskStatus.FAILED, TaskStatus.CANCELLED]),
