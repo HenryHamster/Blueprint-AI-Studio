@@ -45,6 +45,7 @@ from app.strategic_completion import (
     _reset_scaffolding_state_on_outcome_change,
 )
 from app.strategic_constants import (
+    MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
     STRATEGIC_MESSAGE_CONTENT_MAX,
     STRATEGIC_NOTES_HISTORY_MAX,
@@ -941,6 +942,22 @@ async def strategic_operation(
         session.add(task)
         await session.commit()
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
+        # Advisory (non-blocking): each active direction is one parallel work-lane
+        # the fleet fans out across, so retiring below the healthy floor caps max
+        # parallelism and leaves VM capacity idle. ``directions`` already reflects
+        # this retire (the row was flipped to "expired" above).
+        _active_after = sum(
+            1 for d in directions if d.get("status") == "active"
+        )
+        if _active_after < MIN_HEALTHY_ACTIVE_DIRECTIONS:
+            warnings.append(
+                f"Only {_active_after} active direction(s) remain after this "
+                f"retire. Active directions are the fleet's parallel work-lanes, "
+                f"so this caps max parallelism and leaves VM capacity idle. If "
+                f"there is worthwhile parallel work, consider opening a "
+                f"replacement direction (aim for at least "
+                f"{MIN_HEALTHY_ACTIVE_DIRECTIONS} active)."
+            )
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
 
     elif payload.op == "approve_direction":
@@ -1144,7 +1161,9 @@ async def strategic_operation(
         try:
             msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid message_id")
+            raise HTTPException(
+                status_code=400, detail="Invalid message_id"
+            ) from None
         if not msg or msg.project_id != project.id:
             raise HTTPException(status_code=404, detail="Message not found")
         if msg.status == "resolved":
