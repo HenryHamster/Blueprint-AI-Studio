@@ -1914,6 +1914,26 @@ async def claim_task(
                             logger.debug(
                                 "[AGENT] Stale-ref check skipped (non-critical)"
                             )
+                        # Ground design-doc systems/capabilities against the file
+                        # tree: persist a presence warning + downgrade when a
+                        # present-status entry's backing module files are all gone.
+                        try:
+                            from app.playbook_learning import (
+                                ground_design_doc_systems,
+                            )
+
+                            repo_root = (
+                                _shared_state.runtime_config.get(
+                                    "playbook_repo_root", ""
+                                )
+                                or ""
+                            )
+                            if repo_root:
+                                doc = ground_design_doc_systems(doc, repo_root)
+                        except Exception:  # noqa: BLE001 — best-effort, never block claim
+                            logger.debug(
+                                "[AGENT] Design-doc grounding skipped (non-critical)"
+                            )
                         try:
                             from app.playbook_learning import retire_idle_auto_entries
 

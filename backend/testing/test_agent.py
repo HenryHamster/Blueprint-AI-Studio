@@ -2554,6 +2554,195 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     assert idx["backend/app/db.py"] == "database"
 
 
+@pytest.mark.asyncio
+async def test_design_doc_get_reconciles_absent_capability_entry(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Make the reconcile pass hermetic. The default repo_root (/tmp/workspace)
+    # is absent inside CI containers, and `git` is not installed there, so the
+    # real git-backed existence check degrades to a no-op. Inject a valid
+    # repo_root (tmp_path) so the isdir guard passes, and mock the existence
+    # probe to report the claimed file as absent — mirroring the mocking
+    # pattern in test_source_ref_validation.py.
+    from functools import partial
+
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        srv, "_path_exists_at_head", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._reconcile_design_doc_presence",
+        partial(srv.reconcile_design_doc_presence, repo_root=str(tmp_path)),
+    )
+
+    project = Project(
+        name="Design Doc Capability Presence Test",
+        user_id="test-user-123",
+        design_doc={
+            "capabilities/research": {
+                "status": "working",
+                "notes": "backend/app/definitely-missing.py",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-capability",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-capability", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "capabilities/research"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "missing"
+    assert value["notes"].startswith("backend/app/definitely-missing.py")
+    assert "[reconciled:" in value["notes"]
+    assert "presence_warning" in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_leaves_present_system_entry_unchanged(
+    client: AsyncClient, db_session
+):
+    design_doc = {
+        "systems/auth": {
+            "status": "functional",
+            "description": "Authentication code path.",
+            "modules": ["backend/app/source_ref_validation.py"],
+        }
+    }
+    project = Project(
+        name="Design Doc Present System Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-present",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-present", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/auth"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "functional"
+    assert value["description"] == "Authentication code path."
+    assert "presence_warning" not in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_leaves_partial_system_entry_unchanged(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Design Doc Partial System Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/auth": {
+                "status": "functional",
+                "description": "Partially grounded system.",
+                "modules": [
+                    "backend/app/source_ref_validation.py",
+                    "backend/app/definitely-missing.py",
+                ],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-partial",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-partial", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/auth"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "functional"
+    assert value["description"] == "Partially grounded system."
+    assert "presence_warning" not in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_leaves_summary_entry_unchanged(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Design Doc Summary Test",
+        user_id="test-user-123",
+        design_doc={"summary": "Project overview."},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-summary",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-summary", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "summary"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["value"] == "Project overview."
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_playbook_size_limits(client: AsyncClient, db_session):

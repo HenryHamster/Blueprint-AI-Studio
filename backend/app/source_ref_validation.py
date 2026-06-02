@@ -8,11 +8,19 @@ on validation failures — does not crash.
 
 import asyncio
 import logging
+import os
 import re
 from urllib.parse import quote
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_REPO_ROOT = "/tmp/workspace"
+_DESIGN_DOC_PATH_RE = re.compile(
+    r"\b((?:backend|agent|admin-ui)/(?:[\w.-]+/)*[\w.-]+\.\w+)\b"
+)
+_PRESENT_SYSTEM_STATUSES = {"mature", "functional", "partial"}
+_PRESENT_CAPABILITY_STATUSES = {"working", "partial"}
 
 
 def _parse_ref(ref: str) -> Tuple[str, Optional[int], Optional[int]]:
@@ -71,6 +79,22 @@ async def _file_exists_at_head(path: str, *, cwd: str = "/tmp/workspace") -> boo
     if not _looks_like_file_path(path):
         # Reject obvious non-file paths to avoid wasting git calls
         return False
+    exists = await _path_exists_at_head(path, repo_root=cwd)
+    return exists is True
+
+
+async def _path_exists_at_head(path: str, repo_root: str = _REPO_ROOT) -> Optional[bool]:
+    """Return whether *path* exists in HEAD, or None when indeterminate.
+
+    False means the path is definitely absent in HEAD. None means git/root
+    validation failed, so callers should degrade conservatively and leave the
+    original value untouched.
+    """
+    if not _looks_like_file_path(path):
+        # Not a recognizable file path — indeterminate, leave callers to degrade.
+        return None
+    if not repo_root or not os.path.isdir(repo_root):
+        return None
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -78,7 +102,7 @@ async def _file_exists_at_head(path: str, *, cwd: str = "/tmp/workspace") -> boo
             "ls-files",
             "--",
             path,
-            cwd=cwd,
+            cwd=repo_root,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -89,14 +113,16 @@ async def _file_exists_at_head(path: str, *, cwd: str = "/tmp/workspace") -> boo
             logger.warning(
                 f"[SOURCE_REF_VALIDATION] git ls-files timeout for path {path}"
             )
-            return False
+            return None
+        if proc.returncode != 0:
+            return None
         # git ls-files returns 0 and outputs the path if it exists, empty otherwise
-        return proc.returncode == 0 and path in stdout.decode()
+        return path in stdout.decode(errors="replace").splitlines()
     except Exception as e:
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}"
         )
-        return False
+        return None
 
 
 async def _file_exists_in_repo_branch(
@@ -370,6 +396,94 @@ async def _symbol_defined_at_head(path: str, symbol: str) -> Optional[bool]:
         return False
     # not-a-repo or any other git error → indeterminate, degrade gracefully.
     return None
+
+
+def _extract_design_doc_paths(entry: Any) -> list[str]:
+    """Collect unique repo-relative file paths referenced by a design-doc entry."""
+    if not isinstance(entry, dict):
+        return []
+    seen: set[str] = set()
+    paths: list[str] = []
+
+    modules = entry.get("modules")
+    if isinstance(modules, list):
+        for module in modules:
+            if isinstance(module, str):
+                path = module.strip()
+                if path and path not in seen:
+                    seen.add(path)
+                    paths.append(path)
+
+    for field in ("notes", "description"):
+        text = entry.get(field)
+        if not isinstance(text, str) or not text:
+            continue
+        for match in _DESIGN_DOC_PATH_RE.finditer(text):
+            path = match.group(1)
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+
+    return paths
+
+
+async def reconcile_design_doc_presence(
+    value: Any,
+    key: str,
+    repo_root: str = _REPO_ROOT,
+) -> Any:
+    """Downgrade present-status design-doc entries whose backing files are gone.
+
+    Conservative no-op when the entry is not a system/capability record, the
+    repo root is invalid, any referenced path is indeterminate, or at least one
+    referenced path still exists. Only entries whose every referenced path is
+    confirmed absent are downgraded to ``missing`` and annotated.
+    """
+    if not isinstance(value, dict):
+        return value
+    if not isinstance(key, str):
+        return value
+    if not repo_root or not os.path.isdir(repo_root):
+        return value
+
+    if key.startswith("systems/"):
+        present_statuses = _PRESENT_SYSTEM_STATUSES
+        text_field = "description"
+    elif key.startswith("capabilities/"):
+        present_statuses = _PRESENT_CAPABILITY_STATUSES
+        text_field = "notes"
+    else:
+        return value
+
+    status = str(value.get("status") or "").strip().lower()
+    if status not in present_statuses:
+        return value
+
+    paths = _extract_design_doc_paths(value)
+    if not paths:
+        return value
+
+    seen_present = False
+    for path in paths:
+        exists = await _path_exists_at_head(path, repo_root=repo_root)
+        if exists is None:
+            return value
+        if exists:
+            seen_present = True
+    if seen_present:
+        return value
+
+    warning = (
+        f"claimed {status} but all referenced module file(s) are absent on the "
+        f"integration branch — treat as missing"
+    )
+    downgraded: dict[str, Any] = {**value, "status": "missing", "presence_warning": warning}
+    raw_text = value.get(text_field)
+    existing = raw_text.strip() if isinstance(raw_text, str) else ""
+    downgraded[text_field] = (
+        f"{existing} " if existing else ""
+    ) + f"[reconciled: {warning}]"
+    return downgraded
 
 
 async def summarize_ungrounded_claims(

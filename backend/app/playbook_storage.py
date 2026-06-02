@@ -126,6 +126,117 @@ def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
     return doc
 
 
+# Statuses that assert the referenced code is PRESENT (and therefore
+# improvable). Anything else (stub/missing/planned) already tells the agent to
+# build rather than improve, so it needs no grounding. Mirrors the agent-side
+# sets in agent/src/utils/design-doc-presence.ts — keep parity.
+_PRESENT_SYSTEM_STATUSES = frozenset({"mature", "functional", "partial"})
+_PRESENT_CAPABILITY_STATUSES = frozenset({"working", "partial"})
+
+
+def _extract_entry_paths(entry: dict) -> list[str]:
+    """Collect unique file-path pointers for a design-doc system/capability.
+
+    Mirrors ``extractEntryPaths`` in agent/src/utils/design-doc-presence.ts:
+    the explicit ``modules`` array (systems) plus any source paths embedded in
+    the entry's ``notes`` / ``description`` free text (capabilities carry
+    pointers only in ``notes``).
+    """
+    paths: list[str] = []
+    modules = entry.get("modules")
+    if isinstance(modules, list):
+        for module in modules:
+            if isinstance(module, str) and module.strip():
+                paths.append(module.strip())
+    text_parts = [
+        entry[key]
+        for key in ("notes", "description")
+        if isinstance(entry.get(key), str) and entry[key]
+    ]
+    if text_parts:
+        paths.extend(_FILE_PATH_RE.findall("\n".join(text_parts)))
+    return list(dict.fromkeys(paths))
+
+
+def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
+    """Ground design-doc ``systems/*`` and ``capabilities/*`` against the tree.
+
+    When a PRESENT-status entry (mature/functional/partial for systems,
+    working/partial for capabilities) carries at least one backing-module path
+    pointer AND every one of those paths is absent under *repo_root*, persist a
+    ``presence_warning`` and downgrade ``status`` to ``missing`` so the
+    correction survives across cycles and surfaces to the design-doc maintenance
+    and strategic agents.
+
+    Conservative by construction (mirrors
+    agent/src/utils/design-doc-presence.ts):
+      - no-op when *repo_root* is falsy or not a directory,
+      - partial hits (some paths present) are left untouched — the code
+        partially exists, so the present-status claim is plausible,
+      - entries with no path pointer are left untouched (absence of a path is
+        not evidence of absent code).
+
+    Idempotent: once downgraded to ``missing`` the entry falls out of the
+    present-status set and is skipped on subsequent sweeps. Mutates and returns
+    *doc* (same contract as :func:`check_and_flag_stale_refs`).
+    """
+    if not repo_root or not os.path.isdir(repo_root):
+        return doc
+
+    updated = False
+    for key, value in doc.items():
+        if not isinstance(value, dict):
+            continue
+        if key.startswith("systems/"):
+            present_set = _PRESENT_SYSTEM_STATUSES
+        elif key.startswith("capabilities/"):
+            present_set = _PRESENT_CAPABILITY_STATUSES
+        else:
+            continue
+
+        status_raw = value.get("status")
+        status = status_raw.lower() if isinstance(status_raw, str) else ""
+        if status not in present_set:
+            continue
+
+        paths = _extract_entry_paths(value)
+        # No pointer at all → absence of a path is NOT evidence of absent code.
+        if not paths:
+            continue
+
+        # Only downgrade when EVERY referenced path is gone. A partial hit means
+        # the code partially exists, so the present-status claim is plausible.
+        all_missing = all(
+            not os.path.exists(os.path.join(repo_root, path)) for path in paths
+        )
+        if not all_missing:
+            continue
+
+        warning = (
+            f"claimed {status} but all referenced module file(s) are absent on "
+            f"the integration branch — treat as missing"
+        )
+        entry = dict(value)
+        entry["status"] = "missing"
+        entry["presence_warning"] = warning
+        doc[key] = entry
+        updated = True
+        logger.debug(
+            "[DESIGN-DOC] Grounded '%s' to missing (all referenced paths absent: %s)",
+            key,
+            paths,
+        )
+
+    if updated:
+        meta = dict(doc.get("_meta", {"revision": 0}))
+        meta["revision"] = meta.get("revision", 0) + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "design-doc-grounding"
+        doc["_meta"] = meta
+
+    return doc
+
+
 def _playbook_size_bytes(doc: dict) -> int:
     """Return the JSON-serialised byte size of all playbook entries in *doc*."""
     playbook_subset = {

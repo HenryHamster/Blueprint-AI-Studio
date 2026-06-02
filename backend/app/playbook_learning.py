@@ -115,6 +115,7 @@ from app.playbook_storage import (  # noqa: F401
     _PLAYBOOK_CAPACITY_BYTES,
     _playbook_size_bytes,
     finalize_pending_playbook_entries,
+    ground_design_doc_systems,
     maybe_archive_for_capacity,
     retire_idle_auto_entries,
 )

@@ -34,6 +34,7 @@ from app.playbook_storage import (
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
 )
 from app.routers.agent import verify_agent_token
+from app.source_ref_validation import reconcile_design_doc_presence as _reconcile_design_doc_presence
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     limiter,
@@ -145,6 +146,7 @@ async def update_design_doc(
             raise HTTPException(
                 status_code=404, detail=f"Key '{payload.key}' not found"
             )
+        value = await _reconcile_design_doc_presence(value, payload.key)
         return {"key": payload.key, "value": value}
 
     if not payload.key or not isinstance(payload.key, str):
@@ -182,26 +184,26 @@ async def update_design_doc(
             )
         # Rebuild file-to-system reverse index atomically when a systems/* key is set
         if key.startswith("systems/"):
-            file_to_system: dict = {}
+            file_to_system_map: dict[str, str] = {}
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/"):]
                     for fpath in doc_val.get("modules", []):
                         if isinstance(fpath, str):
-                            file_to_system[fpath] = sys_id
-            doc["_file_to_system"] = file_to_system
+                            file_to_system_map[fpath] = sys_id
+            doc["_file_to_system"] = file_to_system_map
     elif payload.op == "delete":
         doc.pop(key, None)
         # Rebuild reverse index if a systems/* key is deleted to remove stale entries
         if key.startswith("systems/"):
-            file_to_system: dict = {}
+            file_to_system_deleted_map: dict[str, str] = {}
             for doc_key, doc_val in doc.items():
                 if doc_key.startswith("systems/") and isinstance(doc_val, dict):
                     sys_id = doc_key[len("systems/"):]
                     for fpath in doc_val.get("modules", []):
                         if isinstance(fpath, str):
-                            file_to_system[fpath] = sys_id
-            doc["_file_to_system"] = file_to_system
+                            file_to_system_deleted_map[fpath] = sys_id
+            doc["_file_to_system"] = file_to_system_deleted_map
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 
@@ -485,18 +487,25 @@ async def agent_annotate(
         raise HTTPException(status_code=429, detail="Max 10 annotations per task")
 
     if is_size_breach:
-        new_limit = _bump_size_limit(payload.current_size)
+        current_size = payload.current_size
+        file_path = payload.file_path
+        change_summary = payload.change_summary
+        assert current_size is not None
+        assert file_path is not None
+        assert change_summary is not None
+
+        new_limit = _bump_size_limit(current_size)
         content = (
-            f"Size breach: {payload.file_path} grew to {payload.current_size} lines. "
-            f"Suggested new limit: {new_limit}. Change: {payload.change_summary.strip()}"
+            f"Size breach: {file_path} grew to {current_size} lines. "
+            f"Suggested new limit: {new_limit}. Change: {change_summary.strip()}"
         )
         ctx = {
             "annotation_type": "size_breach",
             "task_type": token.get("task_type", ""),
-            "file_path": payload.file_path.strip(),
-            "current_size": payload.current_size,
+            "file_path": file_path.strip(),
+            "current_size": current_size,
             "new_limit": new_limit,
-            "change_summary": payload.change_summary.strip(),
+            "change_summary": change_summary.strip(),
         }
     else:
         content = payload.content.strip()
