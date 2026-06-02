@@ -23,6 +23,7 @@ from app.auth import (
 from app.compute_manifest import (
     build_agent_secret_manifest,
     build_taskless_agent_secret_manifest,
+    build_warm_claim_retarget_manifest,
     POOL_MODE_ENV_VAR,
 )
 from app.models import PoolVmState, Project, Task, TaskStatus
@@ -439,3 +440,48 @@ def test_task_bound_manifest_still_has_task_binding():
     payload = verify_agent_jwt(env["AGENT_SECRET_TOKEN"])
     assert payload["sub"] == str(task_id)
     assert payload.get("token_scope") is None
+
+
+# ---------------------------------------------------------------------------
+# Warm-claim credential re-target manifest (account-agnostic pool lease)
+# ---------------------------------------------------------------------------
+
+
+def test_retarget_manifest_is_credential_only_no_identity_token():
+    """The re-target manifest carries provider creds ONLY — no agent token and
+    no task/VM identity env (the warm claim rotates the JWT separately and the
+    VM keeps its VM_INSTANCE_ID). It must never mint a credential."""
+    manifest = build_warm_claim_retarget_manifest(
+        provider="anthropic",
+        auth_mode="api_key",
+        model="claude-opus-4-8",
+        oauth_token="sk-ant-resolved-secret",
+    )
+    env = manifest["env"]
+    # Provider identity is re-materialized.
+    assert env["PROVIDER"] == "anthropic"
+    assert env["AUTH_MODE"] == "api_key"
+    assert env["LLM_MODEL"] == "claude-opus-4-8"
+    # No token, no VM/task identity — this is a credential SWAP, not a cold boot.
+    assert "AGENT_SECRET_TOKEN" not in env
+    assert "TASK_ID" not in env
+    assert "VM_INSTANCE_ID" not in env
+    assert POOL_MODE_ENV_VAR not in env
+    # Marked as a transient re-target grant.
+    assert manifest["metadata"]["retarget"] is True
+    assert manifest["metadata"]["provider"] == "anthropic"
+    # Provider secret files for the RESOLVED account are present.
+    assert isinstance(manifest["files"], list)
+
+
+def test_retarget_manifest_materializes_resolved_account_secret():
+    """The secret env baked into the re-target manifest is the RESOLVED account's
+    credential, so the re-targeted VM runs on the correct account."""
+    manifest = build_warm_claim_retarget_manifest(
+        provider="anthropic",
+        auth_mode="api_key",
+        model="claude-opus-4-8",
+        oauth_token="sk-ant-RESOLVED",
+    )
+    # The resolved secret reaches the agent env (anthropic api_key → ANTHROPIC_API_KEY).
+    assert "sk-ant-RESOLVED" in manifest["env"].values()

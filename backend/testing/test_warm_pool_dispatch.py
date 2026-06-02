@@ -109,6 +109,47 @@ def warm_pool_on():
     shared_state.warm_pool_suppressed_until = None
 
 
+@pytest.fixture
+def warm_pool_retarget_on():
+    """Enable warm-pool + the account-agnostic re-target relaxation.
+
+    Mirrors an operator who has flipped on account re-target once the agent-side
+    re-materialize step shipped. Same-provider only (cross-provider stays off).
+    """
+    shared_state.runtime_config["warm_pool_enabled"] = True
+    shared_state.runtime_config["warm_pool_account_retarget_enabled"] = True
+    shared_state.warm_pool_suppressed_until = None
+    yield
+    shared_state.warm_pool_suppressed_until = None
+
+
+def _seed_account(account_id, *, provider="anthropic", auth_mode="api_key"):
+    """Seed an LLM account into the in-memory pool so the claim path can build a
+    credential re-target manifest for it. Returns the account dict (so a test can
+    assert on its active_tasks). Caller must clean up via _clear_accounts."""
+    from app.max_plan_pool import _account_by_id
+
+    acct = {
+        "id": account_id,
+        "name": f"acct-{account_id}",
+        "provider": provider,
+        "auth_mode": auth_mode,
+        "runtime_secret": f"secret-{account_id}",
+        "oauth_token": None,
+        "claude_config_json": None,
+        "provider_metadata": {},
+        "active_tasks": 0,
+    }
+    _account_by_id[account_id] = acct
+    return acct
+
+
+def _clear_accounts():
+    from app.max_plan_pool import _account_by_id
+
+    _account_by_id.clear()
+
+
 # ---------------------------------------------------------------------------
 # 1. Compatible task is leased + pinned (not cold-provisioned)
 # ---------------------------------------------------------------------------
@@ -359,6 +400,307 @@ async def test_next_role_ignores_pool_pin_when_pool_disabled(db_session, client)
     assert resp.status_code == 204
     await db_session.refresh(task)
     assert task.status == TaskStatus.QUEUED
+
+
+# ---------------------------------------------------------------------------
+# Account-agnostic lease + claim-time credential re-target
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_account_mismatch_not_leased_when_retarget_disabled(
+    db_session, warm_pool_on
+):
+    """With re-target OFF (default), the lease stays STRICT-equality: a member on
+    a different account than the resolved selection is NOT leased — so the pool is
+    never relaxed without a working agent re-materialize step."""
+    project = await _make_project(db_session, name="Strict Default")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-strict", account_id="acct-boot"
+    )
+    task = await _make_queued_task(db_session, project)
+    leased = await _dispatch(db_session, task, account="acct-run")
+    assert leased is None
+    assert task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_account_mismatch_leased_and_pinned_to_resolved_account(
+    db_session, warm_pool_retarget_on
+):
+    """With re-target ON, a same-tenant member on a DIFFERENT account is leased,
+    and the task is pinned/accounted to the RESOLVED account (not the member's
+    boot account) so per-account caps attribute correctly."""
+    project = await _make_project(db_session, name="Retarget Lease")
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id="vm-rt", account_id="acct-boot"
+    )
+    task = await _make_queued_task(db_session, project)
+
+    leased = await _dispatch(db_session, task, account="acct-run")
+    await db_session.commit()
+
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-rt"
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.LEASED
+    # Accounting attributes to the RESOLVED account, NOT the member's boot account.
+    ctx = task.context or {}
+    assert ctx.get("llm_account_id") == "acct-run"
+    assert ctx.get(WARM_POOL_PIN_KEY) is True
+
+
+@pytest.mark.asyncio
+async def test_retarget_lease_still_honors_blacklist(
+    db_session, warm_pool_retarget_on
+):
+    """Even under the relaxed account-agnostic lease, a member pinned to a
+    rate-limit-blacklisted account is NEVER leased."""
+    project = await _make_project(db_session, name="Retarget Blacklist")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-rt-bl", account_id="acct-rl"
+    )
+    task = await _make_queued_task(db_session, project)
+    leased = await _dispatch(
+        db_session, task, account="acct-run", excluded=["acct-rl"]
+    )
+    assert leased is None
+    assert task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_retarget_lease_still_enforces_tenant_isolation(
+    db_session, warm_pool_retarget_on
+):
+    """The account relaxation NEVER relaxes the hard tenant gate: a member in
+    project B is never leased for a task in project A."""
+    project_a = await _make_project(db_session, name="RT Tenant A")
+    project_b = await _make_project(db_session, name="RT Tenant B")
+    await _make_idle_member(
+        db_session, project_b, vm_instance_id="vm-rt-b", account_id="acct-boot"
+    )
+    task = await _make_queued_task(db_session, project_a)
+    leased = await _dispatch(db_session, task, account="acct-run")
+    assert leased is None
+    assert task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_retarget_lease_restricted_to_same_provider(
+    db_session, warm_pool_retarget_on
+):
+    """Account re-target alone (cross-provider OFF) stays restricted to
+    same-provider members: an OpenAI member is not leased for an Anthropic task."""
+    project = await _make_project(db_session, name="RT Same Provider")
+    await _make_idle_member(
+        db_session,
+        project,
+        vm_instance_id="vm-openai",
+        account_id="acct-boot",
+        provider="openai",
+    )
+    task = await _make_queued_task(db_session, project)
+    leased = await _dispatch(
+        db_session, task, provider="anthropic", account="acct-run"
+    )
+    assert leased is None
+    assert task.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_next_role_emits_retarget_manifest_on_account_mismatch(
+    db_session, client, warm_pool_retarget_on
+):
+    """Full flow: an account-mismatched lease is claimed warm via /next-role,
+    the claim response carries a credential re-target ``secret_manifest`` for the
+    RESOLVED account, and the resolved account's concurrency slot is reserved
+    (not the member's boot account)."""
+    project = await _make_project(db_session, name="RT Claim Flow")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-rt-claim", account_id="acct-boot"
+    )
+    boot_acct = _seed_account("acct-boot")
+    run_acct = _seed_account("acct-run")
+    try:
+        task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+        leased = await _dispatch(db_session, task, account="acct-run")
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-rt-claim", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-rt-claim"},
+            headers={"X-Agent-Token": tok},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(task.id)
+        # Credential re-target manifest emitted for the resolved account.
+        manifest = body.get("secret_manifest")
+        assert manifest is not None, body
+        assert manifest["metadata"]["retarget"] is True
+        assert "secret-acct-run" in manifest["env"].values()
+        assert "AGENT_SECRET_TOKEN" not in manifest["env"]
+
+        # Accounting: the RESOLVED account's slot is reserved, NOT the boot one.
+        assert run_acct["active_tasks"] == 1
+        assert boot_acct["active_tasks"] == 0
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.IN_PROGRESS
+        timing = (task.context or {}).get("_timing") or {}
+        assert timing.get("warm_claim_origin") == "warm_pool"
+        assert (task.context or {}).get("llm_account_id") == "acct-run"
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_next_role_no_manifest_when_account_matches(
+    db_session, client, warm_pool_retarget_on
+):
+    """When the resolved account equals the member's boot account, NO re-target
+    manifest is emitted (the frozen boot credentials are already correct)."""
+    project = await _make_project(db_session, name="RT Match No Manifest")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-rt-match", account_id="acct-same"
+    )
+    _seed_account("acct-same")
+    try:
+        task = await _make_queued_task(db_session, project)
+        leased = await _dispatch(db_session, task, account="acct-same")
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-rt-match", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-rt-match"},
+            headers={"X-Agent-Token": tok},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert body.get("secret_manifest") is None
+    finally:
+        _clear_accounts()
+
+
+@pytest.mark.asyncio
+async def test_next_role_aborts_claim_when_retarget_manifest_unavailable(
+    db_session, client, warm_pool_retarget_on
+):
+    """LANDS-TOGETHER invariant: when an account mismatch is detected but the
+    resolved account is UNKNOWN to the in-memory pool (e.g. evicted/reloaded
+    between dispatch and claim), no credential re-target manifest can be built.
+    The warm claim MUST be aborted rather than served on the member's wrong
+    frozen boot credentials — /next-role returns 204 and leaves the task QUEUED
+    so the orchestrator re-dispatches it (cold once the deadline expires)."""
+    project = await _make_project(db_session, name="RT Manifest Missing")
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-rt-missing", account_id="acct-boot"
+    )
+    # Seed ONLY the boot account; the RESOLVED run account is intentionally NOT
+    # in the in-memory pool, so build_account_retarget_manifest returns None.
+    _seed_account("acct-boot")
+    try:
+        task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+        leased = await _dispatch(db_session, task, account="acct-run")
+        await db_session.commit()
+        assert leased is not None
+
+        tok = create_vm_scoped_token("vm-rt-missing", str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": "vm-rt-missing"},
+            headers={"X-Agent-Token": tok},
+        )
+        # Aborted: no warm claim served on wrong credentials.
+        assert resp.status_code == 204, resp.text
+        # Task left QUEUED for re-dispatch (NOT transitioned IN_PROGRESS).
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+    finally:
+        _clear_accounts()
+
+
+# ---------------------------------------------------------------------------
+# Cost-aware auto-drain guard gates the lease side (cluster 2/5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cost_guard_engaged_blocks_lease(db_session, warm_pool_on):
+    """When the cost guard is engaged, a compatible IDLE member is NOT leased —
+    leasing pauses the moment idle spend stops being amortized, before the
+    maintainer's next drain tick."""
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        get_pool_funnel_snapshot,
+        record_pool_cold_dispatch,
+    )
+    from app.warm_pool import is_pool_cost_guard_engaged
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+    # Force engagement on the live signals: one recorded dispatch with a 0% hit
+    # rate, a min-hit-rate floor of 100%, and a $0 idle-cost floor (any accrued
+    # idle spend qualifies). Thresholds are configurable — we tighten them here.
+    record_pool_cold_dispatch()
+    shared_state.runtime_config["warm_pool_cost_guard_min_dispatches"] = 1
+    shared_state.runtime_config["warm_pool_cost_guard_min_hit_rate"] = 1.0
+    shared_state.runtime_config["warm_pool_cost_guard_min_idle_cost_usd"] = 0.0
+
+    project = await _make_project(db_session, name="Cost Guard On")
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id="vm-cost-guard", account_id="acct-1"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+
+    assert await is_pool_cost_guard_engaged(db_session) is True
+    leased = await _dispatch(db_session, task, account="acct-1")
+    assert leased is None
+    # Member stays IDLE (not leased), task not pinned.
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.IDLE
+    assert task.vm_instance_id is None
+
+    snap = get_pool_funnel_snapshot()
+    assert snap["lease_miss_by_reason"].get("cost_guard") == 1
+
+
+@pytest.mark.asyncio
+async def test_cost_guard_disengaged_allows_lease(db_session, warm_pool_on):
+    """A healthy hit rate (or too few dispatches) leaves the guard disengaged, so
+    a compatible member is leased normally."""
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+    )
+    from app.warm_pool import is_pool_cost_guard_engaged
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+    # No dispatches recorded → below min_dispatches → guard cannot engage.
+    project = await _make_project(db_session, name="Cost Guard Off")
+    member = await _make_idle_member(
+        db_session, project, vm_instance_id="vm-no-guard", account_id="acct-1"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+
+    assert await is_pool_cost_guard_engaged(db_session) is False
+    leased = await _dispatch(db_session, task, account="acct-1")
+    assert leased is not None
+    assert leased.vm_instance_id == "vm-no-guard"
+    await db_session.refresh(member)
+    assert member.state == PoolVmState.LEASED
 
 
 # NOTE: the pool-hit-vs-cold-dispatch funnel now lives solely in

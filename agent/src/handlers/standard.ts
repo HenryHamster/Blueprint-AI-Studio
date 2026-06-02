@@ -624,6 +624,26 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 }
 
 // ── Handler: Create (default — make changes, push, open PR) ─────────────────
+/**
+ * Handle a 'create' task: implement a new feature from a prompt.
+ *
+ * Runs Claude Code with the provided prompt, captures output, runs tests
+ * if applicable, commits changes, and opens a pull request. Supports
+ * sibling-task coordination and file-overlap warnings for parallel tasks.
+ *
+ * @param taskId - Task UUID
+ * @param payload - Task payload with 'prompt', 'branch', optional 'related_files'
+ * @param task - Full task object from API
+ * @param ghToken - GitHub token for repo access
+ * @param owner - GitHub repo owner
+ * @param repo - GitHub repo name
+ * @param ws - Optional WebSocket for live log streaming
+ * @param statusRef - Status message reference (mutated by handler)
+ * @param model - Optional model override (e.g. 'claude-opus-4-8')
+ * @param effort - Optional effort level for planning ('low', 'medium', 'high')
+ *
+ * Throws on fatal errors: invalid prompt, git clone failure, etc.
+ */
 export async function handleCreate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -743,6 +763,25 @@ export async function handleCreate(
   });
 }
 
+/**
+ * Handle a 'refactor' task: improve code quality without changing behavior.
+ *
+ * Runs Claude Code with the refactoring prompt, runs tests to ensure no
+ * behavioral changes, commits, and opens a PR. Respects file-overlap warnings.
+ *
+ * @param taskId - Task UUID
+ * @param payload - Task payload with 'prompt', optional 'related_files'
+ * @param task - Full task object from API
+ * @param ghToken - GitHub token for repo access
+ * @param owner - GitHub repo owner
+ * @param repo - GitHub repo name
+ * @param ws - Optional WebSocket for live log streaming
+ * @param statusRef - Status message reference (mutated by handler)
+ * @param model - Optional model override
+ * @param effort - Optional effort level
+ *
+ * Throws on fatal errors: missing prompt, git failure, etc.
+ */
 // ── Handler: Refactor (improve code quality without changing behavior) ────────
 export async function handleRefactor(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,

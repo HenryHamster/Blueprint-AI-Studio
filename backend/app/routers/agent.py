@@ -616,6 +616,30 @@ async def claim_task(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
+    """Claim a QUEUED or PROVISIONING task for execution.
+
+    Agent VMs call this upon startup to claim their assigned work. Transitions
+    the task from QUEUED/PROVISIONING to IN_PROGRESS and returns full task
+    details including payloads and context.
+
+    Authentication: Agent JWT token (2-hour or 8-hour bootstrap TTL).
+
+    Returns:
+        {
+            "id": str, "vm_instance_id": str, "payloads": list,
+            "context": dict, "parent_task_id": str | null,
+            ... (full Task object)
+        }
+
+    Status codes:
+        200: Task claimed successfully
+        404: No unclaimed task on this VM
+        429: Task locked by another process (retry recommended)
+        401: Invalid or expired token
+
+    Rate limit: 200 requests/minute.
+    Idempotency: Replays last successful claim within 5 minutes if present.
+    """
     vm_id = token.get("vm_instance_id")
     # Phase 2c Race A mitigation: a successful claim is a strong liveness
     # signal — we wouldn't be here without an authenticated VM. Recording
@@ -3202,8 +3226,32 @@ async def agent_heartbeat(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """
-    Endpoint for agents to send a periodic heartbeat.
+    """Send a keep-alive heartbeat with optional telemetry.
+
+    Agents periodically call this endpoint (~30-60s interval) to signal
+    liveness and optionally report progress, metrics, tool usage, or status
+    beacons. Reaper uses 5-minute heartbeat timeout to detect stuck agents.
+
+    Request body (HeartbeatRequest):
+        {
+            "task_id": str, "status_message": str | null,
+            "metrics": HeartbeatMetrics | null,
+            "tool_traces": list[ToolTraceEntry] | null
+        }
+
+    Returns:
+        {"status": "ok"} | {"status": "locked", "detail": "..."}
+
+    Status codes:
+        200: Heartbeat recorded successfully
+        404: Task not found on this VM
+        409: Task locked or already terminal (retry or stop)
+        401: Invalid token
+        403: Task ID mismatch
+
+    Rate limit: 600 requests/minute.
+    Heartbeat timeout (reaper): 5 minutes.
+    Lock handling: Uses SKIP_LOCKED to avoid stalling on concurrent updates.
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")

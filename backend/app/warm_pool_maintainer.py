@@ -54,7 +54,14 @@ logger = logging.getLogger("blueprint")
 # project and registers it in PoolVm, returning True on success. Injected so the
 # reconcile logic is unit-testable with a stub and the production credential
 # resolution lives in one place (_default_pool_provision_fn).
-ProvisionFn = Callable[[object, uuid.UUID], Awaitable[bool]]
+#
+# Signature is intentionally loose (``Callable[..., ...]``): the production fn
+# and demand-weighted reconcile accept an optional keyword ``account_id`` to
+# steer WHICH account a member boots on, but legacy/test stubs with the old
+# ``(session, project_id)`` arity still satisfy the alias — reconcile only
+# passes ``account_id`` when it has actually chosen one (greedy fallback
+# otherwise), so those stubs are never handed the extra keyword.
+ProvisionFn = Callable[..., Awaitable[bool]]
 
 # How recently a member must have been flipped to RETIRING for an *adoption*
 # (``pool_retiring_cleanup``) sweep to treat the teardown as owned by a live
@@ -135,6 +142,128 @@ def _demand_window_minutes(runtime_config) -> int:
         return max(0, int(runtime_config.get("warm_pool_demand_window_minutes", 30)))
     except (TypeError, ValueError):
         return 30
+
+
+_COST_GUARD_ALERT_TITLE = "Warm pool cost guard engaged: idle spend not amortized"
+
+
+def _cost_guard_config(runtime_config) -> dict:
+    """Thresholds for the cost-aware auto-drain guard (safe defaults).
+
+    The guard is a cheap circuit-breaker on cost: it engages when the pool has
+    accrued real idle spend that recent warm-start hits are NOT amortizing, so an
+    operator can enable the dark pool without risking an unattended
+    cost-per-merged-PR regression.
+    """
+
+    def _f(key, default):
+        try:
+            return float(runtime_config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _i(key, default):
+        try:
+            return int(runtime_config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": bool(runtime_config.get("warm_pool_cost_guard_enabled", True)),
+        # Below this hit rate the pool is spending on idle VMs without delivering
+        # reuse. Disengages (provisioning resumes) once hit rate recovers above it.
+        "min_hit_rate": _f("warm_pool_cost_guard_min_hit_rate", 0.10),
+        # Don't act until enough dispatches have happened to trust the hit rate.
+        "min_dispatches": _i("warm_pool_cost_guard_min_dispatches", 20),
+        # Don't act until idle spend is material enough to be worth protecting.
+        "min_idle_cost_usd": _f("warm_pool_cost_guard_min_idle_cost_usd", 1.0),
+        "window_hours": _i("warm_pool_cost_guard_window_hours", 24),
+    }
+
+
+async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
+    """Cheap live cost-regression check on the warm pool.
+
+    Engages when ALL hold over the rolling window: enough dispatches to trust the
+    signal, a pool hit rate below the floor, and fleet idle spend above the floor.
+    Uses the LIVE rolling dispatch funnel (``get_pool_funnel_snapshot``) and the
+    LIVE pool idle-cost accrual (``compute_pool_idle_cost``) — never the
+    once-per-day efficiency snapshot — so it is cheap to evaluate every tick and
+    reverses as soon as a healthy hit rate returns.
+    """
+    from app.efficiency_snapshot import compute_pool_idle_cost
+    from app.warm_backlog_reuse import get_pool_funnel_snapshot
+
+    cfg = _cost_guard_config(runtime_config)
+    funnel = get_pool_funnel_snapshot(cfg["window_hours"])
+    hit_rate = funnel.get("pool_hit_rate")
+    total = funnel.get("total_dispatches", 0)
+    idle_cost = (await compute_pool_idle_cost(session)).get("total_idle_cost_usd", 0.0)
+
+    engaged = (
+        cfg["enabled"]
+        and total >= cfg["min_dispatches"]
+        and hit_rate is not None
+        and hit_rate < cfg["min_hit_rate"]
+        and idle_cost >= cfg["min_idle_cost_usd"]
+    )
+    reason = None
+    if engaged:
+        reason = (
+            f"Pool hit rate {hit_rate:.1%} is below the {cfg['min_hit_rate']:.0%} "
+            f"floor over {cfg['window_hours']}h ({total} dispatches) while idle "
+            f"spend is ${idle_cost:.2f} — draining idle members and pausing "
+            f"provisioning until the hit rate recovers."
+        )
+    return {
+        "engaged": engaged,
+        "reason": reason,
+        "hit_rate": hit_rate,
+        "total_dispatches": total,
+        "idle_cost_usd": idle_cost,
+    }
+
+
+async def _maybe_emit_cost_guard_alert(session, project_id: uuid.UUID, reason: str) -> None:
+    """Emit a deduplicated WARNING alert when the cost guard engages for a project.
+
+    Mirrors the circuit-breaker alert pattern (alert_dispatch): skip if an
+    undismissed cost-guard alert already exists, otherwise create + broadcast one.
+    Best-effort — a broadcast hiccup never blocks the drain.
+    """
+    from app.models import Alert, AlertSeverity
+
+    existing = (
+        await session.execute(
+            select(Alert).where(
+                Alert.project_id == project_id,
+                Alert.task_id.is_(None),
+                Alert.dismissed_at.is_(None),
+                Alert.title == _COST_GUARD_ALERT_TITLE,
+            )
+        )
+    ).scalars().first()
+    if existing is not None:
+        return
+    session.add(
+        Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=_COST_GUARD_ALERT_TITLE,
+            message=reason,
+        )
+    )
+    await session.commit()
+    try:
+        from app.broadcast import broadcast_to_project
+
+        await broadcast_to_project(
+            str(project_id),
+            "alert_created",
+            {"severity": "WARNING", "title": _COST_GUARD_ALERT_TITLE},
+        )
+    except Exception:
+        logger.debug("[WARM-POOL] cost-guard alert broadcast failed", exc_info=True)
 
 
 async def retire_and_delete_pool_vm(
@@ -286,7 +415,9 @@ async def retire_and_delete_pool_vm(
     return True
 
 
-async def _default_pool_provision_fn(session, project_id: uuid.UUID) -> bool:
+async def _default_pool_provision_fn(
+    session, project_id: uuid.UUID, *, account_id: str | None = None
+) -> bool:
     """Production provisioner: resolve a credentialed account and boot a pool VM.
 
     Reads an eligible LLM account for the project's owner from the in-memory pool
@@ -294,6 +425,12 @@ async def _default_pool_provision_fn(session, project_id: uuid.UUID) -> bool:
     the account slot is consumed only when the member is later leased — see the
     boot-account credit fix). Returns False (and logs) when no ready account is
     available so the maintainer simply tries again next tick.
+
+    When ``account_id`` is given (the demand-weighted reconcile path), boot on
+    THAT specific account so the same small idle pool spreads across a project's
+    account mix; the account must still pass the existing readiness/cap gates. A
+    ``None`` ``account_id`` preserves the original greedy first-eligible
+    behavior.
     """
     from app.max_plan_pool import (
         _account_at_cap,
@@ -322,13 +459,19 @@ async def _default_pool_provision_fn(session, project_id: uuid.UUID) -> bool:
             continue
         if not _account_runtime_ready(acct):
             continue
+        # Demand-weighted path: only the requested account is acceptable. A
+        # None account_id keeps the greedy first-eligible behavior.
+        if account_id is not None and str(acct.get("id")) != str(account_id):
+            continue
         account = acct
         break
     if account is None:
         logger.info(
-            "[WARM-POOL] no ready account for project %s owner %s — skip provision",
+            "[WARM-POOL] no ready account for project %s owner %s (account_id=%s) "
+            "— skip provision",
             project_id,
             owner_id,
+            account_id,
         )
         return False
 
@@ -391,6 +534,113 @@ async def _stale_pool_image_ids() -> set[str]:
         return set()
 
 
+async def _account_demand_for_project(
+    session, project_id: uuid.UUID, *, runtime_config
+) -> dict[str | None, int]:
+    """Per-account dispatch demand for ONE project, derived purely from the DB.
+
+    Mirrors the project-level :func:`_demand_active_projects` signal but bucketed
+    by the LLM account each task resolved/booted on: count this project's
+    eligible QUEUED backlog plus its recent COLD dispatches
+    (``Task.vm_dispatched_at`` within ``warm_pool_demand_window_minutes``), and
+    attribute each to ``get_task_llm_account_id`` (the account recorded in the
+    task's context). The returned mapping ``{account_id: count}`` is the supply
+    side's target distribution — it tells the maintainer WHICH accounts have
+    real, recent demand so the same small idle pool spreads across a project's
+    account mix instead of piling onto the first eligible account.
+
+    Tasks with no resolvable account land under the ``None`` key; the caller
+    ignores that bucket (it cannot be attributed to a bootable account) and
+    falls back to the greedy first-eligible provision for those slots.
+
+    Full Task rows are loaded (not a projection) so reading ``task.context`` via
+    ``get_task_llm_account_id`` never triggers an async lazy-load.
+    """
+    from app.max_plan_pool import get_task_llm_account_id
+
+    cutoff = _utcnow() - timedelta(minutes=_demand_window_minutes(runtime_config))
+    tasks = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project_id,
+                    or_(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.vm_dispatched_at >= cutoff,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    demand: dict[str | None, int] = {}
+    for task in tasks:
+        acct = get_task_llm_account_id(task)
+        key = str(acct) if acct else None
+        demand[key] = demand.get(key, 0) + 1
+    return demand
+
+
+async def _eligible_pool_accounts(session, project_id: uuid.UUID) -> dict[str, dict]:
+    """``{account_id: account_dict}`` of the project owner's bootable accounts.
+
+    An account is bootable when it is enabled, runtime-ready, not at any usage
+    cap, and not in a rate-limit cooldown — the SAME gates the greedy
+    :func:`_default_pool_provision_fn` applies, plus the rate-limit blacklist.
+    Used by :func:`reconcile_project_pool` to restrict demand-weighted
+    distribution to accounts that can actually boot a member right now.
+    """
+    from app.max_plan_pool import (
+        _account_at_cap,
+        _account_runtime_ready,
+        _max_plan_pool_lock,
+        _max_plan_pools,
+        account_in_rate_limit_cooldown,
+    )
+
+    project = await session.get(Project, project_id)
+    if project is None or not project.user_id:
+        return {}
+    async with _max_plan_pool_lock:
+        pool = list(_max_plan_pools.get(project.user_id, []))
+    eligible: dict[str, dict] = {}
+    for acct in pool:
+        acct_id = acct.get("id")
+        if not acct_id:
+            continue
+        if not acct.get("enabled", True):
+            continue
+        if _account_at_cap(acct):
+            continue
+        if not _account_runtime_ready(acct):
+            continue
+        if account_in_rate_limit_cooldown(str(acct_id)):
+            continue
+        eligible[str(acct_id)] = acct
+    return eligible
+
+
+def _pick_demand_weighted_account(
+    demand_eligible: dict[str, int], supply: dict[str | None, int]
+) -> str | None:
+    """Water-fill: the demand-active account most under-served by current supply.
+
+    Returns the eligible account with the largest ``demand - current_idle_supply``
+    gap so each provisioned member broadens coverage; an account already
+    over-represented among idle members has a smaller (or negative) gap and is
+    deprioritized. Returns None when there is no demand-attributable eligible
+    account (caller then falls back to greedy provisioning).
+    """
+    best: str | None = None
+    best_gap = 0
+    for acct_id, want in demand_eligible.items():
+        gap = want - supply.get(acct_id, 0)
+        if best is None or gap > best_gap:
+            best, best_gap = acct_id, gap
+    return best
+
+
 async def reconcile_project_pool(
     session,
     project_id: uuid.UUID,
@@ -401,6 +651,7 @@ async def reconcile_project_pool(
     pool_budget_remaining: int,
     stale_vm_ids: set[str],
     suppressed: bool,
+    cost_guard_engaged: bool = False,
 ) -> dict:
     """Reconcile one project's live pool toward its target. Returns a summary.
 
@@ -411,9 +662,13 @@ async def reconcile_project_pool(
       3. Provision up to the deficit when live < target, capped by the dispatch
          slot budget (so dispatch is never starved) AND the pool budget. Skipped
          while the circuit breaker is tripped.
+
+    When ``cost_guard_engaged`` the effective IDLE target is forced to 0 so step 2
+    drains every idle member, and provisioning (step 3) is paused — the
+    cost-aware auto-drain. It reverses on the next tick the guard disengages.
     """
     summary = {"recycled": 0, "drained": 0, "provisioned": 0}
-    target = _pool_target_size(runtime_config)
+    target = 0 if cost_guard_engaged else _pool_target_size(runtime_config)
 
     # Lock-free candidate read: the recycle/drain mutations below go through
     # retire_and_delete_pool_vm, whose atomic compare-and-swap claim is the sole
@@ -469,15 +724,50 @@ async def reconcile_project_pool(
         return summary
 
     # 3. Provision the deficit, yielding to real dispatch and the pool budget.
-    if suppressed:
+    #    The TOTAL number of boots is unchanged (still bounded by the global
+    #    per-project target and both budget ceilings) — this step only steers
+    #    WHICH account each boot lands on so the same small idle pool spreads
+    #    across the accounts that actually have recent demand, instead of always
+    #    the first eligible account. No concurrency slot is reserved for an idle
+    #    member (preserved); per-account cost stays attributed to the boot account.
+    if suppressed or cost_guard_engaged:
         return summary
     deficit = target - live
     allowed = min(deficit, max(0, dispatch_slots_remaining), max(0, pool_budget_remaining))
+    if allowed <= 0:
+        return summary
+
+    # Demand-weighted account selection. Restrict to accounts that are BOTH
+    # demand-active for this project AND currently bootable (ready / non-at-cap /
+    # non-cooldown). Seed current per-account idle supply from the members we
+    # already fetched (no extra query) so water-fill deprioritizes accounts that
+    # are already over-represented among idle members.
+    demand = await _account_demand_for_project(
+        session, project_id, runtime_config=runtime_config
+    )
+    eligible = await _eligible_pool_accounts(session, project_id)
+    demand_eligible = {
+        acct_id: count
+        for acct_id, count in demand.items()
+        if acct_id is not None and acct_id in eligible and count > 0
+    }
+    supply: dict[str | None, int] = {}
+    for member in warm_capacity:
+        supply[member.account_id] = supply.get(member.account_id, 0) + 1
+
     for _ in range(allowed):
-        ok = await provision_fn(session, project_id)
+        chosen = _pick_demand_weighted_account(demand_eligible, supply)
+        if chosen is not None:
+            ok = await provision_fn(session, project_id, account_id=chosen)
+        else:
+            # No demand-attributable eligible account (empty pool, unattributed
+            # demand, etc.) — fall back to the greedy first-eligible provision.
+            ok = await provision_fn(session, project_id)
         if not ok:
             break
         summary["provisioned"] += 1
+        if chosen is not None:
+            supply[chosen] = supply.get(chosen, 0) + 1
     return summary
 
 
@@ -565,6 +855,14 @@ async def run_pool_maintainer_cycle(
     pool_max = _pool_max_vms(runtime_config)
 
     async with session_factory() as session:
+        # Cost-aware auto-drain guard: evaluated ONCE per tick from the live pool
+        # idle-cost + lease-hit signals. When engaged, every project's reconcile
+        # forces target 0 (drain idle) and pauses provisioning until the hit rate
+        # recovers — protecting cost-per-PR while reuse is still low.
+        guard = await evaluate_pool_cost_guard(session, runtime_config=runtime_config)
+        cost_guard_engaged = guard["engaged"]
+        if cost_guard_engaged:
+            logger.warning("[WARM-POOL] cost guard engaged: %s", guard["reason"])
         # Reconcile the UNION of (a) projects that already have live pool members
         # and (b) demand-active projects with no members yet. (b) is what lets a
         # pool actually FORM: a demand-active zero-member project flows through
@@ -611,7 +909,12 @@ async def run_pool_maintainer_cycle(
                     pool_budget_remaining=pool_budget_remaining,
                     stale_vm_ids=stale_vm_ids,
                     suppressed=suppressed,
+                    cost_guard_engaged=cost_guard_engaged,
                 )
+                if cost_guard_engaged:
+                    await _maybe_emit_cost_guard_alert(
+                        session, project_id, guard["reason"]
+                    )
             except Exception:
                 await session.rollback()
                 logger.warning(
