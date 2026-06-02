@@ -33,6 +33,8 @@ from app.review_pipeline import (
     STUCK_CYCLE_THRESHOLD_DEFAULT,
     STUCK_CYCLE_THRESHOLD_MEDIUM,
     STUCK_CYCLE_THRESHOLD_REFACTOR,
+    EARLY_NONCONVERGENCE_ESCALATE_AT,
+    SPAWN_REASON_NONCONVERGENCE,
     _compute_scope_budget_utilization,
     _detect_issue_churn,
     _failure_fingerprint_msg,
@@ -40,6 +42,9 @@ from app.review_pipeline import (
     _format_repeating_issues_section,
     build_ci_failure_fix_prompt,
     compute_drift_signal,
+    detect_early_nonconvergence,
+    detect_fix_all_issue_class,
+    fix_all_occurrences_directive,
     _feedback_jaccard,
     _feedback_token_set,
     _is_cross_cutting_pr,
@@ -8436,3 +8441,751 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(
 
     assert refetched_parent.status == TaskStatus.COMPLETED
     assert (refetched_parent.context or {}).get("pr_merged") is True
+
+
+# ── FIX #1: fix-all-occurrences class detection ──────────────────────────────
+
+
+class TestDetectFixAllIssueClass:
+    def test_two_issues_sharing_stem_is_a_class(self):
+        # Same fix applied at several sites → shared normalized stem.
+        issues = [
+            _issue("Use timezone-aware datetime in services.py", "MAJOR"),
+            _issue("Use timezone-aware datetime in reaper.py", "MAJOR"),
+        ]
+        assert detect_fix_all_issue_class(issues) is True
+
+    def test_single_unrelated_issue_is_not_a_class(self):
+        issues = [_issue("Null pointer dereference in handler", "CRITICAL")]
+        assert detect_fix_all_issue_class(issues) is False
+
+    def test_two_distinct_issues_are_not_a_class(self):
+        # Different stems, no pattern cue → not a file-spanning class.
+        issues = [
+            _issue("Null pointer dereference in handler", "CRITICAL"),
+            _issue("Race condition in the cache layer", "MAJOR"),
+        ]
+        assert detect_fix_all_issue_class(issues) is False
+
+    def test_pattern_cue_triggers_on_single_issue(self):
+        # Reviewer enumerates one site but flags it as one of many.
+        issues = [
+            _issue(
+                "This is one instance of a pattern — other call sites use the "
+                "deprecated API too",
+                "MAJOR",
+            )
+        ]
+        assert detect_fix_all_issue_class(issues) is True
+
+    def test_all_instances_cue_triggers(self):
+        issues = [
+            _issue("Fix all instances of the unguarded dict access", "CRITICAL")
+        ]
+        assert detect_fix_all_issue_class(issues) is True
+
+    def test_minor_only_does_not_trigger(self):
+        # Minor severity is excluded from class detection.
+        issues = [
+            _issue("Use timezone-aware datetime in a.py", "MINOR"),
+            _issue("Use timezone-aware datetime in b.py", "MINOR"),
+        ]
+        assert detect_fix_all_issue_class(issues) is False
+
+    def test_empty_issues_does_not_trigger(self):
+        assert detect_fix_all_issue_class([]) is False
+        assert detect_fix_all_issue_class(None) is False
+
+    def test_directive_text_is_nonempty_and_mentions_grep(self):
+        d = fix_all_occurrences_directive()
+        assert d
+        assert "grep" in d.lower()
+        assert "in scope" in d.lower()
+
+
+# ── FIX #3a: early non-convergence detection ─────────────────────────────────
+
+
+class TestDetectEarlyNonconvergence:
+    def _round(self, descs, verdict="REQUEST_CHANGES", severity="CRITICAL"):
+        return {
+            "verdict": verdict,
+            "issues": [_issue(d, severity) for d in descs],
+        }
+
+    def test_plateau_low_but_nonzero_escalates(self):
+        # [3, 2, 2, 1, 1] shrinks but never reaches 0 — churn MISSES this
+        # (decreasing counts) but it grinds to the cap.
+        hist = [
+            self._round(["a1", "a2", "a3"]),
+            self._round(["b1", "b2"]),
+            self._round(["c1", "c2"]),
+            self._round(["d1"]),
+            self._round(["e1"]),
+        ]
+        should, reason = detect_early_nonconvergence(hist)
+        assert should is True
+        assert "plateau" in reason
+
+    def test_normally_converging_loop_does_not_escalate(self):
+        # Counts decline to ZERO (APPROVE) — a healthy loop must NOT escalate.
+        hist = [
+            self._round(["a1", "a2", "a3"]),
+            self._round(["b1"]),
+            self._round([], verdict="APPROVE"),
+        ]
+        should, _ = detect_early_nonconvergence(hist)
+        assert should is False
+
+    def test_verification_only_drift_escalates(self):
+        # Same issue re-raised every recent round with NO new descriptions, but
+        # an earlier round had a distinct issue so it isn't caught as a plateau
+        # of identical text. The last 3 rounds raise nothing new.
+        hist = [
+            self._round(["leak in foo", "leak in bar"]),
+            self._round(["leak in foo"]),
+            self._round(["leak in foo"]),
+            self._round(["leak in foo"]),
+        ]
+        should, _reason = detect_early_nonconvergence(hist)
+        assert should is True
+
+    def test_one_at_a_time_disclosure_escalates(self):
+        # Each round flags a SMALL batch of NEW distinct sites (count > plateau
+        # max of 3 so the plateau branch does not also fire), all distinct
+        # across rounds → total distinct (16) >> max single-round (4): serial
+        # disclosure of one issue-class.
+        hist = [
+            self._round(["site a1", "site a2", "site a3", "site a4"]),
+            self._round(["site b1", "site b2", "site b3", "site b4"]),
+            self._round(["site c1", "site c2", "site c3", "site c4"]),
+            self._round(["site d1", "site d2", "site d3", "site d4"]),
+        ]
+        should, reason = detect_early_nonconvergence(hist)
+        assert should is True
+        assert "disclosure" in reason
+
+    def test_too_few_rounds_does_not_escalate(self):
+        hist = [self._round(["a1"]), self._round(["b1"])]
+        should, _ = detect_early_nonconvergence(hist)
+        assert should is False
+
+    def test_high_steady_count_not_plateau(self):
+        # Counts stay high (>3) — not the "low-but-nonzero" plateau shape; the
+        # churn detector (non-decreasing) owns this case instead.
+        hist = [
+            self._round([f"a{i}" for i in range(6)]),
+            self._round([f"b{i}" for i in range(6)]),
+            self._round([f"c{i}" for i in range(6)]),
+            self._round([f"d{i}" for i in range(6)]),
+        ]
+        should, _ = detect_early_nonconvergence(hist)
+        # Distinct total (24) >> max round (6) → caught as one-at-a-time
+        # disclosure, which is the correct escalation for 24 distinct issues.
+        assert should is True
+
+
+@pytest.mark.asyncio
+async def test_early_nonconvergence_escalates_at_K_blocks_spawn(db_session, mocker):
+    """A plateau ([... ,2,2,1,1]) trajectory at iteration K must block the fix
+    spawn, flag requires_approval, and set the early-nonconvergence spawn
+    reason — instead of grinding to the full cap."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Prior rounds form a low-but-nonzero plateau. iteration=K means the current
+    # (incoming) round is the K-th — escalation should fire.
+    plateau_history = [
+        {"iteration": 0, "verdict": "REQUEST_CHANGES", "issues": [_issue("a1"), _issue("a2"), _issue("a3")]},
+        {"iteration": 1, "verdict": "REQUEST_CHANGES", "issues": [_issue("b1"), _issue("b2")]},
+        {"iteration": 2, "verdict": "REQUEST_CHANGES", "issues": [_issue("c1"), _issue("c2")]},
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 901,
+                "branch": "b1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": EARLY_NONCONVERGENCE_ESCALATE_AT - 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 901,
+                "branch": "b1",
+                "base_branch": "main",
+                "review_history": plateau_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current round: a single low-count issue continues the plateau (→ [..,2,2,1]
+    # in the inspected window, all 0 < c <= 3).
+    current_issues = [_issue("d1", "CRITICAL")]
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=901,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the remaining issue",
+        current_feedback="One more issue",
+        current_issues=current_issues,
+    )
+
+    assert result is None, "Early non-convergence at K should block the fix spawn"
+    assert created is False
+    await db_session.refresh(original_task)
+    assert original_task.requires_approval is True
+    assert "not converging" in (original_task.latest_status_message or "").lower()
+    ctx_src = source_task.context or {}
+    assert ctx_src.get(SPAWN_REASON_KEY) == SPAWN_REASON_NONCONVERGENCE
+
+
+@pytest.mark.asyncio
+async def test_converging_loop_does_not_escalate_early(db_session, mocker):
+    """A healthy loop whose issue count is collapsing toward zero must NOT be
+    escalated early even past iteration K — _spawn_pipeline_task should produce
+    a real fix task."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # A sharply-converging trajectory: big count, then one round, ALL distinct
+    # (no repeats) so neither plateau, verify-drift, nor one-at-a-time fires.
+    converging_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue(f"firstpass-{i}") for i in range(6)],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 902,
+                "branch": "b2",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": EARLY_NONCONVERGENCE_ESCALATE_AT - 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 902,
+                "branch": "b2",
+                "base_branch": "main",
+                "review_history": converging_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # One genuinely-new issue this round — not a plateau/drift/disclosure shape.
+    current_issues = [_issue("brand-new-distinct-issue", "CRITICAL")]
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=902,
+        branch="b2",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Address the new issue",
+        current_feedback="A new issue",
+        current_issues=current_issues,
+    )
+
+    assert result is not None, "Converging loop must NOT be escalated early"
+    assert created is True
+    ctx_src = source_task.context or {}
+    assert ctx_src.get(SPAWN_REASON_KEY) != SPAWN_REASON_NONCONVERGENCE
+
+
+# ── FIX #3b: preserve work on cap (non-empty, mergeable rollup) ──────────────
+
+
+def _mock_preservable_pr(mocker, *, changed_files: int, mergeable_state: str):
+    """Mock GitHub side effects + get_pull_request for the preserve-work path."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "o", "r"),
+    )
+    close_mock = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "changed_files": changed_files,
+            "mergeable_state": mergeable_state,
+        },
+    )
+    return close_mock
+
+
+@pytest.mark.asyncio
+async def test_cap_preserves_nonempty_mergeable_rollup_pr(db_session, mocker):
+    """FIX #3b: capping a NON-EMPTY, conflict-free ROLLUP PR on REQUEST_CHANGES
+    leaves the PR OPEN, flags requires_approval, records NO CODE_ERROR, and does
+    NOT close the PR."""
+    close_mock = _mock_preservable_pr(
+        mocker, changed_files=4, mergeable_state="clean"
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    rec_task = mocker.patch("app.routers.agent_status.record_task_result")
+    rec_dir = mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "rollup_pr_number": 610,
+            # Genuine non-convergence: latest round has outstanding changes.
+            "review_loop": {
+                "pr_number": 610,
+                "review_history": [
+                    {"verdict": "CHANGES_REQUESTED", "issues": [_issue("x")]},
+                ],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 610, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"pr_number": 610}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 610, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert (orig.context or {}).get("failure_detail") == (
+        "review_cap_preserved_for_handmerge"
+    ), "Preservable rollup PR must be tagged for hand-merge"
+    assert (orig.context or {}).get("pr_preserved_for_handmerge") is True
+    assert orig.requires_approval is True, "Preserved PR must be flagged for operator"
+    assert (orig.context or {}).get("failure_category") != "CODE_ERROR", (
+        "Preserving salvageable work must NOT record CODE_ERROR"
+    )
+    assert (orig.context or {}).get("pr_rejected") is not True
+    close_mock.assert_not_called()  # PR LEFT OPEN
+    rec_task.assert_not_called()
+    rec_dir.assert_not_called()
+    alert_mock.assert_awaited()  # operator still alerted
+
+
+@pytest.mark.asyncio
+async def test_cap_closes_empty_rollup_pr(db_session, mocker):
+    """GUARDRAIL: an EMPTY rollup PR (changed_files == 0) is not preservable —
+    it keeps today's close + FAIL + CODE_ERROR path."""
+    close_mock = _mock_preservable_pr(
+        mocker, changed_files=0, mergeable_state="clean"
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "rollup_pr_number": 611,
+            "review_loop": {
+                "pr_number": 611,
+                "review_history": [
+                    {"verdict": "CHANGES_REQUESTED", "issues": [_issue("x")]},
+                ],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 611, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"pr_number": 611}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 611, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert orig.status == TaskStatus.FAILED
+    assert (orig.context or {}).get("failure_detail") == "review_cap_exhausted"
+    assert (orig.context or {}).get("failure_category") == "CODE_ERROR"
+    assert (orig.context or {}).get("pr_rejected") is True
+    close_mock.assert_awaited()  # empty PR IS closed
+
+
+@pytest.mark.asyncio
+async def test_cap_closes_conflicted_rollup_pr(db_session, mocker):
+    """GUARDRAIL: a genuinely-conflicted rollup PR (mergeable_state == 'dirty')
+    cannot be hand-merged, so it keeps the close + FAIL + CODE_ERROR path."""
+    close_mock = _mock_preservable_pr(
+        mocker, changed_files=4, mergeable_state="dirty"
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "rollup_pr_number": 612,
+            "review_loop": {
+                "pr_number": 612,
+                "review_history": [
+                    {"verdict": "CHANGES_REQUESTED", "issues": [_issue("x")]},
+                ],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 612, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"pr_number": 612}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 612, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert orig.status == TaskStatus.FAILED
+    assert (orig.context or {}).get("failure_detail") == "review_cap_exhausted"
+    assert (orig.context or {}).get("failure_category") == "CODE_ERROR"
+    close_mock.assert_awaited()  # conflicted PR IS closed
+
+
+@pytest.mark.asyncio
+async def test_cap_closes_nonrollup_pr_even_if_mergeable(db_session, mocker):
+    """GUARDRAIL: a non-rollup chain PR is not preserved — only rollup PRs
+    aggregate already-completed sibling work worth keeping open. A plain create
+    task keeps the close + FAIL + CODE_ERROR path."""
+    close_mock = _mock_preservable_pr(
+        mocker, changed_files=4, mergeable_state="clean"
+    )
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            # No rollup markers.
+            "review_loop": {
+                "pr_number": 613,
+                "review_history": [
+                    {"verdict": "CHANGES_REQUESTED", "issues": [_issue("x")]},
+                ],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 613, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"pr_number": 613}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 613, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert orig.status == TaskStatus.FAILED
+    assert (orig.context or {}).get("failure_detail") == "review_cap_exhausted"
+    close_mock.assert_awaited()
+
+
+# ── FIX #1: narrow-focus ↔ fix-all reconciliation ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fix_all_directive_reconciles_with_narrow_focus_prefix(
+    db_session, mocker
+):
+    """When a fix_prompt already carries the FIX-ALL-OCCURRENCES directive AND a
+    narrow-focus prefix (churn) is injected by _spawn_pipeline_task, the spawned
+    prompt must include the reconciliation clause so the narrow-focus 'avoid
+    modifying files not referenced by the issues' rule does not silently veto
+    migrating the flagged class's sibling sites."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Two prior rounds with non-decreasing CRITICAL counts (2 → 2), all DISTINCT
+    # descriptions so the stuck-cycle detector does NOT fire but issue-churn DOES
+    # (which injects the narrow-focus prefix). The descriptions differ from the
+    # current round so this isn't escalated as non-convergence at iteration 1.
+    churn_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("alpha one"), _issue("alpha two")],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 920,
+                "branch": "rec1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 920,
+                "branch": "rec1",
+                "base_branch": "main",
+                "review_history": churn_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Current round: 2 distinct CRITICAL issues → counts [2, 2] non-decreasing →
+    # churn → narrow-focus prefix injected. fix_prompt carries the directive.
+    current_issues = [_issue("beta one"), _issue("beta two")]
+    fix_prompt_with_directive = (
+        fix_all_occurrences_directive() + "A code review flagged this PR."
+    )
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=920,
+        branch="rec1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt=fix_prompt_with_directive,
+        current_feedback="beta feedback",
+        current_issues=current_issues,
+    )
+
+    assert result is not None and created is True
+    prompt = (result.payloads[0] if result.payloads else {}).get("prompt") or ""
+    # Narrow-focus prefix is present (churn fired)...
+    assert "ISSUE CHURN DETECTED" in prompt
+    # ...the fix-all directive survives...
+    assert "FIX ALL OCCURRENCES" in prompt
+    # ...and the reconciliation clause was appended to the narrow-focus prefix.
+    assert "takes precedence" in prompt
+
+
+@pytest.mark.asyncio
+async def test_no_reconcile_clause_without_fix_all_directive(db_session, mocker):
+    """When the fix_prompt does NOT carry the fix-all directive, the narrow-focus
+    prefix must NOT gain the reconciliation clause (no spurious precedence note)."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    churn_history = [
+        {
+            "iteration": 0,
+            "verdict": "REQUEST_CHANGES",
+            "issues": [_issue("alpha one"), _issue("alpha two")],
+        },
+    ]
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 921,
+                "branch": "rec2",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 1,
+                "original_task_id": str(original_task.id),
+                "pr_number": 921,
+                "branch": "rec2",
+                "base_branch": "main",
+                "review_history": churn_history,
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    current_issues = [_issue("beta one"), _issue("beta two")]
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=921,
+        branch="rec2",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="A code review flagged this PR.",  # no directive
+        current_feedback="beta feedback",
+        current_issues=current_issues,
+    )
+
+    assert result is not None and created is True
+    prompt = (result.payloads[0] if result.payloads else {}).get("prompt") or ""
+    assert "ISSUE CHURN DETECTED" in prompt  # churn still fired
+    assert "FIX ALL OCCURRENCES" not in prompt
+    assert "takes precedence" not in prompt

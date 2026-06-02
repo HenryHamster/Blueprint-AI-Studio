@@ -47,6 +47,8 @@ from app.review_pipeline import (
     REVIEW_FIX_GOAL_PREAMBLE,
     _spawn_pipeline_task,
     build_ci_failure_fix_prompt,
+    detect_fix_all_issue_class,
+    fix_all_occurrences_directive,
     should_auto_approve_diff,
 )
 from app.failure_classification import classify_failure
@@ -2904,6 +2906,25 @@ async def _process_post_commit(
                         fix_prompt_text = f"{disagreement_hint}{REVIEW_FIX_GOAL_PREAMBLE}A code review flagged this PR. Issues to address:{structured}{ci_errors_text}"
                     else:
                         fix_prompt_text = f"{disagreement_hint}{REVIEW_FIX_GOAL_PREAMBLE}A code review flagged this PR. Reviewer feedback:\n\n{feedback}{ci_errors_text}"
+                    # FIX-ALL-OCCURRENCES: when the flagged issues look like
+                    # instances of ONE file-spanning class (shared description
+                    # stem, or an explicit "all instances"/"other call sites"
+                    # cue), prepend a directive to grep + fix EVERY occurrence
+                    # in this pass. Prevents the whack-a-mole loop where the fix
+                    # agent migrates only the cited line and the next review
+                    # finds the next sibling site. The directive explicitly
+                    # reconciles with the narrow-focus guardrails injected later
+                    # in _spawn_pipeline_task: migrating sibling sites of the
+                    # flagged class is completing the fix, not refactoring.
+                    if detect_fix_all_issue_class(issues):
+                        logger.info(
+                            f"[REVIEW PIPELINE] PR #{pr_number}: flagged issues "
+                            f"form a file-spanning class — injecting "
+                            f"fix-all-occurrences directive"
+                        )
+                        fix_prompt_text = (
+                            f"{fix_all_occurrences_directive()}{fix_prompt_text}"
+                        )
                     # First-pass minor-only verdict: when every blocking finding
                     # from the initial review is minor-severity, the spawned fix
                     # only addresses nits. Mark the fix so its completion handler
