@@ -128,6 +128,23 @@ async def create_pr_review_comment(
     return response.json()
 
 
+def _is_self_review_422(response_text: str) -> bool:
+    """True when a 422 from the Reviews API is GitHub rejecting an
+    APPROVE / REQUEST_CHANGES review on a PR authored by the same identity
+    as the reviewing token.
+
+    GitHub only permits ``COMMENT`` reviews on your own PR; APPROVE and
+    REQUEST_CHANGES return 422 with a message like
+    "Can not approve your own pull request" /
+    "Can not request changes on your own pull request". This is the common
+    case for the autonomous pipeline today, where every PR is authored by the
+    single Blueprint GitHub-App bot and reviewed with that same token.
+    """
+    if not response_text:
+        return False
+    return "your own pull request" in response_text.lower()
+
+
 async def submit_pr_review(
     token: str,
     owner: str,
@@ -141,7 +158,19 @@ async def submit_pr_review(
     Submits a PR review via the GitHub Pull Request Reviews API.
 
     Fetches the HEAD commit SHA first, then POSTs the review.
-    If inline comments cause a 422, retries without them so a review is always posted.
+
+    Handles the two distinct 422 causes separately so a review is always
+    posted and no futile retries are wasted:
+
+    * **Self-authored review** — GitHub forbids APPROVE / REQUEST_CHANGES on a
+      PR you authored (only COMMENT is allowed). The verdict already lives in
+      ``body``, so we downgrade the event to ``COMMENT`` and retry, keeping any
+      inline comments. APPROVE / REQUEST_CHANGES are preserved when the PR
+      author differs from the reviewing identity (future separate-reviewer or
+      external-contributor PRs).
+    * **Bad inline comments** — a comment anchored to a path/line outside the
+      diff. We drop the inline comments and retry with the original event.
+
     Returns None on 404.
     """
     from app import github as _gh
@@ -162,24 +191,36 @@ async def submit_pr_review(
         "comments": comments,
     }
 
-    response = await _github_request(
-        "POST",
-        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-        headers,
-        json=payload,
-    )
+    async def _post():
+        # Send a shallow copy so each POST carries its own snapshot of the
+        # payload (event / comments get mutated across retries below).
+        return await _github_request(
+            "POST",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            headers,
+            json=dict(payload),
+        )
+
+    response = await _post()
+
+    if response.status_code == 422 and _is_self_review_422(response.text):
+        # Self-authored PR: GitHub rejects APPROVE/REQUEST_CHANGES. The verdict
+        # is already in the review body — submit it as a COMMENT review instead.
+        logger.info(
+            f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — self-authored, "
+            f"downgrading event {event!r} -> 'COMMENT' and retrying"
+        )
+        payload["event"] = "COMMENT"
+        response = await _post()
 
     if response.status_code == 422:
+        # Remaining 422 cause: inline comments anchored outside the diff.
+        # Retry without them so a review is still posted.
         logger.warning(
             f"[GITHUB] submit_pr_review 422 for PR #{pr_number} — retrying without inline comments: {response.text[:300]}"
         )
         payload["comments"] = []
-        response = await _github_request(
-            "POST",
-            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-            headers,
-            json=payload,
-        )
+        response = await _post()
 
     if response.status_code == 404:
         logger.warning(

@@ -326,6 +326,33 @@ describe('resolveBuildConfig', () => {
     expect(resolveBuildConfig(task)?.staging_branch_prefixes).toBeUndefined();
   });
 
+  it('forwards a valid task_branch_namespace onto the resolved config', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'src', type: 'node' }],
+        task_branch_namespace: 'stsbot',
+      },
+    };
+    expect(resolveBuildConfig(task)?.task_branch_namespace).toBe('stsbot');
+  });
+
+  it('drops an unsafe task_branch_namespace (slash / traversal / case / shell chars)', () => {
+    for (const ns of ['evil/x', '../escape', 'has space', 'Up$(x)', '', 'Capitalized']) {
+      const task = {
+        build_config: {
+          directories: [{ path: 'src', type: 'node' }],
+          task_branch_namespace: ns,
+        },
+      };
+      expect(resolveBuildConfig(task)?.task_branch_namespace).toBeUndefined();
+    }
+  });
+
+  it('leaves task_branch_namespace unset when absent', () => {
+    const task = { build_config: { directories: [{ path: 'src', type: 'node' }] } };
+    expect(resolveBuildConfig(task)?.task_branch_namespace).toBeUndefined();
+  });
+
   it('ignores staging_branch_prefixes when it is not an array', () => {
     const task = {
       build_config: {
