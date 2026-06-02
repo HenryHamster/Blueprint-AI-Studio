@@ -443,6 +443,15 @@ runtime_config: Dict = {
     "warm_pool_heartbeat_stale_seconds": 300,
     # Maintainer tick cadence (leader-only background service).
     "warm_pool_maintainer_interval_seconds": 120,
+    # Demand lookback window (minutes) for bootstrap-from-zero pool formation.
+    # A project with ZERO live pool members is still reconciled (bootstrapped up
+    # to target) when it has real dispatch demand: eligible QUEUED backlog OR a
+    # cold dispatch (Task.vm_dispatched_at) within this window. Sized comfortably
+    # above the maintainer tick interval (120s) so a project that dispatched
+    # moments ago is still seen as demand-active on the next tick; a DORMANT
+    # project (no recent demand, no members) is never seeded. Read by
+    # warm_pool_maintainer._demand_active_projects.
+    "warm_pool_demand_window_minutes": 30,
     # Circuit-breaker thresholds for POOL-served claims. When pool leases or
     # pool-leased tasks fail (lease/finalize error, a leased VM found tearing
     # down, or a FAILED pool task) more than the threshold within a 1h rolling
@@ -856,6 +865,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "warm_pool_idle_ttl_secs",
                     "warm_pool_heartbeat_stale_seconds",
                     "warm_pool_maintainer_interval_seconds",
+                    "warm_pool_demand_window_minutes",
                     "warm_pool_failure_rate_threshold",
                     "warm_pool_cooldown_seconds",
                     "project_broadcast_limit",

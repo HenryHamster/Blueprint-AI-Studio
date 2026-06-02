@@ -104,6 +104,8 @@ def warm_pool_on():
             "warm_pool_idle_ttl_seconds",
             "warm_pool_heartbeat_stale_seconds",
             "warm_pool_failure_rate_threshold",
+            "warm_pool_demand_window_minutes",
+            "max_concurrent_vms",
         ):
             if k in prior:
                 _runtime_config[k] = prior[k]
@@ -570,6 +572,267 @@ async def test_run_pool_maintainer_cycle_inert_when_disabled(db_session):
         }
     finally:
         _runtime_config.pop("warm_pool_enabled", None)
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap-from-zero: a demand-active project with ZERO live members forms a
+# pool (the maintainer no longer reconciles ONLY members-bearing projects).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_pool_maintainer_cycle_bootstraps_zero_member_queued_demand(
+    db_session, warm_pool_on
+):
+    """A project with QUEUED backlog and ZERO pool members is bootstrapped up to
+    target through the normal reconcile path (deficit = target - 0)."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Real dispatch demand (QUEUED task), but no pool member exists yet.
+    await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    calls = {"n": 0}
+
+    async def _stub_provision(session, project_id):
+        calls["n"] += 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    # Zero members + target 2 → bootstrap the full target within ample budgets.
+    assert totals["provisioned"] == 2
+    assert totals["projects"] == 1
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_pool_maintainer_cycle_bootstraps_on_recent_cold_dispatch(
+    db_session, warm_pool_on
+):
+    """A recent COLD dispatch (vm_dispatched_at within the window) is itself a
+    demand signal — even with no QUEUED backlog and zero members."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Terminal task whose VM was dispatched 5 min ago — within the demand window.
+    task = await _make_task(db_session, project, TaskStatus.COMPLETED)
+    task.vm_dispatched_at = _utcnow() - timedelta(minutes=5)
+    db_session.add(task)
+    await db_session.commit()
+
+    calls = {"n": 0}
+
+    async def _stub_provision(session, project_id):
+        calls["n"] += 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    assert totals["provisioned"] == 2
+    assert totals["projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_pool_maintainer_cycle_skips_dormant_zero_member_project(
+    db_session, warm_pool_on
+):
+    """A DORMANT project (no QUEUED backlog, dispatch outside the window, no
+    members) must NEVER be seeded — blanket-seeding would explode spend."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    # Terminal task dispatched 2h ago — well outside the 30-min demand window.
+    task = await _make_task(db_session, project, TaskStatus.COMPLETED)
+    task.vm_dispatched_at = _utcnow() - timedelta(minutes=120)
+    db_session.add(task)
+    await db_session.commit()
+
+    async def _no_provision(session, project_id):
+        raise AssertionError("dormant zero-member project must not be seeded")
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_no_provision,
+        session_factory=_factory_for(db_session),
+    )
+    assert totals == {
+        "recycled": 0,
+        "drained": 0,
+        "provisioned": 0,
+        "projects": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_respects_dispatch_slot_budget(db_session, warm_pool_on):
+    """Bootstrapping from zero still yields to the dispatch-slot headroom: a
+    demand-active project never provisions into slots real dispatch needs."""
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_max_vms"] = 20
+    # Only 1 dispatch slot free fleet-wide (1 IN_PROGRESS task fills the other).
+    _runtime_config["max_concurrent_vms"] = 2
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    await _make_task(db_session, project, TaskStatus.QUEUED)  # demand
+    await _make_task(db_session, project, TaskStatus.IN_PROGRESS)  # consumes a slot
+
+    calls = {"n": 0}
+
+    async def _stub_provision(session, project_id):
+        calls["n"] += 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    # max_concurrent 2 − 1 active task − 0 idle pool = 1 dispatch slot → cap at 1.
+    assert totals["provisioned"] == 1
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_respects_pool_max_budget(db_session, warm_pool_on):
+    """The fleet-wide warm_pool_max_vms ceiling bounds bootstrap provisioning."""
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_max_vms"] = 1  # only 1 live pool member allowed
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    await _make_task(db_session, project, TaskStatus.QUEUED)
+
+    calls = {"n": 0}
+
+    async def _stub_provision(session, project_id):
+        calls["n"] += 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    # pool budget = 1 − 0 live = 1 → cap at 1 even though deficit is 3.
+    assert totals["provisioned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_pool_maintainer_cycle_inert_with_demand_when_disabled(
+    db_session,
+):
+    """Byte-identical inertness when warm_pool_enabled is off: even with live
+    demand, the cycle early-returns zero totals and never queries/provisions."""
+    _runtime_config["warm_pool_enabled"] = False
+    try:
+        project = await _make_project(db_session)
+        await _make_task(db_session, project, TaskStatus.QUEUED)
+
+        async def _no_provision(session, project_id):
+            raise AssertionError("must not provision when warm pool disabled")
+
+        totals = await run_pool_maintainer_cycle(
+            runtime_config=_runtime_config,
+            provision_fn=_no_provision,
+            session_factory=_factory_for(db_session),
+        )
+        assert totals == {
+            "recycled": 0,
+            "drained": 0,
+            "provisioned": 0,
+            "projects": 0,
+        }
+    finally:
+        _runtime_config.pop("warm_pool_enabled", None)
+
+
+@pytest.mark.asyncio
+async def test_demand_and_member_projects_both_reconcile_in_one_cycle(
+    db_session, warm_pool_on
+):
+    """The union reconciles BOTH a demand-active zero-member project and a
+    member-bearing (idle) project in a single tick, with no double-counting."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+
+    # Project A: zero members, QUEUED demand → bootstrap to target (2).
+    project_a = await _make_project(db_session, name="Pool A")
+    await _make_task(db_session, project_a, TaskStatus.QUEUED)
+    # Project B: one existing idle member, no tasks → top up to target (1 more).
+    project_b = await _make_project(db_session, name="Pool B")
+    await _register(db_session, project_b, "agent-vm-b-seed", PoolVmState.IDLE)
+
+    per_project = {}
+
+    async def _stub_provision(session, project_id):
+        per_project[project_id] = per_project.get(project_id, 0) + 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    assert totals["projects"] == 2
+    assert totals["provisioned"] == 3  # A: 2 (0→2), B: 1 (1→2)
+    assert per_project[project_a.id] == 2
+    assert per_project[project_b.id] == 1
+
+
+@pytest.mark.asyncio
+async def test_bootstrapped_member_idle_cost_is_observable(
+    db_session, warm_pool_on
+):
+    """A bootstrapped member flows through the normal register→idle lifecycle, so
+    its idle cost is observable through the standard compute_pool_idle_cost path
+    (no special bootstrap cost path)."""
+    from app.efficiency_snapshot import compute_pool_idle_cost
+
+    _runtime_config["warm_pool_target_size"] = 1
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+    project = await _make_project(db_session)
+    await _make_task(db_session, project, TaskStatus.QUEUED)  # demand, zero members
+
+    async def _registering_provision(session, project_id):
+        member = await register_pool_vm(
+            session,
+            vm_instance_id=f"agent-vm-boot-{uuid.uuid4().hex}",
+            project_id=project_id,
+            account_id="acct-1",
+            provider="anthropic",
+            model="claude-opus-4-8",
+            state=PoolVmState.IDLE,
+        )
+        member.idle_since = _utcnow() - timedelta(seconds=600)
+        session.add(member)
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_registering_provision,
+        session_factory=_factory_for(db_session),
+    )
+    assert totals["provisioned"] == 1
+    # The bootstrapped member is a normal pool member: idle accrual shows up.
+    cost = await compute_pool_idle_cost(db_session, project.id)
+    assert cost["pool_size"] == 1
+    assert cost["idle_count"] == 1
+    assert cost["live_idle_cost_usd"] > 0
 
 
 # ---------------------------------------------------------------------------
