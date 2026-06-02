@@ -134,6 +134,162 @@ async def _file_has_line_count(path: str, min_line: int) -> bool:
         return False
 
 
+# Recognizes the `path/to/file.ext:symbol` convention used in finding claims
+# (e.g. "backend/app/x.py:my_func stores Y"). The symbol must start with a
+# letter or underscore, which excludes line-number refs like file.py:42.
+_PATH_SYMBOL_RE = re.compile(
+    r"(?<![\w/])([\w./-]+\.(?:py|ts|tsx|js|jsx|mjs|cjs|go|rs)):([A-Za-z_]\w*)"
+)
+
+# Definition-introducing keywords across Python, TS/JS, Go, and Rust. A symbol
+# is considered grounded when any of these precedes it, OR when it appears on
+# the left of an assignment/object-key/definition. Conservative by design: we
+# only flag a symbol as absent when NO plausible definition is found.
+_DEF_KEYWORDS = (
+    "def",
+    "class",
+    "function",
+    "func",
+    "fn",
+    "const",
+    "let",
+    "var",
+    "type",
+    "interface",
+    "enum",
+    "struct",
+    "trait",
+    "mod",
+    "static",
+)
+
+
+def _parse_path_symbol_refs(text: Any) -> list:
+    """Extract deduplicated (path, symbol) pairs from `path:symbol` refs in text.
+
+    Returns [] for non-strings or text with no recognizable references.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    out: list = []
+    seen: set = set()
+    for m in _PATH_SYMBOL_RE.finditer(text):
+        key = (m.group(1), m.group(2))
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def _symbol_definition_regex(symbol: str) -> "re.Pattern":
+    """Build a regex matching a plausible definition of ``symbol`` in source.
+
+    Matches a definition keyword followed by the symbol, or the symbol on the
+    left of an assignment / object-key / function-or-method definition. The
+    leading ``[^\\w.]`` guard avoids treating ``obj.symbol`` as a definition.
+    """
+    s = re.escape(symbol)
+    kw = r"(?:^|[^\w.])(?:" + "|".join(_DEF_KEYWORDS) + r")\s+" + s + r"\b"
+    lhs = r"(?:^|[^\w.])" + s + r"\s*(?:[:=]|\()"
+    return re.compile(kw + "|" + lhs, re.MULTILINE)
+
+
+async def _symbol_defined_at_head(path: str, symbol: str) -> Optional[bool]:
+    """Return whether ``symbol`` is defined in ``path`` at HEAD.
+
+    True  → file exists at HEAD and a plausible definition of ``symbol`` found.
+    False → unambiguously absent (file exists but no definition, or the file
+            itself is absent at HEAD).
+    None  → indeterminate (git unavailable / timeout / non-repo / error). Callers
+            treat None as grounded so a git outage never flags refs.
+    """
+    if not path or not symbol or not isinstance(path, str) or not isinstance(symbol, str):
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "show",
+            f"HEAD:{path}",
+            cwd="/tmp/workspace",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning(f"[SOURCE_REF_VALIDATION] git show timeout for {path}")
+            return None
+    except Exception as e:
+        logger.warning(f"[SOURCE_REF_VALIDATION] git show failed for {path}: {e}")
+        return None
+    if proc.returncode == 0:
+        return bool(_symbol_definition_regex(symbol).search(stdout.decode(errors="replace")))
+    err = stderr.decode(errors="replace").lower()
+    if "does not exist" in err or "exists on disk, but not in" in err:
+        # git ran fine; the path is genuinely absent at HEAD → unambiguously absent.
+        return False
+    # not-a-repo or any other git error → indeterminate, degrade gracefully.
+    return None
+
+
+async def summarize_ungrounded_claims(
+    claims: Optional[list],
+    sources: Optional[list] = None,
+) -> Optional[Dict[str, Any]]:
+    """Verify ``path:symbol`` references in a finding's claims resolve at HEAD.
+
+    Parses ``path:symbol`` references out of each claim (and, when provided,
+    file source excerpts using the same convention) and checks each one names a
+    symbol actually defined in an existing file at HEAD. A claim is *ungrounded*
+    when one of its references is unambiguously absent. Returns a structured
+    grounding-warning summary mirroring :func:`summarize_broken_refs`::
+
+        {"ungrounded_claim_count": N, "ungrounded_refs": ["path:symbol", ...]}
+
+    ``ungrounded_claim_count`` is the number of distinct claims carrying an
+    absent reference — callers use it to discount ungrounded claims from the
+    actionability grade, mirroring how an invalid file citation already fails to
+    count as a valid source. Returns None when no claim carries a parseable
+    reference or all references are grounded. Degrades gracefully: an
+    indeterminate ref (git unavailable) is never flagged.
+    """
+    if not isinstance(claims, list):
+        claims = []
+    ungrounded_refs: list = []
+    seen_refs: set = set()
+    ungrounded_claim_count = 0
+
+    async def _check(text: Any, *, count_claim: bool) -> None:
+        nonlocal ungrounded_claim_count
+        flagged = False
+        for path, symbol in _parse_path_symbol_refs(text):
+            if await _symbol_defined_at_head(path, symbol) is False:
+                flagged = True
+                ref = f"{path}:{symbol}"
+                if ref not in seen_refs:
+                    seen_refs.add(ref)
+                    ungrounded_refs.append(ref)
+        if flagged and count_claim:
+            ungrounded_claim_count += 1
+
+    for claim in claims:
+        await _check(claim, count_claim=True)
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        if str(source.get("type") or "").lower() != "file":
+            continue
+        await _check(source.get("quote") or source.get("excerpt"), count_claim=False)
+
+    if not ungrounded_refs:
+        return None
+    return {
+        "ungrounded_claim_count": ungrounded_claim_count,
+        "ungrounded_refs": ungrounded_refs,
+    }
+
+
 def extract_source_file_paths(sources: Optional[list]) -> list:
     """Extract normalized file paths from all file-type sources.
 

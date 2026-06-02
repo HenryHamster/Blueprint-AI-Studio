@@ -73,6 +73,7 @@ from app.research_direction_state import (  # noqa: F401 — re-exported for cal
 from app.source_ref_validation import (
     validate_source_refs,
     summarize_broken_refs,
+    summarize_ungrounded_claims,
 )
 from app.scope_complexity import _composite_complexity_score
 from app.shared_state import (
@@ -638,6 +639,13 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
     downgrades = 0
     for f in findings:
         claims = f.get("claims") if isinstance(f.get("claims"), list) else []
+        # Discount claims that reference code absent at HEAD: a claim asserting
+        # facts about a nonexistent symbol/file must not count as structural
+        # support, mirroring how an invalid file citation fails to count as a
+        # valid source. _ungrounded_claim_count is set at ingestion by
+        # summarize_ungrounded_claims.
+        ungrounded = int(f.get("_ungrounded_claim_count", 0) or 0)
+        effective_claims = max(0, len(claims) - ungrounded)
         desc = str(f.get("description") or "").strip()
         sources = f.get("sources") if isinstance(f.get("sources"), list) else []
         valid_sources = sum(
@@ -650,9 +658,9 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
             )
         )
         structural_grade = "LOW"
-        if len(claims) >= 2 and valid_sources >= 1 and len(desc) >= 80:
+        if effective_claims >= 2 and valid_sources >= 1 and len(desc) >= 80:
             structural_grade = "HIGH"
-        elif (len(claims) >= 1 or valid_sources >= 1) and len(desc) >= 40:
+        elif (effective_claims >= 1 or valid_sources >= 1) and len(desc) >= 40:
             structural_grade = "MEDIUM"
         current = f.get("actionability_grade", "MEDIUM")
         if grade_order[structural_grade] < grade_order.get(current, 1):
@@ -764,6 +772,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     for _f in findings:
         if "claims" in _f and not isinstance(_f.get("claims"), list):
             _f["claims"] = []
+        _broken_provenance: Optional[Dict[str, Any]] = None
         if "sources" in _f:
             if not isinstance(_f["sources"], list):
                 _f["sources"] = []
@@ -777,9 +786,23 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 # marks file refs invalid. The finding still spawns; the data
                 # is here so downstream consumers (admin UI, agent prompts)
                 # can flag research with bad citations as lower-trust.
-                _provenance = summarize_broken_refs(_f["sources"])
-                if _provenance is not None:
-                    _f["_provenance_warnings"] = _provenance
+                _broken_provenance = summarize_broken_refs(_f["sources"])
+        # Symbol-level grounding: verify path:symbol references in claims (and
+        # file source excerpts) name code that actually exists at HEAD. A claim
+        # asserting facts about a function/class/constant that is absent from an
+        # otherwise-existing file is surfaced the same way a broken file citation
+        # is, and discounted from the actionability grade below.
+        _ungrounded = await summarize_ungrounded_claims(
+            _f.get("claims"), _f.get("sources")
+        )
+        if _ungrounded is not None:
+            _f["_ungrounded_claim_count"] = _ungrounded["ungrounded_claim_count"]
+        # Merge file-citation and symbol grounding warnings into one provenance
+        # blob propagated to child task context.
+        if _broken_provenance and _ungrounded:
+            _f["_provenance_warnings"] = {**_broken_provenance, **_ungrounded}
+        elif _broken_provenance or _ungrounded:
+            _f["_provenance_warnings"] = _broken_provenance or _ungrounded
 
     _structural_downgrades = _apply_structural_actionability_downgrade(findings)
 

@@ -13,8 +13,10 @@ from app.spawn_calibration import (
 )
 from app.source_ref_validation import (
     _parse_ref,
+    _symbol_defined_at_head,
     collect_stale_refs,
     extract_source_file_paths,
+    summarize_ungrounded_claims,
     summarize_broken_refs,
     validate_source_refs,
 )
@@ -372,6 +374,21 @@ class TestSourceRefParsing:
 class TestSourceRefValidation:
     """Validation of research finding source file references."""
 
+    def _patch_git_show(self, monkeypatch, *, stdout=b"", stderr=b"", returncode=0):
+        from app import source_ref_validation as srv
+
+        class _Proc:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return stdout, stderr
+
+        async def _create(*args, **kwargs):
+            return _Proc()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
+
     async def test_pr_source_passes_through(self):
         """PR-type sources require no validation."""
         sources = [
@@ -530,6 +547,34 @@ class TestSourceRefValidation:
         validated = await validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0]["type"] == "custom_type"
+
+    async def test_symbol_ref_present_is_grounded(self, monkeypatch):
+        self._patch_git_show(monkeypatch, stdout=b"def present_symbol():\n    pass\n")
+        assert await _symbol_defined_at_head("backend/app/example.py", "present_symbol") is True
+
+    async def test_symbol_ref_absent_in_existing_file_is_flagged(self, monkeypatch):
+        self._patch_git_show(monkeypatch, stdout=b"def other_symbol():\n    pass\n")
+        assert await _symbol_defined_at_head("backend/app/example.py", "missing_symbol") is False
+
+    async def test_symbol_ref_missing_file_is_flagged(self, monkeypatch):
+        self._patch_git_show(
+            monkeypatch,
+            returncode=128,
+            stderr=b"fatal: path 'backend/app/missing.py' exists on disk, but not in 'HEAD'",
+        )
+        assert await _symbol_defined_at_head("backend/app/missing.py", "missing") is False
+
+    async def test_malformed_symbol_ref_is_ignored(self):
+        assert await summarize_ungrounded_claims(["backend/app/example.py:42"]) is None
+
+    async def test_git_failure_degrades_gracefully(self, monkeypatch):
+        from app import source_ref_validation as srv
+
+        async def _create(*args, **kwargs):
+            raise OSError("git unavailable")
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
+        assert await _symbol_defined_at_head("backend/app/example.py", "present_symbol") is None
 
 
 class TestExtractSourceFilePaths:
