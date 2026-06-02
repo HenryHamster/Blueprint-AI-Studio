@@ -33,9 +33,48 @@ from app.shared_state import (
     get_project_promotion_target,
     runtime_config as _runtime_config,
 )
+from app.strategic_constants import MIN_HEALTHY_ACTIVE_DIRECTIONS
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+
+def _build_parallelism_hint(
+    active_count: int, max_concurrent_vms: int, max_active_directions: int
+) -> str:
+    """Advisory prompt hint surfaced to the strategic agent when its active-
+    direction count caps fleet parallelism well below capacity.
+
+    Each active direction is one parallel work-lane (research/plan dispatch fans
+    out per-direction), so the active-direction count — not the VM cap — is the
+    real ceiling on how much of the fleet works at once. Returns "" when the lane
+    count is healthy, or when fleet capacity itself is the limit (so we never nag
+    about <floor directions on a 1-2 VM fleet). Quality-framed: it nudges toward
+    opening lanes for *worthwhile* parallel work, not hitting a number.
+    """
+    floor = MIN_HEALTHY_ACTIVE_DIRECTIONS
+    if max_concurrent_vms:
+        floor = min(floor, max_concurrent_vms)
+    if active_count >= floor:
+        return ""
+    cap_clause = (
+        f" the fleet can run up to ~{max_concurrent_vms} VMs at once, so"
+        if max_concurrent_vms
+        else ""
+    )
+    return (
+        f"PARALLELISM: You currently have {active_count} active direction(s). "
+        f"Research/plan work fans out PER ACTIVE DIRECTION, so your active-"
+        f"direction count — not the VM cap — is the effective ceiling on how much "
+        f"of the fleet works at once;{cap_clause} most of that capacity is idle "
+        f"right now. If there is worthwhile parallel work (e.g. hardening or "
+        f"auditing systems you've already built this version), opening additional "
+        f"directions converts idle capacity into progress. Do not stay narrow "
+        f"solely because one direction is load-bearing — only keep the count low "
+        f"if there is genuinely no other valuable work to run in parallel "
+        f"(aim for at least {MIN_HEALTHY_ACTIVE_DIRECTIONS} active directions; "
+        f"ceiling is {max_active_directions})."
+    )
 
 
 # Keys kept in Project.design_doc for operator/UI consumption but never
@@ -2193,6 +2232,20 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _approaches_block
             )
+    # Advisory: when too few directions are active the fleet's per-direction
+    # fan-out leaves most VM capacity idle. Surface that cost so the agent can
+    # weigh opening more lanes for worthwhile parallel work.
+    _parallelism_hint = _build_parallelism_hint(
+        sum(1 for d in (project.directions or []) if d.get("status") == "active"),
+        _runtime_config.get("max_concurrent_vms", 0),
+        _runtime_config.get("max_active_directions", 10),
+    )
+    if _parallelism_hint:
+        prompt_suffix = (
+            f"{prompt_suffix}\n{_parallelism_hint}"
+            if prompt_suffix
+            else _parallelism_hint
+        )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
