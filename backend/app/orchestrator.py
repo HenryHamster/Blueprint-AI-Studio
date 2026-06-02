@@ -2663,6 +2663,22 @@ async def orchestrator_worker():
                                     f"for task {task.id}; falling back to cold provision"
                                 )
                                 _shared_state.record_pool_claim_failure("commit_error")
+                                # Release the slot pre-reserved during runtime
+                                # selection (select_max_plan_account pre-increments
+                                # active_tasks under lock). This early-exit abandons
+                                # the dispatch without launching, so the reservation
+                                # would otherwise leak until the next per-cycle
+                                # reconciliation re-bases the counter from the DB —
+                                # mirroring the cold-provision commit-failure release.
+                                # Guarded so it is a no-op when selection resolved to
+                                # an env-credential fallback with no pooled account;
+                                # the release helper also floors at zero. Use the
+                                # account carried on the resolved selection, not the
+                                # loop-local account_id (only assigned later, below).
+                                if runtime_selection and runtime_selection.account:
+                                    await release_max_plan_account(
+                                        runtime_selection.account["id"]
+                                    )
                                 await session.rollback()
                                 # session.rollback() expires every session-bound
                                 # instance (independent of expire_on_commit=False),
@@ -2714,6 +2730,19 @@ async def orchestrator_worker():
                             f"cold-provision of task {task.id} (project {task.project_id}) "
                             f"— idle warm VM has first claim"
                         )
+                        # Release the slot pre-reserved during runtime selection
+                        # (select_max_plan_account pre-increments active_tasks). This
+                        # hold abandons the dispatch so the warm VM can claim the task
+                        # via /next-role; without releasing, the reservation leaks for
+                        # the rest of the cycle and repeated holds compound the drift.
+                        # Mirrors the cold-provision commit-failure release; guarded for
+                        # the env-credential fallback (no pooled account) and floored at
+                        # zero by the helper. Targets the resolved selection's account,
+                        # not the loop-local account_id (assigned later, below).
+                        if runtime_selection and runtime_selection.account:
+                            await release_max_plan_account(
+                                runtime_selection.account["id"]
+                            )
                         await session.rollback()
                         continue
 

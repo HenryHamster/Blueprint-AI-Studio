@@ -3768,6 +3768,11 @@ class TestWarmVMSkipProvision:
         lease_hit_spy = mocker.patch(
             "app.warm_backlog_reuse.record_pool_lease_hit"
         )
+        # The slot pre-reserved during runtime selection must be released on
+        # this early-exit (mirroring the cold-provision commit-failure path).
+        release_spy = mocker.patch(
+            "app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock
+        )
 
         _shared_state.runtime_config["warm_pool_enabled"] = True
         try:
@@ -3798,6 +3803,80 @@ class TestWarmVMSkipProvision:
         assert pool_fail_spy.called
         assert pool_fail_spy.call_args.args[0] == "commit_error"
         assert not lease_hit_spy.called
+        # The reserved account slot was released (no leak) — and against the
+        # account carried on the resolved selection, not a loop-local variable.
+        assert release_spy.await_count == 1
+        assert release_spy.await_args.args[0] == "acct-pool-1"
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_backlog_first_refusal_hold_releases_reserved_slot(
+        self, orch_warm_db, mocker
+    ):
+        """When an idle warm VM gets first refusal on a backlog task, the
+        orchestrator holds off cold-provisioning (rolls back, leaves the task
+        QUEUED for the warm VM to claim) — and must release the account slot
+        pre-reserved during runtime selection so the reservation does not leak
+        for the rest of the cycle (repeated holds would otherwise compound the
+        drift)."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        # An idle warm VM is actively polling for this project → first refusal.
+        mocker.patch(
+            "app.orchestrator._shared_state.is_backlog_first_refusal_active",
+            return_value=True,
+        )
+        release_spy = mocker.patch(
+            "app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock
+        )
+
+        _shared_state.runtime_config["warm_backlog_reuse_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Backlog-FirstRefusal", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_backlog_reuse_enabled", None)
+
+        # Held off cold provisioning so the warm VM can claim it, and released
+        # the reserved slot against the resolved selection's account.
+        assert not prov_mock.called
+        assert release_spy.await_count == 1
+        assert release_spy.await_args.args[0] == "acct-pool-1"
 
         async with orch_warm_db() as verify:
             row = (

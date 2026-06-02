@@ -10137,3 +10137,79 @@ async def test_no_reconcile_clause_without_fix_all_directive(db_session, mocker)
     assert "ISSUE CHURN DETECTED" in prompt  # churn still fired
     assert "FIX ALL OCCURRENCES" not in prompt
     assert "takes precedence" not in prompt
+
+
+# ── _pr_number_match: None-bind dialect resolution regression ────────────────
+
+
+def test_pr_number_match_picks_sqlite_branch_on_none_bind_session():
+    """Regression for the None-bind dialect footgun (PR #7099 class).
+
+    ``_pr_number_match`` builds a dialect-conditional WHERE clause. A session
+    whose ``.bind`` is None still resolves a real engine lazily at execute-time.
+    The old idiom (``session.bind.dialect.name if session.bind else "postgresql"``)
+    defaulted to the Postgres ``.as_string()`` branch on such a session, emitting
+    JSON-path SQL that SQLite cannot run. Routing through ``resolve_dialect_name``
+    resolves the dialect via ``get_bind()`` instead, so a None-bind SQLite-backed
+    session correctly selects the ``json_extract`` branch.
+    """
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.ci_merge_helpers import _pr_number_match
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        # The footgun condition: .bind is None, but get_bind() resolves SQLite.
+        session = MagicMock()
+        session.bind = None
+        session.get_bind.return_value = engine
+        assert session.get_bind().dialect.name == "sqlite"
+
+        expr = _pr_number_match(session, 7099)
+        compiled = str(expr).lower()
+        assert "json_extract" in compiled, (
+            "None-bind SQLite session must select the json_extract branch — "
+            "the old idiom defaulted to the Postgres JSON-path branch. "
+            f"Got: {compiled}"
+        )
+        assert "as_string" not in compiled and "->" not in compiled
+    finally:
+        engine.sync_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pr_number_match_matches_seeded_pr_number_end_to_end(db_session):
+    """Functional companion: against the real test engine, ``_pr_number_match``
+    selects exactly the task whose ``payloads[0].pr_number`` equals the target
+    and excludes others — proving the chosen branch actually executes and
+    matches (on SQLite standalone and on ``--postgres`` alike)."""
+    from app.ci_merge_helpers import _pr_number_match
+
+    project = await _make_db_project(db_session)
+    target = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "pr_number": 7099}],
+    )
+    other = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "pr_number": 12345}],
+    )
+    await _persist(db_session, target, other)
+
+    rows = (
+        (await db_session.execute(select(Task).where(_pr_number_match(db_session, 7099))))
+        .scalars()
+        .all()
+    )
+    matched_ids = {t.id for t in rows}
+    assert target.id in matched_ids
+    assert other.id not in matched_ids

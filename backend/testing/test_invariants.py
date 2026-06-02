@@ -733,6 +733,51 @@ class TestSecurityIntegrity:
         )
 
 
+# ── Dialect-resolution footgun guard ───────────────────────────────────────
+
+
+class TestNoRawBindDialectIdiom:
+    """Guard against the None-bind dialect footgun (triggering incident PR #7099).
+
+    The idiom ``<session>.bind.dialect.name if <session>.bind else "postgresql"``
+    (and the ``.bind.dialect.name == "postgresql"`` guard variant) reads ``.bind``
+    directly off a session. An ``AsyncSession`` created from an
+    ``async_sessionmaker`` exposes a **None** ``.bind`` even though it resolves a
+    real engine lazily at execute-time, so the idiom silently defaults to
+    Postgres and emits Postgres-only SQL on a SQLite-bound session. All dialect
+    resolution must go through ``app.database.resolve_dialect_name`` instead.
+    """
+
+    def test_no_raw_session_bind_dialect_in_app_code(self):
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # database.py *defines* resolve_dialect_name and documents the bad idiom
+        # in its docstring; it is the one legitimate site that names ``.bind.dialect``.
+        allow_list = {"database.py"}
+        pattern = re.compile(r"\.bind\.dialect")
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py") or fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if pattern.search(line):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found raw `.bind.dialect` access in backend/app/.\n"
+            "Resolve the dialect via app.database.resolve_dialect_name(session) "
+            "instead — a None-bind async session silently defaults to Postgres "
+            "and emits Postgres-only SQL on SQLite (incident PR #7099).\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Base-branch fallback hardening ─────────────────────────────────────────
 
 

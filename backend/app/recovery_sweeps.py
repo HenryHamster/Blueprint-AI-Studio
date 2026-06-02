@@ -35,6 +35,7 @@ from sqlmodel import select
 import app.shared_state as _shared_state
 from app import services
 from app.branch_resolution import classify_rollup_merge_outcome
+from app.database import resolve_dialect_name
 from app.landed_signal import (
     apply_merged_landed_signal,
     mark_landed_on_integration,
@@ -2137,10 +2138,7 @@ async def _sweep_post_commit_pending():
                         # contention rather than burn cycle time.
                         try:
                             async with services.AsyncSessionLocal() as t_session:
-                                if (
-                                    t_session.bind
-                                    and t_session.bind.dialect.name == "postgresql"
-                                ):
+                                if resolve_dialect_name(t_session) == "postgresql":
                                     await t_session.execute(
                                         text("SET LOCAL lock_timeout = '5s'")
                                     )
@@ -2197,10 +2195,7 @@ async def _sweep_post_commit_pending():
                             # Postgres-only fast-fail on row contention; on
                             # SQLite (test DB) SET LOCAL is a no-op syntax
                             # error, so dialect-gate it.
-                            if (
-                                bump_session.bind
-                                and bump_session.bind.dialect.name == "postgresql"
-                            ):
+                            if resolve_dialect_name(bump_session) == "postgresql":
                                 await bump_session.execute(
                                     text("SET LOCAL lock_timeout = '5s'")
                                 )
