@@ -1773,6 +1773,103 @@ async def test_snapshot_persists_reuse_dropout_and_surfaces_trend(db_session):
     assert trend[0]["dropout_total"] == 6
 
 
+@pytest.mark.asyncio
+async def test_compute_current_axes_persists_pool_dispatch_funnel(db_session):
+    """compute_current_axes folds the live pool dispatch funnel into the snapshot,
+    carrying lease hits, cold dispatches, the lease-miss-by-reason breakdown, and
+    the dominant-miss call-out (named per the >=2 / >=50% / strictly-outranks gate)."""
+    import app.warm_backlog_reuse as wbr
+    from app.efficiency_snapshot import compute_current_axes
+
+    # Fresh process-global pool funnel deques, then seed a clear dominant miss:
+    # 3 no_compatible_member misses dominate over 1 no_idle_member miss, plus a
+    # hit and a cold dispatch so the hit-rate aggregates are exercised too.
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    wbr.record_pool_lease_hit("acct-a")
+    wbr.record_pool_cold_dispatch("acct-a")
+    for _ in range(3):
+        wbr.record_pool_lease_miss("no_compatible_member", "acct-a")
+    wbr.record_pool_lease_miss("no_idle_member", "acct-b")
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    axes = await compute_current_axes(db_session, project.id)
+    funnel = axes["pool_dispatch_funnel"]
+    assert funnel["pool_lease_hits"] == 1
+    assert funnel["cold_dispatches"] == 1
+    assert funnel["pool_hit_rate"] == 0.5
+    assert funnel["lease_miss_by_reason"]["no_compatible_member"] == 3
+    assert funnel["lease_miss_by_reason"]["no_idle_member"] == 1
+    assert funnel["lease_miss_total"] == 4
+    # Dominant miss: 3/4 = 0.75 >= 0.5, >=2 events, strictly outranks the runner-up.
+    assert funnel["dominant_miss"]["reason"] == "no_compatible_member"
+    assert funnel["dominant_miss"]["count"] == 3
+    assert funnel["dominant_miss"]["share"] == 0.75
+    # Per-account breakdown rides along for the controlled-enable view.
+    assert funnel["by_account"]["acct-a"]["pool_lease_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_returns_pool_dispatch_funnel_trend(db_session):
+    """write_snapshot persists the pool dispatch funnel, and
+    read_baseline_with_drift surfaces the latest block plus a day-over-day trend
+    that survives the in-memory pool funnel reset."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    wbr.record_pool_lease_hit("acct-a")
+    for _ in range(2):
+        wbr.record_pool_lease_miss("no_idle_member", "acct-a")
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    snapshot = await write_snapshot(db_session, project.id)
+    assert snapshot["pool_dispatch_funnel"]["dominant_miss"]["reason"] == "no_idle_member"
+    assert snapshot["pool_dispatch_funnel"]["pool_lease_hits"] == 1
+
+    # Simulate a deploy/restart wiping the in-memory pool funnel counters.
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_lease_miss_events.clear()
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    # Latest persisted funnel is still surfaced despite the wiped live counters.
+    assert result["pool_dispatch_funnel"]["dominant_miss"]["reason"] == "no_idle_member"
+    trend = result["pool_dispatch_funnel_trend"]
+    assert len(trend) == 1
+    assert trend[0]["pool_lease_hits"] == 1
+    assert trend[0]["lease_miss_total"] == 2
+    assert trend[0]["dominant_miss_reason"] == "no_idle_member"
+
+
+def test_compute_dominant_pool_miss_no_leader_on_even_split():
+    """An even split between two miss reasons names no dominant leader — the same
+    strictly-outranks discipline the reuse-dropout ranking uses."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    for _ in range(2):
+        wbr.record_pool_lease_miss("no_idle_member")
+    for _ in range(2):
+        wbr.record_pool_lease_miss("no_compatible_member")
+
+    result = wbr.compute_dominant_pool_miss()
+    assert result["lease_miss_total"] == 4
+    # 2 vs 2: neither strictly outranks the other => no dominant miss named.
+    assert result["dominant_miss"] is None
+
+
 def test_compute_pool_cost_amortization_no_hits():
     """No warm-start hit yet => idle spend is not amortized at all."""
     from app.efficiency_snapshot import compute_pool_cost_amortization
@@ -1840,3 +1937,233 @@ async def test_read_baseline_with_drift_includes_pool_cost_amortization(db_sessi
     # Fresh instance: no idle cost recorded and no hits => not amortized.
     assert amort["pool_lease_hits"] == 0
     assert amort["cost_per_pool_hit_usd"] is None
+
+
+# ---------------------------------------------------------------------------
+# Pre-enable counterfactual warm-pool hit-rate estimate
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    _estimate_pool_hit_rate,
+    estimate_pool_hit_rate,
+)
+
+
+def _disp(label, second):
+    """A (account_label, dispatched_at) tuple at ``second`` seconds past an epoch."""
+    base = datetime(2026, 6, 1, 0, 0, 0)
+    return (label, base + timedelta(seconds=second))
+
+
+def test_estimate_pool_hit_rate_empty_returns_none():
+    out = _estimate_pool_hit_rate(
+        [], target_size=3, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    assert out["total_dispatches"] == 0
+    assert out["estimated_hit_rate"] is None
+    assert out["by_account"] == {}
+
+
+def test_estimate_pool_hit_rate_target_zero_all_cold():
+    # Zero capacity -> every dispatch is a miss -> hit rate 0.0 (not None: we
+    # have dispatches, just no warm capacity).
+    disp = [_disp("acct-a", s) for s in (0, 1000, 2000)]
+    out = _estimate_pool_hit_rate(
+        disp, target_size=0, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    assert out["total_dispatches"] == 3
+    assert out["estimated_warm_hits"] == 0
+    assert out["estimated_hit_rate"] == 0.0
+
+
+def test_estimate_pool_hit_rate_large_target_serves_all_when_spread():
+    # One member per simultaneous arrival -> all warm.
+    disp = [_disp("acct-a", s) for s in (0, 1, 2, 3)]
+    out = _estimate_pool_hit_rate(
+        disp, target_size=10, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    assert out["estimated_hit_rate"] == 1.0
+
+
+def test_estimate_pool_hit_rate_cross_account_is_miss_without_retarget():
+    # Pool target 1, single demand-active account 'a' gets the slot; a dispatch
+    # on a different account 'b' has no compatible idle member -> miss.
+    disp = [_disp("acct-a", 0), _disp("acct-a", 1000), _disp("acct-b", 2000)]
+    out = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    # 'a' is busiest (2 dispatches) so it owns the single slot; both its
+    # well-spaced dispatches are warm, 'b' misses.
+    assert out["by_account"]["acct-a"]["estimated_warm_hits"] == 2
+    assert out["by_account"]["acct-b"]["estimated_warm_hits"] == 0
+    assert out["estimated_warm_hits"] == 2
+
+
+def test_estimate_pool_hit_rate_retarget_covers_other_account():
+    # Same history, but with retarget the single shared member can serve EITHER
+    # account, so the 'b' dispatch (well after 'a's are done) also lands warm.
+    disp = [_disp("acct-a", 0), _disp("acct-a", 1000), _disp("acct-b", 2000)]
+    pinned = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    retarget = _estimate_pool_hit_rate(
+        disp,
+        target_size=1,
+        replenish_seconds=120,
+        idle_ttl_seconds=1800,
+        account_retarget=True,
+    )
+    assert retarget["estimated_warm_hits"] >= pinned["estimated_warm_hits"]
+    assert retarget["estimated_warm_hits"] == 3
+
+
+def test_estimate_pool_hit_rate_bursty_below_steady():
+    # Bursty: 3 arrivals within one replenish window exceed a single member.
+    bursty = [_disp("acct-a", s) for s in (0, 1, 2)]
+    # Steady: same count spread far apart (and within TTL) -> all warm.
+    steady = [_disp("acct-a", s) for s in (0, 1000, 2000)]
+    burst_out = _estimate_pool_hit_rate(
+        bursty, target_size=1, replenish_seconds=500, idle_ttl_seconds=100000
+    )
+    steady_out = _estimate_pool_hit_rate(
+        steady, target_size=1, replenish_seconds=500, idle_ttl_seconds=100000
+    )
+    assert burst_out["estimated_hit_rate"] < steady_out["estimated_hit_rate"]
+    assert burst_out["estimated_warm_hits"] == 1  # only the first burst arrival
+    assert steady_out["estimated_hit_rate"] == 1.0
+
+
+def test_estimate_pool_hit_rate_increases_with_target_size():
+    # Burst of 3 near-simultaneous arrivals; more slots -> more warm hits.
+    disp = [_disp("acct-a", s) for s in (0, 1, 2)]
+    small = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=500, idle_ttl_seconds=1800
+    )
+    big = _estimate_pool_hit_rate(
+        disp, target_size=3, replenish_seconds=500, idle_ttl_seconds=1800
+    )
+    assert big["estimated_hit_rate"] > small["estimated_hit_rate"]
+
+
+def test_estimate_pool_hit_rate_increases_with_ttl():
+    # Sparse, steady arrivals with gaps far larger than a short TTL: a short TTL
+    # reaps the member between arrivals (cold re-provision gap), a long TTL keeps
+    # it warm. Longer TTL -> higher hit rate.
+    disp = [_disp("acct-a", s) for s in (0, 1000, 2000, 3000)]
+    short_ttl = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=500, idle_ttl_seconds=100
+    )
+    long_ttl = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=500, idle_ttl_seconds=5000
+    )
+    assert long_ttl["estimated_hit_rate"] > short_ttl["estimated_hit_rate"]
+    assert long_ttl["estimated_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_estimate_pool_hit_rate_wrapper_buckets_by_account(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Two dispatches on account a, one on account b.
+    for secs, acct in ((300, "a"), (200, "a"), (100, "b")):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                vm_dispatched_at=now - timedelta(seconds=secs),
+                context={"llm_account_id": acct},
+            )
+        )
+    await db_session.commit()
+
+    out = await estimate_pool_hit_rate(
+        db_session, project.id, target_size=2, window_days=7
+    )
+    assert out["total_dispatches"] == 3
+    assert out["target_size"] == 2
+    assert set(out["by_account"].keys()) == {"a", "b"}
+    assert "estimated_hit_rate" in out
+    assert "account_retarget_scenario" in out
+    assert "assumptions" in out
+
+
+@pytest.mark.asyncio
+async def test_pool_hit_rate_estimate_endpoint_returns_shape(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_dispatched_at=now - timedelta(minutes=5),
+            context={"llm_account_id": "acct-a"},
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=2"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["target_size"] == 2
+    assert data["total_dispatches"] == 1
+    for key in (
+        "estimated_hit_rate",
+        "estimated_warm_hits",
+        "by_account",
+        "account_retarget_scenario",
+        "assumptions",
+        "replenish_seconds",
+        "idle_ttl_seconds",
+    ):
+        assert key in data
+
+
+@pytest.mark.asyncio
+async def test_pool_hit_rate_estimate_endpoint_requires_membership(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # No membership.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=2"
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pool_hit_rate_estimate_endpoint_validates_target_size(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    # target_size is required.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate"
+    )
+    assert resp.status_code == 422
+    # target_size above le=100 is rejected.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=101"
+    )
+    assert resp.status_code == 422

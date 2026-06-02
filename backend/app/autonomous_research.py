@@ -1279,6 +1279,56 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 "missing": missing,
             }
 
+        # Verify design-doc CAPABILITIES the same way as systems above. The
+        # research agent reasons about — and proposes improvements to —
+        # capability behavior; a capability claimed working/partial whose every
+        # backing path is absent on the integration branch describes code that
+        # does not exist. The backend's research-side loop historically covered
+        # only systems/, leaving this gap. Mirror the strategic-side
+        # reconciliation: only PRESENT-status capabilities (working/partial) are
+        # checked, only when the entry carries at least one path pointer (in
+        # ``modules`` or embedded in ``notes``/``description`` free text), and an
+        # all-absent entry is flagged ``claimed_absent`` while a partial hit is
+        # left ``partial`` (conservative). Read-only/advisory: design_doc is
+        # never mutated; the agent renders this as a prominent prompt section
+        # (buildCapabilityVerificationSection).
+        from app.playbook_lifecycle import _extract_file_paths
+
+        _present_cap_statuses = {"working", "partial"}
+        capability_verification: dict = {}
+        for dkey in sorted(
+            k for k in doc if isinstance(k, str) and k.startswith("capabilities/")
+        ):
+            dval = doc[dkey]
+            if not isinstance(dval, dict):
+                continue
+            claimed = str(dval.get("status", "")).lower()
+            if claimed not in _present_cap_statuses:
+                continue  # planned/missing/stub already tells the agent to build
+            cap_paths = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+            for _field in ("notes", "description"):
+                _txt = dval.get(_field)
+                if isinstance(_txt, str) and _txt:
+                    cap_paths.extend(_extract_file_paths(_txt))
+            cap_paths = list(dict.fromkeys(cap_paths))
+            if not cap_paths:
+                continue  # no path pointer → absence is not evidence of absent code
+            present, missing = await classify_existing_paths(
+                cap_paths, **verification_kwargs
+            )
+            if not missing:
+                status = "verified"
+            elif present:
+                status = "partial"
+            else:
+                status = "claimed_absent"
+            capability_verification[dkey[len("capabilities/"):]] = {
+                "status": status,
+                "claimed_status": str(dval.get("status", "")),
+                "present": present,
+                "missing": missing,
+            }
+
         research_payload: dict = {
             "type": "research",
             "directions": direction_summaries,
@@ -1293,6 +1343,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         }
         if system_verification:
             research_payload["system_verification"] = system_verification
+        if capability_verification:
+            research_payload["capability_verification"] = capability_verification
         if chosen_direction and chosen_direction.get("category") == "product":
             append_prompt_suffix(
                 research_payload,

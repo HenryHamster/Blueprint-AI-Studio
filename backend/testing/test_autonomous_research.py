@@ -9738,6 +9738,195 @@ async def test_system_verification_uses_project_repo_and_integration_branch(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Design-doc capability verification (claimed-but-absent / partial / untouched)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_all_missing_flagged_claimed_absent(
+    db_session, mocker
+):
+    """A working capability whose every backing path is absent is flagged claimed_absent."""
+    direction = _active_direction("d-capverif-absent", "Improve ghost capability")
+    project = Project(
+        name="CapVerif Absent",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/ghostcap": {
+                "status": "working",
+                "modules": ["backend/app/cap_a.py", "backend/app/cap_b.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None, "capability_verification annotation should be present"
+    assert cv["ghostcap"]["status"] == "claimed_absent"
+    assert cv["ghostcap"]["claimed_status"] == "working"
+    assert cv["ghostcap"]["present"] == []
+    assert set(cv["ghostcap"]["missing"]) == {
+        "backend/app/cap_a.py",
+        "backend/app/cap_b.py",
+    }
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_path_in_notes_flagged(db_session, mocker):
+    """A capability carrying its only path pointer in `notes` free text is verified."""
+    direction = _active_direction("d-capverif-notes", "Improve notes capability")
+    project = Project(
+        name="CapVerif Notes",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/notescap": {
+                "status": "working",
+                "notes": "Implemented in backend/app/notes_only.py and wired up.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None
+    assert cv["notescap"]["status"] == "claimed_absent"
+    assert cv["notescap"]["missing"] == ["backend/app/notes_only.py"]
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_present_path_not_flagged(db_session, mocker):
+    """A capability with a present backing path is left alone (not claimed_absent)."""
+    direction = _active_direction("d-capverif-present", "Improve real capability")
+    project = Project(
+        name="CapVerif Present",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/realcap": {
+                "status": "working",
+                "modules": ["backend/app/real_cap.py", "backend/app/gone_cap.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/real_cap.py"})
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None
+    assert cv["realcap"]["status"] == "partial"
+    assert cv["realcap"]["present"] == ["backend/app/real_cap.py"]
+    assert cv["realcap"]["missing"] == ["backend/app/gone_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_no_path_untouched(db_session, mocker):
+    """A capability with no path pointer is never classified (absence ≠ absent code)."""
+    direction = _active_direction("d-capverif-nopath", "Improve pathless capability")
+    project = Project(
+        name="CapVerif NoPath",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/pathless": {
+                "status": "working",
+                "notes": "Lets operators do a thing. No file pointer here.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    # No path pointer → the capability must not appear in the verification map.
+    assert "pathless" not in (payload.get("capability_verification") or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_planned_status_skipped(db_session, mocker):
+    """A non-present-status capability (planned) is skipped — agent already builds it."""
+    direction = _active_direction("d-capverif-planned", "Build planned capability")
+    project = Project(
+        name="CapVerif Planned",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/plannedcap": {
+                "status": "planned",
+                "modules": ["backend/app/not_yet.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert "plannedcap" not in (payload.get("capability_verification") or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_does_not_mutate_design_doc(db_session, mocker):
+    """Capability verification is advisory only — stored design_doc is unchanged."""
+    direction = _active_direction("d-capverif-immut", "Improve capability")
+    original_doc = {
+        "capabilities/x": {
+            "status": "working",
+            "modules": ["backend/app/cap_missing.py"],
+        }
+    }
+    project = Project(
+        name="CapVerif Immutable",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={k: dict(v) for k, v in original_doc.items()},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    await _spawn_and_get_research_payload(project, db_session)
+    await db_session.refresh(project)
+    assert project.design_doc == original_doc, (
+        "design_doc must not be mutated by capability verification"
+    )
+
+
 # ── Undirected (cross-cutting) research spawn guard ──────────────────────────
 
 

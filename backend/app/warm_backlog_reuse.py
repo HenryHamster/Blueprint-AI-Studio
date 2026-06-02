@@ -857,6 +857,59 @@ def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
     }
 
 
+def compute_dominant_pool_miss(window_hours: int = 24) -> dict:
+    """Rank pool lease-miss reasons and name the single dominant miss.
+
+    Mirrors :func:`compute_dominant_reuse_dropout` for the POOL dispatch funnel
+    (a DIFFERENT funnel from the backlog reuse-dropout one): derives the
+    lease-miss-by-reason breakdown from :func:`get_pool_funnel_snapshot` and
+    names a ``dominant_miss`` reason only when one clearly dominates the miss
+    population — present at meaningful volume (>=2 events), covering at least
+    half the misses, AND strictly outranking the runner-up (an even split names
+    no leader). The full funnel aggregates (hits, cold dispatches, overall and
+    per-account hit rate, the miss breakdown) ride along so the whole block can
+    be folded into the daily efficiency snapshot and survive the restarts that
+    wipe the in-memory funnel counters.
+
+    Why the miss breakdown matters: when the pool is missing, WHY drives the
+    next action. A funnel dominated by ``no_compatible_member`` (idle VM on the
+    wrong account/provider/model) says enable account-retarget or rebalance
+    provisioning; one dominated by ``no_idle_member`` says grow the pool or the
+    demand is too bursty for the current target size. Losing that breakdown on
+    every restart makes the enable-and-tune loop blind.
+    """
+    snap = get_pool_funnel_snapshot(window_hours)
+    miss_by_reason = dict(snap.get("lease_miss_by_reason") or {})
+    total = sum(miss_by_reason.values())
+    dominant = None
+    if total > 0:
+        ranked = sorted(miss_by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_reason, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= _DOMINANT_DROPOUT_MIN_COUNT
+            and top_count / total >= _DOMINANT_DROPOUT_MIN_SHARE
+            and top_count > second_count
+        ):
+            dominant = {
+                "reason": top_reason,
+                "count": top_count,
+                "total": total,
+                "share": round(top_count / total, 3),
+            }
+    return {
+        "window_hours": snap.get("window_hours"),
+        "pool_lease_hits": snap.get("pool_lease_hits"),
+        "cold_dispatches": snap.get("cold_dispatches"),
+        "total_dispatches": snap.get("total_dispatches"),
+        "pool_hit_rate": snap.get("pool_hit_rate"),
+        "lease_miss_by_reason": miss_by_reason,
+        "lease_miss_total": snap.get("lease_miss_total"),
+        "dominant_miss": dominant,
+        "by_account": snap.get("by_account"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Chain-continuity funnel observability counters
 # ---------------------------------------------------------------------------

@@ -663,6 +663,96 @@ describe('WarmVmPanel — warm-start origin breakdown', () => {
   });
 });
 
+describe('WarmVmPanel — pre-enable pool hit-rate estimate', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    effCell.value = null;
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const stateWithProjectVm: WarmVmStateResponse = {
+    ...baseState,
+    active_vms: [
+      {
+        vm_instance_id: 'agent-vm-est-1',
+        last_heartbeat: new Date().toISOString(),
+        is_alive: true,
+        current_task: {
+          id: 'task-est-1',
+          title: 'feat: a task',
+          task_type: 'create',
+          status: 'IN_PROGRESS',
+          warm_start: false,
+          warm_claim_origin: null,
+          prior_role_vm_id: null,
+          setup_secs: null,
+          started_at: new Date().toISOString(),
+          pr_number: null,
+          project_id: 'proj-estimate-1',
+        },
+        warm_pinned_queued: [],
+        recent_completions: [],
+      },
+    ],
+  };
+
+  const estimateResponse = {
+    project_id: 'proj-estimate-1',
+    target_size: 5,
+    window_days: 7,
+    replenish_seconds: 120,
+    idle_ttl_seconds: 1800,
+    total_dispatches: 8,
+    estimated_warm_hits: 6,
+    estimated_hit_rate: 0.75,
+    by_account: {},
+    account_retarget_scenario: { estimated_warm_hits: 7, estimated_hit_rate: 0.875 },
+    assumptions: 'coarse estimate',
+  };
+
+  test('runs the estimate with the chosen target size and renders the hit rate', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      if (url.includes('/pool-hit-rate-estimate')) {
+        return new Response(JSON.stringify(estimateResponse), { status: 200 });
+      }
+      return new Response(JSON.stringify(stateWithProjectVm), { status: 200 });
+    });
+
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    // The estimate control renders once data (with a project-bearing VM) loads.
+    const targetInput = await screen.findByTestId('pool-estimate-target');
+    fireEvent.change(targetInput, { target: { value: '5' } });
+    fireEvent.click(screen.getByTestId('pool-estimate-run'));
+
+    await waitFor(() => {
+      expect(authGet).toHaveBeenCalledWith(
+        expect.stringContaining(
+          '/api/admin/projects/proj-estimate-1/pool-hit-rate-estimate?target_size=5',
+        ),
+      );
+    });
+    const hitRate = await screen.findByTestId('pool-estimate-hit-rate');
+    expect(hitRate.textContent).toBe('75%');
+    expect(screen.getByTestId('pool-estimate-result').textContent).toContain('6/8');
+  });
+
+  test('hides the estimate control when no active VM carries a project_id', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(baseState), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('pool-hit-rate-estimate-row')).toBeNull();
+  });
+});
+
 describe('WarmVmPanel — per-project warm-pool scope control', () => {
   const projects: Project[] = [
     {

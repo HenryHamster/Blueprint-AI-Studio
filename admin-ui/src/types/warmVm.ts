@@ -158,6 +158,39 @@ export interface PoolMetrics {
   cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
 }
 
+// Per-account slice of the offline pool hit-rate estimate, as built by
+// efficiency_snapshot._estimate_pool_hit_rate -> by_account.
+export interface PoolHitRateEstimateAccount {
+  total_dispatches: number;
+  estimated_warm_hits: number;
+  estimated_hit_rate: number | null;
+  allocated_slots: number;
+}
+
+// Offline, read-only counterfactual estimate of the warm-pool hit rate a
+// project would achieve at a candidate target size, returned by GET
+// /api/admin/projects/{project_id}/pool-hit-rate-estimate. Derived purely from
+// recent per-account dispatch history — it provisions nothing and does not
+// change the dispatch path. estimated_hit_rate is null when there are no
+// dispatches in the window. account_retarget_scenario is the same estimate with
+// account-retarget on (any idle member can serve any account).
+export interface PoolHitRateEstimate {
+  project_id: string;
+  target_size: number;
+  window_days: number;
+  replenish_seconds: number;
+  idle_ttl_seconds: number;
+  total_dispatches: number;
+  estimated_warm_hits: number;
+  estimated_hit_rate: number | null;
+  by_account: Record<string, PoolHitRateEstimateAccount>;
+  account_retarget_scenario: {
+    estimated_warm_hits: number;
+    estimated_hit_rate: number | null;
+  };
+  assumptions: string;
+}
+
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
   warm_pin_metrics: {

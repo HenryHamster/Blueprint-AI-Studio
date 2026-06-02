@@ -2,7 +2,7 @@ import { useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject } from '../api';
 import { parseTimestamp } from '../utils/time';
-import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics } from '../types/warmVm';
+import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate } from '../types/warmVm';
 import type { Project } from '../types/project';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
@@ -320,6 +320,8 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
 
               {pool && <PoolAccountMixRow pool={pool} />}
 
+              <PoolHitRateEstimateRow data={data} />
+
               {data.spawn_pin_funnel && (
                 <SpawnPinFunnelRow funnel={data.spawn_pin_funnel} />
               )}
@@ -548,6 +550,124 @@ function PoolAccountMixRow({ pool }: { pool: PoolMetrics }) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function fmtEstRate(v: number | null | undefined): string {
+  if (v === null || v === undefined) return '—';
+  return `${Math.round(v * 100)}%`;
+}
+
+// Pre-enable counterfactual: lets an operator pick a project + candidate pool
+// target size and see the estimated warm-pool hit rate over recent dispatches
+// BEFORE enabling the pool (and paying real idle cost). Read-only — it GETs the
+// offline estimate endpoint and is re-runnable to tune the target size. The
+// project selector is populated from the active-VM dispatch mix (deduped
+// project_ids); when no VM carries a project_id there is nothing to estimate so
+// the control hides itself.
+function PoolHitRateEstimateRow({ data }: { data: WarmVmStateResponse }) {
+  const projectIds = Array.from(
+    new Set(
+      data.active_vms
+        .map((vm) => vm.current_task?.project_id)
+        .filter((pid): pid is string => !!pid),
+    ),
+  );
+  const [projectId, setProjectId] = useState<string>('');
+  const [targetSize, setTargetSize] = useState<number>(2);
+  const [estimate, setEstimate] = useState<PoolHitRateEstimate | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const effectiveProject = projectId || projectIds[0] || '';
+
+  const run = useCallback(async () => {
+    if (!effectiveProject) return;
+    setLoading(true);
+    setErr(null);
+    try {
+      const res = await authGet(
+        `${API_BASE_URL}/api/admin/projects/${encodeURIComponent(effectiveProject)}` +
+          `/pool-hit-rate-estimate?target_size=${Math.max(0, Math.round(targetSize))}`,
+      );
+      if (!res.ok) {
+        setErr(`HTTP ${res.status}`);
+        setEstimate(null);
+        return;
+      }
+      setEstimate((await res.json()) as PoolHitRateEstimate);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setEstimate(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [effectiveProject, targetSize]);
+
+  if (projectIds.length === 0) return null;
+
+  return (
+    <div
+      className="mb-3 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60"
+      data-testid="pool-hit-rate-estimate-row"
+    >
+      <span className="text-neutral-500 font-bold uppercase tracking-widest block mb-1">
+        Pre-enable Pool Hit-Rate Estimate
+      </span>
+      <div className="flex flex-wrap items-center gap-2 mb-1">
+        <select
+          aria-label="Project"
+          data-testid="pool-estimate-project"
+          value={effectiveProject}
+          onChange={(e) => { setProjectId(e.target.value); setEstimate(null); }}
+          className="bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 font-mono max-w-[160px]"
+        >
+          {projectIds.map((pid) => (
+            <option key={pid} value={pid}>{shortVm(pid)}</option>
+          ))}
+        </select>
+        <label className="flex items-center gap-1">
+          <span className="text-neutral-500">target N</span>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            aria-label="Target size"
+            data-testid="pool-estimate-target"
+            value={targetSize}
+            onChange={(e) => setTargetSize(Number(e.target.value))}
+            className="w-12 bg-neutral-800 border border-neutral-700 rounded px-1 py-0.5 text-neutral-200 font-mono"
+          />
+        </label>
+        <button
+          onClick={() => { void run(); }}
+          disabled={loading || !effectiveProject}
+          data-testid="pool-estimate-run"
+          className={
+            'bg-violet-500/20 border border-violet-500/40 text-violet-300 hover:bg-violet-500/30 ' +
+            'font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (loading ? ' opacity-50 cursor-wait' : ' cursor-pointer')
+          }
+        >
+          {loading ? '…' : 'Estimate'}
+        </button>
+      </div>
+      {err && <div className="text-red-400">Estimate failed: {err}</div>}
+      {estimate && (
+        <div className="flex flex-wrap gap-x-4 gap-y-1" data-testid="pool-estimate-result">
+          <span title={estimate.assumptions}>
+            <span className="text-neutral-500">at N={estimate.target_size}, est. hit rate</span>:{' '}
+            <span className="font-mono text-emerald-400" data-testid="pool-estimate-hit-rate">
+              {fmtEstRate(estimate.estimated_hit_rate)}
+            </span>
+          </span>
+          <span><span className="text-neutral-500">warm/total</span>: <span className="font-mono text-neutral-300">{estimate.estimated_warm_hits}/{estimate.total_dispatches}</span></span>
+          <span><span className="text-neutral-500">retarget</span>: <span className="font-mono text-violet-300">{fmtEstRate(estimate.account_retarget_scenario.estimated_hit_rate)}</span></span>
+          <span><span className="text-neutral-500">window</span>: <span className="font-mono text-neutral-300">{estimate.window_days}d</span></span>
+          <span className="text-neutral-600 italic w-full">estimate only — replays recent dispatches, provisions nothing</span>
+        </div>
+      )}
     </div>
   );
 }

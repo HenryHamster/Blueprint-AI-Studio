@@ -80,6 +80,7 @@ import {
   resolveMemoHandles,
   buildEfficiencySnapshotSection,
   buildEmptyRepoGuidance,
+  buildCapabilityVerificationSection,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -848,6 +849,90 @@ describe('buildEmptyRepoGuidance', () => {
   it('returns empty string for non-boolean falsy values', () => {
     expect(buildEmptyRepoGuidance({ repo_is_empty: 0 })).toBe('');
     expect(buildEmptyRepoGuidance({ repo_is_empty: '' })).toBe('');
+  });
+});
+
+describe('buildCapabilityVerificationSection', () => {
+  it('returns empty string when the verification map is absent', () => {
+    expect(buildCapabilityVerificationSection(undefined)).toBe('');
+  });
+
+  it('returns empty string for an empty verification map', () => {
+    expect(buildCapabilityVerificationSection({})).toBe('');
+  });
+
+  it('flags a working-status capability whose every backing path is absent', () => {
+    // claimed_absent is the backend verdict for a capability claimed working/partial
+    // whose declared backing paths are ALL missing on the integration branch.
+    const section = buildCapabilityVerificationSection({
+      'streaming-uploads': {
+        status: 'claimed_absent',
+        claimed_status: 'working',
+        missing: ['backend/app/streaming.py', 'agent/src/upload.ts'],
+        present: [],
+      },
+    });
+    expect(section).toContain('# CAPABILITY VERIFICATION');
+    expect(section).toContain('Claimed-but-absent');
+    expect(section).toContain('**streaming-uploads**');
+    expect(section).toContain('design-doc status: working');
+    expect(section).toContain('CLAIMED-BUT-ABSENT');
+    expect(section).toContain('backend/app/streaming.py');
+    expect(section).toContain('agent/src/upload.ts');
+  });
+
+  it('does not flag a capability that partially exists (a present backing path)', () => {
+    // A capability with at least one present backing path is conservatively
+    // classified `partial`, not claimed_absent — it must NOT appear under the
+    // "Claimed-but-absent" heading.
+    const section = buildCapabilityVerificationSection({
+      'token-refresh': {
+        status: 'partial',
+        claimed_status: 'working',
+        missing: ['backend/app/refresh.py'],
+        present: ['agent/src/auth.ts'],
+      },
+    });
+    expect(section).toContain('PARTIAL');
+    expect(section).toContain('**token-refresh**');
+    expect(section).toContain('present: agent/src/auth.ts');
+    // Present-path capabilities are left alone — never marked claimed-but-absent.
+    expect(section).not.toContain('Claimed-but-absent');
+    expect(section).not.toContain('CLAIMED-BUT-ABSENT');
+  });
+
+  it('leaves a capability with no path pointer untouched (never classified)', () => {
+    // The backend never classifies a capability that declares no backing path
+    // (absence of a path is not evidence of absent code), so it never appears in
+    // the verification map. A map containing only such a (never-emitted)
+    // capability is effectively empty here — the section renders nothing for it.
+    const section = buildCapabilityVerificationSection({
+      'verified-cap': {
+        status: 'verified',
+        claimed_status: 'working',
+        missing: [],
+        present: ['backend/app/real.py'],
+      },
+    });
+    // The pathless capability is simply not in the map; only the verified one is.
+    expect(section).toContain('Verified');
+    expect(section).toContain('**verified-cap**');
+    expect(section).not.toContain('Claimed-but-absent');
+    expect(section).not.toContain('PARTIAL');
+  });
+
+  it('groups mixed verdicts into their respective sections', () => {
+    const section = buildCapabilityVerificationSection({
+      'cap-absent': { status: 'claimed_absent', claimed_status: 'working', missing: ['a.py'], present: [] },
+      'cap-partial': { status: 'partial', claimed_status: 'partial', missing: ['b.py'], present: ['c.ts'] },
+      'cap-verified': { status: 'verified', claimed_status: 'mature', missing: [], present: ['d.py'] },
+    });
+    expect(section).toContain('Claimed-but-absent');
+    expect(section).toContain('**cap-absent**');
+    expect(section).toContain('Partial');
+    expect(section).toContain('**cap-partial**');
+    expect(section).toContain('Verified');
+    expect(section).toContain('**cap-verified**');
   });
 });
 

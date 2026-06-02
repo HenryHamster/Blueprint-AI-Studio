@@ -354,6 +354,65 @@ async def test_warm_reuse_dropout_trend_reads_persisted_snapshots(client, db_ses
 
 
 @pytest.mark.asyncio
+async def test_pool_dispatch_funnel_trend_endpoint(client, db_session):
+    """The pool-dispatch-funnel-trend endpoint returns an empty list before any
+    snapshot lands, then one bucket per snapshot carrying the funnel aggregates
+    and the dominant lease-miss reason; snapshots lacking the block are skipped."""
+    from app.efficiency_snapshot import DESIGN_DOC_KEY
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    # Before any snapshot captures the block: empty buckets.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-dispatch-funnel-trend"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["buckets"] == []
+
+    project.design_doc = {
+        DESIGN_DOC_KEY: {
+            "snapshots": [
+                {"captured_at": "2026-05-30T00:00:00"},  # no block -> skipped
+                {
+                    "captured_at": "2026-05-31T00:00:00",
+                    "pool_dispatch_funnel": {
+                        "pool_lease_hits": 4,
+                        "cold_dispatches": 6,
+                        "pool_hit_rate": 0.4,
+                        "lease_miss_total": 5,
+                        "dominant_miss": {
+                            "reason": "no_compatible_member",
+                            "share": 0.6,
+                        },
+                    },
+                },
+            ]
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-dispatch-funnel-trend"
+    )
+    assert resp.status_code == 200
+    buckets = resp.json()["buckets"]
+    assert len(buckets) == 1
+    assert buckets[0]["captured_at"] == "2026-05-31T00:00:00"
+    assert buckets[0]["pool_lease_hits"] == 4
+    assert buckets[0]["cold_dispatches"] == 6
+    assert buckets[0]["pool_hit_rate"] == 0.4
+    assert buckets[0]["lease_miss_total"] == 5
+    assert buckets[0]["dominant_miss_reason"] == "no_compatible_member"
+    assert buckets[0]["dominant_miss_share"] == 0.6
+
+
+@pytest.mark.asyncio
 async def test_pipeline_efficiency_includes_warm_start_origin_breakdown(
     client, db_session
 ):

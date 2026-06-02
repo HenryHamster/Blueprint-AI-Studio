@@ -21,7 +21,7 @@ import logging
 import statistics
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func
@@ -407,6 +407,239 @@ def compute_pool_cost_amortization_by_account(
             "cost_per_pool_hit_usd": round(idle_cost / hits, 6) if hits else None,
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pre-enable counterfactual warm-pool hit-rate estimate (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# The warm pool ships dark and is unexercised in prod (pool_hit_rate=0), so no
+# operator will enable it for a project without evidence it will pay off. This
+# is an OFFLINE, READ-ONLY estimate of the pool hit rate a project WOULD achieve
+# at a candidate target size, derived purely from durable data we already record
+# (per-task resolved account + dispatch timestamps on recent terminal tasks).
+#
+# It is deliberately a COARSE counterfactual, not a discrete-event simulation: a
+# defensible number grounded in the real arrival pattern is more useful than a
+# precise-looking model that is hard to trust. The model replays the per-account
+# dispatch sequence over a small simulated idle pool:
+#   * ``target_size`` idle members are spread across the project's demand-active
+#     accounts (demand-weighted even split), mirroring how the maintainer steers
+#     a small pool across a project's account mix (reconcile_project_pool /
+#     _pick_demand_weighted_account). With ``account_retarget`` ON, a single
+#     shared pool of ``target_size`` members can serve ANY account (the
+#     secret-manifest retarget path), so the slots are not account-pinned.
+#   * A dispatch is a likely WARM HIT iff a compatible member is plausibly idle
+#     at that moment. Serving a member leases it; a replacement is ready only
+#     after ``replenish_seconds`` (the maintainer interval) — so a tight arrival
+#     burst that exceeds the idle supply spills to cold dispatch.
+#   * A member left idle past ``idle_ttl_seconds`` is reaped and re-provisioned
+#     (a ``replenish_seconds`` gap), so a longer TTL keeps sparse-but-steady
+#     demand warm while a short TTL churns it cold.
+# NOTHING here touches the dispatch/claim path or provisions anything — it reads
+# history and computes a number.
+
+
+def _estimate_pool_hit_rate(
+    dispatches: list[tuple[Optional[str], Optional[datetime]]],
+    *,
+    target_size: int,
+    replenish_seconds: float,
+    idle_ttl_seconds: float,
+    account_retarget: bool = False,
+) -> Dict[str, Any]:
+    """Coarse counterfactual: pool hit rate a candidate ``target_size`` would yield.
+
+    ``dispatches`` is a list of ``(account_label, dispatched_at)`` tuples (the
+    account is the resolved LLM account the dispatch was served for; use
+    :func:`app.warm_backlog_reuse._account_label` so ``None`` collapses to the
+    unattributed bucket). Entries without a timestamp are ignored. Pure and
+    DB-free so it is unit-testable over synthetic histories.
+
+    Returns ``estimated_hit_rate`` (None only when there are no timestamped
+    dispatches), the warm-hit count, and a ``by_account`` breakdown. Works in
+    seconds relative to the first dispatch, so it is timezone-agnostic.
+    """
+    items = [(label, ts) for (label, ts) in dispatches if ts is not None]
+    total = len(items)
+    target_size = max(0, int(target_size))
+    replenish = max(0.0, float(replenish_seconds))
+    ttl = max(0.0, float(idle_ttl_seconds))
+
+    if total == 0:
+        return {
+            "target_size": target_size,
+            "total_dispatches": 0,
+            "estimated_warm_hits": 0,
+            "estimated_hit_rate": None,
+            "by_account": {},
+            "account_retarget": account_retarget,
+        }
+
+    items.sort(key=lambda x: x[1])
+    t0 = items[0][1]
+    seq = [(label, (ts - t0).total_seconds()) for label, ts in items]
+
+    from collections import Counter  # noqa: PLC0415
+
+    demand = Counter(label for label, _ in seq)
+    # Demand-active accounts, busiest first — so a pool smaller than the account
+    # count covers the heaviest-demand accounts (mirrors the maintainer's
+    # demand-weighted water-fill steering).
+    accounts = [a for a, _ in demand.most_common()]
+    n = len(accounts)
+
+    # Allocate slots. Each slot is its next-available time (relative seconds);
+    # all members start ready at t0 (pool pre-warmed at window start).
+    alloc: Dict[Optional[str], int] = {a: 0 for a in accounts}
+    if account_retarget:
+        shared_slots = [0.0] * target_size
+    else:
+        if n > 0 and target_size > 0:
+            base = target_size // n
+            rem = target_size % n
+            for i, a in enumerate(accounts):
+                alloc[a] = base + (1 if i < rem else 0)
+        slots: Dict[Optional[str], list[float]] = {
+            a: [0.0] * alloc[a] for a in accounts
+        }
+
+    def _serve(slot_list: list[float], t: float) -> bool:
+        """Lease the first compatible idle member at time ``t``; True iff warm."""
+        for i, free_at in enumerate(slot_list):
+            fa = free_at
+            # Reap + re-provision cycles for a member left idle past the TTL.
+            # cycle = ttl + replenish > 0 (ttl > 0), so this always terminates.
+            if ttl > 0:
+                cycle = ttl + replenish
+                while fa <= t and (t - fa) >= ttl:
+                    fa += cycle
+            slot_list[i] = fa
+            if fa <= t:
+                # Idle and ready — lease it; a replacement is ready after replenish.
+                slot_list[i] = t + replenish
+                return True
+        return False
+
+    hits_by_acct: Dict[Optional[str], int] = {a: 0 for a in accounts}
+    for label, t in seq:
+        if account_retarget:
+            if _serve(shared_slots, t):
+                hits_by_acct[label] = hits_by_acct.get(label, 0) + 1
+        else:
+            sl = slots.get(label)
+            if sl and _serve(sl, t):
+                hits_by_acct[label] += 1
+
+    total_hits = sum(hits_by_acct.values())
+    by_account: Dict[str, Any] = {}
+    for a in accounts:
+        d = demand[a]
+        h = hits_by_acct.get(a, 0)
+        by_account[str(a)] = {
+            "total_dispatches": d,
+            "estimated_warm_hits": h,
+            "estimated_hit_rate": round(h / d, 4) if d else None,
+            "allocated_slots": target_size if account_retarget else alloc[a],
+        }
+    return {
+        "target_size": target_size,
+        "total_dispatches": total,
+        "estimated_warm_hits": total_hits,
+        "estimated_hit_rate": round(total_hits / total, 4) if total else None,
+        "by_account": by_account,
+        "account_retarget": account_retarget,
+    }
+
+
+_POOL_ESTIMATE_ASSUMPTIONS = (
+    "Coarse offline estimate, NOT a measurement: replays recent per-account "
+    "dispatch timestamps over a simulated idle pool of the candidate target "
+    "size. A dispatch counts as a likely warm hit when a compatible idle member "
+    "would plausibly be ready — leasing a member costs one replenish interval "
+    "before a replacement is ready, and a member idle past the TTL is reaped and "
+    "re-provisioned. Assumes the pool was pre-warmed at the window start and "
+    "ignores provider/model compatibility beyond the resolved account. The "
+    "account-retarget scenario lets any idle member serve any account."
+)
+
+
+async def estimate_pool_hit_rate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    target_size: int,
+    window_days: int = _AXIS_WINDOW_DAYS,
+    runtime_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Offline pool hit-rate estimate for a project at a candidate target size.
+
+    Loads recent terminal tasks via :func:`_load_recent_tasks` (already carries
+    ``vm_dispatched_at`` + ``context``), buckets each dispatch by its resolved
+    LLM account, and runs the pure :func:`_estimate_pool_hit_rate` counterfactual
+    twice: account-pinned (the maintainer's per-account spread) and with
+    account-retarget on (any idle member serves any account). Read-only — it
+    provisions nothing and never touches the dispatch path.
+
+    ``replenish_seconds`` and ``idle_ttl_seconds`` are read from runtime config
+    (the maintainer interval and the pool idle TTL) but threaded through as
+    explicit params to the pure helper for deterministic testing.
+    """
+    from app.max_plan_pool import get_task_llm_account_id  # noqa: PLC0415
+    from app.warm_backlog_reuse import _account_label  # noqa: PLC0415
+
+    if runtime_config is None:
+        from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
+        runtime_config = _rc
+
+    try:
+        replenish = int(
+            runtime_config.get("warm_pool_maintainer_interval_seconds", 120) or 120
+        )
+    except (TypeError, ValueError):
+        replenish = 120
+    try:
+        idle_ttl = int(runtime_config.get("warm_pool_idle_ttl_seconds", 1800) or 1800)
+    except (TypeError, ValueError):
+        idle_ttl = 1800
+
+    tasks = await _load_recent_tasks(session, project_id, window_days=window_days)
+    dispatches: list[tuple[Optional[str], Optional[datetime]]] = []
+    for t in tasks:
+        if t.vm_dispatched_at is None:
+            continue
+        dispatches.append((_account_label(get_task_llm_account_id(t)), t.vm_dispatched_at))
+
+    pinned = _estimate_pool_hit_rate(
+        dispatches,
+        target_size=target_size,
+        replenish_seconds=replenish,
+        idle_ttl_seconds=idle_ttl,
+        account_retarget=False,
+    )
+    retarget = _estimate_pool_hit_rate(
+        dispatches,
+        target_size=target_size,
+        replenish_seconds=replenish,
+        idle_ttl_seconds=idle_ttl,
+        account_retarget=True,
+    )
+    return {
+        "project_id": str(project_id),
+        "target_size": int(max(0, target_size)),
+        "window_days": window_days,
+        "replenish_seconds": replenish,
+        "idle_ttl_seconds": idle_ttl,
+        "total_dispatches": pinned["total_dispatches"],
+        "estimated_warm_hits": pinned["estimated_warm_hits"],
+        "estimated_hit_rate": pinned["estimated_hit_rate"],
+        "by_account": pinned["by_account"],
+        "account_retarget_scenario": {
+            "estimated_warm_hits": retarget["estimated_warm_hits"],
+            "estimated_hit_rate": retarget["estimated_hit_rate"],
+        },
+        "assumptions": _POOL_ESTIMATE_ASSUMPTIONS,
+    }
 
 
 def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
@@ -799,7 +1032,10 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
-    from app.warm_backlog_reuse import compute_dominant_reuse_dropout  # noqa: PLC0415
+    from app.warm_backlog_reuse import (  # noqa: PLC0415
+        compute_dominant_pool_miss,
+        compute_dominant_reuse_dropout,
+    )
 
     tasks = await _load_recent_tasks(session, project_id)
     pool_metrics = await compute_pool_idle_cost(session, project_id)
@@ -838,6 +1074,17 @@ async def compute_current_axes(
         # the dominant drop-out survive restarts and trendable day over day
         # (surfaced via read_baseline_with_drift -> the warm-VM admin view).
         "reuse_dropout": compute_dominant_reuse_dropout(),
+        # Durable snapshot of the warm-POOL dispatch funnel (a DIFFERENT funnel
+        # from reuse_dropout above — do not conflate). The live pool funnel
+        # counters (lease hits, cold dispatches, lease-miss-by-reason, per-account
+        # hit rates) are in-memory and reset on every deploy/restart (frequent on
+        # Cloud Run); folding the aggregates + the dominant-miss-reason call-out
+        # into the daily snapshot makes the dispatch funnel survive restarts and
+        # trendable day over day. This is what tells an operator enabling the pool
+        # not just whether it is hitting but, when it misses, WHY (no idle member
+        # vs no compatible member vs lost-lease race) — the answer that drives the
+        # next tuning action. Surfaced via read_baseline_with_drift -> warm-VM view.
+        "pool_dispatch_funnel": compute_dominant_pool_miss(),
     }
 
 
@@ -991,6 +1238,34 @@ async def read_baseline_with_drift(
         if snap.get("reuse_dropout")
     ]
 
+    # Durable warm-POOL dispatch funnel: the latest persisted funnel block plus a
+    # day-over-day trend of the key aggregates (hit rate, hits/cold counts) and
+    # the dominant lease-miss reason, so an operator can read the WHY-it-missed
+    # breakdown across the multi-day windows even though the live pool funnel
+    # counters reset on every restart. A DIFFERENT funnel from reuse_dropout_trend.
+    pool_dispatch_funnel_trend = [
+        {
+            "captured_at": snap.get("captured_at"),
+            "pool_lease_hits": (snap.get("pool_dispatch_funnel") or {}).get(
+                "pool_lease_hits"
+            ),
+            "cold_dispatches": (snap.get("pool_dispatch_funnel") or {}).get(
+                "cold_dispatches"
+            ),
+            "pool_hit_rate": (snap.get("pool_dispatch_funnel") or {}).get(
+                "pool_hit_rate"
+            ),
+            "lease_miss_total": (snap.get("pool_dispatch_funnel") or {}).get(
+                "lease_miss_total"
+            ),
+            "dominant_miss_reason": (
+                (snap.get("pool_dispatch_funnel") or {}).get("dominant_miss") or {}
+            ).get("reason"),
+        }
+        for snap in snapshots
+        if snap.get("pool_dispatch_funnel")
+    ]
+
     axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
         cur = latest.get(axis)
@@ -1028,6 +1303,14 @@ async def read_baseline_with_drift(
         # (live in-memory counters), these persist in the efficiency snapshot.
         "reuse_dropout": latest.get("reuse_dropout"),
         "reuse_dropout_trend": reuse_dropout_trend,
+        # Durable (restart-surviving) warm-POOL dispatch funnel from the latest
+        # snapshot — lease hits, cold dispatches, overall + per-account hit rate,
+        # the lease-miss-by-reason breakdown, and the single dominant-miss-reason
+        # call-out — plus its day-over-day trend. A DIFFERENT funnel from
+        # ``reuse_dropout`` above; both are persisted in the efficiency snapshot
+        # specifically because the live in-memory funnel counters reset on restart.
+        "pool_dispatch_funnel": latest.get("pool_dispatch_funnel"),
+        "pool_dispatch_funnel_trend": pool_dispatch_funnel_trend,
         # Warm-pool idle cost from the latest snapshot, plus the net-cost
         # companion that folds it into cost_per_merged_pr (see compute_current_axes).
         "pool_idle_cost_usd": latest.get("pool_idle_cost_usd"),
@@ -1247,3 +1530,59 @@ async def get_llm_cost_breakdown(
         "generated_at": _utcnow().isoformat(),
         **breakdown,
     }
+
+
+@router.get("/projects/{project_id}/pool-hit-rate-estimate")
+async def get_pool_hit_rate_estimate(
+    project_id: uuid.UUID,
+    target_size: int = Query(..., ge=0, le=100),
+    window_days: int = Query(default=7, ge=1, le=30),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Offline counterfactual estimate of the warm-pool hit rate a project would
+    achieve at a candidate ``target_size``, before any idle cost is paid.
+
+    The warm pool ships disabled, so its observed hit rate is 0 and no operator
+    has evidence that enabling it for a project will pay off. This read-only
+    endpoint replays the project's recent per-account dispatch history
+    (``vm_dispatched_at`` + resolved account on recently-terminal tasks within
+    ``window_days``) over a simulated idle pool of ``target_size`` members and
+    reports the share of dispatches that would plausibly have been served warm —
+    so an operator can size the pool before enabling it, and re-run to tune N.
+
+    It does NOT change the dispatch/claim path or provision anything; the window
+    is bounded (``window_days`` ≤ 30, ≤ 5000 tasks) so it stays cheap on large
+    histories. See :func:`estimate_pool_hit_rate` for the model and
+    ``assumptions`` for the stated caveats.
+
+    Response shape::
+
+        {
+          "project_id": str,
+          "target_size": int,
+          "window_days": int,
+          "replenish_seconds": int,
+          "idle_ttl_seconds": int,
+          "total_dispatches": int,
+          "estimated_warm_hits": int,
+          "estimated_hit_rate": float|None,   # None when no dispatches in window
+          "by_account": {"<account>": {
+              "total_dispatches": int,
+              "estimated_warm_hits": int,
+              "estimated_hit_rate": float|None,
+              "allocated_slots": int
+          }, ...},
+          "account_retarget_scenario": {
+              "estimated_warm_hits": int,
+              "estimated_hit_rate": float|None
+          },
+          "assumptions": str
+        }
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return await estimate_pool_hit_rate(
+        session, project_id, target_size=target_size, window_days=window_days
+    )

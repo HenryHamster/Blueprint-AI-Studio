@@ -1254,6 +1254,53 @@ async def get_warm_reuse_dropout_trend(
     return {"buckets": buckets}
 
 
+@router.get("/projects/{project_id}/pool-dispatch-funnel-trend")
+async def get_pool_dispatch_funnel_trend(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Day-over-day warm-POOL dispatch funnel trend from persisted snapshots.
+
+    Reads the ``pool_dispatch_funnel`` block persisted into each daily
+    efficiency-snapshot (see :mod:`app.efficiency_snapshot`) so the pool
+    dispatch funnel — lease hits, cold dispatches, hit rate, the lease-miss
+    breakdown, and the single dominant lease-miss reason — survives the
+    instance restarts that reset the in-memory funnel counters. This is the
+    restart-durable view of WHY the pool missed across the multi-day windows an
+    operator watches during a controlled enable; a miss funnel dominated by
+    ``no_compatible_member`` says enable account-retarget, one dominated by
+    ``no_idle_member`` says grow the pool. A DIFFERENT funnel from
+    ``warm-reuse-dropout-trend``. Returns an empty ``buckets`` list until at
+    least one daily snapshot has captured the block. Observability only.
+    """
+    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    project = await session.get(Project, project_id)
+    container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
+    buckets: List[Dict[str, Any]] = []
+    for snap in container.get("snapshots") or []:
+        block = snap.get("pool_dispatch_funnel")
+        if not isinstance(block, dict):
+            continue
+        dominant = block.get("dominant_miss") or {}
+        buckets.append(
+            {
+                "captured_at": snap.get("captured_at"),
+                "pool_lease_hits": block.get("pool_lease_hits"),
+                "cold_dispatches": block.get("cold_dispatches"),
+                "pool_hit_rate": block.get("pool_hit_rate"),
+                "lease_miss_total": block.get("lease_miss_total"),
+                "dominant_miss_reason": dominant.get("reason"),
+                "dominant_miss_share": dominant.get("share"),
+            }
+        )
+    return {"buckets": buckets}
+
+
 @router.get("/pipeline-efficiency")
 async def get_pipeline_efficiency(
     project_id: Optional[uuid.UUID] = Query(default=None),

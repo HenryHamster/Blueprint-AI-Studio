@@ -851,6 +851,65 @@ normal for new projects. Use the design doc specs and the project's config files
 foundational structure. Output a large-scope finding that bootstraps the target system.\n`;
 }
 
+/**
+ * Renders the CAPABILITY VERIFICATION section for the tactical research prompt,
+ * mirroring the inline SYSTEM VERIFICATION block. The backend's research-side
+ * verification loop historically classified only design-doc `systems/` entries;
+ * design-doc CAPABILITIES claimed working/partial were never verified for the
+ * research agent. So a capability whose backing code is absent on the
+ * integration branch slipped through, and the agent reasoned about — and
+ * proposed improvements to — behavior that does not exist.
+ *
+ * The backend now emits a parallel `capability_verification` map (same shape as
+ * `system_verification`: per-capability `status` of claimed_absent/partial/
+ * verified plus `claimed_status`/`present`/`missing`). This helper surfaces it
+ * as a prominent prompt section the agent cannot miss. The classification is
+ * conservative by construction (computed backend-side the same way systems are):
+ * a capability is flagged claimed_absent only when EVERY referenced backing path
+ * is absent; a present path makes it `partial`; a capability with no path
+ * pointer is never classified and so never appears here. Returns '' when no
+ * verification map is provided, so existing prompts are unchanged.
+ */
+export function buildCapabilityVerificationSection(
+  capVerif: Record<string, Record<string, unknown>> | undefined,
+): string {
+  if (!capVerif || typeof capVerif !== 'object' || Object.keys(capVerif).length === 0) return '';
+  const absent: string[] = [];
+  const partial: string[] = [];
+  const verified: string[] = [];
+  for (const capName of Object.keys(capVerif).sort()) {
+    const v = capVerif[capName];
+    const status = strVal(v.status as string);
+    const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
+    const present = Array.isArray(v.present) ? v.present as string[] : [];
+    const claimed = strVal(v.claimed_status as string);
+    const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
+    if (status === 'claimed_absent') {
+      absent.push(`- **${capName}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared backing path(s) missing: ${missing.join(', ')}`);
+    } else if (status === 'partial') {
+      partial.push(`- **${capName}**${claimedNote}: PARTIAL — missing: ${missing.join(', ')}; present: ${present.join(', ')}`);
+    } else if (status === 'verified') {
+      verified.push(`- **${capName}**: verified — ${present.length} declared path(s) exist`);
+    }
+  }
+  if (absent.length === 0 && partial.length === 0 && verified.length === 0) return '';
+  const vlines: string[] = ['# CAPABILITY VERIFICATION (code existence vs. design-doc claims)'];
+  vlines.push('The backend verified each design-doc capability\'s declared backing paths against the integration-branch file tree. Do NOT trust a capability\'s status over this evidence — if a capability is flagged below, treat its claimed status (working/partial) as unreliable, design from what actually exists, and do NOT propose improvements to behavior that is not built.');
+  if (absent.length > 0) {
+    vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');
+    vlines.push(...absent);
+  }
+  if (partial.length > 0) {
+    vlines.push('\n## ⚠️ Partial (some declared backing paths missing)');
+    vlines.push(...partial);
+  }
+  if (verified.length > 0) {
+    vlines.push('\n## Verified (all declared backing paths present)');
+    vlines.push(...verified);
+  }
+  return vlines.join('\n') + '\n\n';
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -1331,6 +1390,15 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
     }
   }
 
+  // Capability verification: the design-doc-system check above covers only
+  // `systems/` entries. The backend now emits a parallel verdict map for
+  // design-doc CAPABILITIES claimed working/partial — surface it the same way so
+  // the research agent never proposes improving a capability whose backing code
+  // is absent on the integration branch.
+  const capabilityVerificationSection = buildCapabilityVerificationSection(
+    payload.capability_verification as Record<string, Record<string, unknown>> | undefined,
+  );
+
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
@@ -1371,7 +1439,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 # CODEBASE CONTEXT
 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
-${designDocHighlight}${designDocSection}${systemVerificationSection}# DIRECTIONS
+${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these
