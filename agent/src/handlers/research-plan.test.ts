@@ -832,23 +832,52 @@ describe('buildPortfolioComposition', () => {
 });
 
 describe('buildEmptyRepoGuidance', () => {
+  // buildEmptyRepoGuidance now routes through the unified isGreenfieldRepo
+  // predicate, which ORs the durable repo_is_empty signal with the live
+  // detectGreenfield() clone scan. To isolate the durable-signal cases we must
+  // control what the live scan sees via the git ls-files mock.
+  const setSourceRichClone = () =>
+    vi.mocked(execFileSync).mockReturnValue(
+      // > GREENFIELD_SOURCE_FILE_THRESHOLD (8) real source files → live scan false
+      Array.from({ length: 12 }, (_, i) => `src/m${i}.ts`).join('\n') as never,
+    );
+  const setEmptyClone = () =>
+    vi.mocked(execFileSync).mockReturnValue('package.json\nREADME.md\n.gitignore' as never);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('returns the bootstrap paragraph when repo_is_empty is truthy', () => {
+    // Durable signal short-circuits even when the live clone has real source.
+    setSourceRichClone();
     const out = buildEmptyRepoGuidance({ repo_is_empty: true });
     expect(out).toContain('If the codebase is nearly empty');
     expect(out).toContain('bootstraps the target system');
   });
 
-  it('returns empty string when repo_is_empty is false', () => {
+  it('returns empty string when repo_is_empty is false and the live clone has source', () => {
+    setSourceRichClone();
     expect(buildEmptyRepoGuidance({ repo_is_empty: false })).toBe('');
   });
 
-  it('returns empty string when repo_is_empty is absent', () => {
+  it('returns empty string when repo_is_empty is absent and the live clone has source', () => {
+    setSourceRichClone();
     expect(buildEmptyRepoGuidance({})).toBe('');
   });
 
-  it('returns empty string for non-boolean falsy values', () => {
+  it('returns empty string for non-boolean falsy values when the live clone has source', () => {
+    setSourceRichClone();
     expect(buildEmptyRepoGuidance({ repo_is_empty: 0 })).toBe('');
     expect(buildEmptyRepoGuidance({ repo_is_empty: '' })).toBe('');
+  });
+
+  it('returns the bootstrap paragraph when repo_is_empty is falsy but the live clone is near-empty', () => {
+    // Previously-divergent case: durable signal absent, but the live full-clone
+    // scan catches a lightly-scaffolded repo. Both handlers now agree on this.
+    setEmptyClone();
+    const out = buildEmptyRepoGuidance({ repo_is_empty: false });
+    expect(out).toContain('If the codebase is nearly empty');
   });
 });
 

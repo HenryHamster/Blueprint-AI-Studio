@@ -182,6 +182,49 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     }
   }
 
+  // Strategic Intent — the LIVE, operator-editable problem-model steering
+  // (purpose, current focus, project context framing, active constraints).
+  // Surfaced separately from the legacy Project Vision; the backend sends at
+  // most one of the two, so they never double-render.
+  const strategicIntent = task.strategic_intent as Record<string, unknown> | undefined;
+  if (strategicIntent && typeof strategicIntent === 'object') {
+    const siLines: string[] = ['## Strategic Intent'];
+    const purpose = strVal(strategicIntent.purpose);
+    if (purpose) siLines.push(`**Purpose:** ${purpose}`);
+    const currentFocus = strVal(strategicIntent.current_focus);
+    if (currentFocus) siLines.push(`**Current focus:** ${currentFocus}`);
+    const ctx = strategicIntent.context as Record<string, unknown> | undefined;
+    if (ctx && typeof ctx === 'object') {
+      const ctxFields: Array<[string, string]> = [
+        ['project_type', 'Project type'],
+        ['users', 'Users'],
+        ['team', 'Team'],
+        ['deploy_cadence', 'Deploy cadence'],
+        ['notes', 'Notes'],
+      ];
+      const ctxParts: string[] = [];
+      for (const [key, label] of ctxFields) {
+        const v = strVal(ctx[key]);
+        if (v) ctxParts.push(`${label}: ${v}`);
+      }
+      if (ctxParts.length > 0) {
+        siLines.push('**Context:**');
+        for (const part of ctxParts) siLines.push(`- ${part}`);
+      }
+    }
+    const constraints = Array.isArray(strategicIntent.constraints)
+      ? (strategicIntent.constraints as unknown[]).map(c => strVal(c)).filter(Boolean)
+      : [];
+    if (constraints.length > 0) {
+      siLines.push('**Constraints:**');
+      for (const c of constraints) siLines.push(`- ${c}`);
+    }
+    if (siLines.length > 1) {
+      siLines.push('');
+      prefix += siLines.join('\n') + '\n';
+    }
+  }
+
   if (projectCtx) {
     const hasData = Object.keys(projectCtx).some(k => {
       const v = projectCtx[k]; return Array.isArray(v) && v.length > 0;
@@ -192,7 +235,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         (payload?.related_files as string[] | undefined) ||
         (taskContext?.related_files as string[] | undefined) ||
         [];
-      prefix = formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
+      prefix += formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
       if (['create', 'fix', 'refactor', 'migrate'].includes(taskType)) {
         prefix += formatSelfReviewCalibrationSection(
           (projectCtx.self_review_catch_rate as SRCatchRateSource | undefined) ||
@@ -213,6 +256,18 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (priority) dcLines.push(`**Priority:** ${priority}`);
     const implConstraints = strVal(dirCtx.implementation_constraints);
     if (implConstraints) dcLines.push(`**Implementation constraints:** ${implConstraints}`);
+    // Contract — what "done" means for this direction (success evidence /
+    // completion criteria / retirement condition). Rendered defensively; only
+    // fields the backend actually sent appear.
+    const contract = dirCtx.contract as Record<string, unknown> | undefined;
+    if (contract && typeof contract === 'object') {
+      const completionCriteria = strVal(contract.completion_criteria);
+      if (completionCriteria) dcLines.push(`**Completion criteria:** ${completionCriteria}`);
+      const successEvidence = strVal(contract.success_evidence);
+      if (successEvidence) dcLines.push(`**Success evidence:** ${successEvidence}`);
+      const retirementCondition = strVal(contract.retirement_condition);
+      if (retirementCondition) dcLines.push(`**Retirement condition:** ${retirementCondition}`);
+    }
     const narrative = dirCtx.narrative as Record<string, unknown> | undefined;
     if (narrative && typeof narrative === 'object') {
       const established = Array.isArray(narrative.established_findings)

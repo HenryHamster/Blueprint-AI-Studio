@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag } from 'lucide-react';
 import { onboardProject, authGet, apiFetch, API_BASE_URL } from '../api';
 import type { BuildConfig, AutoRemediationConfig } from '../types/project';
+import type { ProblemModelPatch } from '../types';
 
 interface IssueImplementationConfig {
   enabled: boolean;
@@ -17,6 +18,15 @@ type Step = 'repo' | 'config' | 'submitting' | 'success';
 interface RepoOption {
   full_name: string;
   default_branch: string;
+}
+
+interface InitialSteeringState {
+  projectType: string;
+  users: string;
+  team: string;
+  deployCadence: string;
+  notes: string;
+  constraints: string[];
 }
 
 interface SetupProject {
@@ -41,6 +51,28 @@ function parseRepoInput(input: string): { owner: string; repo: string } | null {
   return null;
 }
 
+function buildInitialSteeringPayload(
+  state: InitialSteeringState,
+): Pick<ProblemModelPatch, 'context' | 'constraints'> | undefined {
+  const contextEntries = [
+    ['project_type', state.projectType],
+    ['users', state.users],
+    ['team', state.team],
+    ['deploy_cadence', state.deployCadence],
+    ['notes', state.notes],
+  ]
+    .map(([key, value]) => [key, value.trim()] as const)
+    .filter(([, value]) => value.length > 0);
+
+  const context = Object.fromEntries(contextEntries);
+  const constraints = state.constraints.map((constraint) => constraint.trim()).filter((constraint) => constraint.length > 0);
+
+  const payload: Pick<ProblemModelPatch, 'context' | 'constraints'> = {};
+  if (Object.keys(context).length > 0) payload.context = context;
+  if (constraints.length > 0) payload.constraints = constraints;
+  return Object.keys(payload).length > 0 ? payload : undefined;
+}
+
 const STEP_LABELS: Record<string, string> = { repo: 'Repository', config: 'Confirm', success: 'Created' };
 
 export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProjectModalProps) {
@@ -48,7 +80,12 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const [repoInput, setRepoInput] = useState('');
   const [projectName, setProjectName] = useState('');
   const [goal, setGoal] = useState('');
-  const [initialSteering, setInitialSteering] = useState('');
+  const [projectType, setProjectType] = useState('');
+  const [users, setUsers] = useState('');
+  const [team, setTeam] = useState('');
+  const [deployCadence, setDeployCadence] = useState('');
+  const [notes, setNotes] = useState('');
+  const [constraints, setConstraints] = useState<string[]>(['']);
   const [repoError, setRepoError] = useState('');
   const [submitError, setSubmitError] = useState('');
   const [createdProjectId, setCreatedProjectId] = useState(setupProject?.id ?? '');
@@ -143,7 +180,14 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
     try {
       const effectivePromotionTarget = promotionTargetInput.trim() || undefined;
       const trimmedGoal = goal.trim();
-      const trimmedSteering = initialSteering.trim();
+      const initialSteering = buildInitialSteeringPayload({
+        projectType,
+        users,
+        team,
+        deployCadence,
+        notes,
+        constraints,
+      });
       const data = await onboardProject(
         parsed.owner,
         parsed.repo,
@@ -151,7 +195,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
         undefined,
         effectivePromotionTarget,
         trimmedGoal || undefined,
-        trimmedSteering ? { context: { notes: trimmedSteering } } : undefined,
+        initialSteering,
       );
       const projectId = data.project_id;
       setCreatedProjectId(projectId);
@@ -232,6 +276,14 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const filteredRepos = repoOptions.filter(r =>
     r.full_name.toLowerCase().includes(repoFilter.toLowerCase())
   );
+
+  const addConstraint = () => setConstraints((prev) => [...prev, '']);
+  const updateConstraint = (idx: number, value: string) => {
+    setConstraints((prev) => prev.map((constraint, i) => (i === idx ? value : constraint)));
+  };
+  const removeConstraint = (idx: number) => {
+    setConstraints((prev) => (prev.length <= 1 ? [''] : prev.filter((_, i) => i !== idx)));
+  };
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
@@ -408,17 +460,104 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
               </div>
 
               <div className="mb-6">
-                <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
-                  Initial Steering{' '}
-                  <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
+                <div className="mb-2">
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">
+                    Initial Steering{' '}
+                    <span className="text-neutral-600 font-normal normal-case tracking-normal">(optional)</span>
+                  </label>
+                  <p className="text-[9px] text-neutral-600 mt-1">
+                    Capture project context and hard constraints so the first cycle starts with the right shape.
+                  </p>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label className="block">
+                    <span className="block text-[10px] text-neutral-500 mb-1">Project type</span>
+                    <input
+                      type="text"
+                      value={projectType}
+                      onChange={e => setProjectType(e.target.value)}
+                      placeholder="startup / research / product / personal / enterprise"
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="block text-[10px] text-neutral-500 mb-1">Team</span>
+                    <input
+                      type="text"
+                      value={team}
+                      onChange={e => setTeam(e.target.value)}
+                      placeholder="solo / 3 engineers + 1 PM / etc."
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="block text-[10px] text-neutral-500 mb-1">Users</span>
+                    <input
+                      type="text"
+                      value={users}
+                      onChange={e => setUsers(e.target.value)}
+                      placeholder="Who this is for, in one line"
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    />
+                  </label>
+                  <label className="block">
+                    <span className="block text-[10px] text-neutral-500 mb-1">Deploy cadence</span>
+                    <input
+                      type="text"
+                      value={deployCadence}
+                      onChange={e => setDeployCadence(e.target.value)}
+                      placeholder="continuous / weekly / quarterly / sporadic"
+                      className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    />
+                  </label>
+                </div>
+                <label className="block mt-3">
+                  <span className="block text-[10px] text-neutral-500 mb-1">Notes</span>
+                  <textarea
+                    value={notes}
+                    onChange={e => setNotes(e.target.value)}
+                    rows={3}
+                    placeholder="Risk tolerance, compliance constraints, or other context"
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
+                  />
                 </label>
-                <textarea
-                  value={initialSteering}
-                  onChange={e => setInitialSteering(e.target.value)}
-                  rows={2}
-                  placeholder="Constraints, priorities, or project context"
-                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 resize-none"
-                />
+                <div className="mt-4">
+                  <div className="mb-2">
+                    <span className="block text-[10px] font-semibold text-neutral-400 uppercase tracking-wider">Constraints</span>
+                    <p className="text-[9px] text-neutral-600 mt-1">
+                      Hard rules and preferences the agent must respect. One per line.
+                    </p>
+                  </div>
+                  <div className="space-y-2">
+                    {constraints.map((constraint, index) => (
+                      <div key={index} className="flex items-start gap-2">
+                        <input
+                          type="text"
+                          value={constraint}
+                          onChange={e => updateConstraint(index, e.target.value)}
+                          placeholder="e.g., Don't modify .github/workflows/"
+                          className="flex-1 min-w-0 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => removeConstraint(index)}
+                          className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 text-neutral-500 hover:text-rose-400 hover:bg-neutral-800/60 transition-colors"
+                          aria-label="Remove constraint"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={addConstraint}
+                      className="min-h-[44px] inline-flex items-center gap-1 px-2 py-1 text-xs text-neutral-400 hover:text-neutral-100 transition-colors"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add constraint
+                    </button>
+                  </div>
+                </div>
               </div>
 
               <div className="flex justify-end gap-2">

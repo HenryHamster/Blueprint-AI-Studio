@@ -42,25 +42,34 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
     return slug[:40] if slug else "project"
 
-
-# Root files that do NOT count as source code — their presence alone does not
-# make a repo "non-empty". Matched case-insensitively by stem-prefix (e.g.
-# "README.md", "LICENSE.txt") or exact name for the dotfiles. Source manifests
-# (pyproject.toml, package.json, go.mod, Cargo.toml, etc.) are deliberately
-# absent so a scaffolded repo is correctly classified as non-empty.
-_NON_SOURCE_FILE_PREFIXES = (
-    "readme",
-    "license",
-    "licence",
-    "contributing",
-    "code_of_conduct",
-    "changelog",
-    "authors",
-    "notice",
-    "security",
+# Backend onboarding must stay aligned with the agent prompt-time greenfield
+# detector: same threshold and same "real source" exclusions live there in
+# agent/src/constants.ts and agent/src/prompts/discovery.ts.
+GREENFIELD_SOURCE_FILE_THRESHOLD = 8
+_NON_SOURCE_FILE_EXTENSIONS = (
+    ".md",
+    ".markdown",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".txt",
+    ".lock",
+    ".lockb",
 )
-_NON_SOURCE_EXACT_FILES = frozenset(
+_NON_SOURCE_FILE_BASENAMES = frozenset(
     {
+        "license",
+        "licence",
+        "notice",
+        "authors",
+        "codeowners",
+        "dockerfile",
+        "makefile",
+        "procfile",
+        "go.mod",
         ".gitignore",
         ".gitattributes",
         ".editorconfig",
@@ -73,23 +82,40 @@ _NON_SOURCE_EXACT_FILES = frozenset(
         ".pre-commit-config.yaml",
     }
 )
-# Root directories that are infrastructure/metadata, not source code.
-_NON_SOURCE_DIRS = frozenset({".github", ".git", ".circleci", ".gitlab"})
+_NON_SOURCE_FILE_PREFIXES = (
+    "readme",
+    "contributing",
+    "changelog",
+    "security",
+)
+
+
+def _is_real_source_file(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1].strip().lower()
+    if not base or base.startswith("."):
+        return False
+    if base in _NON_SOURCE_FILE_BASENAMES:
+        return False
+    if any(base.startswith(prefix) for prefix in _NON_SOURCE_FILE_PREFIXES):
+        return False
+    if any(base.endswith(ext) for ext in _NON_SOURCE_FILE_EXTENSIONS):
+        return False
+    return True
 
 
 def _classify_repo_emptiness(root_items: list[Dict[str, Any]]) -> bool:
-    """Classify a repo as empty / near-empty from its root contents listing.
+    """Classify a repo as empty / near-empty from fetched contents listings.
 
-    Returns True when the repository contains no source directories and every
-    root file is a recognized non-source scaffolding/config file (README,
-    LICENSE, CONTRIBUTING, CI/editor dotfiles, etc.). Returns False as soon as
-    any source directory or any unrecognized (i.e. likely source) root file is
-    present.
+    Returns True when the repository has at most
+    ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across the fetched
+    root listing and the already-fetched first-level subdirectory listings.
+    Documentation/config/data files, dotfiles, and common manifests are not
+    counted as source.
 
-    ``root_items`` is the raw GitHub ``contents/`` listing (each item a dict
-    with ``name`` and ``type``). Designed to run on the listing already fetched
-    by :func:`_detect_build_config`, so it adds zero GitHub cost.
+    ``root_items`` is the raw GitHub ``contents/`` listings already fetched by
+    :func:`_detect_build_config`, so it adds zero GitHub cost.
     """
+    source_file_count = 0
     for item in root_items:
         if not isinstance(item, dict):
             continue
@@ -97,24 +123,12 @@ def _classify_repo_emptiness(root_items: list[Dict[str, Any]]) -> bool:
         if not isinstance(name, str) or not name:
             continue
         item_type = item.get("type")
-
-        if item_type == "dir":
-            if name.lower() in _NON_SOURCE_DIRS:
-                continue
-            # Any non-infrastructure directory implies source structure.
-            return False
-
-        # File: must be a recognized non-source file, else treat as source.
-        lowered = name.lower()
-        if lowered in _NON_SOURCE_EXACT_FILES:
+        if item_type != "file":
             continue
-        if lowered.startswith(".") and "." not in lowered[1:]:
-            # Bare config dotfiles (e.g. ".env", ".tool-versions") are scaffolding.
-            continue
-        if any(lowered.startswith(prefix) for prefix in _NON_SOURCE_FILE_PREFIXES):
-            continue
-        # Unrecognized root file — assume it is (or accompanies) source code.
-        return False
+        if _is_real_source_file(name):
+            source_file_count += 1
+            if source_file_count > GREENFIELD_SOURCE_FILE_THRESHOLD:
+                return False
 
     return True
 
@@ -158,11 +172,13 @@ async def _detect_build_config(
         )
         return {}
 
-    root_files = {item["name"]: item for item in resp.json() if isinstance(item, dict)}
+    root_listing = [item for item in resp.json() if isinstance(item, dict)]
+    root_files = {item["name"]: item for item in root_listing}
     root_names = set(root_files.keys())
 
     directories: list[Dict[str, Any]] = []
     languages: list[str] = []
+    source_items: list[Dict[str, Any]] = list(root_listing)
 
     # Detect Python project
     if (
@@ -233,7 +249,9 @@ async def _detect_build_config(
         )
         if sub_resp.status_code != 200:
             continue
-        sub_files = {item["name"] for item in sub_resp.json() if isinstance(item, dict)}
+        sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
+        source_items.extend(sub_listing)
+        sub_files = {item["name"] for item in sub_listing}
 
         if "package.json" in sub_files and not any(
             d["path"] == f"{subdir}/" for d in directories
@@ -277,12 +295,11 @@ async def _detect_build_config(
         "directories": directories,
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
-        # Deterministic empty/near-empty signal from the root listing already
-        # fetched above (zero extra GitHub cost). Gates the research prompt's
-        # bootstrap-from-goal guidance on real code presence.
-        "repo_is_empty": _classify_repo_emptiness(
-            [item for item in resp.json() if isinstance(item, dict)]
-        ),
+        # Deterministic empty/near-empty signal from the already-fetched root
+        # + first-level subdirectory listings (zero extra GitHub cost). Must
+        # stay aligned with agent/src/prompts/discovery.ts and the threshold in
+        # agent/src/constants.ts.
+        "repo_is_empty": _classify_repo_emptiness(source_items),
     }
 
     return config

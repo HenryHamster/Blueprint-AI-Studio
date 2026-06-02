@@ -1,5 +1,6 @@
 import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
+import type { ProblemModelPatch } from './types';
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -714,14 +715,25 @@ export async function onboardProject(
   buildConfigOverride?: Record<string, unknown>,
   promotionTarget?: string,
   goal?: string,
-  initialSteering?: Record<string, unknown>,
+  initialSteering?: Pick<ProblemModelPatch, 'context' | 'constraints'>,
 ): Promise<{ project_id: string; build_config: Record<string, unknown> }> {
   const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
   if (name) body.name = name;
   if (buildConfigOverride) body.build_config_override = buildConfigOverride;
   if (promotionTarget) body.promotion_target = promotionTarget;
   if (goal) body.goal = goal;
-  if (initialSteering && Object.keys(initialSteering).length > 0) body.initial_steering = initialSteering;
+  if (initialSteering) {
+    const steering: Record<string, unknown> = {};
+    const contextEntries = Object.entries(initialSteering.context ?? {})
+      .map(([key, value]) => [key, typeof value === 'string' ? value.trim() : ''] as const)
+      .filter(([, value]) => value.length > 0);
+    if (contextEntries.length > 0) steering.context = Object.fromEntries(contextEntries);
+
+    const constraints = initialSteering.constraints?.map((constraint) => constraint.trim()).filter((constraint) => constraint.length > 0);
+    if (constraints && constraints.length > 0) steering.constraints = constraints;
+
+    if (Object.keys(steering).length > 0) body.initial_steering = steering;
+  }
   const res = await apiFetch('/api/admin/projects/onboard', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));

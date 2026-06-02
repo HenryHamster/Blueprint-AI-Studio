@@ -16,7 +16,7 @@ import {
   extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, detectGreenfield, configureAgentPermissions,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -834,18 +834,21 @@ export function buildPortfolioComposition(
 }
 
 /**
- * Bootstrap-from-goal research guidance, gated on the deterministic
- * onboarding-time empty-repo signal (`task.repo_is_empty`, persisted as
- * `build_config.repo_is_empty`).
+ * Bootstrap-from-goal research guidance, gated on the unified greenfield
+ * predicate (`isGreenfieldRepo`) so the research bootstrap gate and the plan
+ * handler's GREENFIELD-MODE gate consult the identical signal and can never
+ * disagree. The predicate is greenfield when the durable onboarding signal
+ * (`task.repo_is_empty`, persisted as `build_config.repo_is_empty`) is truthy
+ * OR the live full-clone `detectGreenfield()` scan says so.
  *
- * Returns the "nearly empty codebase → bootstrap the foundation" paragraph
- * ONLY when the repo was classified empty/near-empty at onboarding. Mature-repo
- * agents (`repo_is_empty` falsy) get `''`, so the guidance stops appearing as
- * noise in every research prompt. The leading blank line keeps spacing when the
- * paragraph is interpolated between other mission bullets.
+ * Returns the "nearly empty codebase → bootstrap the foundation" paragraph ONLY
+ * when the repo is greenfield. Mature-repo agents get `''`, so the guidance
+ * stops appearing as noise in every research prompt. The leading blank line
+ * keeps spacing when the paragraph is interpolated between other mission
+ * bullets.
  */
 export function buildEmptyRepoGuidance(task: Record<string, unknown>): string {
-  if (!task.repo_is_empty) return '';
+  if (!isGreenfieldRepo(task)) return '';
   return `\n**If the codebase is nearly empty** (few source files, mostly config/scaffolding): this is
 normal for new projects. Use the design doc specs and the project's config files to create
 foundational structure. Output a large-scope finding that bootstraps the target system.\n`;
@@ -953,7 +956,7 @@ export async function handlePlan(
   // config/scaffolding), the plan agent must NOT treat absent code as "nothing
   // to decompose". Mirror the research agent's "if the codebase is nearly empty"
   // branch and decompose "build the foundation for <goal>" instead.
-  const isGreenfield = detectGreenfield();
+  const isGreenfield = isGreenfieldRepo(task);
   const greenfieldBranch = isGreenfield ? `
 **GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).**
 Do NOT treat absent source as "nothing to decompose". This is a first-class bootstrap case: your job is to decompose **"build the foundation for the project goal"** into ordered implementation subtasks. Drive the foundation from the **Project Vision / goal above** and any design-doc specs — pick the structure, entry points, and core modules the goal requires, and order them so later subtasks build on earlier ones. An empty repo with a stated goal is NOT a valid no-op.

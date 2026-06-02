@@ -67,6 +67,8 @@ from app.claim_task_helpers import (
     _compute_failure_stage_pattern,
     _build_vision_summary,
     _build_direction_narrative,
+    _build_problem_model_summary,
+    _build_direction_contract,
 )
 
 logger = logging.getLogger(__name__)
@@ -3097,13 +3099,24 @@ async def claim_task(
                             "[AGENT] Failed to track arch context injection (non-critical)"
                         )
 
-    # Inject strategic vision so tactical agents understand the "why" behind
-    # their work. Useful for every task type — the orchestrator's strategic
-    # layer publishes this, but until now it was never read by implementers.
+    # Inject strategic intent so tactical agents understand the "why" behind
+    # their work. Useful for every task type. Prefer the LIVE, operator-editable
+    # problem model (onboarding + Problem Model editor write here) so current
+    # steering reaches the very next worker without waiting for a strategic
+    # cycle to mirror it into the legacy vision blob. Fall back to the legacy
+    # vision summary when the problem model is empty/malformed so existing
+    # projects are unaffected. Exactly one source is sent to avoid the agent
+    # double-rendering overlapping "why" sections.
     if project_for_playbook:
-        vision_summary = _build_vision_summary(project_for_playbook.vision)
-        if vision_summary:
-            response["vision"] = vision_summary
+        strategic_intent = _build_problem_model_summary(
+            project_for_playbook.problem_model
+        )
+        if strategic_intent:
+            response["strategic_intent"] = strategic_intent
+        else:
+            vision_summary = _build_vision_summary(project_for_playbook.vision)
+            if vision_summary:
+                response["vision"] = vision_summary
 
     # Inject direction narrative (established findings + open questions + last
     # cycle outcome) for task types that work inside a direction. Gives agents
@@ -3134,6 +3147,14 @@ async def claim_task(
                 if "direction_context" not in response:
                     response["direction_context"] = {}
                 response["direction_context"]["narrative"] = narrative
+            # Surface the current direction's contract (success evidence /
+            # completion criteria / retirement condition) so workers can align
+            # to what "done" means for this direction, not just its analytics.
+            contract = _build_direction_contract(_narrative_direction)
+            if contract:
+                if "direction_context" not in response:
+                    response["direction_context"] = {}
+                response["direction_context"]["contract"] = contract
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:

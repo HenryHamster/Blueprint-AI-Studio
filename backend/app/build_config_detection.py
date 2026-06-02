@@ -71,27 +71,26 @@ def apply_operator_build_config_overrides(
 async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> bool:
     """Auto-refresh a project's ``build_config`` once its repo gains structure.
 
-    A project onboarded against an empty/near-empty repository ends up with a
-    stored ``build_config`` whose ``directories`` are empty: detection found no
-    manifests. As that repo is scaffolded over later PRs (a ``package.json``,
-    ``pyproject.toml``, ``go.mod``, ``Cargo.toml`` lands on the integration
-    branch), the stored config is otherwise never refreshed and every task runs
-    with no generated ``./check`` — so bootstrapped work merges unverified.
+    A project onboarded against an empty/near-empty repository can store
+    ``build_config.repo_is_empty=True`` even after ``directories`` were seeded
+    by a manifest. As that repo is scaffolded over later PRs (real source files
+    land on the integration branch), the stored signal must be re-evaluated and
+    flipped to ``False`` once the source-file threshold is exceeded so the
+    durable onboarding signal stops advertising a greenfield repo.
 
     This helper is the idempotent, cheap auto-refresh wired into integration
     landing paths:
 
-    - The in-memory ``directories`` guard makes it effectively run *once* — the
-      moment the project stops being empty. While ``directories`` is populated
-      it returns immediately with NO GitHub call, so it is harmless to reach
-      from more than one landing path and never clobbers a config an operator
-      has already curated.
+    - The durable ``repo_is_empty`` guard makes it run only while the stored
+      signal is still True. Once a refresh flips it False, later landing paths
+      return immediately with NO GitHub call.
     - It reuses the EXISTING repo detector (``_detect_build_config``) against
       the project's *integration* branch and the same operator-override
       preservation the manual re-detect endpoint uses, so no second detector is
       introduced and operator-set fields survive.
-    - It persists only when detection actually found ``directories`` — it never
-      overwrites an empty config with another empty one.
+    - It persists only when detection returns a valid BuildConfig; if the
+      refreshed detection still classifies the repo as empty, the stored signal
+      remains True and the helper stays best-effort.
     - It is best-effort: any exception is logged and swallowed so it can NEVER
       raise into or block a merge/landing path.
 
@@ -99,9 +98,10 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
     """
     try:
         existing = project.build_config or {}
-        # Cheap in-memory guard: once directories are populated, do nothing and
-        # issue no GitHub call. This is what makes the trigger run once.
-        if existing.get("directories"):
+        # Only refresh while the durable onboarding signal still says the repo
+        # is empty/near-empty. Once a refresh flips repo_is_empty=False, the
+        # helper becomes a no-op on later landing paths.
+        if not existing.get("repo_is_empty"):
             return False
         if not getattr(project, "github_owner", None) or not getattr(
             project, "github_repo", None
@@ -130,9 +130,7 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
             project.github_repo,
             ref=integration_branch,
         )
-        # Only persist when detection found a project structure; never overwrite
-        # an empty config with another empty config.
-        if not detected or not detected.get("directories"):
+        if not detected:
             return False
 
         detected = apply_operator_build_config_overrides(detected, existing)

@@ -15,6 +15,7 @@ export {
   buildFileTree,
   countSourceFiles,
   detectGreenfield,
+  isGreenfieldRepo,
   extractTestConventions,
   discoverRelatedTests,
   extractModuleInterfaces,

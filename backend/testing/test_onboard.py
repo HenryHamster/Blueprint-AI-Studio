@@ -8,6 +8,7 @@ from app.main import app
 from app.models import Project, ProjectMessage, ProjectStatus
 from app.auth import get_current_user, require_admin
 from app.routers.admin_onboard import (
+    GREENFIELD_SOURCE_FILE_THRESHOLD,
     _detect_build_config,
     _classify_repo_emptiness,
     _seed_strategic_intent,
@@ -954,6 +955,62 @@ class TestOnboardStrategicIntentSeed:
         pm = parse_problem_model(project.problem_model)
         assert pm.context.notes == "Prioritize reliability over features"
 
+    @pytest.mark.asyncio
+    async def test_onboard_persists_structured_initial_steering(
+        self, client: AsyncClient, db_session
+    ):
+        """Structured onboarding steering should land in the persisted problem model."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "platform",
+                    "goal": "Ship the core fix",
+                    "initial_steering": {
+                        "context": {
+                            "project_type": "startup",
+                            "users": "Platform team",
+                            "team": "4 engineers + 1 PM",
+                            "deploy_cadence": "weekly",
+                            "notes": "Reliability over speed",
+                        },
+                        "constraints": ["No workflow edits"],
+                    },
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        assert project is not None
+        from app.problem_model import parse_problem_model
+
+        pm = parse_problem_model(project.problem_model)
+        assert pm.intent.purpose == "Ship the core fix"
+        assert pm.context.project_type == "startup"
+        assert pm.context.users == "Platform team"
+        assert pm.context.team == "4 engineers + 1 PM"
+        assert pm.context.deploy_cadence == "weekly"
+        assert pm.context.notes == "Reliability over speed"
+        assert pm.constraints == ["No workflow edits"]
+
     def test_malformed_steering_context_raises_400_not_500(self):
         """A wrong-typed steering value (bare string where ProjectContext is
         expected) must surface as a clean HTTP 400, not an unhandled
@@ -1158,10 +1215,10 @@ class TestBuildConfigDetection:
         assert config["repo_is_empty"] is True
 
     @pytest.mark.asyncio
-    async def test_detect_build_config_sets_repo_is_empty_false_for_source(self):
-        """A repo with a source manifest is classified non-empty → repo_is_empty False."""
+    async def test_detect_build_config_sets_repo_is_empty_true_for_config_only(self):
+        """A repo with only config/manifests remains empty → repo_is_empty True."""
         root_files = [
-            {"name": "pyproject.toml", "type": "file"},
+            {"name": "package.json", "type": "file"},
         ]
         root_resp = MagicMock()
         root_resp.status_code = 200
@@ -1171,6 +1228,60 @@ class TestBuildConfigDetection:
             "app.github._github_request",
             new_callable=AsyncMock,
             side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["repo_is_empty"] is True
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_keeps_repo_is_empty_true_at_threshold(self):
+        """A lightly scaffolded repo at the threshold still counts as empty."""
+        root_files = [
+            {"name": "src", "type": "dir"},
+        ]
+        subdir_files = [
+            {"name": f"file{i}.py", "type": "file"}
+            for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD)
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 200
+        subdir_resp.json.return_value = subdir_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["repo_is_empty"] is True
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_sets_repo_is_empty_false_over_threshold(self):
+        """A lightly scaffolded repo over the threshold is non-empty."""
+        root_files = [
+            {"name": "src", "type": "dir"},
+        ]
+        subdir_files = [
+            {"name": f"file{i}.py", "type": "file"}
+            for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD + 1)
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 200
+        subdir_resp.json.return_value = subdir_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1204,7 +1315,7 @@ class TestMaybeRefreshEmptyBuildConfig:
             github_owner="acme",
             github_repo="bootstrap-repo",
             integration_branch="develop",
-            build_config={"language": "python", "directories": []},
+            build_config={"language": "python", "directories": [], "repo_is_empty": True},
         )
         db_session.add(project)
         await db_session.commit()
@@ -1233,7 +1344,7 @@ class TestMaybeRefreshEmptyBuildConfig:
 
     @pytest.mark.asyncio
     async def test_noop_when_directories_already_populated(self, db_session):
-        """Populated directories => return immediately with NO GitHub call."""
+        """A stored repo_is_empty=False signal => return immediately with NO GitHub call."""
         from app.build_config_detection import maybe_refresh_empty_build_config
 
         project = Project(
@@ -1245,6 +1356,7 @@ class TestMaybeRefreshEmptyBuildConfig:
             build_config={
                 "language": "python",
                 "directories": [{"path": ".", "type": "python"}],
+                "repo_is_empty": False,
             },
         )
         db_session.add(project)
@@ -1280,6 +1392,7 @@ class TestMaybeRefreshEmptyBuildConfig:
             build_config={
                 "language": "python",
                 "directories": [],
+                "repo_is_empty": True,
                 "env_vars": {"FOO": "bar"},
                 "task_branch_namespace": "team-x",
                 "protected_branches": ["main", "release"],
@@ -1315,7 +1428,7 @@ class TestMaybeRefreshEmptyBuildConfig:
         """Detection finding no directories => config untouched, no crash, no commit."""
         from app.build_config_detection import maybe_refresh_empty_build_config
 
-        original = {"language": "python", "directories": []}
+        original = {"language": "python", "directories": [], "repo_is_empty": True}
         project = Project(
             name="StillEmpty",
             user_id=TEST_USER_ID,
@@ -1356,7 +1469,7 @@ class TestMaybeRefreshEmptyBuildConfig:
             github_owner="acme",
             github_repo="boom-repo",
             integration_branch="develop",
-            build_config={"language": "python", "directories": []},
+            build_config={"language": "python", "directories": [], "repo_is_empty": True},
         )
         db_session.add(project)
         await db_session.commit()
@@ -1376,6 +1489,51 @@ class TestMaybeRefreshEmptyBuildConfig:
             refreshed = await maybe_refresh_empty_build_config(project, db_session)
 
         assert refreshed is False
+
+    @pytest.mark.asyncio
+    async def test_refreshes_stale_repo_is_empty_even_when_directories_populated(
+        self, db_session
+    ):
+        """A populated config with repo_is_empty=True still refreshes until the signal flips."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Stale Empty Signal",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="stale-empty-signal",
+            integration_branch="develop",
+            build_config={
+                "language": "python",
+                "directories": [{"path": ".", "type": "python"}],
+                "repo_is_empty": True,
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "backend", "type": "python"}],
+                    "repo_is_empty": False,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is True
+        mock_detect.assert_awaited_once()
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("repo_is_empty") is False
 
 
 class TestClassifyRepoEmptiness:
@@ -1401,23 +1559,31 @@ class TestClassifyRepoEmptiness:
         ]
         assert _classify_repo_emptiness(items) is True
 
-    def test_source_directory_makes_non_empty(self):
+    def test_source_directory_with_one_file_is_still_empty_below_threshold(self):
         items = [
             {"name": "README.md", "type": "file"},
             {"name": "src", "type": "dir"},
+            {"name": "main.py", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is False
+        assert _classify_repo_emptiness(items) is True
 
-    def test_source_manifest_makes_non_empty(self):
+    def test_source_manifest_is_empty_below_threshold(self):
         items = [
-            {"name": "README.md", "type": "file"},
             {"name": "pyproject.toml", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is False
+        assert _classify_repo_emptiness(items) is True
 
-    def test_arbitrary_source_file_makes_non_empty(self):
+    def test_threshold_source_file_count_is_still_empty(self):
         items = [
-            {"name": "main.py", "type": "file"},
+            {"name": f"src/file{i}.py", "type": "file"}
+            for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD)
+        ]
+        assert _classify_repo_emptiness(items) is True
+
+    def test_over_threshold_source_file_count_is_non_empty(self):
+        items = [
+            {"name": f"src/file{i}.py", "type": "file"}
+            for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD + 1)
         ]
         assert _classify_repo_emptiness(items) is False
 

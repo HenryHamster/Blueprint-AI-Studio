@@ -10,7 +10,7 @@ vi.mock('../index.js', () => ({
 }));
 
 import { execFileSync } from 'child_process';
-import { countSourceFiles, detectGreenfield } from './discovery.js';
+import { countSourceFiles, detectGreenfield, isGreenfieldRepo } from './discovery.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
 const setLsFiles = (files: string[]) =>
@@ -49,11 +49,11 @@ describe('countSourceFiles', () => {
     expect(countSourceFiles()).toBe(5);
   });
 
-  it('returns 0 when git ls-files fails', () => {
+  it('returns null when git ls-files fails', () => {
     vi.mocked(execFileSync).mockImplementation(() => {
       throw new Error('not a git repo');
     });
-    expect(countSourceFiles()).toBe(0);
+    expect(countSourceFiles()).toBeNull();
   });
 });
 
@@ -77,5 +77,50 @@ describe('detectGreenfield', () => {
     const files = Array.from({ length: GREENFIELD_SOURCE_FILE_THRESHOLD + 1 }, (_, i) => `src/m${i}.ts`);
     setLsFiles(files);
     expect(detectGreenfield()).toBe(false);
+  });
+
+  it('returns false when the live scan cannot complete', () => {
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw new Error('git unavailable');
+    });
+    expect(detectGreenfield()).toBe(false);
+  });
+});
+
+describe('isGreenfieldRepo', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('is greenfield when the durable signal is true even if the live clone has source', () => {
+    // Source-rich tree (live detectGreenfield() would be false) — the durable
+    // onboarding short-circuit still classifies it greenfield.
+    const files = Array.from({ length: GREENFIELD_SOURCE_FILE_THRESHOLD + 5 }, (_, i) => `src/m${i}.ts`);
+    setLsFiles(files);
+    expect(isGreenfieldRepo({ repo_is_empty: true })).toBe(true);
+  });
+
+  it('is greenfield when the durable signal is absent but the live clone is near-empty', () => {
+    // Config-only tree: durable signal absent, but live detection catches it
+    // (lightly-scaffolded / pre-onboarding-signal repos).
+    setLsFiles(['package.json', 'README.md', 'tsconfig.json', '.gitignore']);
+    expect(isGreenfieldRepo({})).toBe(true);
+    expect(isGreenfieldRepo({ repo_is_empty: false })).toBe(true);
+  });
+
+  it('is NOT greenfield when the durable signal is falsy and the live clone has source', () => {
+    const files = Array.from({ length: GREENFIELD_SOURCE_FILE_THRESHOLD + 1 }, (_, i) => `src/m${i}.ts`);
+    setLsFiles(files);
+    expect(isGreenfieldRepo({ repo_is_empty: false })).toBe(false);
+    expect(isGreenfieldRepo({})).toBe(false);
+  });
+
+  it('falls back to the durable signal when the live scan fails', () => {
+    vi.mocked(execFileSync).mockImplementation(() => {
+      throw new Error('git unavailable');
+    });
+    expect(isGreenfieldRepo({ repo_is_empty: true })).toBe(true);
+    expect(isGreenfieldRepo({ repo_is_empty: false })).toBe(false);
+    expect(isGreenfieldRepo({})).toBe(false);
   });
 });

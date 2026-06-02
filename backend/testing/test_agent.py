@@ -3497,6 +3497,82 @@ async def test_claim_injects_implementation_constraints_in_direction_context(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_injects_live_strategic_intent_and_contract(
+    client: AsyncClient, db_session
+):
+    """Claim surfaces the LIVE problem_model intent/context/constraints as
+    response['strategic_intent'] and the direction's contract fields under
+    direction_context, for a create task with a direction."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Live Intent Test", user_id="test-user-live")
+    project.problem_model = {
+        "intent": {
+            "purpose": "Ship a reliable autonomous coding studio.",
+            "current_focus": "Make operator steering reach workers immediately.",
+        },
+        "context": {
+            "project_type": "internal-tool",
+            "team": "solo",
+        },
+        "constraints": ["Never break the main branch", "Keep PRs small"],
+    }
+    project.vision = {"purpose": "stale legacy vision purpose"}
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Carry live intent",
+            "priority": "high",
+            "completion_criteria": "Workers render live intent and contract.",
+            "context": {
+                "success_evidence": "Claim response exposes strategic_intent.",
+                "retirement_condition": "Live intent reaches every worker type.",
+            },
+        }
+    ]
+    flag_modified(project, "problem_model")
+    flag_modified(project, "vision")
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do the work"}],
+        vm_instance_id="agent-vm-live-intent",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-live-intent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Live problem model wins over legacy vision (single source, no double-render).
+    assert "strategic_intent" in data, list(data.keys())
+    assert "vision" not in data
+    si = data["strategic_intent"]
+    assert si["purpose"] == "Ship a reliable autonomous coding studio."
+    assert si["current_focus"] == "Make operator steering reach workers immediately."
+    assert si["context"]["project_type"] == "internal-tool"
+    assert si["context"]["team"] == "solo"
+    assert "Never break the main branch" in si["constraints"]
+    assert "Keep PRs small" in si["constraints"]
+
+    # Direction contract fields surfaced under direction_context.
+    contract = data["direction_context"]["contract"]
+    assert contract["completion_criteria"] == "Workers render live intent and contract."
+    assert contract["success_evidence"] == "Claim response exposes strategic_intent."
+    assert contract["retirement_condition"] == "Live intent reaches every worker type."
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_omits_implementation_constraints_when_unset(
     client: AsyncClient, db_session
 ):
@@ -3534,6 +3610,43 @@ async def test_claim_omits_implementation_constraints_when_unset(
 
     dc = resp.json().get("direction_context") or {}
     assert "implementation_constraints" not in dc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_falls_back_to_legacy_vision_when_problem_model_empty(
+    client: AsyncClient, db_session
+):
+    """When problem_model is empty, claim falls back to the legacy vision
+    summary and does not emit strategic_intent."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Legacy Vision Fallback", user_id="test-user-legacy")
+    project.problem_model = {}  # empty → no live intent
+    project.vision = {"purpose": "Legacy vision purpose still rendered."}
+    flag_modified(project, "problem_model")
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do the work"}],
+        vm_instance_id="agent-vm-legacy-vision",
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-legacy-vision")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "strategic_intent" not in data
+    assert data["vision"]["purpose"] == "Legacy vision purpose still rendered."
 
 
 @pytest.mark.smoketest

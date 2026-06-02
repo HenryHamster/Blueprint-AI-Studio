@@ -58,9 +58,10 @@ const NON_SOURCE_BASENAMES = new Set([
  * Counts the real source files in the cloned working tree, excluding
  * config/scaffolding (lockfiles, *.md/*.json/*.yml/*.toml, dotfiles, common
  * manifests). Reuses the same `git ls-files` enumeration as buildFileTree.
- * Returns 0 on any failure (treated as no source).
+ * Returns null when the scan cannot complete, so callers can fall back to the
+ * durable onboarding signal instead of misclassifying an existing repo.
  */
-export function countSourceFiles(): number {
+export function countSourceFiles(): number | null {
   try {
     const out = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' });
     const files = out
@@ -77,7 +78,7 @@ export function countSourceFiles(): number {
     }
     return count;
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -86,9 +87,36 @@ export function countSourceFiles(): number {
  * scaffolding — so the system should bootstrap the foundation from the project
  * goal rather than assume an existing codebase. Gated by a single threshold
  * constant (GREENFIELD_SOURCE_FILE_THRESHOLD).
+ *
+ * Cross-language coupling: the NON_SOURCE_EXT / NON_SOURCE_BASENAMES sets and
+ * GREENFIELD_SOURCE_FILE_THRESHOLD that define "real source" here must stay
+ * aligned with the backend's durable empty-repo classifier
+ * (backend/app/build_config_detection.py). If you change what counts as source
+ * on one side, change it on the other or the durable onboarding signal and this
+ * live prompt-time signal will disagree again.
  */
 export function detectGreenfield(): boolean {
-  return countSourceFiles() <= GREENFIELD_SOURCE_FILE_THRESHOLD;
+  const sourceFileCount = countSourceFiles();
+  if (sourceFileCount === null) return false;
+  return sourceFileCount <= GREENFIELD_SOURCE_FILE_THRESHOLD;
+}
+
+/**
+ * Single greenfield predicate that BOTH the research and plan handlers consult,
+ * so the durable onboarding gate and the prompt-time gate can never disagree.
+ *
+ * Reconciles two signals:
+ *  - the DURABLE onboarding signal `task.repo_is_empty` (persisted as
+ *    `build_config.repo_is_empty` from the shallow onboarding scan), and
+ *  - the LIVE full-clone `detectGreenfield()` scan of the working tree.
+ *
+ * The repo is greenfield when EITHER says so. The short-circuiting OR keeps the
+ * durable onboarding classification authoritative while letting the live scan
+ * catch lightly-scaffolded repos the shallow onboarding scan may have missed,
+ * and projects onboarded before the durable signal existed.
+ */
+export function isGreenfieldRepo(task: Record<string, unknown>): boolean {
+  return Boolean(task.repo_is_empty) || detectGreenfield();
 }
 
 // ── Test Convention Extraction ───────────────────────────────────────────────

@@ -452,6 +452,61 @@ describe('buildContextPrefix', () => {
     expect(buildContextPrefix(task)).not.toContain('## Project Vision');
   });
 
+  it('renders ## Strategic Intent (purpose, focus, context, constraints) when task.strategic_intent is present', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      strategic_intent: {
+        purpose: 'Ship a reliable autonomous coding studio.',
+        current_focus: 'Make operator steering reach workers immediately.',
+        context: { project_type: 'internal-tool', team: 'solo' },
+        constraints: ['Never break the main branch', 'Keep PRs small'],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Strategic Intent');
+    expect(result).toContain('**Purpose:** Ship a reliable autonomous coding studio.');
+    expect(result).toContain('**Current focus:** Make operator steering reach workers immediately.');
+    expect(result).toContain('- Project type: internal-tool');
+    expect(result).toContain('- Team: solo');
+    expect(result).toContain('- Never break the main branch');
+    expect(result).toContain('- Keep PRs small');
+  });
+
+  it('does not render ## Strategic Intent when task.strategic_intent is absent', () => {
+    const task = { payloads: [{ type: 'create' }] };
+    expect(buildContextPrefix(task)).not.toContain('## Strategic Intent');
+  });
+
+  it('renders direction contract fields (completion/success/retirement) in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'Carry live intent',
+        priority: 'high',
+        contract: {
+          completion_criteria: 'Workers render live intent and contract.',
+          success_evidence: 'Claim response exposes strategic_intent.',
+          retirement_condition: 'Live intent reaches every worker type.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Completion criteria:** Workers render live intent and contract.');
+    expect(result).toContain('**Success evidence:** Claim response exposes strategic_intent.');
+    expect(result).toContain('**Retirement condition:** Live intent reaches every worker type.');
+  });
+
+  it('does not render contract lines when direction_context.contract is absent', () => {
+    const task = {
+      direction_context: { title: 'No contract', priority: 'low' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Completion criteria:**');
+    expect(result).not.toContain('**Success evidence:**');
+    expect(result).not.toContain('**Retirement condition:**');
+  });
+
   it('renders narrative (established findings, open questions, last cycle) in Direction Context', () => {
     const task = {
       direction_context: {

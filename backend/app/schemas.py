@@ -310,15 +310,15 @@ class BuildConfig(BaseModel):
     stale_branch_prefixes: List[str] | None = None
     protected_branches: List[str] | None = None
     enable_self_improvement: bool = False
-    # Deterministic empty/near-empty repo signal, computed once at onboarding
-    # from the root directory listing already fetched during build-config
-    # detection (see ``admin_onboard._classify_repo_emptiness``). True when the
-    # repo has no source directories and every root file is a non-source
-    # scaffolding/config file (README, LICENSE, CI dotfiles, etc.). Surfaced on
-    # the agent claim response as ``repo_is_empty`` so research/plan prompts can
-    # gate bootstrap-from-goal guidance on real code presence instead of the
-    # playbook-count ``first_task_on_repo`` proxy. Default False so pre-existing
-    # projects (and any repo with detected source) degrade gracefully.
+    # Deterministic empty/near-empty repo signal, computed at onboarding from
+    # the already-fetched root + first-level subdirectory listings during
+    # build-config detection (see ``admin_onboard._classify_repo_emptiness``).
+    # True when the repo has at most the greenfield source-file threshold after
+    # excluding docs/config/data files, dotfiles, and common manifests. Keep
+    # this count-based rule aligned with the agent's prompt-time detector so
+    # research/plan bootstrap guidance and the durable onboarding signal agree.
+    # Default False so pre-existing projects (and any repo with detected source)
+    # degrade gracefully.
     repo_is_empty: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
