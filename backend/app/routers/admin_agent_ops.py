@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import uuid
+from datetime import timedelta
 from typing import Any, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -1212,6 +1213,62 @@ async def strategic_operation(
         spawn_payload = _validate_internal_payload(
             spawn_payload, f"strategic_spawn_task:{spawn_type}"
         )
+
+        # Idempotency guard against retry-duplicated spawns.
+        #
+        # ``spawn_task`` is a non-idempotent POST, and the strategic agent's
+        # shell helper (``_call`` in strategic-helpers.ts) retries on any
+        # non-2xx — including its own ``curl --max-time 30`` timeout. When this
+        # endpoint runs slow (e.g. event-loop saturation pushed one observed
+        # call to 93s), the agent abandons the in-flight request and retries;
+        # the abandoned request still commits server-side, so one logical spawn
+        # produces two identical tasks (incident 2026-06-02: 00a63ec1 / 65108ef3
+        # — same parent strategic review, byte-identical payload, 59s apart).
+        #
+        # The agent's retry is strictly sequential (timeout -> 5s sleep ->
+        # retry), so the duplicate requests are never concurrent; a plain
+        # read-then-skip closes the hole. Keying on the *source* strategic
+        # task means a same-(type, title) match is always a true duplicate (a
+        # single review run never legitimately re-spawns the identical task),
+        # so this only collapses accidental retries — it does not constrain the
+        # strategic agent's judgement across distinct reviews.
+        dedup_since = _utcnow() - timedelta(minutes=30)
+        dupe_stmt = (
+            select(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.created_by == "STRATEGIC_AGENT",
+                Task.title == title,
+                Task.created_at >= dedup_since,
+            )
+            .order_by(Task.created_at.asc())
+        )
+        for candidate in (await session.execute(dupe_stmt)).scalars().all():
+            cctx = candidate.context or {}
+            if (
+                cctx.get("spawned_by") == "strategic_direct"
+                and cctx.get("parent_strategic_task_id") == str(task.id)
+                and (candidate.first_payload or {}).get("type") == spawn_type
+            ):
+                logger.info(
+                    "[STRATEGIC API] spawn_task idempotency: returning existing "
+                    "%s for duplicate spawn from strategic review %s "
+                    "(type=%s, title=%r)",
+                    candidate.id,
+                    task.id,
+                    spawn_type,
+                    title,
+                )
+                return _resp(
+                    {
+                        "status": "ok",
+                        "op": "spawn_task",
+                        "task_id": str(candidate.id),
+                        "type": spawn_type,
+                        "priority": candidate.priority,
+                        "deduplicated": True,
+                    }
+                )
 
         new_task_ctx: dict = {
             "spawned_by": "strategic_direct",
