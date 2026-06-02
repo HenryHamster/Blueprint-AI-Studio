@@ -9738,6 +9738,74 @@ async def test_system_verification_uses_project_repo_and_integration_branch(
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket,key,marker",
+    [
+        ("systems", "system_verification", "systems/ctx"),
+        ("capabilities", "capability_verification", "capabilities/ctxcap"),
+    ],
+)
+async def test_symbol_verification_passes_branch_context_to_symbol_checks(
+    db_session, mocker, bucket, key, marker
+):
+    direction = _active_direction(f"d-{bucket}-symbol-ctx", "Improve symbol-aware")
+    design_doc = {
+        marker: {
+            "status": "mature" if bucket == "systems" else "working",
+            "modules": ["backend/app/ctx.py:missing_symbol"],
+            (
+                "description" if bucket == "systems" else "notes"
+            ): "Depends on backend/app/ctx.py:missing_symbol.",
+        }
+    }
+    project = Project(
+        name=f"{bucket.title()} Symbol Context",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    seen_kwargs = {}
+
+    async def _classify(paths, **kwargs):
+        return paths, []
+
+    async def _detect(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return ["backend/app/ctx.py:missing_symbol"]
+
+    mocker.patch(
+        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+    )
+    mocker.patch("app.autonomous_research.detect_absent_symbols", side_effect=_detect)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("ghs_test", "acme", "widget")),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert (
+        payload[key]["ctx" if bucket == "systems" else "ctxcap"]["status"]
+        == "claimed_absent"
+    )
+    assert seen_kwargs == {
+        "branch": "automain",
+        "project_id": str(project.id),
+        "token": "ghs_test",
+        "owner": "acme",
+        "repo": "widget",
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Design-doc capability verification (claimed-but-absent / partial / untouched)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -9808,6 +9876,61 @@ async def test_capability_verification_path_in_notes_flagged(db_session, mocker)
     assert cv is not None
     assert cv["notescap"]["status"] == "claimed_absent"
     assert cv["notescap"]["missing"] == ["backend/app/notes_only.py"]
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_passes_branch_context_to_symbol_checks(
+    db_session, mocker
+):
+    direction = _active_direction("d-capverif-symbol-ctx", "Improve symbol-aware capability")
+    project = Project(
+        name="CapVerif Symbol Context",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/ctxcap": {
+                "status": "working",
+                "modules": ["backend/app/ctx.py:missing_symbol"],
+                "notes": "Uses backend/app/ctx.py:missing_symbol.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    seen_kwargs = {}
+
+    async def _classify(paths, **kwargs):
+        return paths, []
+
+    async def _detect(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return ["backend/app/ctx.py:missing_symbol"]
+
+    mocker.patch(
+        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+    )
+    mocker.patch("app.autonomous_research.detect_absent_symbols", side_effect=_detect)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("ghs_test", "acme", "widget")),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert payload["capability_verification"]["ctxcap"]["status"] == "claimed_absent"
+    assert seen_kwargs == {
+        "branch": "automain",
+        "project_id": str(project.id),
+        "token": "ghs_test",
+        "owner": "acme",
+        "repo": "widget",
+    }
 
 
 @pytest.mark.asyncio

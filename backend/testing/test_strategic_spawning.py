@@ -2650,7 +2650,7 @@ async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
         new=AsyncMock(return_value=verification_context),
     )
     reconcile_mock = mocker.patch(
-        "app.strategic_spawning.reconcile_design_doc",
+        "app.strategic_spawning.ground_design_doc",
         new=AsyncMock(return_value=reconciled_design_doc),
     )
     mocker.patch(
@@ -2669,6 +2669,153 @@ async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
     reconcile_mock.assert_awaited_once_with(
         _agent_view_design_doc(project.design_doc), **verification_context
     )
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_payload_downgrades_symbol_absent_entry(
+    db_session, mocker
+):
+    """A FILE-PRESENT but SYMBOL-ABSENT entry is downgraded to missing in the payload.
+
+    Exercises the real symbol-aware ``ground_design_doc`` walker (NOT mocked):
+    the backing file still exists on the branch (file-level pass leaves the entry
+    alone), but the specifically-cited ``path:symbol`` was deleted, so the
+    symbol-level pass downgrades the entry to ``missing`` with a presence_warning
+    naming the absent symbol — the post-refactor facade case file-level grounding
+    cannot see.
+    """
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "automain",
+        "project_id": "proj-789",
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "functional",
+                "modules": ["backend/app/api.py"],
+                "description": "Serves requests via backend/app/api.py:deleted_func.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_shipped_changes_manifest",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+    # File still present on the branch → file-level pass does NOT downgrade.
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        new=AsyncMock(return_value=True),
+    )
+    # Cited symbol is unambiguously absent from the present file → symbol-level
+    # pass downgrades the entry.
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=False),
+    )
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    assert entry["status"] == "missing"
+    assert "backend/app/api.py:deleted_func" in entry["presence_warning"]
+    assert "[reconciled:" in entry["description"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_symbol_indeterminate_leaves_entry(
+    db_session, mocker
+):
+    """An indeterminate symbol result never downgrades a file-present entry."""
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "automain",
+        "project_id": "proj-790",
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "functional",
+                "modules": ["backend/app/api.py"],
+                "description": "Serves requests via backend/app/api.py:maybe_func.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_shipped_changes_manifest",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        new=AsyncMock(return_value=True),
+    )
+    # Indeterminate (None) and present (True) symbol results must NOT downgrade.
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=None),
+    )
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    assert entry["status"] == "functional"
+    assert "presence_warning" not in entry
 
 
 @pytest.mark.asyncio
@@ -2733,7 +2880,7 @@ async def test_spawn_strategic_review_payload_uses_reconciled_design_doc(
         new=AsyncMock(return_value=verification_context),
     )
     reconcile_mock = mocker.patch(
-        "app.strategic_spawning.reconcile_design_doc",
+        "app.strategic_spawning.ground_design_doc",
         new=AsyncMock(return_value=reconciled_design_doc),
     )
     mocker.patch(

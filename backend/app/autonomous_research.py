@@ -1267,6 +1267,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             absent_symbols = await detect_absent_symbols(
                 dval.get("modules"),
                 [dval.get("description"), dval.get("notes")],
+                **verification_kwargs,
             )
             if absent_symbols and status != "claimed_absent":
                 status = "claimed_absent"
@@ -1326,6 +1327,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             absent_symbols = await detect_absent_symbols(
                 dval.get("modules"),
                 [dval.get("notes"), dval.get("description")],
+                **verification_kwargs,
             )
             if absent_symbols and status != "claimed_absent":
                 status = "claimed_absent"

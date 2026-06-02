@@ -29,7 +29,7 @@ from app.models import (
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.source_ref_validation import (
     classify_existing_paths,
-    reconcile_design_doc,
+    ground_design_doc,
     resolve_branch_verification_context,
 )
 import app.shared_state as _shared_state
@@ -1534,7 +1534,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # it: present-but-absent systems/capabilities are downgraded so the agent
     # never sees a status the backing code can't support. Read-only/advisory —
     # the stored design_doc is untouched; reconcile operates on the agent view.
-    reconciled_design_doc = await reconcile_design_doc(
+    reconciled_design_doc = await ground_design_doc(
         _agent_view_design_doc(project.design_doc), **verification_kwargs
     )
 
@@ -2388,7 +2388,7 @@ async def _spawn_strategic_review(
         {
             "type": "strategic_review",
             "research_mode": "strategic",
-            "design_doc": await reconcile_design_doc(
+            "design_doc": await ground_design_doc(
                 _agent_view_design_doc(project.design_doc), **verification_kwargs
             ),
             "vision": project.vision or {},

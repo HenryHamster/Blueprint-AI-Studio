@@ -35,10 +35,7 @@ from app.playbook_storage import (
 )
 from app.routers.agent import verify_agent_token
 from app.source_ref_validation import (
-    _PRESENT_CAPABILITY_STATUSES,
-    _PRESENT_SYSTEM_STATUSES,
-    detect_absent_symbols as _detect_absent_symbols,
-    reconcile_design_doc_presence as _reconcile_design_doc_presence,
+    ground_design_doc_value,
     resolve_branch_verification_context as _resolve_branch_verification_context,
 )
 from app.shared_state import (
@@ -110,75 +107,6 @@ class DesignDocUpdate(BaseModel):
     value: Any | None = None
 
 
-async def _ground_design_doc_value(value: Any, key: str, **verification_kwargs: Any) -> Any:
-    """File- AND symbol-level grounding for an on-demand design-doc read.
-
-    First applies the file-level reconciliation (downgrades a present-status
-    system/capability entry whose every referenced file is absent on the
-    integration branch). If the entry survives as present-status, additionally
-    flags it when a cited ``path:symbol`` pointer names a symbol that is
-    unambiguously absent from a file that still exists — the post-refactor
-    facade case the file-level check cannot see (the file passes, but the symbol
-    implementing the behavior was deleted or moved). Such an entry receives the
-    same "treat as missing" downgrade a fully-absent file already does.
-
-    Conservative, mirroring the file-level semantics: a symbol is flagged only on
-    an unambiguous absence (file present at HEAD, no plausible definition). An
-    indeterminate result (git unavailable / non-repo) or a present symbol never
-    downgrades the entry.
-
-    *verification_kwargs* (branch/token/owner/repo/project_id, from
-    :func:`resolve_branch_verification_context`) ground BOTH the file-level
-    reconcile and the symbol-level absence check against the project's real
-    integration branch via the GitHub API rather than the orchestrator's local
-    checkout (which does not exist on the backend). When credentials are absent
-    the kwargs degrade to branch-only and both checks fall back to local git
-    HEAD, preserving the conservative indeterminate-never-flags semantics.
-    """
-    value = await _reconcile_design_doc_presence(value, key, **verification_kwargs)
-    if not isinstance(value, dict) or not isinstance(key, str):
-        return value
-    if key.startswith("systems/"):
-        present_statuses = _PRESENT_SYSTEM_STATUSES
-        text_field = "description"
-    elif key.startswith("capabilities/"):
-        present_statuses = _PRESENT_CAPABILITY_STATUSES
-        text_field = "notes"
-    else:
-        return value
-    # A non-present status means the file-level pass already downgraded it (or it
-    # never claimed to be built) — nothing for the symbol check to add.
-    status = str(value.get("status") or "").strip().lower()
-    if status not in present_statuses:
-        return value
-
-    modules = value.get("modules")
-    module_pointers = modules if isinstance(modules, list) else []
-    absent = await _detect_absent_symbols(
-        module_pointers,
-        [value.get("notes"), value.get("description")],
-        **verification_kwargs,
-    )
-    if not absent:
-        return value
-
-    warning = (
-        f"claimed {status} but cited symbol(s) {', '.join(absent)} are absent "
-        f"even though the file exists — treat as missing"
-    )
-    downgraded: dict[str, Any] = {
-        **value,
-        "status": "missing",
-        "presence_warning": warning,
-    }
-    raw_text = value.get(text_field)
-    existing = raw_text.strip() if isinstance(raw_text, str) else ""
-    downgraded[text_field] = (
-        f"{existing} " if existing else ""
-    ) + f"[reconciled: {warning}]"
-    return downgraded
-
-
 @router.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
 async def update_design_doc(
@@ -232,7 +160,7 @@ async def update_design_doc(
             if project
             else {}
         )
-        value = await _ground_design_doc_value(
+        value = await ground_design_doc_value(
             value, payload.key, **verification_kwargs
         )
         return {"key": payload.key, "value": value}

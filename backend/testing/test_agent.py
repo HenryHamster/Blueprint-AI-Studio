@@ -2579,8 +2579,8 @@ async def test_design_doc_get_reconciles_absent_capability_entry(
         srv, "_path_exists_at_head", AsyncMock(return_value=False)
     )
     monkeypatch.setattr(
-        "app.routers.admin_agent_ops._reconcile_design_doc_presence",
-        partial(srv.reconcile_design_doc_presence, repo_root=str(tmp_path)),
+        "app.routers.admin_agent_ops.ground_design_doc_value",
+        partial(srv.ground_design_doc_value, repo_root=str(tmp_path)),
     )
 
     project = Project(
@@ -3087,8 +3087,8 @@ def _patch_grounding(monkeypatch, tmp_path, *, file_present, symbol_verdict):
         srv, "_symbol_defined_at_head", AsyncMock(return_value=symbol_verdict)
     )
     monkeypatch.setattr(
-        "app.routers.admin_agent_ops._reconcile_design_doc_presence",
-        partial(srv.reconcile_design_doc_presence, repo_root=str(tmp_path)),
+        "app.routers.admin_agent_ops.ground_design_doc_value",
+        partial(srv.ground_design_doc_value, repo_root=str(tmp_path)),
     )
 
 

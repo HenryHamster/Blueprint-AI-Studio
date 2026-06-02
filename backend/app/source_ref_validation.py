@@ -762,6 +762,140 @@ async def reconcile_design_doc(
     return out
 
 
+async def ground_design_doc_value(
+    value: Any,
+    key: str,
+    repo_root: str = _REPO_ROOT,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> Any:
+    """File- AND symbol-level grounding for a single design-doc entry.
+
+    First applies the file-level reconciliation
+    (:func:`reconcile_design_doc_presence`): a present-status system/capability
+    entry whose every referenced backing file is absent on the integration
+    branch is downgraded to ``missing``. If the entry survives as present-status,
+    it then runs the symbol-level check (:func:`detect_absent_symbols` over the
+    entry's ``modules`` list plus its notes/description text) and, when a cited
+    ``path:symbol`` pointer names a symbol that is unambiguously absent from a
+    file that still exists (the post-refactor facade case the file-level check
+    cannot see), applies the same "treat as missing" downgrade — annotating the
+    text field and naming the absent symbol(s) in a ``presence_warning``.
+
+    Conservative, mirroring the file-level semantics: a symbol is flagged only on
+    an unambiguous absence (file present at HEAD, no plausible definition). An
+    indeterminate result (git unavailable / non-repo) or a present symbol never
+    downgrades the entry.
+
+    Shared, public, self-contained helper: the symbol-aware sibling of the
+    per-entry file-only :func:`reconcile_design_doc_presence`, reusable by the
+    admin read path and the strategic-payload path. ``token``/``owner``/``repo``/
+    ``branch``/``project_id`` ground BOTH passes against the project's real
+    integration branch via the GitHub API; when credentials are absent both
+    checks fall back to local git HEAD.
+    """
+    value = await reconcile_design_doc_presence(
+        value,
+        key,
+        repo_root,
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
+    )
+    if not isinstance(value, dict) or not isinstance(key, str):
+        return value
+    if key.startswith("systems/"):
+        present_statuses = _PRESENT_SYSTEM_STATUSES
+        text_field = "description"
+    elif key.startswith("capabilities/"):
+        present_statuses = _PRESENT_CAPABILITY_STATUSES
+        text_field = "notes"
+    else:
+        return value
+    # A non-present status means the file-level pass already downgraded it (or it
+    # never claimed to be built) — nothing for the symbol check to add.
+    status = str(value.get("status") or "").strip().lower()
+    if status not in present_statuses:
+        return value
+
+    modules = value.get("modules")
+    module_pointers = modules if isinstance(modules, list) else []
+    absent = await detect_absent_symbols(
+        module_pointers,
+        [value.get("notes"), value.get("description")],
+        token=token,
+        owner=owner,
+        repo=repo,
+        branch=branch,
+        project_id=project_id,
+    )
+    if not absent:
+        return value
+
+    warning = (
+        f"claimed {status} but cited symbol(s) {', '.join(absent)} are absent "
+        f"even though the file exists — treat as missing"
+    )
+    downgraded: dict[str, Any] = {
+        **value,
+        "status": "missing",
+        "presence_warning": warning,
+    }
+    raw_text = value.get(text_field)
+    existing = raw_text.strip() if isinstance(raw_text, str) else ""
+    downgraded[text_field] = (
+        f"{existing} " if existing else ""
+    ) + f"[reconciled: {warning}]"
+    return downgraded
+
+
+async def ground_design_doc(
+    doc: Any,
+    *,
+    repo_root: str = _REPO_ROOT,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> Any:
+    """Symbol-aware reconcile of every ``systems/*``/``capabilities/*`` entry.
+
+    The symbol-aware sibling of the file-only :func:`reconcile_design_doc`
+    walker: applies the combined file- AND symbol-level
+    :func:`ground_design_doc_value` to each system/capability key, forwarding the
+    GitHub verification context so present-but-absent entries — whether their
+    backing file is gone OR their cited symbol was deleted from a still-present
+    file — are downgraded against the project's real integration branch (and the
+    local-git fallback otherwise). Non system/capability keys are passed through
+    untouched. Operates on a shallow copy: the input mapping is never mutated.
+    """
+    if not isinstance(doc, dict):
+        return doc
+    out: dict[str, Any] = dict(doc)
+    for entry_key, entry_value in doc.items():
+        if not isinstance(entry_key, str):
+            continue
+        if entry_key.startswith("systems/") or entry_key.startswith("capabilities/"):
+            out[entry_key] = await ground_design_doc_value(
+                entry_value,
+                entry_key,
+                repo_root,
+                token=token,
+                owner=owner,
+                repo=repo,
+                branch=branch,
+                project_id=project_id,
+            )
+    return out
+
+
 async def resolve_branch_verification_context(session: Any, project: Any) -> Dict[str, str]:
     """Resolve the GitHub-backed verification context for design-doc grounding.
 
