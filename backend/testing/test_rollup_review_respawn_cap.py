@@ -258,6 +258,8 @@ async def test_at_cap_with_gates_off_skips_child_instead_of_escalating(
     # Wedged child skipped so it drops from the unmerged set next cycle.
     await rollup_db.refresh(child)
     assert (child.context or {}).get("pr_merged") is True
+    assert (child.context or {}).get("landed_on_integration") is False
+    assert (child.context or {}).get("_non_merge_unblock_reason") == "review_respawn_cap"
     assert (child.context or {}).get("_rollup_skipped_reason") == "review_respawn_cap"
     # Alert still raised so the dropped subtask is visible (not silent).
     mock_alert.assert_awaited()

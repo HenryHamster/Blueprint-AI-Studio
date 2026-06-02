@@ -25,6 +25,7 @@ from app.branch_resolution import (
     classify_rollup_merge_outcome,
     merged_pr_counts_as_integration_landing,
 )
+from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
 from app.models import (
     Artifact,
     ArtifactType,
@@ -55,6 +56,52 @@ def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
     payload = task.first_payload or {}
     ctx = task.context or {}
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
+
+
+def _merge_context_with_hotfix_non_landing(
+    task: Task,
+    project: Project | None,
+    *,
+    base_context: Dict[str, Any],
+    landed_branch: str,
+    record_pr_merged: bool,
+    preserve_hotfix_non_landing: bool = True,
+) -> Dict[str, Any]:
+    """Preserve merge-equivalent unblock semantics for hotfix promotion merges."""
+    task.context = dict(base_context)
+
+    if record_pr_merged:
+        apply_merged_landed_signal(
+            task,
+            project,
+            base_branch=landed_branch,
+            hotfix_lane=_promotion_target_merge_allowed(task, landed_branch),
+            non_merge_reason="merged_pr_non_integration_branch",
+        )
+        return dict(task.context or {})
+
+    if (
+        not preserve_hotfix_non_landing
+        or project is None
+        or not _promotion_target_merge_allowed(task, landed_branch)
+    ):
+        return dict(base_context)
+
+    from app.shared_state import get_project_promotion_target
+
+    promotion_target = get_project_promotion_target(project)
+    integration_branch = get_project_integration_branch(project)
+    if (
+        landed_branch == promotion_target
+        and landed_branch != integration_branch
+    ):
+        mark_unblocked_non_merge(
+            task,
+            reason="merged_pr_non_integration_branch",
+        )
+        return dict(task.context or {})
+
+    return dict(base_context)
 
 
 async def _block_admin_merge_for_branch_safety(
@@ -402,10 +449,22 @@ async def _handle_rollup_pr_approval(
                 if terminal_rollup_merge
                 else TaskStatus.EVALUATING
             )
-            task.context = {
-                **ctx,
-                **({"pr_merged": True} if record_pr_merged else {}),
-            }
+            # The hotfix lane is intentionally allowed to merge to the promotion
+            # target (see _promotion_target_merge_allowed). When it does, the
+            # work never landed on the integration branch, so record_pr_merged
+            # is False — but it must still unblock the rollup as a
+            # merge-equivalent non-landing. Preserve that hotfix unblock here so
+            # the hotfix path stamps pr_merged=True / landed_on_integration=False
+            # while the non-hotfix promotion-target landing stays unqualified
+            # (pr_merged unset).
+            task.context = _merge_context_with_hotfix_non_landing(
+                task,
+                _project,
+                base_context=ctx,
+                landed_branch=landed_branch,
+                record_pr_merged=record_pr_merged,
+                preserve_hotfix_non_landing=True,
+            )
             if terminal_rollup_merge:
                 task.latest_status_message = (
                     f"Human-approved merge of rollup PR #{rollup_pr_number}"
@@ -637,10 +696,13 @@ async def _merge_critical_pr(
                 source="admin_task_mutations.critical_pr_approval",
             )
             task.status = TaskStatus.COMPLETED
-            task.context = {
-                **ctx,
-                **({"pr_merged": True} if record_pr_merged else {}),
-            }
+            task.context = _merge_context_with_hotfix_non_landing(
+                task,
+                _project,
+                base_context=ctx,
+                landed_branch=base_branch,
+                record_pr_merged=record_pr_merged,
+            )
             task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
             await create_pr_comment(
                 gh_token,

@@ -24,6 +24,7 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.landed_signal import is_merged_completion, landed_signal_predicate
 from app.time_utils import _to_naive_utc
 
 logger = logging.getLogger(__name__)
@@ -578,8 +579,7 @@ async def compute_remediation_funnel(
         "merged": sum(
             1
             for t in _ci_rem_tasks
-            if t.status == TaskStatus.COMPLETED
-            and (t.context or {}).get("pr_merged") is True
+            if is_merged_completion(t)
         ),
         "failed": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.FAILED),
         "by_ci_failure_type": {},
@@ -594,10 +594,7 @@ async def compute_remediation_funnel(
             ci_type, {"spawned": 0, "merged": 0, "failed": 0}
         )
         bucket["spawned"] += 1
-        if (
-            t.status == TaskStatus.COMPLETED
-            and (t.context or {}).get("pr_merged") is True
-        ):
+        if is_merged_completion(t):
             bucket["merged"] += 1
         elif t.status == TaskStatus.FAILED:
             bucket["failed"] += 1
@@ -607,9 +604,7 @@ async def compute_remediation_funnel(
         t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")
     ]
     _total_with_prior = len(_prior_tasks)
-    _merged_with_prior = sum(
-        1 for t in _prior_tasks if t.status == TaskStatus.COMPLETED
-    )
+    _merged_with_prior = sum(1 for t in _prior_tasks if is_merged_completion(t))
     _failed_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.FAILED)
     _prior_resolved = _merged_with_prior + _failed_with_prior
     prior_investigation_reuse: Dict[str, Any] = {
@@ -629,7 +624,7 @@ async def compute_remediation_funnel(
             Task.context.has_key("diagnosis_task_id"),
             Task.auto_remediation.is_(True),  # promoted column (audit W1)
         ),
-        Task.context["pr_merged"].as_boolean() == True,  # noqa: E712
+        landed_signal_predicate(session),
     ]
     if project_id:
         _cum_filters.append(Task.project_id == project_id)

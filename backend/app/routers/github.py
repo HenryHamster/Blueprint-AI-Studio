@@ -28,6 +28,7 @@ from app.github import (
     get_user_installations,
     validate_fine_grained_pat,
 )
+from app.landed_signal import apply_merged_landed_signal
 from app.models import (
     Artifact,
     ArtifactType,
@@ -431,10 +432,16 @@ async def github_webhook(
                                 source="github.pull_request.closed",
                             )
                             if record_pr_merged:
-                                pr_task.context = {
-                                    **(pr_task.context or {}),
-                                    "pr_merged": True,
-                                }
+                                apply_merged_landed_signal(
+                                    pr_task,
+                                    project,
+                                    base_branch=landed_branch,
+                                    hotfix_lane=bool(
+                                        (pr_task.first_payload or {}).get("hotfix")
+                                        or (pr_task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
                                 affected_tasks.append(pr_task)
                                 logger.info(
                                     f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})"

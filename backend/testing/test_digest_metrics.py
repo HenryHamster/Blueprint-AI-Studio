@@ -11,6 +11,7 @@ from app.models import (
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    _compute_first_review_approval_breakdowns,
     compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
@@ -757,6 +758,61 @@ def test_compute_digest_cost_economics_cost_per_merge_by_type():
     assert by_type["create"]["merged_count"] == 1
     assert by_type["create"]["cost_per_merge"] is not None
     assert by_type["create"]["total_cost_usd"] > 0.0
+
+
+def test_compute_digest_cost_economics_excludes_non_merge_unblocks():
+    """Cost-per-merge denominators ignore merge-equivalent non-landings."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    landed = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    staging_only = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1, minutes=30),
+        context={"pr_merged": True, "landed_on_integration": False},
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[landed, staging_only],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    by_type = result["cost_per_merge_by_type"]
+    assert by_type["create"]["merged_count"] == 1
+
+
+def test_first_review_approval_breakdowns_exclude_non_merge_unblocks():
+    """Review-eligible merge analytics require an integration-landing signal."""
+    now = _utcnow()
+    result = _compute_first_review_approval_breakdowns(
+        [
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={"pr_merged": True, "landed_on_integration": True},
+                created_at=now - timedelta(hours=1),
+            ),
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={"pr_merged": True, "landed_on_integration": False},
+                created_at=now - timedelta(hours=1),
+            ),
+        ]
+    )
+
+    assert result["overall"] == 1.0
+    assert result["sample_size"] == 1
 
 
 def test_compute_digest_cost_economics_pipeline_aggregates():
