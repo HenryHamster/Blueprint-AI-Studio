@@ -56,7 +56,19 @@ def cluster_files_by_cochange(
     groups: dict[str, list[str]] = {}
     for f in files:
         groups.setdefault(find(f), []).append(f)
-    return list(groups.values())
+    clusters = list(groups.values())
+    # Reject an all-singletons result: if union-find joined no pair, every file
+    # is its own cluster and there is no real co-change structure to split on.
+    # The affinity guard above can still pass when a single file carries
+    # cochange data only with files OUTSIDE this set, so the loop joins nothing
+    # and we'd otherwise fan a coherent finding out into one task per file
+    # (incident 2026-06-02: research a473833c -> 1 finding -> 5 redundant
+    # "(cluster N/5)" tasks, 1 stalled + 4 cancelled). Treat it as "no
+    # co-change structure" — matching this function's documented contract — and
+    # skip decomposition so the finding stays a single task.
+    if not any(len(c) >= 2 for c in clusters):
+        return None
+    return clusters
 
 
 def cluster_files_by_toplevel_dir(files: list[str]) -> list[list[str]] | None:
