@@ -803,7 +803,7 @@ async def test_verify_pr_merged_no_artifact(cleanup_db, mocker):
 
 @pytest.mark.asyncio
 async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
-    """Rollup-child PR merges unblock the task without marking an integration landing."""
+    """A verified merged child PR is treated as an integration landing."""
     project = await _make_project(cleanup_db)
     task = await _make_task(cleanup_db, project.id, context={})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/42")
@@ -825,8 +825,8 @@ async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
 
     assert result is True
     assert task.context.get("pr_merged") is True
-    assert task.context.get("landed_on_integration") is False
-    assert task.context.get("_non_merge_unblock_reason") == "verified_child_pr_merged"
+    assert task.context.get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in task.context
 
 
 @pytest.mark.asyncio

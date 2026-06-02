@@ -30,7 +30,7 @@ from app.models import (
     Project,
 )
 from app.branch_resolution import merged_pr_counts_as_integration_landing
-from app.landed_signal import mark_unblocked_non_merge
+from app.landed_signal import mark_landed_on_integration, mark_unblocked_non_merge
 
 logger = logging.getLogger(__name__)
 
@@ -204,10 +204,7 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 if record_pr_merged:
                     # Update in-memory first so caller sees the change even if DB write
                     # fails.
-                    mark_unblocked_non_merge(
-                        task,
-                        reason="verified_child_pr_merged",
-                    )
+                    mark_landed_on_integration(task)
                     # Persist to DB in separate session (best-effort — may fail if
                     # caller holds FOR UPDATE lock on this row, but in-memory update is
                     # sufficient for the current rollup cycle).
