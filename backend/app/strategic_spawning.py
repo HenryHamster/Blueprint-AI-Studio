@@ -1596,6 +1596,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         cycle_id=cycle_id,
         phase1_task_id=new_task.id,
         baseline_vision=project.vision or {},
+        baseline_problem_model=project.problem_model or {},
     )
     await session.commit()
     logger.info(

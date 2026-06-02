@@ -3996,6 +3996,133 @@ class TestPatchProblemModel:
         assert pm["revision"] == 4  # bumped
         assert pm["last_updated_by"] == "user"
 
+    @pytest.mark.asyncio
+    async def test_problem_model_stale_revision_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Supplying an outdated problem_model_base_revision returns 409."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Existing.", "current_focus": ""},
+            "revision": 4,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "Clobber."}},
+                "problem_model_base_revision": 1,
+            },
+        )
+        assert resp.status_code == 409
+        msg = resp.json()["error"]["message"]
+        assert "base_revision=1" in msg
+        assert "current=4" in msg
+
+    @pytest.mark.asyncio
+    async def test_problem_model_current_revision_succeeds_and_bumps(
+        self, client: AsyncClient, db_session
+    ):
+        """Matching base_revision saves the patch and bumps the revision."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Old.", "current_focus": ""},
+            "revision": 2,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "New."}},
+                "problem_model_base_revision": 2,
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "New."
+        assert pm["revision"] == 3
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_problem_model_no_base_revision_always_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting problem_model_base_revision skips the CAS check (back-compat)."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Old.", "current_focus": ""},
+            "revision": 7,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"problem_model_patch": {"intent": {"purpose": "Unconditional."}}},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Unconditional."
+        assert pm["revision"] == 8
+
+    @pytest.mark.asyncio
+    async def test_concurrent_problem_model_write_no_data_loss(
+        self, client: AsyncClient, db_session
+    ):
+        """A second writer with a stale base_revision is rejected; the first
+        writer's edit survives intact."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Base.", "current_focus": ""},
+            "revision": 1,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        # First writer succeeds with the correct base revision.
+        resp_a = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "Writer A."}},
+                "problem_model_base_revision": 1,
+            },
+        )
+        assert resp_a.status_code == 200
+
+        # Second writer with the now-stale base revision must be rejected.
+        resp_b = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "Writer B clobber."}},
+                "problem_model_base_revision": 1,
+            },
+        )
+        assert resp_b.status_code == 409
+
+        # Writer A's edit must be intact — not overwritten.
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Writer A."
+        assert pm["revision"] == 2
+
 
 class TestAcknowledgeRunningUpdate:
     """Acknowledge endpoint stamps running_update_acknowledged_at. The

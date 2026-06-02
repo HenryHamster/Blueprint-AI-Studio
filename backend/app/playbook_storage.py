@@ -133,6 +133,12 @@ def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
 _PRESENT_SYSTEM_STATUSES = frozenset({"mature", "functional", "partial"})
 _PRESENT_CAPABILITY_STATUSES = frozenset({"working", "partial"})
 
+# A module pointer may name a specific symbol (``path/to/file.py:symbol``). For
+# file-level existence we want the bare path; the symbol is checked separately
+# by :func:`_absent_symbol_in_present_file`. Only a symbol suffix (starts with a
+# letter/underscore) is stripped — a ``:42`` line-number suffix is left intact.
+_MODULE_SYMBOL_SUFFIX_RE = re.compile(r"^(.+\.\w+):[A-Za-z_]\w*$")
+
 
 def _extract_entry_paths(entry: dict) -> list[str]:
     """Collect unique file-path pointers for a design-doc system/capability.
@@ -147,7 +153,9 @@ def _extract_entry_paths(entry: dict) -> list[str]:
     if isinstance(modules, list):
         for module in modules:
             if isinstance(module, str) and module.strip():
-                paths.append(module.strip())
+                stripped = module.strip()
+                symbol_match = _MODULE_SYMBOL_SUFFIX_RE.match(stripped)
+                paths.append(symbol_match.group(1) if symbol_match else stripped)
     text_parts = [
         entry[key]
         for key in ("notes", "description")
@@ -158,23 +166,92 @@ def _extract_entry_paths(entry: dict) -> list[str]:
     return list(dict.fromkeys(paths))
 
 
+def _absent_symbol_in_present_file(entry: dict, repo_root: str) -> str | None:
+    """Return a ``path:symbol`` ref whose symbol is unambiguously absent from a
+    file that still exists, or ``None``.
+
+    Symbol-level companion to the file-level absence check in
+    :func:`ground_design_doc_systems`. A present-status entry can cite a
+    specific function/class via a ``path:symbol`` pointer (in its ``modules``
+    list or its ``notes`` / ``description`` free text) whose file still exists
+    while the symbol that implemented the behavior was deleted or moved — a
+    common shape in this codebase, where thin re-export facades and post-refactor
+    stubs are routine. The file-existence check then passes even though the cited
+    behavior is not actually built.
+
+    Reuses the proven ``path:symbol`` parsing and definition regex from
+    :mod:`app.source_ref_validation` (the same machinery that grounds research
+    finding claims) but reads the file from *repo_root* synchronously, matching
+    this module's directory-based grounding rather than the git-backed path.
+
+    Conservative by construction, mirroring the file-level semantics: a ref is
+    returned ONLY on an unambiguous absence — the file exists on disk but no
+    plausible definition of the symbol is found. A missing or unreadable file
+    (indeterminate) and a present symbol both yield ``None``, so a partial or
+    indeterminate result is never flagged.
+    """
+    from app.source_ref_validation import (
+        _parse_path_symbol_refs,
+        _symbol_definition_regex,
+    )
+
+    texts: list[str] = []
+    modules = entry.get("modules")
+    if isinstance(modules, list):
+        texts.extend(m for m in modules if isinstance(m, str) and m)
+    texts.extend(
+        entry[key]
+        for key in ("notes", "description")
+        if isinstance(entry.get(key), str) and entry[key]
+    )
+
+    seen: set = set()
+    for text in texts:
+        for path, symbol in _parse_path_symbol_refs(text):
+            if (path, symbol) in seen:
+                continue
+            seen.add((path, symbol))
+            full = os.path.join(repo_root, path)
+            if not os.path.isfile(full):
+                # File absent → a file-level concern (or indeterminate), not a
+                # symbol verdict. Leave it to the file-level check.
+                continue
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                # Unreadable → indeterminate; degrade gracefully, never flag.
+                continue
+            if not _symbol_definition_regex(symbol).search(content):
+                return f"{path}:{symbol}"
+    return None
+
+
 def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
     """Ground design-doc ``systems/*`` and ``capabilities/*`` against the tree.
 
-    When a PRESENT-status entry (mature/functional/partial for systems,
-    working/partial for capabilities) carries at least one backing-module path
-    pointer AND every one of those paths is absent under *repo_root*, persist a
-    ``presence_warning`` and downgrade ``status`` to ``missing`` so the
-    correction survives across cycles and surfaces to the design-doc maintenance
-    and strategic agents.
+    A PRESENT-status entry (mature/functional/partial for systems,
+    working/partial for capabilities) is downgraded to ``missing`` with a
+    persisted ``presence_warning`` — so the correction survives across cycles and
+    surfaces to the design-doc maintenance and strategic agents — when EITHER:
+
+      - *file-level absence*: it carries at least one backing-module path pointer
+        AND every one of those paths is absent under *repo_root*, OR
+      - *symbol-level absence*: it cites a specific ``path:symbol`` pointer whose
+        file still exists under *repo_root* but whose symbol is unambiguously gone
+        (see :func:`_absent_symbol_in_present_file`). This catches re-export
+        facades and post-refactor stubs where the file survives but the symbol
+        that implemented the behavior was deleted or moved.
 
     Conservative by construction (mirrors
     agent/src/utils/design-doc-presence.ts):
       - no-op when *repo_root* is falsy or not a directory,
-      - partial hits (some paths present) are left untouched — the code
-        partially exists, so the present-status claim is plausible,
+      - partial hits (some paths present) are left untouched at the file level —
+        the code partially exists, so the present-status claim is plausible,
       - entries with no path pointer are left untouched (absence of a path is
-        not evidence of absent code).
+        not evidence of absent code),
+      - a symbol is flagged only on an unambiguous absence; an indeterminate
+        result (file gone/unreadable) or a present symbol never flags.
 
     Idempotent: once downgraded to ``missing`` the entry falls out of the
     present-status set and is skipped on subsequent sweeps. Mutates and returns
@@ -200,31 +277,45 @@ def ground_design_doc_systems(doc: dict, repo_root: str) -> dict:
             continue
 
         paths = _extract_entry_paths(value)
-        # No pointer at all → absence of a path is NOT evidence of absent code.
-        if not paths:
-            continue
 
-        # Only downgrade when EVERY referenced path is gone. A partial hit means
-        # the code partially exists, so the present-status claim is plausible.
-        all_missing = all(
+        # File-level absence: downgrade only when EVERY referenced path is gone.
+        # No pointer at all → absence of a path is NOT evidence of absent code; a
+        # partial hit means the code partially exists, so the claim is plausible.
+        file_absent = bool(paths) and all(
             not os.path.exists(os.path.join(repo_root, path)) for path in paths
         )
-        if not all_missing:
+
+        # Symbol-level absence: a cited symbol is gone even though its file still
+        # exists. Complementary to (not a replacement for) the file-level check —
+        # only consulted when the file-level check did not already fire.
+        absent_symbol = (
+            None if file_absent else _absent_symbol_in_present_file(value, repo_root)
+        )
+
+        if not file_absent and absent_symbol is None:
             continue
 
-        warning = (
-            f"claimed {status} but all referenced module file(s) are absent on "
-            f"the integration branch — treat as missing"
-        )
+        if file_absent:
+            warning = (
+                f"claimed {status} but all referenced module file(s) are absent "
+                f"on the integration branch — treat as missing"
+            )
+            detail = f"all referenced paths absent: {paths}"
+        else:
+            warning = (
+                f"claimed {status} but cited symbol '{absent_symbol}' is absent on "
+                f"the integration branch though its file exists — treat as missing"
+            )
+            detail = f"cited symbol absent: {absent_symbol}"
         entry = dict(value)
         entry["status"] = "missing"
         entry["presence_warning"] = warning
         doc[key] = entry
         updated = True
         logger.debug(
-            "[DESIGN-DOC] Grounded '%s' to missing (all referenced paths absent: %s)",
+            "[DESIGN-DOC] Grounded '%s' to missing (%s)",
             key,
-            paths,
+            detail,
         )
 
     if updated:

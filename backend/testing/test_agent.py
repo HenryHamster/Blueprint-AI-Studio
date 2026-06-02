@@ -2743,6 +2743,123 @@ async def test_design_doc_get_leaves_summary_entry_unchanged(
     assert resp.json()["value"] == "Project overview."
 
 
+async def _design_doc_get(client, db_session, key, entry, vm):
+    """Create a project + design-doc task and GET *key*, returning the value."""
+    project = Project(
+        name=f"Design Doc Symbol Test {vm}",
+        user_id="test-user-123",
+        design_doc={key: entry},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id=vm,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm, task_type="design_doc_update")
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": key},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    return resp.json()["value"]
+
+
+def _patch_grounding(monkeypatch, tmp_path, *, file_present, symbol_verdict):
+    """Make file-level reconcile + symbol resolution hermetic for the read path.
+
+    ``file_present`` controls the file-existence probe; ``symbol_verdict`` is the
+    ``_symbol_defined_at_head`` result (True present / False absent / None
+    indeterminate) used by the symbol-level grounding pass.
+    """
+    from functools import partial
+
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        srv, "_path_exists_at_head", AsyncMock(return_value=file_present)
+    )
+    monkeypatch.setattr(
+        srv, "_symbol_defined_at_head", AsyncMock(return_value=symbol_verdict)
+    )
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._reconcile_design_doc_presence",
+        partial(srv.reconcile_design_doc_presence, repo_root=str(tmp_path)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_present_file_present_symbol_not_flagged(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Present file + present cited symbol → entry keeps its working status.
+    _patch_grounding(monkeypatch, tmp_path, file_present=True, symbol_verdict=True)
+    value = await _design_doc_get(
+        client,
+        db_session,
+        "capabilities/grounding",
+        {
+            "status": "working",
+            "notes": "Implemented in backend/app/real.py:ground_systems end to end.",
+        },
+        "agent-vm-dd-sym-present",
+    )
+    assert value["status"] == "working"
+    assert "presence_warning" not in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_present_file_absent_symbol_downgraded(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Present file + absent cited symbol (post-refactor facade) → treat as missing.
+    _patch_grounding(monkeypatch, tmp_path, file_present=True, symbol_verdict=False)
+    value = await _design_doc_get(
+        client,
+        db_session,
+        "capabilities/grounding",
+        {
+            "status": "working",
+            "notes": "The backend/app/facade.py:ground_systems path handles it.",
+        },
+        "agent-vm-dd-sym-absent",
+    )
+    assert value["status"] == "missing"
+    assert "presence_warning" in value
+    assert "ground_systems" in value["presence_warning"]
+    assert "file exists" in value["presence_warning"]
+    assert "[reconciled:" in value["notes"]
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_indeterminate_symbol_not_flagged(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Indeterminate symbol resolution (git unavailable) → never flagged.
+    _patch_grounding(monkeypatch, tmp_path, file_present=True, symbol_verdict=None)
+    value = await _design_doc_get(
+        client,
+        db_session,
+        "systems/core",
+        {
+            "status": "mature",
+            "modules": ["backend/app/facade.py:ground_systems"],
+        },
+        "agent-vm-dd-sym-indeterminate",
+    )
+    assert value["status"] == "mature"
+    assert "presence_warning" not in value
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_playbook_size_limits(client: AsyncClient, db_session):

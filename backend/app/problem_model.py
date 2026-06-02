@@ -313,9 +313,32 @@ class ProblemModel(BaseModel):
     revision_log: list[RevisionLogEntry] = Field(default_factory=list)
     """Last N revisions' deltas. Capped at REVISION_LOG_MAX."""
 
+    rejected_agent_edits: list[dict[str, Any]] = Field(default_factory=list)
+    """Operator-wins 3-way-merge ledger.
+
+    When a strategic cycle's agent write lands on an operator-owned field
+    (``intent.purpose`` / ``context`` / ``constraints``) the operator edited
+    mid-cycle, the operator's value is kept and the overridden agent value is
+    appended here (see :func:`_merge_operator_owned_fields`). The ledger is
+    agent-owned bookkeeping carried in the strategic payload so the next cycle
+    can reconcile what it tried to change. Capped at
+    :data:`REJECTED_AGENT_EDITS_MAX`; older entries roll off.
+
+    Absent from :func:`apply_agent_update` output until at least one edit is
+    actually overridden, so the no-conflict / no-baseline path stays
+    byte-identical to the pre-merge behavior.
+    """
+
 
 REVISION_LOG_MAX = 10
 """Cap on revision_log length — older entries are dropped."""
+
+REJECTED_AGENT_EDITS_KEY = "rejected_agent_edits"
+"""Field/key name for the operator-wins merge ledger on the problem model."""
+
+REJECTED_AGENT_EDITS_MAX = 30
+"""Cap on the rejected-agent-edits ledger — older entries roll off. Mirrors
+``vision_merge.REJECTED_EDITS_MAX`` so the two ledgers behave identically."""
 
 
 SELF_REFLECTION_LOG_MAX = 20
@@ -624,10 +647,104 @@ def _preserve_operator_intent(current: ProblemModel, proposed: ProblemModel) -> 
         proposed.constraints = list(current.constraints)
 
 
+def _merge_operator_owned_fields(
+    baseline: ProblemModel,
+    current: ProblemModel,
+    proposed: ProblemModel,
+    now_iso: str,
+) -> list[dict[str, Any]]:
+    """3-way, operator-wins field-level merge for the operator-owned subset.
+
+    Generalizes the vision 3-way merge (:mod:`app.vision_merge`) to the three
+    operator-owned problem-model fields — ``intent.purpose``, ``context``,
+    ``constraints`` (:data:`USER_EDITABLE_FIELDS`). This protects a *non-blank*
+    operator edit made WHILE a strategic cycle is in flight: the agent computes
+    its proposed model from a snapshot taken at cycle spawn and may write a
+    different non-blank value for the same field, which the blank-only
+    :func:`_preserve_operator_intent` backstop would let through silently.
+
+    Three inputs per field:
+      - ``baseline`` — the value the agent saw at cycle spawn (snapshot).
+      - ``proposed`` (agent) — the value the agent returned at cycle end.
+      - ``current`` — the value in the DB now (may carry a mid-cycle operator
+        edit).
+
+    Rule per field:
+      - ``current == baseline`` (operator didn't touch it): take the agent's
+        value (no-op here — ``proposed`` already holds it).
+      - ``current != baseline`` (operator edited mid-cycle) AND
+        ``proposed != baseline`` (agent also tried to change it): keep the
+        operator's value and record the overridden agent value to the returned
+        ledger so the next cycle can reconcile.
+      - only the operator changed it: keep the operator's value.
+      - only the agent changed it: take the agent's value.
+
+    Mutates ``proposed`` in place to the resolved values; returns the (possibly
+    empty) list of rejected agent edits for the caller to fold into the durable
+    ledger. ``intent.purpose`` is treated as operator-owned only when the prior
+    intent was attributed to a ``user_message`` source, matching
+    :func:`_preserve_operator_intent`; otherwise the purpose is agent-authored
+    and the agent overwrites it freely.
+    """
+    rejected: list[dict[str, Any]] = []
+
+    def _record(field: str, operator_value: Any, agent_value: Any) -> None:
+        rejected.append(
+            {
+                "at": now_iso,
+                "field": field,
+                "kind": "value_conflict",
+                "operator_value": operator_value,
+                "agent_value": agent_value,
+            }
+        )
+
+    # intent.purpose — operator-owned only when the prior change came from a
+    # user message; agent-authored purposes are not protected here.
+    purpose_was_operator = (
+        current.intent.source is not None
+        and current.intent.source.type == "user_message"
+    )
+    if purpose_was_operator and current.intent.purpose != baseline.intent.purpose:
+        if proposed.intent.purpose not in (
+            baseline.intent.purpose,
+            current.intent.purpose,
+        ):
+            _record(
+                "intent.purpose", current.intent.purpose, proposed.intent.purpose
+            )
+        proposed.intent.purpose = current.intent.purpose
+        # Keep operator provenance on the surviving purpose.
+        proposed.intent.source = current.intent.source
+
+    # context — a mid-cycle change of current vs baseline can only be an
+    # operator edit (a single strategic cycle runs at a time), so operator wins.
+    if current.context != baseline.context:
+        if proposed.context not in (baseline.context, current.context):
+            _record(
+                "context",
+                current.context.model_dump(exclude_none=True),
+                proposed.context.model_dump(exclude_none=True),
+            )
+        proposed.context = current.context.model_copy(deep=True)
+
+    # constraints — same operator-wins rule.
+    if current.constraints != baseline.constraints:
+        if proposed.constraints not in (baseline.constraints, current.constraints):
+            _record(
+                "constraints", list(current.constraints), list(proposed.constraints)
+            )
+        proposed.constraints = list(current.constraints)
+
+    return rejected
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,
     now_iso: str,
+    *,
+    baseline_raw: dict | None = None,
 ) -> tuple[dict, dict]:
     """Apply an agent-proposed problem_model update to the current state.
 
@@ -647,16 +764,24 @@ def apply_agent_update(
 
     Operator intent is protected, not frozen: a genuine, explicit, non-empty
     agent change to ``intent.purpose`` / ``context`` / ``constraints`` still
-    applies and still bumps the revision. An agent that genuinely intends to
-    *change* operator-owned intent should route that through the
-    ``pending_user_confirmation`` channel (``type='intent_change'``) rather
-    than overwriting it silently. Only blanks/omissions are filled back, so a
-    merely-preserved purpose never registers as ``intent_changed``.
+    applies and still bumps the revision when the operator did NOT also touch
+    that field. An agent that genuinely intends to *change* operator-owned
+    intent should route that through the ``pending_user_confirmation`` channel
+    (``type='intent_change'``) rather than overwriting it silently.
 
-    Note: concurrent user edits are not yet merged carefully. If the DB
-    revision advanced while the cycle ran, the agent's write will overwrite
-    those edits. Future work: field-level merge like the legacy vision
-    update path does for purpose/success_criteria.
+    Concurrent operator edits ARE merged when ``baseline_raw`` is supplied (the
+    problem-model snapshot the cycle captured at spawn — see
+    ``strategic_cycle.baseline_problem_model``). For the operator-owned subset,
+    a field-level operator-wins 3-way merge runs (see
+    :func:`_merge_operator_owned_fields`): if the operator edited a field
+    mid-cycle to a new non-blank value while the agent also changed it, the
+    operator's value wins and the agent's overridden value is recorded to the
+    :data:`REJECTED_AGENT_EDITS_KEY` ledger for next-cycle reconciliation.
+    Agent-owned fields (``current_focus``, gaps, capabilities, friction, …) are
+    unaffected and still advance + bump the revision. When ``baseline_raw`` is
+    None (legacy task with no cycle row, or no baseline resolvable), the merge
+    is skipped and behavior is byte-identical to the blank-preservation-only
+    path. The blank-preservation backstop runs in both cases.
     """
     proposed = ProblemModel.model_validate(proposed_raw)
     current = parse_problem_model(current_raw)
@@ -668,8 +793,20 @@ def apply_agent_update(
     proposed.archived_gaps = list(current.archived_gaps) + list(proposed.archived_gaps)
     proposed.revision_log = list(current.revision_log)
 
+    # 3-way operator-wins merge for operator-owned fields when a cycle baseline
+    # is available. Runs BEFORE blank-preservation and the diff so a concurrent
+    # operator edit is honored and reported faithfully.
+    rejected_edits: list[dict[str, Any]] = []
+    if baseline_raw is not None:
+        baseline = parse_problem_model(baseline_raw)
+        rejected_edits = _merge_operator_owned_fields(
+            baseline, current, proposed, now_iso
+        )
+
     # Carry operator-seeded intent forward before computing the diff so a
-    # merely-preserved purpose is not falsely reported as intent_changed.
+    # merely-preserved purpose is not falsely reported as intent_changed. This
+    # is a complementary backstop to the 3-way merge above: the merge handles
+    # non-blank concurrent edits; this fills agent omissions/blanks.
     _preserve_operator_intent(current, proposed)
 
     # Compute diff before archival so closed gaps are still visible on
@@ -681,4 +818,17 @@ def apply_agent_update(
 
     append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
 
-    return proposed.model_dump(), diff
+    # Carry the durable rejected-agent-edits ledger forward and append any new
+    # overrides, capped — mirrors archived_gaps/revision_log preservation. The
+    # agent's own submission of this field is ignored (agent-readable, not
+    # agent-writable bookkeeping).
+    ledger = list(current.rejected_agent_edits) + rejected_edits
+    proposed.rejected_agent_edits = ledger[-REJECTED_AGENT_EDITS_MAX:]
+
+    result = proposed.model_dump()
+    # Keep output byte-identical to the pre-merge behavior on the no-conflict /
+    # no-baseline path: only surface the ledger key when it carries entries.
+    if not result.get(REJECTED_AGENT_EDITS_KEY):
+        result.pop(REJECTED_AGENT_EDITS_KEY, None)
+
+    return result, diff

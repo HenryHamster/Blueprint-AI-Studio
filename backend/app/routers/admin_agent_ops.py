@@ -34,7 +34,12 @@ from app.playbook_storage import (
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
 )
 from app.routers.agent import verify_agent_token
-from app.source_ref_validation import reconcile_design_doc_presence as _reconcile_design_doc_presence
+from app.source_ref_validation import (
+    _PRESENT_CAPABILITY_STATUSES,
+    _PRESENT_SYSTEM_STATUSES,
+    detect_absent_symbols as _detect_absent_symbols,
+    reconcile_design_doc_presence as _reconcile_design_doc_presence,
+)
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     limiter,
@@ -104,6 +109,65 @@ class DesignDocUpdate(BaseModel):
     value: Any | None = None
 
 
+async def _ground_design_doc_value(value: Any, key: str) -> Any:
+    """File- AND symbol-level grounding for an on-demand design-doc read.
+
+    First applies the file-level reconciliation (downgrades a present-status
+    system/capability entry whose every referenced file is absent on the
+    integration branch). If the entry survives as present-status, additionally
+    flags it when a cited ``path:symbol`` pointer names a symbol that is
+    unambiguously absent from a file that still exists — the post-refactor
+    facade case the file-level check cannot see (the file passes, but the symbol
+    implementing the behavior was deleted or moved). Such an entry receives the
+    same "treat as missing" downgrade a fully-absent file already does.
+
+    Conservative, mirroring the file-level semantics: a symbol is flagged only on
+    an unambiguous absence (file present at HEAD, no plausible definition). An
+    indeterminate result (git unavailable / non-repo) or a present symbol never
+    downgrades the entry.
+    """
+    value = await _reconcile_design_doc_presence(value, key)
+    if not isinstance(value, dict) or not isinstance(key, str):
+        return value
+    if key.startswith("systems/"):
+        present_statuses = _PRESENT_SYSTEM_STATUSES
+        text_field = "description"
+    elif key.startswith("capabilities/"):
+        present_statuses = _PRESENT_CAPABILITY_STATUSES
+        text_field = "notes"
+    else:
+        return value
+    # A non-present status means the file-level pass already downgraded it (or it
+    # never claimed to be built) — nothing for the symbol check to add.
+    status = str(value.get("status") or "").strip().lower()
+    if status not in present_statuses:
+        return value
+
+    modules = value.get("modules")
+    module_pointers = modules if isinstance(modules, list) else []
+    absent = await _detect_absent_symbols(
+        module_pointers, [value.get("notes"), value.get("description")]
+    )
+    if not absent:
+        return value
+
+    warning = (
+        f"claimed {status} but cited symbol(s) {', '.join(absent)} are absent "
+        f"even though the file exists — treat as missing"
+    )
+    downgraded: dict[str, Any] = {
+        **value,
+        "status": "missing",
+        "presence_warning": warning,
+    }
+    raw_text = value.get(text_field)
+    existing = raw_text.strip() if isinstance(raw_text, str) else ""
+    downgraded[text_field] = (
+        f"{existing} " if existing else ""
+    ) + f"[reconciled: {warning}]"
+    return downgraded
+
+
 @router.post("/api/agent/design-doc")
 @limiter.limit("60/minute")
 async def update_design_doc(
@@ -146,7 +210,7 @@ async def update_design_doc(
             raise HTTPException(
                 status_code=404, detail=f"Key '{payload.key}' not found"
             )
-        value = await _reconcile_design_doc_presence(value, payload.key)
+        value = await _ground_design_doc_value(value, payload.key)
         return {"key": payload.key, "value": value}
 
     if not payload.key or not isinstance(payload.key, str):
@@ -1348,6 +1412,7 @@ async def strategic_operation(
         # revision_log entry with the structured diff.
         from pydantic import ValidationError as _PmValidationError
 
+        from app import strategic_cycle as _strategic_cycle
         from app.problem_model import apply_agent_update
         from app.strategic_completion import (
             QUALIFY_REQUEST_CONTEXT_KEY,
@@ -1375,11 +1440,27 @@ async def strategic_operation(
             pm_data.pop("version_phase_decision", None)
         )
         qualify_request = extract_qualify_request(pm_data.pop("qualify_request", None))
+        # Resolve the cycle's baseline problem model (snapshot at spawn) so a
+        # concurrent operator edit to an operator-owned field is merged
+        # operator-wins rather than silently clobbered. Mirrors the vision
+        # baseline resolution in strategic_completion; degrade to None (today's
+        # blank-preservation-only behavior) when no cycle/baseline is available.
+        baseline_pm: dict | None = None
+        pm_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        if pm_cycle_id:
+            pm_cycle_row = await _strategic_cycle.get(session, pm_cycle_id)
+            if pm_cycle_row is not None:
+                snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
+                if snap:
+                    baseline_pm = snap
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
                 proposed_raw=pm_data,
                 now_iso=_utcnow().isoformat(),
+                baseline_raw=baseline_pm,
             )
         except _PmValidationError as ve:
             raise HTTPException(

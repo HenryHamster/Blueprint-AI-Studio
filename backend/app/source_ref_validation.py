@@ -486,6 +486,43 @@ async def reconcile_design_doc_presence(
     return downgraded
 
 
+async def detect_absent_symbols(
+    module_pointers: Optional[list] = None,
+    text_fields: Optional[list] = None,
+) -> List[str]:
+    """Return ``path:symbol`` refs whose symbol is absent from a present file.
+
+    Symbol-level companion to :func:`reconcile_design_doc_presence`'s
+    file-level check. A design-doc system/capability entry can cite a specific
+    function/class via a ``path:symbol`` pointer in its ``modules`` list or in
+    its notes/description free text. The file can still exist while the symbol
+    that implemented the behavior was deleted or moved — so the file-existence
+    check passes yet the cited behavior is not actually built. This collects the
+    ``path:symbol`` references out of *module_pointers* and *text_fields* and
+    checks each against HEAD via :func:`_symbol_defined_at_head`.
+
+    A ref is returned ONLY when that check is unambiguously ``False`` — the file
+    exists at HEAD but no plausible definition of the symbol is found (or the
+    file itself is absent). An indeterminate result (git unavailable / non-repo)
+    and a present symbol are never returned, preserving the conservative
+    semantics shared with the file-level path: a symbol is flagged only on
+    unambiguous absence, never on a partial or indeterminate hit. Deduplicated,
+    order-preserving.
+    """
+    pairs: List[Tuple[str, str]] = []
+    seen: set = set()
+    for text in list(module_pointers or []) + list(text_fields or []):
+        for pair in _parse_path_symbol_refs(text):
+            if pair not in seen:
+                seen.add(pair)
+                pairs.append(pair)
+    absent: List[str] = []
+    for path, symbol in pairs:
+        if await _symbol_defined_at_head(path, symbol) is False:
+            absent.append(f"{path}:{symbol}")
+    return absent
+
+
 async def summarize_ungrounded_claims(
     claims: Optional[list],
     sources: Optional[list] = None,

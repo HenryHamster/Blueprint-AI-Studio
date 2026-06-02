@@ -42,7 +42,7 @@ from app.playbook_learning import (
     RECENT_SUCCESSES_TASK_TYPES,
     summarize_recent_successes,
 )
-from app.source_ref_validation import classify_existing_paths
+from app.source_ref_validation import classify_existing_paths, detect_absent_symbols
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -1272,11 +1272,21 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # Every declared module is absent from the integration branch:
                 # the system is claimed but its backing code does not exist.
                 status = "claimed_absent"
+            # Symbol-level depth: a present file can still have lost the cited
+            # symbol. An unambiguously-absent symbol gets the same treat-as-missing
+            # verdict a fully-absent file already receives.
+            absent_symbols = await detect_absent_symbols(
+                dval.get("modules"),
+                [dval.get("description"), dval.get("notes")],
+            )
+            if absent_symbols and status != "claimed_absent":
+                status = "claimed_absent"
             system_verification[dkey[len("systems/"):]] = {
                 "status": status,
                 "claimed_status": str(dval.get("status", "")),
                 "present": present,
                 "missing": missing,
+                **({"absent_symbols": absent_symbols} if absent_symbols else {}),
             }
 
         # Verify design-doc CAPABILITIES the same way as systems above. The
@@ -1322,11 +1332,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 status = "partial"
             else:
                 status = "claimed_absent"
+            # Symbol-level depth (see systems loop): flag a cited symbol that is
+            # unambiguously gone even though its file is present.
+            absent_symbols = await detect_absent_symbols(
+                dval.get("modules"),
+                [dval.get("notes"), dval.get("description")],
+            )
+            if absent_symbols and status != "claimed_absent":
+                status = "claimed_absent"
             capability_verification[dkey[len("capabilities/"):]] = {
                 "status": status,
                 "claimed_status": str(dval.get("status", "")),
                 "present": present,
                 "missing": missing,
+                **({"absent_symbols": absent_symbols} if absent_symbols else {}),
             }
 
         research_payload: dict = {

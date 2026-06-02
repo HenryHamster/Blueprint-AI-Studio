@@ -30,6 +30,16 @@ beforeAll(() => {
   // Create one real backing file: backend/app/present.py
   fs.mkdirSync(path.join(root, 'backend', 'app'), { recursive: true });
   fs.writeFileSync(path.join(root, 'backend', 'app', 'present.py'), '# present\n');
+  // A file that exists and DEFINES `real_impl` (symbol present)...
+  fs.writeFileSync(
+    path.join(root, 'backend', 'app', 'impl.py'),
+    'def real_impl():\n    return 1\n',
+  );
+  // ...and a re-export facade that exists but no longer defines `gone_func`.
+  fs.writeFileSync(
+    path.join(root, 'backend', 'app', 'facade.py'),
+    'from .impl import real_impl  # facade shell, gone_func deleted\n',
+  );
 });
 
 afterAll(() => {
@@ -172,5 +182,59 @@ describe('reconcileEntry direct', () => {
     const entry = { status: 'planned', notes: 'backend/app/gone.py' };
     // capability 'planned' is not a present status → untouched
     expect(reconcileEntry(entry, root, 'capability').status).toBe('planned');
+  });
+});
+
+describe('symbol-level grounding (present file + absent symbol)', () => {
+  it('present file + present symbol → NOT flagged', () => {
+    const sys = {
+      id: 'sys-sym-ok',
+      status: 'functional',
+      modules: ['backend/app/impl.py'],
+      description: 'core logic in backend/app/impl.py:real_impl',
+    };
+    const out = reconcileEntry(sys, root, 'system');
+    expect(out).toBe(sys); // pure no-op
+    expect(out.status).toBe('functional');
+  });
+
+  it('present file + absent symbol → flagged as missing', () => {
+    const sys = {
+      id: 'sys-sym-gone',
+      status: 'mature',
+      // facade.py exists, so the file-level check passes — but gone_func is gone.
+      modules: ['backend/app/facade.py'],
+      description: 'behavior lives in backend/app/facade.py:gone_func',
+    };
+    const out = reconcileEntry(sys, root, 'system');
+    expect(out.status).toBe('missing');
+    expect(out.presence_warning).toMatch(/symbol `backend\/app\/facade\.py:gone_func` is absent/);
+    expect(String(out.description)).toMatch(/\[reconciled:/);
+    // input not mutated
+    expect(sys.status).toBe('mature');
+  });
+
+  it('symbol cited in a capability notes field is flagged too', () => {
+    const caps = {
+      retarget: { status: 'working', notes: 'see backend/app/facade.py:gone_func' },
+    };
+    const out = reconcileMissingCapabilities(caps, root);
+    expect(out?.retarget.status).toBe('missing');
+  });
+
+  it('indeterminate (cited file does not exist) is NOT symbol-flagged', () => {
+    // No file at all → the file-level path check owns this case, and the
+    // symbol read is indeterminate, so it must not produce a symbol-flag.
+    const sys = {
+      id: 'sys-sym-indet',
+      status: 'functional',
+      // present.py exists so the file-level check does NOT downgrade (partial hit),
+      // and the symbol ref points at an absent file → indeterminate, not flagged.
+      modules: ['backend/app/present.py'],
+      description: 'helper in backend/app/never_existed.py:phantom',
+    };
+    const out = reconcileEntry(sys, root, 'system');
+    expect(out).toBe(sys);
+    expect(out.status).toBe('functional');
   });
 });

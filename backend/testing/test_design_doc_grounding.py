@@ -146,6 +146,103 @@ def test_other_keys_ignored(tmp_path):
     assert "_meta" not in result
 
 
+def _write(tmp_path, rel, content):
+    """Create a file under tmp_path with explicit content and return repo_root."""
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    return str(tmp_path)
+
+
+def test_symbol_present_in_present_file_untouched(tmp_path):
+    """Present file + present cited symbol → not flagged (no false positive)."""
+    repo_root = _write(
+        tmp_path, "backend/app/real.py", "def ground_systems():\n    return 1\n"
+    )
+    doc = {
+        "capabilities/grounding": {
+            "status": "working",
+            "notes": "Implemented in backend/app/real.py:ground_systems end to end.",
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["capabilities/grounding"]["status"] == "working"
+    assert "presence_warning" not in result["capabilities/grounding"]
+    assert "_meta" not in result
+
+
+def test_symbol_absent_from_present_file_downgraded(tmp_path):
+    """Present file + absent cited symbol → downgraded to missing (the core case)."""
+    # The file exists but the cited symbol was deleted/moved (a re-export facade).
+    repo_root = _write(
+        tmp_path, "backend/app/facade.py", "from app.real import other_thing\n"
+    )
+    doc = {
+        "capabilities/grounding": {
+            "status": "working",
+            "notes": "The backend/app/facade.py:ground_systems path handles it.",
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    entry = result["capabilities/grounding"]
+    assert entry["status"] == "missing"
+    assert "ground_systems" in entry["presence_warning"]
+    assert "file exists" in entry["presence_warning"]
+    assert result["_meta"]["updated_by"] == "design-doc-grounding"
+
+
+def test_symbol_absent_via_module_pointer_downgraded(tmp_path):
+    """A module pointer that names a symbol gone from a present file is flagged."""
+    repo_root = _write(
+        tmp_path, "backend/app/facade.py", "from app.real import other_thing\n"
+    )
+    doc = {
+        "systems/core": {
+            "status": "mature",
+            "modules": ["backend/app/facade.py:ground_systems"],
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    entry = result["systems/core"]
+    assert entry["status"] == "missing"
+    assert "ground_systems" in entry["presence_warning"]
+
+
+def test_module_pointer_with_present_symbol_untouched(tmp_path):
+    """Module pointer naming a present symbol is NOT flagged at file or symbol level."""
+    repo_root = _write(
+        tmp_path, "backend/app/core.py", "class GroundSystems:\n    pass\n"
+    )
+    doc = {
+        "systems/core": {
+            "status": "mature",
+            "modules": ["backend/app/core.py:GroundSystems"],
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    assert result["systems/core"]["status"] == "mature"
+    assert "presence_warning" not in result["systems/core"]
+    assert "_meta" not in result
+
+
+def test_symbol_indeterminate_missing_file_not_symbol_flagged(tmp_path):
+    """Symbol ref to an absent file is handled by the file-level check, not flagged
+    as a symbol absence (no false 'symbol' verdict when the file itself is gone)."""
+    repo_root = _make_repo(tmp_path, "backend/app/real.py")
+    doc = {
+        "capabilities/grounding": {
+            "status": "working",
+            "notes": "See backend/app/gone.py:vanished for the implementation.",
+        }
+    }
+    result = ground_design_doc_systems(doc, repo_root)
+    entry = result["capabilities/grounding"]
+    # File is absent → file-level grounding fires with the file-level message,
+    # not the symbol-level one.
+    assert entry["status"] == "missing"
+    assert "all referenced module file(s) are absent" in entry["presence_warning"]
+
+
 def test_grounding_is_idempotent(tmp_path):
     """Re-running the sweep does not re-bump _meta once an entry is downgraded."""
     repo_root = _make_repo(tmp_path, "backend/app/real.py")

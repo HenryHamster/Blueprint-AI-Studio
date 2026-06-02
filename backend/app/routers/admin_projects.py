@@ -195,6 +195,9 @@ class ProjectUpdate(BaseModel):
     # User-editable subset of problem_model — intent, constraints, context.
     # Gaps / capabilities / friction are agent-owned and not writable here.
     problem_model_patch: Dict[str, Any] | None = None
+    # Optimistic concurrency: supply the problem_model revision the client
+    # loaded.  Server rejects with 409 if another writer has advanced it.
+    problem_model_base_revision: int | None = None
     # Per-project approval-gate file lists (infra_files / critical_files).
     # Partial update: only the keys supplied are replaced. Takes effect for
     # agents immediately via the existing claim-response seam.
@@ -258,6 +261,7 @@ async def update_project(
         or payload.design_doc is not None
         or payload.vision is not None
         or payload.approval_gate_config is not None
+        or payload.problem_model_patch is not None
     )
     if needs_lock:
         project = await lock_project_or_429(session, project.id)
@@ -268,6 +272,7 @@ async def update_project(
                 ("design_doc", payload.design_doc),
                 ("vision", payload.vision),
                 ("approval_gate_config", payload.approval_gate_config),
+                ("problem_model", payload.problem_model_patch),
             )
             if p is not None
         ]
@@ -432,6 +437,18 @@ async def update_project(
                 f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
             )
         current = parse_problem_model(project.problem_model)
+        if (
+            payload.problem_model_base_revision is not None
+            and payload.problem_model_base_revision != current.revision
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"problem_model was modified by another writer "
+                    f"(base_revision={payload.problem_model_base_revision}, current={current.revision}). "
+                    "Reload and retry."
+                ),
+            )
         merged_raw: Dict[str, Any] = current.model_dump()
         merged_raw.update(payload.problem_model_patch)
         try:

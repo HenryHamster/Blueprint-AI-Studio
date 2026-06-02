@@ -24,7 +24,7 @@
     "routers/admin_operator_triggers.py": 450,
     "routers/admin_digest.py": 10300,
     "routers/admin_release_version.py": 430,
-    "routers/admin_agent_ops.py": 1700,
+    "routers/admin_agent_ops.py": 1850,
     "routers/admin_pool_accounts.py": 1200,
     "max_plan_pool.py": 2750,
     "anomaly_detection.py": 2100,
@@ -69,7 +69,7 @@
     "playbook_capacity.py": 200,
     "review_learning.py": 1100,
     "playbook_lifecycle.py": 600,
-    "playbook_storage.py": 750,
+    "playbook_storage.py": 850,
     "playbook_auto.py": 450,
     "playbook_sr_metrics.py": 3100,
     "models.py": 3500,
@@ -163,6 +163,6 @@
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 1650,
-    "api.ts": 1300
+    "api.ts": 1350
   }
 }

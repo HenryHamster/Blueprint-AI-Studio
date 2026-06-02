@@ -8,7 +8,11 @@ playbook stale-ref flagging share one partition path:
 
 import pytest
 
-from app.source_ref_validation import classify_existing_paths, partition_missing
+from app.source_ref_validation import (
+    classify_existing_paths,
+    detect_absent_symbols,
+    partition_missing,
+)
 
 
 # ── partition_missing (pure) ──────────────────────────────────────────────────
@@ -126,3 +130,81 @@ async def test_classify_existing_paths_uses_repo_branch_context_when_provided(mo
     assert present == ["x.py"]
     assert missing == ["y.py"]
     local_exists.assert_not_called()
+
+
+# ── detect_absent_symbols (symbol-level grounding depth) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_detect_absent_symbols_present_symbol_not_flagged(mocker):
+    """File present + symbol present → grounded, nothing flagged."""
+
+    async def _defined(path, symbol):
+        return True
+
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+    )
+    absent = await detect_absent_symbols(
+        ["backend/app/x.py:do_thing"], ["see backend/app/y.py:helper"]
+    )
+    assert absent == []
+
+
+@pytest.mark.asyncio
+async def test_detect_absent_symbols_absent_symbol_in_present_file_flagged(mocker):
+    """File present but cited symbol gone → flagged as effectively-absent."""
+
+    async def _defined(path, symbol):
+        return False
+
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+    )
+    absent = await detect_absent_symbols(
+        ["backend/app/x.py:gone_func"],
+        ["the impl in backend/app/x.py:gone_func handles Y"],
+    )
+    # Deduplicated: the module pointer and the free-text ref collapse to one.
+    assert absent == ["backend/app/x.py:gone_func"]
+
+
+@pytest.mark.asyncio
+async def test_detect_absent_symbols_indeterminate_not_flagged(mocker):
+    """Indeterminate git result (None) → conservatively not flagged."""
+
+    async def _defined(path, symbol):
+        return None
+
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+    )
+    absent = await detect_absent_symbols(["backend/app/x.py:maybe_func"])
+    assert absent == []
+
+
+@pytest.mark.asyncio
+async def test_detect_absent_symbols_partial_hit_only_flags_absent(mocker):
+    """Mixed: only the unambiguously-absent symbol is reported."""
+
+    async def _defined(path, symbol):
+        return symbol != "gone_func"
+
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head", side_effect=_defined
+    )
+    absent = await detect_absent_symbols(
+        ["backend/app/x.py:gone_func", "backend/app/x.py:live_func"]
+    )
+    assert absent == ["backend/app/x.py:gone_func"]
+
+
+@pytest.mark.asyncio
+async def test_detect_absent_symbols_no_symbol_refs_returns_empty(mocker):
+    """Plain file paths with no `:symbol` suffix carry no symbol claim."""
+    called = mocker.patch("app.source_ref_validation._symbol_defined_at_head")
+    absent = await detect_absent_symbols(
+        ["backend/app/x.py"], ["prose with no path:symbol refs"]
+    )
+    assert absent == []
+    called.assert_not_called()
