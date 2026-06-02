@@ -191,6 +191,31 @@ export interface PoolHitRateEstimate {
   assumptions: string;
 }
 
+// Per-project warm-pool TARGET sizing, read from GET /api/admin/settings. The
+// maintainer reconciles each scoped project toward its explicit per-project
+// target in `warm_pool_target_size_by_project` (keyed by project id), falling
+// back to the global `warm_pool_target_size` when the project has no explicit
+// entry. Both fields are always present on a current backend; an older backend
+// that predates per-project targets simply omits the map (treated as {}).
+export interface WarmPoolTargets {
+  warm_pool_target_size: number;
+  warm_pool_target_size_by_project: Record<string, number>;
+}
+
+// Response from POST /api/admin/projects/{project_id}/warm-pool/target. Mirrors
+// the additive-only keys returned by admin_warm_pool.set_warm_pool_target_for_project:
+// `target_size` is the explicit per-project value now stored (null when cleared),
+// `effective_target` is the value the maintainer reconciles toward after global
+// fallback, `cleared` is whether the explicit entry was removed, and
+// `warm_pool_target_size_by_project` is the resulting map.
+export interface WarmPoolTargetSetResponse {
+  project_id: string;
+  target_size: number | null;
+  effective_target: number;
+  cleared: boolean;
+  warm_pool_target_size_by_project: Record<string, number>;
+}
+
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
   warm_pin_metrics: {

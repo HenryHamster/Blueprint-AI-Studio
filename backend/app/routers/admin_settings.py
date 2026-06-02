@@ -115,6 +115,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_enabled",
         "warm_pool_project_allowlist",
         "warm_pool_target_size",
+        "warm_pool_target_size_by_project",
         "warm_pool_idle_ttl_secs",
     }
 )
@@ -134,6 +135,30 @@ def _normalize_warm_pool_allowlist(raw) -> set[str]:
     if not isinstance(raw, (list, tuple, set)):
         raw = [raw]
     return {str(p).strip() for p in raw if str(p).strip()}
+
+
+def _normalize_warm_pool_target_map(raw) -> dict[str, int]:
+    """Coerce a per-project warm-pool target map to ``{project_id: int}``.
+
+    Mirrors ``warm_pool.warm_pool_project_target_map`` (and the config-sync
+    normalizer) so the admin surface and the maintainer agree on the per-project
+    targets: trimmed, non-empty string keys mapping to integer values clamped to
+    the same 0..50 range the global target uses, dropping malformed entries. A
+    non-dict input yields an empty map.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        sid = str(key).strip()
+        if not sid:
+            continue
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            continue
+        out[sid] = max(0, min(50, ival))
+    return out
 
 
 def _build_provider_catalog(runtime_config: Dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
@@ -302,6 +327,9 @@ async def get_settings(
         ),
         "warm_pool_target_size": int(
             _runtime_config.get("warm_pool_target_size", 2)
+        ),
+        "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
+            _runtime_config.get("warm_pool_target_size_by_project") or {}
         ),
         "warm_pool_idle_ttl_secs": int(
             _runtime_config.get("warm_pool_idle_ttl_secs", 1800)
@@ -779,6 +807,52 @@ async def _apply_settings(
                 detail="warm_pool_target_size must be between 0 and 50",
             )
         _runtime_config["warm_pool_target_size"] = val
+    if "warm_pool_target_size_by_project" in payload:
+        raw = payload["warm_pool_target_size_by_project"]
+        # Per-project IDLE target overrides: a mapping of project-id strings to
+        # integers in the same 0..50 range as the global warm_pool_target_size.
+        # An empty map means every scoped project falls back to the global target.
+        # Validated strictly (reject 400 on a non-mapping or an out-of-range /
+        # non-integer value) — consistent with the other warm-pool validators —
+        # then normalized via the shared helper before storing.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "warm_pool_target_size_by_project must be a mapping of "
+                    "project-id strings to integers"
+                ),
+            )
+        cleaned_targets: dict[str, int] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "warm_pool_target_size_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            try:
+                ival = int(value)
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"warm_pool_target_size_by_project[{sid}] must be an integer"
+                    ),
+                )
+            if not (0 <= ival <= 50):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"warm_pool_target_size_by_project[{sid}] must be "
+                        "between 0 and 50"
+                    ),
+                )
+            cleaned_targets[sid] = ival
+        _runtime_config["warm_pool_target_size_by_project"] = cleaned_targets
     if "warm_pool_idle_ttl_secs" in payload:
         try:
             val = int(payload["warm_pool_idle_ttl_secs"])
@@ -1834,6 +1908,15 @@ async def _apply_settings(
                     ),
                     "warm_pool_target_size": int(
                         _runtime_config.get("warm_pool_target_size", 2)
+                    ),
+                    # Persist the per-project IDLE target overrides so a
+                    # per-project target (set via /warm-pool/target, /warm-pool/
+                    # enable, or the raw PATCH) survives a Cloud Run restart.
+                    # runtime_config_state.sync_* reads this key back on boot;
+                    # without it the in-memory map reverts to the {} (all-global)
+                    # default and every project's configured size is lost.
+                    "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
+                        _runtime_config.get("warm_pool_target_size_by_project") or {}
                     ),
                     "warm_pool_idle_ttl_secs": int(
                         _runtime_config.get("warm_pool_idle_ttl_secs", 1800)

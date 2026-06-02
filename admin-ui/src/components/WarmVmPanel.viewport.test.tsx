@@ -102,6 +102,11 @@ vi.mock('../api', () => ({
   authGet: vi.fn(async () => new Response(JSON.stringify(emptyState), { status: 200 })),
   enableWarmPoolForProject: vi.fn(async () => ({})),
   disableWarmPoolForProject: vi.fn(async () => ({})),
+  fetchWarmPoolTargets: vi.fn(async () => ({
+    warm_pool_target_size: 2,
+    warm_pool_target_size_by_project: {},
+  })),
+  setWarmPoolTargetForProject: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
 }));
 

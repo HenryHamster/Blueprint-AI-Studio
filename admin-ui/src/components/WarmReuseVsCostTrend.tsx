@@ -22,11 +22,14 @@ const TOOLTIP_STYLE = {
 
 const REUSE_COLOR = '#10b981';
 const COST_COLOR = '#f59e0b';
+// Idle-inclusive cost line: a hotter hue + dashed stroke so it reads as the
+// "true cost" companion to the solid headline cost line on the same axis.
+const COST_INCL_COLOR = '#ef4444';
 
-// Keys on the efficiency-axes response. cost_per_merged_pr is intentionally
-// sourced from the same axis the backend already maintains, so when warm-pool
-// idle-cost accounting later folds idle overhead into the server-side
-// cost-per-merged-PR computation, this trend reflects it with no UI change.
+// Keys on the efficiency-axes response. cost_per_merged_pr is the idle-EXCLUSIVE
+// headline axis. The idle-INCLUSIVE companion lives on a dedicated top-level key
+// (cost_per_merged_pr_incl_pool_idle_axis) rather than inside `axes`, because the
+// backend keeps it out of the immutable baseline axis set on purpose.
 const REUSE_KEY = 'vm_reuse_rate';
 const COST_KEY = 'cost_per_merged_pr';
 
@@ -34,26 +37,37 @@ interface MergedPoint {
   captured_at: string;
   reuse: number | null;
   cost: number | null;
+  costIncl: number | null;
 }
 
-// Zip the two axes' history arrays onto one shared captured_at time axis.
+// Zip the reuse, headline-cost, and idle-inclusive-cost history arrays onto one
+// shared captured_at time axis.
 function mergeHistory(data: EfficiencyAxesResponse): MergedPoint[] {
   const byTime = new Map<string, MergedPoint>();
   const reuseHistory = data.axes[REUSE_KEY]?.history ?? [];
   const costHistory = data.axes[COST_KEY]?.history ?? [];
+  const costInclHistory = data.cost_per_merged_pr_incl_pool_idle_axis?.history ?? [];
+
+  const ensure = (captured_at: string): MergedPoint => {
+    let point = byTime.get(captured_at);
+    if (!point) {
+      point = { captured_at, reuse: null, cost: null, costIncl: null };
+      byTime.set(captured_at, point);
+    }
+    return point;
+  };
 
   for (const h of reuseHistory) {
     if (!h.captured_at) continue;
-    byTime.set(h.captured_at, { captured_at: h.captured_at, reuse: h.value, cost: null });
+    ensure(h.captured_at).reuse = h.value;
   }
   for (const h of costHistory) {
     if (!h.captured_at) continue;
-    const existing = byTime.get(h.captured_at);
-    if (existing) {
-      existing.cost = h.value;
-    } else {
-      byTime.set(h.captured_at, { captured_at: h.captured_at, reuse: null, cost: h.value });
-    }
+    ensure(h.captured_at).cost = h.value;
+  }
+  for (const h of costInclHistory) {
+    if (!h.captured_at) continue;
+    ensure(h.captured_at).costIncl = h.value;
   }
 
   return Array.from(byTime.values()).sort((a, b) => a.captured_at.localeCompare(b.captured_at));
@@ -67,10 +81,15 @@ function formatDay(captured_at: string): string {
   return `${month}/${day}`;
 }
 
+const COST_LABEL = 'Cost / merged PR';
+const COST_INCL_LABEL = 'Cost / merged PR (incl. pool idle)';
+
 function tooltipFormatter(value: unknown, name: unknown): [string, string] {
   const label = String(name ?? '');
   if (value === null || value === undefined) return ['—', label];
-  if (label === 'Cost / merged PR') return [`$${(value as number).toFixed(2)}`, label];
+  if (label === COST_LABEL || label === COST_INCL_LABEL) {
+    return [`$${(value as number).toFixed(2)}`, label];
+  }
   return [`${(value as number).toFixed(1)}%`, label];
 }
 
@@ -131,6 +150,10 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
 
   const merged = data ? mergeHistory(data) : [];
   const reuseBaseline = data?.axes[REUSE_KEY]?.baseline ?? null;
+  const costInclAxis = data?.cost_per_merged_pr_incl_pool_idle_axis ?? null;
+  const costBaseline = costInclAxis?.baseline ?? null;
+  const costInclDrift = costInclAxis?.drift_pct ?? null;
+  const hasCostIncl = merged.some((p) => p.costIncl !== null);
 
   if (merged.length < 2) {
     return (
@@ -143,9 +166,25 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
     );
   }
 
+  const driftReadout =
+    hasCostIncl && costInclDrift !== null ? (
+      <span
+        data-testid="cost-incl-drift"
+        className={`ml-2 text-[10px] font-semibold normal-case tracking-normal ${
+          costInclDrift > 0 ? 'text-red-400' : 'text-emerald-400'
+        }`}
+      >
+        idle-incl cost {costInclDrift > 0 ? '+' : ''}
+        {costInclDrift.toFixed(1)}% vs baseline
+      </span>
+    ) : null;
+
   return (
     <section>
-      {title}
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        Warm Reuse vs Cost / Merged PR
+        {driftReadout}
+      </h2>
       <div className="bg-neutral-900 border border-neutral-800 rounded-lg p-3">
         <ResponsiveContainer width="100%" height={200}>
           <LineChart data={merged} margin={{ top: 4, right: 4, left: 0, bottom: 0 }}>
@@ -186,15 +225,37 @@ export function WarmReuseVsCostTrend({ projectId }: { projectId: string | null }
               name="Warm reuse rate"
               connectNulls
             />
+            {hasCostIncl && costBaseline !== null && (
+              <ReferenceLine
+                yAxisId="cost"
+                y={costBaseline}
+                stroke={COST_INCL_COLOR}
+                strokeDasharray="4 3"
+                strokeOpacity={0.5}
+                label={{ value: 'cost baseline', position: 'insideBottomRight', fill: '#737373', fontSize: 9 }}
+              />
+            )}
             <Line
               yAxisId="cost"
               dataKey="cost"
               stroke={COST_COLOR}
               dot={false}
               strokeWidth={1.5}
-              name="Cost / merged PR"
+              name={COST_LABEL}
               connectNulls
             />
+            {hasCostIncl && (
+              <Line
+                yAxisId="cost"
+                dataKey="costIncl"
+                stroke={COST_INCL_COLOR}
+                strokeDasharray="5 3"
+                dot={false}
+                strokeWidth={1.5}
+                name={COST_INCL_LABEL}
+                connectNulls
+              />
+            )}
           </LineChart>
         </ResponsiveContainer>
       </div>

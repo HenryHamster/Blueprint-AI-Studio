@@ -59,7 +59,9 @@ from app.warm_pool import (
     is_project_warm_pool_scoped,
     is_warm_pool_enabled,
     list_pool_vms,
+    resolve_project_warm_pool_target,
     warm_pool_project_scope,
+    warm_pool_project_target_map,
 )
 from app.warm_pool_maintainer import (
     _default_pool_provision_fn,
@@ -296,10 +298,20 @@ async def enable_warm_pool_for_project(
             "warm_pool_enabled": True,
             "warm_pool_project_allowlist": sorted(scope),
         }
-        # Establish a sensible target only when none is configured; otherwise keep
-        # the operator's existing per-project target untouched.
-        if int(runtime_config.get("warm_pool_target_size", 0) or 0) <= 0:
-            payload["warm_pool_target_size"] = 2
+        # Establish a PER-PROJECT target for this project only when it has no
+        # effective target yet — i.e. it has no explicit per-project entry AND no
+        # global fallback is configured. In that case default to 2 so enabling
+        # actually warms members; otherwise leave the map untouched so an existing
+        # per-project value (or the global fallback) is preserved. This replaces
+        # the old behavior of hardcoding the GLOBAL target to 2, which sized every
+        # project at once.
+        if (
+            str(project_id) not in warm_pool_project_target_map()
+            and resolve_project_warm_pool_target(project_id) <= 0
+        ):
+            new_target_map = dict(warm_pool_project_target_map())
+            new_target_map[str(project_id)] = 2
+            payload["warm_pool_target_size_by_project"] = new_target_map
         await _apply_settings(payload, session, runtime_config)
 
     logger.info(
@@ -382,4 +394,107 @@ async def disable_warm_pool_for_project(
         "drained": drained,
         "enabled": is_warm_pool_enabled(),
         "project_allowlist": sorted(warm_pool_project_scope()),
+    }
+
+
+@router.post("/projects/{project_id}/warm-pool/target")
+async def set_warm_pool_target_for_project(
+    project_id: uuid.UUID,
+    payload: dict,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Set (or clear) ONE project's per-project warm-pool IDLE target.
+
+    Owner-gated. The request body is ``{"target_size": <int 0..50> | null}``:
+
+    * an integer 0..50 establishes/overrides this project's explicit target in
+      ``warm_pool_target_size_by_project`` — the maintainer then reconciles this
+      project toward THAT number, independently of the fleet-wide
+      ``warm_pool_target_size`` and of every other project's target. ``0`` keeps
+      this project's pool empty while leaving the master switch and other
+      projects untouched;
+    * ``null`` (or omitting a numeric value) CLEARS this project's explicit
+      target, so it falls back to the global ``warm_pool_target_size``.
+
+    The map is read-modify-written under ``runtime_config_lock`` so a concurrent
+    edit to a DIFFERENT project is never clobbered, then persisted via the durable
+    settings path (:func:`admin_settings._apply_settings`) so the change survives a
+    Cloud Run restart. Setting a target does NOT enable the pool or scope the
+    project — it only sizes the pool the maintainer keeps for an already-scoped
+    project; while ``warm_pool_enabled`` is False the value is inert.
+
+    Response keys (additive-only): ``project_id``, ``target_size`` (the explicit
+    per-project value now stored, or ``None`` when cleared), ``effective_target``
+    (the value the maintainer will reconcile toward, after global fallback),
+    ``cleared`` (whether the explicit entry was removed), and
+    ``warm_pool_target_size_by_project`` (the resulting map).
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if not isinstance(payload, dict) or "target_size" not in payload:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "request body must include target_size (an integer 0..50, or "
+                "null to clear the per-project target back to the global fallback)"
+            ),
+        )
+    raw_target = payload["target_size"]
+
+    # Validate BEFORE mutating so a bad value never leaves a half-applied state.
+    if raw_target is not None:
+        try:
+            target_value = int(raw_target)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="target_size must be an integer (0..50) or null",
+            )
+        if not (0 <= target_value <= 50):
+            raise HTTPException(
+                status_code=400,
+                detail="target_size must be between 0 and 50",
+            )
+    else:
+        target_value = None
+
+    from app.routers.admin_settings import _apply_settings
+    from app.shared_state import runtime_config, runtime_config_lock
+
+    sid = str(project_id)
+    async with runtime_config_lock:
+        # Read-modify-write the normalized map so a concurrent edit to ANOTHER
+        # project's target is never clobbered.
+        target_map = dict(warm_pool_project_target_map())
+        if target_value is None:
+            cleared = sid in target_map
+            target_map.pop(sid, None)
+        else:
+            cleared = False
+            target_map[sid] = target_value
+        await _apply_settings(
+            {"warm_pool_target_size_by_project": target_map}, session, runtime_config
+        )
+        resulting_map = warm_pool_project_target_map()
+        effective_target = resolve_project_warm_pool_target(project_id)
+
+    logger.info(
+        "[WARM-POOL] operator set target project=%s by user=%s target_size=%s "
+        "cleared=%s effective=%d",
+        project_id,
+        current_user["user_id"],
+        target_value,
+        cleared,
+        effective_target,
+    )
+
+    return {
+        "project_id": sid,
+        "target_size": resulting_map.get(sid),
+        "effective_target": effective_target,
+        "cleared": cleared,
+        "warm_pool_target_size_by_project": resulting_map,
     }

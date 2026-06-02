@@ -126,6 +126,56 @@ def is_project_warm_pool_scoped(project_id) -> bool:
     return str(project_id) in scope
 
 
+def warm_pool_project_target_map() -> dict[str, int]:
+    """Per-project warm-pool IDLE target overrides, as ``{project_id: int}``.
+
+    Read from the durable ``warm_pool_target_size_by_project`` runtime-config
+    value (modeled on ``warm_pool_project_allowlist``). Normalizes to trimmed,
+    non-empty string project-id keys mapping to integer targets clamped to the
+    same 0..50 range the global ``warm_pool_target_size`` uses, silently dropping
+    malformed entries so a garbage value can never corrupt a reconcile target. An
+    EMPTY map (the default) means every scoped project falls back to the single
+    fleet-wide target. Parallel to :func:`warm_pool_project_scope`.
+    """
+    raw = _runtime_config.get("warm_pool_target_size_by_project") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        sid = str(key).strip()
+        if not sid:
+            continue
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            continue
+        out[sid] = max(0, min(50, ival))
+    return out
+
+
+def resolve_project_warm_pool_target(project_id) -> int:
+    """A project's EFFECTIVE warm-pool IDLE target.
+
+    Returns the project's explicit per-project value from
+    ``warm_pool_target_size_by_project`` when one is set, otherwise falls back to
+    the global ``warm_pool_target_size``. Mirrors the global-target floor clamp in
+    ``warm_pool_maintainer._pool_target_size`` (``max(0, …)``, default 0) for the
+    fallback so the resolved value is byte-identical to the prior global behavior
+    when no per-project override exists. Parallel to
+    :func:`is_project_warm_pool_scoped`; this resolves the per-project SIZE the
+    maintainer reconciles a scoped project toward (the scope decides whether the
+    project is reconciled at all; this decides to what target).
+    """
+    per_project = warm_pool_project_target_map()
+    sid = str(project_id)
+    if sid in per_project:
+        return per_project[sid]
+    try:
+        return max(0, int(_runtime_config.get("warm_pool_target_size", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 async def register_pool_vm(
     session,
     *,

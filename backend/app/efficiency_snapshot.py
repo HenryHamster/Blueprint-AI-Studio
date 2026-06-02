@@ -1292,6 +1292,44 @@ async def read_baseline_with_drift(
             "history": history,
         }
 
+    # Idle-inclusive cost-per-merged-PR as a companion trended axis. The
+    # per-snapshot ``cost_per_merged_pr_incl_pool_idle`` already folds warm-pool
+    # idle spend into the numerator (see compute_current_axes); here we surface
+    # it as a full {current, baseline, drift_pct, history} series so an operator
+    # can read TRUE cost regression in the same trend as the headline axis.
+    #
+    # Baseline is deliberately the immutable pre-pool ``cost_per_merged_pr``
+    # baseline (idle cost was zero before the pool existed), so drift directly
+    # answers "did enabling the pool regress cost per PR?". We do NOT add this to
+    # ALL_AXES — that would seed a separate immutable inclusive baseline and a
+    # migration, defeating the apples-to-apples separation the headline axis keeps.
+    incl_current = latest.get("cost_per_merged_pr_incl_pool_idle")
+    incl_baseline = baseline.get(AXIS_COST_PER_MERGED_PR)
+    if (
+        incl_current is None
+        or incl_baseline is None
+        or not isinstance(incl_current, (int, float))
+        or not isinstance(incl_baseline, (int, float))
+        or incl_baseline == 0
+    ):
+        incl_drift_pct = None
+    else:
+        incl_drift_pct = round(
+            ((incl_current - incl_baseline) / incl_baseline) * 100.0, 2
+        )
+    cost_incl_pool_idle_axis = {
+        "current": incl_current,
+        "baseline": incl_baseline,
+        "drift_pct": incl_drift_pct,
+        "history": [
+            {
+                "captured_at": snap.get("captured_at"),
+                "value": snap.get("cost_per_merged_pr_incl_pool_idle"),
+            }
+            for snap in snapshots
+        ],
+    }
+
     return {
         "axes": axes,
         "baseline_captured_at": baseline.get("captured_at"),
@@ -1318,6 +1356,11 @@ async def read_baseline_with_drift(
         "cost_per_merged_pr_incl_pool_idle": latest.get(
             "cost_per_merged_pr_incl_pool_idle"
         ),
+        # Idle-inclusive cost as a full trended axis (current/baseline/drift/
+        # history), baselined against the immutable pre-pool cost_per_merged_pr so
+        # its drift directly answers "did enabling the pool regress cost per PR?".
+        # Charted alongside the headline cost line in the warm-reuse-vs-cost trend.
+        "cost_per_merged_pr_incl_pool_idle_axis": cost_incl_pool_idle_axis,
         # Per-origin warm-start breakdown (pool vs chain-continuity vs backlog-
         # reuse) + the pool-origin share, from the latest snapshot. Sits next to
         # the pool idle cost and both cost-per-merged-PR figures so an operator

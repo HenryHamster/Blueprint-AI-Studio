@@ -47,6 +47,7 @@ from app.warm_pool import (
     is_pool_vm_image_stale,
     is_project_warm_pool_scoped,
     is_warm_pool_enabled,
+    resolve_project_warm_pool_target,
 )
 
 logger = logging.getLogger("blueprint")
@@ -678,7 +679,13 @@ async def reconcile_project_pool(
     summary = {"recycled": 0, "drained": 0, "provisioned": 0}
     in_scope = is_project_warm_pool_scoped(project_id)
     drain_only = cost_guard_engaged or not in_scope
-    target = 0 if drain_only else _pool_target_size(runtime_config)
+    # PER-PROJECT target: the project's explicit warm_pool_target_size_by_project
+    # value when set, else the global warm_pool_target_size. This replaces ONLY
+    # the single per-project IDLE target — every other guard/ceiling below (the
+    # fleet-wide warm_pool_max_vms ceiling, dispatch_slots_remaining, the
+    # demand-weighted account steering, and the cost-guard / out-of-scope
+    # drain-to-0 forcing) is unchanged.
+    target = 0 if drain_only else resolve_project_warm_pool_target(project_id)
 
     # Lock-free candidate read: the recycle/drain mutations below go through
     # retire_and_delete_pool_vm, whose atomic compare-and-swap claim is the sole

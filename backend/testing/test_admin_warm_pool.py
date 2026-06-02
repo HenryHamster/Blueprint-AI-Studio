@@ -479,8 +479,12 @@ async def test_enable_is_additive_to_existing_scope(
 async def test_enable_establishes_default_target_when_unset(
     client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
 ):
-    """A 0 target gets a sensible default (2) so enabling actually warms members."""
+    """With neither a per-project nor a global target configured, ENABLE
+    establishes a sensible default (2) for THIS project in the per-project map —
+    NOT by hardcoding the global — so enabling actually warms members while other
+    projects are unaffected."""
     _runtime_config["warm_pool_target_size"] = 0
+    _runtime_config["warm_pool_target_size_by_project"] = {}
     _runtime_config["warm_pool_max_vms"] = 20
     _runtime_config["max_concurrent_vms"] = 10
     _runtime_config["warm_pool_project_allowlist"] = []
@@ -494,8 +498,42 @@ async def test_enable_establishes_default_target_when_unset(
         f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
     )
     assert resp.status_code == 200, resp.text
-    assert _runtime_config["warm_pool_target_size"] == 2
+    # The GLOBAL target is left untouched (no fleet-wide resize)...
+    assert _runtime_config["warm_pool_target_size"] == 0
+    # ...the per-project target for THIS project is established at 2.
+    assert _runtime_config["warm_pool_target_size_by_project"][
+        str(project_owner.id)
+    ] == 2
     assert resp.json()["seeded"] == 2
+
+
+@pytest.mark.asyncio
+async def test_enable_keeps_existing_global_target_without_pinning(
+    client: AsyncClient, db_session, project_owner, warm_pool_enabled, mocker
+):
+    """When a global target IS configured, ENABLE relies on the global fallback
+    and does NOT pin a per-project entry (the effective target stays the global
+    value)."""
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_target_size_by_project"] = {}
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_project_allowlist"] = []
+
+    mocker.patch(
+        "app.routers.admin_warm_pool._default_pool_provision_fn",
+        new=_registering_provision_factory(),
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/enable"
+    )
+    assert resp.status_code == 200, resp.text
+    # No per-project entry pinned — the project resolves to the global target.
+    assert str(project_owner.id) not in _runtime_config[
+        "warm_pool_target_size_by_project"
+    ]
+    assert resp.json()["seeded"] == 3
 
 
 # ---------------------------------------------------------------------------
@@ -606,3 +644,135 @@ async def test_disable_in_fleetwide_mode_leaves_master_untouched(
     assert data["enabled"] is True
     assert data["project_allowlist"] == []
     assert _runtime_config["warm_pool_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# SET TARGET
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_target_denied_for_non_member_project(
+    client: AsyncClient, db_session, foreign_project
+):
+    resp = await client.post(
+        f"/api/admin/projects/{foreign_project.id}/warm-pool/target",
+        json={"target_size": 4},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_target_sets_per_project_value(
+    client: AsyncClient, db_session, project_owner
+):
+    """Setting an integer target stores it in the per-project map and reports it
+    as the effective target (independent of the global)."""
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_target_size_by_project"] = {}
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/target",
+        json={"target_size": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["target_size"] == 5
+    assert data["effective_target"] == 5
+    assert data["cleared"] is False
+    assert data["warm_pool_target_size_by_project"][str(project_owner.id)] == 5
+    # Stored in runtime_config and the global is untouched.
+    assert _runtime_config["warm_pool_target_size_by_project"][
+        str(project_owner.id)
+    ] == 5
+    assert _runtime_config["warm_pool_target_size"] == 2
+
+
+@pytest.mark.asyncio
+async def test_set_target_supports_zero(
+    client: AsyncClient, db_session, project_owner
+):
+    """0 is a valid explicit target (keep this project's pool empty)."""
+    _runtime_config["warm_pool_target_size"] = 3
+    _runtime_config["warm_pool_target_size_by_project"] = {}
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/target",
+        json={"target_size": 0},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["target_size"] == 0
+    assert data["effective_target"] == 0
+    assert _runtime_config["warm_pool_target_size_by_project"][
+        str(project_owner.id)
+    ] == 0
+
+
+@pytest.mark.asyncio
+async def test_set_target_clear_falls_back_to_global(
+    client: AsyncClient, db_session, project_owner
+):
+    """A null target_size removes the explicit entry, so the project falls back
+    to the global warm_pool_target_size."""
+    _runtime_config["warm_pool_target_size"] = 4
+    _runtime_config["warm_pool_target_size_by_project"] = {str(project_owner.id): 9}
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/target",
+        json={"target_size": None},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["cleared"] is True
+    assert data["target_size"] is None
+    # Falls back to the global target.
+    assert data["effective_target"] == 4
+    assert str(project_owner.id) not in _runtime_config[
+        "warm_pool_target_size_by_project"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_set_target_does_not_clobber_other_projects(
+    client: AsyncClient, db_session, project_owner
+):
+    """Read-modify-write: setting one project's target preserves another
+    project's existing explicit target."""
+    peer = str(uuid.uuid4())
+    _runtime_config["warm_pool_target_size"] = 2
+    _runtime_config["warm_pool_target_size_by_project"] = {peer: 7}
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/target",
+        json={"target_size": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    resulting = resp.json()["warm_pool_target_size_by_project"]
+    assert resulting[str(project_owner.id)] == 3
+    assert resulting[peer] == 7
+
+
+@pytest.mark.parametrize("bad_value", [-1, 51, "abc"])
+@pytest.mark.asyncio
+async def test_set_target_rejects_invalid_value(
+    client: AsyncClient, db_session, project_owner, bad_value
+):
+    """Out-of-range / non-integer target_size is rejected with 400."""
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/target",
+        json={"target_size": bad_value},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_target_requires_target_size_key(
+    client: AsyncClient, db_session, project_owner
+):
+    """A body missing target_size is rejected with 400."""
+    resp = await client.post(
+        f"/api/admin/projects/{project_owner.id}/warm-pool/target",
+        json={},
+    )
+    assert resp.status_code == 400, resp.text

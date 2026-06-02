@@ -59,6 +59,18 @@ const POPULATED = {
       ],
     },
   },
+  // Idle-inclusive cost companion: same time axis, higher values (idle overhead),
+  // baselined against the pre-pool idle-exclusive cost (3.0).
+  cost_per_merged_pr_incl_pool_idle_axis: {
+    current: 3.9,
+    baseline: 3.0,
+    drift_pct: 30.0,
+    history: [
+      { captured_at: '2026-05-01T00:00:00', value: 3.4 },
+      { captured_at: '2026-05-02T00:00:00', value: 3.6 },
+      { captured_at: '2026-05-03T00:00:00', value: 3.9 },
+    ],
+  },
   baseline_captured_at: '2026-04-24T00:00:00',
   last_snapshot_at: '2026-05-03T00:00:00',
 };
@@ -94,33 +106,58 @@ describe('WarmReuseVsCostTrend', () => {
     axesPayload = {};
   });
 
-  test('renders both series zipped onto a shared captured_at axis', async () => {
+  test('renders reuse + both cost series zipped onto a shared captured_at axis', async () => {
     axesPayload = POPULATED;
     ({ root, host } = await renderWidget());
 
-    // Both reuse and cost lines are rendered, each pinned to its own Y axis.
+    // Reuse, headline cost, and idle-inclusive cost lines render; the two cost
+    // lines share the cost axis, reuse keeps its own.
     const reuseLine = lineProps.find((p) => p.dataKey === 'reuse');
     const costLine = lineProps.find((p) => p.dataKey === 'cost');
+    const costInclLine = lineProps.find((p) => p.dataKey === 'costIncl');
     expect(reuseLine?.yAxisId).toBe('reuse');
     expect(costLine?.yAxisId).toBe('cost');
+    expect(costInclLine?.yAxisId).toBe('cost');
 
-    // The dataset is a single merged series sharing captured_at.
-    const data = chartData as Array<{ captured_at: string; reuse: number | null; cost: number | null }>;
+    // The dataset is a single merged series sharing captured_at, now carrying
+    // the idle-inclusive cost.
+    const data = chartData as Array<{ captured_at: string; reuse: number | null; cost: number | null; costIncl: number | null }>;
     expect(data).toHaveLength(3);
-    expect(data[0]).toEqual({ captured_at: '2026-05-01T00:00:00', reuse: 20, cost: 3.2 });
-    expect(data[2]).toEqual({ captured_at: '2026-05-03T00:00:00', reuse: 42, cost: 3.1 });
+    expect(data[0]).toEqual({ captured_at: '2026-05-01T00:00:00', reuse: 20, cost: 3.2, costIncl: 3.4 });
+    expect(data[2]).toEqual({ captured_at: '2026-05-03T00:00:00', reuse: 42, cost: 3.1, costIncl: 3.9 });
   });
 
-  test('draws the baseline reference line from vm_reuse_rate.baseline', async () => {
+  test('draws reuse and cost baseline reference lines', async () => {
     axesPayload = POPULATED;
     ({ root, host } = await renderWidget());
 
-    expect(referenceLineProps).toHaveLength(1);
-    expect(referenceLineProps[0].y).toBe(18);
-    expect(referenceLineProps[0].yAxisId).toBe('reuse');
+    // One reuse baseline (reuse axis) + one cost baseline (cost axis).
+    expect(referenceLineProps).toHaveLength(2);
+    const reuseRef = referenceLineProps.find((p) => p.yAxisId === 'reuse');
+    const costRef = referenceLineProps.find((p) => p.yAxisId === 'cost');
+    expect(reuseRef?.y).toBe(18);
+    // Cost baseline is the immutable pre-pool idle-exclusive cost (3.0).
+    expect(costRef?.y).toBe(3.0);
   });
 
-  test('omits the baseline reference line when baseline is null', async () => {
+  test('shows the idle-inclusive cost drift readout', async () => {
+    axesPayload = POPULATED;
+    ({ root, host } = await renderWidget());
+    expect(host.textContent).toContain('idle-incl cost +30.0% vs baseline');
+  });
+
+  test('omits the inclusive cost line and cost baseline when the axis is absent', async () => {
+    axesPayload = { ...POPULATED, cost_per_merged_pr_incl_pool_idle_axis: undefined };
+    ({ root, host } = await renderWidget());
+
+    expect(lineProps.find((p) => p.dataKey === 'costIncl')).toBeUndefined();
+    // Only the reuse baseline remains (cost baseline omitted with the axis).
+    expect(referenceLineProps).toHaveLength(1);
+    expect(referenceLineProps[0].yAxisId).toBe('reuse');
+    expect(host.textContent).not.toContain('idle-incl cost');
+  });
+
+  test('omits the reuse baseline reference line when its baseline is null', async () => {
     axesPayload = {
       ...POPULATED,
       axes: {
@@ -129,7 +166,9 @@ describe('WarmReuseVsCostTrend', () => {
       },
     };
     ({ root, host } = await renderWidget());
-    expect(referenceLineProps).toHaveLength(0);
+    // Reuse baseline gone, but the cost baseline still renders independently.
+    expect(referenceLineProps.find((p) => p.yAxisId === 'reuse')).toBeUndefined();
+    expect(referenceLineProps.find((p) => p.yAxisId === 'cost')?.y).toBe(3.0);
   });
 
   test('shows baseline-pending state when history is too short', async () => {

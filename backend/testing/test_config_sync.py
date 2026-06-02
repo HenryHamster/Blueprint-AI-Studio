@@ -269,6 +269,41 @@ async def test_sync_accepts_csv_warm_pool_project_allowlist():
     ]
 
 
+@pytest.mark.asyncio
+async def test_sync_applies_warm_pool_target_size_by_project():
+    """The per-project warm-pool target map must propagate from persisted
+    runtime_config_json to every instance, normalized to string keys and integer
+    values clamped to 0..50, with malformed entries dropped — so the maintainer
+    fleet-wide agrees on each project's reconcile target."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={
+            "warm_pool_target_size_by_project": {
+                " proj-a ": "3",  # trimmed key, int-coerced value
+                "proj-b": 99,  # clamped to 50
+                "proj-c": -2,  # clamped to 0
+                "": 4,  # dropped (blank key)
+                "proj-d": "bad",  # dropped (non-int)
+            },
+        },
+    )
+    _shared_state.runtime_config["warm_pool_target_size_by_project"] = {}
+
+    changed = await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["warm_pool_target_size_by_project"] == {
+        "proj-a": 3,
+        "proj-b": 50,
+        "proj-c": 0,
+    }
+    assert "warm_pool_target_size_by_project" in changed
+
+
 # --- Dispatcher Cycle Log ---
 
 

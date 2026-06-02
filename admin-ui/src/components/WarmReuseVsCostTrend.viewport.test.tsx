@@ -40,6 +40,16 @@ vi.mock('../api', () => ({
         ],
       },
     },
+    cost_per_merged_pr_incl_pool_idle_axis: {
+      current: 3.9,
+      baseline: 3.0,
+      drift_pct: 30.0,
+      history: [
+        { captured_at: '2026-05-01T00:00:00', value: 3.4 },
+        { captured_at: '2026-05-02T00:00:00', value: 3.6 },
+        { captured_at: '2026-05-03T00:00:00', value: 3.9 },
+      ],
+    },
     baseline_captured_at: '2026-04-24T00:00:00',
     last_snapshot_at: '2026-05-03T00:00:00',
   })),

@@ -1,5 +1,6 @@
 import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
+import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -759,6 +760,11 @@ export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
   last_snapshot_at: string | null;
+  // Idle-inclusive cost-per-merged-PR as a companion trended axis (current +
+  // history + a baseline sourced from the immutable pre-pool cost axis), so the
+  // warm-reuse-vs-cost trend can chart true cost regression beside the headline
+  // idle-exclusive cost line. Absent on older snapshots → optional.
+  cost_per_merged_pr_incl_pool_idle_axis?: EfficiencyAxis;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -1238,6 +1244,39 @@ export async function disableWarmPoolForProject(projectId: string): Promise<unkn
     { method: 'POST' },
   );
   if (!res.ok) throw new Error(`Failed to disable warm pool: ${res.status}`);
+  return res.json();
+}
+
+// Read the current per-project warm-pool TARGET map (and the global fallback)
+// from the settings endpoint. Returns the two target fields; the rest of the
+// settings payload is ignored. An older backend that predates per-project
+// targets omits the map — coerce that to {} so callers always get a record.
+export async function fetchWarmPoolTargets(): Promise<WarmPoolTargets> {
+  const res = await apiFetch('/api/admin/settings');
+  if (!res.ok) throw new Error(`Failed to fetch warm-pool targets: ${res.status}`);
+  const data = await res.json();
+  return {
+    warm_pool_target_size: Number(data?.warm_pool_target_size ?? 0),
+    warm_pool_target_size_by_project: data?.warm_pool_target_size_by_project ?? {},
+  };
+}
+
+// Set (targetSize 0..50) or clear (null) a single project's explicit warm-pool
+// target. Backs POST /api/admin/projects/{id}/warm-pool/target with body
+// {target_size}. Clearing falls the project back to the global default.
+export async function setWarmPoolTargetForProject(
+  projectId: string,
+  targetSize: number | null,
+): Promise<WarmPoolTargetSetResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/warm-pool/target`,
+    { method: 'POST', body: JSON.stringify({ target_size: targetSize }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to set warm-pool target: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to set warm-pool target: ${res.status}`);
+  }
   return res.json();
 }
 

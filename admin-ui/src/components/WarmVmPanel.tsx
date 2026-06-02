@@ -1,8 +1,8 @@
 import { useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
-import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject } from '../api';
+import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject } from '../api';
 import { parseTimestamp } from '../utils/time';
-import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate } from '../types/warmVm';
+import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate, WarmPoolTargets } from '../types/warmVm';
 import type { Project } from '../types/project';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import type { WarmStartOriginBreakdown } from '../hooks/useEfficiencySnapshot';
@@ -51,6 +51,7 @@ interface Props {
 export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem(STORAGE_KEY) === 'true');
   const [data, setData] = useState<WarmVmStateResponse | null>(null);
+  const [targets, setTargets] = useState<WarmPoolTargets | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flipping, setFlipping] = useState(false);
   const efficiency = useEfficiencySnapshot();
@@ -66,6 +67,14 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+    // Per-project target map is a separate, best-effort read (settings endpoint).
+    // A failure here must not blank the panel — leave the last-known targets so
+    // the set-target control degrades gracefully on an older/erroring backend.
+    try {
+      setTargets(await fetchWarmPoolTargets());
+    } catch {
+      // ignore — targets stay at their previous value (or null)
     }
   }, []);
 
@@ -320,7 +329,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
 
               {pool && <PoolAccountMixRow pool={pool} />}
 
-              <PoolHitRateEstimateRow data={data} />
+              <PoolHitRateEstimateRow data={data} targets={targets} onTargetSet={load} />
 
               {data.spawn_pin_funnel && (
                 <SpawnPinFunnelRow funnel={data.spawn_pin_funnel} />
@@ -566,7 +575,16 @@ function fmtEstRate(v: number | null | undefined): string {
 // project selector is populated from the active-VM dispatch mix (deduped
 // project_ids); when no VM carries a project_id there is nothing to estimate so
 // the control hides itself.
-function PoolHitRateEstimateRow({ data }: { data: WarmVmStateResponse }) {
+function PoolHitRateEstimateRow({ data, targets, onTargetSet }: {
+  data: WarmVmStateResponse;
+  // Current per-project target map + global fallback (null while loading or on
+  // an older backend that omits the settings fields). Used to show whether the
+  // scoped project's target is explicit or inherited.
+  targets: WarmPoolTargets | null;
+  // Refresh callback fired after a successful set/clear so the panel re-reads
+  // both the warm-vm state and the target map.
+  onTargetSet: () => void | Promise<void>;
+}) {
   const projectIds = Array.from(
     new Set(
       data.active_vms
@@ -579,6 +597,8 @@ function PoolHitRateEstimateRow({ data }: { data: WarmVmStateResponse }) {
   const [estimate, setEstimate] = useState<PoolHitRateEstimate | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [settingTarget, setSettingTarget] = useState(false);
+  const [targetErr, setTargetErr] = useState<string | null>(null);
 
   const effectiveProject = projectId || projectIds[0] || '';
 
@@ -605,7 +625,31 @@ function PoolHitRateEstimateRow({ data }: { data: WarmVmStateResponse }) {
     }
   }, [effectiveProject, targetSize]);
 
+  // Set this project's explicit target to the tuned N (or clear back to the
+  // global default when `clear` is true). Refreshes the panel on success.
+  const applyTarget = useCallback(async (clear: boolean) => {
+    if (!effectiveProject) return;
+    const value = clear ? null : Math.max(0, Math.round(targetSize));
+    setSettingTarget(true);
+    setTargetErr(null);
+    try {
+      await setWarmPoolTargetForProject(effectiveProject, value);
+      await onTargetSet();
+    } catch (e) {
+      setTargetErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSettingTarget(false);
+    }
+  }, [effectiveProject, targetSize, onTargetSet]);
+
   if (projectIds.length === 0) return null;
+
+  // Resolve the current target for the scoped project: an explicit per-project
+  // entry takes precedence; otherwise it inherits the global fallback.
+  const explicitTarget = targets?.warm_pool_target_size_by_project?.[effectiveProject];
+  const hasExplicit = explicitTarget !== undefined;
+  const globalTarget = targets?.warm_pool_target_size;
+  const currentTarget = hasExplicit ? explicitTarget : globalTarget;
 
   return (
     <div
@@ -668,6 +712,54 @@ function PoolHitRateEstimateRow({ data }: { data: WarmVmStateResponse }) {
           <span className="text-neutral-600 italic w-full">estimate only — replays recent dispatches, provisions nothing</span>
         </div>
       )}
+      <div
+        className="flex flex-wrap items-center gap-2 mt-1 pt-1 border-t border-neutral-800/40"
+        data-testid="pool-target-control"
+      >
+        <span className="text-neutral-500">
+          target:{' '}
+          {targets === null ? (
+            <span className="font-mono text-neutral-300" data-testid="pool-target-current">—</span>
+          ) : hasExplicit ? (
+            <span className="font-mono text-violet-300" data-testid="pool-target-current">
+              explicit {currentTarget}
+            </span>
+          ) : (
+            <span className="font-mono text-neutral-300" data-testid="pool-target-current">
+              inherited (global {globalTarget ?? 0})
+            </span>
+          )}
+        </span>
+        <button
+          onClick={() => { void applyTarget(false); }}
+          disabled={settingTarget || !effectiveProject}
+          data-testid="pool-target-set"
+          title={`Persist N=${Math.max(0, Math.round(targetSize))} as this project's warm-pool target`}
+          className={
+            'bg-violet-500/20 border border-violet-500/40 text-violet-300 hover:bg-violet-500/30 ' +
+            'font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (settingTarget || !effectiveProject ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
+          }
+        >
+          {settingTarget ? '…' : `Set target = ${Math.max(0, Math.round(targetSize))}`}
+        </button>
+        {hasExplicit && (
+          <button
+            onClick={() => { void applyTarget(true); }}
+            disabled={settingTarget}
+            data-testid="pool-target-clear"
+            title="Clear this project's explicit target so it inherits the global default"
+            className={
+              'bg-neutral-700/40 border border-neutral-600/40 text-neutral-300 hover:bg-neutral-700/60 ' +
+              'font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+              (settingTarget ? ' opacity-50 cursor-not-allowed' : ' cursor-pointer')
+            }
+          >
+            Clear
+          </button>
+        )}
+      </div>
+      {targetErr && <div className="text-red-400">Set target failed: {targetErr}</div>}
     </div>
   );
 }

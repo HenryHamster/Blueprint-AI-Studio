@@ -445,6 +445,18 @@ runtime_config: Dict = {
     # pool activity; env-overridable so an operator can size the pool without a
     # code change.
     "warm_pool_target_size": int(os.getenv("WARM_POOL_TARGET_SIZE", "2")),
+    # Per-project warm-pool IDLE target overrides ({project_id: int}). An EMPTY
+    # map (the default) means every scoped project reconciles toward the single
+    # fleet-wide ``warm_pool_target_size``. A per-project entry overrides that
+    # for exactly one project so an operator can size each project's pool to its
+    # own demand, instead of every project being held at the same number. Values
+    # are clamped to the same 0..50 range as the global target; 0 keeps that
+    # project's pool empty while leaving the master switch on. Modeled exactly on
+    # ``warm_pool_project_allowlist`` so it persists in ``runtime_config_json``
+    # with no schema migration. Read by
+    # ``warm_pool.resolve_project_warm_pool_target``; set via
+    # /api/admin/settings and the per-project warm-pool target endpoint.
+    "warm_pool_target_size_by_project": {},
     # Hard ceiling on concurrent live (PROVISIONING/IDLE/LEASED) pool members
     # fleet-wide. The maintainer never provisions past this even if every
     # project is below its target — a dedicated pool budget distinct from the
@@ -886,6 +898,28 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             sorted(
                                 {str(p).strip() for p in raw_allow if str(p).strip()}
                             ),
+                        )
+                if "warm_pool_target_size_by_project" in config_json:
+                    # Persisted per-project IDLE target overrides. Normalize to a
+                    # map of trimmed, non-empty string project-id keys to integer
+                    # values clamped to the same 0..50 range the global target
+                    # uses — mirroring warm_pool.warm_pool_project_target_map() /
+                    # the admin PATCH surface — and drop malformed entries so a
+                    # garbage value can't corrupt a project's reconcile target.
+                    raw_targets = config_json["warm_pool_target_size_by_project"]
+                    if isinstance(raw_targets, dict):
+                        normalized_targets: dict[str, int] = {}
+                        for proj_key, proj_val in raw_targets.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            try:
+                                ival = int(proj_val)
+                            except (TypeError, ValueError):
+                                continue
+                            normalized_targets[sid] = max(0, min(50, ival))
+                        _set(
+                            "warm_pool_target_size_by_project", normalized_targets
                         )
                 for int_key in (
                     "max_provision_retries",

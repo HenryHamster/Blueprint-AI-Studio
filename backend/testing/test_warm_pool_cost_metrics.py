@@ -327,6 +327,56 @@ async def test_compute_current_axes_includes_pool_idle_companion(db_session):
     assert axes["cost_per_merged_pr_incl_pool_idle"] is None
 
 
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_exposes_idle_inclusive_cost_axis(db_session):
+    """read_baseline_with_drift surfaces the idle-inclusive cost as a full trended
+    axis: current from the latest snapshot, history across snapshots, baseline
+    sourced from the immutable pre-pool cost_per_merged_pr, and drift vs it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.efficiency_snapshot import (
+        AXIS_COST_PER_MERGED_PR,
+        DESIGN_DOC_KEY,
+        read_baseline_with_drift,
+    )
+
+    project = await _make_project(db_session)
+    # Pre-pool baseline: idle cost was zero, so cost_per_merged_pr is the correct
+    # comparison point for the idle-inclusive series.
+    container = {
+        "baseline": {AXIS_COST_PER_MERGED_PR: 4.0},
+        "snapshots": [
+            {
+                "captured_at": "2026-05-01T00:00:00",
+                AXIS_COST_PER_MERGED_PR: 4.0,
+                "cost_per_merged_pr_incl_pool_idle": 4.4,
+            },
+            {
+                "captured_at": "2026-05-02T00:00:00",
+                AXIS_COST_PER_MERGED_PR: 4.0,
+                "cost_per_merged_pr_incl_pool_idle": 5.0,
+            },
+        ],
+        "last_run_at": "2026-05-02T00:00:00",
+    }
+    project.design_doc = {DESIGN_DOC_KEY: container}
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    axis = result["cost_per_merged_pr_incl_pool_idle_axis"]
+    assert axis["current"] == 5.0
+    # Baseline is the immutable pre-pool idle-EXCLUSIVE cost, not an inclusive one.
+    assert axis["baseline"] == 4.0
+    # Drift answers "did enabling the pool regress cost per PR?": (5.0-4.0)/4.0.
+    assert axis["drift_pct"] == 25.0
+    assert [h["value"] for h in axis["history"]] == [4.4, 5.0]
+    # The immutable headline axis is untouched (idle-exclusive, no drift).
+    assert result["axes"][AXIS_COST_PER_MERGED_PR]["baseline"] == 4.0
+    assert result["axes"][AXIS_COST_PER_MERGED_PR]["current"] == 4.0
+
+
 # ---------------------------------------------------------------------------
 # Per-account-mix idle cost + amortization (telemetry cluster, d-5fd69fe1)
 # ---------------------------------------------------------------------------

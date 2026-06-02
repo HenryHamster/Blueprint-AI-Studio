@@ -37,6 +37,8 @@ from app.warm_pool import (
     get_live_pool_vm_ids,
     is_pool_vm_image_stale,
     register_pool_vm,
+    resolve_project_warm_pool_target,
+    warm_pool_project_target_map,
 )
 from app.warm_pool_maintainer import (
     evaluate_pool_cost_guard,
@@ -101,6 +103,7 @@ def warm_pool_on():
         for k in (
             "warm_pool_enabled",
             "warm_pool_target_size",
+            "warm_pool_target_size_by_project",
             "warm_pool_max_vms",
             "warm_pool_idle_ttl_seconds",
             "warm_pool_heartbeat_stale_seconds",
@@ -1052,6 +1055,80 @@ def test_is_pool_vm_image_stale_helper():
     member = PoolVm(vm_instance_id="agent-vm-x", project_id=uuid.uuid4())
     assert is_pool_vm_image_stale(member, {"agent-vm-x"}) is True
     assert is_pool_vm_image_stale(member, {"agent-vm-y"}) is False
+
+
+# ---------------------------------------------------------------------------
+# Per-project target resolution
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_project_warm_pool_target_falls_back_to_global():
+    """With no per-project entry the resolver returns the global target."""
+    pid = uuid.uuid4()
+    _runtime_config["warm_pool_target_size"] = 4
+    _runtime_config["warm_pool_target_size_by_project"] = {}
+    assert resolve_project_warm_pool_target(pid) == 4
+
+
+def test_resolve_project_warm_pool_target_uses_explicit_value():
+    """An explicit per-project entry overrides the global target."""
+    pid = uuid.uuid4()
+    _runtime_config["warm_pool_target_size"] = 4
+    _runtime_config["warm_pool_target_size_by_project"] = {str(pid): 1}
+    assert resolve_project_warm_pool_target(pid) == 1
+    # Explicit 0 is honored (not treated as "unset").
+    _runtime_config["warm_pool_target_size_by_project"] = {str(pid): 0}
+    assert resolve_project_warm_pool_target(pid) == 0
+
+
+def test_warm_pool_project_target_map_normalizes_and_clamps():
+    """The map helper trims keys, coerces ints, clamps to 0..50, drops garbage."""
+    _runtime_config["warm_pool_target_size_by_project"] = {
+        " p-a ": "3",
+        "p-b": 99,  # clamped to 50
+        "p-c": -5,  # clamped to 0
+        "": 2,  # dropped (blank key)
+        "p-d": "nope",  # dropped (non-int)
+    }
+    result = warm_pool_project_target_map()
+    assert result == {"p-a": 3, "p-b": 50, "p-c": 0}
+
+
+@pytest.mark.asyncio
+async def test_run_pool_maintainer_cycle_reconciles_projects_to_different_targets(
+    db_session, warm_pool_on
+):
+    """In ONE cycle, two projects reconcile toward DIFFERENT targets: one from the
+    explicit per-project map, the other from the global fallback."""
+    _runtime_config["warm_pool_target_size"] = 1  # global fallback for project B
+    _runtime_config["warm_pool_max_vms"] = 20
+    _runtime_config["max_concurrent_vms"] = 10
+    _runtime_config["warm_pool_demand_window_minutes"] = 30
+
+    project_a = await _make_project(db_session, name="Pool A")
+    project_b = await _make_project(db_session, name="Pool B")
+    # Project A: explicit per-project target of 3; Project B: no entry → global 1.
+    _runtime_config["warm_pool_target_size_by_project"] = {str(project_a.id): 3}
+    # Both demand-active (QUEUED backlog), both start with zero members.
+    await _make_task(db_session, project_a, TaskStatus.QUEUED)
+    await _make_task(db_session, project_b, TaskStatus.QUEUED)
+
+    per_project = {}
+
+    async def _stub_provision(session, project_id, account_id=None):
+        per_project[project_id] = per_project.get(project_id, 0) + 1
+        return True
+
+    totals = await run_pool_maintainer_cycle(
+        runtime_config=_runtime_config,
+        provision_fn=_stub_provision,
+        session_factory=_factory_for(db_session),
+    )
+    assert totals["projects"] == 2
+    # Project A reconciles to its explicit target 3; B to the global fallback 1.
+    assert per_project[project_a.id] == 3
+    assert per_project[project_b.id] == 1
+    assert totals["provisioned"] == 4
 
 
 # ---------------------------------------------------------------------------

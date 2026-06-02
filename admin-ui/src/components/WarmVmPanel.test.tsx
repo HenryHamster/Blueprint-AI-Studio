@@ -37,6 +37,11 @@ vi.mock('../api', () => ({
   authGet: vi.fn(async () => new Response(JSON.stringify(baseState), { status: 200 })),
   enableWarmPoolForProject: vi.fn(async () => ({})),
   disableWarmPoolForProject: vi.fn(async () => ({})),
+  fetchWarmPoolTargets: vi.fn(async () => ({
+    warm_pool_target_size: 2,
+    warm_pool_target_size_by_project: {},
+  })),
+  setWarmPoolTargetForProject: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
 }));
 
@@ -52,7 +57,7 @@ vi.mock('../hooks/useEfficiencySnapshot', () => ({
   fmtEffIter: () => '—',
 }));
 
-import { apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject } from '../api';
+import { apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject } from '../api';
 import type { Project } from '../types/project';
 
 describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
@@ -750,6 +755,82 @@ describe('WarmVmPanel — pre-enable pool hit-rate estimate', () => {
 
     await screen.findByText('backlog reuse');
     expect(screen.queryByTestId('pool-hit-rate-estimate-row')).toBeNull();
+  });
+
+  test('shows the target as inherited when the project has no explicit entry', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithProjectVm), { status: 200 }),
+    );
+    (fetchWarmPoolTargets as ReturnType<typeof vi.fn>).mockResolvedValue({
+      warm_pool_target_size: 3,
+      warm_pool_target_size_by_project: {},
+    });
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const current = await screen.findByTestId('pool-target-current');
+    expect(current.textContent).toContain('inherited');
+    expect(current.textContent).toContain('3');
+    // No explicit entry → no clear affordance.
+    expect(screen.queryByTestId('pool-target-clear')).toBeNull();
+  });
+
+  test('shows the target as explicit when the project has a per-project entry', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithProjectVm), { status: 200 }),
+    );
+    (fetchWarmPoolTargets as ReturnType<typeof vi.fn>).mockResolvedValue({
+      warm_pool_target_size: 3,
+      warm_pool_target_size_by_project: { 'proj-estimate-1': 7 },
+    });
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const current = await screen.findByTestId('pool-target-current');
+    expect(current.textContent).toContain('explicit');
+    expect(current.textContent).toContain('7');
+    // Explicit entry → a clear affordance is offered.
+    expect(screen.getByTestId('pool-target-clear')).toBeTruthy();
+  });
+
+  test('Set target posts the tuned N for the scoped project and refreshes', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithProjectVm), { status: 200 }),
+    );
+    (fetchWarmPoolTargets as ReturnType<typeof vi.fn>).mockResolvedValue({
+      warm_pool_target_size: 2,
+      warm_pool_target_size_by_project: {},
+    });
+    (setWarmPoolTargetForProject as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const targetInput = await screen.findByTestId('pool-estimate-target');
+    fireEvent.change(targetInput, { target: { value: '4' } });
+    fireEvent.click(screen.getByTestId('pool-target-set'));
+
+    await waitFor(() => {
+      expect(setWarmPoolTargetForProject).toHaveBeenCalledWith('proj-estimate-1', 4);
+    });
+    // A successful set refetches state (initial load + post-set reload).
+    await waitFor(() => {
+      expect((authGet as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  test('Clear posts null to fall the project back to the global default', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithProjectVm), { status: 200 }),
+    );
+    (fetchWarmPoolTargets as ReturnType<typeof vi.fn>).mockResolvedValue({
+      warm_pool_target_size: 2,
+      warm_pool_target_size_by_project: { 'proj-estimate-1': 7 },
+    });
+    (setWarmPoolTargetForProject as ReturnType<typeof vi.fn>).mockResolvedValue({});
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    fireEvent.click(await screen.findByTestId('pool-target-clear'));
+
+    await waitFor(() => {
+      expect(setWarmPoolTargetForProject).toHaveBeenCalledWith('proj-estimate-1', null);
+    });
   });
 });
 
