@@ -316,6 +316,92 @@ async def test_spawn_skipped_when_all_directions_non_active(db_session):
     assert len(result.scalars().all()) == 0
 
 
+@pytest.mark.asyncio
+async def test_all_paused_directions_still_get_strategic_via_backstop(db_session, mocker):
+    """Regression: when every active direction is recommended_mode=pause, the
+    wall-clock strategic backstop must still fire a strategic cycle.
+
+    Before the fix, the all-paused early-return short-circuited the strategic-spawn
+    block even when force_strategic was set, so a project whose only directions were
+    all paused starved permanently: no research spawns → the modulo counter never
+    advanced → directions never re-evaluated → the pipeline went idle with free VMs.
+    """
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="All Paused + Backstop Due",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {**_active_direction("d-paused01", "Paused A"), "recommended_mode": "pause"},
+        ],
+        vision={"purpose": "test"},  # purpose set so force_strategic relies on the backstop
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A prior strategic task older than strategic_max_interval (180min) so the
+    # wall-clock backstop promotes force_strategic=True.
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old strategic cycle",
+        payloads=[{"type": "design_doc_update", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=200),
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert design_doc_mock.called or strategic_review_mock.called, (
+        "backstop must spawn a strategic cycle even when all directions are paused"
+    )
+
+
+@pytest.mark.asyncio
+async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mocker):
+    """Companion: with no strategic cycle due (backstop not firing, force_strategic
+    stays False), an all-paused direction set is correctly skipped — the guard only
+    bypasses the pause return when a strategic cycle is actually forced."""
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="All Paused, No Backstop",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[
+            {**_active_direction("d-paused02", "Paused A"), "recommended_mode": "pause"},
+        ],
+        vision={"purpose": "test"},  # purpose set; no stale strategic task → backstop idle
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    assert not design_doc_mock.called and not strategic_review_mock.called, (
+        "must not spawn a strategic cycle when none is due"
+    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    assert len(result.scalars().all()) == 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. _spawn_research_task — Active Research Guard
 # ─────────────────────────────────────────────────────────────────────────────
