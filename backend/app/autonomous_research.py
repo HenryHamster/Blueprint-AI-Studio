@@ -640,7 +640,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         not chosen_directions
         and active_directions
         and all(is_pause_mode(d) for d in active_directions)
+        and not force_strategic
     ):
+        # Skip tactical research when every active direction is paused — UNLESS a
+        # strategic cycle is forced (e.g. the wall-clock backstop above fired).
+        # Without the `not force_strategic` guard this return short-circuits the
+        # strategic-spawn block below, so a project whose only directions are all
+        # paused can never get a strategic cycle: no research spawns → the modulo
+        # counter never advances → directions never re-evaluated → permanent
+        # starvation deadlock. Mirrors the `not active_directions and not
+        # force_strategic` guard above so the backstop reaches the paused case too.
         logger.info(
             "[AUTONOMOUS] skipping tactical research: all active directions recommended_mode=pause"
         )
