@@ -1,6 +1,7 @@
 import { AlertTriangle, CheckCircle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
 import { timeAgo } from '../utils/time';
+import { splitConvergenceVerdict } from '../utils/convergenceVerdict';
 import type { DigestData } from './DashboardHome';
 
 export interface LatestCycle {
@@ -21,15 +22,6 @@ interface SystemStatusCardProps {
   loading: boolean;
 }
 
-// The backend bakes a review/fix convergence verdict into narrative_summary,
-// already gated on churn-signal sufficiency (see
-// digest_metrics.compute_narrative_summary). The sentence always starts with
-// "Review/fix churn is" and runs to the next period. We lift it out of the
-// prose so the headline churn verdict reads as its own line on the status
-// card instead of being buried mid-paragraph. On thin windows the backend
-// emits no such sentence, so nothing extra is surfaced.
-const CONVERGENCE_VERDICT_RE = /Review\/fix churn is[^.]*\./;
-
 export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
   const cycle = digest?.latest_cycle ?? null;
   const memoExits = digest?.memo_pathway_exits ?? 0;
@@ -37,11 +29,9 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
   const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
 
-  const narrative = digest?.narrative_summary ?? '';
-  const convergenceVerdict = narrative.match(CONVERGENCE_VERDICT_RE)?.[0] ?? null;
-  const prose = convergenceVerdict
-    ? narrative.replace(CONVERGENCE_VERDICT_RE, '').replace(/\s{2,}/g, ' ').trim()
-    : narrative;
+  // Lift the convergence verdict out of the prose via the shared helper so this
+  // card and CatchUpNarrativeSummary surface it identically.
+  const { verdict: convergenceVerdict, prose } = splitConvergenceVerdict(digest?.narrative_summary);
 
   return (
     <section>

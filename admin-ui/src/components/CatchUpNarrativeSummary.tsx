@@ -1,20 +1,12 @@
 import type { DigestData } from '../types/digest';
 import type { DirectionProgress } from './DirectionProgressSection';
 import type { TimeWindow } from './catchupHelpers';
+import { splitConvergenceVerdict } from '../utils/convergenceVerdict';
 
 export interface CatchUpNarrativeSummaryProps {
   digest: DigestData<DirectionProgress>;
   activeWindow: TimeWindow;
 }
-
-// The backend bakes a review/fix convergence verdict into narrative_summary,
-// already gated on churn-signal sufficiency (see
-// digest_metrics.compute_narrative_summary). The sentence always starts with
-// "Review/fix churn is" and runs to the next period. We lift it out of the
-// prose so the headline churn verdict reads as its own line instead of being
-// buried mid-paragraph; the rest of the narrative renders unchanged. On thin
-// windows the backend emits no such sentence, so nothing extra is surfaced.
-const CONVERGENCE_VERDICT_RE = /Review\/fix churn is[^.]*\./;
 
 /**
  * Narrative summary paragraph plus the trend pill. Renders nothing when the
@@ -25,11 +17,9 @@ const CONVERGENCE_VERDICT_RE = /Review\/fix churn is[^.]*\./;
 export function CatchUpNarrativeSummary({ digest, activeWindow }: CatchUpNarrativeSummaryProps) {
   if (!digest.narrative_summary && !digest.trend) return null;
 
-  const narrative = digest.narrative_summary ?? '';
-  const convergenceVerdict = narrative.match(CONVERGENCE_VERDICT_RE)?.[0] ?? null;
-  const prose = convergenceVerdict
-    ? narrative.replace(CONVERGENCE_VERDICT_RE, '').replace(/\s{2,}/g, ' ').trim()
-    : narrative;
+  // Lift the convergence verdict out of the prose via the shared helper so this
+  // surface and SystemStatusCard render it identically.
+  const { verdict: convergenceVerdict, prose } = splitConvergenceVerdict(digest.narrative_summary);
 
   return (
     <div className="flex flex-col gap-1.5 mb-3">

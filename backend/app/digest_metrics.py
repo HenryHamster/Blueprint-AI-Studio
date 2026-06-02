@@ -8,6 +8,7 @@ queries off a passed-in ``AsyncSession``. They are imported (and re-exported) by
 """
 
 import logging
+import math
 import statistics
 import uuid
 from collections import defaultdict
@@ -1529,6 +1530,44 @@ def compute_digest_cost_economics(
     }
 
 
+def compute_churn_direction(buckets: List[Dict[str, Any]]) -> str:
+    """Canonical churn-trend direction for a list of per-day trend buckets.
+
+    Single source of truth shared by the narrative verdict
+    (compute_narrative_summary) and the dashboard widget glyph (consumed via
+    the ``churn_direction`` field on the trend endpoint). Both surfaces MUST
+    derive direction here so the lifted "Review/fix churn is X." sentence can
+    never contradict the rising/falling glyph rendered beside it.
+
+    Compares the first-half vs second-half AVERAGE of per-day churn (robust to
+    single-day endpoint anomalies) with a 1% threshold to avoid flip-flopping
+    on near-equal halves. Returns 'falling' | 'rising' | 'flat'.
+    """
+    if len(buckets) < 2:
+        return "flat"
+
+    def _bucket_churn(bucket: Dict[str, Any]) -> float:
+        incidence = bucket.get("incidence_counts") or {}
+        churn = incidence.get("churn")
+        if churn is None:
+            churn = bucket.get("churn_total")
+        return float(churn or 0)
+
+    midpoint = math.ceil(len(buckets) / 2)
+    first_half = buckets[:midpoint]
+    second_half = buckets[midpoint:]
+    avg_first = sum(_bucket_churn(b) for b in first_half) / len(first_half)
+    avg_second = sum(_bucket_churn(b) for b in second_half) / len(second_half)
+
+    threshold = 0.01 * max(avg_first, avg_second, 1)
+    difference = avg_second - avg_first
+    if difference < -threshold:
+        return "falling"
+    if difference > threshold:
+        return "rising"
+    return "flat"
+
+
 def compute_narrative_summary(
     *,
     hours: int,
@@ -1646,31 +1685,20 @@ def compute_narrative_summary(
 
     if outer_loop_convergence_summary and outer_loop_convergence_trend:
         buckets = outer_loop_convergence_trend.get("buckets") or []
-        churn_dir = (
-            outer_loop_convergence_trend.get("churn_direction")
-            or outer_loop_convergence_trend.get("trend")
-        )
+        # Consume the SINGLE canonical churn direction. In production the trend
+        # endpoint already stamps `churn_direction` via compute_churn_direction;
+        # when a caller passes raw buckets without it (e.g. unit tests) fall back
+        # to the SAME helper so the verdict can never diverge from the widget
+        # glyph, which derives from the identical algorithm.
+        churn_dir = outer_loop_convergence_trend.get("churn_direction")
+        if churn_dir not in {"falling", "rising", "flat"}:
+            churn_dir = compute_churn_direction(buckets)
         if len(buckets) >= 2:
-            first = buckets[0].get("incidence_counts", {}).get("churn")
-            if first is None:
-                first = buckets[0].get("churn_total")
-            last = buckets[-1].get("incidence_counts", {}).get("churn")
-            if last is None:
-                last = buckets[-1].get("churn_total")
             has_churn_signal = any(
                 (b.get("incidence_counts", {}).get("churn") or b.get("churn_total") or 0) > 0
                 for b in buckets
             )
-            if first is not None and last is not None and has_churn_signal:
-                churn_dir = (
-                    churn_dir
-                    if churn_dir in {"falling", "rising", "flat"}
-                    else "flat"
-                )
-                if last < first:
-                    churn_dir = "falling"
-                elif last > first:
-                    churn_dir = "rising"
+            if has_churn_signal:
                 verdict = f"Review/fix churn is {churn_dir}"
                 dominant_blocker = outer_loop_convergence_summary.get("dominant_blocker")
                 if (

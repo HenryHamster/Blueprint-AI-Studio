@@ -237,6 +237,24 @@ describe('OuterReviewLoopConvergenceWidget', () => {
     expect(text).toContain('rising');
   });
 
+  test('prefers the backend-stamped churn_direction over local re-derivation', async () => {
+    summaryPayload = POPULATED;
+    // Buckets fall 2 -> 1 (local fallback would read "falling"), but the backend
+    // stamped churn_direction='rising' — the widget must render the canonical
+    // backend value so its glyph matches the narrative verdict.
+    fetchOuterLoopConvergenceTrendMock.mockImplementationOnce(async () => ({
+      ...TREND,
+      churn_direction: 'rising',
+    }));
+    const rendered = await renderWidget();
+    root = rendered.root;
+    host = rendered.host;
+    const text = host.textContent ?? '';
+    expect(text).toContain('churn trend');
+    expect(text).toContain('rising');
+    expect(text).not.toContain('falling');
+  });
+
   test('churn direction returns flat for genuinely stable churn', async () => {
     summaryPayload = POPULATED;
     const flatTrend = {
