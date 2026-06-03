@@ -6677,7 +6677,7 @@ async def test_unblock_sweep_keeps_parent_blocker_waiting_while_child_blocked(
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_moves_parent_blocker_to_evaluating_when_children_clear(
+async def test_unblock_sweep_moves_parent_blocker_to_evaluating_past_deadline(
     reaper_db, mocker
 ):
     """Once a blocked parent's child blockers clear, the parent returns to the
@@ -6700,6 +6700,7 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_when_children_cl
                 "reason": "All 1 subtask(s) blocked on upstream precondition — awaiting recheck",
             }
         },
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
         recheck_after=now - timedelta(minutes=1),
     )
     child = Task(
@@ -6725,6 +6726,16 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_when_children_cl
     assert parent.blocker_kind is None
     assert parent.blocked_at is None
     assert parent.recheck_after is None
+    assert parent.context.get("_blocked_escalated") is None
+    alerts = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.task_id == parent.id,
+                Alert.severity == AlertSeverity.ERROR,
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 0
     broadcast.assert_any_call(
         str(project.id),
         "task_updated",
@@ -6737,7 +6748,9 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_when_children_cl
 
 
 @pytest.mark.asyncio
-async def test_unblock_sweep_requeues_when_dependency_resolves(reaper_db, mocker):
+async def test_unblock_sweep_requeues_when_dependency_resolves_past_deadline(
+    reaper_db, mocker
+):
     """A dependency blocker is requeued once its dep resolves as eligible."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     project = await _make_project(reaper_db)
@@ -6749,17 +6762,30 @@ async def test_unblock_sweep_requeues_when_dependency_resolves(reaper_db, mocker
     reaper_db.add(dep)
     await reaper_db.commit()
     await reaper_db.refresh(dep)
+    now = _utcnow()
     t = await _blocked_task(
         reaper_db, project, blocker_kind="upstream_dependency",
         depends_on=[str(dep.id)],
+        blocked_at=now - _BLOCKED_ESCALATE_AFTER - timedelta(minutes=5),
+        recheck_after=now - timedelta(minutes=1),
     )
     verify = AsyncMock(return_value=True)
 
-    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow(), verify_pr_merged=verify)
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now, verify_pr_merged=verify)
 
     assert requeued == 1
     await reaper_db.refresh(t)
     assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_escalated") is None
+    alerts = (
+        await reaper_db.execute(
+            _select(Alert).where(
+                Alert.task_id == t.id,
+                Alert.severity == AlertSeverity.ERROR,
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 0
 
 
 @pytest.mark.asyncio

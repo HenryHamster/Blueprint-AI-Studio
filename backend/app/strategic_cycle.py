@@ -416,6 +416,34 @@ def baseline_running_update(cycle: StrategicCycle) -> str | None:
     return snap if isinstance(snap, str) else ""
 
 
+def advance_running_update_baseline(cycle: StrategicCycle, value: str) -> None:
+    """Advance the cycle's ``running_update`` baseline to ``value``.
+
+    Called after every successful (non-operator-superseded) agent write so a
+    subsequent same-cycle agent write reconciles against what the agent last
+    persisted rather than the frozen cycle-start snapshot. Without this advance
+    the second same-cycle write sees ``current != baseline`` and is misclassified
+    as an operator edit and discarded.
+
+    A genuine operator edit made between two agent writes still diverges from
+    this advanced baseline, so operator-wins is preserved.
+
+    Legacy cycles whose ``cycle_metadata`` never carried a ``baseline_running_update``
+    key (:func:`baseline_running_update` returns ``None`` for them, degrading to
+    blind-assign) are left untouched — writing the key would silently flip them
+    onto the reconciliation path mid-cycle.
+    """
+    meta = cycle.cycle_metadata
+    if not isinstance(meta, dict) or "baseline_running_update" not in meta:
+        return
+    if meta.get("baseline_running_update") == value:
+        return
+    new_meta = dict(meta)
+    new_meta["baseline_running_update"] = value
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
 def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     """Render a StrategicCycle row in the legacy cycle_history JSONB shape.
 

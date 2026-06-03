@@ -4165,6 +4165,122 @@ async def test_strategic_api_set_running_update_digest_reintegrated(db_session):
 
 
 @pytest.mark.asyncio
+async def test_strategic_api_set_running_update_twice_in_one_cycle_both_persist(
+    db_session,
+):
+    """Live op: two set_running_update calls in one cycle BOTH persist. The
+    baseline advances after the first write, so the second write is recognized
+    as the agent's own refinement and is NOT misclassified as an operator edit /
+    recorded as superseded. Regression: pre-fix the second write was dropped."""
+    from httpx import AsyncClient, ASGITransport
+    from app import strategic_cycle
+    from app.main import app
+    from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        cycle_id = await _attach_cycle_with_running_update_baseline(
+            db_session, project, task_id, baseline="BASELINE", current="BASELINE"
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp1 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT DOC A"},
+                },
+            )
+            assert resp1.status_code == 200, resp1.text
+            await db_session.refresh(project)
+            assert project.running_update == "AGENT DOC A"
+            # Baseline advanced to the first persisted document.
+            cycle = await strategic_cycle.get(db_session, cycle_id)
+            assert strategic_cycle.baseline_running_update(cycle) == "AGENT DOC A"
+
+            resp2 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT DOC B"},
+                },
+            )
+            assert resp2.status_code == 200, resp2.text
+
+        await db_session.refresh(project)
+        assert project.running_update == "AGENT DOC B"
+        ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
+        assert not any(
+            e.get("kind") == RUNNING_UPDATE_REJECTED_KIND for e in ledger
+        ), f"Second same-cycle write must not be recorded superseded; got {ledger}"
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_running_update_operator_edit_between_writes_wins(
+    db_session,
+):
+    """Live op: a genuine operator body edit made BETWEEN two agent writes still
+    wins — it diverges from the advanced baseline, so the second agent write is
+    preserved operator-wins and the agent's doc is recorded as superseded."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        await _attach_cycle_with_running_update_baseline(
+            db_session, project, task_id, baseline="BASELINE", current="BASELINE"
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp1 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT DOC A"},
+                },
+            )
+            assert resp1.status_code == 200, resp1.text
+            await db_session.refresh(project)
+            assert project.running_update == "AGENT DOC A"
+
+            # Operator hand-edits the body between the two agent writes.
+            project.running_update = "OPERATOR HAND EDIT"
+            db_session.add(project)
+            await db_session.commit()
+
+            resp2 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT DOC B"},
+                },
+            )
+            assert resp2.status_code == 200, resp2.text
+
+        await db_session.refresh(project)
+        assert project.running_update == "OPERATOR HAND EDIT"
+        ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
+        assert any(
+            e.get("kind") == RUNNING_UPDATE_REJECTED_KIND
+            and e.get("agent_value") == "AGENT DOC B"
+            for e in ledger
+        ), f"Expected agent doc B recorded operator-superseded; got {ledger}"
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_create_message_rejects_over_limit(db_session):
     """create_message rejects content exceeding limit."""
     from httpx import AsyncClient, ASGITransport

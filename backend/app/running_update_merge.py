@@ -39,9 +39,14 @@ import re
 
 from sqlalchemy.orm.attributes import flag_modified
 
+from typing import TYPE_CHECKING
+
 from app.models import Project
 from app.time_utils import _utcnow
 from app.vision_merge import REJECTED_EDITS_KEY, append_rejected_edits
+
+if TYPE_CHECKING:
+    from app.models import StrategicCycle
 
 
 # A routine-event digest line has the exact one-line shape produced by
@@ -158,6 +163,7 @@ def apply_reconciled_running_update(
     *,
     baseline: str | None,
     agent: str,
+    cycle: "StrategicCycle | None" = None,
 ) -> dict | None:
     """Mutate ``project.running_update`` with the operator-wins reconciliation.
 
@@ -166,9 +172,23 @@ def apply_reconciled_running_update(
     existing ledger) and ``project.vision`` is flagged modified. Returns the
     rejected-edit entry (or ``None``). The caller is responsible for
     ``session.add(project)`` / ``commit``.
+
+    When ``cycle`` is provided, the cycle's ``running_update`` baseline is
+    advanced to the just-persisted document so a subsequent same-cycle agent
+    write reconciles against what was actually last persisted (agent doc,
+    digest-reintegrated doc, or operator-won doc) rather than the frozen
+    cycle-start snapshot. This is the single place both write paths advance the
+    baseline so they cannot drift. The caller is responsible for
+    ``session.add(cycle)`` so the advance is flushed alongside the project write.
     """
     doc, rejected = reconcile_running_update(baseline, agent, project.running_update)
     project.running_update = doc
+    if cycle is not None:
+        # Lazy import (mirrors _routine_event_types) so this pure helper module
+        # keeps no import-time dependency on the strategic_cycle module.
+        from app import strategic_cycle as _strategic_cycle
+
+        _strategic_cycle.advance_running_update_baseline(cycle, doc or "")
     if rejected is not None and isinstance(project.vision, dict):
         # Mutate the live vision dict in place (append_rejected_edits returns
         # the same dict so we flag_modified once) rather than reassigning

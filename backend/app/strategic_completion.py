@@ -2318,6 +2318,7 @@ async def _handle_strategic_completion(
             from app.running_update_merge import apply_reconciled_running_update
 
             ru_baseline: str | None = None
+            ru_cycle_row = None
             ru_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
                 "strategic_cycle_id"
             )
@@ -2328,8 +2329,15 @@ async def _handle_strategic_completion(
                         ru_cycle_row
                     )
             ru_rejected = apply_reconciled_running_update(
-                project, baseline=ru_baseline, agent=new_running_update
+                project,
+                baseline=ru_baseline,
+                agent=new_running_update,
+                cycle=ru_cycle_row,
             )
+            if ru_cycle_row is not None:
+                # Persist the advanced baseline so a later same-cycle write
+                # reconciles against this document, not the cycle-start snapshot.
+                session.add(ru_cycle_row)
             if ru_rejected is not None:
                 logger.info(
                     f"[STRATEGIC] running_update: concurrent operator edit "

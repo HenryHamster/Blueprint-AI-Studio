@@ -8384,6 +8384,142 @@ async def test_strategic_completion_running_update_agent_wins_untouched(
     assert project.running_update == "AGENT REFRESHED DOC"
 
 
+@pytest.mark.asyncio
+async def test_apply_reconciled_running_update_two_agent_writes_one_cycle_both_persist(
+    db_session,
+):
+    """Two consecutive agent writes in one cycle BOTH persist: the baseline
+    advances to the first persisted document so the second write is recognized
+    as the agent's own refinement, not misclassified as an operator edit. No
+    spurious running_update_superseded entry is recorded.
+
+    This is the core regression: pre-fix the second write saw current=DOC_A !=
+    baseline=BASELINE and was discarded operator-wins."""
+    from app import strategic_cycle
+    from app.running_update_merge import (
+        RUNNING_UPDATE_REJECTED_KIND,
+        apply_reconciled_running_update,
+    )
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project = Project(
+        name="RU-two-writes",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+        running_update="BASELINE DOC",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update="BASELINE DOC",
+    )
+    await db_session.commit()
+
+    # First agent write in the cycle.
+    rejected1 = apply_reconciled_running_update(
+        project, baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC A", cycle=cycle,
+    )
+    db_session.add(project)
+    db_session.add(cycle)
+    await db_session.commit()
+    assert rejected1 is None
+    assert project.running_update == "AGENT DOC A"
+    # The baseline advanced to the just-persisted document.
+    assert strategic_cycle.baseline_running_update(cycle) == "AGENT DOC A"
+
+    # Second agent write in the SAME cycle: reconcile against the advanced
+    # baseline (read fresh as both write paths do), not the cycle-start snapshot.
+    rejected2 = apply_reconciled_running_update(
+        project, baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC B", cycle=cycle,
+    )
+    db_session.add(project)
+    db_session.add(cycle)
+    await db_session.commit()
+    assert rejected2 is None
+    assert project.running_update == "AGENT DOC B"
+
+    await db_session.refresh(project)
+    ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
+    assert not any(
+        e.get("kind") == RUNNING_UPDATE_REJECTED_KIND for e in ledger
+    ), f"No running_update should be recorded as superseded; got {ledger}"
+
+
+@pytest.mark.asyncio
+async def test_apply_reconciled_running_update_operator_edit_between_writes_still_wins(
+    db_session,
+):
+    """A genuine operator body edit made BETWEEN two agent writes still wins: it
+    diverges from the advanced baseline, so the second agent write is recorded
+    operator-wins and the operator's document is preserved."""
+    from app import strategic_cycle
+    from app.running_update_merge import (
+        RUNNING_UPDATE_REJECTED_KIND,
+        apply_reconciled_running_update,
+    )
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project = Project(
+        name="RU-operator-between",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+        running_update="BASELINE DOC",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update="BASELINE DOC",
+    )
+    await db_session.commit()
+
+    # First agent write.
+    apply_reconciled_running_update(
+        project, baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC A", cycle=cycle,
+    )
+    db_session.add(project)
+    db_session.add(cycle)
+    await db_session.commit()
+    assert project.running_update == "AGENT DOC A"
+    assert strategic_cycle.baseline_running_update(cycle) == "AGENT DOC A"
+
+    # Operator edits the body between the two agent writes.
+    project.running_update = "OPERATOR HAND EDIT"
+    db_session.add(project)
+    await db_session.commit()
+
+    # Second agent write: current (OPERATOR HAND EDIT) diverges from the advanced
+    # baseline (AGENT DOC A), so operator wins and the agent doc is recorded.
+    rejected = apply_reconciled_running_update(
+        project, baseline=strategic_cycle.baseline_running_update(cycle),
+        agent="AGENT DOC B", cycle=cycle,
+    )
+    db_session.add(project)
+    db_session.add(cycle)
+    await db_session.commit()
+    assert rejected is not None
+    await db_session.refresh(project)
+    assert project.running_update == "OPERATOR HAND EDIT"
+    ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
+    assert any(
+        e.get("kind") == RUNNING_UPDATE_REJECTED_KIND
+        and e.get("agent_value") == "AGENT DOC B"
+        for e in ledger
+    ), f"Expected agent doc B recorded operator-superseded; got {ledger}"
+
+
 def test_reconcile_running_update_invalid_event_type_in_middle_is_operator_edit():
     """When appended lines include a mix of valid digest events and an
     unrecognized event type in the middle (e.g., baseline + valid_digest_line +

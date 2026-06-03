@@ -336,6 +336,46 @@ class TestFilterFileConflicts:
         assert (c.latest_status_message or "").startswith("Blocked:")
 
     @pytest.mark.asyncio
+    async def test_broadcast_emitted_on_blocked_transition(self, mocker):
+        """When parking a candidate into BLOCKED on the escalation threshold,
+        emit a task_updated broadcast carrying BLOCKED status so the UI reflects
+        the committed state immediately."""
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        # First deferral: broadcasts QUEUED
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED
+        broadcast_fn.assert_called_once()
+        args, _ = broadcast_fn.call_args
+        assert args[2]["status"] == "QUEUED"
+        broadcast_fn.reset_mock()
+
+        # Second deferral: message unchanged, so no QUEUED broadcast (line 406 guard).
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED  # Still QUEUED at count=2
+        broadcast_fn.assert_not_called()
+
+        # Third deferral crosses the threshold — now parked in BLOCKED.
+        # Broadcasts BLOCKED on the transition.
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.BLOCKED
+        broadcast_fn.assert_called_once()
+        args, _ = broadcast_fn.call_args
+        assert args[0] == str(pid)
+        assert args[1] == "task_updated"
+        assert args[2]["task_id"] == str(c.id)
+        assert args[2]["status"] == "BLOCKED"
+        assert "Blocked:" in args[2]["message"]
+
+    @pytest.mark.asyncio
     async def test_blocked_at_onset_preserved_across_reblock(self, mocker):
         """When a same-identity onset stamp survives an optimistic requeue, a
         re-block measures blocked_at from the original onset — not a fresh now —

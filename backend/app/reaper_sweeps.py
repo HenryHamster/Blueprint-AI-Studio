@@ -647,6 +647,26 @@ async def sweep_unblock_blocked_tasks(
 
     requeued = 0
     changed = False
+
+    async def _escalate_blocked_task(
+        task,
+        ctx,
+        *,
+        blocker_kind: str,
+        detail: str,
+    ) -> None:
+        await _maybe_create_blocked_escalation_alert(
+            task,
+            session,
+            blocker_kind=blocker_kind,
+            detail=detail,
+        )
+        ctx["_blocked_escalated"] = True
+        task.context = ctx
+        flag_modified(task, "context")
+        task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+        session.add(task)
+
     for task in due:
         ctx = task.context or {}
         # Already escalated terminally — leave parked for the operator. On
@@ -661,32 +681,33 @@ async def sweep_unblock_blocked_tasks(
                 changed = True
             continue
 
-        # Deadline escalation: a blocker that never cleared within the window is
-        # surfaced once and parked (recovery has given up).
-        if task.blocked_at is not None and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER:
-            await _maybe_create_blocked_escalation_alert(
-                task,
-                session,
-                blocker_kind=task.blocker_kind or "unknown",
-                detail=(
-                    f"Task has been blocked since {task.blocked_at:%Y-%m-%d %H:%M} "
-                    f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
-                ),
-            )
-            ctx["_blocked_escalated"] = True
-            task.context = ctx
-            flag_modified(task, "context")
-            task.recheck_after = now + _BLOCKED_ESCALATED_PARK
-            session.add(task)
-            changed = True
-            continue
-
         state = await _blocked_precondition_state(task, session, verify_pr_merged)
         if state == "clear":
+            blocker_meta = (task.context or {}).get("blocker") or {}
+            blocker_source = (
+                blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
+            )
+            is_genuine_clear = bool(task.depends_on) or blocker_source == "parent"
+            if (
+                not is_genuine_clear
+                and task.blocked_at is not None
+                and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
+            ):
+                await _escalate_blocked_task(
+                    task,
+                    ctx,
+                    blocker_kind=task.blocker_kind or "unknown",
+                    detail=(
+                        f"Task has been blocked since {task.blocked_at:%Y-%m-%d %H:%M} "
+                        f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
+                    ),
+                )
+                changed = True
+                continue
             # A conflict/rollup blocker has no dependency edge and is requeued
-            # optimistically — dispatch may re-block it within a cycle, so keep
-            # the first-blocked onset stamp (so its deadline still measures from
-            # true onset). A genuine dependency clear (had dep edges) resets all.
+            # optimistically — unless it has already crossed the deadline and
+            # needs terminal escalation instead. A genuine dependency clear
+            # (had dep edges) resets all.
             _clear_blocked_fields(
                 task, preserve_first_blocked=not task.depends_on
             )
@@ -733,9 +754,9 @@ async def sweep_unblock_blocked_tasks(
                     exc_info=True,
                 )
         elif state == "dead":
-            await _maybe_create_blocked_escalation_alert(
+            await _escalate_blocked_task(
                 task,
-                session,
+                ctx,
                 blocker_kind=task.blocker_kind or "upstream dependency",
                 detail=(
                     "Upstream dependency failed or was cancelled — this task can "
@@ -743,13 +764,25 @@ async def sweep_unblock_blocked_tasks(
                     "(re-scope, re-point dependency, or cancel)."
                 ),
             )
-            ctx["_blocked_escalated"] = True
-            task.context = ctx
-            flag_modified(task, "context")
-            task.recheck_after = now + _BLOCKED_ESCALATED_PARK
-            session.add(task)
             changed = True
         else:  # "waiting" — re-arm a later recheck with backoff.
+            # Deadline escalation stays active for blockers that are still
+            # genuinely unresolved at the 6h mark.
+            if (
+                task.blocked_at is not None
+                and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
+            ):
+                await _escalate_blocked_task(
+                    task,
+                    ctx,
+                    blocker_kind=task.blocker_kind or "unknown",
+                    detail=(
+                        f"Task has been blocked since {task.blocked_at:%Y-%m-%d %H:%M} "
+                        f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
+                    ),
+                )
+                changed = True
+                continue
             attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
             ctx["_blocked_recheck_attempts"] = attempts
             task.context = ctx

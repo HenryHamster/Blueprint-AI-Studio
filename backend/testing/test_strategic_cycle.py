@@ -154,6 +154,58 @@ def test_to_legacy_dict_omits_baseline_problem_model():
 
 
 @pytest.mark.asyncio
+async def test_advance_running_update_baseline_updates_snapshot(db_session):
+    """After an agent write the baseline advances to the persisted document so
+    a subsequent same-cycle write reconciles against it, not the cycle-start
+    snapshot."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update="## v1",
+    )
+    await db_session.commit()
+    strategic_cycle.advance_running_update_baseline(cycle, "## v2 (agent doc A)")
+    db_session.add(cycle)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert (
+        strategic_cycle.baseline_running_update(fetched) == "## v2 (agent doc A)"
+    )
+
+
+def test_advance_running_update_baseline_noop_for_legacy_cycle():
+    """A legacy cycle (no baseline_running_update key) is left untouched — the
+    advance must not silently flip it onto the reconciliation path mid-cycle."""
+    cycle = StrategicCycle(
+        id="sc-legacy-adv",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={"baseline_vision": {"purpose": "x"}},
+    )
+    strategic_cycle.advance_running_update_baseline(cycle, "ignored doc")
+    assert "baseline_running_update" not in (cycle.cycle_metadata or {})
+    assert strategic_cycle.baseline_running_update(cycle) is None
+
+
+def test_advance_running_update_baseline_handles_empty_baseline():
+    """A captured-but-empty baseline (``""``) is a real snapshot, so it advances
+    to the agent's document on the first write."""
+    cycle = StrategicCycle(
+        id="sc-empty-adv",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={"baseline_running_update": ""},
+    )
+    strategic_cycle.advance_running_update_baseline(cycle, "## first agent doc")
+    assert (
+        strategic_cycle.baseline_running_update(cycle) == "## first agent doc"
+    )
+
+
+@pytest.mark.asyncio
 async def test_mark_phase1_completed_with_phase2_spawn(db_session):
     project = await _make_project(db_session)
     phase1 = Task(

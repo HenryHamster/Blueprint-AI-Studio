@@ -1519,6 +1519,7 @@ async def strategic_operation(
         from app.running_update_merge import apply_reconciled_running_update
 
         ru_baseline: str | None = None
+        ru_cycle_row = None
         ru_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
             "strategic_cycle_id"
         )
@@ -1527,9 +1528,13 @@ async def strategic_operation(
             if ru_cycle_row is not None:
                 ru_baseline = _strategic_cycle.baseline_running_update(ru_cycle_row)
         ru_rejected = apply_reconciled_running_update(
-            project, baseline=ru_baseline, agent=doc
+            project, baseline=ru_baseline, agent=doc, cycle=ru_cycle_row
         )
         session.add(project)
+        if ru_cycle_row is not None:
+            # Persist the advanced baseline alongside the project write so the
+            # next same-cycle agent write reconciles against this document.
+            session.add(ru_cycle_row)
         ctx = task.context or {}
         task.context = {
             **ctx,

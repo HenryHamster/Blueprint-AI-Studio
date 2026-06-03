@@ -51,6 +51,7 @@ async def _record_defer_and_maybe_escalate(
     detail: str,
     block_code: str,
     threshold: int = _PRECONDITION_ESCALATE_THRESHOLD,
+    broadcast_fn: Callable[..., Coroutine[Any, Any, None]] | None = None,
 ) -> None:
     """Track repeated deferral of *candidate* on the same precondition blocker.
 
@@ -154,6 +155,22 @@ async def _record_defer_and_maybe_escalate(
             blocker_kind=blocker_kind,
             detail=detail,
         )
+        # Broadcast the BLOCKED status transition so the UI reflects the committed state
+        if broadcast_fn:
+            try:
+                await broadcast_fn(
+                    str(candidate.project_id),
+                    "task_updated",
+                    {
+                        "task_id": str(candidate.id),
+                        "status": "BLOCKED",
+                        "message": candidate.latest_status_message,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    f"Failed to broadcast BLOCKED for {candidate.id}", exc_info=True
+                )
 
 
 def _is_test_file(path: str) -> bool:
@@ -428,6 +445,7 @@ async def filter_file_conflicts(
                 blocker_kind=f"file conflict on {overlapping_files}",
                 detail=defer_msg,
                 block_code="file_conflict",
+                broadcast_fn=broadcast_fn,
             )
         else:
             non_conflicting.append(eid)
@@ -549,6 +567,7 @@ async def filter_rollup_conflicts(
                 blocker_kind=f"pending rollup '{blocking_title[:60]}'",
                 detail=defer_msg,
                 block_code="pending_rollup",
+                broadcast_fn=broadcast_fn,
             )
         else:
             if stale_overlap:
