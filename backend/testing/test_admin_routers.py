@@ -29,6 +29,7 @@ from app.models import (
     Alert,
     ProjectMessage,
     MessageType,
+    MessagesLastSeen,
     SystemMaturity,
     _on_task_terminal_callbacks,
 )
@@ -1424,6 +1425,42 @@ class TestDeleteProject:
         assert resp.json()["active_tasks_cancelled"] == 1
 
     @pytest.mark.asyncio
+    async def test_delete_project_cascades_messageslastseen(
+        self, client: AsyncClient, db_session
+    ):
+        """A project with a MessagesLastSeen row deletes cleanly (ON DELETE
+        CASCADE), rather than FK-violating mid-delete.
+
+        Regression for the prod incident (2026-06-03) where
+        ``DELETE /api/admin/projects/{id}?force=true`` 500'd repeatedly on
+        ``messageslastseen_project_id_fkey``: the table was created (migration
+        0099) without ``ondelete='CASCADE'``, unlike the 0058 convention, and the
+        delete handler only hand-deletes ``Alert``. Migration 0137 adds the
+        cascade so the project delete removes the child row automatically.
+        Meaningful on Postgres (CI), where FK ondelete is enforced.
+        """
+        project = await _make_project(db_session)
+        db_session.add(
+            MessagesLastSeen(user_id=TEST_USER_ID, project_id=project.id)
+        )
+        await db_session.commit()
+
+        resp = await client.delete(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200, (
+            f"project delete must cascade messageslastseen, not FK-violate; "
+            f"got {resp.status_code}: {resp.text}"
+        )
+        # The child row is gone with the project.
+        remaining = (
+            await db_session.execute(
+                select(MessagesLastSeen).where(
+                    MessagesLastSeen.project_id == project.id
+                )
+            )
+        ).scalars().all()
+        assert remaining == []
+
+    @pytest.mark.asyncio
     async def test_delete_project_force_populates_deny_list(
         self, client: AsyncClient, db_session, mocker
     ):
@@ -1441,7 +1478,7 @@ class TestDeleteProject:
         task_id = str(task.id)
 
         fired_ids: list = []
-        sentinel = lambda tid: fired_ids.append(tid)  # noqa: E731
+        sentinel = lambda tid: fired_ids.append(tid)
         _on_task_terminal_callbacks.append(sentinel)
         try:
             resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
@@ -4258,7 +4295,7 @@ class TestDirectionAutoPauseStats:
                 _msg(5, "auto-paused", "high failure rate"),
                 _msg(10, "auto-paused", "no merges"),
                 _msg(11, "auto-retired", "3 consecutive auto-pause cycles"),
-                # Previous window (24–48h ago): only 1 auto-paused — drives "up" trend
+                # Previous window (24-48h ago): only 1 auto-paused - drives "up" trend
                 _msg(30, "auto-paused", "stale activity"),
             ]
         )
@@ -4272,7 +4309,7 @@ class TestDirectionAutoPauseStats:
         assert data["window_hours"] == 24
         assert data["auto_paused_count"] == 3
         assert data["auto_retired_count"] == 1
-        assert data["auto_recovered_count"] == 2  # 3 paused − 1 retired
+        assert data["auto_recovered_count"] == 2  # 3 paused - 1 retired
         assert data["currently_auto_paused"] == 1
         assert data["prev_window_auto_paused_count"] == 1
         assert data["trend"] == "up"
