@@ -51,6 +51,8 @@ type LayoutFixture = {
     | 'npm'
     | 'cargo'
     | 'make'
+    | 'just'
+    | 'task'
     | 'tox'
     | 'nox'
     | 'go'
@@ -60,6 +62,8 @@ type LayoutFixture = {
     | 'elixir'
     | 'dotnet'
     | 'php'
+    | 'composer'
+    | 'script'
     | null;
 };
 
@@ -91,6 +95,12 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
   if (runner.cmd === 'make' && runner.args[0] === 'test') {
     return 'make';
   }
+  if (runner.cmd === 'just' && runner.args[0] === 'test') {
+    return 'just';
+  }
+  if (runner.cmd === 'task' && runner.args[0] === 'test') {
+    return 'task';
+  }
   if (runner.cmd === 'tox') {
     return 'tox';
   }
@@ -117,6 +127,12 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
   }
   if (runner.cmd === 'vendor/bin/phpunit') {
     return 'php';
+  }
+  if (runner.cmd === 'composer' && runner.args[0] === 'test') {
+    return 'composer';
+  }
+  if (runner.cmd === 'bash') {
+    return 'script';
   }
   return null;
 }
@@ -239,6 +255,51 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
     expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
   });
 
+  it('auto-detection for bare pyproject.toml at root emits no runner', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('pyproject.toml') && !p.includes('/backend/'));
+    fs.readFileSync.mockImplementation((p: string) => {
+      if (p.endsWith('pyproject.toml')) return '[build-system]\nrequires = ["setuptools>=68"]\n';
+      return '';
+    });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('auto-detection for setup.cfg with pytest at root emits python3 -m pytest', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/setup.cfg') && !p.includes('/backend/'));
+    fs.readFileSync.mockImplementation((p: string) => {
+      if (p.endsWith('setup.cfg')) return '[tool:pytest]\naddopts = -q\n';
+      return '';
+    });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
+  });
+
+  it('auto-detection for bare setup.cfg or setup.py at root emits no runner', () => {
+    const fs = mockFs;
+
+    for (const manifest of ['setup.cfg', 'setup.py']) {
+      vi.clearAllMocks();
+      fs.existsSync.mockImplementation((p: string) => p.endsWith(`/${manifest}`) && !p.includes('/backend/'));
+      fs.readFileSync.mockImplementation((p: string) => {
+        if (p.endsWith('setup.cfg')) return '[metadata]\nname = demo\n';
+        return '';
+      });
+
+      const runners = detectTestRunners(undefined);
+
+      expect(runners, `manifest ${manifest}`).toHaveLength(0);
+    }
+  });
+
   it('auto-detection for backend/pytest.ini WITHOUT test-backend.sh emits python3 -m pytest', () => {
     const fs = mockFs;
     // backend/pytest.ini exists, but scripts/test-backend.sh does NOT
@@ -346,6 +407,38 @@ describe('detectTestRunners — generic external-repo fallbacks (make/tox/nox/sc
     expect(runners).toHaveLength(0);
   });
 
+  it('justfile/Justfile with a real `test:` target → just test (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/justfile') || p.endsWith('/Justfile'));
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('/justfile') ? 'test:\n\tcargo test\n' : 'build:\n\tcargo build\n',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('just');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+  });
+
+  it('Taskfile.yml/Taskfile.yaml with a real `test:` task → task test (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Taskfile.yml') || p.endsWith('/Taskfile.yaml'));
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('/Taskfile.yaml')
+        ? "version: '3'\n\ntasks:\n  test:\n    cmds:\n      - go test ./...\n"
+        : "version: '3'\n\ntasks:\n  build:\n    cmds:\n      - go build ./...\n",
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('task');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+  });
+
   it('lowercase `makefile` casing variant is recognized', () => {
     const fs = mockFs;
     fs.existsSync.mockImplementation((p: string) => p.endsWith('/makefile'));
@@ -414,6 +507,33 @@ describe('detectTestRunners — generic external-repo fallbacks (make/tox/nox/sc
       expect(runners[0].cmd).toBe('bash');
       expect(runners[0].args).toEqual([script]);
     }
+  });
+
+  it('composer.json with scripts.test → composer test (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/composer.json'));
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('composer.json') ? JSON.stringify({ scripts: { test: 'phpunit' } }) : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('composer');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+  });
+
+  it('bare composer.json without scripts.test emits no runner', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/composer.json'));
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('composer.json') ? JSON.stringify({ scripts: { lint: 'phpcs' } }) : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
   });
 
   it('a repo with none of these (and no Blueprint markers) yields NO runner', () => {
@@ -727,6 +847,9 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     );
     fs.readdirSync.mockImplementation((p: string) =>
       p.endsWith('/services') ? ['a', 'b'] : [],
+    );
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('setup.cfg') ? '[tool:pytest]\naddopts = -q\n' : '',
     );
 
     const runners = detectTestRunners(undefined);

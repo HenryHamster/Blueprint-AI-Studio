@@ -15,6 +15,7 @@ import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer } from './MessagesComposer';
+import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 
@@ -116,6 +117,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [newContent, setNewContent] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string } | null>(null);
+  // Real arming outcome the server reported for the last send (null before any
+  // send, or after the operator changes the message type so the composer reverts
+  // to a fresh type-based prediction).
+  const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   // Per-message action state
@@ -713,10 +718,21 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Read the server's real arming decision (additive, backward-compatible
+      // field) so the toast and composer hint reflect what actually happened
+      // rather than a type-only guess. Tolerate older responses without it.
+      let arming: ArmingOutcome | null = null;
+      try {
+        const data = await res.json();
+        arming = parseArmingOutcome(data?.arming);
+      } catch {
+        // No/invalid JSON body — fall back to generic confirmation copy.
+      }
       setNewContent('');
       setReplyTo(null);
+      setLastArming(arming);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
-      addToast('Message sent', 'success');
+      addToast(armingToastCopy(arming), 'success');
       await fetchMessages();
     } catch {
       addToast('Failed to send message', 'error');
@@ -1034,7 +1050,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         newContent={newContent}
         submitting={submitting}
         replyTo={replyTo}
-        onChangeType={setNewType}
+        lastArming={lastArming}
+        onChangeType={(value) => { setNewType(value); setLastArming(null); }}
         onChangeContent={setNewContent}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}

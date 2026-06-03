@@ -416,6 +416,57 @@ async def test_strategic_failures_below_three_allows_force_strategic(db_session)
     assert tasks[0].payloads[0]["type"] in ("design_doc_update", "strategic_review")
 
 
+# ── operator_overrides in _spawn_strategic_review ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_includes_operator_overrides_when_present(db_session):
+    """The strategic_review payload surfaces the consolidated operator-override
+    summary when a reconciliation ledger carries entries."""
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_rejected_agent_edits": [
+                {
+                    "at": "2026-06-03T10:00:00Z",
+                    "field": "running_update",
+                    "kind": "running_update_superseded",
+                    "agent_value": "my rewrite",
+                }
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "operator_overrides" in payload
+    assert payload["operator_overrides"][0]["document"] == "running_update"
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_omits_operator_overrides_when_empty(db_session):
+    """The payload omits operator_overrides entirely when no ledger entries exist."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "operator_overrides" not in payload
+
+
 # ── operator_rejection_rate in _spawn_strategic_review ────────────────────────
 
 
@@ -2630,6 +2681,119 @@ def test_agent_view_problem_model_no_marker_when_nothing_trimmed():
     assert "_gap_memory_trimmed" not in view
     # The durable input is never mutated.
     assert "_gap_memory_trimmed" not in pm
+
+
+def test_agent_view_problem_model_drops_rejected_agent_edits():
+    """The rejected-agent-edits ledger is surfaced via the consolidated
+    ``operator_overrides`` payload key, so it must be stripped from the
+    problem_model agent view to avoid double-shipping the raw ledger."""
+    from app.strategic_spawning import _agent_view_problem_model
+
+    pm = {
+        "intent": {"purpose": "x"},
+        "rejected_agent_edits": [
+            {"at": "2026-06-01T00:00:00Z", "field": "context", "agent_value": "a"}
+        ],
+    }
+    view = _agent_view_problem_model(pm)
+    assert "rejected_agent_edits" not in view
+    # The durable input is never mutated.
+    assert "rejected_agent_edits" in pm
+
+
+def test_build_operator_overrides_summary_consolidates_both_ledgers():
+    """Both reconciliation ledgers (vision + problem_model) are consolidated
+    into one normalized list, newest-first, with document/value mapping."""
+    from app.strategic_spawning import _build_operator_overrides_summary
+
+    project = _make_project(
+        vision={
+            "_rejected_agent_edits": [
+                {
+                    "at": "2026-06-02T10:00:00Z",
+                    "field": "vision.goal",
+                    "kind": "value_conflict",
+                    "user_value": "ship safe",
+                    "agent_value": "ship fast",
+                },
+                {
+                    "at": "2026-06-03T10:00:00Z",
+                    "field": "running_update",
+                    "kind": "running_update_superseded",
+                    "agent_value": "my rewrite",
+                },
+            ]
+        },
+        problem_model={
+            "rejected_agent_edits": [
+                {
+                    "at": "2026-06-01T10:00:00Z",
+                    "field": "intent.purpose",
+                    "kind": "value_conflict",
+                    "operator_value": "refine",
+                    "agent_value": "rewrite",
+                },
+            ]
+        },
+    )
+    out = _build_operator_overrides_summary(project)
+
+    # Newest-first ordering by `at`.
+    assert [e["at"] for e in out] == [
+        "2026-06-03T10:00:00Z",
+        "2026-06-02T10:00:00Z",
+        "2026-06-01T10:00:00Z",
+    ]
+    by_doc = {e["document"]: e for e in out}
+    # running_update entry: no operator value (operator's win is the live body).
+    assert by_doc["running_update"]["operator_value"] is None
+    assert by_doc["running_update"]["agent_value"] == "my rewrite"
+    # vision conflict maps user_value -> operator_value.
+    assert by_doc["vision"]["operator_value"] == "ship safe"
+    assert by_doc["vision"]["agent_value"] == "ship fast"
+    # problem_model intent conflict -> document "intent", operator_value carried.
+    assert by_doc["intent"]["operator_value"] == "refine"
+    assert by_doc["intent"]["agent_value"] == "rewrite"
+
+
+def test_build_operator_overrides_summary_empty_when_no_ledgers():
+    """Returns [] when neither ledger carries entries."""
+    from app.strategic_spawning import _build_operator_overrides_summary
+
+    assert _build_operator_overrides_summary(_make_project()) == []
+    assert (
+        _build_operator_overrides_summary(
+            _make_project(vision={"_rejected_agent_edits": []}, problem_model={})
+        )
+        == []
+    )
+
+
+def test_build_operator_overrides_summary_caps_and_truncates():
+    """The summary respects the entry cap and char-bounds each value."""
+    from app.strategic_spawning import (
+        _build_operator_overrides_summary,
+        _OPERATOR_OVERRIDES_MAX,
+        _OVERRIDE_VALUE_MAXLEN,
+    )
+
+    ledger = [
+        {
+            "at": f"2026-06-{i:02d}T00:00:00Z",
+            "field": "vision.g",
+            "kind": "value_conflict",
+            "user_value": "u",
+            "agent_value": "x" * (_OVERRIDE_VALUE_MAXLEN + 50),
+        }
+        for i in range(1, _OPERATOR_OVERRIDES_MAX + 6)
+    ]
+    project = _make_project(vision={"_rejected_agent_edits": ledger})
+    out = _build_operator_overrides_summary(project)
+
+    assert len(out) == _OPERATOR_OVERRIDES_MAX
+    # Truncated value carries the ellipsis marker and respects the cap.
+    assert out[0]["agent_value"].endswith("…")
+    assert len(out[0]["agent_value"]) == _OVERRIDE_VALUE_MAXLEN + 1
 
 
 @pytest.mark.asyncio

@@ -191,6 +191,12 @@
       "classification": "routine",
       "message_type": "NOTE",
       "source_fn": "post_strategic_steering_deferred_message"
+    },
+    {
+      "name": "strategic_steering_acted",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_strategic_steering_acted_message"
     }
   ]
 }

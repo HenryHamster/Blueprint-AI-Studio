@@ -64,6 +64,46 @@ DEFAULT_MIN_INTERVAL_SECONDS = 120
 ORIGIN_QUALIFICATION = "qualification"
 ORIGIN_OPERATOR = "operator"
 
+# Operator-message arming outcomes. These describe what the wake-gate actually
+# decided for a just-created message and are surfaced to the operator (the
+# message-create response, the composer hint/toast) so the UI reflects the real
+# server-side decision rather than a type-only guess:
+#   * ``steering``       — armed the operator-origin refresh marker (will wake
+#                          the strategist);
+#   * ``passive_note``   — a passive ``NOTE``, recorded but never wakes;
+#   * ``routine_event``  — a system/routine digest event, never wakes even
+#                          though its type is non-passive.
+ARMING_STEERING = "steering"
+ARMING_PASSIVE_NOTE = "passive_note"
+ARMING_ROUTINE_EVENT = "routine_event"
+
+
+def classify_operator_arming(
+    message_type: MessageType, *, event_type: str | None = None
+) -> str:
+    """Pure classifier: what will/did an operator message do to the strategist?
+
+    Single source of truth for the wake decision, shared by
+    ``maybe_arm_operator_refresh`` (which arms only on ``ARMING_STEERING``) and
+    the message-create endpoint (which echoes the outcome back to the operator).
+    Keeping both on this one function guarantees the surfaced outcome always
+    matches what arming actually did.
+
+    Returns one of ``ARMING_PASSIVE_NOTE`` (a ``NOTE``), ``ARMING_ROUTINE_EVENT``
+    (a non-passive type carrying a system/routine digest ``event_type``), or
+    ``ARMING_STEERING`` (genuine human steering that wakes the strategist).
+    """
+    if message_type is MessageType.NOTE:
+        return ARMING_PASSIVE_NOTE
+    if event_type:
+        # Inline import — ROUTINE_EVENT_TYPES lives in the router module, which
+        # imports a great deal; importing it at module load would risk a cycle.
+        from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
+
+        if event_type in ROUTINE_EVENT_TYPES:
+            return ARMING_ROUTINE_EVENT
+    return ARMING_STEERING
+
 
 async def request_strategic_refresh(
     session,
@@ -199,16 +239,13 @@ async def maybe_arm_operator_refresh(
     swallows its own errors and does NOT commit (the caller owns the txn), so
     arming can never make message creation fail. Returns True when arming was
     requested.
-    """
-    if message_type is MessageType.NOTE:
-        return False
-    if event_type:
-        # Inline import — ROUTINE_EVENT_TYPES lives in the router module, which
-        # imports a great deal; importing it at module load would risk a cycle.
-        from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
-        if event_type in ROUTINE_EVENT_TYPES:
-            return False
+    The wake decision itself is derived from ``classify_operator_arming`` so this
+    helper and the operator-facing outcome surfaced by the message-create
+    endpoint can never diverge.
+    """
+    if classify_operator_arming(message_type, event_type=event_type) != ARMING_STEERING:
+        return False
     await request_strategic_refresh(
         session,
         project_id,

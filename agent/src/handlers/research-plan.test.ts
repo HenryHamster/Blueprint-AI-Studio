@@ -80,6 +80,7 @@ import {
   buildScopeCalibrationSignal,
   buildFilteredFindingsSection,
   buildRejectedProposalsSection,
+  buildOperatorOverridesSection,
   buildRunningUpdateSupersededSection,
   buildUserPausedSection,
   readProgressArtifact,
@@ -762,6 +763,41 @@ describe('buildRejectedProposalsSection', () => {
     const out = buildRejectedProposalsSection(many);
     expect(out).toContain('proposal 9');
     expect(out).not.toContain('proposal 10');
+  });
+});
+
+describe('buildOperatorOverridesSection', () => {
+  it('returns empty string for empty input', () => {
+    expect(buildOperatorOverridesSection([])).toBe('');
+  });
+
+  it('renders vision/intent overrides with agent + operator values', () => {
+    const out = buildOperatorOverridesSection([
+      { document: 'vision', field: 'vision.goal', agent_value: 'ship fast', operator_value: 'ship safe', at: '2026-06-02T10:00:00Z' },
+      { document: 'intent', field: 'intent.purpose', agent_value: 'rewrite', operator_value: 'refine', at: '2026-06-01T10:00:00Z' },
+    ]);
+    expect(out).toContain('## Operator Overrides Since Last Cycle');
+    expect(out).toContain('do NOT simply re-propose');
+    expect(out).toContain('(2026-06-02) vision `vision.goal`');
+    expect(out).toContain('you proposed "ship fast"; the operator kept "ship safe".');
+    expect(out).toContain('(2026-06-01) intent `intent.purpose`');
+  });
+
+  it('renders running_update overrides without an operator scalar value', () => {
+    const out = buildOperatorOverridesSection([
+      { document: 'running_update', field: 'running_update', agent_value: 'my rewrite', at: '2026-06-03T10:00:00Z' },
+    ]);
+    expect(out).toContain('(2026-06-03) running_update');
+    expect(out).toContain('the operator kept their own running_update edit');
+  });
+
+  it('caps at 8 entries', () => {
+    const many = Array.from({ length: 12 }, (_, i) => ({
+      document: 'vision', field: `f${i}`, agent_value: `a${i}`, operator_value: `o${i}`, at: '2026-06-01T00:00:00Z',
+    }));
+    const out = buildOperatorOverridesSection(many);
+    expect(out).toContain('`f7`');
+    expect(out).not.toContain('`f8`');
   });
 });
 

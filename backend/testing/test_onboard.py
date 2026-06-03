@@ -139,10 +139,18 @@ def _backend_family_for_directory(directory):
         return "maven"
     if test_cmd == "mix test":
         return "elixir"
+    if test_cmd == "just test":
+        return "just"
+    if test_cmd == "task test":
+        return "task"
     if test_cmd == "dotnet test":
         return "dotnet"
     if test_cmd == "vendor/bin/phpunit":
         return "php"
+    if test_cmd == "composer test":
+        return "composer"
+    if test_cmd.startswith("bash "):
+        return "script"
     return None
 
 
@@ -1403,7 +1411,7 @@ class TestBuildConfigDetection:
             {"name": "backend", "type": "dir"},
         ]
         subdir_files = [
-            {"name": "setup.py", "type": "file"},
+            {"name": "setup.cfg", "type": "file"},
         ]
         root_resp = MagicMock()
         root_resp.status_code = 200
@@ -1412,11 +1420,12 @@ class TestBuildConfigDetection:
         subdir_resp = MagicMock()
         subdir_resp.status_code = 200
         subdir_resp.json.return_value = subdir_files
+        setup_cfg_resp = _file_content_resp("[tool:pytest]\naddopts = -q\n")
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp, subdir_resp],
+            side_effect=[root_resp, subdir_resp, setup_cfg_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1513,6 +1522,65 @@ class TestBuildConfigDetection:
         assert dir_config["test_cmd"] == "python3 -m pytest"
 
     @pytest.mark.asyncio
+    async def test_detect_build_config_bare_pyproject_keeps_lint_only(self):
+        """A pyproject.toml without a pytest signal is Python-for-lint, not pytest-gated."""
+        root = _listing_resp([{"name": "pyproject.toml", "type": "file"}])
+        pyproject = _file_content_resp("[build-system]\nrequires = [\"setuptools>=68\"]\n")
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, pyproject],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["type"] == "python"
+        assert dir_config["lint_cmd"] == "ruff check"
+        assert "test_cmd" not in dir_config
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_bare_setup_cfg_keeps_lint_only(self):
+        """A setup.cfg without pytest config must not claim a runnable suite."""
+        root = _listing_resp([{"name": "setup.cfg", "type": "file"}])
+        setup_cfg = _file_content_resp("[metadata]\nname = demo\n")
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, setup_cfg],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["type"] == "python"
+        assert dir_config["lint_cmd"] == "ruff check"
+        assert "test_cmd" not in dir_config
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_bare_setup_py_keeps_lint_only(self):
+        """A bare setup.py is a packaging signal only, not a pytest signal."""
+        root = _listing_resp([{"name": "setup.py", "type": "file"}])
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["type"] == "python"
+        assert dir_config["lint_cmd"] == "ruff check"
+        assert "test_cmd" not in dir_config
+
+    @pytest.mark.asyncio
     async def test_detect_build_config_pytest_ini_with_pyproject_no_duplicate(self):
         """pytest.ini alongside a core Python manifest yields exactly one Python
         directory — the (path, type) dedupe prevents a duplicate emission."""
@@ -1587,6 +1655,7 @@ class TestBuildConfigDetection:
         subdir_resp = MagicMock()
         subdir_resp.status_code = 200
         subdir_resp.json.return_value = subdir_files
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
 
         # The pyproject body fetch (to confirm pytest) must carry the same ref.
         pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
@@ -2042,7 +2111,8 @@ class TestDetectorRuntimeParity:
     (``agent/src/utils/test-runners.ts``) re-resolves entrypoints with its own
     rules. These pin the alignment: Node ``npm test`` is persisted only when
     ``scripts.test`` exists, Python ``python3 -m pytest`` is unconditional for
-    pytest.ini/setup.py/setup.cfg but content-gated for a pyproject-only dir.
+    pytest.ini but content-gated for a pyproject- or setup.cfg-only dir, and a
+    bare setup.py (packaging only) emits no test command at all.
     """
 
     @pytest.mark.asyncio
@@ -2147,8 +2217,9 @@ class TestDetectorRuntimeParity:
         assert py_dirs[0]["lint_cmd"] == "ruff check"
 
     @pytest.mark.asyncio
-    async def test_setup_py_dir_emits_pytest_without_content_fetch(self):
-        """setup.py is an unconditional pytest signal — no body fetch needed."""
+    async def test_setup_py_dir_emits_no_test_cmd_without_pytest_signal(self):
+        """A bare setup.py is packaging-only: the runtime emits no runner for it,
+        so onboarding must not claim a pytest suite (no-CI detector parity)."""
         root = _listing_resp(
             [
                 {"name": "setup.py", "type": "file"},
@@ -2164,7 +2235,7 @@ class TestDetectorRuntimeParity:
 
         assert mock_req.call_count == 1
         py_dirs = [d for d in config["directories"] if d["type"] == "python"]
-        assert py_dirs[0]["test_cmd"] == "python3 -m pytest"
+        assert py_dirs and "test_cmd" not in py_dirs[0]
 
     @pytest.mark.asyncio
     async def test_bare_pyproject_keeps_no_ci_gate_unverified(self):
@@ -2249,6 +2320,76 @@ class TestFallbackTestEntrypointDetection:
         assert config["directories"] == []
 
     @pytest.mark.asyncio
+    async def test_justfile_with_test_target_emits_just_test(self):
+        root = _listing_resp([{"name": "Justfile", "type": "file"}])
+        justfile = _file_content_resp(
+            "set shell := [\"bash\", \"-eu\", \"-o\", \"pipefail\", \"-c\"]\n\ntest:\n\tcargo test\n"
+        )
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, justfile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["type"] == "other"
+        assert dirs[0]["test_cmd"] == "just test"
+
+    @pytest.mark.asyncio
+    async def test_justfile_without_test_target_emits_no_test_cmd(self):
+        root = _listing_resp([{"name": "justfile", "type": "file"}])
+        justfile = _file_content_resp(
+            "build:\n\tcargo build\n\nlint:\n\tcargo clippy\n"
+        )
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, justfile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+
+    @pytest.mark.asyncio
+    async def test_taskfile_yaml_with_test_task_emits_task_test(self):
+        root = _listing_resp([{"name": "Taskfile.yaml", "type": "file"}])
+        taskfile = _file_content_resp(
+            "version: '3'\n\ntasks:\n  test:\n    cmds:\n      - go test ./...\n"
+        )
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, taskfile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["type"] == "other"
+        assert dirs[0]["test_cmd"] == "task test"
+
+    @pytest.mark.asyncio
+    async def test_taskfile_without_test_task_emits_no_test_cmd(self):
+        root = _listing_resp([{"name": "Taskfile.yml", "type": "file"}])
+        taskfile = _file_content_resp(
+            "version: '3'\n\ntasks:\n  build:\n    cmds:\n      - go build ./...\n"
+        )
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, taskfile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+
+    @pytest.mark.asyncio
     async def test_tox_ini_emits_tox(self):
         root = _listing_resp([{"name": "tox.ini", "type": "file"}])
         with patch(
@@ -2295,6 +2436,24 @@ class TestFallbackTestEntrypointDetection:
         dirs = config["directories"]
         assert len(dirs) == 1
         assert dirs[0]["test_cmd"] == "bash run-tests.sh"
+
+    @pytest.mark.asyncio
+    async def test_scripts_test_sh_emits_repo_root_invocation(self):
+        """scripts/test.sh must match the agent's repo-root bash invocation."""
+        root = _listing_resp([{"name": "scripts", "type": "dir"}])
+        scripts = _listing_resp([{"name": "test.sh", "type": "file"}])
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, scripts],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["path"] == "./"
+        assert dirs[0]["test_cmd"] == "bash scripts/test.sh"
 
     @pytest.mark.asyncio
     async def test_ruby_gemfile_and_rakefile_emit_rake_test(self):
@@ -2620,7 +2779,7 @@ class TestSharedTestRunnerLayouts:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         directories = config.get("directories") or []
-        assert bool(directories) is layout["detectable"]
+        assert any(str(item.get("test_cmd") or "").strip() for item in directories) is layout["detectable"]
 
         project = Project(
             name=f"shared-layout-{layout['name']}",
@@ -2633,7 +2792,6 @@ class TestSharedTestRunnerLayouts:
         assert has_detectable_tests(project) is layout["detectable"]
 
         if not layout["detectable"]:
-            assert directories == []
             assert not any(
                 str(item.get("test_cmd") or "").strip() for item in directories
             )

@@ -2746,6 +2746,9 @@ class TestMessages:
             )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "created"
+        # The response reports the real arming decision so the UI can tell the
+        # operator the message actually steered the strategist.
+        assert resp.json()["arming"] == "steering"
 
         vision = await self._reload_vision(db_session, project.id)
         assert strategic_refresh_pending(vision) is True
@@ -2774,6 +2777,7 @@ class TestMessages:
             },
         )
         assert resp.status_code == 200, resp.text
+        assert resp.json()["arming"] == "passive_note"
 
         vision = await self._reload_vision(db_session, project.id)
         assert strategic_refresh_pending(vision) is False
@@ -2798,6 +2802,7 @@ class TestMessages:
             },
         )
         assert resp.status_code == 200, resp.text
+        assert resp.json()["arming"] == "routine_event"
 
         vision = await self._reload_vision(db_session, project.id)
         assert strategic_refresh_pending(vision) is False

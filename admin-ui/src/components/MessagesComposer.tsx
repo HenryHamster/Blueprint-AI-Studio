@@ -1,6 +1,7 @@
 import { type RefObject } from 'react';
 import { X, Send, Reply } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
+import { type ArmingOutcome, armingHintCopy, predictArming } from './messageArming';
 
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -8,6 +9,8 @@ export interface MessagesComposerProps {
   newContent: string;
   submitting: boolean;
   replyTo: { id: string; content: string; from: string } | null;
+  /** Outcome the server reported for the last send, or null before any send. */
+  lastArming?: ArmingOutcome | null;
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -28,6 +31,7 @@ export function MessagesComposer({
   newContent,
   submitting,
   replyTo,
+  lastArming,
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -41,8 +45,10 @@ export function MessagesComposer({
     el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
   }
 
-  // NOTE is recorded passively; every other type wakes the active strategist.
-  const isPassive = newType === 'NOTE';
+  // Hint reflects the server's real decision for the last send when available
+  // (the only source that accounts for routine/system event exclusions),
+  // falling back to the type-based prediction before any message has been sent.
+  const hintOutcome: ArmingOutcome = lastArming ?? predictArming(newType);
 
   return (
     <div className="px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50">
@@ -81,11 +87,10 @@ export function MessagesComposer({
           <Send className="w-4 h-4" />
         </button>
       </div>
-      {/* Steering hint: tells the operator whether the chosen type wakes the strategist. */}
+      {/* Steering hint: grounded in the last send's real outcome when available,
+          otherwise predicted from the selected type. */}
       <p className="text-[11px] leading-snug text-neutral-500 mt-1.5 px-0.5">
-        {isPassive
-          ? 'Recorded as a note — won’t wake the strategist.'
-          : 'Steering message — reaches the strategist soon.'}
+        {armingHintCopy(hintOutcome)}
       </p>
     </div>
   );

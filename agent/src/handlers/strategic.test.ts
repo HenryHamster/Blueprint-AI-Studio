@@ -74,6 +74,8 @@ vi.mock('./research-plan.js', () => ({
   buildStrategicCompletionLogs: () => ({ logs: '', warning: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
+  buildOperatorOverridesSection: (o: Array<Record<string, unknown>>) =>
+    Array.isArray(o) && o.length ? `OPERATOR_OVERRIDES(${o.length})` : '',
   buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>
     signal && Number(signal.count) > 0 ? '\n_operator preserved running_update_\n' : '',
   buildUserPausedSection: () => '',
@@ -189,6 +191,36 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('```json');
     expect(section).not.toContain('this is the first cycle');
     expect(section).not.toContain('EXISTS but was not shipped in full');
+  });
+});
+
+describe('handleStrategic operator_overrides wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('threads payload.operator_overrides into the thinker params', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      operator_overrides: [
+        { document: 'running_update', field: 'running_update', agent_value: 'a', at: '2026-06-01' },
+        { document: 'vision', field: 'vision.goal', agent_value: 'b', operator_value: 'c', at: '2026-06-02' },
+      ],
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-ov', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.operatorOverridesSection).toBe('OPERATOR_OVERRIDES(2)');
+  });
+
+  it('passes empty section when operator_overrides absent', async () => {
+    const payload: Record<string, unknown> = { project_name: 'Blueprint' };
+    const statusRef = { value: '' };
+    await handleStrategic('task-no-ov', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.operatorOverridesSection).toBe('');
   });
 });
 

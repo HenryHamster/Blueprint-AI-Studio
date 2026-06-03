@@ -4,7 +4,11 @@ import { act, createRef } from 'react';
 import { MessagesComposer } from './MessagesComposer';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
-async function renderComposer(root: Root, newType: string) {
+async function renderComposer(
+  root: Root,
+  newType: string,
+  lastArming: 'steering' | 'passive_note' | 'routine_event' | null = null,
+) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
     root.render(
@@ -14,6 +18,7 @@ async function renderComposer(root: Root, newType: string) {
         newContent=""
         submitting={false}
         replyTo={null}
+        lastArming={lastArming}
         onChangeType={() => {}}
         onChangeContent={() => {}}
         onCancelReply={() => {}}
@@ -63,6 +68,23 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       await renderComposer(r, 'FEEDBACK');
     });
     expect(host!.textContent).toContain('reaches the strategist soon');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('last-send routine_event outcome overrides the type-based prediction', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      // FEEDBACK would predict steering, but the server reported routine_event
+      // for the last send — the real outcome must win.
+      await renderComposer(r, 'FEEDBACK', 'routine_event');
+    });
+    expect(host!.textContent).toContain('Routine event');
+    expect(host!.textContent).toContain('won’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

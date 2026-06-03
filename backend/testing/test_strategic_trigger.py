@@ -149,6 +149,57 @@ def test_clear_drops_origin_and_notified_on_consume():
 
 
 # ===========================================================================
+# Operator arming classifier — pure, no DB
+# ===========================================================================
+
+
+def test_classify_passive_note():
+    """A NOTE is passive regardless of any event_type."""
+    from app.models import MessageType
+
+    assert (
+        st.classify_operator_arming(MessageType.NOTE) == st.ARMING_PASSIVE_NOTE
+    )
+    assert (
+        st.classify_operator_arming(MessageType.NOTE, event_type="pr_merged")
+        == st.ARMING_PASSIVE_NOTE
+    )
+
+
+def test_classify_steering_for_nonpassive_without_event():
+    """A non-passive operator type with no event_type is genuine steering."""
+    from app.models import MessageType
+
+    assert (
+        st.classify_operator_arming(MessageType.FEEDBACK) == st.ARMING_STEERING
+    )
+
+
+def test_classify_routine_event_for_nonpassive_with_routine_event():
+    """A non-passive type carrying a routine/system digest event never wakes."""
+    from app.models import MessageType
+
+    assert (
+        st.classify_operator_arming(
+            MessageType.FEEDBACK, event_type="review_feedback"
+        )
+        == st.ARMING_ROUTINE_EVENT
+    )
+
+
+def test_classify_steering_for_nonroutine_event():
+    """A non-passive type with a non-routine event_type still steers."""
+    from app.models import MessageType
+
+    assert (
+        st.classify_operator_arming(
+            MessageType.FEEDBACK, event_type="not_a_routine_event"
+        )
+        == st.ARMING_STEERING
+    )
+
+
+# ===========================================================================
 # Durable set + coalescing — with DB
 # ===========================================================================
 

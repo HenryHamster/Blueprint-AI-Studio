@@ -93,6 +93,27 @@ function isDockerAvailable(): boolean {
   }
 }
 
+function manifestDefinesTestScript(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text) as { scripts?: { test?: string } };
+    return Boolean(parsed.scripts?.test);
+  } catch {
+    return false;
+  }
+}
+
+function textDefinesTestTarget(text: string): boolean {
+  return /^\s*test\b[^:\n]*:/m.test(text);
+}
+
+function fileMentionsPytest(path: string): boolean {
+  try {
+    return fs.readFileSync(path, 'utf-8').includes('pytest');
+  } catch {
+    return false;
+  }
+}
+
 export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync, readdirSync } = fs;
   const runners: TestRunner[] = [];
@@ -159,6 +180,57 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     if (has('phpunit.xml') || has('phpunit.xml.dist')) {
       return { cmd: 'vendor/bin/phpunit', args: [], cwd: absDir, label: `vendor/bin/phpunit (${label})` };
     }
+    // Composer: composer.json declaring a real `scripts.test` → `composer test`.
+    if (has('composer.json')) {
+      try {
+        if (manifestDefinesTestScript(readFileSync(`${absDir}/composer.json`, 'utf-8'))) {
+          return { cmd: 'composer', args: ['test'], cwd: absDir, label: `composer test (${label})` };
+        }
+      } catch { /* unreadable — skip */ }
+    }
+    return null;
+  };
+
+  const detectGenericFallbackRunner = (absDir: string, label: string): TestRunner | null => {
+    const has = (name: string): boolean => {
+      try { return _exists(`${absDir}/${name}`); } catch { return false; }
+    };
+    const tryTextManifest = (name: string): boolean => {
+      try {
+        return textDefinesTestTarget(readFileSync(`${absDir}/${name}`, 'utf-8'));
+      } catch {
+        return false;
+      }
+    };
+    // Makefile with a real `test:` target → `make test`.
+    for (const makefileName of ['Makefile', 'makefile', 'GNUmakefile']) {
+      if (has(makefileName) && tryTextManifest(makefileName)) {
+        return { cmd: 'make', args: ['test'], cwd: absDir, label: `make test (${label}/${makefileName})` };
+      }
+    }
+    // just / Taskfile support mirrors the backend content-guarded fallback:
+    // only emit when the manifest actually declares a runnable `test` target.
+    for (const justfileName of ['Justfile', 'justfile']) {
+      if (has(justfileName) && tryTextManifest(justfileName)) {
+        return { cmd: 'just', args: ['test'], cwd: absDir, label: `just test (${label}/${justfileName})` };
+      }
+    }
+    for (const taskfileName of ['Taskfile.yml', 'Taskfile.yaml']) {
+      if (has(taskfileName) && tryTextManifest(taskfileName)) {
+        return { cmd: 'task', args: ['test'], cwd: absDir, label: `task test (${label}/${taskfileName})` };
+      }
+    }
+    if (has('tox.ini')) {
+      return { cmd: 'tox', args: [], cwd: absDir, label: `tox (${label})` };
+    }
+    if (has('noxfile.py')) {
+      return { cmd: 'nox', args: [], cwd: absDir, label: `nox (${label})` };
+    }
+    for (const script of ['test.sh', 'run-tests.sh', 'run_tests.sh', 'scripts/test.sh']) {
+      if (has(script)) {
+        return { cmd: 'bash', args: [script], cwd: absDir, label: `bash ${script} (${label})` };
+      }
+    }
     return null;
   };
 
@@ -180,12 +252,10 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
     if (noRunners()) {
       if (existsSync(pytestIniPath)) {
         runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
-      } else if (existsSync(pyprojectPath)) {
-        try {
-          if (readFileSync(pyprojectPath, 'utf-8').includes('pytest')) {
-            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
-          }
-        } catch { /* unreadable — skip */ }
+      } else if (existsSync(pyprojectPath) && fileMentionsPytest(pyprojectPath)) {
+        runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
+      } else if (existsSync(`${WORKSPACE}/setup.cfg`) && fileMentionsPytest(`${WORKSPACE}/setup.cfg`)) {
+        runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root setup.cfg)' });
       }
     }
 
@@ -230,15 +300,19 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
           runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
         }
       } else if (existsSync(backendPyproject)) {
-        try {
-          if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
-            if (existsSync(backendTestScript)) {
-              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
-            } else {
-              runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
-            }
+        if (fileMentionsPytest(backendPyproject)) {
+          if (existsSync(backendTestScript)) {
+            runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
+          } else {
+            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
           }
-        } catch { /* unreadable — skip */ }
+        }
+      } else if (existsSync(`${WORKSPACE}/backend/setup.cfg`) && fileMentionsPytest(`${WORKSPACE}/backend/setup.cfg`)) {
+        if (existsSync(backendTestScript)) {
+          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend setup.cfg)' });
+        } else {
+          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend setup.cfg)' });
+        }
       }
 
       if (existsSync(agentPkg)) {
@@ -249,6 +323,16 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
           }
         } catch { /* malformed package.json — skip */ }
       }
+    }
+
+    // --- Generic external-repo fallbacks (only if no Blueprint-specific or
+    //     manifest-based runner was found above). These let an external no-CI
+    //     repo whose stored build_config is empty still run its real suite.
+    //     Ordering is deterministic: Makefile → just/Taskfile → tox.ini →
+    //     noxfile.py → test scripts; the first match wins.
+    if (noRunners()) {
+      const genericRoot = detectGenericFallbackRunner(WORKSPACE, 'root');
+      if (genericRoot) runners.push(genericRoot);
     }
 
     // --- Nested monorepo / external-layout detection (only if no root-level or
@@ -275,31 +359,26 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
       const pushRunnerForPackageDir = (relPath: string): void => {
         const abs = `${WORKSPACE}/${relPath}`;
         try {
-          // Python: pytest.ini / setup.py / setup.cfg (manifest present) or a
-          // pyproject.toml that actually mentions pytest (content-guarded, to
-          // avoid emitting pytest for a packaging-only python directory).
-          if (
-            existsSync(`${abs}/pytest.ini`) ||
-            existsSync(`${abs}/setup.py`) ||
-            existsSync(`${abs}/setup.cfg`)
-          ) {
+          // Python: pytest.ini, or pyproject.toml / setup.cfg that actually
+          // mention pytest. A bare setup.py is a packaging signal only and
+          // must not claim a runnable suite.
+          if (existsSync(`${abs}/pytest.ini`)) {
             runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: abs, label: `pytest (${relPath})` });
             return;
           }
-          if (existsSync(`${abs}/pyproject.toml`)) {
-            let hasPytest = false;
-            try { hasPytest = readFileSync(`${abs}/pyproject.toml`, 'utf-8').includes('pytest'); } catch { /* unreadable — skip */ }
-            if (hasPytest) {
-              runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: abs, label: `pytest (${relPath} pyproject)` });
-              return;
-            }
+          if (existsSync(`${abs}/pyproject.toml`) && fileMentionsPytest(`${abs}/pyproject.toml`)) {
+            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: abs, label: `pytest (${relPath} pyproject)` });
+            return;
+          }
+          if (existsSync(`${abs}/setup.cfg`) && fileMentionsPytest(`${abs}/setup.cfg`)) {
+            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: abs, label: `pytest (${relPath} setup.cfg)` });
+            return;
           }
           // Node: package.json declaring a real `scripts.test` (conservative —
           // an absent test script must fall back, not block, per the no-CI gate).
           if (existsSync(`${abs}/package.json`)) {
             try {
-              const pkg = JSON.parse(readFileSync(`${abs}/package.json`, 'utf-8')) as { scripts?: { test?: string } };
-              if (pkg.scripts?.test) {
+              if (manifestDefinesTestScript(readFileSync(`${abs}/package.json`, 'utf-8'))) {
                 runners.push({ cmd: 'npm', args: ['test'], cwd: abs, label: `npm test (${relPath})` });
                 return;
               }
@@ -322,6 +401,11 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
             runners.push(extra);
             return;
           }
+          const generic = detectGenericFallbackRunner(abs, relPath);
+          if (generic) {
+            runners.push(generic);
+            return;
+          }
         } catch { /* defensive: any fs error — skip this package */ }
       };
 
@@ -341,53 +425,13 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         }
       };
 
-      for (const container of ['services', 'apps', 'packages']) {
+      for (const container of ['services', 'apps', 'packages', 'libs', 'modules', 'crates', 'cmd', 'pkg']) {
         scanContainer(container);
       }
       // `src/` is treated as a single package directory (manifest at src/ itself)
       // AND scanned for child packages, matching the backend's depth-bounded walk.
       pushRunnerForPackageDir('src');
       scanContainer('src');
-    }
-
-    // --- Generic external-repo fallbacks (only if no Blueprint-specific or
-    //     manifest-based runner was found above). These let an external no-CI
-    //     repo whose stored build_config is empty still run its real suite.
-    //     Ordering is deterministic: Makefile → tox.ini → noxfile.py → test
-    //     scripts; the first match wins.
-    if (noRunners()) {
-      // Makefile with a real `test:` target → `make test` from repo root.
-      // SAFETY: only emit when the file actually declares a `test` target,
-      // otherwise `make test` fails with "No rule to make target 'test'".
-      for (const makefileName of ['Makefile', 'makefile', 'GNUmakefile']) {
-        if (!noRunners()) break;
-        const makefilePath = `${WORKSPACE}/${makefileName}`;
-        if (existsSync(makefilePath)) {
-          try {
-            if (/^test\s*:/m.test(readFileSync(makefilePath, 'utf-8'))) {
-              runners.push({ cmd: 'make', args: ['test'], cwd: WORKSPACE, label: `make test (${makefileName})` });
-            }
-          } catch { /* unreadable — skip */ }
-        }
-      }
-    }
-
-    if (noRunners() && existsSync(`${WORKSPACE}/tox.ini`)) {
-      runners.push({ cmd: 'tox', args: [], cwd: WORKSPACE, label: 'tox (root)' });
-    }
-
-    if (noRunners() && existsSync(`${WORKSPACE}/noxfile.py`)) {
-      runners.push({ cmd: 'nox', args: [], cwd: WORKSPACE, label: 'nox (root)' });
-    }
-
-    // Conventional root-level test scripts → `bash <script>`. First match wins.
-    if (noRunners()) {
-      for (const script of ['test.sh', 'run-tests.sh', 'run_tests.sh', 'scripts/test.sh']) {
-        if (!noRunners()) break;
-        if (existsSync(`${WORKSPACE}/${script}`)) {
-          runners.push({ cmd: 'bash', args: [script], cwd: WORKSPACE, label: `bash ${script}` });
-        }
-      }
     }
   }
 

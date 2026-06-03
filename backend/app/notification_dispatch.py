@@ -74,6 +74,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_stabilize_stalled",  # post_version_stabilize_stalled_message
         "release_ci_unresolved_stall",  # post_version_ci_unresolved_stall_message
         "release_auto_merge_stalled",  # post_version_auto_merge_stall_message
+        "strategic_steering_acted",  # post_strategic_steering_acted_message
     }
 )
 
@@ -520,6 +521,32 @@ async def post_strategic_steering_deferred_message(
         project_id,
         event_type="strategic_steering_deferred",
         summary=f"Strategic steering request deferred — {reason}",
+        context={"reason": reason},
+    )
+
+
+async def post_strategic_steering_acted_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    reason: str = "the strategist is now acting on your steering",
+) -> ProjectMessage:
+    """Post a HIGH-SIGNAL system message when operator steering reaches the strategist.
+
+    The symmetric success counterpart to
+    ``post_strategic_steering_deferred_message``. An operator steering message
+    routes through the coalesced strategic-refresh marker; when the autonomous
+    loop actually consumes an operator-origin marker and spawns the strategist,
+    the operator must be told their steering landed rather than left to guess
+    from silence. Classified ``high_signal`` (NOT critical/escalation) so it
+    surfaces in the high-signal feed and fires an info-severity toast — higher
+    signal than the routine deferral notice, without the error styling reserved
+    for failures.
+    """
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="strategic_steering_acted",
+        summary=f"Strategic steering reached the strategist — {reason}",
         context={"reason": reason},
     )
 

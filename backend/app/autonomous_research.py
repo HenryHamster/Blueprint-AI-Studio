@@ -179,6 +179,40 @@ async def _maybe_notify_operator_refresh_deferred(
         )
 
 
+async def _maybe_notify_operator_steering_acted(
+    project: Project, session: AsyncSession
+) -> None:
+    """Confirm, exactly once, that operator steering reached the strategist.
+
+    Symmetric success counterpart to ``_maybe_notify_operator_refresh_deferred``.
+    Called only after a strategic spawn has *consumed* an operator-origin refresh
+    marker — the caller reads the marker origin BEFORE ``clear_strategic_refresh``
+    wipes it, so this fires only for operator intent (a qualification-origin
+    consume stays silent). The marker is gone after consume, so this single
+    consume site is inherently once-per-pending-request — no notified flag is
+    needed. Best-effort and non-fatal: a failure here must never break the spawn
+    that already succeeded and committed.
+    """
+    try:
+        from app.notification_dispatch import (
+            post_strategic_steering_acted_message,
+        )
+
+        await post_strategic_steering_acted_message(session, project.id)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC] operator steering consumed on spawn for project %s "
+            "— posted one-time confirmation notice",
+            project.id,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] failed to post operator steering confirmation for "
+            "project %s",
+            project.id,
+        )
+
+
 async def _fetch_direction_reasoning_memos(
     project_id,
     direction_id: str,
@@ -981,6 +1015,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         f"task(s) created in last {cooldown_minutes}min for project {project.id} "
                         f"(force_strategic={force_strategic}); falling through to tactical"
                     )
+                    # An operator steering request that is pending but not yet due
+                    # (min-interval / spawn-cooldown floor) is held, not dropped —
+                    # surface that once so it isn't a silent swallow.
+                    await _maybe_notify_operator_refresh_deferred(
+                        project,
+                        session,
+                        "queued behind a recent strategic cycle (spawn cooldown not yet elapsed)",
+                    )
                     is_strategic = False
 
     if is_strategic:
@@ -1071,9 +1113,22 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
             await with_vision_locked(session, project.id, _mark_payload_bloat_skip)
             await session.commit()
+            # A pending operator steering marker survives this skip (the spawn
+            # never happened, so it is not consumed). Tell the operator their
+            # steering is paused on payload bloat rather than leaving it silent.
+            await _maybe_notify_operator_refresh_deferred(
+                project,
+                session,
+                "strategic refresh paused — context payload exceeds the size limit",
+            )
 
         if spawned:
             research_spawn_count += 1
+
+            # Capture, inside the lock, whether the consumed marker was
+            # operator-origin — read BEFORE clear_strategic_refresh wipes it so
+            # the symmetric success notice can fire only for operator steering.
+            _consumed: dict = {}
 
             def _record_strategic_spawn(vision: dict) -> None:
                 vision["_research_spawn_count"] = research_spawn_count
@@ -1087,8 +1142,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # Consume any pending strategic-refresh marker — this spawn
                 # satisfies the owed refresh (and stamps the fire time so the
                 # min-interval floor measures refresh-driven fires).
-                from app.strategic_trigger import clear_strategic_refresh
+                from app.strategic_trigger import (
+                    ORIGIN_OPERATOR,
+                    clear_strategic_refresh,
+                    strategic_refresh_origin,
+                )
 
+                _consumed["operator"] = (
+                    strategic_refresh_origin(vision) == ORIGIN_OPERATOR
+                )
                 clear_strategic_refresh(vision, now)
 
             await with_vision_locked(session, project.id, _record_strategic_spawn)
@@ -1101,6 +1163,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             # has_active_strategic guard above, eventually that strategic
             # task completes and the next tick re-fires immediately.
             await session.commit()
+
+            # Symmetric success counterpart to the deferral notice: when the
+            # consumed marker was operator-origin, confirm the strategist woke
+            # and is acting on the steering. Best-effort — never fatal to the
+            # spawn that already succeeded and committed above.
+            if _consumed.get("operator"):
+                await _maybe_notify_operator_steering_acted(project, session)
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.

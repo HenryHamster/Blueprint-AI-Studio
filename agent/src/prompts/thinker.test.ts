@@ -59,6 +59,7 @@ describe('buildThinkerPrompt', () => {
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',
     rejectedProposalsSection: '',
+    operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
     systemMaturitySection: '',
     driftSection: '',
@@ -196,6 +197,14 @@ describe('buildThinkerPrompt', () => {
 
     const without = buildThinkerPrompt({ ...base, systemMaturitySection: '' });
     expect(without).not.toContain('## System Maturity');
+  });
+
+  it('operator overrides section rendered only when operatorOverridesSection is non-empty', () => {
+    const with_ = buildThinkerPrompt({ ...base, operatorOverridesSection: '\n## Operator Overrides Since Last Cycle\nentry\n' });
+    expect(with_).toContain('## Operator Overrides Since Last Cycle');
+
+    const without = buildThinkerPrompt({ ...base, operatorOverridesSection: '' });
+    expect(without).not.toContain('## Operator Overrides Since Last Cycle');
   });
 
   it('drift section rendered only when driftSection is non-empty', () => {
@@ -504,6 +513,7 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',
     rejectedProposalsSection: '',
+    operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
     systemMaturitySection: '',
     driftSection: '',
@@ -560,6 +570,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     dirHealthSummary: 'Active: 0/10 slots.',
     userPausedSection: '',
     rejectedProposalsSection: '',
+    operatorOverridesSection: '',
     portfolioCompositionText: 'No active directions — portfolio is empty.',
     systemMaturitySection: '',
     driftSection: '',

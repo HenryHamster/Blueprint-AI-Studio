@@ -27,6 +27,7 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.problem_model import REJECTED_AGENT_EDITS_KEY as PM_REJECTED_EDITS_KEY
 from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
 from app.source_ref_validation import (
     classify_existing_paths,
@@ -142,6 +143,11 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
         return {}
     trimmed = dict(pm)
     trimmed.pop("archived_gaps", None)
+    # The rejected-agent-edits ledger is surfaced to the agent through the
+    # dedicated, consolidated ``operator_overrides`` payload key (see
+    # :func:`_build_operator_overrides_summary`) — strip it here so the raw,
+    # unbounded ledger is not double-shipped inside problem_model.
+    trimmed.pop("rejected_agent_edits", None)
     gaps = trimmed.get("gaps") or []
     if gaps:
         new_gaps = []
@@ -179,6 +185,97 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
         if gap_memory_trimmed:
             trimmed["_gap_memory_trimmed"] = gap_memory_trimmed
     return trimmed
+
+
+# Maximum operator-override entries surfaced to the next strategic cycle, and
+# the per-value character cap. The override summary closes the operator-wins
+# reconciliation loop: the reconciliation writers record each overridden agent
+# value into rolling, capped ledgers (vision ``_rejected_agent_edits`` and
+# problem_model ``rejected_agent_edits``) "so next cycle's agent can see what
+# was overridden and reconcile" — this helper reads those ledgers (read-only;
+# never clears or mutates them) into one bounded list. Kept small so it can
+# never bloat the prompt; the payload packer drops it whole under budget.
+_OPERATOR_OVERRIDES_MAX = 8
+_OVERRIDE_VALUE_MAXLEN = 240
+
+
+def _truncate_override_value(value: Any) -> Any:
+    """Char-bound a single ledger value so the override summary stays compact.
+
+    Strings are truncated with an ellipsis marker; non-strings are coerced to
+    their ``repr`` and truncated the same way so a stray dict/list cannot blow
+    the per-entry budget.
+    """
+    if value is None:
+        return None
+    text = value if isinstance(value, str) else repr(value)
+    if len(text) > _OVERRIDE_VALUE_MAXLEN:
+        return text[:_OVERRIDE_VALUE_MAXLEN] + "…"
+    return text
+
+
+def _build_operator_overrides_summary(project: Project) -> list[dict]:
+    """Consolidate the operator-wins rejected-edit ledgers into one bounded list.
+
+    Reads both reconciliation ledgers — ``project.vision[_rejected_agent_edits]``
+    (vision scalar conflicts + ``running_update_superseded`` entries) and
+    ``project.problem_model[rejected_agent_edits]`` (operator-owned intent /
+    context / constraints conflicts) — and normalizes each entry to a compact,
+    char-bounded shape::
+
+        {document, field, kind, agent_value, operator_value, at}
+
+    ``document`` is ``running_update`` | ``vision`` | ``intent`` so the agent
+    can tell which document it overrode. Running-update entries have no operator
+    value (the operator's winning value is the live running_update body itself),
+    so ``operator_value`` is ``None`` there. Sorted newest-first and capped at
+    :data:`_OPERATOR_OVERRIDES_MAX`. Read-only: neither ledger is cleared or
+    mutated. Returns ``[]`` when both ledgers are empty.
+    """
+    entries: list[dict] = []
+
+    vision = project.vision if isinstance(project.vision, dict) else {}
+    for e in vision.get(REJECTED_EDITS_KEY) or []:
+        if not isinstance(e, dict):
+            continue
+        field = e.get("field") or ""
+        if field == "running_update":
+            document = "running_update"
+        else:
+            document = "vision"
+        entries.append(
+            {
+                "document": document,
+                "field": field,
+                "kind": e.get("kind"),
+                "agent_value": _truncate_override_value(e.get("agent_value")),
+                # Vision conflicts log the operator's winning value as
+                # ``user_value``; running_update entries carry none.
+                "operator_value": _truncate_override_value(e.get("user_value")),
+                "at": e.get("at"),
+            }
+        )
+
+    pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+    for e in pm.get(PM_REJECTED_EDITS_KEY) or []:
+        if not isinstance(e, dict):
+            continue
+        field = e.get("field") or ""
+        document = "intent" if field.startswith("intent") else "problem_model"
+        entries.append(
+            {
+                "document": document,
+                "field": field,
+                "kind": e.get("kind"),
+                "agent_value": _truncate_override_value(e.get("agent_value")),
+                "operator_value": _truncate_override_value(e.get("operator_value")),
+                "at": e.get("at"),
+            }
+        )
+
+    # Newest-first by ISO timestamp; missing/empty ``at`` sorts last.
+    entries.sort(key=lambda x: x.get("at") or "", reverse=True)
+    return entries[:_OPERATOR_OVERRIDES_MAX]
 
 
 async def _verify_capability_backing_paths(
@@ -627,6 +724,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "running_update": {"priority": "high"},
     "running_update_acknowledged_at": {"priority": "high"},
     "user_last_active_at": {"priority": "high"},
+    # Bounded summary of the operator's recent reconciliation overrides (what the
+    # agent proposed vs. what the operator kept, per document). Medium priority
+    # with no summarize_fn: it is already capped + char-bounded at build time, so
+    # the packer drops it whole under budget rather than trimming. Closes the
+    # operator-wins reconciliation loop so the agent reconciles instead of
+    # re-proposing overridden values.
+    "operator_overrides": {"priority": "medium"},
     # Core working set (the big stuff) — summarize when over budget
     "directions_summary": {"priority": "high", "summarize": _summarize_directions},
     "problem_model": {"priority": "high", "summarize": _agent_view_problem_model},
@@ -2813,6 +2917,11 @@ async def _spawn_strategic_review(
             "project_name": project.name,
             "open_messages": open_msgs,
             "conversation_thread": conversation_thread,
+            **(
+                {"operator_overrides": _operator_overrides}
+                if (_operator_overrides := _build_operator_overrides_summary(project))
+                else {}
+            ),
             **(
                 {"rejected_proposals": rejected_proposals} if rejected_proposals else {}
             ),

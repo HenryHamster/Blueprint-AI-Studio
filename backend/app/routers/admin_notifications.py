@@ -141,6 +141,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
         "release_auto_merge_stalled",
+        "strategic_steering_acted",
     }
 )
 
@@ -525,13 +526,22 @@ async def create_message(
     # so the two paths cannot diverge again. Best-effort: the helper does not
     # commit (we own the txn) and swallows its own errors, so message creation
     # never fails on it; the second commit persists the marker independently.
-    from app.strategic_trigger import maybe_arm_operator_refresh
+    from app.strategic_trigger import (
+        classify_operator_arming,
+        maybe_arm_operator_refresh,
+    )
 
+    # Classify first so the response can report the *actual* wake decision the
+    # operator's message triggered (steering / passive note / routine event).
+    # maybe_arm_operator_refresh derives its arm/no-arm choice from the same
+    # classifier, so the surfaced ``arming`` value always matches what arming
+    # actually did. Additive field — existing ``id``/``status`` are unchanged.
+    arming = classify_operator_arming(MessageType(msg_type), event_type=event_type)
     if await maybe_arm_operator_refresh(
         session, project_id, MessageType(msg_type), event_type=event_type
     ):
         await session.commit()
-    return {"id": str(msg.id), "status": "created"}
+    return {"id": str(msg.id), "status": "created", "arming": arming}
 
 
 @router.patch("/messages/{message_id}")

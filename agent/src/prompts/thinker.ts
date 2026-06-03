@@ -80,6 +80,7 @@ export interface ThinkerPromptParams {
   dirHealthSummary: string;
   userPausedSection: string;
   rejectedProposalsSection: string;
+  operatorOverridesSection: string;
   portfolioCompositionText: string;
   systemMaturitySection: string;
   driftSection: string;
@@ -152,7 +153,7 @@ ${p.dirSummaryText}
 
 ## Direction Health
 ${p.dirHealthSummary}
-${p.userPausedSection}${p.rejectedProposalsSection}
+${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
 ${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}

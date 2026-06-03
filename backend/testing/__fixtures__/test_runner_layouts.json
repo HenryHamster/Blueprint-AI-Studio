@@ -21,6 +21,28 @@
     "family": "pytest"
   },
   {
+    "name": "pyproject_toml_without_pytest",
+    "files": [
+      {
+        "path": "pyproject.toml",
+        "content": "[build-system]\nrequires = [\"setuptools>=68\"]\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "setup_py_bare_root",
+    "files": [
+      {
+        "path": "setup.py",
+        "content": "from setuptools import setup\nsetup(name=\"demo\")\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
     "name": "package_json_with_scripts_test",
     "files": [
       {
@@ -30,6 +52,50 @@
     ],
     "detectable": true,
     "family": "npm"
+  },
+  {
+    "name": "justfile_with_test_target",
+    "files": [
+      {
+        "path": "Justfile",
+        "content": "test:\n\tcargo test\n"
+      }
+    ],
+    "detectable": true,
+    "family": "just"
+  },
+  {
+    "name": "justfile_without_test_target",
+    "files": [
+      {
+        "path": "justfile",
+        "content": "build:\n\tcargo build\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "taskfile_yaml_with_test_target",
+    "files": [
+      {
+        "path": "Taskfile.yaml",
+        "content": "version: '3'\n\ntasks:\n  test:\n    cmds:\n      - go test ./...\n"
+      }
+    ],
+    "detectable": true,
+    "family": "task"
+  },
+  {
+    "name": "taskfile_yml_without_test_target",
+    "files": [
+      {
+        "path": "Taskfile.yml",
+        "content": "version: '3'\n\ntasks:\n  build:\n    cmds:\n      - go build ./...\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
   },
   {
     "name": "makefile_with_test_target",
@@ -94,6 +160,59 @@
     "family": "go"
   },
   {
+    "name": "libs_web_pyproject_nested",
+    "files": [
+      {
+        "path": "libs/web/pyproject.toml",
+        "content": "[tool.pytest.ini_options]\n"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "modules_api_package_json_nested",
+    "files": [
+      {
+        "path": "modules/api/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "crates_core_cargo_nested",
+    "files": [
+      {
+        "path": "crates/core/Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
+  },
+  {
+    "name": "cmd_tool_go_mod_nested",
+    "files": [
+      {
+        "path": "cmd/tool/go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "pkg_svc_setup_cfg_nested",
+    "files": [
+      {
+        "path": "pkg/svc/setup.cfg",
+        "content": "[tool:pytest]\naddopts = -q\n"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
     "name": "gemfile_rakefile_root",
     "files": [
       {
@@ -155,6 +274,28 @@
     ],
     "detectable": true,
     "family": "php"
+  },
+  {
+    "name": "composer_json_with_scripts_test",
+    "files": [
+      {
+        "path": "composer.json",
+        "content": "{\"scripts\":{\"test\":\"phpunit\",\"lint\":\"phpcs\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "composer"
+  },
+  {
+    "name": "scripts_test_sh_root_convention",
+    "files": [
+      {
+        "path": "scripts/test.sh",
+        "content": "#!/usr/bin/env bash\nexit 0\n"
+      }
+    ],
+    "detectable": true,
+    "family": "script"
   },
   {
     "name": "empty_repo",
