@@ -842,7 +842,7 @@ describe('testFixLoop directory scoping', () => {
   const multiRunnerConfig = {
     directories: [
       { path: 'agent', type: 'node', test_cmd: 'npm test' },
-      { path: 'backend', type: 'python', test_cmd: 'python3 -m pytest' },
+      { path: 'backend', type: 'python', test_cmd: 'python3 -m pytest -x -q' },
     ],
   };
 

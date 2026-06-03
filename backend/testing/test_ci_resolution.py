@@ -69,7 +69,7 @@ def test_has_detectable_tests_true_when_any_test_cmd_present():
     p = _proj(
         {
             "directories": [
-                {"path": "backend/", "test_cmd": "python3 -m pytest"},
+                {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"},
                 {"path": "ui/", "test_cmd": ""},
             ]
         }
@@ -108,7 +108,7 @@ def test_verdict_ci_checks_when_requires_ci_default():
 def test_verdict_ci_checks_even_with_detectable_tests():
     # requires_ci_checks True takes precedence over present test commands.
     p = _proj(
-        {"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}]}
+        {"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}]}
     )
     verdict = ci_resolution.compute_merge_verification_verdict(p)
     assert verdict["state"] == "ci_checks"
@@ -122,7 +122,7 @@ def test_verdict_tests_gated_collects_commands():
         {
             "requires_ci_checks": False,
             "directories": [
-                {"path": "backend/", "test_cmd": "python3 -m pytest"},
+                {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"},
                 {"path": "ui/", "test_cmd": "   "},
                 {"path": "agent/", "test_cmd": "npm test"},
             ],
@@ -131,7 +131,7 @@ def test_verdict_tests_gated_collects_commands():
     verdict = ci_resolution.compute_merge_verification_verdict(p)
     assert verdict["state"] == "tests_gated"
     assert verdict["test_commands"] == [
-        {"path": "backend/", "test_cmd": "python3 -m pytest"},
+        {"path": "backend/", "test_cmd": "python3 -m pytest -x -q"},
         {"path": "agent/", "test_cmd": "npm test"},
     ]
     # The verdict agrees with the gate predicates.
@@ -178,7 +178,7 @@ def _no_ci_repo():
     return _proj(
         {
             "requires_ci_checks": False,
-            "directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}],
+            "directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}],
         }
     )
 
@@ -219,7 +219,7 @@ def test_gate_skipped_on_internal_staging_base():
 def test_gate_skipped_for_ci_gated_repo():
     # CI-gated repo (requires_ci_checks default True): the no_checks branch keeps
     # polling; the gate must never engage.
-    p = _proj({"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}]})
+    p = _proj({"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest -x -q"}]})
     assert (
         ci_resolution.should_run_no_ci_test_gate(p, "main", gate_enabled=True) is False
     )

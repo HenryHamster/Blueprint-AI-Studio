@@ -4464,3 +4464,410 @@ class TestTypedMockAssertConvention:
             assert not _RAW_TYPED_MOCK_RE.search(line), (
                 f"Scanner false-positive on known-good snippet: {snippet!r}"
             )
+
+
+# ── Agent ⇄ backend test-runner detector parity (CI-enforced) ─────────────────
+#
+# Blueprint's no-CI merge gate depends on TWO test-suite detectors emitting the
+# same runner FAMILY *and* an equivalent COMMAND for every supported repo layout:
+#   - the agent runtime detector  : agent/src/utils/test-runners.ts
+#       (``detectTestRunners`` — runs at merge time against the cloned PR head)
+#   - the backend onboarding detector : backend/app/routers/admin_onboard.py
+#       (``_detect_build_config`` — runs against the GitHub Contents API)
+#
+# A shared fixture (backend/testing/__fixtures__/test_runner_layouts.json) is the
+# single source of truth. The BACKEND half is already pinned to it in plain
+# GitHub CI by ``TestSharedTestRunnerLayouts`` in test_onboard.py. The AGENT half
+# was only pinned by a *vitest* test, and the agent CI job runs only ``tsc
+# --noEmit`` (no vitest), so a single-sided change to the agent detector — a new
+# family, a changed command, a dropped manifest — was verified NOWHERE in CI.
+#
+# This block closes that gap using the same precedent as the SR-category mirror
+# (``AGENT_SELF_REVIEW_CATEGORIES`` / ``test_agent_categories_match_prompt_source``)
+# and the helper-exclusion scan above:
+#   1. ``AGENT_TEST_RUNNER_COMMANDS`` — a backend-resident declarative table of
+#      the family → emitted-command mapping the agent detector produces. Lives in
+#      the backend so it ships in CI's ``./backend`` Docker context.
+#   2. An ALWAYS-ON test pinning that table to the shared fixture (family
+#      coverage + exact command), so the table — and via the existing backend
+#      parity test, the backend detector — is pinned to the shared spec in plain
+#      GitHub CI, no agent/src required.
+#   3. A SOURCE-SCAN test that, when agent/src is available (the local +
+#      merge-gate path, where scripts/test-backend.sh mounts ../agent/src to
+#      /agent/src), statically parses test-runners.ts and asserts the agent
+#      detector's literal family → command mapping equals the table. It FAILS
+#      LOUDLY on a parse miss (anchor/region not found) and SKIPS with a clear
+#      marker only when agent/src is genuinely absent (the GH-only Docker
+#      context, exactly like the SR-category test).
+
+# Family → command the agent detector (``detectTestRunners``) emits for each
+# supported layout. MUST stay byte-for-byte in sync with BOTH:
+#   - the shared fixture test_runner_layouts.json (asserted always-on below), and
+#   - the literal runner objects in agent/src/utils/test-runners.ts (asserted by
+#     the source-scan below when agent/src is mounted).
+# Edit this table AND test-runners.ts together; the source-scan fails otherwise.
+AGENT_TEST_RUNNER_COMMANDS = {
+    "pytest": "python3 -m pytest -x -q",
+    "npm": "npm test",
+    "make": "make test",
+    "just": "just test",
+    "task": "task test",
+    "cargo": "cargo test",
+    "tox": "tox",
+    "nox": "nox",
+    "go": "go test ./...",
+    "ruby": "bundle exec rake test",
+    "gradle": "./gradlew test",
+    "maven": "mvn test",
+    "elixir": "mix test",
+    "dotnet": "dotnet test",
+    "php": "vendor/bin/phpunit",
+    "composer": "composer test",
+    # Dynamic-arg case: the agent emits ``{ cmd: 'bash', args: [script] }`` where
+    # ``script`` ranges over a literal list; the ``scripts/test.sh`` member is the
+    # one the shared fixture's ``script`` layout exercises. The fixture names this
+    # family ``script`` (bash fallbacks => family 'script'), so the table key
+    # matches the fixture's detectable-family set exactly.
+    "script": "bash scripts/test.sh",
+}
+
+# The lone family whose command the agent builds from a loop variable rather than
+# a literal ``args`` array, so it can't be reconstructed from the runner literal
+# and is verified via its script-list literal instead.
+_AGENT_DYNAMIC_ARG_FAMILIES = {"script"}
+
+
+def _load_shared_runner_layouts() -> list:
+    """Load the shared test-runner layout fixture (read-only)."""
+    fixture_path = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__), "__fixtures__", "test_runner_layouts.json"
+        )
+    )
+    import json
+
+    with open(fixture_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _resolve_agent_test_runners_ts_path() -> "str | None":
+    """Locate ``agent/src/utils/test-runners.ts`` across local + Docker envs.
+
+    Search order mirrors ``_resolve_prompt_ts_path``:
+      1. ``AGENT_TEST_RUNNERS_TS`` env override (caller-supplied path).
+      2. ``/agent/src/utils/test-runners.ts`` (Docker volume-mount target used by
+         ``scripts/test-backend.sh``).
+      3. Host filesystem at ``../../agent/src/utils/test-runners.ts`` from this
+         test file (``backend/testing/`` → repo root).
+
+    Returns the first existing path or ``None`` if none resolve.
+    """
+    env_override = os.getenv("AGENT_TEST_RUNNERS_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/utils/test-runners.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "utils",
+                "test-runners.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+# Matches a single-line TestRunner object literal's ``cmd``/``args`` pair, e.g.
+#   cmd: 'python3', args: ['-m', 'pytest']
+#   cmd: 'vendor/bin/phpunit', args: []
+# Every runner literal in test-runners.ts is emitted on one line, so a non-greedy
+# single-line match captures the command name and the raw args array body.
+_AGENT_RUNNER_LITERAL_RE = re.compile(r"cmd:\s*'([^']+)',\s*args:\s*\[([^\]]*)\]")
+_AGENT_QUOTED_STRING_RE = re.compile(r"'([^']*)'")
+
+
+def _reconstruct_agent_commands(source: str) -> "set[str]":
+    """Reconstruct every literal ``<cmd> <args...>`` the agent detector emits.
+
+    Parses each ``cmd: '<c>', args: [<a>...]`` runner literal and joins the
+    command with its *quoted* args (unquoted args — e.g. the ``[script]`` loop
+    variable or the ``pgFlag`` ternary — are intentionally dropped; those runners
+    are handled by their own family-specific assertions). Returns the set of
+    reconstructed command strings. Raises on a parse miss so the scan can never
+    silently pass with an empty set.
+    """
+    commands: "set[str]" = set()
+    for cmd, args_blob in _AGENT_RUNNER_LITERAL_RE.findall(source):
+        args = _AGENT_QUOTED_STRING_RE.findall(args_blob)
+        commands.add(" ".join([cmd, *args]).strip())
+    if not commands:
+        raise ValueError(
+            "No `cmd: '...', args: [...]` runner literals found in "
+            "agent/src/utils/test-runners.ts — the runner-literal format changed "
+            "or the file is empty. Update _AGENT_RUNNER_LITERAL_RE in "
+            "backend/testing/test_invariants.py to match the new emit format."
+        )
+    return commands
+
+
+def _extract_extra_family_region(source: str) -> str:
+    """Return the body of the ``detectExtraFamilyRunner`` helper.
+
+    This helper is the canonical home of the divergent-family runners
+    (Ruby/Gradle/Maven/Elixir/.NET/PHP/Composer). Scanning it lets the reverse
+    parity check catch a NEW extra family added to the agent without a matching
+    table entry. Raises (loud) if the anchor or its terminating ``return null;``
+    cannot be located — never silently returns an empty region.
+    """
+    start = source.find("detectExtraFamilyRunner = (")
+    if start == -1:
+        raise ValueError(
+            "Could not find `detectExtraFamilyRunner = (` anchor in "
+            "agent/src/utils/test-runners.ts — the divergent-family helper was "
+            "renamed or removed. Update _extract_extra_family_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+    end = source.find("return null;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return null;` of "
+            "detectExtraFamilyRunner in agent/src/utils/test-runners.ts — the "
+            "helper's structure changed. Update _extract_extra_family_region."
+        )
+    return source[start:end]
+
+
+class TestAgentTestRunnerTableParity:
+    """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
+    fixture. Runs in plain GitHub CI (no agent/src required).
+
+    The backend onboarding detector is already pinned to the same fixture by
+    ``TestSharedTestRunnerLayouts`` in test_onboard.py, so this test transitively
+    pins the table to the backend half for every layout — without duplicating or
+    weakening that backend parity assertion.
+    """
+
+    def test_table_keys_equal_fixture_detectable_families(self):
+        """The table's family set must exactly equal the fixture's detectable
+        families — no missing family, no phantom extra family."""
+        layouts = _load_shared_runner_layouts()
+        fixture_families = {
+            layout["family"] for layout in layouts if layout["detectable"]
+        }
+        table_families = set(AGENT_TEST_RUNNER_COMMANDS)
+        missing = fixture_families - table_families
+        extra = table_families - fixture_families
+        assert not missing and not extra, (
+            "AGENT_TEST_RUNNER_COMMANDS has drifted from the shared fixture "
+            "test_runner_layouts.json:\n"
+            f"  families in fixture but missing from table: {sorted(missing)}\n"
+            f"  families in table but absent from fixture:  {sorted(extra)}\n"
+            "Update AGENT_TEST_RUNNER_COMMANDS in backend/testing/test_invariants.py."
+        )
+
+    def test_table_has_nonempty_command_for_every_fixture_family(self):
+        """Every detectable fixture family must map to a non-empty command string
+        in the table — the family→command bridge has no gaps.
+
+        The shared fixture's schema is {name, files, detectable, family}; it
+        deliberately carries NO command (the canonical command lives in this table
+        and is pinned byte-for-byte to the agent source by the source-scan below
+        when agent/src is mounted). So the always-on guarantee here is coverage +
+        non-emptiness in plain GitHub CI, not the exact command string."""
+        layouts = _load_shared_runner_layouts()
+        missing = []
+        for layout in layouts:
+            if not layout["detectable"]:
+                continue
+            family = layout["family"]
+            command = AGENT_TEST_RUNNER_COMMANDS.get(family)
+            if not command or not command.strip():
+                missing.append(f"  {family} (layout {layout['name']})")
+        assert not missing, (
+            "AGENT_TEST_RUNNER_COMMANDS is missing a non-empty command for "
+            "detectable fixture family/families:\n" + "\n".join(missing) + "\n"
+            "Add the family→command entry in backend/testing/test_invariants.py."
+        )
+
+    def test_fixture_families_are_unambiguous(self):
+        """Defensive: the fixture must not assign the same family to layouts that
+        would require different commands — the single-command-per-family table
+        could not represent that. The fixture carries no command field, so we
+        assert the weaker structural invariant the table relies on: every
+        detectable layout names a family that exists as a single table key (a
+        dict is a function by construction, so one family => one command)."""
+        layouts = _load_shared_runner_layouts()
+        unknown = sorted(
+            {
+                layout["family"]
+                for layout in layouts
+                if layout["detectable"]
+                and layout["family"] not in AGENT_TEST_RUNNER_COMMANDS
+            }
+        )
+        assert not unknown, (
+            "Fixture names detectable family/families with no table entry: "
+            f"{unknown}. Every detectable family must map to exactly one command "
+            "in AGENT_TEST_RUNNER_COMMANDS."
+        )
+
+
+class TestAgentTestRunnerSourceParity:
+    """SOURCE-SCAN: when agent/src is mounted, the agent detector's literal
+    family → command mapping in test-runners.ts must equal the backend table.
+
+    Fires whenever the backend suite runs via scripts/test-backend.sh (the local
+    + no-CI merge-gate path, which mounts ../agent/src to /agent/src). Skips with
+    a clear marker only in the GH-only Docker context where agent/src is genuinely
+    absent — exactly the precedent of ``test_agent_categories_match_prompt_source``.
+
+    A single-sided change to the agent detector (new family, changed command,
+    dropped manifest) that is not mirrored in AGENT_TEST_RUNNER_COMMANDS fails
+    here; a table change not mirrored in test-runners.ts also fails.
+    """
+
+    @staticmethod
+    def _read_agent_source() -> str:
+        path = _resolve_agent_test_runners_ts_path()
+        if path is None:
+            pytest.skip(
+                "agent/src/utils/test-runners.ts not available in this test "
+                "environment (CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_agent_emits_table_command_for_every_family(self):
+        """Every non-dynamic table command must be reconstructable from a literal
+        runner object in test-runners.ts.
+
+        Catches a CHANGED command (e.g. ``mvn test`` → ``mvn verify``: the old
+        literal is gone) and a DROPPED manifest (the runner removed: command gone).
+        """
+        source = self._read_agent_source()
+        agent_commands = _reconstruct_agent_commands(source)  # raises on parse miss
+        missing = []
+        for family, command in AGENT_TEST_RUNNER_COMMANDS.items():
+            if family in _AGENT_DYNAMIC_ARG_FAMILIES:
+                continue
+            if command not in agent_commands:
+                missing.append(f"  {family}: expected agent to emit {command!r}")
+        assert not missing, (
+            "agent/src/utils/test-runners.ts no longer emits the command(s) the "
+            "backend table expects:\n"
+            + "\n".join(missing)
+            + "\n\nThe agent detector drifted from AGENT_TEST_RUNNER_COMMANDS. "
+            "Reconcile agent/src/utils/test-runners.ts and the table in "
+            "backend/testing/test_invariants.py."
+        )
+
+    def test_agent_emits_shell_script_runner(self):
+        """The dynamic-arg ``script`` family: the agent must emit a ``bash`` runner
+        and its script list must include ``scripts/test.sh`` (the fixture's member).
+
+        Verified via the script-list literal because the command is built from a
+        loop variable, not a literal ``args`` array.
+        """
+        source = self._read_agent_source()
+        shell_command = AGENT_TEST_RUNNER_COMMANDS["script"]
+        # shell_command == "bash scripts/test.sh"
+        cmd, script = shell_command.split(" ", 1)
+        assert f"cmd: '{cmd}'" in source, (
+            f"agent/src/utils/test-runners.ts no longer emits a {cmd!r} runner; "
+            f"the shell family ({shell_command!r}) cannot be produced."
+        )
+        assert f"'{script}'" in source, (
+            f"agent/src/utils/test-runners.ts no longer lists {script!r} in its "
+            f"shell-script fallback list; the fixture's shell layout "
+            f"({shell_command!r}) would no longer be detected. Reconcile the "
+            "script list with AGENT_TEST_RUNNER_COMMANDS['shell']."
+        )
+
+    def test_agent_extra_family_runners_are_all_in_table(self):
+        """Reverse direction: every command the divergent-family helper emits must
+        appear in the backend table.
+
+        Catches a NEW family added to ``detectExtraFamilyRunner`` (e.g. an sbt
+        runner) without a matching AGENT_TEST_RUNNER_COMMANDS entry.
+        """
+        source = self._read_agent_source()
+        region = _extract_extra_family_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits divergent-family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+
+class TestAgentTestRunnerParseHelpers:
+    """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic
+    source strings (no agent/src required). Demonstrates the scan catches drift
+    and fails loudly on a parse miss — mirroring ``TestSrCategoryParityHelper``.
+    """
+
+    def test_reconstructs_command_from_literal(self):
+        synthetic = (
+            "runners.push({ cmd: 'python3', args: ['-m', 'pytest'], cwd: W, "
+            "label: 'pytest (root)' });"
+        )
+        assert _reconstruct_agent_commands(synthetic) == {"python3 -m pytest"}
+
+    def test_reconstructs_command_with_empty_args(self):
+        synthetic = "return { cmd: 'vendor/bin/phpunit', args: [], cwd: d, label: x };"
+        assert _reconstruct_agent_commands(synthetic) == {"vendor/bin/phpunit"}
+
+    def test_dynamic_arg_runner_drops_unquoted_variable(self):
+        """A ``[script]`` loop-variable arg yields just the bare command — proving
+        the shell family genuinely needs its script-list assertion."""
+        synthetic = "runners.push({ cmd: 'bash', args: [script], cwd: W, label: l });"
+        assert _reconstruct_agent_commands(synthetic) == {"bash"}
+
+    def test_reconstruct_raises_on_parse_miss(self):
+        with pytest.raises(ValueError, match="No `cmd:"):
+            _reconstruct_agent_commands("// no runner literals here\nconst x = 1;")
+
+    def test_extract_extra_family_region_raises_on_missing_anchor(self):
+        with pytest.raises(ValueError, match="detectExtraFamilyRunner"):
+            _extract_extra_family_region("export function detectTestRunners() {}")
+
+    def test_extract_extra_family_region_raises_on_missing_terminator(self):
+        with pytest.raises(ValueError, match="return null;"):
+            _extract_extra_family_region(
+                "const detectExtraFamilyRunner = (absDir, label) => { return foo; }"
+            )
+
+    def test_scan_catches_changed_command(self):
+        """A drifted agent command (mvn verify) is absent from the reconstructed
+        set, so the family check would flag it."""
+        synthetic = "return { cmd: 'mvn', args: ['verify'], cwd: d, label: x };"
+        agent_commands = _reconstruct_agent_commands(synthetic)
+        assert "mvn test" not in agent_commands
+        assert "mvn verify" in agent_commands
+
+    def test_scan_catches_new_extra_family(self):
+        """A new divergent family with no table entry is surfaced as an orphan."""
+        region = (
+            "detectExtraFamilyRunner = (absDir, label) => {\n"
+            "  if (has('build.sbt')) return { cmd: 'sbt', args: ['test'], "
+            "cwd: absDir, label: l };\n"
+            "  return null;\n};"
+        )
+        body = _extract_extra_family_region(region)
+        orphans = _reconstruct_agent_commands(body) - set(
+            AGENT_TEST_RUNNER_COMMANDS.values()
+        )
+        assert orphans == {"sbt test"}
