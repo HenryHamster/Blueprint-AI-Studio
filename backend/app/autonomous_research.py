@@ -889,7 +889,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             from app.strategic_spawning import _spawn_strategic_review
 
             if await _spawn_strategic_review(
-                project, session, cycle_id=pending_sr.get("cycle_id")
+                project,
+                session,
+                cycle_id=pending_sr.get("cycle_id"),
+                operator_steered=bool(pending_sr.get("operator_steered")),
             ):
                 def _clear_pending_sr(vision: dict) -> None:
                     vision.pop("_pending_strategic_review", None)

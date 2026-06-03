@@ -23,6 +23,7 @@ from app.models import (
     Project,
     TaskHistory,
     TaskStatus,
+    MessageType,
     ProjectMessage,
     SystemMaturity,
 )
@@ -33,6 +34,12 @@ from app.source_ref_validation import (
     classify_existing_paths,
     ground_design_doc,
     resolve_branch_verification_context,
+)
+from app.strategic_trigger import (
+    ARMING_STEERING,
+    ORIGIN_OPERATOR,
+    classify_operator_arming,
+    strategic_refresh_origin,
 )
 import app.shared_state as _shared_state
 from app.shared_state import (
@@ -645,6 +652,69 @@ def _summarize_outcome_evaluation(oe: dict) -> dict:
             :_OUTCOME_DIRECTION_OUTCOMES_KEEP
         ]
     return trimmed
+
+
+_OPERATOR_STEERING_QUOTE_MAX_CHARS = 600
+_OPERATOR_STEERING_QUOTE_COUNT = 2
+
+
+def _build_operator_steering_directive(conversation_thread: list) -> str | None:
+    """High-priority steering directive for an operator-woken strategic cycle.
+
+    When a strategic cycle is spawned *because* an operator-origin
+    strategic-refresh marker was armed, the operator's steering message would
+    otherwise appear only as one undifferentiated entry in the (capped)
+    ``conversation_thread`` snapshot. This selects the most recent operator
+    steering message(s) from that same thread — ``from == 'user'``, excluding
+    passive ``NOTE``s and system/routine digest events via the shared
+    ``classify_operator_arming`` gate so "steering" means exactly what arming
+    meant — and frames them as the reason this cycle exists, so the strategist
+    treats them as a priority directive rather than one of N messages.
+
+    Returns ``None`` when the thread snapshot carries no qualifying operator
+    steering message (e.g. it was trimmed out under budget pressure), in which
+    case the caller appends no steering framing.
+    """
+    steering_msgs = []
+    for m in conversation_thread:
+        if m.get("from") != "user":
+            continue
+        try:
+            mtype = m.get("type")
+            if not isinstance(mtype, MessageType):
+                mtype = MessageType(mtype)
+            event_type = (m.get("context") or {}).get("event_type")
+            if (
+                classify_operator_arming(mtype, event_type=event_type)
+                != ARMING_STEERING
+            ):
+                continue
+        except Exception:
+            # Unknown/malformed type — treat as steering rather than silently
+            # dropping a potential directive.
+            pass
+        steering_msgs.append(m)
+    if not steering_msgs:
+        return None
+    # conversation_thread is chronological (oldest→newest); the steering
+    # message(s) that woke this cycle are the most recent, so quote the tail.
+    quoted = []
+    for m in steering_msgs[-_OPERATOR_STEERING_QUOTE_COUNT:]:
+        content = (m.get("content") or "").strip()
+        if not content:
+            continue
+        if len(content) > _OPERATOR_STEERING_QUOTE_MAX_CHARS:
+            content = content[:_OPERATOR_STEERING_QUOTE_MAX_CHARS] + "…"
+        quoted.append(f"  > {content}")
+    if not quoted:
+        return None
+    return (
+        "OPERATOR STEERING — THIS CYCLE WAS TRIGGERED BY OPERATOR STEERING.\n"
+        "An operator sent a live-chat steering message that woke this strategic "
+        "cycle; acting on that steering is the reason this cycle exists. Treat "
+        "the operator message(s) below as a priority directive, NOT as one of "
+        "the undifferentiated conversation_thread entries:\n" + "\n".join(quoted)
+    )
 
 
 def _summarize_conversation_thread(thread: list) -> list:
@@ -1789,6 +1859,16 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # vision at cycle start so the 3-way merge in strategic_completion can
     # compare user edits against the same baseline the agent was given.
     cycle_id = strategic_cycle.new_cycle_id()
+    # Capture the operator-origin steering signal at spawn time: the pending
+    # refresh marker is still armed here (the autonomous loop's spawn-record
+    # consumes it AFTER this returns), but it will be gone by the time Phase 2
+    # (_spawn_strategic_review) chains off this task's completion. Persist the
+    # flag on the task context so the Phase 2 chain can re-surface the operator
+    # steering directive rather than silently dropping it on architecture cycles.
+    operator_steered = strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR
+    task_context: dict = {"strategic_cycle_id": cycle_id}
+    if operator_steered:
+        task_context["operator_steered"] = True
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -1797,7 +1877,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={"strategic_cycle_id": cycle_id},
+        context=task_context,
         strategic_cycle_id=cycle_id,
     )
     session.add(new_task)
@@ -1829,13 +1909,25 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
 
 
 async def _spawn_strategic_review(
-    project: Project, session: AsyncSession, cycle_id: str | None = None
+    project: Project,
+    session: AsyncSession,
+    cycle_id: str | None = None,
+    operator_steered: bool = False,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
     Uses type 'strategic_review' so it doesn't block tactical research.
     Returns True if a task was created, False if skipped.
+
+    ``operator_steered`` carries the operator-origin signal forward when this
+    spawn is the Phase 2 tail of an architecture cycle. On that path the
+    pending refresh marker has already been consumed by the autonomous loop's
+    spawn-record (it cleared once for the Phase 1 design_doc spawn), so
+    ``strategic_refresh_origin(project.vision)`` reads ``None`` here and the
+    steering directive would otherwise be dropped (~1/3 of operator wakes land
+    on an architecture cycle). The caller threads the flag through the
+    design_doc task context so the directive still reaches the strategist.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -2869,6 +2961,26 @@ async def _spawn_strategic_review(
             if prompt_suffix
             else _parallelism_hint
         )
+    # If this cycle was woken by operator steering, lead the prompt_suffix with
+    # a high-priority steering directive so the operator's message reaches and
+    # steers the strategist instead of being diluted into conversation_thread.
+    # Two ways an operator wake reaches here:
+    #   - Strategy-only cycle: the operator-origin pending refresh marker is
+    #     still armed (read here BEFORE autonomous_research.clear_strategic_refresh
+    #     consumes it on the loop's spawn-record path).
+    #   - Architecture cycle Phase 2: the marker was already consumed when the
+    #     Phase 1 design_doc spawn was recorded, so it reads None now —
+    #     ``operator_steered`` is threaded in from the design_doc task context
+    #     to keep the directive alive across the Phase 1 → Phase 2 chain.
+    # Read-only on the marker; scheduled/qualification cycles never reach this.
+    if operator_steered or strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR:
+        _steering_directive = _build_operator_steering_directive(conversation_thread)
+        if _steering_directive:
+            prompt_suffix = (
+                f"{_steering_directive}\n{prompt_suffix}"
+                if prompt_suffix
+                else _steering_directive
+            )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",

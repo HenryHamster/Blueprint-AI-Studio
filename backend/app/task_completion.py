@@ -2058,6 +2058,12 @@ async def _handle_design_doc_completion(
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
     cycle_id = (task.context or {}).get("strategic_cycle_id")
+    # Architecture-cycle operator steering: the pending refresh marker was
+    # consumed when Phase 1 (this design_doc task) was spawned, so it no longer
+    # reads as operator-origin in vision. The flag was stamped on the task
+    # context at spawn time — thread it into Phase 2 so the operator steering
+    # directive still reaches the strategist.
+    operator_steered = bool((task.context or {}).get("operator_steered"))
     spawned = None
     try:
         # Wave F4 H9: removed `await session.refresh(project)`. The caller
@@ -2066,7 +2072,9 @@ async def _handle_design_doc_completion(
         # the row is fresh-read at lock time, so a refresh here is a redundant
         # round-trip that defeats the lock-share optimization between
         # strategic-completion handlers.
-        spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
+        spawned = await _spawn_strategic_review(
+            project, session, cycle_id=cycle_id, operator_steered=operator_steered
+        )
         if spawned:
             phase2_spawned = True
             task.latest_status_message = (
@@ -2085,6 +2093,7 @@ async def _handle_design_doc_completion(
                     "failed_at": _utcnow().isoformat(),
                     "error": "skipped: active strategic task exists",
                     "cycle_id": cycle_id,
+                    "operator_steered": operator_steered,
                 },
             }
             flag_modified(project, "vision")
@@ -2110,6 +2119,7 @@ async def _handle_design_doc_completion(
                 "failed_at": _utcnow().isoformat(),
                 "error": str(chain_exc)[:200],
                 "cycle_id": cycle_id,
+                "operator_steered": operator_steered,
             },
         }
         if cycle_id:

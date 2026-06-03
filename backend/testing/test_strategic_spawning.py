@@ -24,9 +24,11 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    MessageType,
     ProjectMessage,
     RECOMMENDED_MODE_META_KEY,
 )
+from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
@@ -6932,3 +6934,332 @@ async def test_running_update_superseded_signal_excludes_stale_entries(db_sessio
     payload = result.scalars().all()[0].payloads[0]
 
     assert "running_update_superseded" not in payload
+
+
+# ── operator-steered cycle: steering directive in prompt_suffix ───────────────
+
+
+def _operator_refresh_marker(reason: str = "operator_message") -> dict:
+    """A pending operator-origin strategic-refresh marker (as request_strategic_refresh writes it)."""
+    return {
+        "requested_at": "2026-06-03T00:00:00",
+        "reason": reason,
+        "count": 1,
+        "origin": ORIGIN_OPERATOR,
+    }
+
+
+@pytest.mark.asyncio
+async def test_operator_steered_cycle_appends_steering_directive_to_prompt_suffix(
+    db_session,
+):
+    """An operator-origin spawn surfaces a high-priority steering directive that
+    flags the cycle as operator-steered AND quotes the operator's message."""
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": _operator_refresh_marker(),
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    steering_text = "Please pivot the roadmap toward billing reliability this week."
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content=steering_text,
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "OPERATOR STEERING" in suffix
+    assert "operator steering" in suffix.lower()
+    # The actual operator message must be quoted, not just referenced.
+    assert steering_text in suffix
+
+
+@pytest.mark.asyncio
+async def test_qualification_origin_marker_adds_no_steering_directive(db_session):
+    """A qualification-origin marker must NOT be framed as operator steering."""
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": {
+                "requested_at": "2026-06-03T00:00:00",
+                "reason": "qualification_verdict",
+                "count": 1,
+                "origin": ORIGIN_QUALIFICATION,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content="A user message that must not be promoted to a steering directive.",
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "OPERATOR STEERING" not in payload.get("prompt_suffix", "")
+
+
+@pytest.mark.asyncio
+async def test_no_marker_adds_no_steering_directive(db_session):
+    """A cadence cycle (no pending marker at all) carries no steering framing."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content="Just a routine question, not operator steering of this cycle.",
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "OPERATOR STEERING" not in payload.get("prompt_suffix", "")
+
+
+@pytest.mark.asyncio
+async def test_operator_steering_directive_quotes_most_recent_message_and_truncates(
+    db_session,
+):
+    """With several operator messages, the newest is quoted and long content is bounded."""
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": _operator_refresh_marker(),
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    old_text = "An older operator note from earlier in the session."
+    newest_text = "NEWEST: " + ("x" * 2000)  # exceeds the 600-char quote cap
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content=old_text,
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+        )
+    )
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content=newest_text,
+            created_at=datetime(2026, 6, 3, 2, 0, 0),
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    suffix = payload["prompt_suffix"]
+    # Newest message is present (its distinctive prefix) and is truncated.
+    assert "NEWEST:" in suffix
+    assert "…" in suffix
+    # The full 2000-char body must not appear verbatim — it was bounded.
+    assert ("x" * 2000) not in suffix
+
+
+# ── architecture-cycle operator wake: directive survives Phase 1 → Phase 2 ────
+#
+# Regression for review iter-1 MAJOR (autonomous_research.py:1193): on an
+# architecture cycle the operator-origin refresh marker is consumed when Phase 1
+# (design_doc_update) is recorded, so by the time Phase 2 (strategic_review)
+# chains off the design-doc completion the marker reads None and the steering
+# directive would be silently dropped (~1/3 of operator wakes). The fix threads
+# an ``operator_steered`` flag through the design_doc task context into Phase 2.
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_stamps_operator_steered_when_marker_operator_origin(
+    db_session,
+):
+    """Phase 1 stamps ``operator_steered`` on the design_doc task context when an
+    operator-origin refresh marker is armed, so the signal survives the marker's
+    consumption and reaches Phase 2."""
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": _operator_refresh_marker(),
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+        )
+    )
+    task = result.scalars().all()[0]
+    assert task.payloads[0]["type"] == "design_doc_update"
+    assert (task.context or {}).get("operator_steered") is True
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
+    """A cadence (non-operator) architecture cycle carries no operator_steered flag."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    task = result.scalars().all()[0]
+    assert "operator_steered" not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_cleared(
+    db_session, mocker
+):
+    """End-to-end: an operator wake landing on an architecture cycle still
+    surfaces the steering directive in the Phase 2 strategic_review prompt, even
+    though the refresh marker was consumed when Phase 1 was recorded.
+
+    This is the path the four strategy-only tests above never exercise:
+    design_doc_update → _handle_design_doc_completion → _spawn_strategic_review.
+    """
+    from app.task_completion import _handle_design_doc_completion
+
+    # Phase-1 → Phase-2 completion emits cycle events; stub them so the test
+    # exercises only the steering-directive threading, not the SSE layer.
+    mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_started", new=AsyncMock()
+    )
+    mocker.patch(
+        "app.strategic_events.emit_strategic_cycle_completed", new=AsyncMock()
+    )
+
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            "_strategic_refresh": _operator_refresh_marker(),
+        },
+        design_doc={"overview": {"body": "x"}, "_meta": {"revision": 1}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    steering_text = "Pivot the roadmap toward billing reliability this week."
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content=steering_text,
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+        )
+    )
+    await db_session.commit()
+
+    # Phase 1: spawn the design_doc_update task (stamps operator_steered).
+    assert await _spawn_design_doc_update(project, db_session) is True
+    design_doc_task = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()[0]
+    )
+    assert (design_doc_task.context or {}).get("operator_steered") is True
+
+    # Simulate the autonomous loop consuming the operator marker when it records
+    # the Phase 1 spawn (clear_strategic_refresh in autonomous_research.py), and
+    # mark Phase 1 complete so the Phase 2 active-task guard does not skip.
+    from app.strategic_trigger import strategic_refresh_origin
+
+    project.vision = {k: v for k, v in project.vision.items() if k != "_strategic_refresh"}
+    design_doc_task.status = TaskStatus.COMPLETED
+    db_session.add(project)
+    db_session.add(design_doc_task)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Precondition: the marker is gone, so Phase 2 cannot re-derive operator
+    # origin from vision — it must rely on the threaded flag.
+    assert strategic_refresh_origin(project.vision) is None
+
+    # Phase 2: chain the strategic review off the design-doc completion.
+    await _handle_design_doc_completion(
+        design_doc_task, "", db_session, project=project
+    )
+
+    strategic_task = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    review = next(
+        t for t in strategic_task if t.payloads[0]["type"] == "strategic_review"
+    )
+    suffix = review.payloads[0].get("prompt_suffix", "")
+    assert "OPERATOR STEERING" in suffix
+    assert steering_text in suffix
