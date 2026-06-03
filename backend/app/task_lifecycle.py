@@ -2404,6 +2404,23 @@ async def _process_post_commit(
                                                 _rp_exc,
                                             )
                                         await session.commit()
+                                        # Heal the direction's research-history
+                                        # merge counts for ORIG's cycle. ORIG (not
+                                        # this review ``task``) is the merged child,
+                                        # so the terminal-status recompute below —
+                                        # which keys off ``task.context`` — never
+                                        # covers ORIG's direction. Recompute now
+                                        # that ORIG's landed signal is committed so
+                                        # prs_merged doesn't stay stale-low and trip
+                                        # the churn / lifetime-burn guardrails.
+                                        if _record_pr_merged:
+                                            from app.direction_outcomes import (
+                                                refresh_direction_outcomes_after_merge,
+                                            )
+
+                                            await refresh_direction_outcomes_after_merge(
+                                                orig, session
+                                            )
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
                                         # Completion-side warm-reuse trigger: the
@@ -2981,6 +2998,12 @@ async def _process_post_commit(
                             )
                         if original_task_id:
                             _orig_broadcast_status = TaskStatus.EVALUATING
+                            # Captured for the post-commit direction-outcome
+                            # refresh: the empty-PR cleanup lands ORIG as a
+                            # merge-equivalent integration landing, but ORIG (not
+                            # this review ``task``) carries the direction lineage,
+                            # so the terminal recompute below misses it.
+                            _orig_to_refresh: Task | None = None
                             try:
                                 # Phase A1: skip_locked + bounded retry. If the
                                 # parent row is held, defer the empty-PR cleanup;
@@ -3054,6 +3077,8 @@ async def _process_post_commit(
                                         )
                                     _orig_broadcast_status = _orig.status
                                     session.add(_orig)
+                                    if _record_pr_merged:
+                                        _orig_to_refresh = _orig
                                 else:
                                     logger.warning(
                                         f"[REVIEW PIPELINE] Empty-PR cleanup deferred — parent {original_task_id[:8]} contended"
@@ -3066,6 +3091,18 @@ async def _process_post_commit(
                         task.latest_status_message = f"Review complete — PR #{pr_number} closed as empty (obsolete rollup)"
                         session.add(task)
                         await session.commit()
+                        # Heal ORIG's direction merge counts now that its
+                        # merge-equivalent landing is committed (mirrors the
+                        # review_merge_success path). No-op unless ORIG carries a
+                        # direction/research lineage; best-effort.
+                        if original_task_id and _orig_to_refresh is not None:
+                            from app.direction_outcomes import (
+                                refresh_direction_outcomes_after_merge,
+                            )
+
+                            await refresh_direction_outcomes_after_merge(
+                                _orig_to_refresh, session
+                            )
                         if original_task_id:
                             try:  # noqa: SIM105
                                 await broadcast_to_project(

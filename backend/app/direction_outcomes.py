@@ -28,7 +28,7 @@ from app.failure_classification import (
     classify_failure_taxonomy as _classify_taxonomy,
 )
 from app.landed_signal import is_merged_completion
-from app.models import Project, Task, TaskStatus
+from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
@@ -292,6 +292,37 @@ async def _update_direction_research_outcomes(
     child_tasks_rows = (await session.execute(child_tasks_stmt)).scalars().all()
     if not child_tasks_rows:
         return
+    # Set of child task IDs that ever opened a PR. The PULL_REQUEST Artifact is
+    # the canonical "this task opened a PR" record (partial-unique per task, see
+    # models.Artifact ux_artifact_task_pull_request) — it is written when the
+    # agent publishes a PR and survives even after the task goes terminal, so it
+    # is the most reliable opened-a-PR signal. Fetched as one batched id-only
+    # query to avoid an N+1 and to avoid loading full Artifact rows. The
+    # ``pr_number`` payload/context keys are layered on below as fallbacks for
+    # the (rare) window where the PR exists but the artifact row was not yet
+    # persisted.
+    _child_ids = [ct.id for ct in child_tasks_rows]
+    _pr_artifact_task_ids: set[uuid.UUID] = set(
+        (
+            await session.execute(
+                select(Artifact.task_id).where(
+                    Artifact.task_id.in_(_child_ids),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    def _opened_pr(ct: Task) -> bool:
+        """True when *ct* opened a PR (via any reliable signal)."""
+        if ct.id in _pr_artifact_task_ids:
+            return True
+        ctx_ = ct.context or {}
+        if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
+            return True
+        return bool((ct.first_payload or {}).get("pr_number"))
     # Per-(provider, model) cost rollup: keyed by f"{provider}|{model}", values
     # in USD. Uses VM-runtime × spot/on-demand rate (matching admin_digest math)
     # so values are consistent even when Task.estimated_cost_usd is unbackfilled
@@ -339,6 +370,21 @@ async def _update_direction_research_outcomes(
         1
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
+    )
+    # tasks_completed_no_pr: children that COMPLETED correctly without ever
+    # opening a PR — "no changes needed / work already exists" outcomes. These
+    # are a healthy result, NOT churn, so a downstream zero-merge/churn guard
+    # must be able to subtract them from the completed-but-unmerged population.
+    # Excludes merged completions (is_merged_completion) and pr_rejected ones so
+    # only genuine no-PR completions are counted; ``_opened_pr`` gates on the
+    # canonical PULL_REQUEST artifact (plus pr_number fallbacks).
+    entry["tasks_completed_no_pr"] = sum(
+        1
+        for ct in child_tasks_rows
+        if ct.status == TaskStatus.COMPLETED
+        and not is_merged_completion(ct)
+        and not (ct.context or {}).get("pr_rejected")
+        and not _opened_pr(ct)
     )
     _merged_rows = [
         ct

@@ -1315,6 +1315,11 @@ async def reaper_service():
                     # appended parent (truncating by index — never reading p.id on a
                     # post-rollback-expired ORM object, which would MissingGreenlet).
                     _dq_len_at_row_start = len(_deferred_parent_requeues)
+                    # Set when this orphan's recovery records a real integration
+                    # landing (out-of-band merge), so the post-(per-row)-commit
+                    # direction-outcome refresh runs for it. Re-fetched in a fresh
+                    # session below — the per-row commit can expire ``task``.
+                    _orphan_merge_refresh_needed = False
                     try:
                         # Re-validate status before acting — task may have completed/been cancelled
                         # between the initial query and now
@@ -2148,6 +2153,12 @@ async def reaper_service():
                                     ),
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
+                                # Defer the direction-outcome refresh until after the
+                                # per-row commit persists this landing (a fresh
+                                # session re-fetches the task — the reaper's per-row
+                                # commit can expire ``task``, so reading its context
+                                # here would risk a sync lazy-load / MissingGreenlet).
+                                _orphan_merge_refresh_needed = True
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -2677,6 +2688,32 @@ async def reaper_service():
                         # released before this loop (commit + expire_all above), so a
                         # per-row commit here holds no extra locks across the I/O.
                         await session.commit()
+                        # Heal the direction's research-history merge counts for an
+                        # orphan whose PR merged out-of-band. Done in a FRESH session
+                        # re-fetching the task by id (the per-row commit above can
+                        # expire ``task``, and the refresh takes the directions
+                        # FOR-NO-KEY-UPDATE lock + commits, so it must not share the
+                        # reaper's batch session). No-op unless the task carries
+                        # direction/research lineage; best-effort.
+                        if _orphan_merge_refresh_needed:
+                            from app.direction_outcomes import (
+                                refresh_direction_outcomes_after_merge,
+                            )
+
+                            try:
+                                async with AsyncSessionLocal() as _dir_session:
+                                    _dir_task = await _dir_session.get(Task, task_id)
+                                    if _dir_task is not None:
+                                        await refresh_direction_outcomes_after_merge(
+                                            _dir_task, _dir_session
+                                        )
+                            except Exception as _dir_exc:  # noqa: BLE001
+                                logger.warning(
+                                    "[REAPER] direction-outcome refresh failed for "
+                                    "orphan-recovered merge of task %s: %r",
+                                    task_id,
+                                    _dir_exc,
+                                )
                     except Exception as _reap_exc:
                         # Roll back partial mutations for THIS row only — earlier rows
                         # were already committed per-row above, so they survive. The

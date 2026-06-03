@@ -47,6 +47,7 @@
     "admin_task_mutations.py": 1100,
     "review_pipeline.py": 3350,
     "deploy_health.py": 1250,
+    "direction_outcomes.py": 1630,
     "digest_metrics.py": 3000,
     "digest_remediation.py": 900,
     "digest_direction_progress.py": 800,

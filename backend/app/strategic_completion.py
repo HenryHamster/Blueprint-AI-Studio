@@ -784,11 +784,18 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     window = history[-churn_window:]
     merged = sum(e.get("prs_merged", 0) for e in window)
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
+    # Children that COMPLETED without opening a PR because the deliverable already
+    # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
+    # a direction whose features are already built does not look like it is burning
+    # tasks. Field absent on pre-existing entries → defaults to 0 (unchanged behavior).
+    no_pr_completions = sum(e.get("tasks_completed_no_pr", 0) for e in window)
     code_failed = sum(
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in window
     )
-    non_merge_finished = max(0, tasks_complete + code_failed - merged)
+    non_merge_finished = max(
+        0, (tasks_complete - no_pr_completions) + code_failed - merged
+    )
     total_finished = merged + non_merge_finished
     merge_rate = merged / total_finished if total_finished > 0 else 0.0
     return {
@@ -811,20 +818,28 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
 
     window_merged = sum(e.get("prs_merged", 0) for e in history)
     window_completed = sum(e.get("tasks_completed", 0) for e in history)
+    # Correct no-op completions ("deliverable already exists", no PR) are not burn.
+    # Subtract them across both the rolling window and the lifetime aggregate. Both
+    # accessors default to 0 so old entries / un-folded aggregates are unchanged.
+    window_no_pr = sum(e.get("tasks_completed_no_pr", 0) for e in history)
     window_code_failed = sum(
         max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
         for e in history
     )
     agg_merged = agg.get("total_prs_merged", 0)
     agg_completed = agg.get("total_tasks_completed", 0)
+    agg_no_pr = agg.get("total_tasks_completed_no_pr", 0)
     agg_code_failed = max(
         0, agg.get("total_tasks_failed", 0) - agg.get("total_tasks_failed_infra", 0)
     )
 
     lifetime_merged = window_merged + agg_merged
+    lifetime_completed_real = max(
+        0, (window_completed - window_no_pr) + (agg_completed - agg_no_pr)
+    )
     lifetime_non_merge_finished = max(
         0,
-        (window_completed + window_code_failed + agg_completed + agg_code_failed)
+        (lifetime_completed_real + window_code_failed + agg_code_failed)
         - lifetime_merged,
     )
     total_finished = lifetime_merged + lifetime_non_merge_finished
@@ -836,6 +851,93 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
         "lifetime_non_merge_finished": lifetime_non_merge_finished,
         "lifetime_merge_rate": round(lifetime_merge_rate, 3),
     }
+
+
+def _direction_still_productive(direction: dict) -> bool:
+    """True when a direction is demonstrably still producing useful work.
+
+    Gate for the cumulative merge-rate family of pause rules (Rule 2 zero-merge,
+    Rule 5 churn, Rule 6 lifetime burn). Those rules count "finished but not merged"
+    volume and can wrongly pause a healthy direction whose implementation tasks
+    correctly complete as no-ops ("deliverable already present") — no PR, no merge,
+    yet genuinely productive.
+
+    We require BOTH signals rather than either alone (the task allows OR, but AND is
+    strictly more robust here):
+      * ``last_cycle_productive`` is True — the system's own per-cycle verdict that
+        the most recent cycle spawned actionable work. This is the authoritative,
+        already-computed contradiction to a "this direction is dead" pause.
+      * ``consecutive_unproductive_cycles < N`` — guards against a single stale True
+        flag papering over a direction that has since gone quiet for several cycles.
+        N defaults to 2 and is configurable to match the direction_* config style.
+
+    Using AND keeps existing behavior unchanged for directions that never set the
+    productivity flag (the common case in fixtures and legacy data): ``.get`` returns
+    falsy → not productive → the rules fire exactly as before. CODE-FAILURE rules
+    (3, 4) are intentionally NOT gated by this — a crashing direction must still
+    pause regardless of how productive its last cycle looked.
+    """
+    if not direction.get("last_cycle_productive"):
+        return False
+    skip_max = int(
+        _runtime_config.get("direction_productive_pause_skip_max_unproductive", 2) or 2
+    )
+    consecutive = int(direction.get("consecutive_unproductive_cycles", 0) or 0)
+    return consecutive < skip_max
+
+
+def _already_built_signature(direction: dict) -> dict | None:
+    """Detect a direction whose recent cycles are dominated by correct no-op
+    "already-built" completions (PRs not opened because the deliverable already
+    exists) — i.e. the goal is effectively already met.
+
+    Returns a metrics dict (for completion-suggestion wording / evidence) when the
+    signature holds, else None. Conservative by design: it only fires when, over a
+    rolling window, the no-op completions clearly dominate finished work, there are
+    essentially no merges, and there are NO code failures (a code-failing direction
+    is broken, not done).
+
+    Signature (all must hold over the last ``direction_churn_window_cycles`` cycles,
+    needing the same >=3-cycle history floor the churn metric uses):
+      * total no-op "already-built" completions >= ``min_no_pr`` (default 3), and
+      * no-op completions are >= ``dominance`` (default 0.8) of all completed tasks,
+      * merged PRs <= ``max_merged`` (default 1) — not an actively shipping direction,
+      * zero code failures in the window — nothing is broken.
+    """
+    history = direction.get("research_history") or []
+    window_cycles = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    if len(history) < 3 or window_cycles <= 0:
+        return None
+    window = history[-window_cycles:]
+    no_pr = sum(e.get("tasks_completed_no_pr", 0) for e in window)
+    completed = sum(e.get("tasks_completed", 0) for e in window)
+    merged = sum(e.get("prs_merged", 0) for e in window)
+    code_failed = sum(
+        max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
+        for e in window
+    )
+    min_no_pr = int(
+        _runtime_config.get("direction_already_built_min_no_pr", 3) or 3
+    )
+    dominance = float(
+        _runtime_config.get("direction_already_built_dominance", 0.8) or 0.8
+    )
+    max_merged = int(_runtime_config.get("direction_already_built_max_merged", 1) or 1)
+    if (
+        no_pr >= min_no_pr
+        and completed > 0
+        and (no_pr / completed) >= dominance
+        and merged <= max_merged
+        and code_failed == 0
+    ):
+        return {
+            "window_cycles": len(window),
+            "no_pr_completions": no_pr,
+            "completed": completed,
+            "merged": merged,
+            "no_pr_ratio": round(no_pr / completed, 3),
+        }
+    return None
 
 
 def _check_direction_health(direction: dict) -> str | None:
@@ -852,6 +954,13 @@ def _check_direction_health(direction: dict) -> str | None:
         (e.get("timestamp") or "") > recovered_at for e in history
     )
 
+    # Fix #1 gate for the cumulative merge-rate family (Rules 2, 5, 6 only): a
+    # direction that is still demonstrably productive must not be pause-retired by a
+    # zero-merge / churn / lifetime-burn signal. Code-failure rules (3, 4) below are
+    # deliberately left UNGATED — a crashing direction pauses no matter how productive
+    # its last cycle looked.
+    still_productive = _direction_still_productive(direction)
+
     if not in_grace:
         # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
         if direction.get("possibly_saturated") and len(history) >= 5:
@@ -862,14 +971,29 @@ def _check_direction_health(direction: dict) -> str | None:
                 )
 
         # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
-        # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed)
-        if len(history) >= 5:
+        # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed).
+        # Skipped when the direction is still productive (Fix #1). Also skipped when the
+        # only thing that "finished" was correct no-op "already-built" completions
+        # (Fix #2 inline math): subtract tasks_completed_no_pr (and infra failures) from
+        # the lifetime non-merge volume — if nothing real finished unmerged, 0 PRs merged
+        # is "nothing to merge", not unproductiveness.
+        if len(history) >= 5 and not still_productive:
             total_merged = sum(entry.get("prs_merged", 0) for entry in history)
             if total_merged == 0:
+                non_merge_real = sum(
+                    max(0, entry.get("tasks_completed", 0))
+                    - entry.get("tasks_completed_no_pr", 0)
+                    + max(
+                        0,
+                        entry.get("tasks_failed", 0)
+                        - entry.get("tasks_failed_infra", 0),
+                    )
+                    for entry in history
+                )
                 last = history[-1]
                 created = last.get("tasks_created", 0)
                 finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
-                if created == 0 or finished >= created:
+                if (created == 0 or finished >= created) and non_merge_real > 0:
                     total_created = sum(
                         entry.get("tasks_created", 0) for entry in history
                     )
@@ -908,7 +1032,10 @@ def _check_direction_health(direction: dict) -> str | None:
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
 
-    if not in_grace:
+    if not in_grace and not still_productive:
+        # Rules 5 & 6 are gated on the same Fix #1 productivity check as Rule 2: a
+        # still-productive direction is never churn/burn-paused.
+        #
         # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
         # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
         # to avoid pausing productive high-throughput directions that simply have many tasks.
@@ -1024,6 +1151,30 @@ def _check_direction_completion(direction: dict) -> str | None:
             f"{len(history)} cycles, last 2 cycles low-yield"
         )
     return None
+
+
+def already_built_completion_suggestion(direction: dict) -> str | None:
+    """Return a completion-suggestion string when the direction's recent cycles are
+    dominated by correct no-op "already-built" completions, else None (Fix #3).
+
+    A direction whose implementation tasks keep completing as "no changes needed —
+    deliverable already present" has effectively reached its goal: the feature exists
+    on the integration branch already. That is COMPLETE/saturated, not churn — the
+    operator should see it surfaced as possibly_complete, not silently auto-paused.
+
+    Delegates the conservative signature to ``_already_built_signature`` (high no-op
+    ratio, ~no merges, no code failures). Returns None when the signature does not
+    hold so callers fall through to the normal pause / completion paths.
+    """
+    sig = _already_built_signature(direction)
+    if not sig:
+        return None
+    return (
+        f"Direction appears already built: {sig['no_pr_completions']} of "
+        f"{sig['completed']} completed tasks needed no changes (deliverable already "
+        f"present) across the last {sig['window_cycles']} cycles, "
+        f"{sig['merged']} PRs merged. Goal likely already met — review for completion."
+    )
 
 
 # ── Outcome-progress (scaffolding) detector ──────────────────────────────────

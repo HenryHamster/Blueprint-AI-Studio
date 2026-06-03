@@ -267,6 +267,7 @@ async def _process_direction_lifecycle_locked(
         _compute_lifetime_burn_metrics,
         _evidence_progress_suppresses_scaffolding,
         _outcome_progress_config,
+        already_built_completion_suggestion,
     )
 
     directions_modified = False
@@ -673,6 +674,31 @@ async def _process_direction_lifecycle_locked(
                 "cumulative_estimated_cost_usd": round(cumulative_cost, 4),
                 "cost_budget_usd": round(budget_f, 4),
             }
+        # Fix #3: route "already-built" directions to completion instead of a
+        # churn / zero-merge auto-pause. When the pending pause is a cumulative
+        # merge-rate signal (Rule 2 Unproductive, Rule 5 Churn, Rule 6 Lifetime burn)
+        # AND the direction's recent cycles are dominated by correct no-op
+        # "already-present" completions (no merges, no code failures), the goal is
+        # effectively already met. Suppress the pause here; the possibly_complete
+        # flag itself is set authoritatively by the positive-completion block below
+        # (which also owns clearing it), so the two paths cannot fight over the flag.
+        # Budget and code-failure pauses are deliberately excluded — those are not
+        # "already built".
+        _CHURN_FAMILY_PREFIXES = (
+            "Unproductive:",
+            "Churn guardrail:",
+            "Lifetime burn backstop:",
+        )
+        if (
+            pause_reason
+            and pause_reason.startswith(_CHURN_FAMILY_PREFIXES)
+            and already_built_completion_suggestion(d)
+        ):
+            logger.info(
+                f"[AUTONOMOUS] Direction {did} suppressing churn-pause "
+                f"({pause_reason!r}); routing to possibly_complete (already built)"
+            )
+            pause_reason = None
         if pause_reason:
             d["status"] = "paused"
             d["paused_reason"] = pause_reason
@@ -918,8 +944,15 @@ async def _process_direction_lifecycle_locked(
             # (and its operator notification, posted above) is the preserved
             # signal; the strategic agent / operator decides any follow-up.
             continue
-        # Positive completion detection — mark for user review but don't pause
-        completion_suggestion = _check_direction_completion(d)
+        # Positive completion detection — mark for user review but don't pause.
+        # Two signals feed possibly_complete: the merge-based heuristic
+        # (_check_direction_completion) and the Fix #3 "already-built" signature
+        # (no-op-dominated completions). The already-built signal is the reason a
+        # churn/zero-merge pause was just suppressed above, so it must set the flag
+        # here; otherwise the else-branch below would immediately pop it.
+        completion_suggestion = _check_direction_completion(
+            d
+        ) or already_built_completion_suggestion(d)
         if completion_suggestion:
             if not d.get("possibly_complete"):
                 d["possibly_complete"] = True

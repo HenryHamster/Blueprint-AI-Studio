@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import select, text
@@ -71,6 +72,8 @@ from app.release_qualifier import _lts_branch_names, _resolve_github_with_sessio
 from app.models import (
     Alert,
     AlertSeverity,
+    Artifact,
+    ArtifactType,
     Project,
     Task,
     TaskHistory,
@@ -78,6 +81,7 @@ from app.models import (
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -103,10 +107,24 @@ _RESOLUTION_PRIORITY = 95
 _RESOLUTION_TASK_TYPE = "create"
 
 # Terminal task statuses — a resolution plan in one of these no longer counts
-# as "open" for the duplicate-spawn guard.
+# as "open" for the (fast, GH-free) duplicate-spawn guard.
 _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
+
+# Lookback window for the cross-cycle dedup's GitHub leg.  A resolver task goes
+# COMPLETED the instant it OPENS its resolution PR — long before that PR merges
+# into the integration trunk (CI + review tail can take many minutes, or never
+# if CI stays red).  During that window the back-merge is still DIRTY, so the
+# fast (non-terminal) guard returns False and the next reconciler cycle spawns a
+# DUPLICATE resolver (real incident: competing PRs #7476 CI-red-orphaned vs
+# #7478 clean-merged).  So a RECENTLY-terminal resolver whose resolution PR is
+# still OPEN is treated as in-flight.  The window bounds the (rare) GitHub call
+# to genuinely-recent resolvers: an old terminal resolver whose PR was never
+# landed must not block a fresh respawn forever, and a stale row never triggers
+# a network lookup.  ``Task.created_at`` is naive-UTC (``_utcnow``); the cutoff
+# uses the same source so the comparison is apples-to-apples.
+_RESOLVER_PR_LOOKBACK = timedelta(hours=24)
 
 
 async def reconcile_main_into_automain(
@@ -394,6 +412,9 @@ async def open_backmerge_pr(
             project=project,
             message=str(msg),
             periodic=periodic,
+            token=token,
+            owner=owner,
+            repo=repo,
         )
         return {"status": "conflict", "pr_url": pr_url}
 
@@ -427,6 +448,9 @@ async def open_backmerge_pr(
             project=project,
             message=str(msg),
             periodic=periodic,
+            token=token,
+            owner=owner,
+            repo=repo,
         )
         return {"status": "ci_failure", "pr_url": pr_url}
 
@@ -482,8 +506,12 @@ def _describe_trigger(merged_pr_url: str, hotfix_task_id: str | None) -> str:
 async def _resolution_task_already_open(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
 ) -> bool:
-    """Return True if a back-merge conflict-resolution task is already open.
+    """Return True if a back-merge conflict-resolution task is already in flight.
 
     Only ONE such task is ever needed at a time: it runs ``git merge
     origin/main`` into ``automain``, which reconciles ALL divergence regardless
@@ -493,22 +521,137 @@ async def _resolution_task_already_open(
     reconciler called every cycle.
 
     A resolution task is identified by ``context["backmerge_conflict"] is
-    True``.  Only non-terminal tasks count as "open" — a CANCELLED/FAILED prior
-    attempt does not block a fresh spawn.
+    True``.  "In flight" is broader than "non-terminal", because a resolver
+    ``create`` task goes COMPLETED the instant it OPENS its resolution PR —
+    NOT when that PR merges into the integration trunk.  The back-merge is not
+    actually resolved until that PR lands, and during the CI + review tail the
+    back-merge PR stays DIRTY, so a "non-terminal only" guard would let the
+    next reconciler cycle spawn a duplicate resolver against the same still-open
+    resolution PR (real incident: competing PRs #7476 vs #7478).  So a task is
+    treated as in flight when EITHER:
+
+      1. (fast path, no GitHub call) it is non-terminal; OR
+      2. it is RECENTLY-terminal (within :data:`_RESOLVER_PR_LOOKBACK`) and its
+         resolution PR is STILL OPEN on GitHub (state == "open" and not merged).
+
+    Leg 2 only runs when ``token``/``owner``/``repo`` are supplied AND a
+    candidate recently-terminal resolver exists, so the common no-conflict path
+    (and unit callers that omit creds) makes ZERO GitHub calls.  A resolver whose
+    PR is MERGED or CLOSED-unmerged does NOT block a fresh respawn — that is the
+    legitimate "the first resolver genuinely failed, try again" path.
+
+    The GitHub leg is FAIL-SAFE: any lookup exception is treated as "still
+    open" (returns True), so a transient GitHub hiccup can never let a duplicate
+    resolver through.
     """
+    # Fetch ALL tasks for the project; the Python-side filter on
+    # ``context["backmerge_conflict"]`` keeps the dialect-agnostic shape the
+    # original guard used (SQLite local tests have no JSONB operators).  Leg 1
+    # (non-terminal) and leg 2 (recently-terminal-with-open-PR) both partition
+    # this list, so — unlike the prior version — terminal rows are NOT pre-
+    # filtered at the DB level.
     rows = (
         (
             await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.status.notin_(_TERMINAL_STATUSES),
-                )
+                select(Task).where(Task.project_id == project_id)
             )
         )
         .scalars()
         .all()
     )
-    return any((task.context or {}).get("backmerge_conflict") is True for task in rows)
+
+    candidates = [
+        task for task in rows if (task.context or {}).get("backmerge_conflict") is True
+    ]
+
+    # Leg 1 — any non-terminal resolver blocks (fast, GitHub-free).
+    if any(task.status not in _TERMINAL_STATUSES for task in candidates):
+        return True
+
+    # Leg 2 — a recently-terminal resolver whose resolution PR is still OPEN is
+    # in flight.  Skip entirely without creds (unit fast path) — leg 1 already
+    # answered for non-terminal rows.
+    if not (token and owner and repo):
+        return False
+
+    cutoff = _utcnow() - _RESOLVER_PR_LOOKBACK
+    recent_terminal = [
+        task
+        for task in candidates
+        if task.status in _TERMINAL_STATUSES
+        and task.created_at is not None
+        and task.created_at >= cutoff
+    ]
+    for task in recent_terminal:
+        if await _resolver_pr_still_open(
+            session, task, project_id, token, owner, repo
+        ):
+            return True
+    return False
+
+
+async def _resolver_pr_still_open(
+    session: AsyncSession,
+    task: Task,
+    project_id: uuid.UUID,
+    token: str,
+    owner: str,
+    repo: str,
+) -> bool:
+    """Return True if ``task``'s resolution PR exists and is still OPEN on GitHub.
+
+    The resolver does NOT store its resolution PR number in context (only the
+    BACK-MERGE PR is recorded there as ``backmerge_pr_number``).  The resolution
+    PR is recorded as a ``PULL_REQUEST`` :class:`Artifact` row on the task —
+    written atomically with PR creation by the agent-status path.  This mirrors
+    :func:`reaper._task_has_open_pr`'s artifact read (and its PR-number parse
+    from ``pr_url``), then asks GitHub for the live state.
+
+    Returns:
+      * ``True``  — the PR is OPEN and not merged (resolver is in flight), OR the
+        GitHub lookup raised (FAIL-SAFE: never let a transient hiccup spawn a
+        duplicate).
+      * ``False`` — no PR artifact yet, an unparseable URL, or the PR is MERGED /
+        CLOSED-unmerged (a fresh respawn is legitimate).
+    """
+    artifact = (
+        await session.execute(
+            select(Artifact).where(
+                Artifact.task_id == task.id,
+                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+            )
+        )
+    ).scalars().first()
+    if artifact is None or not artifact.pr_url:
+        # No resolution PR recorded — the prior resolver never opened one, so it
+        # genuinely failed; a respawn is legitimate.
+        return False
+    try:
+        pr_number = int(artifact.pr_url.rstrip("/").rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        # Unparseable URL — cannot confirm "still open"; allow respawn rather
+        # than block forever on a malformed artifact.
+        return False
+    try:
+        pr = await github.get_pull_request(
+            token, owner, repo, pr_number, project_id=str(project_id)
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-safe: assume still open
+        logger.warning(
+            "[BACKMERGE] could not read resolution PR #%s for task %s "
+            "(project %s): %s — assuming still open to avoid a duplicate spawn",
+            pr_number,
+            task.id,
+            project_id,
+            exc,
+        )
+        return True
+    state = str(pr.get("state") or "").lower()
+    merged = bool(pr.get("merged"))
+    # Only an OPEN, not-yet-merged PR blocks a respawn.  A merged or
+    # closed-unmerged PR means the resolver is done (success) or genuinely
+    # failed (closed) — either way a fresh resolver is allowed.
+    return state == "open" and not merged
 
 
 async def _handle_conflict(
@@ -522,6 +665,9 @@ async def _handle_conflict(
     message: str,
     periodic: bool,
     project: Project | None = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
 ) -> None:
     """Raise a conflict Alert and (if not already open) spawn a resolution task.
 
@@ -554,7 +700,7 @@ async def _handle_conflict(
                 {"key": f"blueprint:backmerge_conflict_resolution:{project_id}"},
             )
         ).scalar()
-    except Exception as _lock_err:
+    except Exception as _lock_err:  # noqa: BLE001 — non-PG backend: fall through to dedup
         # Non-PostgreSQL backend — fall through to read-committed dedup.
         lock_acquired = True
         logger.debug(
@@ -569,7 +715,9 @@ async def _handle_conflict(
         )
         return
 
-    already_open = await _resolution_task_already_open(session, project_id)
+    already_open = await _resolution_task_already_open(
+        session, project_id, token=token, owner=owner, repo=repo
+    )
 
     if periodic and already_open:
         # The reconciler runs every cycle — a resolution task is already open
@@ -843,6 +991,9 @@ async def _handle_ci_failure(
     message: str,
     periodic: bool,
     project: Project | None = None,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
 ) -> None:
     """Raise a CI-blocked Alert and (if no back-merge remediation is open) spawn a CI-fix task.
 
@@ -875,7 +1026,9 @@ async def _handle_ci_failure(
         )
         return
 
-    already_open = await _resolution_task_already_open(session, project_id)
+    already_open = await _resolution_task_already_open(
+        session, project_id, token=token, owner=owner, repo=repo
+    )
     if periodic and already_open:
         logger.info(
             "[BACKMERGE] back-merge CI failure for project %s — a remediation "

@@ -49,6 +49,34 @@ _TERMINAL_STATUSES = frozenset(
 )
 
 
+async def _refresh_direction_outcomes_for_task(task: Task) -> None:
+    """Re-run the research-history merge recompute for *task* on a fresh session.
+
+    The admin merge paths persist a task's landed signal on the request session;
+    its research cycle's ``prs_merged`` must then be recomputed from the now-
+    committed child rows. The recompute takes the project's directions FOR-NO-KEY-
+    UPDATE lock and commits, so it runs on its OWN ``AsyncSessionLocal`` rather
+    than the in-flight request session. ``refresh_direction_outcomes_after_merge``
+    is a no-op unless the task carries ``direction_id`` + ``research_task_id`` and
+    is best-effort (it rolls back its own session on error); this wrapper adds a
+    fresh-session re-fetch and a top-level guard so it can never break the PATCH.
+    """
+    from app.database import AsyncSessionLocal
+    from app.direction_outcomes import refresh_direction_outcomes_after_merge
+
+    try:
+        async with AsyncSessionLocal() as _dir_session:
+            _dir_task = await _dir_session.get(Task, task.id)
+            if _dir_task is not None:
+                await refresh_direction_outcomes_after_merge(_dir_task, _dir_session)
+    except Exception as _dir_exc:  # noqa: BLE001 — best-effort; must not break PATCH
+        logger.warning(
+            "[ADMIN] direction-outcome refresh failed for merged task %s: %r",
+            getattr(task, "id", None),
+            _dir_exc,
+        )
+
+
 def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
     """Allow the intentionally-gated hotfix lane to merge to promotion."""
     if not target_branch:
@@ -487,6 +515,14 @@ async def _handle_rollup_pr_approval(
             )
             session.add(task)
             await session.commit()
+            # Heal this task's direction research-history merge counts now that the
+            # human-approved landing is committed. The terminal recompute on the
+            # task-completion path never re-fires for an admin merge, so prs_merged
+            # would otherwise stay stale-low. No-op unless the task carries
+            # direction/research lineage; runs on a fresh session (the directions
+            # lock + commit must not piggyback the request session mid-mutation).
+            if record_pr_merged:
+                await _refresh_direction_outcomes_for_task(task)
             await _cleanup_branches(task, session)
             if base_branch == _promotion_target and _runtime_config.get(
                 "smoketest_enabled"
@@ -718,6 +754,12 @@ async def _merge_critical_pr(
                     f"[ADMIN] Failed to delete branch {branch} after merge"
                 )
             changes["merged_pr"] = pr_number
+            # Heal this task's direction research-history merge counts after the
+            # shared session commits in _commit_and_broadcast. _merge_critical_pr
+            # defers its commit there, so the refresh (which queries committed
+            # child rows) must run post-commit — flag it for the caller.
+            if record_pr_merged:
+                changes["_refresh_direction_after_merge"] = True
             logger.info(
                 f"[ADMIN] Human-approved merge of PR #{pr_number} (critical files)"
             )
@@ -940,6 +982,13 @@ async def _commit_and_broadcast(
     if not changes:
         return
 
+    # Internal-only marker set by _merge_critical_pr: pop before history so it
+    # isn't serialized into TaskHistory.details, then run the direction-outcome
+    # refresh AFTER the commit below (it must see the committed child rows).
+    _refresh_direction_after_merge = bool(
+        changes.pop("_refresh_direction_after_merge", False)
+    )
+
     session.add(task)
     history = TaskHistory(
         task_id=task.id,
@@ -949,6 +998,9 @@ async def _commit_and_broadcast(
     session.add(history)
     await session.commit()
     await session.refresh(task)
+
+    if _refresh_direction_after_merge:
+        await _refresh_direction_outcomes_for_task(task)
 
     old_vm = changes.pop("_old_vm_to_delete", None)
     if old_vm:

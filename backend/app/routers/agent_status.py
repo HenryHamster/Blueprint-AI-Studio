@@ -2147,6 +2147,17 @@ async def update_agent_status(
                         )
                     session.add(task)
                     await session.commit()
+                    # Heal the direction's research-history merge counts: this PR
+                    # merged out-of-band (agent reported FAILED after the merge),
+                    # so the COMPLETED-time recompute never saw the landed signal.
+                    # Recompute now that it is committed. No-op unless the task
+                    # carries direction/research lineage; best-effort.
+                    if _record_pr_merged:
+                        from app.direction_outcomes import (
+                            refresh_direction_outcomes_after_merge,
+                        )
+
+                        await refresh_direction_outcomes_after_merge(task, session)
                     await broadcast_to_project(
                         str(task.project_id),
                         "task_updated",

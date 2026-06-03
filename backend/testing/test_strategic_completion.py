@@ -35,6 +35,9 @@ from app.strategic_completion import (
     _extract_rationale_from_notes,
     _compute_churn_metrics,
     _compute_lifetime_burn_metrics,
+    _direction_still_productive,
+    _already_built_signature,
+    already_built_completion_suggestion,
     _compute_outcome_progress_signal,
     record_outcome_progress_snapshot,
     _check_outcome_scaffolding,
@@ -5816,6 +5819,319 @@ class TestRule6LifetimeBurnBackstop:
         assert reason is not None
         assert "Lifetime burn backstop" in reason
         assert _is_code_failure_pause_reason(reason) is False
+
+
+# ── Fix #1: productivity gate on cumulative merge-rate rules (2, 5, 6) ─────────
+
+
+def _no_pr_history(
+    n,
+    tasks_created=5,
+    tasks_completed=5,
+    tasks_completed_no_pr=0,
+    tasks_failed=0,
+    tasks_failed_infra=0,
+    prs_merged=0,
+):
+    """research_history entries that also carry the tasks_completed_no_pr field."""
+    return [
+        {
+            "tasks_created": tasks_created,
+            "tasks_completed": tasks_completed,
+            "tasks_completed_no_pr": tasks_completed_no_pr,
+            "tasks_failed": tasks_failed,
+            "tasks_failed_infra": tasks_failed_infra,
+            "prs_merged": prs_merged,
+        }
+        for _ in range(n)
+    ]
+
+
+class TestDirectionStillProductive:
+    def test_false_when_flag_absent(self):
+        # Legacy directions never set last_cycle_productive → not gated (rules fire)
+        assert _direction_still_productive(_direction()) is False
+
+    def test_false_when_flag_false(self):
+        assert (
+            _direction_still_productive(_direction(last_cycle_productive=False))
+            is False
+        )
+
+    def test_true_when_productive_and_low_consecutive(self):
+        d = _direction(last_cycle_productive=True, consecutive_unproductive_cycles=0)
+        assert _direction_still_productive(d) is True
+
+    def test_false_when_productive_but_too_many_unproductive_cycles(self):
+        # Stale True flag must not override a long unproductive streak (default N=2)
+        d = _direction(last_cycle_productive=True, consecutive_unproductive_cycles=2)
+        assert _direction_still_productive(d) is False
+
+    def test_threshold_is_configurable(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_productive_pause_skip_max_unproductive": 4},
+            clear=False,
+        )
+        d = _direction(last_cycle_productive=True, consecutive_unproductive_cycles=3)
+        assert _direction_still_productive(d) is True
+
+
+class TestProductivityGateOnHealthRules:
+    """Core regression: a still-productive direction with 0 merges over many cycles
+    must NOT be paused by Rule 2 / 5 / 6, while genuine code failures still pause."""
+
+    def test_rule2_zero_merge_skipped_when_still_productive(self):
+        # 6 cycles, 0 merges, fully finished — Rule 2 would normally fire.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(
+                6, tasks_created=2, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+        )
+        assert _check_direction_health(d) is None
+
+    def test_rule5_churn_skipped_when_still_productive(self):
+        # Would trip Rule 5 (non_merge_finished=20, merge_rate 0%) but productive.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            ),
+        )
+        assert _check_direction_health(d) is None
+
+    def test_rule6_lifetime_burn_skipped_when_still_productive(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 160,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        assert _check_direction_health(d) is None
+
+    def test_code_failure_rule3_still_pauses_when_productive(self):
+        # Rule 3 is UNGATED: a crashing direction pauses regardless of the flag.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(
+                3, tasks_created=3, tasks_failed=3, tasks_failed_infra=0, prs_merged=0
+            ),
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "failure rate" in result.lower()
+
+    def test_code_failure_rule4_still_pauses_when_productive(self):
+        # Rule 4 (recent stall) is also UNGATED.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=0,
+            research_history=_history(
+                3,
+                tasks_created=2,
+                tasks_completed=1,
+                tasks_failed=1,
+                tasks_failed_infra=0,
+                prs_merged=0,
+            ),
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Recent stall" in result
+
+    def test_rule5_still_fires_when_productive_but_streak_exceeds_threshold(self):
+        # Stale True flag does not exempt a direction once the unproductive streak
+        # crosses the default N=2 — the gate falls open and Rule 5 fires.
+        d = _direction(
+            last_cycle_productive=True,
+            consecutive_unproductive_cycles=3,
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            ),
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+
+# ── Fix #2: tasks_completed_no_pr excluded from non-merge churn ────────────────
+
+
+class TestNoPrCompletionsExcludedFromChurn:
+    def test_churn_metrics_subtracts_no_pr_completions(self):
+        # 5 cycles: 4 completed each, ALL 4 are no-op "already-built" completions,
+        # 0 merged. With the field honored: non_merge_finished = (20-20)+0-0 = 0.
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=4, tasks_completed_no_pr=4, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 0
+
+    def test_churn_metrics_partial_no_pr(self):
+        # 5 cycles: 5 completed each (2 no-op), 0 merged.
+        # non_merge_finished = (25 - 10) + 0 - 0 = 15
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=5, tasks_completed_no_pr=2, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 15
+
+    def test_churn_metrics_unchanged_when_field_absent(self):
+        # Legacy entries (no tasks_completed_no_pr) behave exactly as before:
+        # 3 cycles x 5 completed, 0 merged → non_merge_finished = 15.
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 15
+
+    def test_lifetime_burn_subtracts_window_no_pr(self):
+        # 5 window cycles x 5 completed (all no-op), 0 merged → lifetime non-merge 0.
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=5, tasks_completed_no_pr=5, prs_merged=0
+            )
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        # total_finished = 0 → returns None (no meaningful burn)
+        assert m is None
+
+    def test_lifetime_burn_subtracts_aggregate_no_pr(self):
+        # Aggregate carries total_tasks_completed_no_pr; subtract it from burn.
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 100,
+            "total_tasks_completed_no_pr": 100,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is None  # 100 completed, all no-op → 0 lifetime burn
+
+    def test_lifetime_burn_unchanged_when_field_absent(self):
+        # Legacy: 5 cycles x 5 completed, 0 merged, no field → 25 lifetime burn.
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 25
+
+
+# ── Fix #3: already-built signature & completion routing ───────────────────────
+
+
+class TestAlreadyBuiltSignature:
+    def test_fires_when_no_op_dominated(self):
+        # 5 cycles: 4 completed each, all no-op, 0 merged, 0 failures.
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=4, tasks_completed_no_pr=4, prs_merged=0
+            )
+        )
+        sig = _already_built_signature(d)
+        assert sig is not None
+        assert sig["no_pr_completions"] == 20
+        assert sig["no_pr_ratio"] == 1.0
+
+    def test_none_when_code_failures_present(self):
+        # A direction with code failures is broken, not "already built".
+        d = _direction(
+            research_history=_no_pr_history(
+                5,
+                tasks_completed=4,
+                tasks_completed_no_pr=4,
+                tasks_failed=2,
+                tasks_failed_infra=0,
+                prs_merged=0,
+            )
+        )
+        assert _already_built_signature(d) is None
+
+    def test_none_when_actively_merging(self):
+        # Many merges → actively shipping, not already-complete.
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=4, tasks_completed_no_pr=4, prs_merged=3
+            )
+        )
+        assert _already_built_signature(d) is None
+
+    def test_none_when_no_op_ratio_too_low(self):
+        # Only 1 of 5 completions is no-op → below 0.8 dominance.
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=5, tasks_completed_no_pr=1, prs_merged=0
+            )
+        )
+        assert _already_built_signature(d) is None
+
+    def test_none_when_field_absent(self):
+        # Legacy directions never look "already built" (no_pr defaults to 0).
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        assert _already_built_signature(d) is None
+
+    def test_none_below_history_floor(self):
+        d = _direction(
+            research_history=_no_pr_history(
+                2, tasks_completed=4, tasks_completed_no_pr=4, prs_merged=0
+            )
+        )
+        assert _already_built_signature(d) is None
+
+    def test_completion_suggestion_string(self):
+        d = _direction(
+            research_history=_no_pr_history(
+                5, tasks_completed=4, tasks_completed_no_pr=4, prs_merged=0
+            )
+        )
+        msg = already_built_completion_suggestion(d)
+        assert msg is not None
+        assert "already built" in msg.lower()
+
+    def test_completion_suggestion_none_when_signature_absent(self):
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        assert already_built_completion_suggestion(d) is None
 
 
 # ── Outcome-progress (scaffolding) detector ───────────────────────────────────
