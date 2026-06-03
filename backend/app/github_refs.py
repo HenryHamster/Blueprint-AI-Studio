@@ -69,6 +69,100 @@ async def create_branch(
     return response.json()
 
 
+async def merge_branch(
+    token: str,
+    owner: str,
+    repo: str,
+    base: str,
+    head: str,
+    *,
+    commit_message: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Merge ``head`` into ``base`` via the GitHub merges API (server-side).
+
+    Wraps ``POST /repos/{owner}/{repo}/merges``. This is the safe "rebase the
+    branch from another branch" primitive: it brings every commit on ``head``
+    into ``base`` with a merge commit, WITHOUT touching commits already on
+    ``base`` (so sibling rollup work on a shared staging branch is preserved).
+
+    Used to re-cut a held cross-rollup code-dependent's staging/rollup base from
+    current integration once its dependency has landed there, so the dependent's
+    base provably contains the landed code without re-homing it onto integration.
+
+    Returns a small status dict so callers never have to keyword-match GitHub
+    prose:
+
+      * ``{"merged": True,  "already": False}`` — a merge commit was created
+        (HTTP 201).
+      * ``{"merged": True,  "already": True}``  — ``base`` already contains
+        ``head``; nothing to do (HTTP 204).
+      * ``{"merged": False, "conflict": True}`` — the merge would conflict
+        (HTTP 409); the caller must NOT dispatch against this base.
+      * ``{"merged": False, "missing": True}``  — ``base`` or ``head`` does not
+        exist (HTTP 404).
+
+    Never raises for an API error — callers degrade on the returned flags.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload: dict = {"base": base, "head": head}
+    if commit_message:
+        payload["commit_message"] = commit_message
+
+    response = await _github_request(
+        "POST",
+        f"https://api.github.com/repos/{owner}/{repo}/merges",
+        headers,
+        json=payload,
+        project_id=project_id,
+    )
+    status_code = response.status_code
+    if status_code == 201:
+        logger.info(
+            "[GITHUB] merge_branch: merged %s into %s for %s/%s",
+            head,
+            base,
+            owner,
+            repo,
+        )
+        return {"merged": True, "already": False, "status": status_code}
+    if status_code == 204:
+        # Nothing to merge — base already contains head.
+        return {"merged": True, "already": True, "status": status_code}
+    if status_code == 409:
+        logger.warning(
+            "[GITHUB] merge_branch: conflict merging %s into %s for %s/%s",
+            head,
+            base,
+            owner,
+            repo,
+        )
+        return {"merged": False, "conflict": True, "status": status_code}
+    if status_code == 404:
+        logger.warning(
+            "[GITHUB] merge_branch: base %r or head %r not found for %s/%s",
+            base,
+            head,
+            owner,
+            repo,
+        )
+        return {"merged": False, "missing": True, "status": status_code}
+    logger.error(
+        "[GITHUB] merge_branch: unexpected %s merging %s into %s for %s/%s: %s",
+        status_code,
+        head,
+        base,
+        owner,
+        repo,
+        response.text[:300],
+    )
+    return {"merged": False, "status": status_code}
+
+
 async def create_tag(
     token: str,
     owner: str,

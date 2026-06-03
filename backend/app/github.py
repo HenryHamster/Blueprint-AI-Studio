@@ -766,6 +766,7 @@ from app.github_issues import (  # noqa: F401
 from app.github_refs import (  # noqa: F401
     create_branch,
     create_tag,
+    merge_branch,
     get_branch_sha,
     get_repo_default_branch,
     delete_branch,

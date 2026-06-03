@@ -46,7 +46,7 @@ from app.ci_resolution import (
     classify_merge_test_verdict,
     should_run_no_ci_test_gate,
 )
-from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
 from app.release_qualifier_audit import _latest_artifact_logs
 from app.review_pipeline import _spawn_pipeline_task
 
@@ -137,8 +137,27 @@ def _patch_github(mocker):
     """Patch every outward I/O the gate touches so the test does no real work."""
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     mocker.patch("app.review_pipeline.broadcast_to_project", return_value=None)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification", return_value=None
+    )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+
+
+async def _unverified_merge_alerts(db_session, project_id):
+    return (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title.contains("Merged UNVERIFIED"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +322,12 @@ async def test_no_ci_passing_suite_proceeds_to_merge(db_session, mocker):
     await db_session.refresh(parent)
     assert parent.status == TaskStatus.COMPLETED
 
+    # PASS verdict gates correctly: no UNVERIFIED-merge alert is raised because
+    # the orchestrator never set review_loop["unverified_merge_reason"].
+    assert (
+        await _unverified_merge_alerts(db_session, project.id) == []
+    ), "a verified (passing) merge must not raise an UNVERIFIED-merge alert"
+
 
 # The orchestrator's terminal guard: a verify_tests task is classified only once
 # it reaches one of these states. While QUEUED / IN_PROGRESS the no-CI gate
@@ -452,3 +477,120 @@ async def test_no_ci_no_detectable_tests_falls_back_to_proceed_without_checks(
     merge_mock.assert_called_once()
     await db_session.refresh(parent)
     assert parent.status == TaskStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# 4. UNVERIFIED merge raises exactly one operator alert (and dedups on re-entry)
+# ---------------------------------------------------------------------------
+
+
+async def _set_unverified_reason(db_session, parent, reason):
+    """Mirror the orchestrator threading review_loop['unverified_merge_reason']."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    parent = await db_session.get(Task, parent.id)
+    loop = dict((parent.context or {}).get("review_loop", {}))
+    loop["unverified_merge_reason"] = reason
+    parent.context = {**(parent.context or {}), "review_loop": loop}
+    flag_modified(parent, "context")
+    db_session.add(parent)
+    await db_session.commit()
+    return parent
+
+
+@pytest.mark.asyncio
+async def test_unverified_merge_raises_single_alert_naming_pr_and_reason(
+    db_session, mocker
+):
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # The verify run reported detected=false → 'undetected' → merge UNVERIFIED.
+    outcome, detail = classify_merge_test_verdict({"detected": False})
+    assert outcome == "undetected"
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    # The orchestrator records WHY the merge is unverified on the parent context.
+    parent = await _set_unverified_reason(db_session, parent, "undetected_runtime")
+
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1, "exactly one UNVERIFIED-merge alert per merged PR"
+    from app.models import AlertSeverity
+
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].task_id == parent.id
+    assert f"PR #{PR_NUMBER}" in alerts[0].title
+    assert "UNVERIFIED" in alerts[0].message
+    assert "no usable verdict" in alerts[0].message  # undetected_runtime label
+
+
+@pytest.mark.asyncio
+async def test_unverified_merge_alert_not_duplicated_on_second_sweep(
+    db_session, mocker
+):
+    _patch_github(mocker)
+    mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=False)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    parent = await _set_unverified_reason(
+        db_session, parent, "no_detectable_test_command"
+    )
+
+    # First sweep merges and raises the alert.
+    await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    # A second sweep re-enters the merge-confirmed path (idempotent merge); the
+    # alert helper dedups on (task_id, title) so no duplicate row is created.
+    parent = await db_session.get(Task, parent.id)
+    parent.status = TaskStatus.EVALUATING
+    db_session.add(parent)
+    await db_session.commit()
+    await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1, "second merge sweep must not duplicate the alert"
+
+
+@pytest.mark.asyncio
+async def test_failing_verdict_raises_no_unverified_alert(db_session, mocker):
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # FAIL verdict blocks the merge entirely — no merge, so no unverified alert.
+    ci_result = build_no_ci_gate_ci_result("fail", "1 failed")
+    assert ci_result["conclusion"] == "failure"
+    parent = await db_session.get(Task, parent.id)
+    await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    merge_mock.assert_not_called()
+    assert (
+        await _unverified_merge_alerts(db_session, project.id) == []
+    ), "a blocked (failing) merge must not raise an UNVERIFIED-merge alert"

@@ -2502,6 +2502,99 @@ class TestMarkUnblockedDependents:
         await db_session.refresh(dependent)
         assert dependent.context.get("_deps_satisfied") is None
 
+    @pytest.mark.asyncio
+    async def test_marks_after_recut_for_requeue_replaced_cross_base_dep(
+        self, db_session, mocker
+    ):
+        """Completion-side trigger follows the requeue replacement remap before
+        re-cutting. A dependent on a requeue-cancelled-and-replaced cross-base
+        genuine code-dependency (whose landed code lives in the replacement clone)
+        must have its base re-cut BEFORE the warm-claim marker is stamped — the
+        re-cut resolves the replacement, not the superseded CANCELLED original
+        (which ``_has_landed_cross_base_code_dep`` would skip). Without the remap
+        the re-cut is silently no-oped and the dependent is stamped warm-claimable
+        against a base missing the replacement's landed code."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": True, "already": False},
+        )
+        project = make_project(
+            name="UnblockRemapRecut", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Replacement clone carries the landed cross-base code (base research/ccc).
+        replacement = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/ccc"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(replacement)
+        db_session.add(replacement)
+        await db_session.commit()
+        await db_session.refresh(replacement)
+
+        # Original cross-base dep was requeue-cancelled, points at the replacement.
+        original_dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "_replaced_by_task_id": str(replacement.id),
+            },
+            status=TaskStatus.CANCELLED,
+        )
+        # Same-base sibling whose completion fires the trigger.
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "plan/bbb"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add_all([original_dep, completed])
+        await db_session.commit()
+        await db_session.refresh(original_dep)
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(original_dep.id), str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 1
+        # Remap followed → landed replacement triggered the base re-cut (integration
+        # merged into the rollup base) BEFORE the marker was stamped.
+        merge_mock.assert_awaited_once()
+        _, kwargs = merge_mock.await_args
+        assert kwargs.get("base") == "plan/bbb"
+        assert kwargs.get("head") == "main"
+
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert dependent.context.get("_deps_satisfied") is True
+
 
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker
@@ -4078,3 +4171,562 @@ class TestClassifyStuckTasksSharedPolicy:
         # A genuine A<->B cycle: both members cleared-and-dispatched.
         assert sorted(reason for _, reason in out) == ["cycle", "cycle"]
         assert {tid for tid, _ in out} == {a.id, b.id}
+
+
+class TestCrossBaseCodeDependencyPolicy:
+    """The genuine-vs-ordering-only dependency policy
+    (``orchestrator_health.is_genuine_code_dependency``) that decides whether a
+    cross-rollup dependent must HOLD for its dependency's landed code."""
+
+    def _dep(self, dtype="create", files=None, base="research/aaa"):
+        return make_task(
+            payloads=[{"type": dtype, "base_branch": base}],
+            context={"related_files": files or []},
+        )
+
+    def _dependent(self, dtype="create", files=None, base="plan/bbb"):
+        return make_task(
+            payloads=[{"type": dtype, "base_branch": base}],
+            context={"related_files": files or []},
+        )
+
+    def test_file_overlap_is_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        dep = self._dep("create", ["backend/app/foo.py"])
+        dependent = self._dependent("create", ["backend/app/foo.py", "backend/app/bar.py"])
+        assert is_genuine_code_dependency(dependent, dep) is True
+
+    def test_no_overlap_non_transforming_is_ordering_only(self):
+        from app.orchestrator_health import (
+            is_genuine_code_dependency,
+            is_ordering_only_dependency,
+        )
+
+        dep = self._dep("create", ["backend/app/foo.py"])
+        dependent = self._dependent("create", ["backend/app/bar.py"])
+        assert is_genuine_code_dependency(dependent, dep) is False
+        assert is_ordering_only_dependency(dependent, dep) is True
+
+    def test_modify_fix_dependent_is_genuine_even_without_overlap(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        dep = self._dep("create", [])  # no declared files
+        dependent = self._dependent("fix", [])
+        assert is_genuine_code_dependency(dependent, dep) is True
+
+    def test_transforming_dependent_with_disjoint_declared_files_is_ordering_only(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        dep = self._dep("create", ["backend/app/foo.py"])
+        dependent = self._dependent("fix", ["backend/app/totally_other.py"])
+        # Both declare files that provably do NOT overlap → no code relationship.
+        assert is_genuine_code_dependency(dependent, dep) is False
+
+    def test_non_code_producing_dependency_is_ordering_only(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # A research dependency with overlapping files is still ordering-only —
+        # research produces no code to inherit.
+        dep = self._dep("research", ["backend/app/foo.py"])
+        dependent = self._dependent("create", ["backend/app/foo.py"])
+        assert is_genuine_code_dependency(dependent, dep) is False
+
+    def test_test_only_overlap_does_not_count_as_genuine(self):
+        from app.orchestrator_health import is_genuine_code_dependency
+
+        # Overlap only on test files (additive, excluded by _prod_files) is not a
+        # genuine code relationship for a non-transforming dependent.
+        dep = self._dep("create", ["backend/testing/test_foo.py"])
+        dependent = self._dependent("create", ["backend/testing/test_foo.py"])
+        assert is_genuine_code_dependency(dependent, dep) is False
+
+
+class TestCrossBaseDependencyGate:
+    """``_check_candidate_task_deps`` HOLDS a cross-rollup GENUINE code-dependent
+    until its dependency lands on integration, re-resolves it eligible once it
+    lands, keeps ordering-only cross-base deps non-blocking, leaves same-base
+    behavior unchanged, and still cascade-cancels on a terminal dependency."""
+
+    async def _verify_true(self, _task, _session):
+        return True
+
+    async def _verify_false(self, _task, _session):
+        return False
+
+    @pytest.mark.asyncio
+    async def test_cross_base_genuine_code_dep_held_until_landed(self, db_session):
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import (
+            mark_landed_on_integration,
+            mark_unblocked_non_merge,
+        )
+
+        project = make_project(name="XBaseHold", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        # Merged to its OWN staging branch only — NOT yet on integration.
+        mark_unblocked_non_merge(dep, reason="rollup_child_staging_merge")
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Held while the cross-rollup code-dependency has only staging-merged.
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "waiting"
+
+        # Once it lands on integration the dependent becomes eligible.
+        mark_landed_on_integration(dep)
+        result2, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result2 == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_cross_base_genuine_code_dep_in_flight_is_held(self, db_session):
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="XBaseInflight", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.IN_PROGRESS,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "waiting"
+
+    @pytest.mark.asyncio
+    async def test_ordering_only_cross_base_dep_dispatches_without_waiting(
+        self, db_session
+    ):
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="XBaseOrdering", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        # In-flight dependency, but no code relationship (disjoint files,
+        # non-transforming dependent) across rollup boundaries → ordering-only.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.IN_PROGRESS,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/bar.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_same_base_wait_and_pr_merge_unchanged(self, db_session):
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="SameBase", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        # Same-base create dep that is COMPLETED but PR not merged → still waits.
+        waiting, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_false
+        )
+        assert waiting == "waiting"
+        # PR merged → eligible (unchanged same-base behavior).
+        eligible, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert eligible == "eligible"
+
+    @pytest.mark.asyncio
+    async def test_terminally_failed_cross_base_code_dep_cascade_cancels(
+        self, db_session
+    ):
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="XBaseFail", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.FAILED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        # A dependency that can never land must still cascade-cancel — no hang.
+        assert result == "cascade_cancel"
+
+
+class TestCrossBaseBaseRecut:
+    """Once a cross-rollup code-dependency lands, the dependent's staging/rollup
+    base is re-cut from current integration before it can dispatch
+    (``ensure_dependent_base_recut`` / ``recut_dependent_base_from_integration``)."""
+
+    @pytest.mark.asyncio
+    async def test_base_equal_integration_is_noop(self, db_session, mocker):
+        from app.orchestrator_health import ensure_dependent_base_recut
+        from app.landed_signal import mark_landed_on_integration
+
+        merge_mock = mocker.patch(
+            "app.github.merge_branch", new_callable=AsyncMock
+        )
+        project = make_project(
+            name="RecutNoop", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        # Dependent already bases on integration → cloning HEAD has the code.
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "main"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert ok is True
+        merge_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_staging_base_merges_integration(self, db_session, mocker):
+        from app.orchestrator_health import ensure_dependent_base_recut
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": True, "already": False},
+        )
+        project = make_project(
+            name="RecutMerge", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        assert ok is True
+        merge_mock.assert_awaited_once()
+        _, kwargs = merge_mock.await_args
+        assert kwargs.get("base") == "plan/bbb"
+        assert kwargs.get("head") == "main"
+
+    @pytest.mark.asyncio
+    async def test_merge_conflict_holds_dependent(self, db_session, mocker):
+        from app.orchestrator_health import ensure_dependent_base_recut
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutConflict", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+
+        ok = await ensure_dependent_base_recut(dependent, [dep], db_session)
+        # Re-cut required but conflicted → caller must keep holding.
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_recut_driver_drops_dependent_on_failed_recut(
+        self, db_session, mocker
+    ):
+        from app.orchestrator_health import recut_landed_cross_base_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutDriver", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        eligible = [dependent.id]
+        out = await recut_landed_cross_base_dependents(
+            eligible, [dependent], {dep.id: dep}, db_session
+        )
+        # Conflict on re-cut → dropped from this cycle's eligible set.
+        assert out == []
+
+    @pytest.mark.asyncio
+    async def test_recut_conflict_clears_warm_claim_marker(self, db_session, mocker):
+        """Dep landed + re-cut conflicts => dependent must NOT be warm-claimable.
+
+        Regression for the warm-claim bypass: a dropped cross-base code-dependent
+        that was already stamped ``_deps_satisfied`` this cycle has the marker
+        durably cleared, so ``warm_backlog_reuse``'s ``/next-role`` scan (which
+        treats any depends_on task carrying ``_deps_satisfied`` as warm-claimable)
+        cannot dispatch it against a base missing the landed dependency code."""
+        from app.orchestrator_health import recut_landed_cross_base_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": False, "conflict": True},
+        )
+        project = make_project(
+            name="RecutClearMarker", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(dep)
+        # Dependent was already stamped warm-claimable this cycle.
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "_deps_satisfied": True,
+            },
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add_all([dep, dependent])
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        out = await recut_landed_cross_base_dependents(
+            [dependent.id], [dependent], {dep.id: dep}, db_session
+        )
+        assert out == []
+
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        # Marker durably cleared → not warm-claimable while the re-cut is unmet.
+        assert not (dependent.context or {}).get("_deps_satisfied")
+
+    @pytest.mark.asyncio
+    async def test_recut_driver_follows_requeue_replacement_remap(
+        self, db_session, mocker
+    ):
+        """A requeue-cancelled-and-replaced cross-base code-dependency still
+        triggers the dependent's base re-cut: the driver resolves the replacement
+        clone (which carries the landed code), not the superseded CANCELLED row."""
+        from app.orchestrator_health import recut_landed_cross_base_dependents
+        from app.landed_signal import mark_landed_on_integration
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("tok", "owner", "repo"),
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_branch",
+            new_callable=AsyncMock,
+            return_value={"merged": True, "already": False},
+        )
+        project = make_project(
+            name="RecutRemap", user_id="u1", integration_branch="main"
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        replacement = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/ccc"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(replacement)
+        db_session.add(replacement)
+        await db_session.commit()
+        await db_session.refresh(replacement)
+
+        # Original dep was requeue-cancelled and points at the replacement clone.
+        original_dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/aaa"}],
+            context={
+                "related_files": ["backend/app/foo.py"],
+                "_replaced_by_task_id": str(replacement.id),
+            },
+            status=TaskStatus.CANCELLED,
+        )
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(original_dep.id)],
+        )
+        db_session.add_all([original_dep, dependent])
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        out = await recut_landed_cross_base_dependents(
+            [dependent.id], [dependent], {original_dep.id: original_dep}, db_session
+        )
+        # Remap followed → landed replacement triggers a successful re-cut, so the
+        # dependent stays eligible (not dropped).
+        assert out == [dependent.id]
+        merge_mock.assert_awaited_once()
+        _, kwargs = merge_mock.await_args
+        assert kwargs.get("base") == "plan/bbb"
+        assert kwargs.get("head") == "main"

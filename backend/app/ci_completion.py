@@ -116,7 +116,10 @@ async def _attempt_merge_with_retry_and_escalation(
         ci_passed) — heartbeat-only mutations don't touch those fields.
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
-    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.alert_dispatch import (
+        _maybe_create_failure_alert,
+        _maybe_create_unverified_merge_alert,
+    )
     from app.branch_resolution import (
         is_custom_staged_rollup_root,
         merged_pr_counts_as_integration_landing,
@@ -489,6 +492,25 @@ async def _attempt_merge_with_retry_and_escalation(
                 _merge_project.id,
                 ci_base,
             )
+        # No-CI UNVERIFIED-merge alert: if the orchestrator decided this merge
+        # proceeds without test verification (undetected verdict / kill-switch
+        # off / internal staging base / no detectable test command), surface it
+        # ONCE to the operator now that the merge actually landed. Deduped per
+        # PR inside the helper; isolated so an alert error never undoes the merge.
+        _unverified_reason = ci_loop.get("unverified_merge_reason")
+        if _unverified_reason:
+            try:
+                await _maybe_create_unverified_merge_alert(
+                    task,
+                    session,
+                    pr_number=ci_pr_number,
+                    reason=_unverified_reason,
+                )
+            except Exception as _ue:
+                logger.warning(
+                    f"[CI] PR #{ci_pr_number} unverified-merge alert failed: {_ue}",
+                    exc_info=True,
+                )
         logger.info(f"[CI] PR #{ci_pr_number} merged ({source})")
         return True
 

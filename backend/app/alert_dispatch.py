@@ -318,6 +318,103 @@ async def _maybe_create_failure_alert(
         logger.warning(f"[NOTIFY] TASK_FAILED dispatch setup failed: {_ne}")
 
 
+# Human-readable labels for the no-CI UNVERIFIED-merge reasons. The orchestrator
+# writes the reason KEY into review_loop["unverified_merge_reason"] at the two
+# UNVERIFIED decision sites, so keep these keys stable. The reason is NOT part of
+# the dedup title (the PR number is), so the label only shapes the message text.
+_UNVERIFIED_REASON_LABELS = {
+    "no_detectable_test_command": "no runnable test command could be detected",
+    "kill_switch_off": "the no-CI test-gate is disabled (kill-switch off)",
+    "internal_staging_base": (
+        "the PR targets an internal staging branch (CI is path-filtered there)"
+    ),
+    "undetected_runtime": "the detected test suite produced no usable verdict",
+}
+
+
+async def _maybe_create_unverified_merge_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    pr_number: "int | None",
+    reason: str,
+    severity: AlertSeverity = AlertSeverity.WARNING,
+) -> None:
+    """Create a deduplicated operator Alert when a no-CI merge proceeds UNVERIFIED.
+
+    For repos with no required CI checks, Blueprint runs the repo's own detected
+    tests as the merge gate. The 'undetected' verdict — no detectable test
+    command, the gate kill-switch off, an internal staging base, or a verify run
+    that produced no usable verdict — falls back to merging the PR WITHOUT test
+    verification so genuinely test-less repos still make progress. That fallback
+    was previously info-log only; this surfaces it in the same Alerts banner as
+    other pipeline escalations so the operator who turned off 'required CI checks'
+    learns that a specific merge proceeded with zero test verification, and why.
+
+    The PASS and FAIL verdicts gate correctly and never reach here — only the
+    UNVERIFIED merge does. Alerting only; it does not change the merge outcome.
+
+    Deduplicated by ``(task_id, title)`` where the title encodes the PR number
+    (NOT the reason), so a single unverified merge raises exactly ONE alert even
+    if a later merge sweep re-enters the path. ``task`` should be the chain task
+    so the alert is task-linked (renders a "View task" button in the banner).
+    """
+    label = _UNVERIFIED_REASON_LABELS.get(reason, reason)
+    pr_label = f"PR #{pr_number}" if pr_number is not None else "PR"
+    title = f"Merged UNVERIFIED: {pr_label} — no test verification"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=severity,
+        title=title,
+        message=(
+            f"{pr_label} merged without test verification because {label}. "
+            f"This project has no required CI checks, so Blueprint runs the "
+            f"repo's own detected tests as the merge gate — this merge proceeded "
+            f"UNVERIFIED. Review the merge if test coverage was expected."
+        ),
+        task_id=task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+        },
+    )
+    try:
+        from app.notification_dispatch import dispatch_external_notification
+        import asyncio as _asyncio
+
+        _asyncio.ensure_future(  # noqa: RUF006  # fire-and-forget; caller does not await
+            dispatch_external_notification(
+                task.project_id,
+                "MERGE_UNVERIFIED",
+                {
+                    "task_id": str(task.id),
+                    "task_title": task.title or str(task.id)[:8],
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "reason_label": label,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning(f"[NOTIFY] MERGE_UNVERIFIED dispatch setup failed: {_ne}")
+
+
 async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

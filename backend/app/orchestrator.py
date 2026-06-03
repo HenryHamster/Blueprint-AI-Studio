@@ -714,7 +714,10 @@ async def _persist_deps_satisfied(task: Task) -> None:
 
 from app.orchestrator_health import (
     _check_candidate_task_deps,
+    _effective_dep_task,
+    ensure_dependent_base_recut,
     get_confirmed_down_critical_deps,
+    recut_landed_cross_base_dependents,
 )
 
 
@@ -959,6 +962,28 @@ async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> 
                 d, dep_tasks, du, dep_session, verify_pr_merged
             )
             if result_str == "eligible":
+                # A dependent unblocked by a cross-rollup code-dependency landing
+                # must have its base re-cut from current integration BEFORE it is
+                # marked warm-claimable — otherwise a warm VM could claim it via
+                # the _deps_satisfied marker and run against a base missing the
+                # landed code, bypassing the dispatch-loop re-cut. Reuse the same
+                # re-cut; skip the marker (keep holding) if it can't complete.
+                # Resolve effective (remap-following) dep rows first so a
+                # requeue-cancelled-and-replaced cross-base code-dependency is
+                # recognized as landed — otherwise the CANCELLED original is
+                # skipped by _has_landed_cross_base_code_dep and no re-cut fires,
+                # leaving the dependent stamped against a base missing the
+                # replacement's landed code (mirrors the dispatch loop and
+                # recut_landed_cross_base_dependents).
+                from app.orchestrator_health import ensure_dependent_base_recut
+
+                effective_dep_tasks = [
+                    await _effective_dep_task(dt, dep_session) for dt in dep_tasks
+                ]
+                if not await ensure_dependent_base_recut(
+                    d, effective_dep_tasks, dep_session
+                ):
+                    continue
                 eligible_ids.append(d.id)
     if not eligible_ids:
         return 0
@@ -1919,6 +1944,36 @@ async def orchestrator_worker():
                             )
                             _entry["count"] += _cancelled_count
                     elif all_met:
+                        # A cross-base GENUINE code-dependent must run against a
+                        # base that provably contains its landed dependency's
+                        # code, so re-cut its staging/rollup base from current
+                        # integration BEFORE stamping the warm-claim marker.
+                        # Stamping _deps_satisfied makes the task warm-claimable
+                        # via the /next-role backlog scan; if we stamped first and
+                        # the re-cut then conflicted/errored, a warm VM could claim
+                        # and dispatch it against a base MISSING the landed code
+                        # (the exact invariant this guards). Resolve effective
+                        # (remap-following) dep rows so a requeue-replaced
+                        # dependency is recognized as landed. No-op for tasks with
+                        # no landed cross-base code-dep (returns True immediately).
+                        effective_dep_tasks = [
+                            await _effective_dep_task(dt, session)
+                            for dt in dep_tasks
+                        ]
+                        if not await ensure_dependent_base_recut(
+                            task, effective_dep_tasks, session
+                        ):
+                            # Re-cut required but incomplete (merge conflict /
+                            # transient GitHub error) — keep HOLDING: do not stamp
+                            # the marker and do not dispatch. The task stays QUEUED
+                            # and is retried next cycle (a persistent conflict
+                            # surfaces for a fix task / operator).
+                            logger.warning(
+                                "[CROSS-BASE] Holding dependent %s — base re-cut "
+                                "incomplete; not marking warm-claimable",
+                                task.id,
+                            )
+                            continue
                         # Durably stamp the sticky readiness marker so the cheap
                         # /next-role warm-backlog scan and the dispatch
                         # first-refusal hold can treat this dependency-bearing
@@ -2104,6 +2159,18 @@ async def orchestrator_worker():
                             f"[ORCHESTRATOR] Deadlock resolution cycle complete: "
                             f"{narrow_broken} narrow + {broad_broken} broad = {total_broken} deadlock(s) broken"
                         )
+
+                # Step 2.45: Re-cut held cross-rollup code-dependents' bases from
+                # current integration. A dependent held until its genuine
+                # cross-base code-dependency landed must run against a base that
+                # provably contains that landed code; this merges integration
+                # into the dependent's staging/rollup base (preserving the rollup
+                # model). A dependent whose re-cut conflicts or errors is dropped
+                # from this cycle's eligible set so it never dispatches against a
+                # base missing its dependency's code — it stays QUEUED and retries.
+                eligible_ids = await recut_landed_cross_base_dependents(
+                    eligible_ids, candidate_tasks, _dep_by_id, session
+                )
 
                 # Step 2.5: File-conflict check — defer tasks that would conflict with in-progress work
                 eligible_ids = await filter_file_conflicts(
@@ -4801,6 +4868,11 @@ async def orchestrator_worker():
                         # consumed in the locked block after the re-acquire below.
                         _no_ci_verify_gate = False
                         _no_ci_verify_base = ""
+                        # When a no-CI merge proceeds UNVERIFIED (immediate-pass
+                        # or undetected verify-verdict), record WHY so the
+                        # merge-confirmed block in handle_ci_completion can raise
+                        # exactly one operator alert. None = verified/normal path.
+                        _unverified_merge_reason = None
 
                         if _rt_cfg.get("ci_resolution_strict_mode", True):
                             from app import ci_resolution
@@ -4907,18 +4979,25 @@ async def orchestrator_worker():
                                                 f"targets internal staging branch "
                                                 f"'{_ci_base_ref}'"
                                             )
+                                            _unverified_merge_reason = (
+                                                "internal_staging_base"
+                                            )
                                         elif not _gate_on:
                                             _ci_reason = (
                                                 "the project declares no CI "
                                                 "(requires_ci_checks=False) and the "
                                                 "no_ci_test_gate kill-switch is off"
                                             )
+                                            _unverified_merge_reason = "kill_switch_off"
                                         else:
                                             _ci_reason = (
                                                 "the project declares no CI "
                                                 "(requires_ci_checks=False) and no "
                                                 "test command is detectable — merging "
                                                 "UNVERIFIED"
+                                            )
+                                            _unverified_merge_reason = (
+                                                "no_detectable_test_command"
                                             )
                                         logger.info(
                                             f"[CI] PR #{ci_pr_number} has 0 check-runs and "
@@ -5196,6 +5275,7 @@ async def orchestrator_worker():
                                         f"{_verify_task.status}) — merge proceeding "
                                         f"UNVERIFIED"
                                     )
+                                    _unverified_merge_reason = "undetected_runtime"
                                 ci_result = ci_resolution.build_no_ci_gate_ci_result(
                                     _outcome, _detail
                                 )
@@ -5302,6 +5382,23 @@ async def orchestrator_worker():
 
                         # CI completed — delegate to shared handler
                         from app.ci_completion import handle_ci_completion
+
+                        # Thread the UNVERIFIED-merge reason (if any) into the
+                        # task context so the merge-confirmed block raises the
+                        # operator alert against an ACTUAL merge — not a merely
+                        # opened gate. flag_modified: nested JSONB dict mutation.
+                        if _unverified_merge_reason:
+                            from sqlalchemy.orm.attributes import flag_modified
+
+                            ci_loop["unverified_merge_reason"] = (
+                                _unverified_merge_reason
+                            )
+                            ci_task.context = {
+                                **(ci_task.context or {}),
+                                "review_loop": ci_loop,
+                            }
+                            flag_modified(ci_task, "context")
+                            session.add(ci_task)
 
                         logger.info(
                             f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing"
