@@ -706,6 +706,13 @@ def cmd_directions(args):
         print(f"  Category:   {d.get('category', '-')}")
         print(f"  Merge rate: {d.get('merge_rate', 0):.2f}")
         print(f"  Added:      {(d.get('added_at') or '?')[:19]}")
+        if d.get('status') == 'paused' or d.get('paused_reason'):
+            print(f"  Paused why: {d.get('paused_reason', '(none recorded)')}")
+            print(f"  Auto-paused:{d.get('auto_paused', False)} (count={d.get('auto_pause_count', 0)})")
+            print(f"  Paused at:  {(d.get('paused_at') or '?')[:19]}")
+        if d.get('needs_manual_intervention'):
+            print(f"  ** NEEDS MANUAL INTERVENTION (since {(d.get('needs_manual_intervention_at') or '?')[:19]})")
+        print(f"  Productive: last_cycle_productive={d.get('last_cycle_productive')}  consec_unproductive={d.get('consecutive_unproductive_cycles', 0)}")
         if d.get('paths'):
             print(f"  Paths:      {', '.join(d['paths'])}")
         if d.get('completion_criteria'):

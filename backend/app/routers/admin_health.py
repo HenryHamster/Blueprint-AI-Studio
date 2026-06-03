@@ -1,5 +1,6 @@
 """Unified health overview endpoint."""
 
+import time
 import uuid
 import logging
 from typing import Dict, Any, List
@@ -13,6 +14,14 @@ from sqlmodel import select
 
 from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
+from app.digest_precompute import (
+    HEALTH_KIND,
+    PRECOMPUTE_STALE_FALLBACK_SECONDS,
+    annotate_precompute_metadata,
+    get_health_precompute_cache,
+    read_shared,
+    shared_cache_key,
+)
 from app.models import (
     Task,
     TaskStatus,
@@ -56,6 +65,42 @@ async def get_health_overview(
     request. Cache key is (project_id, lookback_hours) — the response does
     not vary per user. Default TTL 15s; tune in digest_cache.
     """
+    # L1: leader-only in-process precompute cache (warm only on the leader).
+    precompute_cache = get_health_precompute_cache()
+    entry = precompute_cache.get_fresh(
+        lookback_hours,
+        project_id,
+        max_age_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS,
+        worker_only=True,
+    )
+    if entry is not None:
+        return annotate_precompute_metadata(
+            entry.result,
+            precomputed=True,
+            precomputed_at=entry.computed_wall_iso or None,
+            precompute_age_seconds=time.monotonic() - entry.computed_monotonic,
+        )
+
+    # L2: cross-instance shared cache. Health-overview previously had NO
+    # precompute, so every request (on every instance) live-computed the
+    # multi-thousand-row scan — the single largest source of the 2026-06-03
+    # statement_timeout 500 burst. A leader-written row lets all instances serve
+    # it cheaply. Fail-open: falls through to the on-demand path on any miss.
+    shared = await read_shared(
+        shared_cache_key(HEALTH_KIND, lookback_hours, project_id),
+        max_age_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS,
+        session=session,
+    )
+    if shared is not None:
+        return annotate_precompute_metadata(
+            shared.payload,
+            precomputed=True,
+            precomputed_at=shared.computed_at.isoformat(),
+            precompute_age_seconds=max(
+                0.0, (_utcnow() - shared.computed_at).total_seconds()
+            ),
+        )
+
     cache_key = (
         "health-overview",
         str(project_id) if project_id else None,

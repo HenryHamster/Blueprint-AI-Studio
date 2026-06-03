@@ -702,6 +702,12 @@ async def _check_evaluating_timeouts(progress_cb=None):
 
                     _ctx2 = dict(ctx)
                     _ctx2.pop("_pr_state_check_pending", None)
+                    # Set when this recovery records a real integration landing
+                    # (out-of-band merge), so the direction-outcome refresh runs
+                    # after the per-row commit. Re-fetched in a fresh session below
+                    # because the per-row commit can expire ``task`` (and this row
+                    # is loaded with load_only).
+                    _recovery_merge_refresh_needed = False
 
                     if not pr_num:
                         # No PR number recoverable — clear flag, fall through to
@@ -800,6 +806,7 @@ async def _check_evaluating_timeouts(progress_cb=None):
                                     non_merge_reason="merged_pr_non_integration_branch",
                                 )
                                 _ctx2 = dict(task.context or {})
+                                _recovery_merge_refresh_needed = True
                         elif gh_pr_state == "closed" and not gh_pr_merged:
                             task.status = TaskStatus.FAILED
                             task.vm_instance_id = None
@@ -885,6 +892,35 @@ async def _check_evaluating_timeouts(progress_cb=None):
                         flag_modified(task, "context")
                         session.add(task)
                         await session.commit()
+                        # Heal the direction's research-history merge counts for an
+                        # out-of-band merge recovered here. Done in a FRESH session
+                        # re-fetching by id: the per-row commit + internal spawn can
+                        # expire ``task`` (loaded with load_only), and the refresh
+                        # takes the directions lock + commits, so it must not share
+                        # this row's session. No-op unless the task carries
+                        # direction/research lineage; best-effort.
+                        if _recovery_merge_refresh_needed:
+                            from app.direction_outcomes import (
+                                refresh_direction_outcomes_after_merge,
+                            )
+
+                            try:
+                                async with services.AsyncSessionLocal() as _dir_session:
+                                    _dir_task = await _dir_session.get(
+                                        Task, _eval_task_id
+                                    )
+                                    if _dir_task is not None:
+                                        await refresh_direction_outcomes_after_merge(
+                                            _dir_task, _dir_session
+                                        )
+                            except Exception as _dir_exc:
+                                logger.warning(
+                                    "[EVAL TIMEOUT pr_check] direction-outcome "
+                                    "refresh failed for out-of-band merge of task "
+                                    "%s: %r",
+                                    _eval_task_id,
+                                    _dir_exc,
+                                )
                         # Status is unchanged on this recovery path (task stays
                         # EVALUATING). The _spawn_pipeline_task above can roll back
                         # internally and expire `task` (even with expire_on_commit=

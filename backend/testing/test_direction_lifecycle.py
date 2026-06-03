@@ -965,7 +965,6 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     )
 
     # A BLOCKER ProjectMessage with event_type='direction_churn_pause' must be present
-    from sqlmodel import select
 
     msgs = (
         (
@@ -993,6 +992,186 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     # Churn pauses do NOT require manual intervention (they auto-recover)
     assert not d.get("needs_manual_intervention"), (
         "churn pause should NOT set needs_manual_intervention"
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_lifecycle_already_built_routes_to_possibly_complete(
+    db_session, mocker
+):
+    """An "already-built" direction is flagged possibly_complete, not churn-paused.
+
+    The direction's recent cycles are dominated by correct no-op "already-present"
+    completions (tasks_completed_no_pr ~= tasks_completed), with no merges and no code
+    failures. A residual amount of genuine non-merge volume still trips the churn /
+    zero-merge family, but the already-built signature must suppress the pause and
+    surface the direction as possibly_complete for the operator instead.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    # 5 cycles: 20 completed each, 16 no-op (0.8 dominance), 0 merged, 0 failures.
+    # Real non-merge volume = 5*(20-16) = 20 (>=15 churn threshold) so a churn/zero-merge
+    # pause would fire — but no_pr_ratio = 0.8 satisfies the already-built signature.
+    history = [
+        {
+            "timestamp": (now - timedelta(days=i)).isoformat(),
+            "tasks_created": 20,
+            "tasks_completed": 20,
+            "tasks_completed_no_pr": 16,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(5, 0, -1)
+    ]
+    direction = {
+        "id": "d-already-built",
+        "text": "Feature that is already implemented on the integration branch",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history,
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "active", (
+        f"already-built direction must NOT be paused, got status={d['status']!r} "
+        f"reason={d.get('paused_reason')!r}"
+    )
+    assert not d.get("auto_paused"), "already-built direction must not be auto-paused"
+    assert d.get("possibly_complete") is True, (
+        "already-built direction should be flagged possibly_complete"
+    )
+    suggestion = d.get("completion_suggestion", "")
+    assert "already built" in suggestion.lower(), (
+        f"completion_suggestion should explain already-built, got: {suggestion!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_lifecycle_productive_direction_not_churn_paused(
+    db_session, mocker
+):
+    """Fix #1 integration: a still-productive direction (last_cycle_productive=True,
+    consecutive_unproductive_cycles=0) with many cycles and 0 merges is NOT paused by
+    the cumulative merge-rate family (Rule 2 / 5 / 6)."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    # 6 cycles, 5 tasks each, fully completed, 0 merged — Rule 2 + Rule 5 territory.
+    history = [
+        {
+            "timestamp": (now - timedelta(days=i)).isoformat(),
+            "tasks_created": 5,
+            "tasks_completed": 4,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(6, 0, -1)
+    ]
+    direction = {
+        "id": "d-productive-no-merge",
+        "text": "Productive operator-ask direction with no merges yet",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+        "research_history": history,
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "active", (
+        f"still-productive direction must NOT be paused, got status={d['status']!r} "
+        f"reason={d.get('paused_reason')!r}"
+    )
+    assert not d.get("auto_paused")
+
+
+@pytest.mark.asyncio
+async def test_process_lifecycle_productive_direction_still_pauses_on_code_failure(
+    db_session, mocker
+):
+    """Fix #1 integration: the productivity gate does NOT shield code-failure rules.
+    A direction with last_cycle_productive=True but high code-failure rate (Rule 3)
+    is still auto-paused."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    # 3 cycles, 10 tasks each, 9 code failures → >70% code failure rate (Rule 3).
+    history = [
+        {
+            "timestamp": (now - timedelta(days=i)).isoformat(),
+            "tasks_created": 10,
+            "tasks_completed": 1,
+            "tasks_failed": 9,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(3, 0, -1)
+    ]
+    direction = {
+        "id": "d-productive-but-failing",
+        "text": "Direction whose tasks keep crashing",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+        "research_history": history,
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "code-failure rules must still pause a 'productive' direction"
+    )
+    reason = d.get("paused_reason", "")
+    assert "High code failure rate" in reason or "Recent stall" in reason, (
+        f"expected a code-failure pause reason, got: {reason!r}"
     )
 
 
@@ -1296,7 +1475,6 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
 async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
     """A memo task is spawned the first time a direction is flagged as outcome-less scaffolding."""
     from unittest.mock import AsyncMock
-    from sqlmodel import select
 
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
@@ -1346,7 +1524,6 @@ async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
 async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mocker):
     """No additional memo is spawned on subsequent lifecycle passes while the flag is still set."""
     from unittest.mock import AsyncMock
-    from sqlmodel import select
 
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
