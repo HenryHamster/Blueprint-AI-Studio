@@ -3825,6 +3825,88 @@ def test_is_self_review_422_signal():
     assert not _is_self_review_422("")
 
 
+# ── create_pull_request idempotency pre-check (duplicate rollup PR guard) ──
+# GitHub enforces one open PR per (head, base) only best-effort, so two
+# concurrent POSTs can both 201 and leave a duplicate (incident #7350/#7351).
+# create_pull_request now looks up an existing open PR before POSTing.
+
+
+@pytest.mark.asyncio
+async def test_create_pull_request_returns_existing_open_pr_without_posting(mocker):
+    """When an open PR already exists for head->base, create_pull_request returns
+    it WITHOUT issuing a POST."""
+    from app.github import create_pull_request
+
+    calls = []
+
+    async def fake_request(method, url, *args, **kwargs):
+        calls.append(method)
+        if method == "GET":
+            return MockResponse(
+                200,
+                [{"number": 7350, "html_url": "https://github.com/o/r/pull/7350"}],
+            )
+        return MockResponse(201, {"number": 9999})  # POST must never run
+
+    mocker.patch("app.github._github_request", side_effect=fake_request)
+
+    result = await create_pull_request(
+        "tok", "owner", "repo", title="t", head="feature", base="main", body="b"
+    )
+
+    assert result["number"] == 7350
+    assert "POST" not in calls, "must not POST when an open PR already exists"
+    assert calls == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_create_pull_request_posts_when_no_existing_pr(mocker):
+    """When the pre-check finds no open PR, create_pull_request proceeds to POST
+    and returns the newly created PR."""
+    from app.github import create_pull_request
+
+    calls = []
+
+    async def fake_request(method, url, *args, **kwargs):
+        calls.append(method)
+        if method == "GET":
+            return MockResponse(200, [])  # no existing PR
+        return MockResponse(201, {"number": 4321, "html_url": "https://x/pull/4321"})
+
+    mocker.patch("app.github._github_request", side_effect=fake_request)
+
+    result = await create_pull_request(
+        "tok", "owner", "repo", title="t", head="feature", base="main"
+    )
+
+    assert result["number"] == 4321
+    assert calls == ["GET", "POST"]
+
+
+@pytest.mark.asyncio
+async def test_create_pull_request_precheck_error_falls_through_to_post(mocker):
+    """A failing pre-check lookup must NOT block creation — it falls through to
+    the POST (best-effort idempotency)."""
+    from app.github import create_pull_request
+
+    calls = []
+
+    async def fake_request(method, url, *args, **kwargs):
+        calls.append(method)
+        if method == "GET":
+            raise RuntimeError("transient lookup failure")
+        return MockResponse(201, {"number": 555})
+
+    mocker.patch("app.github._github_request", side_effect=fake_request)
+
+    result = await create_pull_request(
+        "tok", "owner", "repo", title="t", head="feature", base="main"
+    )
+
+    assert result["number"] == 555
+    assert calls == ["GET", "POST"]
+
+
 @pytest.mark.asyncio
 async def test_get_file_content_at_ref_success_counts_lines(mocker):
     """A 200 file payload returns (True, newline_count) decoded from base64."""

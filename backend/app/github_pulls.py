@@ -131,6 +131,45 @@ async def pr_is_not_behind_for(
     )
 
 
+async def _find_open_pull_request(
+    headers: dict,
+    owner: str,
+    repo: str,
+    head: str,
+    base: str,
+    project_id: str | None = None,
+) -> dict | None:
+    """Return the open PR for ``head`` -> ``base`` if one exists, else None.
+
+    GitHub allows at most one open PR per (head, base) pair but enforces it only
+    best-effort — two concurrent ``POST /pulls`` can both succeed (201) and leave
+    a duplicate (rollup PR incident #7350/#7351). This lookup lets
+    ``create_pull_request`` collapse the "already created" case into resuming the
+    existing PR. Best-effort by design: any non-200 response or error returns
+    None so a flaky lookup never blocks creation — the POST and its 422 handler
+    still cover the race.
+    """
+    try:
+        list_resp = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            f"?head={owner}:{head}&base={base}&state=open",
+            headers,
+            project_id=project_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — any lookup failure (network, auth, HTTP) must fall through to the POST so a flaky pre-check never blocks creation.
+        logger.warning(f"[PR] Pre-create lookup for {head} -> {base} failed: {exc}")
+        return None
+    if getattr(list_resp, "status_code", None) == 200:
+        try:
+            items = list_resp.json()
+        except Exception:  # noqa: BLE001 — a malformed body is treated as "no existing PR" so creation proceeds.
+            return None
+        if items:
+            return items[0]
+    return None
+
+
 async def create_pull_request(
     token: str,
     owner: str,
@@ -149,6 +188,19 @@ async def create_pull_request(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+
+    # Idempotency pre-check: GitHub enforces one open PR per (head, base) only
+    # best-effort, so two concurrent creates can both 201 → duplicate PRs
+    # (incident #7350/#7351). Resume an already-open PR instead of POSTing again.
+    existing = await _find_open_pull_request(
+        headers, owner, repo, head, base, project_id
+    )
+    if existing is not None:
+        logger.info(
+            f"[PR] Open PR #{existing.get('number')} already exists for "
+            f"{head} -> {base} — returning it instead of creating a duplicate"
+        )
+        return existing
 
     payload = {"title": title[:256], "head": head, "base": base, "body": body[:65536]}
 
@@ -174,14 +226,11 @@ async def create_pull_request(
                 logger.info(
                     f"PR already exists for {head} -> {base}, fetching existing PR"
                 )
-                list_resp = await _github_request(
-                    "GET",
-                    f"https://api.github.com/repos/{owner}/{repo}/pulls?head={owner}:{head}&base={base}&state=open",
-                    headers,
-                    project_id=project_id,
+                existing = await _find_open_pull_request(
+                    headers, owner, repo, head, base, project_id
                 )
-                if list_resp.status_code == 200 and list_resp.json():
-                    return list_resp.json()[0]
+                if existing is not None:
+                    return existing
             if "no commits between" in msg:
                 # Empty diff — branches are identical. Return a synthetic "merged" result
                 # so the caller can mark the task as completed instead of failed.
