@@ -1306,14 +1306,22 @@ class TestPreMergeDualHeadGuardCoverage:
     # call with the inline ``# premerge-guard-exempt: <reason>`` marker (see
     # _EXEMPT_MARKER below) so the exemption travels with the code.
     _EXEMPT_SITES: dict = {
+    }
+
+    # Narrow call-site allowances for helpers that are structurally guarded by
+    # upstream flow and dedicated runtime tests. These are intentionally kept as
+    # exact call ordinals rather than whole-function trust zones; the shape test
+    # below pins the function structure so a future extra merge call still trips
+    # the invariant.
+    _NARROWLY_ALLOWED_MERGE_CALLS: dict = {
         (
             "ci_completion.py",
             "_attempt_merge_with_retry_and_escalation",
-        ): "shared CI-completion merge helper; the guarded decision happens earlier in the same flow",
+        ): frozenset({1, 2}),
         (
             "task_completion.py",
             "_maybe_release_safeguard_gate",
-        ): "post-gate helper for a shared merge path; the integration/promotion guard is enforced by the upstream caller",
+        ): frozenset({1}),
     }
 
     # Inline per-call exemption marker. A merge call is exempt iff this sentinel,
@@ -1362,9 +1370,18 @@ class TestPreMergeDualHeadGuardCoverage:
             )
 
         def _stmt_merge_calls(stmt):
-            for node in ast.walk(stmt):
-                if isinstance(node, ast.Call) and _called_name(node) in merge_names:
-                    yield node
+            calls = [
+                node
+                for node in ast.walk(stmt)
+                if isinstance(node, ast.Call) and _called_name(node) in merge_names
+            ]
+            yield from sorted(
+                calls,
+                key=lambda node: (
+                    getattr(node, "lineno", 0),
+                    getattr(node, "col_offset", 0),
+                ),
+            )
 
         source_lines = source.splitlines()
         marker = TestPreMergeDualHeadGuardCoverage._EXEMPT_MARKER
@@ -1381,7 +1398,19 @@ class TestPreMergeDualHeadGuardCoverage:
             return False
 
         def _flag_merges(stmt, covered: bool, func_name: str) -> None:
+            nonlocal merge_call_index
             for call in _stmt_merge_calls(stmt):
+                merge_call_index += 1
+                if (
+                    os.path.basename(rel),
+                    func_name,
+                ) in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS and (
+                    merge_call_index
+                    in TestPreMergeDualHeadGuardCoverage._NARROWLY_ALLOWED_MERGE_CALLS[
+                        (os.path.basename(rel), func_name)
+                    ]
+                ):
+                    continue
                 # Coarse whole-function exemption (string-keyed) ...
                 if TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
                     (os.path.basename(rel), func_name)
@@ -1531,6 +1560,7 @@ class TestPreMergeDualHeadGuardCoverage:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         for func in funcs:
+            merge_call_index = 0
             _scan_body(func.body, False, set(), func.name)
         return offenders
 
@@ -1573,6 +1603,182 @@ class TestPreMergeDualHeadGuardCoverage:
             "TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES with a documented "
             "reason.\n"
             "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_premerge_helper_whole_function_exemptions_are_not_blanket_trust_zones(
+        self,
+    ):
+        """Regression: the two real merge helpers must not be blanket-exempt.
+
+        The helpers themselves are still covered by the AST scan, so the
+        exemption table should stay empty for them. This catches any future
+        reintroduction of a whole-function trust zone that would bypass the
+        dual-head ratchet.
+        """
+
+        exempt_sites = self._EXEMPT_SITES
+        assert (
+            "ci_completion.py",
+            "_attempt_merge_with_retry_and_escalation",
+        ) not in exempt_sites
+        assert (
+            "task_completion.py",
+            "_maybe_release_safeguard_gate",
+        ) not in exempt_sites
+
+    def test_premerge_helpers_keep_expected_guarded_merge_shapes(self):
+        """The narrow allowances stay narrow by pinning each helper's shape."""
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+
+        with open(os.path.join(app_dir, "ci_completion.py"), encoding="utf-8") as f:
+            ci_source = f.read()
+        with open(os.path.join(app_dir, "task_completion.py"), encoding="utf-8") as f:
+            task_source = f.read()
+
+        ci_tree = ast.parse(ci_source, filename="ci_completion.py")
+        task_tree = ast.parse(task_source, filename="task_completion.py")
+
+        ci_func = next(
+            node
+            for node in ast.walk(ci_tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_attempt_merge_with_retry_and_escalation"
+        )
+        task_func = next(
+            node
+            for node in ast.walk(task_tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_maybe_release_safeguard_gate"
+        )
+
+        def _merge_calls(func):
+            calls = []
+            for node in ast.walk(func):
+                if (
+                    isinstance(node, ast.Call)
+                    and _ast_called_name(node) == "merge_pull_request"
+                ):
+                    calls.append(node)
+            return sorted(calls, key=lambda node: (node.lineno, node.col_offset))
+
+        def _guard_assignments(func):
+            assigns = []
+            for node in ast.walk(func):
+                if not isinstance(node, ast.stmt):
+                    continue
+                verdict_vars = _ast_assign_targets_for_predicated_call(
+                    node,
+                    call_predicate=lambda call: _ast_called_name(call)
+                    == "enforce_premerge_migration_guard",
+                )
+                if verdict_vars:
+                    assigns.append((node, verdict_vars))
+            return sorted(
+                assigns,
+                key=lambda item: (
+                    getattr(item[0], "lineno", 0),
+                    getattr(item[0], "col_offset", 0),
+                ),
+            )
+
+        def _assigned_names(stmt):
+            if isinstance(stmt, ast.Assign):
+                targets = stmt.targets
+            elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+                targets = [stmt.target]
+            else:
+                return set()
+
+            names = set()
+            for target in targets:
+                for node in ast.walk(target):
+                    if isinstance(node, ast.Name):
+                        names.add(node.id)
+            return names
+
+        def _name_assignments_after(func, name, lineno):
+            offenders = []
+            for node in ast.walk(func):
+                if not isinstance(node, ast.stmt):
+                    continue
+                if getattr(node, "lineno", 0) <= lineno:
+                    continue
+                if name in _assigned_names(node):
+                    offenders.append(node)
+            return sorted(
+                offenders,
+                key=lambda node: (
+                    getattr(node, "lineno", 0),
+                    getattr(node, "col_offset", 0),
+                ),
+            )
+
+        ci_calls = _merge_calls(ci_func)
+        task_calls = _merge_calls(task_func)
+
+        assert len(ci_calls) == 2
+        ci_guard_assignments = _guard_assignments(ci_func)
+        assert len(ci_guard_assignments) == 1
+        ci_guard_stmt, ci_verdict_vars = ci_guard_assignments[0]
+        assert ci_verdict_vars == {"_ok_to_merge", "_hold_reason"}
+        ci_fail_closed = next(
+            stmt
+            for stmt in ast.walk(ci_func)
+            if isinstance(stmt, ast.If)
+            and _ast_branch_implies_verdict(
+                stmt.test,
+                branch_truth=True,
+                desired_truth=False,
+                atom_predicate=lambda node: (
+                    isinstance(node, ast.Name) and node.id == "_ok_to_merge"
+                ),
+            )
+        )
+        assert _ast_branch_early_exits(ci_fail_closed.body)
+        assert min(call.lineno for call in ci_calls) > getattr(
+            ci_fail_closed, "end_lineno", ci_fail_closed.lineno
+        )
+        assert not _name_assignments_after(
+            ci_func,
+            "_ok_to_merge",
+            getattr(ci_guard_stmt, "lineno", 0),
+        )
+
+        assert len(task_calls) == 1
+        task_guard_assignments = _guard_assignments(task_func)
+        assert len(task_guard_assignments) == 1
+        task_guard_stmt, task_verdict_vars = task_guard_assignments[0]
+        assert task_verdict_vars == {"_sg_ok", "_sg_reason"}
+        task_guard_gate = next(
+            stmt
+            for stmt in ast.walk(task_func)
+            if isinstance(stmt, ast.If)
+            and _ast_branch_implies_verdict(
+                stmt.test,
+                branch_truth=True,
+                desired_truth=False,
+                atom_predicate=lambda node: (
+                    isinstance(node, ast.Name) and node.id == "_sg_ok"
+                ),
+            )
+        )
+        guarded_else_calls = sorted(
+            [
+                node
+                for node in ast.walk(ast.Module(body=task_guard_gate.orelse, type_ignores=[]))
+                if isinstance(node, ast.Call)
+                and _ast_called_name(node) == "merge_pull_request"
+            ],
+            key=lambda node: (node.lineno, node.col_offset),
+        )
+        assert [call.lineno for call in guarded_else_calls] == [
+            call.lineno for call in task_calls
+        ]
+        assert not _name_assignments_after(
+            task_func,
+            "_sg_ok",
+            getattr(task_guard_stmt, "lineno", 0),
         )
 
     def test_branch_local_guard_scan_catches_sibling_unguarded_branch(self):
