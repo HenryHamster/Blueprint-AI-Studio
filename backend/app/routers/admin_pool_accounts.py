@@ -11,14 +11,14 @@ import uuid
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import cast, or_
+from sqlalchemy import cast, func, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.auth import get_current_user
-from app.database import get_session
+from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
 from app.models import (
     Alert,
@@ -285,22 +285,33 @@ async def _compute_account_health_summary(
     account_ids = {s["id"] for s in summaries}
     failure_counts: dict[str, dict[str, int]] = {}
     if account_ids:
-        # Phase B4 (M-P5/H-P3): GIN-friendly containment on context. The
-        # previous .as_string().in_(...) text-cast bypassed ix_task_context_gin,
-        # forcing a sequential scan. Switching to ``context @> {...}`` lets
-        # Postgres use the GIN index for each per-account predicate.
+        dialect_name = resolve_dialect_name(session)
         # Phase B4 (H-P3): drop status_log/payloads/plan_output JSONB. The
         # downstream consumer reads context, account_id, latest_status_message
         # via classify_failure(); payloads/status_log are not consumed.
         _account_id_list = list(account_ids)
-        _llm_predicates = [
-            Task.context.op("@>")(cast({"llm_account_id": aid}, JSONB))
-            for aid in _account_id_list
-        ]
-        _mp_predicates = [
-            Task.context.op("@>")(cast({"max_plan_account_id": aid}, JSONB))
-            for aid in _account_id_list
-        ]
+        if dialect_name == "sqlite":
+            _llm_predicates = [
+                func.json_extract(Task.context, "$.llm_account_id").in_(
+                    _account_id_list
+                )
+            ]
+            _mp_predicates = [
+                func.json_extract(Task.context, "$.max_plan_account_id").in_(
+                    _account_id_list
+                )
+            ]
+        else:
+            # Postgres keeps the GIN-friendly containment operator so
+            # ``ix_task_context_gin`` can satisfy the context-match predicates.
+            _llm_predicates = [
+                Task.context.op("@>")(cast({"llm_account_id": aid}, JSONB))
+                for aid in _account_id_list
+            ]
+            _mp_predicates = [
+                Task.context.op("@>")(cast({"max_plan_account_id": aid}, JSONB))
+                for aid in _account_id_list
+            ]
         failed_tasks = (
             (
                 await session.execute(

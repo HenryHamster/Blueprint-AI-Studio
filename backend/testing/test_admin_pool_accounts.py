@@ -382,6 +382,52 @@ async def test_account_health_summary_failure_class_window_filter(
     assert reloaded.account_id == acct_id
 
 
+async def test_account_health_summary_matches_context_account_ids(
+    client, db_session, inject_pool
+):
+    """Context-only account matches are counted via the SQLite-safe predicate path."""
+    acct_id = str(uuid.uuid4())
+    acct = {
+        "id": acct_id,
+        "name": "Context Match",
+        "provider": "anthropic",
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-test",
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    inject_pool("test-user-123", [acct])
+
+    project = Project(name="context-match", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    tasks = [
+        Task(
+            project_id=project.id,
+            status=TaskStatus.FAILED,
+            latest_status_message="tests failed: assertion error",
+            context={"llm_account_id": acct_id},
+            updated_at=datetime.utcnow() - timedelta(hours=1),
+        ),
+        Task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            latest_status_message="tests failed: assertion error",
+            context={"max_plan_account_id": acct_id},
+            updated_at=datetime.utcnow() - timedelta(hours=2),
+        ),
+    ]
+    db_session.add_all(tasks)
+    await db_session.commit()
+
+    res = await client.get("/api/admin/max-plan-accounts/health")
+    assert res.status_code == 200, res.text
+    a = res.json()["accounts"][0]
+    assert a["failure_class_counts"]["CODE_ERROR"] == 2
+    assert sum(a["failure_class_counts"].values()) == 2
+
+
 async def test_account_health_summary_user_isolation(client, inject_pool):
     """Health endpoint only returns accounts belonging to the authenticated user."""
     acct_other = {

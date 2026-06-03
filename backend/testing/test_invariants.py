@@ -2363,6 +2363,136 @@ class TestNoRawBindDialectIdiom:
         )
 
 
+class TestNoUnguardedPostgresJsonOp:
+    """Guard against PostgreSQL-only JSON *operators* emitted with no dialect branch.
+
+    The sibling ``TestNoRawBindDialectIdiom`` catches code that resolves the
+    dialect the *wrong* way (raw ``.bind.dialect``). It does NOT catch the more
+    dangerous case: code that emits a Postgres-only JSON operator with **no
+    dialect resolution at all**. Such SQL compiles and runs on Postgres — so CI
+    (which runs ``USE_TEST_POSTGRES=true``) stays green — and only blows up on
+    the local SQLite smoke gate (``./check`` / ``--no-postgres``) with
+    ``unrecognized token: "@"``. This is exactly how the account-health query
+    regressed: a perf optimization swapped a SQLite-safe predicate for the JSONB
+    containment operator ``@>`` (``.op("@>")``) with no dialect branch, and
+    nothing static flagged it.
+
+    This invariant flags any module under ``backend/app`` that emits a
+    Postgres-only JSON operator via the raw ``.op(...)`` surface — the JSONB
+    containment operator ``@>`` and the key-existence operator family
+    ``?`` / ``?|`` / ``?&`` — unless the module also routes dialect resolution
+    through ``app.database.resolve_dialect_name``. A module that branches on the
+    resolved dialect is presumed to guard the Postgres-only path behind it; if a
+    genuine exception is ever needed, add the file to ``allow_list`` (the same
+    escape hatch the ``.bind.dialect`` invariants use for ``database.py``).
+
+    Known scope gap (intentional, documented as latent-risk follow-up): this
+    only scans the raw ``.op(...)`` operator surface. The ``.has_key()`` *method*
+    form (a Postgres-only key-existence check) has pre-existing **unguarded**
+    sites in backend/app (digest_remediation, rollup_management,
+    autonomous_research, residual_case_endpoints) that are out of scope to fix
+    here; including ``.has_key()`` would red-fail CI on those. Closing the
+    ``.has_key()`` gap is a separate follow-up.
+    """
+
+    # The canonical resolver. A module that calls it is presumed to branch on
+    # the resolved dialect and guard its Postgres-only path.
+    _GUARD_TOKEN = "resolve_dialect_name"
+
+    # Raw Postgres-only JSON operators expressed via the SQLAlchemy ``.op(...)``
+    # surface: the JSONB containment operator ``@>`` and the key-existence
+    # operator family ``?`` / ``?|`` / ``?&``.
+    _PG_JSON_OP_RE = re.compile(r"""\.op\(\s*['"](?:@>|\?\|?|\?&)['"]\s*\)""")
+
+    @classmethod
+    def _scan_module_text(cls, text: str) -> list[int]:
+        """Return the 1-based line numbers that emit a raw Postgres-only JSON
+        operator, skipping comment / ``# noqa`` lines (mirrors the sibling
+        scanners). Returns an empty list when the module is guarded — i.e. it
+        also contains ``resolve_dialect_name``."""
+        if cls._GUARD_TOKEN in text:
+            return []
+        hits: list[int] = []
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("#") or "# noqa" in line:
+                continue
+            if cls._PG_JSON_OP_RE.search(line):
+                hits.append(lineno)
+        return hits
+
+    def test_no_unguarded_pg_json_op_in_app_code(self):
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # database.py *defines* resolve_dialect_name and only documents ``@>`` in
+        # prose (no ``.op("@>")`` call), so it is not matched; no entry required.
+        allow_list: set[str] = set()
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py") or fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    text = f.read()
+                for lineno in self._scan_module_text(text):
+                    rel = os.path.relpath(fpath, app_dir)
+                    line = text.splitlines()[lineno - 1]
+                    offenders.append(f"  {rel}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "Found a Postgres-only JSON operator (`.op('@>')` / `.op('?')` / "
+            "`.op('?|')` / `.op('?&')`) in backend/app/ with no dialect branch.\n"
+            "Such SQL runs on Postgres (CI stays green) but fails on the local "
+            "SQLite smoke gate with `unrecognized token: \"@\"`. Route dialect "
+            "resolution through app.database.resolve_dialect_name(session) and "
+            "branch the Postgres-only path behind it (see account-health fix).\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_scanner_flags_injected_unguarded_op(self):
+        """Self-test: the scanner must DETECT an unguarded `.op('@>')` — guards
+        against a scanner that silently matches nothing (mirrors
+        ``test_branch_local_guard_scan_catches_sibling_unguarded_branch``)."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from sqlalchemy.dialects.postgresql import JSONB
+            from sqlalchemy import cast
+
+            async def failed_tasks(session):
+                stmt = select(Task).where(
+                    Task.context.op("@>")(cast({"failed": True}, JSONB))
+                )
+                return await session.execute(stmt)
+            """
+        )
+        assert self._scan_module_text(source) == [7]
+
+        # The key-existence operator family is detected too.
+        key_exists = 'Task.context.op("?")(literal("k"))\n'
+        assert self._scan_module_text(key_exists) == [1]
+
+    def test_scanner_passes_guarded_op(self):
+        """Self-test: a module that emits `.op('@>')` AND resolves the dialect
+        via resolve_dialect_name is NOT flagged."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from app.database import resolve_dialect_name
+
+            async def failed_tasks(session):
+                if resolve_dialect_name(session) == "postgresql":
+                    pred = Task.context.op("@>")(cast({"failed": True}, JSONB))
+                else:
+                    pred = Task.context["failed"].as_boolean().is_(True)
+                return pred
+            """
+        )
+        assert self._scan_module_text(source) == []
+
+
 # ── Base-branch fallback hardening ─────────────────────────────────────────
 
 
