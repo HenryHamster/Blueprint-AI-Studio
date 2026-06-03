@@ -6938,6 +6938,105 @@ class TestAgentTestRunnerTableParity:
             "in AGENT_TEST_RUNNER_COMMANDS."
         )
 
+    @staticmethod
+    def _find_layout_by_file_path(layouts, predicate):
+        """Return the first layout whose ``files`` contains a path matching the
+        predicate, or ``None``. Read-only over the shared fixture schema
+        ``{name, files:[{path, content?}], detectable, family}``."""
+        for layout in layouts:
+            for entry in layout.get("files", []):
+                if predicate(entry.get("path", "")):
+                    return layout
+        return None
+
+    def test_composer_scripts_test_signal_pinned_by_name(self):
+        """NAMED DRIFT SIGNAL (composer): a detectable composer.json-with-
+        scripts.test layout (family ``composer``) must exist in the shared
+        fixture AND the table must map ``composer`` → ``composer test``.
+
+        The general family-set parity test stays green if BOTH the composer
+        fixture layout AND the composer table entry are deleted together; this
+        test names the signal so that removing, renaming, or re-committing it out
+        of either the fixture or the table fails by name in plain GitHub CI."""
+        layouts = _load_shared_runner_layouts()
+        layout = self._find_layout_by_file_path(
+            layouts, lambda p: p == "composer.json"
+        )
+        assert layout is not None, (
+            "NAMED SIGNAL LOST: no shared-fixture layout declares a root "
+            "'composer.json' file. The composer no-CI drift signal "
+            "(family 'composer', command 'composer test') must be carried by a "
+            "detectable layout in test_runner_layouts.json. Restore the "
+            "'composer_json_with_scripts_test' layout."
+        )
+        composer_entry = next(
+            entry
+            for entry in layout["files"]
+            if entry.get("path") == "composer.json"
+        )
+        assert '"test"' in composer_entry.get("content", ""), (
+            "NAMED SIGNAL WEAKENED: the composer.json layout "
+            f"'{layout['name']}' no longer declares a scripts.test entry in its "
+            "content. The composer signal requires a real scripts.test so the "
+            "no-CI detector emits 'composer test'."
+        )
+        assert layout["detectable"] is True, (
+            "NAMED SIGNAL DISABLED: the composer.json layout "
+            f"'{layout['name']}' is no longer detectable=true; the composer "
+            "no-CI drift signal would be silently dropped from coverage."
+        )
+        assert layout["family"] == "composer", (
+            "NAMED SIGNAL RENAMED: the composer.json layout "
+            f"'{layout['name']}' now names family '{layout['family']}', not "
+            "'composer'. The composer no-CI drift signal must keep family "
+            "'composer'."
+        )
+        assert AGENT_TEST_RUNNER_COMMANDS.get("composer") == "composer test", (
+            "NAMED SIGNAL LOST: AGENT_TEST_RUNNER_COMMANDS['composer'] is "
+            f"{AGENT_TEST_RUNNER_COMMANDS.get('composer')!r}, not 'composer "
+            "test'. Restore the composer command in "
+            "test_runner_commands.json / AGENT_TEST_RUNNER_COMMANDS."
+        )
+
+    def test_script_test_sh_signal_pinned_by_name(self):
+        """NAMED DRIFT SIGNAL (script): a detectable root ``scripts/test.sh``
+        layout (family ``script``) must exist in the shared fixture AND the
+        table must map ``script`` → ``bash scripts/test.sh``.
+
+        The general family-set parity test stays green if BOTH the script
+        fixture layout AND the script table entry are deleted together; this
+        test names the signal so that removing, renaming, or re-committing it out
+        of either the fixture or the table fails by name in plain GitHub CI."""
+        layouts = _load_shared_runner_layouts()
+        layout = self._find_layout_by_file_path(
+            layouts, lambda p: p == "scripts/test.sh"
+        )
+        assert layout is not None, (
+            "NAMED SIGNAL LOST: no shared-fixture layout declares a root "
+            "'scripts/test.sh' file. The script no-CI drift signal "
+            "(family 'script', command 'bash scripts/test.sh') must be carried "
+            "by a detectable layout in test_runner_layouts.json. Restore the "
+            "'scripts_test_sh_root_convention' layout."
+        )
+        assert layout["detectable"] is True, (
+            "NAMED SIGNAL DISABLED: the scripts/test.sh layout "
+            f"'{layout['name']}' is no longer detectable=true; the script "
+            "no-CI drift signal would be silently dropped from coverage."
+        )
+        assert layout["family"] == "script", (
+            "NAMED SIGNAL RENAMED: the scripts/test.sh layout "
+            f"'{layout['name']}' now names family '{layout['family']}', not "
+            "'script'. The script no-CI drift signal must keep family 'script'."
+        )
+        assert (
+            AGENT_TEST_RUNNER_COMMANDS.get("script") == "bash scripts/test.sh"
+        ), (
+            "NAMED SIGNAL LOST: AGENT_TEST_RUNNER_COMMANDS['script'] is "
+            f"{AGENT_TEST_RUNNER_COMMANDS.get('script')!r}, not 'bash "
+            "scripts/test.sh'. Restore the script command in "
+            "test_runner_commands.json / AGENT_TEST_RUNNER_COMMANDS."
+        )
+
 
 class TestAgentTestRunnerSourceParity:
     """SOURCE-SCAN: when agent/src is mounted, the agent detector's literal
