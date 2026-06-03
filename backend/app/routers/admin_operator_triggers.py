@@ -267,6 +267,34 @@ async def trigger_rollup(
     )
 
     if is_target_intermediate:
+        # Pre-merge Alembic dual-head guard. This operator-triggered autonomous
+        # rollup auto-merge is the same multi-migration vector as the guarded
+        # autonomous path. On a block-or-defer verdict, skip the merge, surface
+        # the reason, and leave the task EVALUATING so a later sweep can retry
+        # (or an operator can reconcile) rather than wedging the branch.
+        from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            gh_token, owner, repo, rollup_pr_number, target_branch
+        )
+        if not _ok_to_merge:
+            task.context = {
+                **ctx,
+                "rollup_pr_number": rollup_pr_number,
+                "rollup_pr_url": rollup_pr_url,
+            }
+            task.latest_status_message = (
+                f"Rollup merge held — Alembic dual-head guard: {_hold_reason}"
+            )[:500]
+            session.add(task)
+            await session.commit()
+            return {
+                "rollup_pr_url": rollup_pr_url,
+                "rollup_pr_number": rollup_pr_number,
+                "target": target_branch,
+                "status": task.status,
+                "merge_blocked_reason": _hold_reason,
+            }
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
             (

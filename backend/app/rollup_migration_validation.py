@@ -114,6 +114,37 @@ async def _validate_rollup_migration_chain(
     return ("ok", None) if reason is None else ("block", reason)
 
 
+async def enforce_premerge_migration_guard(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    target_branch: str | None,
+) -> tuple[bool, str | None]:
+    """Fail-safe pre-merge Alembic dual-head guard for non-autoreconcile paths.
+
+    Wraps :func:`_validate_rollup_migration_chain` and collapses its
+    ``("ok"|"block"|"defer", reason)`` verdict into a single "is it safe to
+    merge?" decision. Both ``block`` (the combined chain is invalid — duplicate
+    revision id / dual head) and ``defer`` (GitHub metadata could not be
+    fetched, so migration safety is unknown) mean DO NOT MERGE and return
+    ``(False, reason)``. Only an ``ok`` verdict returns ``(True, None)``.
+
+    This is the shared enforcement point for the operator-approval and normal
+    task-PR merge paths which — unlike the autonomous rollup path — do not run
+    the mechanical auto-reconcile; for them, holding the merge and surfacing the
+    dual-head reason is the correct conservative behavior. Reuses the same
+    combined-chain validation policy as the rollup guard rather than inventing a
+    second migration-safety rule set.
+    """
+    verdict, reason = await _validate_rollup_migration_chain(
+        gh_token, owner, repo, pr_number, target_branch=target_branch
+    )
+    if verdict == "ok":
+        return (True, None)
+    return (False, reason)
+
+
 async def _plan_rollup_migration_reconciliation(
     gh_token: str,
     owner: str,

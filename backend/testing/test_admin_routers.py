@@ -43,6 +43,27 @@ TEST_USER_ID = "test-user-123"
 TEST_USER_EMAIL = "test@example.com"
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr():
+    """Default the pre-merge Alembic dual-head guard to a no-op for merge tests.
+
+    The operator-approval merge paths (``_handle_rollup_pr_approval``,
+    ``_merge_critical_pr``) and the operator-triggered rollup auto-merge now run
+    ``enforce_premerge_migration_guard`` before merging, which calls
+    ``github.get_pr_files``. Most merge tests only mock ``merge_pull_request``;
+    returning a benign non-migration file list short-circuits the guard to
+    ``ok`` so those merges proceed unchanged. A non-empty list is used so other
+    ``get_pr_files`` consumers (e.g. empty-PR detection) keep their pre-change
+    behavior. Tests exercising the guard itself re-patch ``app.github.get_pr_files``.
+    """
+    with patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "README.md"}],
+    ):
+        yield
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
@@ -7111,6 +7132,83 @@ class TestModifyTaskApplySeam:
         assert "awaiting downstream landing" in (task.latest_status_message or "")
         assert changes["merged_pr"] == 654
 
+    @pytest.mark.asyncio
+    async def test_rollup_pr_approval_refuses_dual_head_migration(
+        self, db_session, mocker
+    ):
+        """Operator-approved rollup with a colliding migration → 409, no merge."""
+        from fastapi import HTTPException
+
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "automain"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Rollup approval dual-head",
+            payloads=[
+                {"type": "research", "prompt": "rollup", "base_branch": "automain"}
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 777},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        # Guard: a touched migration whose revision id collides with the target.
+        mocker.patch(
+            "app.github.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=[
+                {"filename": "backend/alembic/versions/0002_dup.py"}
+            ],
+        )
+        mocker.patch(
+            "app.github.get_pull_request_diff",
+            new_callable=AsyncMock,
+            return_value=(
+                "diff --git a/backend/alembic/versions/0002_dup.py "
+                "b/backend/alembic/versions/0002_dup.py\n"
+                "+++ b/backend/alembic/versions/0002_dup.py\n"
+                '+revision = "0002"\n'
+                '+down_revision = "0001"\n'
+            ),
+        )
+        mocker.patch(
+            "app.github.list_versions_at_ref",
+            new_callable=AsyncMock,
+            return_value=["0001_init.py", "0002_existing.py"],
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+
+        changes: dict = {}
+        with pytest.raises(HTTPException) as exc_info:
+            await _handle_rollup_pr_approval(
+                task, task.context or {}, 777, db_session, changes
+            )
+        assert exc_info.value.status_code == 409
+        assert "0002" in str(exc_info.value.detail)
+        merge_mock.assert_not_called()
+        await db_session.refresh(task)
+        assert task.requires_approval is True
+        assert "merged_pr" not in changes
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_operator_triggers.py — Manual Operator Triggers
@@ -7498,6 +7596,89 @@ class TestTriggerRollup:
         assert result["rollup_pr_number"] == 456
         assert task.status == TaskStatus.COMPLETED
         assert (task.context or {}).get("pr_merged") is None
+
+    @pytest.mark.asyncio
+    async def test_intermediate_rollup_auto_merge_holds_on_dual_head(
+        self, db_session, mocker
+    ):
+        """Operator-triggered intermediate auto-merge holds on a dual-head collision."""
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["research/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup dual-head",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "research/intermediate-1",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/888",
+                "number": 888,
+            },
+        )
+        mocker.patch(
+            "app.github.get_pr_files",
+            new_callable=AsyncMock,
+            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}],
+        )
+        mocker.patch(
+            "app.github.get_pull_request_diff",
+            new_callable=AsyncMock,
+            return_value=(
+                "diff --git a/backend/alembic/versions/0002_dup.py "
+                "b/backend/alembic/versions/0002_dup.py\n"
+                "+++ b/backend/alembic/versions/0002_dup.py\n"
+                '+revision = "0002"\n'
+                '+down_revision = "0001"\n'
+            ),
+        )
+        mocker.patch(
+            "app.github.list_versions_at_ref",
+            new_callable=AsyncMock,
+            return_value=["0001_init.py", "0002_existing.py"],
+        )
+        merge_mock = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        merge_mock.assert_not_called()
+        assert result["rollup_pr_number"] == 888
+        assert result.get("merge_blocked_reason")
+        assert task.status == TaskStatus.EVALUATING
+        assert "dual-head" in (task.latest_status_message or "").lower()
 
 
 class TestGetProjectFindings:

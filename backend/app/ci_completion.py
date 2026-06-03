@@ -173,6 +173,32 @@ async def _attempt_merge_with_retry_and_escalation(
         or get_project_integration_branch(_merge_project)
     )
 
+    # Pre-merge Alembic dual-head guard (parity with the autonomous rollup and
+    # hotfix back-merge paths). Two task PRs can each independently add 'the
+    # next' migration with the same revision id; each passes its own isolated
+    # CI and then lands a duplicate revision / dual head when the second one
+    # merges against the advanced integration branch. Validate the combined
+    # chain against ``ci_base`` BEFORE merging; on a block-or-defer verdict hold
+    # the merge (leave the task EVALUATING, caller commits) and return False —
+    # mirroring the requires_approval early-return above. This runs after that
+    # approval gate so gate-block behavior is unchanged.
+    if ci_pr_number:
+        from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            gh_token, owner, repo, ci_pr_number, ci_base
+        )
+        if not _ok_to_merge:
+            logger.warning(
+                f"[CI] Merge held for PR #{ci_pr_number} — Alembic combined-chain "
+                f"guard: {_hold_reason}"
+            )
+            task.latest_status_message = (
+                f"Merge held — Alembic dual-head guard: {_hold_reason}"
+            )[:500]
+            session.add(task)
+            return False
+
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
     # rollup_management.py: the in-memory ``task`` is stale after release;

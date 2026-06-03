@@ -426,6 +426,32 @@ async def _handle_rollup_pr_approval(
         from app.github import merge_pull_request, create_pr_comment
 
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+
+        # Pre-merge Alembic dual-head guard. The operator-approved rollup PR
+        # combines several child PRs and is exactly the multi-migration vector
+        # this guard was built for; the autonomous rollup path guards this, the
+        # human-approval path must too. On a block-or-defer verdict, refuse the
+        # merge with a 409 (mirroring the branch-safety refusal) rather than
+        # silently wedging the integration branch.
+        from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            gh_token, owner, repo, rollup_pr_number, base_branch
+        )
+        if not _ok_to_merge:
+            detail = (
+                f"Approved rollup merge refused: Alembic combined-chain guard "
+                f"blocked PR #{rollup_pr_number} — {_hold_reason}"
+            )
+            await _block_admin_merge_for_branch_safety(
+                task,
+                _project,
+                session,
+                detail,
+                issue_code="admin_rollup_alembic_dual_head",
+            )
+            raise HTTPException(status_code=409, detail=detail)
+
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
             _project = await session.get(Project, task.project_id)
@@ -500,6 +526,10 @@ async def _handle_rollup_pr_approval(
             logger.error(
                 f"[ADMIN] Approved rollup merge of PR #{rollup_pr_number} failed: {merge_result.get('message')}"
             )
+    except HTTPException:
+        # Branch-safety / dual-head refusals must surface as a conflict to the
+        # operator, not be swallowed into a "merge failed" status message.
+        raise
     except Exception as e:
         changes["merge_error"] = str(e)[:200]
         task.latest_status_message = f"Approved but rollup merge failed: {str(e)[:200]}"
@@ -681,12 +711,36 @@ async def _merge_critical_pr(
         from app.github import merge_pull_request, create_pr_comment, delete_branch
 
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+        _project = await session.get(Project, task.project_id)
+        base_branch = (task.first_payload).get(
+            "base_branch"
+        ) or get_project_integration_branch(_project)
+
+        # Pre-merge Alembic dual-head guard. A critical-file PR landing on the
+        # integration branch is the same dual-head vector as a normal task PR;
+        # validate the combined chain before merging and refuse with a 409 on a
+        # block-or-defer verdict rather than wedging the branch.
+        from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            gh_token, owner, repo, pr_number, base_branch
+        )
+        if not _ok_to_merge:
+            detail = (
+                f"Approved merge refused: Alembic combined-chain guard blocked "
+                f"PR #{pr_number} — {_hold_reason}"
+            )
+            await _block_admin_merge_for_branch_safety(
+                task,
+                _project,
+                session,
+                detail,
+                issue_code="admin_critical_alembic_dual_head",
+            )
+            raise HTTPException(status_code=409, detail=detail)
+
         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
         if merge_result.get("merged"):
-            _project = await session.get(Project, task.project_id)
-            base_branch = (task.first_payload).get(
-                "base_branch"
-            ) or get_project_integration_branch(_project)
             record_pr_merged = await merged_pr_counts_as_integration_landing(
                 task,
                 _project,
@@ -727,6 +781,10 @@ async def _merge_critical_pr(
             logger.error(
                 f"[ADMIN] Approved merge of PR #{pr_number} failed: {merge_result.get('message')}"
             )
+    except HTTPException:
+        # Branch-safety / dual-head refusals must surface as a conflict to the
+        # operator, not be swallowed into a "merge failed" status message.
+        raise
     except Exception as e:
         changes["merge_error"] = str(e)[:200]
         task.latest_status_message = f"Approved but merge failed: {str(e)[:200]}"

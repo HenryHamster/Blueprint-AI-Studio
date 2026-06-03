@@ -1275,6 +1275,11 @@ async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    # The pre-merge Alembic dual-head guard lists the PR's files; this rollup
+    # touches no migrations, so an empty list yields an "ok" verdict and the
+    # merge proceeds. Without the mock the guard's GitHub call 401s and the
+    # fail-safe "defer" verdict would wrongly refuse this merge.
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
@@ -1321,6 +1326,9 @@ async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    # See sibling test: empty PR-file list → "ok" Alembic guard verdict so the
+    # hotfix merge proceeds instead of hitting the fail-safe "defer" refusal.
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     mocker.patch(
         "app.admin_task_mutations._maybe_spawn_rollup_smoketest", new_callable=AsyncMock
     )

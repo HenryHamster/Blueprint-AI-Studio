@@ -34,6 +34,19 @@ from app.models import Project, Task, TaskStatus
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the pre-merge Alembic dual-head guard to a no-op.
+
+    ``_attempt_merge_with_retry_and_escalation`` runs
+    ``enforce_premerge_migration_guard`` (which calls ``github.get_pr_files``)
+    AFTER the requires_approval gate. These gate tests only mock
+    ``merge_pull_request``; returning an empty file list short-circuits the
+    guard to ``ok`` so the gate behavior under test is what is exercised.
+    """
+    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
 @pytest.fixture
 def _gates_off():
     """Set require_approval_gates=False for the test, restore after."""

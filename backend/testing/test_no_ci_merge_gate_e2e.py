@@ -58,6 +58,21 @@ BRANCH = "feat/no-ci-gate"
 BASE = "main"
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the pre-merge Alembic dual-head guard to a no-op for merge tests.
+
+    ``handle_ci_completion``'s merge primitive now runs
+    ``enforce_premerge_migration_guard`` (which calls ``github.get_pr_files``)
+    before merging. These gate tests do not mock that call; returning an empty
+    (no-migration) file list short-circuits the guard to ``ok`` so the no-CI
+    gate behavior under test is what is exercised.
+    """
+    from unittest.mock import AsyncMock
+
+    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

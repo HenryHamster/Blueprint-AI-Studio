@@ -475,6 +475,66 @@ async def test_guard_with_target_branch_list_error_defers():
     assert "network error" in reason
 
 
+# ── enforce_premerge_migration_guard (block-OR-defer => do-not-merge) ───────
+
+
+async def test_enforce_guard_clean_chain_allows_merge():
+    """An ``ok`` verdict returns (True, None) — safe to merge."""
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0137_new.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+        patch(
+            "app.github.list_versions_at_ref",
+            return_value=["0135_one.py", "0136_prev.py"],
+        ),
+    ):
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain"
+        )
+    assert ok is True and reason is None
+
+
+async def test_enforce_guard_dual_head_holds_merge():
+    """A ``block`` verdict returns (False, reason) — do not merge."""
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0137_new.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+        patch(
+            "app.github.list_versions_at_ref",
+            return_value=["0136_prev.py", "0137_existing.py"],
+        ),
+    ):
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain"
+        )
+    assert ok is False
+    assert reason and "0137" in reason
+
+
+async def test_enforce_guard_fetch_failure_holds_merge():
+    """A ``defer`` verdict (fetch failure) returns (False, reason) — fail-safe hold."""
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    with patch("app.github.get_pr_files", side_effect=RuntimeError("github down")):
+        ok, reason = await enforce_premerge_migration_guard(
+            "t", "o", "r", 1, "automain"
+        )
+    assert ok is False
+    assert reason and "github down" in reason
+
+
 # ── plan_migration_reconciliation (pure renumber planner) ───────────────────
 
 

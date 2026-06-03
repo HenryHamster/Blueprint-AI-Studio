@@ -78,7 +78,6 @@ from app.models import (
 )
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.rollup_migration_validation import (
-    _plan_backmerge_migration_reconciliation,
     _validate_rollup_migration_chain,
 )
 from app.shared_state import runtime_config as _runtime_config
@@ -343,50 +342,42 @@ async def open_backmerge_pr(
         )
         return {"status": "deferred", "error": "alembic_unverified", "pr_url": pr_url}
     if alembic_status == "block":
-        # Before the operator-alert / agent-resolver fallback, try a bounded
-        # automatic reconciliation of a PURE mechanical dual head: a single
-        # integration-branch migration whose revision id collides with the
-        # immutable promotion-target hotfix migration, which simply needs a new
-        # revision number + a rechain onto the unified head. Anything ambiguous
-        # (multi-collision, non-linear tail, parse failure, missing literal, push
-        # error) reconciles to nothing and falls through unchanged. On a pushed
-        # rewrite we fall through to the merge step (step 4) WITHOUT re-running
-        # the forward-direction guard, which would false-flag the (now correct)
-        # reconciled back-merge as a stale anchor.
-        reconciled = await _attempt_backmerge_alembic_autoreconcile(
+        # A dual-head collision is NEVER reconciled inline by pushing to the
+        # live integration branch: the renumbered integration migration chains
+        # onto the promotion-target hotfix revision, which is NOT on the
+        # integration branch until the merge lands. Pushing the rewrite to the
+        # live target before the merge would leave automain with a dangling
+        # migration / second Alembic head (wedging `alembic upgrade head` for
+        # every concurrent task) for as long as the merge is held off by branch
+        # protection, a CI gate, or an unrelated conflict — and the next
+        # periodic cycle would misread that transient state as a fresh dual
+        # head. Instead ALWAYS route to the guided resolver: it does the
+        # renumber + `git merge origin/main` on a fresh branch off automain and
+        # lands the combined fix atomically through the normal PR gate, after
+        # which automain is clean and this back-merge PR is an empty diff.
+        # `_handle_migration_block` dedups against an already-open resolver
+        # (via `_resolution_task_already_open`), so a periodic re-entry spawns
+        # no duplicate task and raises no new alert.
+        logger.warning(
+            "[BACKMERGE] back-merge PR #%s for project %s would create an "
+            "invalid Alembic chain (%s) — blocking the merge and spawning a "
+            "resolver",
+            pr_number,
+            project_id,
+            alembic_reason,
+        )
+        await _handle_migration_block(
             session,
             project_id,
-            token,
-            owner,
-            repo,
             pr_number,
-            integration_branch,
-            promotion_target,
+            pr_url,
+            hotfix_task_id_str,
+            trigger_desc,
+            reason=str(alembic_reason),
             project=project,
+            periodic=periodic,
         )
-        if not reconciled:
-            logger.warning(
-                "[BACKMERGE] back-merge PR #%s for project %s would create an "
-                "invalid Alembic chain (%s) — blocking the merge and spawning a "
-                "resolver",
-                pr_number,
-                project_id,
-                alembic_reason,
-            )
-            await _handle_migration_block(
-                session,
-                project_id,
-                pr_number,
-                pr_url,
-                hotfix_task_id_str,
-                trigger_desc,
-                reason=str(alembic_reason),
-                project=project,
-                periodic=periodic,
-            )
-            return {"status": "migration_conflict", "pr_url": pr_url}
-        # Reconciled: the renumbered integration chain now combines with the
-        # back-merge to a single head. Fall through to the merge step below.
+        return {"status": "migration_conflict", "pr_url": pr_url}
 
     # 4. Merge the PR — merge_method="merge" preserves the main commit history.
     #    merge_pull_request does NOT raise on 405/409; it returns merged=False.
@@ -1128,125 +1119,6 @@ async def _spawn_ci_fix_task(
         checks_str,
     )
     return task
-
-
-async def _attempt_backmerge_alembic_autoreconcile(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    integration_branch: str,
-    promotion_target: str,
-    project: Project | None = None,
-) -> bool:
-    """Try to auto-renumber the integration-side migration of a dual-head back-merge.
-
-    The back-merge mirror of ``rollup_management._attempt_alembic_autoreconcile``.
-    When the combined-chain guard blocked the back-merge solely on a single
-    integration-branch migration colliding with the immutable promotion-target
-    hotfix migration, deterministically renumber + rechain the integration-side
-    migration (the promotion-target migration is already applied in production and
-    must never move) and push the rewrite to *integration_branch* in one commit.
-
-    Returns ``True`` when a reconciliation commit was pushed — the caller then
-    falls through to the merge step, since the renumbered integration chain now
-    combines with the back-merge to a single head. Returns ``False`` — pushing
-    NOTHING — for every non-mechanical case (planner returns ``None``), a missing
-    ``EXPECTED_SCHEMA_REVISION`` literal, or any fetch/push error, so the caller
-    falls through unchanged to the guided dual-head resolver. Conservative and
-    fail-safe: only the unambiguous single-collision case is auto-remediated.
-    """
-    from app.migration_chain import rewrite_expected_schema_revision
-
-    try:
-        plan = await _plan_backmerge_migration_reconciliation(
-            token, owner, repo, pr_number, integration_branch, promotion_target
-        )
-    except Exception as exc:  # noqa: BLE001 — fail-safe: fall back to the resolver
-        logger.warning(
-            "[BACKMERGE] PR #%s alembic auto-reconcile planning failed "
-            "(%s); falling back to the dual-head resolver",
-            pr_number,
-            exc,
-        )
-        return False
-    if not plan:
-        return False
-
-    # The renumbered integration migration becomes the new head once the
-    # back-merge lands, so EXPECTED_SCHEMA_REVISION must bump to match. Read
-    # main.py at the integration tip and rewrite the literal; if it is absent we
-    # must not guess — fall back to the resolver.
-    try:
-        main_text = await github.get_file_text_at_ref(
-            "backend/app/main.py",
-            token=token,
-            owner=owner,
-            repo=repo,
-            ref=integration_branch,
-            project_id=str(project_id),
-        )
-    except Exception as exc:  # noqa: BLE001 — fail-safe
-        logger.warning(
-            "[BACKMERGE] PR #%s alembic auto-reconcile could not fetch main.py "
-            "(%s); falling back to the dual-head resolver",
-            pr_number,
-            exc,
-        )
-        return False
-    if not main_text:
-        return False
-    new_main_text, replaced = rewrite_expected_schema_revision(
-        main_text, plan["expected_schema_revision"]
-    )
-    if replaced == 0:
-        logger.warning(
-            "[BACKMERGE] PR #%s alembic auto-reconcile: no EXPECTED_SCHEMA_REVISION "
-            "literal in main.py; falling back to the dual-head resolver",
-            pr_number,
-        )
-        return False
-
-    # Commit to the INTEGRATION branch (the base / automain), NEVER the PR head:
-    # the promotion-target migration is immutable, so only the integration-side
-    # migration + main.py move.
-    upserts = {**plan["upserts"], "backend/app/main.py": new_main_text}
-    try:
-        await github.commit_file_changes(
-            token,
-            owner,
-            repo,
-            integration_branch,
-            upserts=upserts,
-            deletes=plan["deletes"],
-            message=(
-                f"fix(alembic): auto-renumber back-merge integration migration "
-                f"{plan['old_revision']}->{plan['new_revision']} and rechain onto "
-                f"{plan['new_down_revision']}"
-            ),
-            project_id=str(project_id),
-        )
-    except Exception as exc:  # noqa: BLE001 — push failed: fall back to the resolver
-        logger.warning(
-            "[BACKMERGE] PR #%s alembic auto-reconcile push failed (%s); "
-            "falling back to the dual-head resolver",
-            pr_number,
-            exc,
-        )
-        return False
-
-    logger.info(
-        "[BACKMERGE] PR #%s alembic dual head auto-reconciled: renumbered "
-        "integration migration %s->%s on %s, bumped EXPECTED_SCHEMA_REVISION; "
-        "re-attempting the merge",
-        pr_number,
-        plan["old_revision"],
-        plan["new_revision"],
-        integration_branch,
-    )
-    return True
 
 
 async def _handle_migration_block(

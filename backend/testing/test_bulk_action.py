@@ -32,6 +32,19 @@ from app.models import (
 TEST_USER_ID = "test-user-123"
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the pre-merge Alembic dual-head guard to a no-op for merge tests.
+
+    The bulk-approve rollup/critical merge paths now run
+    ``enforce_premerge_migration_guard`` (which calls ``github.get_pr_files``)
+    before merging. These tests only mock ``merge_pull_request``; returning an
+    empty (no-migration) file list short-circuits the guard to ``ok`` so the
+    merges under test proceed unchanged.
+    """
+    mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
 async def _make_project_with_member(db_session, owner_id=TEST_USER_ID):
     """Helper: create a project with the test user as owner."""
     project = Project(
