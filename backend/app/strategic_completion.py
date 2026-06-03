@@ -2271,6 +2271,11 @@ async def _handle_strategic_completion(
             # the 3-way operator-wins merge, mirroring the vision baseline
             # resolution above. Degrade to None (blank-preservation only) when
             # no cycle/baseline is resolvable (legacy task).
+            # Prefer the agent's own prior same-cycle proposal as the merge
+            # ancestor (mirrors the live set_problem_model op) so a second write
+            # is not misread as an operator edit; fall back to the cycle-start
+            # snapshot on the first/only write. Degrade to None (blank-
+            # preservation only) when no cycle/baseline is resolvable.
             pm_baseline: dict | None = None
             pm_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
                 "strategic_cycle_id"
@@ -2278,9 +2283,13 @@ async def _handle_strategic_completion(
             if pm_cycle_id:
                 pm_cycle_row = await strategic_cycle.get(session, pm_cycle_id)
                 if pm_cycle_row is not None:
-                    snap = strategic_cycle.baseline_problem_model(pm_cycle_row)
-                    if snap:
-                        pm_baseline = snap
+                    prior = strategic_cycle.agent_problem_model_proposal(pm_cycle_row)
+                    if prior is not None:
+                        pm_baseline = prior
+                    else:
+                        snap = strategic_cycle.baseline_problem_model(pm_cycle_row)
+                        if snap:
+                            pm_baseline = snap
 
             try:
                 new_pm_raw, pm_diff = apply_agent_update(

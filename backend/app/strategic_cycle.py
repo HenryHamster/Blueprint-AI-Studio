@@ -400,6 +400,42 @@ def baseline_problem_model(cycle: StrategicCycle) -> dict[str, Any]:
     return dict(snap) if isinstance(snap, dict) else {}
 
 
+AGENT_PM_PROPOSAL_KEY = "agent_problem_model_proposal"
+"""cycle_metadata key holding the agent's last proposed operator-owned subset
+(intent.purpose / context / constraints) for the in-flight cycle. Set after each
+successful ``set_problem_model`` write; absent until the first write. Skipped by
+:func:`_to_legacy_dict` so it never leaks into agent cycle-history context."""
+
+
+def agent_problem_model_proposal(cycle: StrategicCycle) -> dict[str, Any] | None:
+    """Read the agent's last proposed operator-owned subset for this cycle.
+
+    Returns ``None`` when the agent has not yet written problem_model this cycle
+    (first/only write) so callers fall back to the cycle-start
+    :func:`baseline_problem_model` snapshot. On a *second* same-cycle write this
+    is preferred as the merge ancestor so the agent's own prior write is not
+    misread as a mid-cycle operator edit (a genuine operator edit still moves
+    ``current`` away from this proposal and wins). See
+    :func:`set_agent_problem_model_proposal`."""
+    meta = cycle.cycle_metadata or {}
+    snap = meta.get(AGENT_PM_PROPOSAL_KEY)
+    return dict(snap) if isinstance(snap, dict) else None
+
+
+def set_agent_problem_model_proposal(
+    cycle: StrategicCycle, subset: Mapping[str, Any]
+) -> None:
+    """Store the agent's pre-merge operator-owned subset for this cycle.
+
+    ``subset`` is the shape produced by ``problem_model.operator_owned_subset``
+    (intent.purpose / context / constraints). Flags ``cycle_metadata`` modified;
+    the caller is responsible for ``session.add(cycle)`` / commit."""
+    new_meta = dict(cycle.cycle_metadata or {})
+    new_meta[AGENT_PM_PROPOSAL_KEY] = dict(subset)
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
+
+
 def baseline_running_update(cycle: StrategicCycle) -> str | None:
     """Read the snapshot of ``running_update`` taken at cycle start.
 
@@ -485,6 +521,7 @@ def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
             "baseline_vision",
             "baseline_problem_model",
             "baseline_running_update",
+            AGENT_PM_PROPOSAL_KEY,
         ):
             continue
         out[k] = v

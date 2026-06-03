@@ -154,6 +154,47 @@ def test_to_legacy_dict_omits_baseline_problem_model():
 
 
 @pytest.mark.asyncio
+async def test_agent_problem_model_proposal_roundtrip(db_session):
+    """The agent's per-cycle pre-merge proposal stores and reads back; absent
+    until the first write (so callers fall back to the cycle-start snapshot)."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    # No write yet → None (callers fall back to baseline_problem_model snapshot).
+    assert strategic_cycle.agent_problem_model_proposal(fetched) is None
+
+    subset = {
+        "intent": {"purpose": "P"},
+        "context": {"project_type": "startup"},
+        "constraints": ["c1"],
+    }
+    strategic_cycle.set_agent_problem_model_proposal(fetched, subset)
+    db_session.add(fetched)
+    await db_session.commit()
+    refetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.agent_problem_model_proposal(refetched) == subset
+
+
+def test_to_legacy_dict_omits_agent_problem_model_proposal():
+    """The per-cycle agent proposal must never leak into the agent-facing
+    cycle-history shape, exactly as the baseline snapshots are hidden."""
+    cycle = StrategicCycle(
+        id="sc-test-prop",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={
+            strategic_cycle.AGENT_PM_PROPOSAL_KEY: {"intent": {"purpose": "secret"}},
+            "memos_cited": 1,
+        },
+    )
+    out = strategic_cycle._to_legacy_dict(cycle)
+    assert strategic_cycle.AGENT_PM_PROPOSAL_KEY not in out
+    assert out["memos_cited"] == 1
+
+
+@pytest.mark.asyncio
 async def test_advance_running_update_baseline_updates_snapshot(db_session):
     """After an agent write the baseline advances to the persisted document so
     a subsequent same-cycle write reconciles against it, not the cycle-start

@@ -674,6 +674,34 @@ def _preserve_operator_intent(current: ProblemModel, proposed: ProblemModel) -> 
         proposed.constraints = list(current.constraints)
 
 
+def operator_owned_subset(raw: dict | None) -> dict[str, Any]:
+    """Extract the operator-owned subset (:data:`USER_EDITABLE_FIELDS`) from a
+    raw problem-model dict as a merge *ancestor*.
+
+    Returns ``{"intent": {"purpose": ...}, "context": {...}, "constraints": [...]}``
+    — the only three fields :func:`_merge_operator_owned_fields` reads off its
+    ``baseline`` argument. Tolerates extra/agent-owned keys (e.g. a ``_deletions``
+    directive or the full agent collections) so it can be handed the agent's raw
+    *pre-merge* proposal, and round-trips through :func:`parse_problem_model`.
+
+    Used by the ``set_problem_model`` write paths to remember the agent's own
+    last proposed operator-owned values per cycle, so a *second* same-cycle agent
+    write reconciles against the agent's prior proposal — not the cycle-start
+    snapshot — and is no longer misread as a mid-cycle operator edit. A genuine
+    operator edit (which moves ``current`` away from the agent's stored proposal)
+    still wins, because the merge keys on ``current != baseline``.
+    """
+    raw = raw or {}
+    intent = raw.get("intent") if isinstance(raw.get("intent"), dict) else {}
+    context = raw.get("context") if isinstance(raw.get("context"), dict) else {}
+    constraints = raw.get("constraints")
+    return {
+        "intent": {"purpose": str((intent or {}).get("purpose") or "")},
+        "context": dict(context or {}),
+        "constraints": list(constraints) if isinstance(constraints, list) else [],
+    }
+
+
 def _merge_operator_owned_fields(
     baseline: ProblemModel,
     current: ProblemModel,

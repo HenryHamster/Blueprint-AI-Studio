@@ -1079,6 +1079,132 @@ def test_apply_agent_update_ledger_carried_forward_and_capped():
 
 
 # ---------------------------------------------------------------------------
+# Second same-cycle agent write — ancestor is the agent's own prior proposal
+# (the bug this PR fixes: the callers now pass the agent's last proposal, not
+# the cycle-start snapshot, as baseline on writes after the first).
+# ---------------------------------------------------------------------------
+
+
+def test_operator_owned_subset_extracts_only_editable_fields():
+    """operator_owned_subset pulls intent.purpose / context / constraints and
+    tolerates extra agent-owned keys (so it accepts a raw pre-merge proposal)."""
+    from app.problem_model import operator_owned_subset
+
+    subset = operator_owned_subset(
+        {
+            "intent": {"purpose": "P", "current_focus": "ignored"},
+            "context": {"project_type": "startup"},
+            "constraints": ["c1"],
+            "gaps": [{"id": "g", "name": "n", "status": "active"}],
+            "_deletions": {"gaps": ["g"]},
+        }
+    )
+    assert subset == {
+        "intent": {"purpose": "P"},
+        "context": {"project_type": "startup"},
+        "constraints": ["c1"],
+    }
+    # Tolerates None / missing.
+    assert operator_owned_subset(None) == {
+        "intent": {"purpose": ""},
+        "context": {},
+        "constraints": [],
+    }
+
+
+def test_apply_agent_update_second_write_against_own_prior_proposal_no_false_conflict():
+    """The core fix contract: when the merge ancestor is the agent's OWN prior
+    proposal (what the callers now store + pass on a 2nd same-cycle write), a
+    different 2nd context/constraints applies cleanly with NO fabricated
+    operator-conflict — even though current != cycle-start baseline."""
+    from app.problem_model import operator_owned_subset
+
+    # Write 1: agent advances context/constraints from the cycle-start snapshot.
+    snapshot = _operator_seeded_current()
+    proposed1 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "context": {"project_type": "scale-up", "users": "SMBs"},
+        "constraints": ["No PII in logs", "GDPR compliant", "SOC2"],
+    }
+    new_raw1, _ = apply_agent_update(
+        _operator_seeded_current(),
+        dict(proposed1),
+        "2026-04-21T12:00:00",
+        baseline_raw=snapshot,
+    )
+    assert new_raw1["context"]["project_type"] == "scale-up"
+    assert "rejected_agent_edits" not in new_raw1
+
+    # Write 2: ancestor is the agent's prior proposal (not the snapshot), current
+    # is the agent's own first write. A genuinely different 2nd value persists.
+    proposed2 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "y"},
+        "context": {"project_type": "enterprise", "users": "Fortune 500"},
+        "constraints": ["No PII in logs", "GDPR compliant", "SOC2", "HIPAA"],
+    }
+    new_raw2, _ = apply_agent_update(
+        new_raw1,
+        dict(proposed2),
+        "2026-04-21T12:05:00",
+        baseline_raw=operator_owned_subset(proposed1),
+    )
+    # The 2nd write's distinct context/constraints persist — NOT dropped.
+    assert new_raw2["context"]["project_type"] == "enterprise"
+    assert new_raw2["constraints"] == [
+        "No PII in logs",
+        "GDPR compliant",
+        "SOC2",
+        "HIPAA",
+    ]
+    # And NO false operator-conflict was fabricated.
+    assert "rejected_agent_edits" not in new_raw2
+
+
+def test_apply_agent_update_operator_edit_between_two_writes_still_wins():
+    """Case 3: an operator edits between the agent's two writes. With the
+    ancestor = the agent's prior proposal, the operator's mid-cycle value still
+    wins on the 2nd write (current moved away from the agent's proposal)."""
+    from app.problem_model import operator_owned_subset
+
+    snapshot = _operator_seeded_current()
+    proposed1 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "context": {"project_type": "scale-up", "users": "SMBs"},
+        "constraints": ["No PII in logs"],
+    }
+    new_raw1, _ = apply_agent_update(
+        _operator_seeded_current(),
+        dict(proposed1),
+        "2026-04-21T12:00:00",
+        baseline_raw=snapshot,
+    )
+    # Operator edits problem_model mid-cycle (admin patch stamps user + new vals).
+    after_operator = dict(new_raw1)
+    after_operator["context"] = {"project_type": "regulated-fintech"}
+    after_operator["constraints"] = ["No PII in logs", "PCI-DSS"]
+    after_operator["last_updated_by"] = "user"
+
+    # Write 2: agent proposes its own divergent values against its prior proposal.
+    proposed2 = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "y"},
+        "context": {"project_type": "enterprise"},
+        "constraints": ["Move fast"],
+    }
+    new_raw2, _ = apply_agent_update(
+        after_operator,
+        dict(proposed2),
+        "2026-04-21T12:05:00",
+        baseline_raw=operator_owned_subset(proposed1),
+    )
+    # Operator's mid-cycle edit survives; the agent's divergent values are
+    # rejected and recorded.
+    assert new_raw2["context"]["project_type"] == "regulated-fintech"
+    assert new_raw2["constraints"] == ["No PII in logs", "PCI-DSS"]
+    fields = {e["field"] for e in new_raw2["rejected_agent_edits"]}
+    assert fields == {"context", "constraints"}
+
+
+# ---------------------------------------------------------------------------
 # apply_user_intent_patch — the user-facing write path (onboarding + PATCH)
 # ---------------------------------------------------------------------------
 

@@ -1388,7 +1388,7 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app import strategic_cycle as _strategic_cycle
-        from app.problem_model import apply_agent_update
+        from app.problem_model import apply_agent_update, operator_owned_subset
         from app.strategic_completion import (
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
@@ -1420,16 +1420,27 @@ async def strategic_operation(
         # operator-wins rather than silently clobbered. Mirrors the vision
         # baseline resolution in strategic_completion; degrade to None (today's
         # blank-preservation-only behavior) when no cycle/baseline is available.
+        # On the FIRST write the ancestor is the cycle-start snapshot; on a
+        # SECOND same-cycle write it is the agent's own prior proposed
+        # operator-owned subset (stored below after each successful write). This
+        # lets a 2nd agent write advance its own context/constraints instead of
+        # being misread as a mid-cycle operator edit, while a genuine operator
+        # edit still moves ``current`` away from the stored proposal and wins.
         baseline_pm: dict | None = None
+        pm_cycle_row = None
         pm_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
             "strategic_cycle_id"
         )
         if pm_cycle_id:
             pm_cycle_row = await _strategic_cycle.get(session, pm_cycle_id)
             if pm_cycle_row is not None:
-                snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
-                if snap:
-                    baseline_pm = snap
+                prior = _strategic_cycle.agent_problem_model_proposal(pm_cycle_row)
+                if prior is not None:
+                    baseline_pm = prior
+                else:
+                    snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
+                    if snap:
+                        baseline_pm = snap
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
@@ -1444,6 +1455,13 @@ async def strategic_operation(
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
         session.add(project)
+        # Remember the agent's pre-merge operator-owned proposal so a subsequent
+        # same-cycle write reconciles against it (see baseline resolution above).
+        if pm_cycle_row is not None:
+            _strategic_cycle.set_agent_problem_model_proposal(
+                pm_cycle_row, operator_owned_subset(pm_data)
+            )
+            session.add(pm_cycle_row)
         ctx = task.context or {}
         new_ctx = {
             **ctx,

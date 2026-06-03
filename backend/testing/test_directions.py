@@ -3779,6 +3779,185 @@ async def test_strategic_api_set_problem_model_happy_path(db_session):
         _cleanup_strategic_overrides()
 
 
+def _operator_seeded_pm() -> dict:
+    """A problem_model as the onboarding seed leaves it: operator purpose with a
+    user_message source, operator context/constraints, last_updated_by=user."""
+    return {
+        "revision": 1,
+        "last_updated_by": "user",
+        "intent": {
+            "purpose": "Ship reliable billing.",
+            "current_focus": "Phase 1.",
+            "source": {"type": "user_message", "message_id": "m-1"},
+        },
+        "context": {"project_type": "startup", "users": "SMBs"},
+        "constraints": ["No PII in logs"],
+    }
+
+
+async def _attach_cycle_with_problem_model_baseline(
+    db_session, project, task_id, *, baseline_pm, current_pm
+):
+    """Snapshot ``baseline_pm`` as the cycle's problem_model baseline, link the
+    fixture task to the cycle, and set ``current_pm`` as the live DB model.
+    Mirrors :func:`_attach_cycle_with_running_update_baseline`."""
+    from app import strategic_cycle
+
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_problem_model=baseline_pm,
+    )
+    await db_session.commit()
+
+    project.problem_model = current_pm
+    db_session.add(project)
+
+    task = await db_session.get(Task, uuid.UUID(task_id))
+    task.strategic_cycle_id = cycle.id
+    task.context = {**(task.context or {}), "strategic_cycle_id": cycle.id}
+    db_session.add(task)
+    await db_session.commit()
+    return cycle.id
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_double_write_same_cycle_keeps_second_values(
+    db_session,
+):
+    """Case 1: two set_problem_model writes in one cycle with NO operator edit
+    between — the SECOND write's distinct context/constraints persist (not
+    dropped back to the first write) and NO false operator-conflict is recorded.
+    This is the bug: the 2nd write's ancestor must be the agent's own 1st write,
+    not the cycle-start snapshot."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        baseline = _operator_seeded_pm()
+        await _attach_cycle_with_problem_model_baseline(
+            db_session, project, task_id, baseline_pm=baseline, current_pm=dict(baseline)
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            r1 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "intent": {
+                            "purpose": "Ship reliable billing.",
+                            "current_focus": "Phase 1.",
+                        },
+                        "context": {"project_type": "scale-up", "users": "SMBs"},
+                        "constraints": ["No PII in logs", "SOC2"],
+                    },
+                },
+            )
+            assert r1.status_code == 200, r1.text
+            r2 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "intent": {
+                            "purpose": "Ship reliable billing.",
+                            "current_focus": "Phase 2.",
+                        },
+                        "context": {"project_type": "enterprise", "users": "Fortune 500"},
+                        "constraints": ["No PII in logs", "SOC2", "HIPAA"],
+                    },
+                },
+            )
+            assert r2.status_code == 200, r2.text
+        await db_session.refresh(project)
+        pm = project.problem_model
+        # The SECOND write's values win — not silently reverted to the first.
+        assert pm["context"]["project_type"] == "enterprise"
+        assert pm["context"]["users"] == "Fortune 500"
+        assert pm["constraints"] == ["No PII in logs", "SOC2", "HIPAA"]
+        # No fabricated operator-conflict in the ledger.
+        assert not pm.get("rejected_agent_edits")
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_operator_edit_between_writes_still_wins(db_session):
+    """Case 3: an operator edits problem_model BETWEEN the agent's two writes.
+    The operator's mid-cycle value must still win on the 2nd write (the agent's
+    own prior-proposal ancestor does not re-open the operator's field), and the
+    agent's overridden value is recorded to the ledger."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        baseline = _operator_seeded_pm()
+        await _attach_cycle_with_problem_model_baseline(
+            db_session, project, task_id, baseline_pm=baseline, current_pm=dict(baseline)
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            r1 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "intent": {
+                            "purpose": "Ship reliable billing.",
+                            "current_focus": "Phase 1.",
+                        },
+                        "context": {"project_type": "scale-up", "users": "SMBs"},
+                        "constraints": ["No PII in logs", "SOC2"],
+                    },
+                },
+            )
+            assert r1.status_code == 200, r1.text
+
+            # Operator edits problem_model mid-cycle (admin patch stamps user).
+            await db_session.refresh(project)
+            edited = dict(project.problem_model)
+            edited["context"] = {"project_type": "regulated-fintech"}
+            edited["constraints"] = ["No PII in logs", "PCI-DSS"]
+            edited["last_updated_by"] = "user"
+            project.problem_model = edited
+            db_session.add(project)
+            await db_session.commit()
+
+            r2 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "intent": {
+                            "purpose": "Ship reliable billing.",
+                            "current_focus": "Phase 2.",
+                        },
+                        "context": {"project_type": "enterprise"},
+                        "constraints": ["Move fast"],
+                    },
+                },
+            )
+            assert r2.status_code == 200, r2.text
+        await db_session.refresh(project)
+        pm = project.problem_model
+        # Operator's mid-cycle edit survives the agent's 2nd write.
+        assert pm["context"]["project_type"] == "regulated-fintech"
+        assert pm["constraints"] == ["No PII in logs", "PCI-DSS"]
+        fields = {e["field"] for e in (pm.get("rejected_agent_edits") or [])}
+        assert fields == {"context", "constraints"}
+    finally:
+        _cleanup_strategic_overrides()
+
+
 @pytest.mark.asyncio
 async def test_strategic_api_set_problem_model_rejects_malformed(db_session):
     """Invalid schema fields return 400, don't mutate state."""
