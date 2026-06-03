@@ -6,6 +6,7 @@ import { MessagesPanel } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
+import { armingToastCopy, armingHintCopy, type ArmingOutcome } from './messageArming';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -3270,6 +3271,230 @@ describe('MessagesPanel project-switch async race guards', () => {
     // 'A-only' tab must NOT appear in proj-B's tab strip.
     const tabsAfter = [...host!.querySelectorAll('[data-testid="saved-views-tab-strip"] button')];
     expect(tabsAfter.every(b => !b.textContent?.trim().startsWith('A-only'))).toBe(true);
+  });
+});
+
+// ── Outgoing send → arming receipt (toast + composer hint) ────────────────────
+// The operator's live-chat composer must surface a TRUTHFUL receipt for the
+// server's real arming decision. The load-bearing guarantee under test: a
+// genuine steering message the server could NOT arm (`not_armed`) is shown as a
+// distinct, non-success "wasn't woken" receipt — never a green "steering" lie —
+// and the composer hint then reflects that real outcome rather than the
+// type-only guess, resetting to the prediction when the operator switches type.
+// (The arming helpers are unit-tested in isolation in messageArming.test.ts;
+// these tests lock the full send round-trip through the real MessagesPanel.)
+
+describe('MessagesPanel send arming receipt', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  // Serves the panel's mount-time GETs normally (empty message list, no
+  // last-seen, 404'd sync endpoints) and returns `postBody` as the JSON body of
+  // POST /api/admin/messages — the response the send handler parses its arming
+  // decision from. Pass `{}` to model an older server that omits the field.
+  function _setupSendMock(postBody: Record<string, unknown>): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
+        return new Response(JSON.stringify(postBody), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
+  async function renderPanel(addToast: (msg: string, level: string) => void) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  // The composer hint <p> always renders one of the four ArmingOutcome hint
+  // strings; locate it by matching its text against that closed set.
+  const ALL_HINTS = (['steering', 'passive_note', 'routine_event', 'not_armed'] as ArmingOutcome[])
+    .map(armingHintCopy);
+  function hintText(el: HTMLElement): string | null {
+    const p = [...el.querySelectorAll('p')].find(p => ALL_HINTS.includes(p.textContent ?? ''));
+    return p?.textContent ?? null;
+  }
+
+  // Type into the composer textarea (controlled input — bypass React's value
+  // tracker via the prototype setter so the dispatched event fires onChange) and
+  // click Send.
+  async function typeAndSend(el: HTMLElement, text: string) {
+    const textarea = el.querySelector('textarea[placeholder="Type a message..."]') as HTMLTextAreaElement;
+    expect(textarea).toBeTruthy();
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype, 'value',
+    )!.set!;
+    await act(async () => {
+      nativeSetter.call(textarea, text);
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const sendBtn = el.querySelector('button[class*="bg-blue-600"]') as HTMLButtonElement;
+    expect(sendBtn).toBeTruthy();
+    expect(sendBtn.disabled).toBe(false);
+    await act(async () => { sendBtn.click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+  }
+
+  test('steering send shows a success toast confirming the strategist was steered', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    await typeAndSend(el, 'please prioritize the migration work');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    const [text, severity] = addToast.mock.calls[0];
+    expect(text).toBe(armingToastCopy('steering'));
+    expect(text).toContain('steering the strategist');
+    expect(severity).toBe('success');
+    expect(hintText(el)).toBe(armingHintCopy('steering'));
+  });
+
+  test('passive_note send shows a success "won’t wake" toast', async () => {
+    _setupSendMock({ arming: 'passive_note' });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    await typeAndSend(el, 'just a note for the record');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    const [text, severity] = addToast.mock.calls[0];
+    expect(text).toBe(armingToastCopy('passive_note'));
+    expect(text).toContain('won’t wake the strategist');
+    expect(severity).toBe('success');
+    expect(hintText(el)).toBe(armingHintCopy('passive_note'));
+  });
+
+  test('routine_event send shows a success "won’t wake" routine toast', async () => {
+    _setupSendMock({ arming: 'routine_event' });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    await typeAndSend(el, 'routine bookkeeping');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    const [text, severity] = addToast.mock.calls[0];
+    expect(text).toBe(armingToastCopy('routine_event'));
+    expect(text).toContain('routine event');
+    expect(severity).toBe('success');
+    expect(hintText(el)).toBe(armingHintCopy('routine_event'));
+  });
+
+  test('not_armed send shows a non-success "wasn’t woken" receipt — NOT a false steering promise', async () => {
+    _setupSendMock({ arming: 'not_armed' });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    await typeAndSend(el, 'urgent: stop the current direction');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    const [text, severity] = addToast.mock.calls[0];
+    // The load-bearing truthfulness guarantee: a steering message the server
+    // could not arm is surfaced as info, with copy that says the strategist was
+    // NOT woken — never the green "steering the strategist" success line.
+    expect(text).toBe(armingToastCopy('not_armed'));
+    expect(text).toContain('wasn’t woken');
+    expect(text).toContain('try resending');
+    expect(text).not.toContain('steering the strategist');
+    expect(severity).toBe('info');
+    expect(severity).not.toBe('success');
+    expect(hintText(el)).toBe(armingHintCopy('not_armed'));
+  });
+
+  test('composer hint reflects the server\'s real outcome, not the type-only guess', async () => {
+    // Default type is FEEDBACK, which predicts `steering`. The server instead
+    // reports `routine_event`, so the post-send hint must show the real outcome
+    // — proving the hint is grounded in the response, not the type prediction.
+    _setupSendMock({ arming: 'routine_event' });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    // Before any send the hint is the type-based prediction (steering).
+    expect(hintText(el)).toBe(armingHintCopy('steering'));
+
+    await typeAndSend(el, 'message that the server treats as routine');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+
+    expect(hintText(el)).toBe(armingHintCopy('routine_event'));
+    expect(hintText(el)).not.toBe(armingHintCopy('steering'));
+  });
+
+  test('changing message type resets the hint to the type-based prediction', async () => {
+    _setupSendMock({ arming: 'not_armed' });
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    await typeAndSend(el, 'urgent steering attempt');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    // After the send the hint reflects the real (not_armed) outcome.
+    expect(hintText(el)).toBe(armingHintCopy('not_armed'));
+
+    // Switch the message type to Note via the composer dropdown. Selecting a new
+    // type clears the last-arming memory, so the hint falls back to the
+    // type-based prediction (NOTE → passive_note).
+    const typeBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Feedback');
+    expect(typeBtn).toBeTruthy();
+    await act(async () => { (typeBtn as HTMLButtonElement).click(); });
+    const noteOpt = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Note');
+    expect(noteOpt).toBeTruthy();
+    await act(async () => { (noteOpt as HTMLButtonElement).click(); });
+
+    expect(hintText(el)).toBe(armingHintCopy('passive_note'));
+    expect(hintText(el)).not.toBe(armingHintCopy('not_armed'));
+  });
+
+  test('response missing the arming field falls back to the generic confirmation without error', async () => {
+    _setupSendMock({}); // older server: no `arming` field
+    const addToast = vi.fn();
+    const el = await renderPanel(addToast);
+    await typeAndSend(el, 'message to a server that omits arming');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    const [text, severity] = addToast.mock.calls[0];
+    expect(text).toBe(armingToastCopy(null));
+    expect(text).toBe('Message sent');
+    // No arming → generic success, and never a failure toast.
+    expect(severity).toBe('success');
+    expect(text).not.toBe('Failed to send message');
+    // Hint falls back to the type-based prediction (FEEDBACK → steering).
+    expect(hintText(el)).toBe(armingHintCopy('steering'));
   });
 });
 
