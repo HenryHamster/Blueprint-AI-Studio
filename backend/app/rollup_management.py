@@ -41,6 +41,7 @@ from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for caller
 )
 from app.rollup_migration_validation import (  # noqa: F401 - re-exported for callers/tests
     _extract_rollup_migration_sources,
+    _plan_rollup_migration_reconciliation,
     _touches_alembic_versions,
     _validate_rollup_migration_chain,
 )
@@ -87,6 +88,131 @@ logger = logging.getLogger(__name__)
 # github_pulls.create_pull_request, which catches any duplicate that still slips
 # through GitHub's non-atomic enforcement.
 _ROLLUP_PR_CREATE_CLAIM_TTL_S = 300
+
+# Bounded auto-reconcile attempts per rollup PR for a pure mechanical Alembic
+# revision collision. Two attempts is enough to absorb a transient
+# push/re-validate race; beyond that we fall back to the operator-alert / agent
+# fix path rather than loop on a non-mechanical block.
+_ALEMBIC_AUTORECONCILE_CAP = 2
+
+
+async def _attempt_alembic_autoreconcile(
+    parent: Task,
+    session: AsyncSession,
+    gh_token: str,
+    owner: str,
+    repo: str,
+    rollup_pr_number: int,
+    rollup_pr_url: str,
+    staging_branch: str,
+    target_branch: str,
+    parent_ctx: dict,
+    current_count: int,
+) -> bool:
+    """Try to auto-renumber a rollup migration that collides with the target head.
+
+    Returns ``True`` when a reconciliation commit was pushed to *staging_branch*
+    (the caller defers one sweep so re-validation can pass and the rollup can
+    merge with no operator step). Returns ``False`` — leaving the parent
+    untouched — for every non-mechanical case, missing literal, or push failure,
+    so the caller falls through to the existing operator-alert / agent-fix path.
+    Conservative and fail-safe: only the unambiguous single-added-migration
+    collision / stale-anchor is auto-remediated.
+    """
+    from app.migration_chain import rewrite_expected_schema_revision
+    from app.github import get_file_text_at_ref, commit_file_changes
+
+    try:
+        plan = await _plan_rollup_migration_reconciliation(
+            gh_token, owner, repo, rollup_pr_number, target_branch
+        )
+    except Exception as e:  # noqa: BLE001 — fail-safe: fall back to operator path
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile planning "
+            f"failed ({type(e).__name__}: {e}); falling back to fix path"
+        )
+        return False
+    if not plan:
+        return False
+
+    # The migration becomes the new head, so EXPECTED_SCHEMA_REVISION must bump
+    # to match. Read main.py at the staging-branch tip and rewrite the literal;
+    # if it is absent we must not guess — fall back.
+    try:
+        main_text = await get_file_text_at_ref(
+            "backend/app/main.py",
+            token=gh_token,
+            owner=owner,
+            repo=repo,
+            ref=staging_branch,
+            project_id=str(parent.project_id),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile could not "
+            f"fetch main.py ({type(e).__name__}: {e}); falling back to fix path"
+        )
+        return False
+    if not main_text:
+        return False
+    new_main_text, replaced = rewrite_expected_schema_revision(
+        main_text, plan["expected_schema_revision"]
+    )
+    if replaced == 0:
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile: no "
+            f"EXPECTED_SCHEMA_REVISION literal in main.py; falling back to fix path"
+        )
+        return False
+
+    upserts = {
+        plan["new_path"]: plan["new_source"],
+        "backend/app/main.py": new_main_text,
+    }
+    # Renumber always changes the NNNN prefix, so old_path != new_path; delete the
+    # original file so the rename is clean (one head, no duplicate revision).
+    deletes = [plan["old_path"]] if plan["old_path"] != plan["new_path"] else []
+    try:
+        await commit_file_changes(
+            gh_token,
+            owner,
+            repo,
+            staging_branch,
+            upserts=upserts,
+            deletes=deletes,
+            message=(
+                f"fix(alembic): auto-renumber rollup migration "
+                f"{plan['old_revision']}->{plan['new_revision']} and rechain onto "
+                f"{plan['new_down_revision']}"
+            ),
+            project_id=str(parent.project_id),
+        )
+    except Exception as e:  # noqa: BLE001 — push failed: fall back to fix path
+        logger.warning(
+            f"[ROLLUP] PR #{rollup_pr_number} alembic auto-reconcile push failed "
+            f"({type(e).__name__}: {e}); falling back to fix path"
+        )
+        return False
+
+    parent.context = {
+        **parent_ctx,
+        "rollup_pr_url": rollup_pr_url,
+        "rollup_pr_number": rollup_pr_number,
+        "_alembic_autoreconcile_pr": rollup_pr_number,
+        "_alembic_autoreconcile_count": current_count + 1,
+    }
+    parent.latest_status_message = (
+        f"Rollup PR #{rollup_pr_number} — auto-renumbered Alembic migration "
+        f"{plan['old_revision']}->{plan['new_revision']}; re-validating next cycle"
+    )[:500]
+    session.add(parent)
+    await session.commit()
+    logger.info(
+        f"[ROLLUP] PR #{rollup_pr_number} alembic collision auto-reconciled: "
+        f"renumbered {plan['old_revision']}->{plan['new_revision']} on "
+        f"{staging_branch}, bumped EXPECTED_SCHEMA_REVISION; deferring re-validation"
+    )
+    return True
 
 
 async def _classify_merged_rollup_landing(
@@ -1967,7 +2093,7 @@ async def _check_and_trigger_rollup(
                     # subsequent task. Fail-safe: fetch/parse failure does not
                     # auto-merge. Runs in this unlocked window (GitHub I/O).
                     alembic_status, alembic_reason = await _validate_rollup_migration_chain(
-                        gh_token, owner, repo, rollup_pr_number
+                        gh_token, owner, repo, rollup_pr_number, target_branch
                     )
 
                     # Re-acquire to apply mutations / dispatch alerts.
@@ -2146,6 +2272,36 @@ async def _check_and_trigger_rollup(
                         await session.commit()
                         return
                     if alembic_status == "block":
+                        # Before the operator-alert / agent-fix fallback, try a
+                        # bounded automatic reconciliation of a PURE mechanical
+                        # collision: a single added migration that simply needs a
+                        # new revision number + a rechain onto the current head.
+                        # Anything ambiguous (multi-migration, body conflict,
+                        # parse failure, non-resolving renumber) yields no plan
+                        # and falls through unchanged. The per-PR counter caps
+                        # retries so a non-mechanical block never loops.
+                        _ar_pr = parent_ctx.get("_alembic_autoreconcile_pr")
+                        _ar_count = (
+                            int(parent_ctx.get("_alembic_autoreconcile_count", 0))
+                            if _ar_pr == rollup_pr_number
+                            else 0
+                        )
+                        if _ar_count < _ALEMBIC_AUTORECONCILE_CAP:
+                            _reconciled = await _attempt_alembic_autoreconcile(
+                                parent,
+                                session,
+                                gh_token,
+                                owner,
+                                repo,
+                                rollup_pr_number,
+                                rollup_pr_url,
+                                staging_branch,
+                                target_branch,
+                                parent_ctx,
+                                _ar_count,
+                            )
+                            if _reconciled:
+                                return
                         # C5: gate the approval flag on require_approval_gates.
                         # A broken combined migration chain is deterministic and
                         # would break `alembic upgrade head` for the whole project,

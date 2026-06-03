@@ -231,6 +231,28 @@ class TestSchemaRevisionSync:
             mismatches
         )
 
+    def test_rollup_guard_uses_combined_chain_check(self):
+        """The rollup auto-merge guard must pass target_branch to _validate_rollup_migration_chain.
+
+        Regression guard: dropping target_branch silently reverts the guard to the
+        in-isolation check, which is blind to parallel-development collisions where
+        two branches each add the same revision id or anchor to a stale head.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "rollup_management.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        assert re.search(
+            r"_validate_rollup_migration_chain\s*\([^)]*target_branch\b",
+            content,
+            re.DOTALL,
+        ), (
+            "_validate_rollup_migration_chain must be called with target_branch in "
+            "rollup_management.py. Without it the guard is blind to parallel-development "
+            "migration collisions (two branches each adding the same revision id)."
+        )
+
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
         no gaps, no branches, no dangling down_revision references, and no

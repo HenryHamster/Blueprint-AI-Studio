@@ -227,6 +227,214 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
     return None
 
 
+def validate_combined_migration_chain(
+    existing_filenames: list[str], added_sources: dict[str, str]
+) -> str | None:
+    """Validate a rollup's added migrations against the target branch's chain.
+
+    The in-isolation guard (:func:`validate_added_migrations`) only proves the
+    *added* migrations form one linear extension; it treats their anchoring
+    ``down_revision`` as a valid external reference. That is blind to the most
+    common parallel-development collision: two independently-cut branches each
+    add "the next" migration with the SAME revision id (or anchored to a
+    revision that is no longer the target's head). Each branch's own CI is
+    green, but merged they produce duplicate revisions / multiple Alembic heads
+    and the app refuses to boot on the next schema-version check.
+
+    This combines the two: ``existing_filenames`` are the migration filenames
+    currently on the target branch (the filename ``NNNN`` prefix is the existing
+    revision id, kept in lockstep with the in-file revision by the
+    migration-chain invariant), and ``added_sources`` maps an identifier to the
+    source of each migration the rollup adds. Returns ``None`` when the combined
+    chain is valid; otherwise a precise, actionable reason naming the colliding
+    or stale revision and the fix. The in-isolation checks still run first, so
+    this is a strict superset of :func:`validate_added_migrations`.
+
+    With no existing migrations (empty/greenfield target) it degrades exactly to
+    :func:`validate_added_migrations`.
+    """
+    reason = validate_added_migrations(added_sources)
+    if reason is not None:
+        return reason
+    if not added_sources:
+        return None
+
+    existing_revisions = {
+        rev
+        for fn in existing_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    if not existing_revisions:
+        # No existing chain to combine against — in-isolation result stands.
+        return None
+    existing_head = max(existing_revisions, key=int)
+
+    added_chain, _duplicates, _unparseable = build_migration_chain(added_sources)
+
+    # (a) A revision id the rollup adds already exists on the target branch.
+    collisions = sorted(set(added_chain) & existing_revisions, key=int)
+    if collisions:
+        rev = collisions[0]
+        return (
+            f"Alembic revision '{rev}' already exists on the target branch; "
+            f"renumber to the next free revision and rechain onto the current "
+            f"head '{existing_head}'."
+        )
+
+    # (b) The added chain's root must attach to the target's current head; a
+    # stale ``down_revision`` (anchored to an older revision, or to None when
+    # the target already has migrations) would create a second Alembic head.
+    roots = find_roots(added_chain)  # exactly 1 — validate_added_migrations ensured
+    root_rev = roots[0]
+    anchor = added_chain[root_rev]
+    if anchor != existing_head:
+        return (
+            f"Alembic migration '{root_rev}' anchors to down_revision "
+            f"'{anchor}', but the target branch head is '{existing_head}'; "
+            f"rechain '{root_rev}' onto '{existing_head}'."
+        )
+    return None
+
+
+_EXPECTED_SCHEMA_REVISION_RE = re.compile(
+    r"""(?P<lead>EXPECTED_SCHEMA_REVISION\s*=\s*)['"]\w+['"]"""
+)
+
+
+def rewrite_expected_schema_revision(
+    main_source: str, new_revision: str
+) -> tuple[str, int]:
+    """Rewrite the ``EXPECTED_SCHEMA_REVISION = "NNNN"`` literal in ``main.py``.
+
+    Returns ``(rewritten_source, count)`` where ``count`` is the number of
+    assignments replaced (0 when the literal is absent — the caller must not
+    guess and should fall back rather than push a malformed bump). The quote
+    style is normalised to double quotes, matching the in-repo declaration.
+    """
+    return _EXPECTED_SCHEMA_REVISION_RE.subn(
+        lambda m: f'{m.group("lead")}"{new_revision}"', main_source, count=1
+    )
+
+
+def _rewrite_migration_source(
+    source: str, new_revision: str, new_down_revision: str
+) -> str:
+    """Renumber a single migration file's ``revision`` / ``down_revision``.
+
+    Replaces the first ``revision = '...'`` assignment with *new_revision* and
+    the first ``down_revision = '...'`` (or ``down_revision = None``) assignment
+    with *new_down_revision*, preserving the existing quote style for the
+    revision token. Pure string rewrite — used only on a not-yet-merged
+    rollup's own newly-added migration file.
+    """
+
+    def _sub_rev(m: "re.Match[str]") -> str:
+        return m.group(0).replace(m.group(1), new_revision, 1)
+
+    def _sub_down(m: "re.Match[str]") -> str:
+        full = m.group(0)
+        if m.group(1):  # down_revision = '<rev>'
+            return full.replace(m.group(1), new_down_revision, 1)
+        # down_revision = None  ->  down_revision = "<head>"
+        return full[: full.rindex("None")] + f'"{new_down_revision}"'
+
+    source = _REVISION_RE.sub(_sub_rev, source, count=1)
+    source = _DOWN_REVISION_RE.sub(_sub_down, source, count=1)
+    return source
+
+
+def _renumbered_filename(old_path: str, new_revision: str) -> str:
+    """Rename a migration path so its ``NNNN`` prefix matches *new_revision*.
+
+    Keeps the directory and the descriptive suffix after the first underscore
+    (e.g. ``.../0137_add_foo.py`` -> ``.../0138_add_foo.py``).
+    """
+    directory, basename = os.path.split(old_path)
+    suffix = basename[len(basename.split("_", 1)[0]):]  # leading "_..." (or "")
+    return os.path.join(directory, new_revision + suffix) if directory else (
+        new_revision + suffix
+    )
+
+
+def plan_migration_reconciliation(
+    existing_filenames: list[str], added_sources: dict[str, str]
+) -> dict | None:
+    """Plan a mechanical renumber of a rollup's single colliding migration.
+
+    Returns ``None`` unless the block is unambiguously mechanically
+    reconcilable: the rollup adds EXACTLY ONE migration that forms an
+    otherwise-valid single linear extension (per :func:`validate_added_migrations`)
+    and is blocked SOLELY by a revision-id collision with the target branch or
+    a stale ``down_revision`` anchor (the two classes :func:`validate_combined_migration_chain`
+    rejects). Anything else — multiple added migrations, multiple heads, a parse
+    failure, or an already-valid chain — returns ``None`` so the caller falls
+    back to a clear operator alert rather than guessing.
+
+    When reconcilable, returns a plan dict::
+
+        {
+            "old_path", "new_path",          # rename source -> dest
+            "old_revision", "new_revision",  # NNNN renumber
+            "new_down_revision",             # rechained onto target head
+            "new_source",                    # rewritten migration body
+            "expected_schema_revision",      # == new_revision (the post-merge head)
+        }
+
+    The plan is verified against :func:`validate_combined_migration_chain` before
+    being returned, so a renumber that would not resolve to a single clean head
+    yields ``None`` rather than an unsafe push.
+    """
+    # Must be a valid single linear extension in isolation; a body/structure
+    # problem (multi-head, duplicate, unparseable) is not mechanical.
+    if validate_added_migrations(added_sources) is not None:
+        return None
+    if len(added_sources) != 1:
+        return None
+
+    existing_revisions = {
+        rev
+        for fn in existing_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    if not existing_revisions:
+        # No existing chain to collide against — nothing to reconcile.
+        return None
+    existing_head = max(existing_revisions, key=int)
+
+    old_path, source = next(iter(added_sources.items()))
+    old_revision, old_down_revision = parse_revision_identifiers(source)
+    if old_revision is None:
+        return None
+
+    collides = old_revision in existing_revisions
+    stale_anchor = old_down_revision != existing_head
+    if not collides and not stale_anchor:
+        # Already a clean linear extension onto the head — no block to fix.
+        return None
+
+    # Next free revision after the current head (head is the max, so head+1 is
+    # always free and cannot collide with any existing or added revision).
+    width = len(existing_head)
+    new_revision = f"{int(existing_head) + 1:0{width}d}"
+    new_path = _renumbered_filename(old_path, new_revision)
+    new_source = _rewrite_migration_source(source, new_revision, existing_head)
+
+    # Verify the renumbered result against the same combined-chain validation
+    # the guard uses — never return a plan that would not actually resolve.
+    if validate_combined_migration_chain(existing_filenames, {new_path: new_source}):
+        return None
+
+    return {
+        "old_path": old_path,
+        "new_path": new_path,
+        "old_revision": old_revision,
+        "new_revision": new_revision,
+        "new_down_revision": existing_head,
+        "new_source": new_source,
+        "expected_schema_revision": new_revision,
+    }
+
+
 if __name__ == "__main__":
     _dir = sys.argv[1] if len(sys.argv) > 1 else None
     sys.exit(main(_dir))

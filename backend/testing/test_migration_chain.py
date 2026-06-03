@@ -10,7 +10,10 @@ from app.migration_chain import (
     find_roots,
     main,
     parse_revision_identifiers,
+    plan_migration_reconciliation,
+    rewrite_expected_schema_revision,
     validate_added_migrations,
+    validate_combined_migration_chain,
 )
 from app.rollup_management import (
     _extract_rollup_migration_sources,
@@ -331,3 +334,264 @@ def test_main_two_heads_fails(tmp_path, capsys):
 def test_main_empty_dir_passes(tmp_path, capsys):
     result = main(str(tmp_path))
     assert result == 0
+
+
+# ── Combined chain validation (target-branch-aware) ─────────────────────────
+
+
+def test_validate_combined_clean_passes():
+    """A rollup migration correctly anchored to the target head passes."""
+    existing_filenames = ["0135_one.py", "0136_prev.py"]
+    added_sources = {
+        "backend/alembic/versions/0137_new.py": _migration_src("0137", "0136"),
+    }
+    assert validate_combined_migration_chain(existing_filenames, added_sources) is None
+
+
+def test_validate_combined_duplicate_revision_blocks():
+    """A revision id already present on the target branch causes a block."""
+    existing_filenames = ["0136_prev.py", "0137_existing.py"]
+    added_sources = {
+        "backend/alembic/versions/0137_new.py": _migration_src("0137", "0136"),
+    }
+    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    assert reason is not None
+    assert "0137" in reason
+    assert "already exists" in reason.lower() or "renumber" in reason.lower()
+
+
+def test_validate_combined_stale_anchor_blocks():
+    """A migration anchored to an older revision (not the target head) is blocked."""
+    # head is 0136 but the rollup chains off 0135 (stale)
+    existing_filenames = ["0135_one.py", "0136_two.py"]
+    added_sources = {
+        "backend/alembic/versions/0137_new.py": _migration_src("0137", "0135"),
+    }
+    reason = validate_combined_migration_chain(existing_filenames, added_sources)
+    assert reason is not None
+    assert "0135" in reason and "0136" in reason
+    assert "rechain" in reason.lower() or "head" in reason.lower()
+
+
+def test_validate_combined_no_existing_degrades_to_isolation():
+    """Empty existing_filenames degrades to the in-isolation check."""
+    added_sources = {
+        "backend/alembic/versions/0001_root.py": _migration_src("0001", None),
+    }
+    assert validate_combined_migration_chain([], added_sources) is None
+
+
+def test_validate_combined_empty_added_passes():
+    """No added migrations is always valid regardless of existing chain."""
+    assert validate_combined_migration_chain(["0136_prev.py"], {}) is None
+
+
+# ── Async guard with target_branch ──────────────────────────────────────────
+
+
+async def test_guard_with_target_branch_clean_passes():
+    """Guard passes when rollup migration correctly anchors to the target head."""
+    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0137_new.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+        patch(
+            "app.github.list_versions_at_ref",
+            return_value=["0135_one.py", "0136_prev.py"],
+        ),
+    ):
+        assert await _validate_rollup_migration_chain("t", "o", "r", 1, "automain") == (
+            "ok",
+            None,
+        )
+
+
+async def test_guard_with_target_branch_duplicate_blocks():
+    """Guard blocks when the rollup adds a revision already on the target branch."""
+    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0137_new.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+        patch(
+            "app.github.list_versions_at_ref",
+            return_value=["0136_prev.py", "0137_existing.py"],
+        ),
+    ):
+        status, reason = await _validate_rollup_migration_chain(
+            "t", "o", "r", 1, "automain"
+        )
+    assert status == "block"
+    assert "0137" in reason
+    assert "already exists" in reason.lower() or "renumber" in reason.lower()
+
+
+async def test_guard_with_target_branch_stale_anchor_blocks():
+    """Guard blocks when the rollup migration anchors to a stale down_revision."""
+    # head is 0137 but rollup chains off 0136 (stale)
+    diff = _added_file_diff("backend/alembic/versions/0138_new.py", "0138", "0136")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0138_new.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+        patch(
+            "app.github.list_versions_at_ref",
+            return_value=["0136_prev.py", "0137_other.py"],
+        ),
+    ):
+        status, reason = await _validate_rollup_migration_chain(
+            "t", "o", "r", 1, "automain"
+        )
+    assert status == "block"
+    assert "0138" in reason or "0136" in reason
+
+
+async def test_guard_with_target_branch_list_error_defers():
+    """Guard defers (never waves through) when target branch listing fails."""
+    diff = _added_file_diff("backend/alembic/versions/0137_new.py", "0137", "0136")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0137_new.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+        patch(
+            "app.github.list_versions_at_ref",
+            side_effect=RuntimeError("network error"),
+        ),
+    ):
+        status, reason = await _validate_rollup_migration_chain(
+            "t", "o", "r", 1, "automain"
+        )
+    assert status == "defer"
+    assert "network error" in reason
+
+
+# ── plan_migration_reconciliation (pure renumber planner) ───────────────────
+
+
+def test_plan_reconciliation_collision_renumbers_and_rechains():
+    """A single migration whose revision collides with an existing one is
+    renumbered to head+1 and rechained onto the current head."""
+    existing = ["0136_prev.py", "0137_existing.py"]
+    added = {
+        "backend/alembic/versions/0137_new.py": _migration_src("0137", "0136"),
+    }
+    plan = plan_migration_reconciliation(existing, added)
+    assert plan is not None
+    assert plan["old_revision"] == "0137"
+    assert plan["new_revision"] == "0138"
+    assert plan["new_down_revision"] == "0137"
+    assert plan["new_path"] == "backend/alembic/versions/0138_new.py"
+    assert plan["expected_schema_revision"] == "0138"
+    # Rewritten body reflects the new revision + anchor, and revalidates clean.
+    rev, down = parse_revision_identifiers(plan["new_source"])
+    assert (rev, down) == ("0138", "0137")
+    assert (
+        validate_combined_migration_chain(existing, {plan["new_path"]: plan["new_source"]})
+        is None
+    )
+
+
+def test_plan_reconciliation_stale_anchor_rechains():
+    """A single migration anchored to a no-longer-head revision is rechained
+    onto the current head (and renumbered to the next free revision)."""
+    existing = ["0136_prev.py", "0137_other.py"]
+    added = {
+        "backend/alembic/versions/0138_new.py": _migration_src("0138", "0136"),
+    }
+    plan = plan_migration_reconciliation(existing, added)
+    assert plan is not None
+    assert plan["new_revision"] == "0138"
+    assert plan["new_down_revision"] == "0137"
+    rev, down = parse_revision_identifiers(plan["new_source"])
+    assert (rev, down) == ("0138", "0137")
+
+
+def test_plan_reconciliation_already_valid_returns_none():
+    """A migration that already chains cleanly onto the head needs no plan."""
+    existing = ["0136_prev.py", "0137_head.py"]
+    added = {
+        "backend/alembic/versions/0138_new.py": _migration_src("0138", "0137"),
+    }
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_multiple_added_returns_none():
+    """Multiple added migrations are never auto-reconciled (ambiguous)."""
+    existing = ["0136_prev.py", "0137_head.py"]
+    added = {
+        "backend/alembic/versions/0138_a.py": _migration_src("0138", "0137"),
+        "backend/alembic/versions/0139_b.py": _migration_src("0139", "0138"),
+    }
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_multi_head_returns_none():
+    """Two added migrations resolving to two heads are not mechanical."""
+    existing = ["0137_head.py"]
+    added = {
+        "backend/alembic/versions/0138_a.py": _migration_src("0138", "0137"),
+        "backend/alembic/versions/0139_b.py": _migration_src("0139", "0137"),
+    }
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_unparseable_returns_none():
+    """An unparseable migration file yields no plan."""
+    existing = ["0137_head.py"]
+    added = {"backend/alembic/versions/0138_new.py": "def upgrade():\n    pass\n"}
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_no_existing_chain_returns_none():
+    """With no existing migrations there is nothing to collide with."""
+    added = {
+        "backend/alembic/versions/0138_new.py": _migration_src("0138", "0137"),
+    }
+    assert plan_migration_reconciliation([], added) is None
+
+
+def test_plan_reconciliation_stale_anchor_to_none_rechains():
+    """A root-anchored (down_revision = None) migration added to a non-empty
+    target branch is rechained onto the head."""
+    existing = ["0136_prev.py", "0137_head.py"]
+    added = {
+        "backend/alembic/versions/0137_new.py": _migration_src("0137", None),
+    }
+    plan = plan_migration_reconciliation(existing, added)
+    assert plan is not None
+    rev, down = parse_revision_identifiers(plan["new_source"])
+    assert (rev, down) == ("0138", "0137")
+
+
+# ── rewrite_expected_schema_revision ────────────────────────────────────────
+
+
+def test_rewrite_expected_schema_revision_replaces_literal():
+    src = 'X = 1\nEXPECTED_SCHEMA_REVISION = "0137"\nY = 2\n'
+    out, n = rewrite_expected_schema_revision(src, "0138")
+    assert n == 1
+    assert 'EXPECTED_SCHEMA_REVISION = "0138"' in out
+    assert '"0137"' not in out
+
+
+def test_rewrite_expected_schema_revision_single_quotes_normalised():
+    src = "EXPECTED_SCHEMA_REVISION = '0137'\n"
+    out, n = rewrite_expected_schema_revision(src, "0140")
+    assert n == 1
+    assert out.strip() == 'EXPECTED_SCHEMA_REVISION = "0140"'
+
+
+def test_rewrite_expected_schema_revision_absent_returns_zero():
+    src = "SOMETHING_ELSE = 1\n"
+    out, n = rewrite_expected_schema_revision(src, "0138")
+    assert n == 0
+    assert out == src
