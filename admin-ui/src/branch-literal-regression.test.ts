@@ -103,7 +103,11 @@ describe('hardcoded branch-literal regression guard (admin-ui)', () => {
     const offenders: Offender[] = [];
 
     for (const file of files) {
-      const rel = path.relative(SRC_DIR, file);
+      // Normalize to forward slashes so the allowKey (and the printed
+      // offender path) match the ALLOWLIST entries on every platform —
+      // path.relative yields backslashes on Windows, which otherwise made
+      // every allowlisted entry look un-allowlisted in local dev.
+      const rel = path.relative(SRC_DIR, file).split(path.sep).join('/');
       const raw = readFileSync(file, 'utf-8');
       const rawLines = raw.split('\n');
 

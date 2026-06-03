@@ -58,8 +58,82 @@ jobs:
             echo "agent=${{ steps.filter.outputs.agent }}" >> $GITHUB_OUTPUT
           fi
 
-  frontend:
-    name: CI / Frontend
+  # Frontend was one ~5-min serial job (build → lint → unit suite → browser
+  # viewport suite). It's now split into parallel legs: build+lint and the
+  # happy-dom unit suite don't need Playwright/Chromium, so only the browser
+  # viewport leg installs it; and the unit suite is sharded so it no longer
+  # runs serially behind everything else. The `CI / Frontend` gate job (below)
+  # carries the required-status-check name the ruleset expects.
+  #
+  # NOTE: the old per-job "broken on main" baseline escape-hatch
+  # (frontend-status.txt) was dropped. It only populated on a push-to-main
+  # trigger, which this workflow no longer has (PR-only — see the header), so
+  # it had been inert (failures already always blocked). Each leg now fails
+  # directly.
+  frontend-build:
+    name: CI / Frontend (build + lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./admin-ui
+        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
+
+      - name: Build (tsc + vite)
+        working-directory: ./admin-ui
+        env:
+          VITE_API_URL: http://localhost:8080
+          VITE_FIREBASE_API_KEY: ci-placeholder
+          VITE_FIREBASE_AUTH_DOMAIN: ci-placeholder.firebaseapp.com
+          VITE_FIREBASE_PROJECT_ID: ci-placeholder
+        run: npm run build
+
+      - name: Lint
+        working-directory: ./admin-ui
+        run: npx eslint .
+
+  frontend-unit:
+    name: CI / Frontend (unit shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true'
+    # The unit suite (~1400 tests) runs in happy-dom (not a real browser), so
+    # no Playwright. Split into 2 parallel legs via vitest's built-in --shard;
+    # wall-clock ≈ the slower half.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: admin-ui/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ./admin-ui
+        run: npm ci || { echo "::warning::npm ci failed (esbuild ETXTBSY postinstall race) - retrying once"; sleep 5; npm ci; }
+
+      - name: Unit tests (happy-dom, shard ${{ matrix.shard }}/2)
+        working-directory: ./admin-ui
+        run: npx vitest run --shard=${{ matrix.shard }}/2
+
+  frontend-viewport:
+    name: CI / Frontend (viewport)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: detect
@@ -80,7 +154,8 @@ jobs:
       - name: Install Playwright Chromium + system deps
         # Required for the viewport suite (vitest browser-mode + chromium).
         # Agent VMs lack libatk/libnss/libxkbcommon by default; CI gets a
-        # clean ubuntu-latest each run so we install on every job.
+        # clean ubuntu-latest each run so we install on every job. Retry the
+        # Docker Hub / apt download to absorb transient registry blips.
         working-directory: ./admin-ui
         run: |
           for i in 1 2 3; do
@@ -91,24 +166,14 @@ jobs:
           echo "::error::playwright install failed after 3 attempts"
           exit 1
 
-      - name: Build (tsc + vite)
-        id: build
-        continue-on-error: true
+      - name: Viewport coverage invariants
+        # Static guard (no browser): every operator component has a viewport
+        # test, required assertions present, escape-hatch budget within limit.
+        # Was chained ahead of the browser run inside `npm run test:viewport`.
         working-directory: ./admin-ui
-        env:
-          VITE_API_URL: http://localhost:8080
-          VITE_FIREBASE_API_KEY: ci-placeholder
-          VITE_FIREBASE_AUTH_DOMAIN: ci-placeholder.firebaseapp.com
-          VITE_FIREBASE_PROJECT_ID: ci-placeholder
-        run: npm run build
+        run: node scripts/check-viewport-coverage.js
 
-      - name: Lint
-        id: lint
-        continue-on-error: true
-        working-directory: ./admin-ui
-        run: npx eslint .
-
-      - name: Viewport tests
+      - name: Viewport tests (browser mode)
         id: viewport
         continue-on-error: true
         working-directory: ./admin-ui
@@ -117,7 +182,7 @@ jobs:
           VITE_FIREBASE_API_KEY: ci-placeholder
           VITE_FIREBASE_AUTH_DOMAIN: ci-placeholder.firebaseapp.com
           VITE_FIREBASE_PROJECT_ID: ci-placeholder
-        run: npm run test:viewport
+        run: npx vitest run --config vitest.viewport.config.ts
 
       # Failure screenshots are visual regressions; the stack trace alone
       # rarely makes the issue diagnosable. screenshotFailures=true in
@@ -136,39 +201,36 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Save result for baseline (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Fail if viewport tests failed
+        if: steps.viewport.outcome == 'failure'
         run: |
-          if [ "${{ steps.build.outcome }}" = "failure" ] || [ "${{ steps.lint.outcome }}" = "failure" ] || [ "${{ steps.viewport.outcome }}" = "failure" ]; then
-            echo "BROKEN" > frontend-status.txt
-          else
-            echo "OK" > frontend-status.txt
-          fi
+          echo "::error::Viewport (browser-mode) tests failed"
+          exit 1
 
-      - name: Upload frontend status (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
-        with:
-          path: frontend-status.txt
-          key: ci-baseline-frontend-${{ github.sha }}
-
-      - name: Load main baseline (PR only)
-        if: github.event_name == 'pull_request' && (steps.build.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.viewport.outcome == 'failure')
-        uses: actions/cache/restore@v4
-        with:
-          path: frontend-status.txt
-          key: ci-baseline-frontend-${{ github.sha }}
-          restore-keys: ci-baseline-frontend-
-
-      - name: Evaluate result
-        if: steps.build.outcome == 'failure' || steps.lint.outcome == 'failure' || steps.viewport.outcome == 'failure'
+  # Required-status-check gate: the "mainProtection" ruleset requires a check
+  # named exactly "CI / Frontend". The split legs above report under different
+  # names, so this aggregator carries the canonical name and passes iff every
+  # leg succeeded — or frontend was skipped because the PR didn't touch
+  # admin-ui (detect=false), which must still satisfy the required check.
+  frontend-gate:
+    name: CI / Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [frontend-build, frontend-unit, frontend-viewport]
+    if: always()
+    steps:
+      - name: Require all frontend legs to pass
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ] && [ -f frontend-status.txt ] && grep -q "BROKEN" frontend-status.txt; then
-            echo "::warning::Frontend CI failed but is also broken on main — not blocking PR"
-          else
-            echo "::error::Frontend CI failed (build=${{ steps.build.outcome }}, lint=${{ steps.lint.outcome }}, viewport=${{ steps.viewport.outcome }})"
-            exit 1
-          fi
+          B="${{ needs.frontend-build.result }}"
+          U="${{ needs.frontend-unit.result }}"
+          V="${{ needs.frontend-viewport.result }}"
+          for r in "$B" "$U" "$V"; do
+            if [ "$r" != "success" ] && [ "$r" != "skipped" ]; then
+              echo "::error::Frontend leg failed (build=$B unit=$U viewport=$V)"
+              exit 1
+            fi
+          done
+          echo "Frontend legs OK (build=$B unit=$U viewport=$V)"
 
   backend:
     name: CI / Backend (shard ${{ matrix.shard }})
