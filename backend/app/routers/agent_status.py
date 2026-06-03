@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
-from app.database import get_session
+from app.database import get_session, resolve_async_engine
 from app.branch_resolution import classify_rollup_merge_outcome
 from app.landed_signal import apply_merged_landed_signal
 from app.models import (
@@ -946,9 +946,9 @@ async def update_agent_status(
             # the outer lock deadlocks the inner acquire until lock_timeout
             # (30s) → LockNotAvailableError → 500 → Cloud Run ContainerError.
             await session.commit()
-            _bind = session.bind
+            _engine = resolve_async_engine(session)
             _factory = async_sessionmaker(
-                _bind, class_=AsyncSession, expire_on_commit=False
+                _engine, class_=AsyncSession, expire_on_commit=False
             )
             try:
                 result = await _process_post_commit(
@@ -3083,9 +3083,9 @@ async def update_agent_status(
         # Pass a session factory bound to the SAME engine the request used.
         # In production this is AsyncSessionLocal; in tests it's the test engine.
         # This ensures the helper's fresh session doesn't bypass test DB overrides.
-        _bind = session.bind
+        _engine = resolve_async_engine(session)
         _factory = async_sessionmaker(
-            _bind, class_=AsyncSession, expire_on_commit=False
+            _engine, class_=AsyncSession, expire_on_commit=False
         )
         # Audit Phase C4 (M-C6): release the request-session connection back to
         # the pool now. _process_post_commit and _persist_post_commit_pending

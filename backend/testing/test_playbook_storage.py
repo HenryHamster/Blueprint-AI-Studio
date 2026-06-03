@@ -74,6 +74,16 @@ def test_playbook_learning_reexports_storage_helpers():
         storage.finalize_pending_playbook_entries
     )
     assert learning.retire_idle_auto_entries is storage.retire_idle_auto_entries
+    # Full lifecycle re-export set must point at the canonical storage objects
+    # by identity — guards against a facade shadow copy of any of these.
+    assert learning.retire_ineffective_patterns is storage.retire_ineffective_patterns
+    assert learning.record_playbook_applied is storage.record_playbook_applied
+    assert learning.record_playbook_confirmed is storage.record_playbook_confirmed
+    assert learning.check_and_flag_stale_refs is storage.check_and_flag_stale_refs
+    assert learning._is_auto_playbook_suppressed is (
+        storage._is_auto_playbook_suppressed
+    )
+    assert learning._get_prior_archive_entry is storage._get_prior_archive_entry
 
 
 # ─────────────────────────────────────────────────────────────────────────────

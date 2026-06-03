@@ -6995,6 +6995,81 @@ async def test_post_commit_lock_on_retry_returns_pending_not_500(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_post_commit_resolves_engine_from_none_bind_session(
+    client: AsyncClient, db_session, mocker
+):
+    from sqlalchemy.ext.asyncio import AsyncSession as _AS, async_sessionmaker
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    async def _process_post_commit(task_id, _payload, _session_factory):
+        async with _session_factory() as session:
+            assert await session.get(Task, task_id)
+        return {"status": "accepted", "task_id": str(task_id)}
+
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        side_effect=_process_post_commit,
+    )
+
+    project = Project(name="None Bind Post Commit", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+
+    class _NoneBindSession:
+        bind = None
+
+        def __init__(self, session):
+            self._session = session
+
+        def get_bind(self, *args, **kwargs):
+            return self._session.get_bind(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+    async def _override_get_session():
+        async with factory() as session:
+            yield _NoneBindSession(session)
+
+    app.dependency_overrides[get_session] = _override_get_session
+    try:
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "build"}],
+            vm_instance_id="agent-vm-inline",
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        token = create_agent_token(str(task.id), task.vm_instance_id)
+        headers = {"x-agent-token": token}
+        payload = {"task_id": str(task.id), "status": "COMPLETED"}
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "accepted"
+        await db_session.refresh(task)
+        assert task.post_commit_pending is False
+
+        task.post_commit_pending = True
+        db_session.add(task)
+        await db_session.commit()
+        resp = await client.post("/api/agent/status", json=payload, headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "accepted"
+        await db_session.refresh(task)
+        assert task.post_commit_pending is False
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "requested_model", ["gemini-3.1-pro-preview", "gemini-3-pro-preview"]
 )

@@ -2022,6 +2022,67 @@ class TestReviewerOriginParity:
 # compatibility symbols without a CI failure.
 
 
+# Lifecycle/storage helpers + constants whose single canonical home is
+# ``app.playbook_storage``.  The ``playbook_lifecycle`` shim and the
+# ``playbook_learning`` facade must re-export every one of these BY IDENTITY —
+# never redefine a local copy (a "dead twin" that can drift independently).
+# Keep in sync with the re-export blocks in playbook_lifecycle.py / playbook_learning.py.
+_CANONICAL_PLAYBOOK_STORAGE_NAMES = frozenset(
+    {
+        # lifecycle helpers
+        "finalize_pending_playbook_entries",
+        "retire_idle_auto_entries",
+        "retire_ineffective_patterns",
+        "check_and_flag_stale_refs",
+        "record_playbook_applied",
+        "record_playbook_confirmed",
+        "_is_auto_playbook_suppressed",
+        "_get_prior_archive_entry",
+        "count_idle_auto_retired_within",
+        "count_low_success_retired_within",
+        "_extract_file_paths",
+        # lifecycle constants
+        "_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS",
+        "_FILE_PATH_RE",
+        "_IDLE_RETIRE_DAYS",
+        "_RETIRE_MAX_SUCCESS_RATE",
+        "_RETIRE_MIN_FOLLOWED",
+        "_STALE_AGE_DAYS",
+        "_STALE_CONFIRM_THRESHOLD",
+    }
+)
+
+
+def _module_top_level_bound_names(module_path: str) -> set[str]:
+    """Return names *defined* (not imported) at module top level.
+
+    Collects targets of ``def``/``async def``/``class`` statements and
+    module-level assignments (``Assign``/``AnnAssign``), while deliberately
+    excluding names introduced via ``import`` / ``from ... import`` — those are
+    re-exports, which is exactly what the shim/facade are allowed to do.
+    """
+    import ast
+
+    with open(module_path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=module_path)
+
+    bound: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    bound.add(target.id)
+                elif isinstance(target, (ast.Tuple, ast.List)):
+                    for elt in target.elts:
+                        if isinstance(elt, ast.Name):
+                            bound.add(elt.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bound.add(node.target.id)
+    return bound
+
+
 class TestPlaybookLearningFacadeCompat:
     def test_review_categories_is_canonical_object(self):
         """playbook_learning._REVIEW_CATEGORIES must be the same object as
@@ -2065,6 +2126,79 @@ class TestPlaybookLearningFacadeCompat:
         assert callable(finalize_pending_playbook_entries)
         assert callable(retire_idle_auto_entries)
         assert callable(retire_ineffective_patterns)
+
+    def test_facade_lifecycle_symbols_are_canonical_storage_objects(self):
+        """The facade must re-export each lifecycle helper/constant BY IDENTITY.
+
+        ``test_compat_lifecycle_and_storage_symbols_accessible`` only proves the
+        names resolve and are callable — a shadow copy with the same name would
+        pass it.  This tightens the guard to object identity: if the facade ever
+        starts pointing at a local re-implementation again (a "dead twin" that
+        can drift from the canonical storage logic), this fails.
+        """
+        import app.playbook_learning as learning
+        import app.playbook_storage as storage
+
+        mismatched = [
+            name
+            for name in sorted(_CANONICAL_PLAYBOOK_STORAGE_NAMES)
+            if getattr(learning, name) is not getattr(storage, name)
+        ]
+        assert not mismatched, (
+            "app.playbook_learning re-exports a shadow copy instead of the "
+            "canonical app.playbook_storage object for: "
+            f"{mismatched}. The facade must re-export by identity "
+            "(`from app.playbook_storage import <name>`), not redefine."
+        )
+
+    def test_lifecycle_shim_symbols_are_canonical_storage_objects(self):
+        """The playbook_lifecycle shim must re-export storage objects by identity.
+
+        Callers still import ``app.playbook_lifecycle.<name>`` (e.g.
+        ``playbook_auto``, ``autonomous_research``); those must resolve to the
+        one canonical storage implementation, not a re-introduced twin.
+        """
+        import app.playbook_lifecycle as shim
+        import app.playbook_storage as storage
+
+        mismatched = [
+            name
+            for name in sorted(_CANONICAL_PLAYBOOK_STORAGE_NAMES)
+            if getattr(shim, name) is not getattr(storage, name)
+        ]
+        assert not mismatched, (
+            "app.playbook_lifecycle re-exports a shadow copy instead of the "
+            "canonical app.playbook_storage object for: "
+            f"{mismatched}. The shim must re-export by identity, not redefine."
+        )
+
+    def test_shim_and_facade_do_not_redefine_lifecycle_helpers(self):
+        """Neither the shim nor the facade may *define* a canonical lifecycle name.
+
+        Source-scan tripwire: AST-parse playbook_lifecycle.py and
+        playbook_learning.py and assert that none of the canonical
+        storage-owned names is bound by a local ``def``/``class``/assignment.
+        Re-exports via ``import`` are allowed (and expected); a redefinition is
+        a dead twin that the identity checks above would also catch, but this
+        flags it at the source so the regression is obvious in review.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list[str] = []
+        for fname in ("playbook_lifecycle.py", "playbook_learning.py"):
+            path = os.path.join(app_dir, fname)
+            redefined = _module_top_level_bound_names(path) & (
+                _CANONICAL_PLAYBOOK_STORAGE_NAMES
+            )
+            offenders.extend(f"  {fname}: {name}" for name in sorted(redefined))
+        assert not offenders, (
+            "A canonical app.playbook_storage lifecycle helper/constant is "
+            "redefined (not re-exported) in the shim/facade — this re-introduces "
+            "a dead twin that can drift from the canonical implementation. "
+            "Re-export it via `from app.playbook_storage import <name>` instead.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
 
 
 # ── edges_considered Schema Invariants ────────────────────────────────────────

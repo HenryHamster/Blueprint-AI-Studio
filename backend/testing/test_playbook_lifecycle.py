@@ -15,6 +15,33 @@ from testing._playbook_test_helpers import _make_project
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shim re-export identity
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_lifecycle_shim_reexports_storage_by_identity():
+    """app.playbook_lifecycle re-exports the helpers this suite exercises (via
+    the facade) BY IDENTITY from app.playbook_storage — not a local twin.
+
+    These suppression/resurrection helpers must have a single canonical home;
+    the shim exists only for backward-compatible imports.
+    """
+    import app.playbook_lifecycle as shim
+    import app.playbook_storage as storage
+
+    assert shim._is_auto_playbook_suppressed is storage._is_auto_playbook_suppressed
+    assert shim._get_prior_archive_entry is storage._get_prior_archive_entry
+    assert (
+        shim._AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS
+        is storage._AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS
+    )
+    assert shim.finalize_pending_playbook_entries is (
+        storage.finalize_pending_playbook_entries
+    )
+    assert shim.retire_idle_auto_entries is storage.retire_idle_auto_entries
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for anti-resurrection suppression helpers
 # ─────────────────────────────────────────────────────────────────────────────
 

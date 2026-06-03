@@ -85,14 +85,16 @@ from app.playbook_sr_metrics import (  # noqa: F401
     compute_sr_catch_rate_trends,
 )
 
-# Playbook entry lifecycle (pending-source finalize, suppression/resurrection,
-# retirement, follow/confirm bookkeeping, stale-ref flagging) lives in
-# ``app.playbook_lifecycle``.  Re-exported here so callers and tests that
-# patch via ``app.playbook_learning.<name>`` keep working unchanged.
-from app.playbook_lifecycle import (  # noqa: F401
+# The playbook entry lifecycle and storage helpers share one canonical home,
+# ``app.playbook_storage`` (pending-source finalize, suppression/resurrection,
+# retirement, follow/confirm bookkeeping, stale-ref flagging, capacity/archive
+# management, and grounding).  Re-exported here so existing callers and tests
+# that patch via ``app.playbook_learning.<name>`` keep working unchanged.
+from app.playbook_storage import (  # noqa: F401
     _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
     _FILE_PATH_RE,
     _IDLE_RETIRE_DAYS,
+    _PLAYBOOK_CAPACITY_BYTES,
     _RETIRE_MAX_SUCCESS_RATE,
     _RETIRE_MIN_FOLLOWED,
     _STALE_AGE_DAYS,
@@ -100,28 +102,21 @@ from app.playbook_lifecycle import (  # noqa: F401
     _extract_file_paths,
     _get_prior_archive_entry,
     _is_auto_playbook_suppressed,
-    check_and_flag_stale_refs,
-    count_idle_auto_retired_within,
-    count_low_success_retired_within,
-    record_playbook_applied,
-    record_playbook_confirmed,
-    retire_ineffective_patterns,
-)
-
-# Canonical storage helpers live in ``app.playbook_storage``.  Re-exported here
-# so existing callers and tests that patch via ``app.playbook_learning.<name>``
-# keep working unchanged.
-from app.playbook_storage import (  # noqa: F401
-    _PLAYBOOK_CAPACITY_BYTES,
     _playbook_size_bytes,
     branch_grounding_due,
+    check_and_flag_stale_refs,
     check_and_flag_stale_refs_branch_aware,
+    count_idle_auto_retired_within,
+    count_low_success_retired_within,
     finalize_pending_playbook_entries,
     ground_design_doc_systems,
     ground_design_doc_systems_branch_aware,
     mark_branch_grounding_done,
     maybe_archive_for_capacity,
+    record_playbook_applied,
+    record_playbook_confirmed,
     retire_idle_auto_entries,
+    retire_ineffective_patterns,
 )
 
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
@@ -150,12 +145,12 @@ from app.sr_signal_trends import (  # noqa: E402,F401
 # Capacity-management constants/functions are in playbook_capacity.py (imported above).
 # Entry-lifecycle constants (_RETIRE_MIN_FOLLOWED, _IDLE_RETIRE_DAYS,
 # _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS, _STALE_AGE_DAYS,
-# _STALE_CONFIRM_THRESHOLD, _FILE_PATH_RE) live in playbook_lifecycle.py
+# _STALE_CONFIRM_THRESHOLD, _FILE_PATH_RE) live in playbook_storage.py
 # and are re-exported above for backward compatibility.
 
 # Review-extracted playbook entries are refreshed in-place when their
 # updated_at exceeds _REVIEW_PLAYBOOK_REFRESH_DAYS. Stale-flagging and the
-# broader storage lifecycle live in app.playbook_lifecycle and are re-exported
+# broader storage lifecycle live in app.playbook_storage and are re-exported
 # here for backward compatibility.
 _REVIEW_PLAYBOOK_REFRESH_DAYS = 30
 
@@ -163,7 +158,7 @@ _REVIEW_PLAYBOOK_REFRESH_DAYS = 30
 # actually ran verification commands (pytest, lint, typecheck) and got exit 0.
 # Miss rate = fraction of tasks where the agent reported passed: false.
 
-# _FILE_PATH_RE is re-exported above from playbook_lifecycle.
+# _FILE_PATH_RE is re-exported above from playbook_storage.
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +171,7 @@ logger = logging.getLogger(__name__)
 # _is_auto_playbook_suppressed, record_playbook_applied,
 # record_playbook_confirmed, retire_ineffective_patterns,
 # retire_idle_auto_entries, count_idle_auto_retired_within,
-# count_low_success_retired_within) live in app.playbook_lifecycle and
+# count_low_success_retired_within) live in app.playbook_storage and
 # are re-exported above.
 
 
