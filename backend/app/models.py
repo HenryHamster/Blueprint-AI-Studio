@@ -1900,6 +1900,12 @@ class OrchestratorErrorAck(SQLModel, table=True):
     acknowledged_by: str = Field(default="")
 
 
+# Maximum stored length for operator/user-authored message content and
+# resolution notes. Shared by the admin-notifications and project-directions
+# message endpoints so their over-limit rejection cannot drift apart.
+MESSAGE_CONTENT_MAX = 5000
+
+
 class MessageType(str, Enum):
     QUESTION = "QUESTION"
     FEEDBACK = "FEEDBACK"

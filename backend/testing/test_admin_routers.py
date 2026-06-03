@@ -1687,7 +1687,10 @@ class TestDeleteProject:
         task_id = str(task.id)
 
         fired_ids: list = []
-        sentinel = lambda tid: fired_ids.append(tid)
+
+        def sentinel(tid):
+            fired_ids.append(tid)
+
         _on_task_terminal_callbacks.append(sentinel)
         try:
             resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
@@ -2549,6 +2552,59 @@ class TestMessages:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_create_message_over_limit_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """Over-limit content is rejected (not silently truncated)."""
+        from app.models import MESSAGE_CONTENT_MAX
+
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "x" * (MESSAGE_CONTENT_MAX + 1),
+            },
+        )
+        assert resp.status_code == 400
+        assert str(MESSAGE_CONTENT_MAX) in resp.json()["error"]["message"]
+
+        # Nothing should have been persisted for this project.
+        rows = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id
+                )
+            )
+        ).scalars().all()
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_create_message_at_limit_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Content of exactly the limit is accepted and stored in full."""
+        from app.models import MESSAGE_CONTENT_MAX
+
+        project = await _make_project(db_session)
+        content = "x" * MESSAGE_CONTENT_MAX
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": content,
+            },
+        )
+        assert resp.status_code == 200
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        assert len(msg.content) == MESSAGE_CONTENT_MAX
+
+    @pytest.mark.asyncio
     async def test_create_routine_message_appends_running_update(
         self, client: AsyncClient, db_session
     ):
@@ -2591,6 +2647,36 @@ class TestMessages:
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_resolve_message_over_limit_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """Over-limit resolution is rejected; the message stays unresolved."""
+        from app.models import MESSAGE_CONTENT_MAX
+
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="Help me",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={"resolution": "x" * (MESSAGE_CONTENT_MAX + 1)},
+        )
+        assert resp.status_code == 400
+        assert str(MESSAGE_CONTENT_MAX) in resp.json()["error"]["message"]
+
+        await db_session.refresh(msg)
+        assert msg.status == "open"
+        assert msg.resolution is None
 
     @pytest.mark.asyncio
     async def test_resolve_already_resolved_is_idempotent(
@@ -7078,6 +7164,87 @@ class TestBulkApprove:
         assert task.status == TaskStatus.EVALUATING
         assert (task.context or {}).get("pr_merged") is None
         assert "awaiting downstream landing" in (task.latest_status_message or "")
+
+
+class TestBulkRetrySessionFactory:
+    """The bulk-retry scoped session factory must resolve a real engine even
+    when the originating request session exposes a None ``.bind`` — the
+    production case, where ``AsyncSessionLocal`` resolves its engine lazily at
+    execute-time. Feeding that None straight into ``async_sessionmaker`` (the
+    pre-fix behaviour) produced an unbound factory whose sessions could not
+    resolve an engine. Mirrors the agent-status post-commit fix."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_async_engine_passthrough_and_fallback(self):
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from app.database import resolve_async_engine
+        import app.database as app_database
+
+        # 1. Explicit AsyncEngine bind -> passthrough (preserves test behaviour).
+        real_engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        try:
+
+            class _BoundSession:
+                bind = real_engine
+
+            assert resolve_async_engine(_BoundSession()) is real_engine
+        finally:
+            await real_engine.dispose()
+
+        # 2. None bind + get_bind() that cannot resolve -> module-engine fallback.
+        class _NoneBindSession:
+            bind = None
+
+            def get_bind(self, *args, **kwargs):
+                raise RuntimeError("no engine resolvable")
+
+        assert resolve_async_engine(_NoneBindSession()) is app_database.engine
+
+        # 3. Non-AsyncEngine bind (and a non-AsyncEngine get_bind) -> fallback.
+        class _BadBindSession:
+            bind = object()
+
+            def get_bind(self, *args, **kwargs):
+                return object()
+
+        assert resolve_async_engine(_BadBindSession()) is app_database.engine
+
+    @pytest.mark.asyncio
+    async def test_bulk_retry_resolves_engine_on_none_bind(self, db_session):
+        """Drive the bulk-retry mutation with an originating session whose
+        ``.bind`` is None: the scoped factory must still resolve a working
+        engine (the module fallback) and commit the task back to QUEUED."""
+        from app.admin import _bulk_retry_one_task
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Retry me",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.FAILED,
+            vm_instance_id="agent-vm-old",
+            attempt_count=3,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = task.id
+
+        class _NoneBindSession:
+            bind = None
+
+            def get_bind(self, *args, **kwargs):
+                raise RuntimeError("no engine resolvable")
+
+        old_vm = await _bulk_retry_one_task(task_id, _NoneBindSession())
+
+        # Non-parent retry returns the previous VM id for post-commit deletion.
+        assert old_vm == "agent-vm-old"
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.attempt_count == 0
+        assert task.vm_instance_id != "agent-vm-old"
 
 
 class TestTriggerRollup:

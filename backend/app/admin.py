@@ -24,7 +24,7 @@ from sqlalchemy import func, update, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
-from app.database import get_session
+from app.database import get_session, resolve_async_engine
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
@@ -503,10 +503,15 @@ async def _bulk_retry_one_task(
     nuke siblings, and (c) ``_requeue_parent_task`` runs scoped to one
     parent rather than queueing on the bulk transaction.
 
-    The scoped session is built from ``request_session.bind`` so it shares
-    the same engine — in production that's the module-level engine; in
-    tests it's the test engine (in-memory SQLite or test Postgres). Mirrors
-    the agent_status.py post-commit pattern.
+    The scoped session is built from the engine ``request_session`` resolves
+    to (via :func:`resolve_async_engine`) so it shares the same engine — in
+    production that's the module-level engine, in tests the test engine
+    (in-memory SQLite or test Postgres). It does NOT trust ``request_session
+    .bind`` directly: a session created from ``async_sessionmaker`` exposes a
+    None ``.bind`` in production (the engine resolves lazily at execute-time),
+    and feeding that None into a new ``async_sessionmaker`` yields an unbound
+    factory whose sessions fail to resolve an engine. Mirrors the
+    agent_status.py post-commit pattern (and shares its resolution helper).
 
     Returns the old vm_instance_id when the caller should schedule a VM
     delete after commit, or ``None`` for parent-type tasks (which clone
@@ -517,7 +522,7 @@ async def _bulk_retry_one_task(
     from app.task_lifecycle import _requeue_parent_task
 
     scoped_factory = async_sessionmaker(
-        request_session.bind,
+        resolve_async_engine(request_session),
         class_=AsyncSession,
         expire_on_commit=False,
     )

@@ -21,6 +21,7 @@ from app.models import (
     ProjectMember,
     ProjectMessage,
     MessageType,
+    MESSAGE_CONTENT_MAX,
     MessagesLastSeen,
     MessagesNoisePrefs,
     MessagesSavedViews,
@@ -476,8 +477,14 @@ async def create_message(
             status_code=400,
             detail=f"Invalid message_type. Must be one of: {', '.join(valid_types)}",
         )
-    if not payload.content.strip():
+    content = payload.content.strip()
+    if not content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
+    if len(content) > MESSAGE_CONTENT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
     # Cap context size to prevent storage abuse
     ctx = payload.context or {}
     if len(json.dumps(ctx)) > 50_000:
@@ -487,13 +494,13 @@ async def create_message(
         project_id=project_id,
         message_type=MessageType(msg_type),
         from_type="user",
-        content=payload.content.strip()[:5000],
+        content=content,
         context=ctx,
     )
     session.add(msg)
     event_type = ctx.get("event_type")
     if event_type and event_type in ROUTINE_EVENT_TYPES:
-        append_routine_digest(project, event_type, payload.content.strip())
+        append_routine_digest(project, event_type, content)
     await session.commit()
     await session.refresh(msg)
     return {"id": str(msg.id), "status": "created"}
@@ -515,8 +522,14 @@ async def resolve_message(
 
     if msg.status == "resolved":
         return {"id": str(msg.id), "status": "already_resolved"}
+    resolution = (payload.resolution or "").strip()
+    if len(resolution) > MESSAGE_CONTENT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
     msg.status = "resolved"
-    msg.resolution = (payload.resolution or "").strip()[:5000] or None
+    msg.resolution = resolution or None
     msg.resolved_at = _utcnow()
     session.add(msg)
     await session.commit()

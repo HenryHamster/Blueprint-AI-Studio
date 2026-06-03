@@ -69,6 +69,51 @@ def resolve_dialect_name(session: AsyncSession) -> str:
         return "postgresql"
 
 
+def resolve_async_engine(session: AsyncSession) -> AsyncEngine:
+    """Return the ``AsyncEngine`` a new ``async_sessionmaker`` should be bound
+    to in order to mirror the engine ``session`` runs against.
+
+    Footgun this guards against
+    ---------------------------
+    Code that needs a fresh, independently-committing session sometimes builds
+    a scoped factory from the request session's bind::
+
+        factory = async_sessionmaker(session.bind, ...)
+
+    This is a latent bug for the same reason :func:`resolve_dialect_name`
+    exists: an ``AsyncSession`` created from ``async_sessionmaker`` (every
+    ``AsyncSessionLocal()`` background session and every FastAPI request
+    session) exposes a **None ``.bind``** — it resolves a concrete engine
+    lazily at execute-time. Passing that None straight into a new
+    ``async_sessionmaker`` produces an *unbound* factory whose sessions raise
+    ``UnboundExecutionError`` the moment they try to run a query. In tests the
+    session is usually built with an explicit bind so the bug stays hidden; in
+    production (None bind) it fails. The agent-status post-commit path and the
+    admin bulk-retry path both build scoped factories this way.
+
+    Resolution order
+    ----------------
+    1. ``session.bind`` when it is already an ``AsyncEngine`` — preserves the
+       explicit-bind behaviour tests rely on.
+    2. ``session.get_bind()`` when it resolves an ``AsyncEngine`` — this is the
+       real engine the query would execute against in the None-bind case.
+    3. the module-level lazy ``engine`` — the production default, matching the
+       engine ``AsyncSessionLocal`` itself is bound to.
+    """
+    bind = session.bind
+    if isinstance(bind, AsyncEngine):
+        return bind
+    try:
+        resolved = session.get_bind()
+        if isinstance(resolved, AsyncEngine):
+            return resolved
+    except Exception:  # noqa: BLE001 — any bind-resolution failure must
+        # degrade to the module engine rather than crash the caller; the
+        # fallback IS the contract, so the catch is intentionally broad.
+        pass
+    return cast(AsyncEngine, engine)
+
+
 def _asyncpg_ssl_arg(value: str | None) -> object | None:
     """Map a SQLAlchemy/libpq SSL hint to an asyncpg ``ssl=`` connect kwarg.
 

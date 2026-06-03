@@ -17,6 +17,7 @@ from app.models import (
     TaskHistory,
     ProjectMessage,
     MessageType,
+    MESSAGE_CONTENT_MAX,
     RECOMMENDED_MODE_META_KEY,
     _utcnow,
 )
@@ -954,9 +955,10 @@ async def create_message(
     project = await _get_user_project(project_id, user["user_id"], session)
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Content cannot be empty")
-    if len(payload.content) > 5000:
+    if len(payload.content) > MESSAGE_CONTENT_MAX:
         raise HTTPException(
-            status_code=400, detail="Content exceeds 5000 character limit"
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
         )
 
     try:
