@@ -44,6 +44,7 @@ from app.rollup_migration_validation import (  # noqa: F401 - re-exported for ca
     _plan_rollup_migration_reconciliation,
     _touches_alembic_versions,
     _validate_rollup_migration_chain,
+    pr_touches_migrations,
 )
 from app.rollup_pr_verification import (  # noqa: F401 — re-exported for callers/tests
     MAX_REVIEW_RESPAWNS,
@@ -2722,31 +2723,47 @@ async def _check_and_trigger_rollup(
                             # 15-minute stale-parent sweep. Deferral counters below still
                             # run so a genuinely stuck PR still escalates to approval.
                             if _ms_key in ("blocked", "unstable"):
-                                try:
-                                    from app.github import enable_auto_merge
+                                # Migration-carrying rollup PRs must NOT be handed to
+                                # GitHub native auto-merge: the target branch can advance
+                                # while checks are pending, so the eventual merge could land
+                                # against a different migration chain than the one Blueprint
+                                # validated. Skip delegation and fall through to the
+                                # deferral / re-validation path so _validate_rollup_migration_chain
+                                # re-runs against the live target_branch on the next sweep.
+                                if await pr_touches_migrations(
+                                    gh_token, owner, repo, rollup_pr_number
+                                ):
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
+                                        f"touches Alembic migrations — skipping GitHub auto-merge; "
+                                        f"deferring for re-validation against {target_branch}"
+                                    )
+                                else:
+                                    try:
+                                        from app.github import enable_auto_merge
 
-                                    am_result = await enable_auto_merge(
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                        rollup_pr_number,
-                                        project_id=str(parent.project_id),
-                                    )
-                                    if am_result.get("enabled"):
-                                        logger.info(
-                                            f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
-                                            f"— enabled GitHub auto-merge"
+                                        am_result = await enable_auto_merge(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            rollup_pr_number,
+                                            project_id=str(parent.project_id),
                                         )
-                                    else:
-                                        logger.info(
-                                            f"[ROLLUP] PR #{rollup_pr_number} auto-merge enablement "
-                                            f"declined: {am_result.get('message')}"
+                                        if am_result.get("enabled"):
+                                            logger.info(
+                                                f"[ROLLUP] PR #{rollup_pr_number} mergeable_state={_ms_key} "
+                                                f"— enabled GitHub auto-merge"
+                                            )
+                                        else:
+                                            logger.info(
+                                                f"[ROLLUP] PR #{rollup_pr_number} auto-merge enablement "
+                                                f"declined: {am_result.get('message')}"
+                                            )
+                                    except Exception as _am_exc:
+                                        logger.warning(
+                                            f"[ROLLUP] Auto-merge enablement failed for PR "
+                                            f"#{rollup_pr_number}: {_am_exc}"
                                         )
-                                except Exception as _am_exc:
-                                    logger.warning(
-                                        f"[ROLLUP] Auto-merge enablement failed for PR "
-                                        f"#{rollup_pr_number}: {_am_exc}"
-                                    )
                             prev_state = parent_ctx.get("_merge_deferred_state")
                             deferred_count = (
                                 (parent_ctx.get("_merge_deferred_count", 0) + 1)

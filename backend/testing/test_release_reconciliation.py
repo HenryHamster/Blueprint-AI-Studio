@@ -169,6 +169,10 @@ async def test_reconcile_promotion_failed_records_promotion_custom_branches(
         "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
     )
     mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
         "app.github.get_branch_sha",
         new=AsyncMock(return_value="release0" * 5),
     )
@@ -181,6 +185,7 @@ async def test_reconcile_promotion_failed_records_promotion_custom_branches(
     version.last_qualification = {
         "status": "promotion_failed",
         "candidate_sha": candidate_sha,
+        "pr_url": "https://github.com/acme/widget/pull/42",
         "error": "merge_blocked",
         "confidence": 0.95,
     }
@@ -212,6 +217,10 @@ async def test_reconcile_pending_auto_merge_records_promotion_custom_branches(
     )
     is_ancestor = mocker.patch(
         "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+    mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
     )
     mocker.patch(
         "app.github.get_branch_sha",
@@ -247,6 +256,152 @@ async def test_reconcile_pending_auto_merge_records_promotion_custom_branches(
     await db_session.refresh(version)
     assert version.status == "promoted"
     assert version.last_qualification["status"] == "promoted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict, expected_reconciled, expected_status, expected_error",
+    [
+        (("ok", None), True, "promoted", None),
+        (
+            ("block", "live target chain invalid"),
+            True,
+            "promotion_failed",
+            "migration_guard_blocked",
+        ),
+        (("defer", "github unavailable"), False, "pending", None),
+    ],
+)
+async def test_reconcile_pending_auto_merge_revalidates_live_target_before_success(
+    db_session, mocker, verdict, expected_reconciled, expected_status, expected_error
+):
+    """Landing reconciliation only promotes after the live target chain revalidates."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=verdict),
+    )
+    branch_sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.95,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/acme/widget/pull/42",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_pending_auto_merge_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is expected_reconciled
+    await db_session.refresh(version)
+    if verdict[0] == "ok":
+        assert version.status == "promoted"
+        assert version.last_qualification["status"] == "promoted"
+    elif verdict[0] == "block":
+        assert version.status == "open"
+        assert version.last_qualification["status"] == "promotion_failed"
+        assert version.last_qualification["error"] == "migration_guard_blocked"
+        assert "promotion_pending" not in version.last_qualification
+    else:
+        assert version.status == "open"
+        assert version.last_qualification["status"] == "pending"
+        assert "promotion_pending" in version.last_qualification
+    if verdict[0] == "ok":
+        branch_sha_mock.assert_awaited_once()
+    else:
+        branch_sha_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verdict, expected_reconciled, expected_status, expected_error",
+    [
+        (("ok", None), True, "promoted", None),
+        (
+            ("block", "live target chain invalid"),
+            True,
+            "promotion_failed",
+            "migration_guard_blocked",
+        ),
+        (("defer", "github unavailable"), False, "promotion_failed", None),
+    ],
+)
+async def test_reconcile_promotion_failed_revalidates_live_target_before_success(
+    db_session, mocker, verdict, expected_reconciled, expected_status, expected_error
+):
+    """Promotion-failed landing reconciliation only promotes after live revalidation."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=verdict),
+    )
+    branch_sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": candidate_sha,
+        "pr_url": "https://github.com/acme/widget/pull/42",
+        "error": "merge_blocked",
+        "confidence": 0.95,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_promotion_failed_landed(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is expected_reconciled
+    await db_session.refresh(version)
+    if verdict[0] == "ok":
+        assert version.status == "promoted"
+        assert version.last_qualification["status"] == "promoted"
+    elif verdict[0] == "block":
+        assert version.status == "open"
+        assert version.last_qualification["status"] == "promotion_failed"
+        assert version.last_qualification["error"] == "migration_guard_blocked"
+    else:
+        assert version.status == "open"
+        assert version.last_qualification["status"] == "promotion_failed"
+    if verdict[0] == "ok":
+        branch_sha_mock.assert_awaited_once()
+    else:
+        branch_sha_mock.assert_not_awaited()
 
 
 # ===========================================================================

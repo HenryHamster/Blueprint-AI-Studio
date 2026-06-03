@@ -2424,6 +2424,54 @@ async def test_rollup_auto_merge_blocked_calls_enable_auto_merge(rollup_db, mock
     assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
 
 
+@pytest.mark.parametrize("mergeable_state", ["blocked", "unstable"])
+@pytest.mark.asyncio
+async def test_rollup_auto_merge_skips_github_for_migration_pr(
+    rollup_db, mocker, mergeable_state
+):
+    """A migration-carrying rollup PR must NOT be delegated to GitHub native
+    auto-merge: the target branch can advance while checks are pending, so the
+    merge could land against a different migration chain than the one validated.
+    Skip enable_auto_merge and fall through to the deferral / re-validation path
+    (the deferral counter must still increment so a stuck PR escalates)."""
+    state = {"state": mergeable_state}
+    _patch_deferred_counter_mocks(mocker, state)
+    # Override the empty get_pr_files mock so pr_touches_migrations returns True.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/alembic/versions/0140_add_widget.py"}],
+    )
+    # With a migration file present, the pre-merge combined-chain guard would
+    # otherwise fetch the (unmocked) diff and defer before the post-merge-failure
+    # branch. Force "ok" so flow reaches the auto-merge fallback we're testing.
+    mocker.patch(
+        "app.rollup_management._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+    mock_enable = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    mock_enable.assert_not_awaited()
+    # Deferral / re-validation path still runs so a stuck PR still escalates.
+    assert (parent.context or {}).get("_merge_deferred_count") == 1
+    assert (parent.context or {}).get("_merge_deferred_state") == mergeable_state
+
+
 @pytest.mark.asyncio
 async def test_rollup_per_state_alert_does_not_refire_on_flap(rollup_db, mocker):
     """A PR that flaps blocked↔unstable between sweeps resets the per-state

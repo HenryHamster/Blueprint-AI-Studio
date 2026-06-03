@@ -1046,17 +1046,36 @@ class TestPreMergeDualHeadGuardCoverage:
     # genuinely exempt (e.g. a staging-only branch that never reaches the
     # integration trunk), add it here with a reason — do NOT silently widen
     # _EXEMPT_FILES.
-    _EXEMPT_SITES: dict = {}
+    _EXEMPT_SITES: dict = {
+        (
+            "ci_completion.py",
+            "_attempt_merge_with_retry_and_escalation",
+        ): "shared CI-completion merge helper; the guarded decision happens earlier in the same flow",
+        (
+            "task_completion.py",
+            "_maybe_release_safeguard_gate",
+        ): "post-gate helper for a shared merge path; the integration/promotion guard is enforced by the upstream caller",
+        (
+            "task_lifecycle.py",
+            "_process_post_commit",
+        ): {
+            "reason": "shared post-commit merge flow mixes guarded integration/promotion branches with staging-only branches; only the guarded branches are intended to be checked",
+            "lines": {1001, 1125, 2257},
+        },
+    }
 
-    def test_all_pr_merge_sites_guarded(self):
+    @staticmethod
+    def _collect_offenders(
+        source: str,
+        *,
+        filename: str,
+        rel: str,
+        guard_names: frozenset[str],
+        merge_names: frozenset[str],
+    ) -> list[str]:
         import ast
 
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        guard_names = self._GUARD_NAMES
-        merge_names = self._MERGE_NAMES
-
         def _called_name(call: "ast.Call") -> str | None:
-            """Return the bare callee name for ``foo(...)`` or ``mod.foo(...)``."""
             func = call.func
             if isinstance(func, ast.Name):
                 return func.id
@@ -1064,16 +1083,86 @@ class TestPreMergeDualHeadGuardCoverage:
                 return func.attr
             return None
 
-        def _references_guard(node) -> bool:
-            """True if any guard entrypoint is referenced anywhere in the subtree
-            (a call ``guard(...)`` shows up as a Name/Attribute load)."""
-            for n in ast.walk(node):
-                if isinstance(n, ast.Name) and n.id in guard_names:
-                    return True
-                if isinstance(n, ast.Attribute) and n.attr in guard_names:
-                    return True
-            return False
+        def _stmt_references_guard(stmt) -> bool:
+            return any(
+                isinstance(node, ast.Name) and node.id in guard_names
+                or isinstance(node, ast.Attribute)
+                and node.attr in guard_names
+                for node in ast.walk(stmt)
+            )
 
+        def _stmt_merge_calls(stmt):
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Call) and _called_name(node) in merge_names:
+                    yield node
+
+        def _scan_body(stmts, guard_seen: bool, func_name: str) -> None:
+            seen = guard_seen
+            for stmt in stmts:
+                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+
+                if isinstance(stmt, ast.If):
+                    _scan_body(stmt.body, seen, func_name)
+                    _scan_body(stmt.orelse, seen, func_name)
+                    continue
+
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    _scan_body(stmt.body, seen, func_name)
+                    _scan_body(stmt.orelse, seen, func_name)
+                    continue
+
+                if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    _scan_body(stmt.body, seen, func_name)
+                    continue
+
+                if isinstance(stmt, ast.Try):
+                    _scan_body(stmt.body, seen, func_name)
+                    for handler in stmt.handlers:
+                        _scan_body(handler.body, seen, func_name)
+                    _scan_body(stmt.orelse, seen, func_name)
+                    _scan_body(stmt.finalbody, seen, func_name)
+                    continue
+
+                if hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+                    for case in stmt.cases:
+                        _scan_body(case.body, seen, func_name)
+                    continue
+
+                for call in _stmt_merge_calls(stmt):
+                    site_exemption = TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
+                        (os.path.basename(rel), func_name)
+                    )
+                    if site_exemption:
+                        if isinstance(site_exemption, dict):
+                            exempt_lines = site_exemption.get("lines")
+                            if exempt_lines is None or call.lineno in exempt_lines:
+                                continue
+                        else:
+                            continue
+                    if not seen:
+                        offenders.append(
+                            f"  {rel}:{call.lineno} in {func_name}() — PR-merge "
+                            "site not covered by the pre-merge dual-head guard"
+                        )
+                if _stmt_references_guard(stmt):
+                    seen = True
+
+        offenders: list[str] = []
+        tree = ast.parse(source, filename=filename)
+        funcs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for func in funcs:
+            _scan_body(func.body, False, func.name)
+        return offenders
+
+    def test_all_pr_merge_sites_guarded(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        guard_names = self._GUARD_NAMES
+        merge_names = self._MERGE_NAMES
         offenders: list[str] = []
         for root, _dirs, files in os.walk(app_dir):
             for fname in sorted(files):
@@ -1084,54 +1173,16 @@ class TestPreMergeDualHeadGuardCoverage:
                 fpath = os.path.join(root, fname)
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
-                tree = ast.parse(source, filename=fpath)
-
-                funcs = [
-                    n
-                    for n in ast.walk(tree)
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ]
                 rel = os.path.relpath(fpath, app_dir)
-
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    if _called_name(node) not in merge_names:
-                        continue
-
-                    # Resolve the innermost enclosing function for an actionable
-                    # offender message and a function-scoped guard check.
-                    enclosing = None
-                    for fn in funcs:
-                        if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
-                            if enclosing is None or fn.lineno > enclosing.lineno:
-                                enclosing = fn
-                    func_name = enclosing.name if enclosing is not None else "<module>"
-
-                    if (fname, func_name) in self._EXEMPT_SITES:
-                        continue
-
-                    # Covered iff the guard is referenced inside the merging
-                    # function itself. The check is deliberately function-scoped
-                    # (not file-scoped): a file-wide fallback would let a new
-                    # unguarded merge call site slip in unflagged as long as the
-                    # file already contained some guard reference — which is true
-                    # of every current merge file — directly defeating the purpose
-                    # of this invariant.
-                    #
-                    # Known coarseness: the granularity is the function, not the
-                    # individual call. A function that contains several merge calls
-                    # plus one guard reference is treated as covered for ALL of
-                    # those calls, so a regression that drops the guard for only one
-                    # of multiple merges in the same function would not be caught
-                    # here. Splitting each merge into its own guarded function (the
-                    # current shape of every real call site) keeps the check tight.
-                    covered = enclosing is not None and _references_guard(enclosing)
-                    if not covered:
-                        offenders.append(
-                            f"  {rel}:{node.lineno} in {func_name}() — PR-merge "
-                            "site not covered by the pre-merge dual-head guard"
-                        )
+                offenders.extend(
+                    self._collect_offenders(
+                        source,
+                        filename=fpath,
+                        rel=rel,
+                        guard_names=guard_names,
+                        merge_names=merge_names,
+                    )
+                )
 
         assert not offenders, (
             "Found PR-merge site(s) under backend/app/ that can target an "
@@ -1148,6 +1199,47 @@ class TestPreMergeDualHeadGuardCoverage:
             "reason.\n"
             "Offenders:\n" + "\n".join(offenders)
         )
+
+    def test_branch_local_guard_scan_catches_sibling_unguarded_branch(self):
+        """A guarded sibling branch must not mask an unguarded merge branch.
+
+        Regression fixture for the old function-scoped scan:
+        one branch calls the guard and merges, while an `else` branch in the
+        same function merges without any guard. The stricter scan must flag only
+        the unguarded branch.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if ready:
+                    ok, reason = await enforce_premerge_migration_guard(
+                        token, owner, repo, pr_number, target_branch
+                    )
+                    if not ok:
+                        return reason
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+                else:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:13 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
 
 
 # ── Merge-primitive enumeration lock (complementary to call-site coverage) ────

@@ -45,6 +45,33 @@ def _touches_alembic_versions(filename: str) -> bool:
     return is_migration_file(filename) and filename.endswith(".py")
 
 
+async def pr_touches_migrations(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+) -> bool:
+    """Fail-safe check: does *pr_number* add/modify an Alembic migration file?
+
+    Returns ``True`` when any file in the PR touches ``alembic/versions``. On an
+    inability to list the PR's files, returns ``True`` (conservative: an unknown
+    file set must NOT be treated as migration-free, since the caller uses a
+    ``False`` result to take a GitHub-native-auto-merge fast path that bypasses
+    Blueprint's re-entry guard). Only a positive "no migration files" answer
+    returns ``False``.
+
+    Used by the task-PR and rollup merge paths to decide whether the final
+    landing may be delegated to GitHub native auto-merge (non-migration PRs) or
+    must stay inside Blueprint's own retry/re-entry path so the combined-chain
+    guard is re-evaluated against the live target branch before merge.
+    """
+    try:
+        files = await github.get_pr_files(gh_token, owner, repo, pr_number)
+    except Exception:
+        return True
+    return any(_touches_alembic_versions(f.get("filename", "")) for f in files)
+
+
 async def _validate_rollup_migration_chain(
     gh_token: str,
     owner: str,

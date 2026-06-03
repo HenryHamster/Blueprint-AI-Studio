@@ -11732,6 +11732,10 @@ async def test_promotion_failed_candidate_on_main_reconciled(db_session, mocker)
         new=AsyncMock(return_value=True),
     )
     mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
         "app.github.get_branch_sha",
         new=AsyncMock(return_value=main_head_sha),
     )
@@ -11824,6 +11828,7 @@ async def test_promotion_failed_reconcile_idempotent(db_session, mocker):
         "status": "promotion_failed",
         "candidate_sha": candidate_sha,
         "error": "merge_blocked",
+        "pr_url": "https://github.com/acme/widget/pull/42",
     }
     db_session.add(version)
     await db_session.commit()
@@ -11836,6 +11841,10 @@ async def test_promotion_failed_reconcile_idempotent(db_session, mocker):
     mocker.patch(
         "app.github.is_ancestor_of",
         new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
     )
     mocker.patch(
         "app.github.get_branch_sha",
@@ -13033,6 +13042,7 @@ async def test_reconcile_promotion_failed_uses_project_promotion_target(
     version.last_qualification = {
         "status": "promotion_failed",
         "candidate_sha": candidate_sha,
+        "pr_url": "https://github.com/acme/custom/pull/42",
         "error": "merge_blocked",
         "confidence": 0.9,
         "sub_scores": {},
@@ -13047,6 +13057,10 @@ async def test_reconcile_promotion_failed_uses_project_promotion_target(
     )
     # Candidate is now on the promotion_target branch (operator merged it).
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
 
     branch_sha_calls: list[str] = []
 
@@ -13404,6 +13418,10 @@ async def test_reconcile_pending_auto_merge_uses_project_promotion_target(
     )
     # Candidate is now on the promotion_target branch (auto-merge landed).
     mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.release_reconciliation._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
 
     branch_sha_calls: list[str] = []
 

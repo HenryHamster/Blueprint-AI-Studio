@@ -5190,6 +5190,13 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
         new_callable=AsyncMock,
         return_value={"enabled": True},
     )
+    # The pre-auto-merge migration guard calls get_pr_files; a non-migration
+    # file keeps the GitHub-auto-merge fast path (pr_touches_migrations=False).
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/app/foo.py"}],
+    )
 
     session, factory = tl_db
     project = await _make_project(session)
@@ -5246,6 +5253,118 @@ async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocke
     )
     assert _review_approved(parked_loop), (
         "_review_approved must return True so handle_ci_completion can merge"
+    )
+
+
+@pytest.mark.parametrize("mergeable_state", ["clean", "blocked", "unstable"])
+@pytest.mark.asyncio
+async def test_auto_merge_migration_pr_skips_github_auto_merge(
+    tl_db, mocker, mergeable_state
+):
+    """A migration-carrying PR must NOT be delegated to GitHub native auto-merge.
+
+    For clean/blocked/unstable states the non-migration path arms
+    enable_auto_merge. A PR that touches alembic/versions must instead park in
+    CI-wait so handle_ci_completion re-runs the pre-merge Alembic guard against
+    the live target branch — otherwise the merge could land against a different
+    migration chain than the one Blueprint validated.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    spawn_calls: list = []
+
+    async def _capture_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "review"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "not mergeable"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": mergeable_state,
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+    # A migration file makes pr_touches_migrations return True → no delegation.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[
+            {"filename": "backend/alembic/versions/0140_add_widget.py"},
+        ],
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature Y",
+            "base_branch": "research/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/91",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    enable_auto_merge_mock.assert_not_called()
+    assert not spawn_calls, (
+        "Migration PR must park in CI-wait, not spawn a recovery task"
+    )
+
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    parked_loop = (task.context or {}).get("review_loop", {})
+    assert parked_loop.get("ci_waiting") is True, (
+        "migration PR must park with ci_waiting=True so handle_ci_completion "
+        "re-enters and re-runs the pre-merge Alembic guard"
     )
 
 

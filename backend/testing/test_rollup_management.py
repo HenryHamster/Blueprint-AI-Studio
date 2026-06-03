@@ -180,6 +180,92 @@ async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_pr_touches_migrations_positive(mocker):
+    """pr_touches_migrations returns True when a PR file is under alembic/versions."""
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files(
+            "backend/app/models.py",
+            "backend/alembic/versions/0140_add_widget.py",
+        ),
+    )
+    assert await pr_touches_migrations("tok", "owner", "repo", 42) is True
+
+
+@pytest.mark.asyncio
+async def test_pr_touches_migrations_negative(mocker):
+    """pr_touches_migrations returns False when no PR file touches alembic/versions."""
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files("backend/app/models.py", "admin-ui/src/App.tsx"),
+    )
+    assert await pr_touches_migrations("tok", "owner", "repo", 42) is False
+
+
+@pytest.mark.asyncio
+async def test_pr_touches_migrations_fetch_error_failsafe(mocker):
+    """A files-fetch error is fail-safe True: an unknown file set must NOT be
+    treated as migration-free (the caller would otherwise take the auto-merge
+    fast path that bypasses Blueprint's re-entry guard)."""
+    from app.rollup_migration_validation import pr_touches_migrations
+
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("502 from GitHub"),
+    )
+    assert await pr_touches_migrations("tok", "owner", "repo", 42) is True
+
+
+@pytest.mark.asyncio
+async def test_rollup_blocked_migration_pr_does_not_delegate_auto_merge(
+    cleanup_db, mocker
+):
+    """A migration-carrying rollup PR in mergeable_state=blocked must not be
+    handed to GitHub native auto-merge; it defers for re-validation instead."""
+    from app.rollup_management import _check_and_trigger_rollup
+
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="blocked")
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files("backend/alembic/versions/0140_add_widget.py"),
+    )
+    # Force the pre-merge combined-chain guard to "ok" so flow reaches the
+    # post-merge-failure auto-merge branch where pr_touches_migrations is checked
+    # (otherwise the migration file makes it defer on the unmocked diff fetch).
+    mocker.patch(
+        "app.rollup_management._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._dispatch_rollup_approval_alert", new_callable=AsyncMock
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    enable_auto_merge_mock.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert (parent.context or {}).get("_merge_deferred_state") == "blocked"
+
+
+@pytest.mark.asyncio
 async def test_rollup_not_touching_migrations_unaffected(cleanup_db, mocker):
     """A rollup whose diff does not touch alembic/versions auto-merges; the
     guard returns ok without even fetching the diff."""

@@ -1099,26 +1099,49 @@ async def _process_post_commit(
                                 )
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
                                 if ms in ("blocked", "unstable", "clean"):
-                                    am_result = await enable_auto_merge(
-                                        gh_token,
-                                        owner,
-                                        repo,
-                                        pr_number,
-                                        project_id=str(task.project_id),
+                                    from app.rollup_migration_validation import (
+                                        pr_touches_migrations,
                                     )
-                                    if am_result.get("enabled"):
+
+                                    # Migration-carrying PRs must NOT be delegated to
+                                    # GitHub native auto-merge: the target branch can
+                                    # advance while checks are still pending, so the
+                                    # eventual merge could land against a different
+                                    # migration chain than the one Blueprint validated.
+                                    # Skip delegation and park in CI-wait so
+                                    # handle_ci_completion re-enters and re-runs the
+                                    # pre-merge Alembic guard against the live ci_base
+                                    # before merging.
+                                    if await pr_touches_migrations(
+                                        gh_token, owner, repo, pr_number
+                                    ):
+                                        recovery_type = None
                                         logger.info(
-                                            f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})"
+                                            f"[PIPELINE] PR #{pr_number} (mergeable_state={ms}) "
+                                            f"touches Alembic migrations — skipping GitHub auto-merge; "
+                                            f"parking in CI-wait for re-validation against {base_branch}"
                                         )
                                     else:
-                                        logger.info(
-                                            f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
+                                        am_result = await enable_auto_merge(
+                                            gh_token,
+                                            owner,
+                                            repo,
+                                            pr_number,
+                                            project_id=str(task.project_id),
                                         )
-                                    if ms == "clean":
-                                        # PR is clean/ready — transient API failure, not a real
-                                        # conflict. Skip recovery task spawn; let auto-merge
-                                        # fire when GitHub is ready.
-                                        recovery_type = None
+                                        if am_result.get("enabled"):
+                                            logger.info(
+                                                f"[PIPELINE] Enabled GitHub auto-merge on PR #{pr_number} (mergeable_state={ms})"
+                                            )
+                                        else:
+                                            logger.info(
+                                                f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
+                                            )
+                                        if ms == "clean":
+                                            # PR is clean/ready — transient API failure, not a real
+                                            # conflict. Skip recovery task spawn; let auto-merge
+                                            # fire when GitHub is ready.
+                                            recovery_type = None
                                 elif ms == "dirty":
                                     recovery_type = "fix"
                             except Exception as _am_exc:
