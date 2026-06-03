@@ -15,6 +15,43 @@ from pathlib import Path
 import pytest
 
 
+def _assert_backmerge_modules_do_not_import_rollup_management(
+    source: str, *, filename: str
+) -> None:
+    """Reject back-merge-module escape hatches into the push-capable rollup path."""
+    import ast
+
+    tree = ast.parse(source, filename=filename)
+    forbidden_imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == "app.rollup_management":
+                forbidden_imports.append(
+                    "from app.rollup_management import "
+                    + ", ".join(alias.name for alias in node.names)
+                )
+            elif module == "app" and any(
+                alias.name == "rollup_management" for alias in node.names
+            ):
+                forbidden_imports.append("from app import rollup_management")
+        elif isinstance(node, ast.Import):
+            if any(alias.name == "app.rollup_management" for alias in node.names):
+                forbidden_imports.append("import app.rollup_management")
+
+    forbidden_helpers = []
+    if re.search(r"\b_attempt_alembic_autoreconcile\b", source):
+        forbidden_helpers.append("_attempt_alembic_autoreconcile")
+
+    assert not forbidden_imports and not forbidden_helpers, (
+        f"{filename} must not import or reference app.rollup_management's "
+        "push-capable Alembic autoreconcile helper. The back-merge block path "
+        "and its planner must stay read-only; if you genuinely need a new helper, "
+        "keep it out of the back-merge modules and update this invariant with a "
+        "clear justification."
+    )
+
+
 # ── Safety Constants ────────────────────────────────────────────────────────
 
 
@@ -271,6 +308,9 @@ class TestSchemaRevisionSync:
         )
         with open(path) as f:
             content = f.read()
+        _assert_backmerge_modules_do_not_import_rollup_management(
+            content, filename="hotfix_backmerge.py"
+        )
         assert re.search(
             r"_validate_rollup_migration_chain\s*\([^)]*\bintegration_branch\b",
             content,
@@ -404,6 +444,9 @@ class TestSchemaRevisionSync:
         )
         with open(path) as f:
             content = f.read()
+        _assert_backmerge_modules_do_not_import_rollup_management(
+            content, filename="rollup_migration_validation.py"
+        )
 
         # Read-only GitHub helpers the planner legitimately needs to reconstruct
         # and validate the migration chain across the two heads:
