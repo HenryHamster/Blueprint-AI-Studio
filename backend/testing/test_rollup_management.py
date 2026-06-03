@@ -579,6 +579,75 @@ async def test_head_collision_single_migration_auto_renumbers_and_defers(
 
 
 @pytest.mark.asyncio
+async def test_head_collision_multi_migration_auto_renumbers_full_tail_and_defers(
+    cleanup_db, mocker
+):
+    """A rollup bundling SEVERAL chained migrations (multiple subtasks) whose
+    oldest collides with the target head is auto-reconciled at parity with the
+    single-migration case: the colliding migration AND its full linear
+    descendant tail are renumbered monotonically into a contiguous block, the
+    reconcile commit (all renamed migrations + bumped EXPECTED_SCHEMA_REVISION)
+    is pushed to the STAGING branch, and the rollup is deferred one sweep — NOT
+    merged, NO operator/re-chain fix spawned."""
+    # Branch-time head was 0123; subtasks cut 0124 (down 0123) and 0125 (down
+    # 0124). Target advanced to head 0124, so the oldest 0124 collides.
+    diff = _added_file_diff(
+        "backend/alembic/versions/0124_a.py", "0124", "0123"
+    ) + _added_file_diff("backend/alembic/versions/0125_b.py", "0125", "0124")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files(
+            "backend/alembic/versions/0124_a.py",
+            "backend/alembic/versions/0125_b.py",
+        ),
+        diff=diff,
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0123_base.py", "0124_taken.py"],
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new_callable=AsyncMock,
+        return_value='EXPECTED_SCHEMA_REVISION = "0124"\n',
+    )
+    mock_commit = mocker.patch(
+        "app.github.commit_file_changes", new_callable=AsyncMock, return_value=True
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_commit.assert_awaited_once()
+    mock_merge.assert_not_awaited()
+    mock_spawn.assert_not_called()
+    assert mock_commit.await_args.args[3] == "research/conflict-stg"
+    upserts = mock_commit.await_args.kwargs["upserts"]
+    deletes = mock_commit.await_args.kwargs["deletes"]
+    # The whole chain renumbered above max(0125) → 0126, 0127; main.py bumped to
+    # the new head 0127.
+    assert "backend/alembic/versions/0126_a.py" in upserts
+    assert "backend/alembic/versions/0127_b.py" in upserts
+    assert "backend/app/main.py" in upserts
+    assert '"0127"' in upserts["backend/app/main.py"]
+    # Both old paths deleted so the rename is clean.
+    assert "backend/alembic/versions/0124_a.py" in deletes
+    assert "backend/alembic/versions/0125_b.py" in deletes
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.requires_approval is False
+    ctx = parent.context or {}
+    assert ctx.get("_alembic_autoreconcile_pr") == 4242
+    assert ctx.get("_alembic_autoreconcile_count") == 1
+
+
+@pytest.mark.asyncio
 async def test_head_collision_autoreconcile_cap_falls_back_to_fix(cleanup_db, mocker):
     """Once the per-PR auto-reconcile counter reaches the cap, a still-blocked
     rollup stops re-renumbering and falls back to the conservative operator-alert /
