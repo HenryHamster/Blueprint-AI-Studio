@@ -3142,6 +3142,56 @@ class TestVisionLockInvariant:
         _check_lock_invariant("vision", "vision", "with_vision_locked")
 
 
+# ── Running Update Lock Invariant ──────────────────────────────────────────────
+
+
+class TestRunningUpdateLockInvariant:
+    """Tripwire: direct <var>.running_update attribute assignments must not
+    increase above their per-file baseline recorded in lock_assignment_baseline.json.
+
+    Uses AST-based scanning (receiver-name-agnostic: matches any receiver so
+    aliases like proj / p / _proj are all caught).  Assignments inside
+    docstrings, comments, or string literals are naturally excluded.
+
+    The baseline is a ratchet — counts may only decrease as write sites are
+    migrated to the canonical reconciliation helper (reconcile_running_update /
+    apply_reconciled_running_update in running_update_merge.py). Adding a new
+    assignment to any file (even an already-baselined one) raises the count
+    above its baseline and fails this test.
+
+    To migrate a site: route it through apply_reconciled_running_update()
+    (running_update_merge.py) and lower the count in lock_assignment_baseline.json.
+    Remove the entry when count reaches 0.
+
+    Note: running_update does NOT use the task_locking.py with_*_locked()
+    helpers. Its guarantee is operator-wins reconciliation through the shared
+    running_update_merge helpers, not a row-lock pattern.
+    """
+
+    def test_no_new_unlocked_running_update_writes(self):
+        """Direct project.running_update assignments must not exceed baseline."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        baseline: dict[str, int] = _LOCK_BASELINE.get("running_update", {})
+        file_counts = _ast_count_attr_assignments(app_dir, "running_update")
+
+        violations: list[str] = []
+        for rel, count in sorted(file_counts.items()):
+            allowed = baseline.get(rel, 0)
+            if count > allowed:
+                violations.append(f"  {rel}: {count} assignments (baseline: {allowed})")
+
+        assert not violations, (
+            "project.running_update assignment counts exceed their per-file baseline:\n"
+            + "\n".join(violations)
+            + "\n\nRoute new running_update writes through "
+            "apply_reconciled_running_update() (running_update_merge.py). "
+            "Counts may only be lowered (after migrating a site to the canonical "
+            "helper), never raised. To record a legitimate decrease, lower the "
+            "count in backend/testing/lock_assignment_baseline.json. "
+            "Do NOT increase counts — that widens the tripwire hole."
+        )
+
+
 # ── Design-Doc Lock Assignment Guard ─────────────────────────────────────────
 
 
