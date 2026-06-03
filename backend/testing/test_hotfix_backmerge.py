@@ -1072,7 +1072,7 @@ async def test_backmerge_migration_block_dedupes_resolver(db_session, mocker):
 
 
 # ===========================================================================
-# Auto-reconcile a single-collision dual head (no resolver spawned)
+# Dual-head block routes to resolver — never pushes to live integration branch
 # ===========================================================================
 
 
@@ -1123,7 +1123,7 @@ def _branch_aware_versions(main_list: list[str], automain_list: list[str]) -> As
     return AsyncMock(side_effect=_side)
 
 
-async def test_backmerge_autoreconciles_single_collision_dual_head(db_session, mocker):
+async def test_backmerge_block_routes_to_resolver_single_collision(db_session, mocker):
     """A single integration-side migration colliding with the immutable
     promotion-target hotfix migration is NEVER reconciled inline by pushing to
     the live integration branch: doing so would leave automain with a dangling
@@ -1251,7 +1251,7 @@ async def test_backmerge_block_never_pushes_to_integration_branch(db_session, mo
         )
 
 
-async def test_backmerge_autoreconcile_push_then_defers_no_wedge(db_session, mocker):
+async def test_backmerge_block_defers_with_open_resolver_no_new_alert(db_session, mocker):
     """A dual head routes to the resolver instead of pushing to automain, and a
     subsequent periodic call with the resolver still open produces no duplicate
     resolver and no new alert — the integration branch is never mutated."""
@@ -1324,7 +1324,7 @@ async def test_backmerge_autoreconcile_push_then_defers_no_wedge(db_session, moc
     assert len(await _alerts_for(db_session, project.id)) == alerts_after_first
 
 
-async def test_backmerge_autoreconcile_subsequent_cycle_no_spurious_resolver(
+async def test_backmerge_block_dedup_prevents_spurious_resolver_on_periodic(
     db_session, mocker
 ):
     """The periodic reconciler calling open_backmerge_pr(periodic=True) when a
@@ -1439,7 +1439,7 @@ async def test_backmerge_ambiguous_dual_head_falls_back_to_resolver(db_session, 
     assert len(resolvers) == 1
 
 
-async def test_backmerge_autoreconcile_push_error_falls_back(db_session, mocker):
+async def test_backmerge_block_fallback_on_planner_error(db_session, mocker):
     """Fail-safe: even if commit_file_changes would raise, the block path never
     pushes to the integration branch — the merge is never attempted and the
     guided resolver is spawned."""
@@ -1498,7 +1498,7 @@ async def test_backmerge_autoreconcile_push_error_falls_back(db_session, mocker)
     assert len(resolvers) == 1
 
 
-async def test_backmerge_autoreconcile_missing_schema_literal_falls_back(
+async def test_backmerge_block_fallback_on_missing_schema_literal(
     db_session, mocker
 ):
     """A dual-head block routes to the guided resolver and pushes nothing to the

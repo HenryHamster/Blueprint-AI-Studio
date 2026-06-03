@@ -309,10 +309,10 @@ class TestSchemaRevisionSync:
         per-scenario runtime assertions in test_hotfix_backmerge.py
         (``commit_mock.assert_not_called()`` and the call-args scan for
         ``automain``). This static scan locks it as a single invariant so a future
-        change (e.g. "restoring" an inline auto-reconcile, which the stale design
-        doc describes) cannot reintroduce the wedge through a new code path the
-        scenario tests do not cover. A future author who genuinely needs to change
-        this must update this invariant deliberately.
+        change (e.g. "restoring" an inline auto-reconcile/push) cannot reintroduce
+        the wedge through a new code path the scenario tests do not cover. A future
+        author who genuinely needs to change this must update this invariant
+        deliberately.
 
         Allowlist (not denylist) rationale: a denylist of specific write-helper
         names cannot see a NEWLY-introduced or differently-named branch-write
