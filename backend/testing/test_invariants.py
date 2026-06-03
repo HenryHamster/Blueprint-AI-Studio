@@ -5299,6 +5299,85 @@ def _extract_extra_family_region(source: str) -> str:
     return source[start:end]
 
 
+def _extract_generic_fallback_region(source: str) -> str:
+    """Return the body of the ``detectGenericFallbackRunner`` helper.
+
+    This helper is the canonical home of generic-fallback runners
+    (Makefile, just, Taskfile, tox, nox, shell scripts). Raises (loud) if the
+    anchor or its terminating ``return null;`` cannot be located — never
+    silently returns an empty region.
+    """
+    start = source.find("detectGenericFallbackRunner = (")
+    if start == -1:
+        raise ValueError(
+            "Could not find `detectGenericFallbackRunner = (` anchor in "
+            "agent/src/utils/test-runners.ts — the generic-fallback helper was "
+            "renamed or removed. Update _extract_generic_fallback_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+    end = source.find("return null;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return null;` of "
+            "detectGenericFallbackRunner in agent/src/utils/test-runners.ts — the "
+            "helper's structure changed. Update _extract_generic_fallback_region."
+        )
+    return source[start:end]
+
+
+def _extract_core_root_region(source: str) -> str:
+    """Return the region where core root-level runners are emitted.
+
+    This covers npm, pytest, cargo, go detection at repo root.
+    Extracts from the first root-level manifest check to the nested scan.
+    Raises (loud) if the anchor cannot be located — never silently returns
+    an empty region.
+    """
+    start = source.find("const pkgPath = `${WORKSPACE}/package.json`;")
+    if start == -1:
+        raise ValueError(
+            "Could not find root-level runner detection anchor in "
+            "agent/src/utils/test-runners.ts. The core root runner detection "
+            "was refactored or removed. Update _extract_core_root_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+    # End at the start of nested monorepo detection comment
+    end = source.find("--- Nested monorepo / external-layout detection", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find nested monorepo comment in "
+            "agent/src/utils/test-runners.ts. The structure changed. "
+            "Update _extract_core_root_region."
+        )
+    return source[start:end]
+
+
+def _extract_nested_package_region(source: str) -> str:
+    """Return the region where nested-package runners are emitted.
+
+    This covers detection within subdirectories (services/, apps/, packages/,
+    etc.). Raises (loud) if the anchor or terminating condition cannot be
+    located — never silently returns an empty region.
+    """
+    start = source.find("const pushRunnerForPackageDir = (relPath: string): void => {")
+    if start == -1:
+        raise ValueError(
+            "Could not find `pushRunnerForPackageDir` anchor in "
+            "agent/src/utils/test-runners.ts — the nested-package detection "
+            "was refactored or removed. Update _extract_nested_package_region "
+            "in backend/testing/test_invariants.py to match."
+        )
+    # End before the closing of the main function (find the final closing brace)
+    # For safety, look for the specific pattern that ends the nested scanning
+    end = source.find("return runners;", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find `return runners;` terminator after nested package region "
+            "in agent/src/utils/test-runners.ts. Update _extract_nested_package_region."
+        )
+    return source[start:end]
+
+
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
@@ -5465,6 +5544,77 @@ class TestAgentTestRunnerSourceParity:
         orphans = sorted(region_commands - table_commands)
         assert not orphans, (
             "agent/src/utils/test-runners.ts emits divergent-family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_agent_generic_fallback_runners_are_all_in_table(self):
+        """Reverse direction: every command the generic-fallback helper emits
+        (Makefile, just, Taskfile, tox, nox, shell scripts) must appear in
+        the backend table.
+
+        Catches a NEW generic-fallback family added to ``detectGenericFallbackRunner``
+        without a matching AGENT_TEST_RUNNER_COMMANDS entry. The shell-script
+        family (with unquoted loop variable args) is excluded here and verified
+        separately via test_agent_emits_shell_script_runner.
+        """
+        source = self._read_agent_source()
+        region = _extract_generic_fallback_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        # Exclude bare 'bash' command (it has unquoted loop-variable args)
+        # which is already verified in test_agent_emits_shell_script_runner
+        region_commands.discard('bash')
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits generic-fallback family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_agent_core_root_runners_are_all_in_table(self):
+        """Reverse direction: every command emitted at root level (npm, pytest,
+        cargo, go) must appear in the backend table.
+
+        Catches a NEW core runner family added to root detection without a
+        matching AGENT_TEST_RUNNER_COMMANDS entry. Commands with unquoted ternary
+        variable args (like pgFlag for the Blueprint backend test script) are
+        excluded as they are internal/special cases not part of the standard
+        family set.
+        """
+        source = self._read_agent_source()
+        region = _extract_core_root_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        # Exclude commands with unquoted ternary args that are already in the table
+        # (e.g., 'bash scripts/test-backend.sh' is a blueprint-internal case)
+        region_commands = {cmd for cmd in region_commands if cmd in table_commands or not cmd.startswith('bash')}
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits root-level core family command(s) "
+            f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
+            "Add the new family/command to the table in "
+            "backend/testing/test_invariants.py (and the shared fixture)."
+        )
+
+    def test_agent_nested_package_runners_are_all_in_table(self):
+        """Reverse direction: every command emitted in nested package detection
+        (services/, apps/, packages/, etc.) must appear in the backend table.
+
+        Catches a NEW family added to nested package detection without a
+        matching AGENT_TEST_RUNNER_COMMANDS entry. This includes core families
+        (pytest, npm, go, cargo) at nested levels plus any divergent or
+        generic-fallback families detected in subdirectories.
+        """
+        source = self._read_agent_source()
+        region = _extract_nested_package_region(source)  # raises (loud) on parse miss
+        region_commands = _reconstruct_agent_commands(region)
+        table_commands = set(AGENT_TEST_RUNNER_COMMANDS.values())
+        orphans = sorted(region_commands - table_commands)
+        assert not orphans, (
+            "agent/src/utils/test-runners.ts emits nested-package family command(s) "
             f"with no entry in AGENT_TEST_RUNNER_COMMANDS: {orphans}. "
             "Add the new family/command to the table in "
             "backend/testing/test_invariants.py (and the shared fixture)."

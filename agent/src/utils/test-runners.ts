@@ -106,6 +106,18 @@ function textDefinesTestTarget(text: string): boolean {
   return /^\s*test\b[^:\n]*:/m.test(text);
 }
 
+/** Strict Makefile-only `test` target check. `make test` only ever runs an
+ *  EXACT top-level `test` target — a Makefile whose only target is
+ *  `test-integration:` makes `make test` fail with "No rule to make target
+ *  test", and an indented / leading-whitespace target is a recipe line, not a
+ *  target. So the prefix-tolerant `textDefinesTestTarget` (correct for
+ *  just/Taskfile) OVER-detects here. Mirrors the backend onboarding detector's
+ *  `_MAKEFILE_TEST_TARGET_RE = ^test\s*:` (admin_onboard.py): line-anchored with
+ *  no leading whitespace, only optional whitespace between `test` and `:`. */
+function textDefinesMakeTestTarget(text: string): boolean {
+  return /^test[ \t]*:/m.test(text);
+}
+
 function fileMentionsPytest(path: string): boolean {
   try {
     return fs.readFileSync(path, 'utf-8').includes('pytest');
@@ -202,9 +214,18 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         return false;
       }
     };
-    // Makefile with a real `test:` target → `make test`.
+    const tryMakeManifest = (name: string): boolean => {
+      try {
+        return textDefinesMakeTestTarget(readFileSync(`${absDir}/${name}`, 'utf-8'));
+      } catch {
+        return false;
+      }
+    };
+    // Makefile with a real top-level `test:` target → `make test`. Uses the
+    // strict matcher (exact `test:`, no prefix/indent) so it agrees with the
+    // backend onboarding detector; `make test` only runs an exact target.
     for (const makefileName of ['Makefile', 'makefile', 'GNUmakefile']) {
-      if (has(makefileName) && tryTextManifest(makefileName)) {
+      if (has(makefileName) && tryMakeManifest(makefileName)) {
         return { cmd: 'make', args: ['test'], cwd: absDir, label: `make test (${label}/${makefileName})` };
       }
     }

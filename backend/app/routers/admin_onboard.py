@@ -97,11 +97,16 @@ _NON_SOURCE_FILE_PREFIXES = (
 _BUILD_CONFIG_SCAN_MAX_DEPTH = 2
 _BUILD_CONFIG_SCAN_MAX_DIRECTORIES = 40
 
-# A real ``test:`` target at the start of a line (after optional surrounding
-# whitespace). The Contents API only gives file names, so a bare Makefile is not
-# enough to justify ``make test`` — we fetch the body and confirm this target
-# exists, otherwise ``make test`` fails with "No rule to make target 'test'".
-# Mirrors the agent-side check in agent/src/utils/test-runners.ts.
+# A real top-level ``test:`` target: line-anchored with NO leading whitespace,
+# only optional whitespace allowed between ``test`` and the ``:``. ``make test``
+# only ever runs an EXACT ``test`` target, so a prefixed target like
+# ``test-integration:`` or an indented recipe line does NOT justify ``make test``
+# (it fails with "No rule to make target 'test'"). The Contents API only gives
+# file names, so a bare Makefile is not enough — we fetch the body and confirm
+# this exact target exists. Mirrors the agent-side strict Makefile check
+# (``textDefinesMakeTestTarget`` in agent/src/utils/test-runners.ts); note this
+# is INTENTIONALLY stricter than the just/Taskfile check below, which tolerates
+# a prefixed target name on both sides.
 _MAKEFILE_TEST_TARGET_RE = re.compile(r"^test\s*:", re.MULTILINE)
 _JUST_OR_TASK_TEST_TARGET_RE = re.compile(r"^\s*test\b[^:\n]*:", re.MULTILINE)
 

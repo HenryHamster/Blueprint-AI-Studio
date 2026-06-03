@@ -39,6 +39,26 @@ const mockFs = fs as unknown as {
 };
 const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
 
+type RunnerFamily =
+  | 'pytest'
+  | 'npm'
+  | 'cargo'
+  | 'make'
+  | 'just'
+  | 'task'
+  | 'tox'
+  | 'nox'
+  | 'go'
+  | 'ruby'
+  | 'gradle'
+  | 'maven'
+  | 'elixir'
+  | 'dotnet'
+  | 'php'
+  | 'composer'
+  | 'script'
+  | null;
+
 type LayoutFixture = {
   name: string;
   files: Array<{
@@ -46,25 +66,16 @@ type LayoutFixture = {
     content?: string;
   }>;
   detectable: boolean;
-  family:
-    | 'pytest'
-    | 'npm'
-    | 'cargo'
-    | 'make'
-    | 'just'
-    | 'task'
-    | 'tox'
-    | 'nox'
-    | 'go'
-    | 'ruby'
-    | 'gradle'
-    | 'maven'
-    | 'elixir'
-    | 'dotnet'
-    | 'php'
-    | 'composer'
-    | 'script'
-    | null;
+  family: RunnerFamily;
+  // Per-detector expected families for multi-manifest / root+nested layouts on
+  // which the two no-CI detectors legitimately diverge in the auto-detection
+  // fallback (see the parity test comment). When absent, the single-manifest
+  // layout's lone `family` is the expected agent multiset.
+  agent_families?: RunnerFamily[];
+  // The onboarding (backend) detector's expected families — consumed by the
+  // Python parity test (test_onboard.py::test_shared_layout_parity); declared
+  // here only to keep the shared TS fixture type total.
+  onboard_families?: RunnerFamily[];
 };
 
 const sharedLayouts = JSON.parse(
@@ -407,6 +418,42 @@ describe('detectTestRunners — generic external-repo fallbacks (make/tox/nox/sc
     expect(runners).toHaveLength(0);
   });
 
+  it('Makefile whose only target is `test-integration:` (prefix, not exact) → no make runner', () => {
+    // `make test` only runs an EXACT `test` target; a prefixed target name
+    // would fail with "No rule to make target test". This must match the
+    // backend onboarding detector's strict `^test\s*:` semantics.
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Makefile'));
+    fs.readFileSync.mockReturnValue('test-integration:\n\tgo test ./...\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('Makefile with an indented `\\ttest:` target (a recipe line, not a target) → no make runner', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Makefile'));
+    fs.readFileSync.mockReturnValue('build:\n\tgo build\n\ttest:\n\t\tgo test ./...\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('justfile with a prefixed `test-all:` target IS still detected (loose just/Task semantics retained)', () => {
+    // The just/Taskfile path is INTENTIONALLY looser than Makefile and must be
+    // left unchanged — a prefixed target name still justifies `just test`.
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/justfile'));
+    fs.readFileSync.mockReturnValue('test-all:\n\tcargo test\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('just');
+  });
+
   it('justfile/Justfile with a real `test:` target → just test (root)', () => {
     const fs = mockFs;
     fs.existsSync.mockImplementation((p: string) => p.endsWith('/justfile') || p.endsWith('/Justfile'));
@@ -663,8 +710,23 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
         return;
       }
 
-      expect(runners).toHaveLength(1);
-      expect(familyFromRunner(runners[0])).toBe(layout.family);
+      // Multi-manifest and root+nested layouts make the two no-CI detectors
+      // diverge in the empty-config auto-detection fallback, and that divergence
+      // is the whole point of these fixtures: the merge-time AGENT detector
+      // stops at the first detection level (a root-level runner globally
+      // suppresses its nested-package scan and language fallbacks), so it emits
+      // the SINGLE root family, whereas the onboarding (backend) detector walks
+      // and catalogs EVERY directory additively (two runners for one polyglot
+      // dir; a nested-package runner even when a root manifest exists). The
+      // backend side is pinned to `onboard_families` in
+      // test_onboard.py::test_shared_layout_parity. Asserting a sorted MULTISET
+      // (rather than the old "exactly one runner") lets the fixture express the
+      // documented difference explicitly so it can never silently widen.
+      const expectedAgentFamilies = (layout.agent_families ?? [layout.family])
+        .slice()
+        .sort();
+      const actualAgentFamilies = runners.map(familyFromRunner).sort();
+      expect(actualAgentFamilies).toEqual(expectedAgentFamilies);
     });
   }
 });

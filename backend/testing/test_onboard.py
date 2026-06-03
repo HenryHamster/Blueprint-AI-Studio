@@ -2320,6 +2320,27 @@ class TestFallbackTestEntrypointDetection:
         assert config["directories"] == []
 
     @pytest.mark.asyncio
+    async def test_makefile_with_prefixed_target_emits_no_test_cmd(self):
+        """A Makefile whose only target is ``test-integration:`` (prefix, not an
+        exact ``test`` target) must NOT emit ``make test``.
+
+        ``make test`` only ever runs an EXACT ``test`` target; a prefixed name
+        fails with "No rule to make target test". This locks the strict Makefile
+        semantics in parity with the agent-side ``textDefinesMakeTestTarget``.
+        """
+        root = _listing_resp([{"name": "Makefile", "type": "file"}])
+        makefile = _file_content_resp("test-integration:\n\tgo test ./...\n")
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, makefile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+
+    @pytest.mark.asyncio
     async def test_justfile_with_test_target_emits_just_test(self):
         root = _listing_resp([{"name": "Justfile", "type": "file"}])
         justfile = _file_content_resp(
@@ -2797,8 +2818,29 @@ class TestSharedTestRunnerLayouts:
             )
             return
 
-        assert len(directories) == 1
-        assert _backend_family_for_directory(directories[0]) == layout["family"]
+        # Multi-manifest and root+nested layouts make the two no-CI detectors
+        # diverge in the empty-config auto-detection fallback, and capturing that
+        # difference explicitly is the point of these fixtures. The onboarding
+        # (backend) detector walks and catalogs EVERY directory additively: it
+        # emits two runners for one polyglot directory (e.g. a root carrying both
+        # pytest.ini and a package.json with scripts.test) AND a runner for a
+        # nested package even when a root manifest exists. The merge-time AGENT
+        # detector instead stops at the first detection level (a root-level
+        # runner globally suppresses its nested-package scan), so it emits only
+        # the single root family — see the agent-side multiset assertion in
+        # agent/src/utils/test-runners.test.ts. The build-config-mediated path
+        # (a populated stored config) runs every configured directory identically
+        # on both sides; this divergence is confined to auto-detection. Assert a
+        # sorted MULTISET of onboarding families (rather than the old "exactly one
+        # runner") so the fixture can express the difference and it can never
+        # silently widen. Single-manifest layouts fall back to [family].
+        expected_families = sorted(layout.get("onboard_families") or [layout["family"]])
+        actual_families = sorted(
+            _backend_family_for_directory(d)
+            for d in directories
+            if str(d.get("test_cmd") or "").strip()
+        )
+        assert actual_families == expected_families
 
 
 class TestMaybeRefreshEmptyBuildConfig:

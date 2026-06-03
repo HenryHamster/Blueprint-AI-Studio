@@ -120,6 +120,17 @@
     "family": null
   },
   {
+    "name": "makefile_test_prefix_not_exact",
+    "files": [
+      {
+        "path": "Makefile",
+        "content": "test-integration:\n\tgo test ./...\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
     "name": "cargo_toml_root",
     "files": [
       {
@@ -395,5 +406,37 @@
     ],
     "detectable": true,
     "family": "cargo"
+  },
+  {
+    "name": "polyglot_root_pytest_and_node",
+    "files": [
+      {
+        "path": "pytest.ini"
+      },
+      {
+        "path": "package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm",
+    "agent_families": ["npm"],
+    "onboard_families": ["npm", "pytest"]
+  },
+  {
+    "name": "root_pytest_with_nested_node_package",
+    "files": [
+      {
+        "path": "pytest.ini"
+      },
+      {
+        "path": "apps/web/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest run\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest",
+    "agent_families": ["pytest"],
+    "onboard_families": ["npm", "pytest"]
   }
 ]
