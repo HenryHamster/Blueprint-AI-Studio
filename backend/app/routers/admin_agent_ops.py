@@ -1506,7 +1506,29 @@ async def strategic_operation(
                 detail=f"Running update exceeds 100KB character limit "
                 f"({len(doc)} chars provided). Please resubmit with shorter content.",
             )
-        project.running_update = doc
+        # Operator-wins reconciliation, mirroring set_problem_model: resolve the
+        # cycle's baseline running_update (snapshot at spawn) and reconcile the
+        # agent's document against the current DB document via the single shared
+        # helper used by both this live op and the strategic-completion
+        # fallback. A concurrent operator body edit is preserved (operator wins)
+        # and the agent's superseded document is recorded for next cycle; a
+        # mid-cycle routine-event digest append is re-integrated rather than
+        # discarded. Degrades to today's blind-assign when no cycle/baseline is
+        # resolvable (legacy task).
+        from app import strategic_cycle as _strategic_cycle
+        from app.running_update_merge import apply_reconciled_running_update
+
+        ru_baseline: str | None = None
+        ru_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        if ru_cycle_id:
+            ru_cycle_row = await _strategic_cycle.get(session, ru_cycle_id)
+            if ru_cycle_row is not None:
+                ru_baseline = _strategic_cycle.baseline_running_update(ru_cycle_row)
+        ru_rejected = apply_reconciled_running_update(
+            project, baseline=ru_baseline, agent=doc
+        )
         session.add(project)
         ctx = task.context or {}
         task.context = {
@@ -1518,10 +1540,17 @@ async def strategic_operation(
         session.add(task)
         await session.commit()
         await _emit_updated(STRATEGIC_KIND_RUNNING_UPDATE)
-        logger.info(
-            f"[STRATEGIC API] Set running_update for project {project.id} "
-            f"(length: {len(doc)} chars)"
-        )
+        if ru_rejected is not None:
+            logger.info(
+                f"[STRATEGIC API] running_update: concurrent operator edit "
+                f"preserved for project {project.id}; agent's document "
+                f"({len(doc)} chars) recorded as a rejected edit"
+            )
+        else:
+            logger.info(
+                f"[STRATEGIC API] Set running_update for project {project.id} "
+                f"(length: {len(doc)} chars)"
+            )
         return _resp(
             {
                 "status": "ok",

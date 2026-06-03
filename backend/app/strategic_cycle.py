@@ -74,16 +74,22 @@ async def create(
     phase1_task_id=None,
     baseline_vision: Optional[Mapping[str, Any]] = None,
     baseline_problem_model: Optional[Mapping[str, Any]] = None,
-    baseline_running_update: Optional[str] = None,
+    baseline_running_update: str | None = None,
 ) -> StrategicCycle:
     """Insert a new StrategicCycle row at phase-1 spawn.
 
-    ``baseline_vision``, ``baseline_problem_model`` and ``baseline_running_update``
-    are snapshot at cycle start so the 3-way merges in ``strategic_completion`` /
-    the live API path can compare operator edits against the same baseline the
-    agent was given. All are stored under ``cycle_metadata`` to avoid a
-    per-project schema change, and all are skipped by :func:`_to_legacy_dict` so
-    the snapshots never leak into the agent's cycle-history context.
+    ``baseline_vision``, ``baseline_problem_model`` and
+    ``baseline_running_update`` are snapshot at cycle start so the operator-wins
+    merges in ``strategic_completion`` / the live API path can compare operator
+    edits against the same baseline the agent was given. All three are stored
+    under ``cycle_metadata`` to avoid a per-project schema change, and all three
+    are skipped by :func:`_to_legacy_dict` so the snapshots never leak into the
+    agent's cycle-history context.
+
+    ``baseline_running_update`` is stored as a string (``""`` when the document
+    was empty at spawn); a missing key on the row signals a legacy cycle with no
+    snapshot, which :func:`baseline_running_update` reports as ``None`` so the
+    reconciliation degrades to blind-assign.
     """
     cycle = StrategicCycle(
         id=cycle_id or new_cycle_id(),
@@ -94,7 +100,9 @@ async def create(
         cycle_metadata={
             "baseline_vision": dict(baseline_vision or {}),
             "baseline_problem_model": dict(baseline_problem_model or {}),
-            "baseline_running_update": baseline_running_update,
+            "baseline_running_update": baseline_running_update
+            if isinstance(baseline_running_update, str)
+            else "",
         },
     )
     session.add(cycle)
@@ -392,19 +400,20 @@ def baseline_problem_model(cycle: StrategicCycle) -> dict[str, Any]:
     return dict(snap) if isinstance(snap, dict) else {}
 
 
-def baseline_running_update(cycle: StrategicCycle) -> Optional[str]:
+def baseline_running_update(cycle: StrategicCycle) -> str | None:
     """Read the snapshot of ``running_update`` taken at cycle start.
 
-    Mirrors :func:`baseline_vision` / :func:`baseline_problem_model` but for the
-    freeform-markdown ``running_update`` document. Used by
-    ``strategic_completion`` to run a coarse whole-document operator-wins merge
-    so a concurrent operator edit to ``running_update`` is not clobbered by the
-    agent's refreshed write. Returns ``None`` when no baseline was captured
-    (legacy cycles), which the completion path treats as "degrade to blind
-    assignment"."""
+    Returns the snapshot string (``""`` when the document was empty at spawn),
+    or ``None`` for a legacy cycle that predates the snapshot (no key on the
+    row). Used by the live ``set_running_update`` op and the
+    strategic-completion fallback to reconcile a concurrent operator edit
+    operator-wins; ``None`` degrades the reconciliation to today's blind-assign.
+    """
     meta = cycle.cycle_metadata or {}
+    if "baseline_running_update" not in meta:
+        return None
     snap = meta.get("baseline_running_update")
-    return snap if isinstance(snap, str) else None
+    return snap if isinstance(snap, str) else ""
 
 
 def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:

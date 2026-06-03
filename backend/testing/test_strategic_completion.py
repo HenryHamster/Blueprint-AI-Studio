@@ -7772,90 +7772,148 @@ class TestDesignDocCompletionStrategistEvent:
         emit.assert_not_awaited()
 
 
-# ── running_update operator-wins reconciliation ──────────────────────────────
-# project.running_update is operator-editable (set_running_update strategic op +
-# the running-update acknowledge endpoint). On cycle completion the legacy
-# parse path must reconcile concurrent operator edits against the cycle baseline
-# snapshot instead of blind-overwriting, mirroring vision/problem_model.
-#
-# These tests deliberately leave api_was_used False (no _strategic_vision_set,
-# no rev bump, no dir ops) so the handler takes the legacy parse path that
-# actually consumes parsed['running_update'].
+# ─────────────────────────────────────────────────────────────────────────────
+# running_update operator-wins reconciliation (shared helper + fallback path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# A real routine-event digest line, exactly as Project.append_routine_digest
+# emits it: "- [YYYY-MM-DD HH:MM] **<event_type>**: <summary>".
+_DIGEST_LINE = "- [2026-06-03 12:00] **pr_merged**: Merged PR #103"
+
+
+def test_reconcile_running_update_blind_assign_when_no_baseline():
+    """No cycle/baseline resolvable (legacy task) → take the agent's document
+    verbatim, never record a rejection (today's blind-assign behavior)."""
+    from app.running_update_merge import reconcile_running_update
+
+    doc, rejected = reconcile_running_update(
+        baseline=None, agent="AGENT DOC", current="WHATEVER OPERATOR WROTE"
+    )
+    assert doc == "AGENT DOC"
+    assert rejected is None
+
+
+def test_reconcile_running_update_agent_wins_when_untouched():
+    """current == baseline (nothing changed it since the agent got the
+    baseline) → take the agent's fresh document."""
+    from app.running_update_merge import reconcile_running_update
+
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE", agent="AGENT NEW DOC", current="BASELINE"
+    )
+    assert doc == "AGENT NEW DOC"
+    assert rejected is None
+
+
+def test_reconcile_running_update_agent_wins_when_only_trailing_whitespace():
+    """A baseline/current difference of only trailing whitespace (which
+    append_routine_digest rstrips) is not an operator edit → agent wins."""
+    from app.running_update_merge import reconcile_running_update
+
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE\n\n", agent="AGENT NEW DOC", current="BASELINE"
+    )
+    assert doc == "AGENT NEW DOC"
+    assert rejected is None
+
+
+def test_reconcile_running_update_operator_edit_wins_and_records_rejected():
+    """An operator body edit beats the agent's refreshed write; the agent's
+    superseded document is recorded into the rejected-edits ledger entry."""
+    from app.running_update_merge import (
+        RUNNING_UPDATE_REJECTED_KIND,
+        reconcile_running_update,
+    )
+
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE",
+        agent="AGENT NEW DOC",
+        current="OPERATOR EDITED THE BODY",
+    )
+    assert doc == "OPERATOR EDITED THE BODY"
+    assert rejected is not None
+    assert rejected["field"] == "running_update"
+    assert rejected["kind"] == RUNNING_UPDATE_REJECTED_KIND
+    assert rejected["agent_value"] == "AGENT NEW DOC"
+
+
+def test_reconcile_running_update_digest_append_reintegrated():
+    """A mid-cycle routine-event digest append is NOT an operator edit: the
+    agent's rewrite lands AND the digest line is re-appended (not lost, and
+    the document is not frozen at the stale baseline)."""
+    from app.running_update_merge import reconcile_running_update
+
+    current = f"BASELINE\n{_DIGEST_LINE}"
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE", agent="AGENT NEW DOC", current=current
+    )
+    assert doc == f"AGENT NEW DOC\n{_DIGEST_LINE}"
+    assert rejected is None
+
+
+def test_reconcile_running_update_digest_append_on_empty_baseline():
+    """An empty baseline followed by only a digest line is still a pure digest
+    append — the agent doc wins and the digest is re-integrated."""
+    from app.running_update_merge import reconcile_running_update
+
+    doc, rejected = reconcile_running_update(
+        baseline="", agent="AGENT NEW DOC", current=_DIGEST_LINE
+    )
+    assert doc == f"AGENT NEW DOC\n{_DIGEST_LINE}"
+    assert rejected is None
+
+
+def test_reconcile_running_update_multiple_digest_lines_reintegrated():
+    """Several digest lines appended during one cycle are all re-integrated."""
+    from app.running_update_merge import reconcile_running_update
+
+    line2 = "- [2026-06-03 13:30] **cycle_summary**: Cycle 12 complete"
+    current = f"BASELINE\n{_DIGEST_LINE}\n{line2}"
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE", agent="AGENT NEW DOC", current=current
+    )
+    assert doc == f"AGENT NEW DOC\n{_DIGEST_LINE}\n{line2}"
+    assert rejected is None
+
+
+def test_reconcile_running_update_non_routine_appended_line_is_operator_edit():
+    """A trailing line that mimics the digest shape but carries an event_type
+    NOT in ROUTINE_EVENT_TYPES is treated as an operator edit (operator wins),
+    so an operator's hand-written bullet is never silently dropped."""
+    from app.running_update_merge import reconcile_running_update
+
+    fake = "- [2026-06-03 12:00] **operator_note**: please hold this release"
+    current = f"BASELINE\n{fake}"
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE", agent="AGENT NEW DOC", current=current
+    )
+    assert doc == current  # operator wins
+    assert rejected is not None
+    assert rejected["agent_value"] == "AGENT NEW DOC"
 
 
 @pytest.mark.asyncio
-async def test_running_update_agent_wins_when_operator_untouched(db_session, mocker):
-    """Operator did not edit running_update since baseline → the agent's
-    refreshed document is applied (preserves today's behavior)."""
-    from unittest.mock import AsyncMock
-    import json
-    from app.strategic_completion import _handle_strategic_completion
-    from app import strategic_cycle
-    from app.vision_merge import REJECTED_EDITS_KEY
-
-    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-
-    project = Project(
-        name="RU-AgentWins",
-        user_id="u1",
-        vision={"purpose": "test", "revision": 1},
-        directions=[],
-        running_update="BASELINE narrative",
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    cycle = await strategic_cycle.create(
-        db_session,
-        project_id=project.id,
-        baseline_running_update="BASELINE narrative",
-    )
-    await db_session.commit()
-
-    task = Task(
-        project_id=project.id,
-        payloads=[
-            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
-        ],
-        context={"strategic_cycle_id": cycle.id},
-        strategic_cycle_id=cycle.id,
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    logs = json.dumps({"running_update": "AGENT refreshed narrative"})
-    await _handle_strategic_completion(task, logs, db_session)
-
-    await db_session.refresh(project)
-    assert project.running_update == "AGENT refreshed narrative"
-    # No conflict → nothing recorded to the rejected-edits ledger.
-    assert not (project.vision or {}).get(REJECTED_EDITS_KEY)
-
-
-@pytest.mark.asyncio
-async def test_running_update_operator_edit_survives_and_agent_recorded(
+async def test_strategic_completion_running_update_operator_edit_preserved(
     db_session, mocker
 ):
-    """Operator edited running_update mid-cycle AND the agent also changed it →
-    operator's document survives, the agent's proposed doc is stashed to the
-    rejected-edits ledger so it's visible next cycle rather than dropped."""
+    """FALLBACK path: a concurrent operator edit to running_update survives the
+    cycle completion (operator wins) and the agent's document is recorded as a
+    rejected edit on the vision ledger."""
+    import json as _json
     from unittest.mock import AsyncMock
-    import json
-    from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
     from app.vision_merge import REJECTED_EDITS_KEY
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="RU-OperatorWins",
+        name="RU-operator-wins",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
-        # Operator edited it mid-cycle, diverging from the baseline below.
-        running_update="OPERATOR mid-cycle edit",
+        running_update="BASELINE DOC",
     )
     db_session.add(project)
     await db_session.commit()
@@ -7864,12 +7922,18 @@ async def test_running_update_operator_edit_survives_and_agent_recorded(
     cycle = await strategic_cycle.create(
         db_session,
         project_id=project.id,
-        baseline_running_update="BASELINE narrative",
+        baseline_running_update="BASELINE DOC",
     )
+    await db_session.commit()
+
+    # Operator edits the document mid-cycle.
+    project.running_update = "OPERATOR EDITED BODY"
+    db_session.add(project)
     await db_session.commit()
 
     task = Task(
         project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
         payloads=[
             {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
         ],
@@ -7880,41 +7944,40 @@ async def test_running_update_operator_edit_survives_and_agent_recorded(
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({"running_update": "AGENT refreshed narrative"})
+    logs = _json.dumps({"running_update": "AGENT REFRESHED DOC"})
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    # Operator's edit wins.
-    assert project.running_update == "OPERATOR mid-cycle edit"
-    # Agent's rejected document is recorded to the ledger.
+    assert project.running_update == "OPERATOR EDITED BODY"
     ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
-    ru_entries = [e for e in ledger if e.get("field") == "running_update"]
-    assert len(ru_entries) == 1
-    assert ru_entries[0]["agent_value"] == "AGENT refreshed narrative"
-    assert ru_entries[0]["user_value"] == "OPERATOR mid-cycle edit"
+    assert any(
+        e.get("field") == "running_update"
+        and e.get("agent_value") == "AGENT REFRESHED DOC"
+        for e in ledger
+    ), f"Expected the agent's superseded doc on the ledger; got {ledger}"
 
 
 @pytest.mark.asyncio
-async def test_running_update_operator_edit_kept_when_agent_unchanged(
+async def test_strategic_completion_running_update_digest_reintegrated(
     db_session, mocker
 ):
-    """Operator edited running_update but the agent's document equals the
-    baseline (agent didn't change it) → operator's edit is kept and nothing is
-    recorded as rejected (there is nothing to reconcile)."""
+    """FALLBACK path: a mid-cycle routine-event digest append does NOT discard
+    the agent's rewrite — the agent's document lands and the digest line is
+    re-integrated onto it."""
+    import json as _json
     from unittest.mock import AsyncMock
-    import json
-    from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
-    from app.vision_merge import REJECTED_EDITS_KEY
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="RU-AgentNoop",
+        name="RU-digest",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
-        running_update="OPERATOR mid-cycle edit",
+        running_update="BASELINE DOC",
     )
     db_session.add(project)
     await db_session.commit()
@@ -7923,59 +7986,19 @@ async def test_running_update_operator_edit_kept_when_agent_unchanged(
     cycle = await strategic_cycle.create(
         db_session,
         project_id=project.id,
-        baseline_running_update="BASELINE narrative",
+        baseline_running_update="BASELINE DOC",
     )
     await db_session.commit()
 
-    task = Task(
-        project_id=project.id,
-        payloads=[
-            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
-        ],
-        context={"strategic_cycle_id": cycle.id},
-        strategic_cycle_id=cycle.id,
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    # Agent returns the baseline unchanged.
-    logs = json.dumps({"running_update": "BASELINE narrative"})
-    await _handle_strategic_completion(task, logs, db_session)
-
-    await db_session.refresh(project)
-    assert project.running_update == "OPERATOR mid-cycle edit"
-    assert not (project.vision or {}).get(REJECTED_EDITS_KEY)
-
-
-@pytest.mark.asyncio
-async def test_running_update_blind_assign_when_no_baseline(db_session, mocker):
-    """Legacy task with no cycle baseline snapshot → degrade to the prior
-    blind-assignment behavior (agent's document is applied)."""
-    from unittest.mock import AsyncMock
-    import json
-    from app.strategic_completion import _handle_strategic_completion
-    from app import strategic_cycle
-
-    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-
-    project = Project(
-        name="RU-Legacy",
-        user_id="u1",
-        vision={"purpose": "test", "revision": 1},
-        directions=[],
-        running_update="OPERATOR mid-cycle edit",
-    )
+    # A routine digest line fires mid-cycle (exactly as append_routine_digest
+    # would have produced it).
+    project.running_update = f"BASELINE DOC\n{_DIGEST_LINE}"
     db_session.add(project)
     await db_session.commit()
-    await db_session.refresh(project)
-
-    # Cycle created WITHOUT a baseline_running_update (legacy / pre-feature).
-    cycle = await strategic_cycle.create(db_session, project_id=project.id)
-    await db_session.commit()
 
     task = Task(
         project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
         payloads=[
             {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
         ],
@@ -7986,31 +8009,33 @@ async def test_running_update_blind_assign_when_no_baseline(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
-    logs = json.dumps({"running_update": "AGENT refreshed narrative"})
+    logs = _json.dumps({"running_update": "AGENT REFRESHED DOC"})
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    # No baseline resolvable → blind assign (prior behavior preserved).
-    assert project.running_update == "AGENT refreshed narrative"
+    assert project.running_update == f"AGENT REFRESHED DOC\n{_DIGEST_LINE}"
 
 
 @pytest.mark.asyncio
-async def test_running_update_untouched_when_agent_omits_it(db_session, mocker):
-    """Agent output omits running_update entirely → the operator's value is left
-    untouched (the reconciliation block does not run)."""
+async def test_strategic_completion_running_update_agent_wins_untouched(
+    db_session, mocker
+):
+    """FALLBACK path: when nothing touched running_update since the baseline,
+    the agent's refreshed document is taken verbatim."""
+    import json as _json
     from unittest.mock import AsyncMock
-    import json
-    from app.strategic_completion import _handle_strategic_completion
     from app import strategic_cycle
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
 
     project = Project(
-        name="RU-Omitted",
+        name="RU-agent-wins",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
         directions=[],
-        running_update="OPERATOR mid-cycle edit",
+        running_update="BASELINE DOC",
     )
     db_session.add(project)
     await db_session.commit()
@@ -8019,12 +8044,13 @@ async def test_running_update_untouched_when_agent_omits_it(db_session, mocker):
     cycle = await strategic_cycle.create(
         db_session,
         project_id=project.id,
-        baseline_running_update="BASELINE narrative",
+        baseline_running_update="BASELINE DOC",
     )
     await db_session.commit()
 
     task = Task(
         project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
         payloads=[
             {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
         ],
@@ -8035,9 +8061,8 @@ async def test_running_update_untouched_when_agent_omits_it(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
-    # No running_update key in the agent output.
-    logs = json.dumps({"vision": {"purpose": "test", "revision": 1}})
+    logs = _json.dumps({"running_update": "AGENT REFRESHED DOC"})
     await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    assert project.running_update == "OPERATOR mid-cycle edit"
+    assert project.running_update == "AGENT REFRESHED DOC"

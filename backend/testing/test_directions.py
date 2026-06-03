@@ -3976,6 +3976,139 @@ async def test_strategic_api_set_running_update_rejects_over_limit(db_session):
         _cleanup_strategic_overrides()
 
 
+async def _attach_cycle_with_running_update_baseline(
+    db_session, project, task_id, *, baseline, current
+):
+    """Snapshot ``baseline`` as the cycle's running_update baseline, link the
+    fixture's task to the cycle, and set ``current`` as the live DB document
+    (simulating a mid-cycle operator/digest edit). Returns the cycle id."""
+    from app import strategic_cycle
+
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update=baseline,
+    )
+    await db_session.commit()
+
+    project.running_update = current
+    db_session.add(project)
+
+    task = await db_session.get(Task, uuid.UUID(task_id))
+    task.strategic_cycle_id = cycle.id
+    task.context = {**(task.context or {}), "strategic_cycle_id": cycle.id}
+    db_session.add(task)
+    await db_session.commit()
+    return cycle.id
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_running_update_agent_wins_when_untouched(db_session):
+    """Live op: when nothing changed running_update since the cycle baseline,
+    the agent's refreshed document is taken verbatim."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        await _attach_cycle_with_running_update_baseline(
+            db_session, project, task_id, baseline="BASELINE", current="BASELINE"
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT REFRESHED DOC"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        assert project.running_update == "AGENT REFRESHED DOC"
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_running_update_operator_edit_preserved(db_session):
+    """Live op: a concurrent operator body edit survives (operator wins) and the
+    agent's superseded document is recorded on the vision rejected-edits ledger."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        await _attach_cycle_with_running_update_baseline(
+            db_session,
+            project,
+            task_id,
+            baseline="BASELINE",
+            current="OPERATOR EDITED BODY",
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT REFRESHED DOC"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        assert project.running_update == "OPERATOR EDITED BODY"
+        ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
+        assert any(
+            e.get("field") == "running_update"
+            and e.get("agent_value") == "AGENT REFRESHED DOC"
+            for e in ledger
+        ), f"Expected the agent's superseded doc on the ledger; got {ledger}"
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_running_update_digest_reintegrated(db_session):
+    """Live op: a mid-cycle routine-event digest append does NOT discard the
+    agent's rewrite — the agent's document lands and the digest line is
+    re-integrated onto it (not frozen at the stale baseline)."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    digest_line = "- [2026-06-03 12:00] **pr_merged**: Merged PR #103"
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        await _attach_cycle_with_running_update_baseline(
+            db_session,
+            project,
+            task_id,
+            baseline="BASELINE",
+            current=f"BASELINE\n{digest_line}",
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "AGENT REFRESHED DOC"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        assert project.running_update == f"AGENT REFRESHED DOC\n{digest_line}"
+    finally:
+        _cleanup_strategic_overrides()
+
+
 @pytest.mark.asyncio
 async def test_strategic_api_create_message_rejects_over_limit(db_session):
     """create_message rejects content exceeding limit."""

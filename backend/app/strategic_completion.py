@@ -2155,26 +2155,16 @@ async def _handle_strategic_completion(
                 "[STRATEGIC] Failed to apply problem_model update (non-fatal)"
             )
 
-    # Replace project.running_update with the agent's refined markdown
-    # document. Unlike the old per-cycle append, the document is a living
-    # narrative the agent rewrites each cycle — the user sees a single
-    # clean view of current state, not a log of summaries.
-    #
-    # running_update is operator-editable (the set_running_update strategic op
-    # and the running-update acknowledge endpoint), so a blind overwrite would
-    # silently clobber an operator edit made mid-cycle. Apply the same
-    # operator-wins reconciliation vision/problem_model already have, but as a
-    # coarse whole-document compare (running_update is freeform markdown, not a
-    # structured field set): resolve the cycle's baseline snapshot, and on
-    # completion (a) take the agent's new document when the operator did not
-    # touch running_update since baseline, (b) keep the operator's current
-    # document when they edited it mid-cycle, and (c) when both changed, keep
-    # the operator's version and stash the agent's proposed document into the
-    # existing rejected-edits ledger so it's visible next cycle. Degrade to a
-    # blind assignment when no baseline is resolvable (legacy task).
+    # Reconcile project.running_update operator-wins via the same shared helper
+    # the live set_running_update op uses, so the two write paths cannot drift.
+    # The document is a living narrative the agent rewrites each cycle; a
+    # concurrent operator body edit is preserved (operator wins, agent's
+    # document recorded for next cycle) and a mid-cycle routine-event digest
+    # append is re-integrated rather than discarded. Degrades to blind-assign
+    # when no cycle/baseline is resolvable (legacy task).
     if isinstance(new_running_update, str):
         try:
-            from app.vision_merge import append_rejected_edits
+            from app.running_update_merge import apply_reconciled_running_update
 
             ru_baseline: str | None = None
             ru_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
@@ -2186,64 +2176,20 @@ async def _handle_strategic_completion(
                     ru_baseline = strategic_cycle.baseline_running_update(
                         ru_cycle_row
                     )
-
-            current_running_update = project.running_update
-
-            if ru_baseline is None:
-                # Legacy task / no baseline captured — preserve prior behavior.
-                project.running_update = new_running_update
+            ru_rejected = apply_reconciled_running_update(
+                project, baseline=ru_baseline, agent=new_running_update
+            )
+            if ru_rejected is not None:
                 logger.info(
-                    f"[STRATEGIC] Set running_update for project {project.id} "
-                    f"(length: {len(new_running_update)} chars, no baseline)"
+                    f"[STRATEGIC] running_update: concurrent operator edit "
+                    f"preserved for project {project.id}; agent's document "
+                    f"({len(new_running_update)} chars) recorded as a rejected edit"
                 )
-            elif current_running_update == ru_baseline:
-                # Operator did not touch running_update since baseline — take
-                # the agent's refreshed document.
-                project.running_update = new_running_update
+            else:
                 logger.info(
                     f"[STRATEGIC] Set running_update for project {project.id} "
                     f"(length: {len(new_running_update)} chars)"
                 )
-            else:
-                # Operator edited running_update mid-cycle — keep their version.
-                # If the agent also changed it (relative to baseline), stash the
-                # agent's proposed document to the rejected-edits ledger so it's
-                # not silently dropped.
-                if (
-                    new_running_update != ru_baseline
-                    and new_running_update != current_running_update
-                    and isinstance(project.vision, dict)
-                ):
-                    # Mutate the live vision dict in place (the documented usage
-                    # of append_rejected_edits — it returns the same dict so the
-                    # caller can flag_modified once) rather than reassigning
-                    # project.vision. This keeps the operator-wins reconciliation
-                    # off the direct-vision-write tripwire (the handler already
-                    # holds the project row lock via the strategic post-commit
-                    # pair-lock, so an in-place flagged mutation is safe).
-                    append_rejected_edits(
-                        project.vision,
-                        [
-                            {
-                                "at": _utcnow().isoformat(),
-                                "field": "running_update",
-                                "kind": "value_conflict",
-                                "user_value": current_running_update,
-                                "agent_value": new_running_update,
-                            }
-                        ],
-                    )
-                    flag_modified(project, "vision")
-                    logger.info(
-                        f"[STRATEGIC] running_update merge kept operator edit for "
-                        f"project {project.id}; agent document ("
-                        f"{len(new_running_update)} chars) recorded as rejected"
-                    )
-                else:
-                    logger.info(
-                        f"[STRATEGIC] running_update kept operator edit for "
-                        f"project {project.id} (agent unchanged since baseline)"
-                    )
         except Exception:
             logger.exception("[STRATEGIC] Failed to set running_update (non-fatal)")
 

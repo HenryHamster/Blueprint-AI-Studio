@@ -74,40 +74,6 @@ async def test_create_snapshots_baseline_problem_model(db_session):
 
 
 @pytest.mark.asyncio
-async def test_create_snapshots_baseline_running_update(db_session):
-    """The running_update snapshot is captured alongside the other baselines so
-    the operator-wins reconciliation can compare the agent's refreshed document
-    against the value the agent started from."""
-    project = await _make_project(db_session)
-    cycle = await strategic_cycle.create(
-        db_session,
-        project_id=project.id,
-        baseline_vision={"purpose": "x"},
-        baseline_running_update="BASELINE narrative",
-    )
-    await db_session.commit()
-    fetched = await strategic_cycle.get(db_session, cycle.id)
-    assert strategic_cycle.baseline_running_update(fetched) == "BASELINE narrative"
-    # The other baselines are unaffected by the new key.
-    assert strategic_cycle.baseline_vision(fetched) == {"purpose": "x"}
-
-
-@pytest.mark.asyncio
-async def test_baseline_running_update_defaults_none(db_session):
-    """A cycle created without a running_update baseline (legacy spawn) reads
-    back None, so the completion path degrades to a blind assignment."""
-    project = await _make_project(db_session)
-    cycle = await strategic_cycle.create(
-        db_session,
-        project_id=project.id,
-        baseline_vision={"purpose": "x"},
-    )
-    await db_session.commit()
-    fetched = await strategic_cycle.get(db_session, cycle.id)
-    assert strategic_cycle.baseline_running_update(fetched) is None
-
-
-@pytest.mark.asyncio
 async def test_baseline_problem_model_defaults_empty(db_session):
     """A cycle created without a problem-model baseline (e.g. legacy spawn)
     reads back an empty dict, so apply_agent_update degrades to None safely."""
@@ -122,6 +88,48 @@ async def test_baseline_problem_model_defaults_empty(db_session):
     assert strategic_cycle.baseline_problem_model(fetched) == {}
 
 
+@pytest.mark.asyncio
+async def test_create_snapshots_baseline_running_update(db_session):
+    """The running_update snapshot is captured at cycle start so the
+    operator-wins reconciliation can compare the agent's write against it."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_running_update="## Current state\nShipping v4.",
+    )
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert (
+        strategic_cycle.baseline_running_update(fetched)
+        == "## Current state\nShipping v4."
+    )
+
+
+@pytest.mark.asyncio
+async def test_baseline_running_update_empty_when_none_at_spawn(db_session):
+    """A cycle whose running_update was empty at spawn reads back as ``""``
+    (a captured-but-empty baseline), distinct from a legacy cycle's ``None``."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.baseline_running_update(fetched) == ""
+
+
+def test_baseline_running_update_none_for_legacy_cycle():
+    """A legacy cycle row predating the snapshot (no key in cycle_metadata)
+    reports ``None`` so the reconciliation degrades to blind-assign."""
+    cycle = StrategicCycle(
+        id="sc-legacy-ru",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={"baseline_vision": {"purpose": "x"}},
+    )
+    assert strategic_cycle.baseline_running_update(cycle) is None
+
+
 def test_to_legacy_dict_omits_baseline_problem_model():
     """The problem-model snapshot must never leak into the agent-facing
     cycle-history shape, exactly as baseline_vision is hidden."""
@@ -133,7 +141,7 @@ def test_to_legacy_dict_omits_baseline_problem_model():
         cycle_metadata={
             "baseline_vision": {"purpose": "secret"},
             "baseline_problem_model": {"intent": {"purpose": "also secret"}},
-            "baseline_running_update": "secret narrative",
+            "baseline_running_update": "secret running update doc",
             "memos_cited": 2,
         },
     )
