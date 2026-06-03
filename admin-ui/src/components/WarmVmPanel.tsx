@@ -88,7 +88,12 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
   };
 
   const flipFlag = useCallback(async (
-    configKey: 'warm_continuity_enabled' | 'warm_backlog_reuse_enabled' | 'warm_pool_enabled',
+    configKey:
+      | 'warm_continuity_enabled'
+      | 'warm_backlog_reuse_enabled'
+      | 'warm_pool_enabled'
+      | 'warm_pool_account_retarget_enabled'
+      | 'warm_pool_cross_provider_retarget_enabled',
     label: string,
     currentValue: boolean,
   ) => {
@@ -170,6 +175,8 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
   const chainClaims = data?.warm_pin_metrics.active_chain_continuity_claims ?? 0;
   const pool = data?.pool_metrics;
   const poolOn = pool?.enabled ?? false;
+  const accountRetargetOn = data?.warm_pool_account_retarget_enabled ?? false;
+  const crossProviderRetargetOn = data?.warm_pool_cross_provider_retarget_enabled ?? false;
   const overThreshold = clearsHour > 5;
 
   return (
@@ -248,6 +255,52 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           }
         >
           {flipping ? '…' : (poolOn ? 'POOL' : 'NO-POOL')}
+        </button>
+        <button
+          onClick={() => { void flipFlag('warm_pool_account_retarget_enabled', 'warm-pool account retarget', accountRetargetOn); }}
+          disabled={flipping || !data}
+          data-testid="warm-pool-account-retarget-toggle"
+          className={
+            (accountRetargetOn
+              ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
+              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+            ) +
+            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
+            (!data ? ' opacity-50 cursor-not-allowed' : '')
+          }
+          title={
+            flipping
+              ? 'flipping…'
+              : (accountRetargetOn
+                  ? 'Click to DISABLE warm-pool account retarget (strict per-account match)'
+                  : 'Click to ENABLE warm-pool account retarget (an idle member can serve a different account)')
+          }
+        >
+          {flipping ? '…' : (accountRetargetOn ? 'RETARGET' : 'NO-RETARGET')}
+        </button>
+        <button
+          onClick={() => { void flipFlag('warm_pool_cross_provider_retarget_enabled', 'warm-pool cross-provider retarget', crossProviderRetargetOn); }}
+          disabled={flipping || !data}
+          data-testid="warm-pool-cross-provider-retarget-toggle"
+          className={
+            (crossProviderRetargetOn
+              ? 'bg-violet-500/20 border border-violet-500/40 text-violet-400 hover:bg-violet-500/30'
+              : 'bg-neutral-700/40 border border-neutral-600/40 text-neutral-400 hover:bg-neutral-700/60'
+            ) +
+            ' text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors' +
+            (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer') +
+            (!data ? ' opacity-50 cursor-not-allowed' : '')
+          }
+          title={
+            flipping
+              ? 'flipping…'
+              : (crossProviderRetargetOn
+                  ? 'Click to DISABLE warm-pool cross-provider retarget (same-provider only)'
+                  : 'Click to ENABLE warm-pool cross-provider retarget (an idle member can serve a different provider)')
+          }
+        >
+          {flipping ? '…' : (crossProviderRetargetOn ? 'X-PROV' : 'SAME-PROV')}
         </button>
         <button
           onClick={toggle}
@@ -650,6 +703,10 @@ function PoolAccountMixRow({ pool }: { pool: PoolMetrics }) {
   const byAccount = (pool as PoolMetrics & {
     cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
   }).cost_amortization_by_account ?? {};
+  // Per-account lease-miss breakdown lives in the dispatch funnel (the same
+  // map the fleet-wide misses come from). Keyed by the same account ids so we
+  // can join it to the amortization row; older backends omit by_account.
+  const missByAccount = pool.funnel?.by_account ?? {};
   // Busiest account first so the operator reads the heaviest dispatch mix on top.
   const entries = Object.entries(byAccount).sort(
     (a, b) => b[1].total_dispatches - a[1].total_dispatches,
@@ -666,6 +723,8 @@ function PoolAccountMixRow({ pool }: { pool: PoolMetrics }) {
       <div className="space-y-1">
         {entries.map(([account, a]) => {
           const hr = a.pool_hit_rate;
+          const miss = missByAccount[account];
+          const missTotal = miss?.lease_miss_total ?? 0;
           return (
             <div
               key={account}
@@ -677,6 +736,18 @@ function PoolAccountMixRow({ pool }: { pool: PoolMetrics }) {
               <span><span className="text-neutral-500">warm</span>: <span className="font-mono text-emerald-400">{a.pool_lease_hits}</span><span className="text-neutral-600">/{a.total_dispatches}</span></span>
               <span><span className="text-neutral-500">idle cost</span>: <span className="font-mono text-amber-400">{fmtUsd(a.pool_idle_cost_usd)}</span></span>
               <span><span className="text-neutral-500">$/warm</span>: <span className="font-mono text-neutral-300">{fmtUsd(a.cost_per_pool_hit_usd ?? undefined)}</span></span>
+              {missTotal > 0 && (
+                <span data-testid={`pool-account-misses-${account}`}>
+                  <span className="text-neutral-500">misses</span>:{' '}
+                  <span className="font-mono text-rose-400">{missTotal}</span>
+                  <span className="text-neutral-600">
+                    {' '}({Object.entries(miss?.lease_miss_by_reason ?? {})
+                      .sort((x, y) => y[1] - x[1])
+                      .map(([reason, n]) => `${reason} ${n}`)
+                      .join(', ')})
+                  </span>
+                </span>
+              )}
             </div>
           );
         })}

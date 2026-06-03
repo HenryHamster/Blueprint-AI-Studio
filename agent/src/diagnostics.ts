@@ -1,20 +1,15 @@
-// Forensic instrumentation for silent-death investigation.
-//
-// History: commit 50aca46d added setImmediate yields between stream-json
-// chunks to fix event-loop starvation during heavy bash output. Silent-deaths
-// recurred on the new image, so the diagnosis is unconfirmed. These trace
-// files give the next failure direct evidence: did the event loop actually
-// stall, did heartbeats fire, what was the agent's last state before exit?
-//
-// Files written:
-//   /tmp/eventloop-lag.log    — appended every time setInterval drift > 5s
-//   /tmp/heartbeat-trace.log  — start/end/duration of every heartbeat attempt
-//   /tmp/agent-final-state.log — last-words on beforeExit/exit/SIGTERM
-//
-// All writes use fs.appendFileSync — sync writes survive subsequent crashes,
-// async writes (fs.appendFile) would be lost if the process dies mid-write.
-// Reaper's serial console capture (plan task 25075953) will pull these files
-// off the dying VM so we have ground truth on the next silent-death.
+/**
+ * Forensic instrumentation and diagnostics for debugging agent failures.
+ *
+ * Traces event-loop lag, heartbeat timing, and final agent state to diagnose
+ * silent deaths and process hangs. Writes are synchronous (fs.appendFileSync)
+ * to survive subsequent crashes.
+ *
+ * Files written:
+ *   /tmp/eventloop-lag.log    — appended every time setInterval drift > 5s
+ *   /tmp/heartbeat-trace.log  — start/end/duration of every heartbeat attempt
+ *   /tmp/agent-final-state.log — last-words on beforeExit/exit/SIGTERM
+ */
 
 import fs from 'fs';
 

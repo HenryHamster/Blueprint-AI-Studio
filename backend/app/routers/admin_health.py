@@ -988,6 +988,20 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "warm_backlog_reuse_enabled": bool(
             _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
+        # Warm-pool retarget controls, surfaced so the operator panel can reflect
+        # each flag's current enabled state (and offer a confirm-and-PATCH toggle).
+        # account_retarget lets an idle member serve a dispatch whose ACCOUNT
+        # differs; cross_provider_retarget further relaxes the PROVIDER match.
+        "warm_pool_account_retarget_enabled": bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_account_retarget_enabled", False
+            )
+        ),
+        "warm_pool_cross_provider_retarget_enabled": bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_cross_provider_retarget_enabled", False
+            )
+        ),
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
         ),

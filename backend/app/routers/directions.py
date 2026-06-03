@@ -978,6 +978,20 @@ async def create_message(
     await session.commit()
     await session.refresh(msg)
 
+    # An operator message that warrants strategist attention (steering /
+    # feedback / question / blocker — anything but a passive NOTE) arms the
+    # coalescing strategic-refresh marker so the autonomous loop wakes the
+    # strategist promptly (bypassing strategic_spawn_cooldown) instead of
+    # waiting for the next scheduled cycle. Best-effort and coalescing: the
+    # helper does not commit (we own the txn), swallows its own errors so
+    # message creation never fails on it, and the min-interval floor + failure
+    # breaker keep a burst of messages from storming strategic spawns.
+    if msg_type is not MessageType.NOTE:
+        from app.strategic_trigger import request_strategic_refresh
+
+        await request_strategic_refresh(session, project.id, "operator_message")
+        await session.commit()
+
     return {"id": str(msg.id), "status": "created"}
 
 

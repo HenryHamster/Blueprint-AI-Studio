@@ -7268,3 +7268,81 @@ async def test_update_direction_preserves_scaffolding_state_when_outcome_unchang
     assert resp.status_code == 200, resp.text
     updated = resp.json()["direction"]
     assert updated.get("outcome_progress_ever_met") is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator message wakes the strategist (coalescing strategic-refresh trigger)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _reload_vision(db_session, project_id: str) -> dict:
+    """Reload a project's vision dict from a fresh read of the DB."""
+    db_session.expire_all()
+    result = await db_session.execute(
+        select(Project).where(Project.id == uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    return project.vision or {}
+
+
+@pytest.mark.asyncio
+async def test_operator_message_arms_strategic_refresh(
+    client: AsyncClient, db_session, mocker
+):
+    """A steering-class operator message arms the coalescing refresh marker."""
+    from app.strategic_trigger import strategic_refresh_pending
+
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={"content": "Please refocus on the auth bug", "message_type": "FEEDBACK"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "created"
+
+    vision = await _reload_vision(db_session, project_id)
+    assert strategic_refresh_pending(vision) is True
+    marker = vision["_strategic_refresh"]
+    assert marker["reason"] == "operator_message"
+    assert marker["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_passive_note_does_not_arm_strategic_refresh(
+    client: AsyncClient, db_session, mocker
+):
+    """A passive NOTE must NOT wake the strategist (no refresh marker)."""
+    from app.strategic_trigger import strategic_refresh_pending
+
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={"content": "FYI, just a note", "message_type": "NOTE"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    vision = await _reload_vision(db_session, project_id)
+    assert strategic_refresh_pending(vision) is False
+
+
+@pytest.mark.asyncio
+async def test_operator_message_burst_coalesces_into_one_slot(
+    client: AsyncClient, db_session, mocker
+):
+    """A burst of operator messages collapses into a single coalesced marker."""
+    from app.strategic_trigger import strategic_refresh_pending
+
+    project_id = await _deploy_project(client, mocker)
+    for message_type in ("QUESTION", "BLOCKER"):
+        resp = await client.post(
+            f"/api/admin/projects/{project_id}/messages",
+            json={"content": f"steer {message_type}", "message_type": message_type},
+        )
+        assert resp.status_code == 200, resp.text
+
+    vision = await _reload_vision(db_session, project_id)
+    assert strategic_refresh_pending(vision) is True
+    marker = vision["_strategic_refresh"]
+    # Single slot — two messages bumped the observability count, not stacked.
+    assert marker["count"] == 2
+    assert marker["reason"] == "operator_message"

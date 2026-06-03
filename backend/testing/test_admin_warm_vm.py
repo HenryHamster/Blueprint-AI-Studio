@@ -41,6 +41,22 @@ async def test_warm_vm_state_empty(client: AsyncClient, db_session):
         assert "warm_continuity_enabled" in body
         assert "warm_backlog_reuse_enabled" in body
         assert isinstance(body["warm_backlog_reuse_enabled"], bool)
+        # Warm-pool retarget controls are surfaced so the panel can reflect each
+        # flag's current state and offer a confirm-and-PATCH toggle.
+        assert "warm_pool_account_retarget_enabled" in body
+        assert isinstance(body["warm_pool_account_retarget_enabled"], bool)
+        assert body["warm_pool_account_retarget_enabled"] == bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_account_retarget_enabled", False
+            )
+        )
+        assert "warm_pool_cross_provider_retarget_enabled" in body
+        assert isinstance(body["warm_pool_cross_provider_retarget_enabled"], bool)
+        assert body["warm_pool_cross_provider_retarget_enabled"] == bool(
+            _shared_state.runtime_config.get(
+                "warm_pool_cross_provider_retarget_enabled", False
+            )
+        )
         assert isinstance(body["next_role_poll_timeout_secs"], int)
         funnel = body.get("chain_continuity_funnel", {})
         assert isinstance(funnel, dict)

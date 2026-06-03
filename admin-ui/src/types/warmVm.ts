@@ -237,6 +237,13 @@ export interface WarmVmStateResponse {
   };
   warm_continuity_enabled: boolean;
   warm_backlog_reuse_enabled: boolean;
+  // Warm-pool retarget controls. Optional for backward compatibility with an
+  // older backend that predates surfacing them in the warm-vm-state payload —
+  // the panel defaults each to false when absent. account_retarget lets an idle
+  // pool member serve a dispatch whose account differs; cross_provider_retarget
+  // further relaxes the provider match.
+  warm_pool_account_retarget_enabled?: boolean;
+  warm_pool_cross_provider_retarget_enabled?: boolean;
   next_role_poll_timeout_secs: number;
   chain_continuity_funnel?: ChainContinuityFunnelSnapshot;
   spawn_pin_funnel?: SpawnPinFunnelSnapshot;

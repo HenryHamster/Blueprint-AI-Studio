@@ -1,3 +1,12 @@
+/**
+ * Diff analysis and loop divergence detection for the fix-loop.
+ *
+ * Detects when consecutive fix-loop iterations make no measurable progress
+ * (e.g., the diff reverts to a prior state) using Jaccard token-set similarity
+ * and line-level diff capture. Used to signal convergence failures and prevent
+ * infinite retry loops.
+ */
+
 import { execSync } from 'child_process';
 import { FIX_LOOP_JACCARD_THRESHOLD, FIX_LOOP_DIFF_REVERT_THRESHOLD } from '../constants.js';
 

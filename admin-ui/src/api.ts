@@ -3,15 +3,26 @@ import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
 
+/** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
-export const COST_PER_VM_HR = 0.067;  // $/hr, e2-standard-2 on-demand VM cost
+/** Hourly cost in USD for a standard e2-standard-2 GCP VM on-demand pricing. Used to calculate task cost estimates. */
+export const COST_PER_VM_HR = 0.067;
 
+/**
+ * Generate Firebase authentication headers for API requests.
+ * @returns Promise resolving to headers object with Authorization (Bearer token) and Content-Type
+ */
 export async function authHeaders(): Promise<Record<string, string>> {
   const token = await getIdToken();
   return { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' };
 }
 
+/**
+ * Fetch a URL with Firebase authentication headers.
+ * @param url — The URL to fetch
+ * @returns Promise resolving to fetch Response
+ */
 export async function authGet(url: string) {
   const token = await getIdToken();
   return fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });

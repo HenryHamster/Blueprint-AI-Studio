@@ -1,3 +1,12 @@
+/**
+ * Test runner detection and project build configuration parsing.
+ *
+ * Detects available test runners (npm test, pytest, cargo test, etc.) via
+ * auto-detection of package.json, pytest.ini, Cargo.toml, etc., or from
+ * explicit project build configuration. Also parses build config for language,
+ * build/lint/install commands, environment variables, and migration layout.
+ */
+
 import { execSync } from 'child_process';
 import fs from 'fs';
 

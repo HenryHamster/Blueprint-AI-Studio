@@ -1,3 +1,11 @@
+/**
+ * Test failure capture and baseline initialization for the fix-loop.
+ *
+ * Runs the project's test suite at task start to capture a baseline of
+ * pre-existing test failures. The fix-loop uses this baseline to distinguish
+ * regression failures (caused by the agent's changes) from pre-existing ones.
+ */
+
 import { execSync } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';

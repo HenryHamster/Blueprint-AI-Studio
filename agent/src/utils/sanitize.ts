@@ -1,3 +1,16 @@
+/**
+ * Sanitize sensitive credentials and tokens from log output and error messages.
+ * Removes or masks:
+ * - GitHub personal access tokens (ghp_, ghs_, github_pat_)
+ * - Anthropic API keys (sk-ant-...)
+ * - Bearer tokens and OAuth tokens
+ * - JWT tokens
+ * - Private SSH keys
+ * - Git URLs with embedded credentials
+ *
+ * @param text — Raw text containing potentially sensitive data
+ * @returns Text with all sensitive patterns replaced with masked values
+ */
 export function sanitize(text: string): string {
   return text
     .replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:***@')
