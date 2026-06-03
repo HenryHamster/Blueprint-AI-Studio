@@ -1,4 +1,11 @@
-FROM python:3.11-slim
+# Multi-stage. The `deps` stage holds everything that only changes when
+# requirements.txt (or this Dockerfile) changes — the apt + pip layers. The
+# final `app` stage adds the source. `docker build` with no --target builds the
+# last stage (`app`), so production / Deploy is unchanged. CI builds just the
+# `deps` stage (`--target deps`), caches it in GHCR keyed by a deps hash, and
+# runs tests by mounting the checked-out source over /app — so the ~8 backend
+# shards no longer each rebuild the image from scratch every run.
+FROM python:3.11-slim AS deps
 
 WORKDIR /app
 
@@ -13,6 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends shellcheck && \
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt uvicorn
+
+# ── Final image: deps + application source ──────────────────────────────────
+FROM deps AS app
 
 # Copy application code
 COPY . .
