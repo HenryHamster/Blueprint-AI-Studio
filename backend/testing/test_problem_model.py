@@ -11,6 +11,8 @@ import pytest
 from pydantic import ValidationError
 
 from app.problem_model import (
+    GAP_HISTORY_DURABLE_MAX,
+    GAP_PAST_MOVES_DURABLE_MAX,
     REVISION_LOG_MAX,
     SELF_REFLECTION_LOG_MAX,
     Capability,
@@ -704,6 +706,180 @@ def test_apply_agent_update_does_not_preserve_agent_authored_intent():
     proposed = {"intent": {"purpose": "", "current_focus": "next"}}
     new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert new_raw["intent"]["purpose"] == ""
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — append-only gap-memory restore after payload trim
+# ---------------------------------------------------------------------------
+
+
+def _gap_with_memory(
+    history_events: list[str],
+    past_moves: list[str],
+    *,
+    status: str = "active",
+) -> dict:
+    """A single durable gap carrying append-only history + past_moves memory."""
+    # ``ts`` is stable per event tag so a trimmed view (the same events the
+    # agent saw, re-submitted) compares equal to the durable entries — exactly
+    # how the real payload trim preserves each event's original timestamp.
+    return {
+        "id": "g-mem",
+        "name": "Cross-cycle memory gap",
+        "status": status,
+        "history": [
+            {"ts": f"2026-04-21T00:00:00-{ev}", "event": ev}
+            for ev in history_events
+        ],
+        "past_moves": list(past_moves),
+    }
+
+
+def test_apply_agent_update_restores_trimmed_gap_history_on_round_trip():
+    """The bug this guards: the payload trims each gap's history to the most
+    recent few entries before the agent sees it, the agent round-trips the
+    trimmed view back as a full replacement, and without restore the older
+    durable entries are silently lost. The durable older events must survive."""
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                ["opened", "priority_raised", "move_attached", "move_failed", "retried"],
+                ["d-1", "d-2", "d-3"],
+            )
+        ],
+    }
+    # Simulate the upstream payload trim: agent only ever saw the last 2 entries
+    # and submits exactly that trimmed view back, unchanged.
+    proposed = {
+        "gaps": [
+            _gap_with_memory(["move_failed", "retried"], ["d-3"]),
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    events = [e["event"] for e in gap["history"]]
+    # All five durable events survive in order — the trim cannot truncate them.
+    assert events == [
+        "opened",
+        "priority_raised",
+        "move_attached",
+        "move_failed",
+        "retried",
+    ]
+    # past_moves likewise restored to the full durable union.
+    assert gap["past_moves"] == ["d-1", "d-2", "d-3"]
+
+
+def test_apply_agent_update_records_genuine_gap_history_append():
+    """The agent can still extend the log: a genuinely new event it adds to the
+    trimmed view is appended after the restored durable head."""
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                ["opened", "priority_raised", "move_attached", "move_failed"],
+                ["d-1", "d-2"],
+            )
+        ],
+    }
+    # Agent saw the trimmed tail and appended one new event + one new past move.
+    proposed = {
+        "gaps": [_gap_with_memory(["move_failed", "move_succeeded"], ["d-2", "d-3"])],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    events = [e["event"] for e in gap["history"]]
+    # Restored durable head + the genuinely new event, no duplication.
+    assert events == [
+        "opened",
+        "priority_raised",
+        "move_attached",
+        "move_failed",
+        "move_succeeded",
+    ]
+    assert gap["past_moves"] == ["d-1", "d-2", "d-3"]
+
+
+def test_apply_agent_update_new_gap_memory_taken_as_is():
+    """A brand-new gap (no prior durable record) is taken verbatim — there is
+    nothing to restore, and the restore must not invent history for it."""
+    current = {
+        "revision": 5,
+        "gaps": [_gap_with_memory(["opened"], ["d-1"])],
+    }
+    proposed = {
+        "gaps": [
+            _gap_with_memory(["opened"], ["d-1"]),  # surviving gap
+            {
+                "id": "g-fresh",
+                "name": "Brand new gap",
+                "status": "active",
+                "history": [{"ts": "2026-04-21T00:00:00", "event": "opened"}],
+                "past_moves": [],
+            },
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    fresh = next(g for g in new_raw["gaps"] if g["id"] == "g-fresh")
+    assert [e["event"] for e in fresh["history"]] == ["opened"]
+    assert fresh["past_moves"] == []
+
+
+def test_apply_agent_update_closed_gap_keeps_full_memory_into_archive():
+    """A gap the agent legitimately closes keeps its FULL durable memory as it
+    moves to the archive — the trimmed round-trip must not truncate the record
+    that gets preserved for posterity."""
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                ["opened", "priority_raised", "move_attached", "shipped"],
+                ["d-1", "d-2"],
+            )
+        ],
+    }
+    # Agent closes the gap, having only seen the trimmed tail.
+    proposed = {
+        "gaps": [_gap_with_memory(["shipped"], ["d-2"], status="closed")],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["gaps"] == []  # archived, not active
+    archived = next(g for g in new_raw["archived_gaps"] if g["id"] == "g-mem")
+    assert [e["event"] for e in archived["history"]] == [
+        "opened",
+        "priority_raised",
+        "move_attached",
+        "shipped",
+    ]
+    assert archived["past_moves"] == ["d-1", "d-2"]
+
+
+def test_apply_agent_update_restored_gap_memory_is_capped():
+    """The restored append-only logs stay bounded by the durable caps so the
+    JSONB column cannot grow without limit — oldest entries roll off."""
+    over = GAP_HISTORY_DURABLE_MAX + 25
+    current = {
+        "revision": 5,
+        "gaps": [
+            _gap_with_memory(
+                [f"e{i}" for i in range(over)],
+                [f"d-{i}" for i in range(GAP_PAST_MOVES_DURABLE_MAX + 25)],
+            )
+        ],
+    }
+    proposed = {"gaps": [_gap_with_memory(["e-tail"], ["d-tail"])]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    gap = new_raw["gaps"][0]
+    assert len(gap["history"]) == GAP_HISTORY_DURABLE_MAX
+    assert len(gap["past_moves"]) == GAP_PAST_MOVES_DURABLE_MAX
+    # Newest entry (the agent's appended tail) is retained at the end.
+    assert gap["history"][-1]["event"] == "e-tail"
+    assert gap["past_moves"][-1] == "d-tail"
+    # Oldest durable entries rolled off the front: 225 durable + 1 appended
+    # tail = 226, capped to 200 drops the first 26 (indices 0..25).
+    assert gap["history"][0]["event"] == "e26"
+    assert gap["past_moves"][0] == "d-26"
 
 
 # ---------------------------------------------------------------------------

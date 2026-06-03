@@ -146,6 +146,35 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('first to read the full current state');
   });
 
+  it('steers to ./fetch full gap history when gapMemoryTrimmedGapIds is non-empty', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      problemModelRecovery: 'present',
+      gapMemoryTrimmedGapIds: ['g-strategic-mem', 'g-auth'],
+    });
+    // Steering block present and naming the trimmed gaps
+    expect(prompt).toContain('# Some gap memory was shortened for payload size');
+    expect(prompt).toContain('g-strategic-mem');
+    expect(prompt).toContain('g-auth');
+    // It must point at the fetch helpers the agent already has
+    expect(prompt).toContain('./fetch problem-model');
+    expect(prompt).toContain('./fetch gap <gap_id>');
+    // It must reference the backend marker the agent inspects
+    expect(prompt).toContain('_gap_memory_trimmed');
+    // Steering lands before the output instructions so the thinker sees it
+    expect(prompt.indexOf('# Some gap memory was shortened')).toBeLessThan(
+      prompt.indexOf('## 1. State assessment'),
+    );
+  });
+
+  it('omits the gap-memory steering block when no gap memory was trimmed', () => {
+    const empty = buildThinkerPrompt({ ...base, gapMemoryTrimmedGapIds: [] });
+    expect(empty).not.toContain('# Some gap memory was shortened for payload size');
+    // Field absent entirely → also omitted (present model, normal cycle)
+    const absent = buildThinkerPrompt({ ...base, problemModelRecovery: 'present' });
+    expect(absent).not.toContain('# Some gap memory was shortened for payload size');
+  });
+
   it('renders neither bootstrap nor recovery block when the model is present', () => {
     const prompt = buildThinkerPrompt({ ...base, problemModelRecovery: 'present' });
     expect(prompt).not.toContain('# Bootstrap (when the problem_model is empty)');

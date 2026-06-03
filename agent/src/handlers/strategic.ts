@@ -193,6 +193,23 @@ export async function handleStrategic(
       ? JSON.stringify(problemModel, null, 2)
       : '';
 
+    // ── Per-gap memory pre-trim signal ──
+    // The backend's `_agent_view_problem_model` (strategic_spawning.py) trims
+    // each active gap's append-only history/past_moves/evidence to a recent
+    // window BEFORE the byte-budget packer runs, so this trim never lands in
+    // `_packer_meta` and the model still ships as 'present'. It surfaces the
+    // trim inline on the problem_model as `_gap_memory_trimmed` — a list of
+    // {gap_id, fields} entries. Extract the affected gap_ids and hand them to
+    // the thinker prompt so it steers the agent to `./fetch` full gap history
+    // before reasoning about a long-lived gap's arc, instead of mistaking the
+    // shortened tail for the gap's entire lifetime.
+    const gapMemoryTrimmedMarker = problemModel?._gap_memory_trimmed;
+    const gapMemoryTrimmedGapIds = Array.isArray(gapMemoryTrimmedMarker)
+      ? (gapMemoryTrimmedMarker as Array<Record<string, unknown>>)
+          .map(g => strVal(g.gap_id))
+          .filter(Boolean)
+      : [];
+
     const runningUpdateDoc = typeof payload.running_update === 'string'
       ? payload.running_update
       : '';
@@ -367,6 +384,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       strategicContext,
       problemModelSection,
       problemModelRecovery,
+      gapMemoryTrimmedGapIds,
       verificationFailuresSection,
       reflectionSection,
       selfImprovementBlock,

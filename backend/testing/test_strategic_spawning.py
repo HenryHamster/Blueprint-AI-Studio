@@ -2568,6 +2568,70 @@ def test_agent_view_design_doc_handles_empty_input():
     assert _agent_view_design_doc({}) == {}
 
 
+def test_agent_view_problem_model_reports_per_gap_memory_trim():
+    """When a gap's append-only history/past_moves are trimmed to the recent
+    window, the trim is surfaced via ``_gap_memory_trimmed`` so the strategic
+    agent can tell the view was shortened and pull full detail via ./fetch.
+    This pre-trim runs before the byte-budget packer, so without this marker
+    nothing would signal the agent that the gap's arc is incomplete."""
+    from app.strategic_spawning import (
+        _agent_view_problem_model,
+        _GAP_HISTORY_KEEP,
+        _GAP_PAST_MOVES_KEEP,
+    )
+
+    pm = {
+        "gaps": [
+            {
+                "id": "g-long-lived",
+                "history": [{"e": i} for i in range(_GAP_HISTORY_KEEP + 4)],
+                "past_moves": [{"m": i} for i in range(_GAP_PAST_MOVES_KEEP + 2)],
+            },
+            {
+                "id": "g-fresh",
+                "history": [{"e": 0}],
+                "past_moves": [],
+            },
+        ]
+    }
+    view = _agent_view_problem_model(pm)
+
+    # The trimmed gap is reported with the actual vs shown counts.
+    trimmed = view["_gap_memory_trimmed"]
+    assert [t["gap_id"] for t in trimmed] == ["g-long-lived"], (
+        f"only the over-window gap should be reported: {trimmed}"
+    )
+    entry = trimmed[0]
+    assert entry["fields"]["history"] == {
+        "shown": _GAP_HISTORY_KEEP,
+        "total": _GAP_HISTORY_KEEP + 4,
+    }
+    assert entry["fields"]["past_moves"] == {
+        "shown": _GAP_PAST_MOVES_KEEP,
+        "total": _GAP_PAST_MOVES_KEEP + 2,
+    }
+    # The arrays themselves are actually trimmed to the recent tail.
+    g0 = view["gaps"][0]
+    assert len(g0["history"]) == _GAP_HISTORY_KEEP
+    assert g0["history"][-1] == {"e": _GAP_HISTORY_KEEP + 3}
+
+
+def test_agent_view_problem_model_no_marker_when_nothing_trimmed():
+    """A model whose gaps are all within the keep window carries no trim marker,
+    so the agent treats the shipped view as complete (no spurious ./fetch)."""
+    from app.strategic_spawning import _agent_view_problem_model
+
+    pm = {
+        "gaps": [
+            {"id": "g-a", "history": [{"e": 0}], "past_moves": [{"m": 0}]},
+        ]
+    }
+    view = _agent_view_problem_model(pm)
+    assert "_gap_memory_trimmed" not in view
+    # The durable input is never mutated.
+    assert "_gap_memory_trimmed" not in pm
+
+
 @pytest.mark.asyncio
 async def test_design_doc_update_payload_omits_playbook_archive(db_session):
     """Integration: _spawn_design_doc_update must not ship playbook_archive."""

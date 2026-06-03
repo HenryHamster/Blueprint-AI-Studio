@@ -190,6 +190,64 @@ describe('handleStrategic problem_model recovery framing', () => {
   });
 });
 
+describe('handleStrategic per-gap memory pre-trim wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('extracts gap_ids from problem_model._gap_memory_trimmed and passes them to the thinker', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: {
+        intent: { purpose: 'real' },
+        gaps: [{ id: 'g-long-lived' }, { id: 'g-fresh' }],
+        // The backend pre-trim marker: per-gap append-only memory shortened
+        // to a recent window before the byte-budget packer ran.
+        _gap_memory_trimmed: [
+          { gap_id: 'g-long-lived', fields: { history: { shown: 3, total: 41 } } },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-gm', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params).toBeDefined();
+    // The model is still 'present' — the pre-trim is independent of packer drops.
+    expect(params?.problemModelRecovery).toBe('present');
+    expect(params?.gapMemoryTrimmedGapIds).toEqual(['g-long-lived']);
+  });
+
+  it('passes an empty list when no gap memory was trimmed', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: { intent: { purpose: 'real' }, gaps: [{ id: 'g-1' }] },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-gm-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.gapMemoryTrimmedGapIds).toEqual([]);
+  });
+
+  it('drops entries with missing gap_id from the trimmed list', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: {
+        intent: { purpose: 'real' },
+        _gap_memory_trimmed: [
+          { gap_id: 'g-a', fields: {} },
+          { fields: {} }, // malformed: no gap_id
+          { gap_id: 'g-b', fields: {} },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-gm-mal', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.gapMemoryTrimmedGapIds).toEqual(['g-a', 'g-b']);
+  });
+});
+
 describe('handleStrategic prompt_suffix wiring', () => {
   beforeEach(() => {
     capturedThinkerPrompt = undefined;

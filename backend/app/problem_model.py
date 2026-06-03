@@ -346,6 +346,23 @@ SELF_REFLECTION_LOG_MAX = 20
 """Cap on project.self_reflection_log length — older entries are dropped."""
 
 
+GAP_HISTORY_DURABLE_MAX = 200
+"""Cap on a surviving gap's durable ``history`` after write-back restore.
+
+The strategic payload trims each active gap's ``history`` to only its most
+recent few entries before the agent ever sees it (see
+``strategic_spawning._GAP_HISTORY_KEEP``); :func:`_merge_gap`
+unions the durable head back in on write-back so a round-tripped trimmed view
+cannot truncate the log. This cap keeps the restored, append-only log bounded
+in the JSONB column — generous (far above the payload trim) so it never loses
+recent memory, but finite so it cannot grow without limit."""
+
+
+GAP_PAST_MOVES_DURABLE_MAX = 200
+"""Cap on a surviving gap's durable ``past_moves`` after write-back restore —
+see :data:`GAP_HISTORY_DURABLE_MAX`."""
+
+
 class SelfReflectionEntry(BaseModel):
     """Agent-written reflection about what was hard this cycle.
 
@@ -837,10 +854,17 @@ def _upsert_by_key(
 def _merge_gap(current: Gap, proposed: Gap) -> Gap:
     """Upsert one gap: proposed wins for every field EXCEPT the append-only
     logs (``history``, ``past_moves``), which union current+proposed so a
-    trimmed tail echoed back by the agent cannot truncate the full record."""
+    trimmed tail echoed back by the agent cannot truncate the full record. The
+    unioned logs are bounded by :data:`GAP_HISTORY_DURABLE_MAX` /
+    :data:`GAP_PAST_MOVES_DURABLE_MAX` (oldest entries roll off) so the JSONB
+    column cannot grow without limit across cycles."""
     merged = proposed.model_copy(deep=True)
-    merged.history = _merge_append_log(current.history, proposed.history)
-    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)
+    merged.history = _merge_append_log(current.history, proposed.history)[
+        -GAP_HISTORY_DURABLE_MAX:
+    ]
+    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)[
+        -GAP_PAST_MOVES_DURABLE_MAX:
+    ]
     return merged
 
 
@@ -893,7 +917,10 @@ def apply_agent_update(
     revision and timestamp, preserves existing ``archived_gaps`` and
     ``revision_log``, carries forward operator-seeded strategic intent the
     agent omitted or blanked (see :func:`_preserve_operator_intent`),
-    auto-archives any gaps that are now closed or abandoned, and appends a
+    restores any append-only per-gap ``history``/``past_moves`` the payload
+    trimmed before the agent saw it (see :func:`_merge_agent_owned_collections`
+    / :func:`_merge_gap`), auto-archives any gaps that are now closed or
+    abandoned, and appends a
     revision-log entry summarizing the change.
 
     Returns a tuple of ``(new_raw_dict, diff_summary)``:

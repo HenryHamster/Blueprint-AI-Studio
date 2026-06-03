@@ -55,6 +55,16 @@ export interface ThinkerPromptParams {
    *  - 'empty'   — genuinely no model yet (true first cycle). Bootstrap.
    */
   problemModelRecovery: 'present' | 'fetch' | 'empty';
+  /**
+   * gap_ids whose append-only history/past_moves were trimmed to a recent
+   * window when the strategic payload was assembled (the per-gap pre-trim in
+   * the backend's `_agent_view_problem_model`). This trim runs before the
+   * byte-budget packer, so it never shows up in the packer-drop metadata —
+   * the model is still 'present'. When non-empty, the prompt steers the agent
+   * to `./fetch` full gap history before reasoning about these gaps' arcs,
+   * so it does not mistake the shortened view for the gap's whole lifetime.
+   */
+  gapMemoryTrimmedGapIds?: string[];
   verificationFailuresSection?: string;
   reflectionSection: string;
   selfImprovementBlock: string;
@@ -99,6 +109,20 @@ Populate intent from: the existing vision field (if any), the conversation_threa
 Your problem_model was NOT shipped in full this cycle — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). It EXISTS; **this is not the first cycle.** Do NOT bootstrap a cold-start model from the sections above: the backend merges your output into the durable model (upsert by key, omitted entries preserved), so a cold-start model would upsert guessed placeholder entries over the real capabilities, gaps, and friction — and the per-gap history you never saw can't be reconstructed from scratch.
 
 Instead: run \`./fetch problem-model\` to retrieve the full current model, then EDIT it in place — refine intent, open/close gaps, upgrade capabilities, record friction — and submit the edited whole.`
+      : '';
+  // Pre-trim steering. Independent of bootstrap/recover: the model IS present,
+  // but specific gaps' append-only memory was shortened to a recent window for
+  // payload size. The shortened view is NOT the gap's complete arc, so steer
+  // the agent to pull full history before deciding whether to push, refine, or
+  // retire those gaps — otherwise it reasons over a partial lifetime it has no
+  // reason to suspect is partial.
+  const gapMemoryTrimmedSection =
+    p.gapMemoryTrimmedGapIds && p.gapMemoryTrimmedGapIds.length > 0
+      ? `# Some gap memory was shortened for payload size
+
+The append-only \`history\` / \`past_moves\` of these gaps were trimmed to only their most recent entries when this payload was assembled (look for the \`_gap_memory_trimmed\` marker in your problem_model above): ${p.gapMemoryTrimmedGapIds.join(', ')}. What you see is the tail, NOT the gap's full arc.
+
+When you reason about whether to keep pushing, refine, or retire any of these gaps, first run \`./fetch problem-model\` (or \`./fetch gap <gap_id>\`) to read its complete history and past_moves. Do not treat the shortened view as the gap's entire lifetime — a long-lived gap may have a much longer arc than the few events shown here.`
       : '';
   return `${p.contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
@@ -171,7 +195,7 @@ On **every** \`create-direction\` and \`update-direction\` call, emit a \`recomm
 ${p.selfImprovementBlock}
 
 ${bootstrapOrRecoverSection}
-
+${gapMemoryTrimmedSection ? `\n${gapMemoryTrimmedSection}\n` : ''}
 # Running update: what the user reads
 
 The running_update is a **single living markdown document** the user sees as "the project's current state." It is NOT a log of per-cycle entries — you rewrite it each cycle as a clean snapshot, not by appending. The prior version is shown above; refine it. Remove what's now stale, integrate what's now true, keep it short and coherent.

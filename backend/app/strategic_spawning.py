@@ -139,11 +139,13 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
     gaps = trimmed.get("gaps") or []
     if gaps:
         new_gaps = []
+        gap_memory_trimmed: list[dict] = []
         for g in gaps:
             if not isinstance(g, dict):
                 new_gaps.append(g)
                 continue
             g2 = dict(g)
+            shortened: dict[str, dict] = {}
             for key, keep in (
                 ("history", _GAP_HISTORY_KEEP),
                 ("past_moves", _GAP_PAST_MOVES_KEEP),
@@ -151,9 +153,25 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
             ):
                 arr = g2.get(key)
                 if isinstance(arr, list) and len(arr) > keep:
+                    shortened[key] = {"shown": keep, "total": len(arr)}
                     g2[key] = arr[-keep:]
+            if shortened:
+                gap_memory_trimmed.append(
+                    {"gap_id": g2.get("id"), "fields": shortened}
+                )
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
+        # Surface the pre-trim so the strategic agent can tell a gap's
+        # append-only memory was shortened to a recent window for payload
+        # size. This trim runs BEFORE the byte-budget packer, so it would
+        # otherwise never appear in the payload's packer metadata and the
+        # agent would mistake the shortened view for the gap's full arc.
+        # The marker rides in the agent-facing problem_model (the durable
+        # project.problem_model is never mutated — this operates on a copy)
+        # and steers the agent to ./fetch full gap history before deciding
+        # whether to push, refine, or retire a long-lived gap.
+        if gap_memory_trimmed:
+            trimmed["_gap_memory_trimmed"] = gap_memory_trimmed
     return trimmed
 
 
