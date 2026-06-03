@@ -115,6 +115,7 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
 import * as testLoopMod from '../utils/test-fix-loop.js';
+import { expectCalledWith, expectLastCalledWith } from '../utils/typed-mock-call.js';
 import {
   handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS,
   detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
@@ -1463,7 +1464,7 @@ describe('handleFix — baseline capture', () => {
     );
 
     expect(vi.mocked(testLoopMod.captureTestBaseline)).not.toHaveBeenCalled();
-    expect(vi.mocked(indexMod.sendLog)).toHaveBeenCalledWith(
+    expectCalledWith(indexMod.sendLog,
       null,
       expect.stringContaining('CI-failure fix'),
     );
@@ -1482,7 +1483,7 @@ describe('handleFix — baseline capture', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    expect(vi.mocked(testLoopMod.testFixLoop)).toHaveBeenCalledWith(
+    expectCalledWith(testLoopMod.testFixLoop,
       null,
       expect.any(Object),
       undefined,
@@ -1744,7 +1745,7 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
     await pushForceWithLeaseRetrying('feature/x', null);
 
     expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(indexMod.gitAsync)).toHaveBeenCalledWith(['push', '--force-with-lease', 'origin', 'feature/x']);
+    expectCalledWith(indexMod.gitAsync, ['push', '--force-with-lease', 'origin', 'feature/x']);
     // No fetch/rebase on the happy path.
     const gitCalls = vi.mocked(indexMod.git).mock.calls.map(c => c[0]);
     expect(gitCalls.some(args => Array.isArray(args) && args[0] === 'fetch')).toBe(false);
@@ -2204,8 +2205,8 @@ describe('handleReview prompt determinism', () => {
   it('handleReview fingerprints static review guidance rather than task-specific context', async () => {
     await handleReview('task-rev', REVIEW_PAYLOAD, REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef());
     const expected = computeReviewPromptFingerprint({});
-    expect(vi.mocked(indexMod.setCurrentPromptFingerprint)).toHaveBeenCalledWith(expected);
-    expect(vi.mocked(indexMod.sendHeartbeatSync)).toHaveBeenCalledWith(
+    expectCalledWith(indexMod.setCurrentPromptFingerprint, expected);
+    expectCalledWith(indexMod.sendHeartbeatSync,
       'task-rev',
       'Running code review...',
       { prompt_fingerprint: expected },
@@ -2229,7 +2230,7 @@ describe('handleReview prompt determinism', () => {
       null,
       statusRef(),
     );
-    expect(vi.mocked(indexMod.setCurrentPromptFingerprint)).toHaveBeenLastCalledWith(expected);
+    expectLastCalledWith(indexMod.setCurrentPromptFingerprint, expected);
   });
 });
 

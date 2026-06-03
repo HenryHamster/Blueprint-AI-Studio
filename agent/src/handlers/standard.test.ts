@@ -130,7 +130,7 @@ import { setupWorkspace, runClaudeCode } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
-import { expectCalledWith } from '../utils/typed-mock-call.js';
+import { expectCalledWith, expectNotCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -408,7 +408,7 @@ describe('module interface extraction', () => {
   it('calls extractModuleInterfaces for handleCreate with scope=medium', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
+    expectCalledWith(extractModuleInterfaces, WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Module Interfaces');
   });
 
@@ -427,7 +427,7 @@ describe('module interface extraction', () => {
   it('calls extractModuleInterfaces for handleRefactor with scope=medium', async () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
+    expectCalledWith(extractModuleInterfaces, WS, ['src/utils.ts']);
     expect(capturedPrompt()).toContain('## Module Interfaces');
   });
 
@@ -448,7 +448,7 @@ describe('affected consumer discovery', () => {
   it('calls discoverAffectedConsumers for handleCreate with scope=medium', async () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' } };
     await handleCreate(TASK_ID, { prompt: 'Do it', related_files: ['src/foo.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/foo.ts']);
+    expectCalledWith(discoverAffectedConsumers, WS, ['src/foo.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
   });
 
@@ -467,7 +467,7 @@ describe('affected consumer discovery', () => {
   it('calls discoverAffectedConsumers for handleRefactor with scope=medium', async () => {
     const task = { title: 'Refactor', description: '', context: { scope: 'medium' } };
     await handleRefactor(TASK_ID, { prompt: 'Improve it', related_files: ['src/utils.ts'] }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(discoverAffectedConsumers)).toHaveBeenCalledWith(WS, ['src/utils.ts']);
+    expectCalledWith(discoverAffectedConsumers, WS, ['src/utils.ts']);
     expect(capturedPrompt()).toContain('## Affected Consumers');
   });
 
@@ -917,7 +917,7 @@ describe('analysis-phase scope feasibility gate', () => {
       project_context: { cochange_files: ['x/y.ts', 'p/q.ts'] },
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(buildAnalysisPrompt)).toHaveBeenCalledWith(
+    expectCalledWith(buildAnalysisPrompt,
       expect.objectContaining({ cochangeFiles: ['x/y.ts', 'p/q.ts'] }),
     );
   });
@@ -937,7 +937,7 @@ describe('analysis-phase scope feasibility gate', () => {
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
     const { persistAndPostStatus } = await import('../index.js');
-    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+    expectNotCalledWith(persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
@@ -952,7 +952,7 @@ describe('analysis-phase scope feasibility gate', () => {
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const { persistAndPostStatus } = await import('../index.js');
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'FAILED',
@@ -985,7 +985,7 @@ describe('analysis-phase scope feasibility gate', () => {
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
     const { persistAndPostStatus } = await import('../index.js');
-    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+    expectNotCalledWith(persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
@@ -1003,7 +1003,7 @@ describe('analysis-phase scope feasibility gate', () => {
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
     const { persistAndPostStatus } = await import('../index.js');
-    expect(vi.mocked(persistAndPostStatus)).not.toHaveBeenCalledWith(
+    expectNotCalledWith(persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({ failure_category: 'scope_overflow' }),
     );
@@ -1269,7 +1269,7 @@ describe('runCodeChangeTask marker detection', () => {
       return '';
     });
     await realRunCodeChangeTask(baseOpts());
-    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(idx.persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'COMPLETED',
@@ -1322,7 +1322,7 @@ describe('runCodeChangeTask marker detection', () => {
     });
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     await realRunCodeChangeTask(baseOpts());
-    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(idx.persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({ status: 'FAILED', failure_category: 'incomplete' }),
     );
@@ -1341,7 +1341,7 @@ describe('runCodeChangeTask marker detection', () => {
     });
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     await realRunCodeChangeTask(baseOpts());
-    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(idx.persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'FAILED',
@@ -1362,7 +1362,7 @@ describe('runCodeChangeTask marker detection', () => {
     });
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'boom', lastResultText: '' });
     await realRunCodeChangeTask(baseOpts());
-    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(idx.persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'FAILED',
@@ -1387,7 +1387,7 @@ describe('runCodeChangeTask marker detection', () => {
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     const opts = { ...baseOpts(), noChangesMessage: 'No documentation changes needed.' };
     await realRunCodeChangeTask(opts);
-    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(idx.persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'FAILED',
@@ -2833,7 +2833,7 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
     await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     // runClaudeCode should NOT have been called for a reviewer pass
-    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(
+    expectNotCalledWith(idx.runClaudeCode,
       expect.stringContaining('You are reviewing a PR for a colleague'),
       expect.anything(), expect.anything(), expect.anything(), expect.anything(), expect.anything(),
     );
@@ -2852,7 +2852,7 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
 
     await handleCreate(TASK_ID, PAYLOAD, TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(
+    expectNotCalledWith(idx.runClaudeCode,
       expect.stringContaining('You are reviewing a PR for a colleague'),
       expect.anything(), expect.anything(), expect.anything(), expect.anything(), expect.anything(),
     );
@@ -2872,7 +2872,7 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
 
     await handleCreate(TASK_ID, PAYLOAD, autoRemTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
-    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(
+    expectNotCalledWith(idx.runClaudeCode,
       expect.stringContaining('You are reviewing a PR for a colleague'),
       expect.anything(), expect.anything(), expect.anything(), expect.anything(), expect.anything(),
     );
@@ -3553,7 +3553,7 @@ describe('handleCreate — SCOPE_EMPTY pre-flight guard', () => {
       task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
-    expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(idx.persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'BLOCKED_PRECONDITION',
@@ -3687,7 +3687,7 @@ describe('operator_requested_review_for branch-existence check', () => {
       task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+    expectCalledWith(persistAndPostStatus,
       TASK_ID,
       expect.objectContaining({
         status: 'COMPLETED',
@@ -3763,7 +3763,7 @@ describe('operator_requested_review_for branch-existence check', () => {
       task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
-    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalledWith(
+    expectCalledWith(prepareWorkspaceForRole,
       expect.objectContaining({ baseBranch: 'trunk' }),
     );
   });

@@ -4539,16 +4539,35 @@ class TestPrMergedLandedWriterAllowlist:
 # run in CI). This mirrors the precedent of ``test_agent_branch_invariants.py``,
 # which statically scans the agent TypeScript source.
 #
-# The allowlist is intentionally a precise, name-based set of the high-risk
-# project-internal helpers the typed-helper work locked. Node standard-library
-# spies (``fs.writeFileSync``, ``process.kill``) and other internal helpers
-# whose call-arg assertions remain legitimately raw are NOT in the set, so the
-# guard has zero false positives.
+# A HAND-MAINTAINED name list fails SILENT the moment a new project-internal
+# function appears: a raw ``expect(vi.mocked(newInternalFn)).toHaveBeenCalledWith
+# (...)`` on a function not in the list slips through unnoticed — the same
+# silent-escape meta-gap the Alembic ``_MERGE_NAMES`` guard had. So the guard
+# does NOT keep a name list. Instead it classifies each mock-call target through
+# the *test file's own imports*:
+#
+#   * A binding imported from a RELATIVE specifier (``./x.js``, ``../index.js``,
+#     ``../prompt.js``) is project-internal — a raw argument-bearing matcher on
+#     it is an offender and must adopt the typed helper.
+#   * A binding imported from a BARE specifier (``fs``, ``node:child_process``,
+#     ``ws``, any third-party package) is external — its signature is owned
+#     elsewhere, so a raw matcher is legitimately allowed.
+#
+# Namespace-qualified targets (``vi.mocked(idx.fn)`` with
+# ``import * as idx from '../index.js'`` or ``const idx = await import('../index.js')``)
+# resolve through the namespace binding. No-argument matchers
+# (``toHaveBeenCalled``) and setup calls (``mockResolvedValue``) are never
+# flagged — they carry no argument list to drift on signature. This mirrors the
+# self-locking precedent of ``TestPrMergedLandedWriterAllowlist`` in this file.
 
-# The protected project-internal functions: any call-argument assertion on one
-# of these in an agent ``*.test.ts`` file must go through ``expectCalledWith`` /
-# ``expectLastCalledWith`` / ``expectNotCalledWith`` rather than a raw matcher.
-_PROTECTED_INTERNAL_FNS = frozenset({"setupWorkspace", "captureTestBaseline"})
+# Documented exemptions: internal bindings that genuinely cannot adopt the typed
+# helper, mapping ``binding name -> human reason``. Mirrors the documented
+# allowlists used by the ``os.walk`` invariants elsewhere in this file. The
+# canonical case is an OVERLOADED function: ``Parameters<F>`` resolves only to
+# the LAST overload, so the wrapper would reject valid calls made against an
+# earlier overload. Keep this set minimal and justified — an empty set is the
+# correct default and means "every internal binding must use the typed helper".
+_TYPED_MOCK_EXEMPT: "dict[str, str]" = {}
 
 # Resolve agent/src across local + Docker test environments. Mirrors
 # ``_resolve_agent_src_root`` in test_agent_branch_invariants.py:
@@ -4573,22 +4592,118 @@ def _resolve_agent_src_for_typed_mock() -> "Path | None":
 _TYPED_MOCK_AGENT_SRC = _resolve_agent_src_for_typed_mock()
 
 
-# Matches a RAW mock-call-argument assertion on a protected function:
+# Matches a RAW argument-bearing mock-call assertion on ANY binding:
 #   expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
 #   expect(vi.mocked(idx.setupWorkspace)).not.toHaveBeenCalledWith(
 #   expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(
-# An optional ``<module>.`` qualifier (e.g. ``idx.setupWorkspace``) is allowed
-# on the receiver, and an optional ``.not`` may precede the matcher. Only the
-# argument-bearing matchers (``toHaveBeenCalledWith`` /
-# ``toHaveBeenLastCalledWith``) are flagged — the no-arg ``toHaveBeenCalled``
-# and ``.mockResolvedValue`` forms are correctly ignored because they carry no
-# argument list and so cannot drift on signature.
+# The optional ``<namespace>.`` qualifier and the bare function name are both
+# captured so the scanner can resolve either through the file's import map. An
+# optional ``.not`` may precede the matcher. Only the argument-bearing matchers
+# (``toHaveBeenCalledWith`` / ``toHaveBeenLastCalledWith``) are matched — the
+# no-arg ``toHaveBeenCalled`` and ``.mockResolvedValue`` forms carry no argument
+# list and so cannot drift on signature.
 _RAW_TYPED_MOCK_RE = re.compile(
-    r"vi\.mocked\(\s*(?:\w+\.)?(?P<fn>"
-    + "|".join(sorted(_PROTECTED_INTERNAL_FNS))
-    + r")\s*\)\s*\)\s*(?:\.not)?\."
+    r"vi\.mocked\(\s*(?:(?P<ns>\w+)\.)?(?P<fn>\w+)\s*\)\s*\)\s*(?:\.not)?\."
     r"(?P<matcher>toHaveBeenCalledWith|toHaveBeenLastCalledWith)"
 )
+
+# ── Import-classification helpers ─────────────────────────────────────────────
+# These build a per-file map of ``binding name -> is_internal`` from the test
+# file's own import statements, so a mock-call target can be classified as
+# project-internal (relative specifier) or external (bare specifier) without any
+# hand-maintained name list.
+_STATIC_IMPORT_RE = re.compile(
+    r"\bimport\s+(?P<clause>[^'\";]+?)\s+from\s+['\"](?P<spec>[^'\"]+)['\"]"
+)
+_DYNAMIC_DESTRUCTURE_RE = re.compile(
+    r"\b(?:const|let|var)\s*\{(?P<names>[^}]*)\}\s*=\s*await\s+"
+    r"import\(\s*['\"](?P<spec>[^'\"]+)['\"]"
+)
+_DYNAMIC_BINDING_RE = re.compile(
+    r"\b(?:const|let|var)\s+(?P<name>\w+)\s*=\s*\(?\s*await\s+"
+    r"import\(\s*['\"](?P<spec>[^'\"]+)['\"]"
+)
+
+
+def _spec_is_internal(spec: str) -> bool:
+    """A relative module specifier denotes project-internal source."""
+    return spec.startswith("./") or spec.startswith("../")
+
+
+def _bindings_from_static_clause(clause: str) -> "list[str]":
+    """Extract every runtime binding name from a static ``import`` clause.
+
+    Handles ``* as ns`` namespace, ``{ a, b as c, type D }`` named, and leading
+    default (``fs``, ``fs, { x }``) forms.
+    """
+    bindings: list[str] = []
+    clause = clause.strip()
+    ns = re.search(r"\*\s+as\s+(\w+)", clause)
+    if ns:
+        bindings.append(ns.group(1))
+    brace = re.search(r"\{([^}]*)\}", clause)
+    if brace:
+        for part in brace.group(1).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            part = re.sub(r"^type\s+", "", part)  # ``{ type Foo }`` inline form
+            alias = re.search(r"\bas\s+(\w+)\s*$", part)  # ``orig as alias``
+            if alias:
+                bindings.append(alias.group(1))
+            else:
+                head = re.match(r"(\w+)", part)
+                if head:
+                    bindings.append(head.group(1))
+    # Default import: a leading bare identifier before any ``{`` or ``*``.
+    lead = clause.split(",")[0].strip()
+    if re.fullmatch(r"\w+", lead):
+        bindings.append(lead)
+    return bindings
+
+
+def _bindings_from_destructure(names: str) -> "list[str]":
+    """Extract bindings from a dynamic ``const { a, default: fs } = await import``
+    destructure pattern (the right-hand side of ``key: alias`` is the binding).
+    """
+    bindings: list[str] = []
+    for part in names.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:  # ``{ default: fs }`` / ``{ orig: alias }``
+            part = part.split(":", 1)[1].strip()
+        head = re.match(r"(\w+)", part)
+        if head:
+            bindings.append(head.group(1))
+    return bindings
+
+
+def _parse_import_map(src: str) -> "dict[str, bool]":
+    """Map each imported binding name -> ``is_internal`` (relative specifier).
+
+    Covers static ``import`` (named, default, ``* as`` namespace) and dynamic
+    ``await import('...')`` (destructured, namespace, and ``.default``) forms.
+    When a binding name is bound more than once, internal wins (stricter), so a
+    binding ever sourced from a relative path is treated as internal.
+    """
+    # Run over comment-stripped source so a commented-out import is ignored, and
+    # join the lines so a multi-line ``import { ... } from '...'`` matches whole.
+    text = "\n".join(line for _, line in _strip_ts_comments(src))
+    result: dict[str, bool] = {}
+
+    def _record(binding: str, spec: str) -> None:
+        result[binding] = result.get(binding, False) or _spec_is_internal(spec)
+
+    for m in _STATIC_IMPORT_RE.finditer(text):
+        for binding in _bindings_from_static_clause(m.group("clause")):
+            _record(binding, m.group("spec"))
+    for m in _DYNAMIC_DESTRUCTURE_RE.finditer(text):
+        for binding in _bindings_from_destructure(m.group("names")):
+            _record(binding, m.group("spec"))
+    for m in _DYNAMIC_BINDING_RE.finditer(text):
+        _record(m.group("name"), m.group("spec"))
+    return result
 
 
 def _strip_ts_comments(src: str) -> "list[tuple[int, str]]":
@@ -4631,14 +4746,38 @@ def _strip_ts_comments(src: str) -> "list[tuple[int, str]]":
     return result
 
 
-def _scan_for_raw_typed_mock(path: Path) -> "list[str]":
-    """Return ``file:lineno: <line>`` offenders in a single agent test file."""
-    src = path.read_text(encoding="utf-8")
+def _scan_source_for_raw_typed_mock(
+    name: str, src: str, exempt: "dict[str, str] | None" = None
+) -> "list[str]":
+    """Return ``name:lineno: <line>`` offenders for one test source string.
+
+    An offender is a raw argument-bearing matcher whose target binding (or, for
+    ``ns.fn``, its namespace qualifier) resolves through the file's imports to a
+    project-internal (relative) specifier and whose function name is not in the
+    documented exemption set. External and unresolved bindings are left alone, so
+    the guard has zero false positives on Node-stdlib / third-party spies.
+    """
+    exempt = _TYPED_MOCK_EXEMPT if exempt is None else exempt
+    import_map = _parse_import_map(src)
     offenders: list[str] = []
     for lineno, line in _strip_ts_comments(src):
-        if _RAW_TYPED_MOCK_RE.search(line):
-            offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+        m = _RAW_TYPED_MOCK_RE.search(line)
+        if not m:
+            continue
+        lookup = m.group("ns") or m.group("fn")
+        if not import_map.get(lookup, False):
+            continue  # external or unresolved binding — raw matcher allowed.
+        if m.group("fn") in exempt:
+            continue  # documented, genuinely-unconvertible internal function.
+        offenders.append(f"{name}:{lineno}: {line.strip()}")
     return offenders
+
+
+def _scan_for_raw_typed_mock(path: Path) -> "list[str]":
+    """Return ``file:lineno: <line>`` offenders in a single agent test file."""
+    return _scan_source_for_raw_typed_mock(
+        path.name, path.read_text(encoding="utf-8")
+    )
 
 
 def _iter_agent_test_files() -> "list[Path]":
@@ -4649,16 +4788,22 @@ def _iter_agent_test_files() -> "list[Path]":
 
 
 class TestTypedMockAssertConvention:
-    """Static guard: call-argument assertions on the high-risk project-internal
-    functions locked by the typed-helper work must use the type-safe wrapper
-    ``expectCalledWith`` (agent/src/utils/typed-mock-call.ts), never the raw
-    ``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher.
+    """Static guard: call-argument assertions on project-internal functions
+    (resolved through the test file's own RELATIVE imports) must use the
+    type-safe wrapper ``expectCalledWith`` (agent/src/utils/typed-mock-call.ts),
+    never the raw ``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher.
 
     The raw matcher accepts ``any[]`` arguments, so a signature change to the
-    protected function silently leaves stale assertions green. The wrapper
+    internal function silently leaves stale assertions green. The wrapper
     constrains the asserted arguments to ``Parameters<F>``, turning drift into a
     ``tsc`` error. Because the agent Vitest suite is not run in CI, this backend
     guard is the only place the convention is CI-enforced.
+
+    Classification is by IMPORT, not by a hand-maintained name list: a binding
+    from a relative specifier (``../index.js``) is internal and must be typed; a
+    binding from a bare specifier (``fs``, third-party) is external and may stay
+    raw. This closes the silent-escape gap where a brand-new internal function,
+    absent from any list, would slip through.
 
     Skips (does not fail) when ``agent/src`` is absent — the CI backend Docker
     image builds from ``./backend`` only, so the agent source is not present
@@ -4673,15 +4818,16 @@ class TestTypedMockAssertConvention:
     )
 
     def test_protected_fn_allowlist_nonempty_and_resolved(self):
-        """The protected-function allowlist must not be accidentally emptied,
-        and at least one agent test file must be discoverable so the scan is
-        not silently vacuous. Mirrors ``test_target_files_exist`` in
-        test_agent_branch_invariants.py.
+        """The scan must not be silently vacuous: the exemption set must be a
+        documented dict and at least one agent test file must be discoverable.
+
+        (Repurposed from the former hardcoded-allowlist assertion — the guard
+        now classifies targets by import, so there is no name list to keep
+        non-empty. The non-vacuity check it provided is preserved here.) Mirrors
+        ``test_target_files_exist`` in test_agent_branch_invariants.py.
         """
-        assert _PROTECTED_INTERNAL_FNS, (
-            "_PROTECTED_INTERNAL_FNS is empty — the typed-mock convention guard "
-            "would pass vacuously. Restore the protected function names "
-            "(setupWorkspace, captureTestBaseline, ...)."
+        assert isinstance(_TYPED_MOCK_EXEMPT, dict), (
+            "_TYPED_MOCK_EXEMPT must be a dict of binding-name -> reason."
         )
         if _TYPED_MOCK_AGENT_SRC is None:
             pytest.skip(self._SKIP_REASON)
@@ -4693,8 +4839,9 @@ class TestTypedMockAssertConvention:
         )
 
     def test_protected_fns_use_typed_helper(self):
-        """No agent ``*.test.ts`` file may assert call arguments on a protected
-        project-internal function via the raw untyped matcher.
+        """No agent ``*.test.ts`` file may assert call arguments on a
+        relative-imported (project-internal) function via the raw untyped
+        matcher.
 
         Correct form (agent/src/utils/typed-mock-call.ts)::
 
@@ -4703,14 +4850,15 @@ class TestTypedMockAssertConvention:
 
         Forbidden form (re-opens the signature-drift blind spot)::
 
+            import { setupWorkspace } from '../index.js';
             expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
                 workspace, { scope: 'medium' });
 
         The ``.not`` and ``toHaveBeenLastCalledWith`` variants, and an optional
-        ``<module>.`` receiver qualifier (``idx.setupWorkspace``), are all
+        ``<module>.`` namespace qualifier (``idx.setupWorkspace``), are all
         covered. No-argument forms (``toHaveBeenCalled()``,
-        ``.mockResolvedValue(...)``) are intentionally NOT flagged — they carry
-        no argument list to drift.
+        ``.mockResolvedValue(...)``) and bindings from bare specifiers
+        (``fs.writeFileSync``) are intentionally NOT flagged.
         """
         if _TYPED_MOCK_AGENT_SRC is None:
             pytest.skip(self._SKIP_REASON)
@@ -4719,69 +4867,159 @@ class TestTypedMockAssertConvention:
             all_offenders.extend(_scan_for_raw_typed_mock(path))
 
         assert not all_offenders, (
-            "Raw untyped mock-call assertion found on a protected internal "
-            "function. The raw ``expect(vi.mocked(fn)).toHaveBeenCalledWith"
-            "(...)`` matcher accepts ``any[]`` args, so a signature change to "
-            f"one of {sorted(_PROTECTED_INTERNAL_FNS)} would leave the "
-            "assertion silently green. Use the type-safe wrapper "
-            "``expectCalledWith`` / ``expectLastCalledWith`` / "
-            "``expectNotCalledWith`` from "
-            "``agent/src/utils/typed-mock-call.ts`` instead:\n"
-            + "\n".join(all_offenders)
+            "Raw untyped mock-call assertion found on a project-internal "
+            "(relative-imported) function. The raw "
+            "``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher accepts "
+            "``any[]`` args, so a signature change would leave the assertion "
+            "silently green. Use the type-safe wrapper ``expectCalledWith`` / "
+            "``expectLastCalledWith`` / ``expectNotCalledWith`` from "
+            "``agent/src/utils/typed-mock-call.ts`` instead (or, if the function "
+            "genuinely cannot be typed, add it to ``_TYPED_MOCK_EXEMPT`` with a "
+            "reason):\n" + "\n".join(all_offenders)
         )
 
     def test_typed_mock_scanner_detects_injected_regression(self):
-        """Sanity-check the scanner against synthetic snippets so a future tweak
-        to the regex (over-anchoring, over-stripping) does not silently weaken
-        the guard.
+        """Sanity-check the scanner against synthetic *sources* (with import
+        headers) so a future tweak to the regex or the import classifier does
+        not silently weaken the guard.
 
-        ``bad`` snippets — raw matchers on a protected function — must be
-        flagged. ``good`` snippets — the typed wrapper, no-arg matchers, raw
-        matchers on intentionally-unprotected Node stdlib spies and other
-        helpers, and commented-out examples — must NOT be flagged.
+        The ``bad`` source asserts call args on relative-imported bindings via
+        the raw matcher (named, namespace-qualified, and ``toHaveBeenLastCalled``
+        forms) — every one must be flagged. The ``good`` source uses the typed
+        wrapper, no-arg matchers, ``mockResolvedValue`` setup, bare-specifier
+        spies, and a commented-out example — none may be flagged.
         """
-        bad_snippets = [
-            "    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(",
-            "    expect(vi.mocked(idx.setupWorkspace)).not.toHaveBeenCalledWith(",
-            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(",
-            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(WS, []);",
-        ]
-        good_snippets = [
-            # Typed wrapper — the convention we are enforcing.
-            "    expectCalledWith(setupWorkspace, workspace, { scope: 'm' });",
-            "    expectNotCalledWith(captureTestBaseline, WS);",
-            # No-argument matcher carries no signature to drift.
-            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();",
-            "    expect(vi.mocked(setupWorkspace)).not.toHaveBeenCalled();",
-            # Setup, not an assertion.
-            "    vi.mocked(idx.setupWorkspace).mockResolvedValue({});",
-            # Intentionally-raw Node stdlib spies — NOT in the allowlist.
-            "    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(p, d);",
-            "    expect(vi.mocked(process.kill)).toHaveBeenCalledWith(-pid);",
-            # Other internal helpers left raw by design — NOT in the allowlist.
-            "    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(",
-            "    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(",
-            # Commented-out example must be stripped before scanning.
-            "    // expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(x);",
-        ]
+        bad_src = (
+            "import { setupWorkspace, runClaudeCode } from '../index.js';\n"
+            "import { captureTestBaseline } from '../utils/test-fix-loop.js';\n"
+            "import * as idx from '../index.js';\n"
+            "import fs from 'fs';\n"
+            "describe('x', () => {\n"
+            "  it('y', () => {\n"
+            "    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(ws, {});\n"
+            "    expect(vi.mocked(idx.runClaudeCode)).not.toHaveBeenCalledWith(p);\n"
+            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(ws, []);\n"
+            "  });\n"
+            "});\n"
+        )
+        offenders = _scan_source_for_raw_typed_mock("bad.test.ts", bad_src)
+        assert len(offenders) == 3, (
+            f"Expected 3 offenders on relative-imported bindings, got: {offenders}"
+        )
 
-        for snippet in bad_snippets:
-            lines = _strip_ts_comments(snippet)
-            assert lines, f"Bad snippet stripped as a comment: {snippet!r}"
-            _, line = lines[0]
-            assert _RAW_TYPED_MOCK_RE.search(line), (
-                f"Scanner failed to flag known-bad snippet: {snippet!r}"
+        good_src = (
+            "import { expectCalledWith, expectNotCalledWith } from "
+            "'../utils/typed-mock-call.js';\n"
+            "import { setupWorkspace } from '../index.js';\n"
+            "import { captureTestBaseline } from '../utils/test-fix-loop.js';\n"
+            "import fs from 'fs';\n"
+            "import { execFileSync } from 'child_process';\n"
+            "describe('x', () => {\n"
+            "  it('y', () => {\n"
+            "    expectCalledWith(setupWorkspace, ws, {});\n"
+            "    expectNotCalledWith(captureTestBaseline, ws);\n"
+            "    expect(vi.mocked(setupWorkspace)).toHaveBeenCalled();\n"
+            "    expect(vi.mocked(captureTestBaseline)).not.toHaveBeenCalled();\n"
+            "    vi.mocked(setupWorkspace).mockResolvedValue({});\n"
+            "    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(p, d);\n"
+            "    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith('git', []);\n"
+            "    // expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(x);\n"
+            "  });\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("good.test.ts", good_src) == [], (
+            "Scanner false-positive on known-good source (typed wrapper, no-arg "
+            "matchers, bare-specifier spies, or commented-out example)."
+        )
+
+    def test_scanner_classifies_by_import_not_namelist(self):
+        """The silent-escape the old name list missed: a brand-new internal
+        function — in NO list — is flagged purely because it is relative-imported,
+        and the SAME name imported from a bare specifier is NOT flagged. Also
+        exercises namespace and default resolution through dynamic imports.
+        """
+        internal = (
+            "import { newInternalFn } from '../foo.js';\n"
+            "expect(vi.mocked(newInternalFn)).toHaveBeenCalledWith(1, 2);\n"
+        )
+        assert _scan_source_for_raw_typed_mock("a.test.ts", internal), (
+            "A relative-imported function absent from any name list must still "
+            "be flagged — this is the silent-escape the import classifier closes."
+        )
+
+        external = (
+            "import { newInternalFn } from 'some-third-party';\n"
+            "expect(vi.mocked(newInternalFn)).toHaveBeenCalledWith(1, 2);\n"
+        )
+        assert _scan_source_for_raw_typed_mock("b.test.ts", external) == [], (
+            "The same name imported from a bare specifier must NOT be flagged."
+        )
+
+        # Namespace qualifier on a dynamic relative import resolves to internal.
+        dyn_internal = (
+            "it('x', async () => {\n"
+            "  const idx = await import('../index.js');\n"
+            "  expect(vi.mocked(idx.persistAndPostStatus)).toHaveBeenCalledWith(s);\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("c.test.ts", dyn_internal), (
+            "vi.mocked(idx.fn) with `const idx = await import('../index.js')` "
+            "must resolve through the namespace binding and be flagged."
+        )
+
+        # Namespace qualifier on a dynamic bare import stays external.
+        dyn_external = (
+            "it('x', async () => {\n"
+            "  const cp = await import('child_process');\n"
+            "  expect(vi.mocked(cp.execFileSync)).toHaveBeenCalledWith('git');\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("d.test.ts", dyn_external) == [], (
+            "A namespace binding from a bare specifier must not be flagged."
+        )
+
+        # Default-via-destructure dynamic import stays external too.
+        dyn_default = (
+            "it('x', async () => {\n"
+            "  const { default: fs } = await import('fs');\n"
+            "  expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(p, d);\n"
+            "});\n"
+        )
+        assert _scan_source_for_raw_typed_mock("e.test.ts", dyn_default) == [], (
+            "`const { default: fs } = await import('fs')` is external."
+        )
+
+    def test_typed_mock_exempt_list_documented(self):
+        """Every exemption must carry a non-empty human reason, mirroring the
+        documented ``os.walk`` allowlists elsewhere in this file. An empty
+        exemption set is acceptable (the default); this guards future entries.
+        """
+        for binding, reason in _TYPED_MOCK_EXEMPT.items():
+            assert isinstance(reason, str) and reason.strip(), (
+                f"Exemption {binding!r} in _TYPED_MOCK_EXEMPT must document a "
+                "non-empty reason (e.g. 'overloaded signature — Parameters<F> "
+                "resolves to the last overload only')."
             )
 
-        for snippet in good_snippets:
-            lines = _strip_ts_comments(snippet)
-            if not lines:
-                # Comment-only line — correctly stripped, nothing to check.
-                continue
-            _, line = lines[0]
-            assert not _RAW_TYPED_MOCK_RE.search(line), (
-                f"Scanner false-positive on known-good snippet: {snippet!r}"
-            )
+    def test_typed_mock_exempt_list_suppresses_internal(self):
+        """An internal binding listed in the exemption set is NOT flagged even
+        with a raw argument-bearing matcher — but IS flagged once the exemption
+        is removed, proving the suppression is real and not incidental.
+        """
+        src = (
+            "import { overloadedFn } from '../index.js';\n"
+            "expect(vi.mocked(overloadedFn)).toHaveBeenCalledWith(a, b);\n"
+        )
+        control = _scan_source_for_raw_typed_mock("f.test.ts", src)
+        assert control, (
+            "Control: an internal binding must be flagged without an exemption."
+        )
+        suppressed = _scan_source_for_raw_typed_mock(
+            "f.test.ts", src, exempt={"overloadedFn": "overloaded signature"}
+        )
+        assert suppressed == [], (
+            "An exempt internal function must be suppressed by _TYPED_MOCK_EXEMPT."
+        )
 
 
 # ── Agent ⇄ backend test-runner detector parity (CI-enforced) ─────────────────
