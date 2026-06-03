@@ -462,6 +462,19 @@ async def _attempt_merge_with_retry_and_escalation(
                                 _orig_session,
                                 ref=_integration_branch,
                             )
+                        # Refresh the direction's research-history merge counts:
+                        # prs_merged was snapshotted when this child COMPLETED
+                        # (PR open, not merged); now that it has landed, recompute
+                        # so the churn guardrail / lifetime-burn backstop /
+                        # productivity scoring see the merge instead of a stale 0.
+                        if record_pr_merged:
+                            from app.direction_outcomes import (
+                                refresh_direction_outcomes_after_merge,
+                            )
+
+                            await refresh_direction_outcomes_after_merge(
+                                orig, _orig_session
+                            )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
