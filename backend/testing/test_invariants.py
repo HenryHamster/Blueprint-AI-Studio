@@ -301,16 +301,25 @@ class TestSchemaRevisionSync:
         the merge is held off by branch protection, a CI gate, or an unrelated
         conflict — the exact failure this design prevents.
 
-        The property is also enforced (a) structurally — the module imports only
-        read/merge GitHub helpers (``create_pull_request``, ``merge_pull_request``,
-        ``get_pull_request``, ``get_check_runs_cached``) and never a branch-write
-        helper — and (b) by per-scenario runtime assertions in
-        test_hotfix_backmerge.py (``commit_mock.assert_not_called()`` and the
-        call-args scan for ``automain``). This static scan locks it as a single
-        invariant so a future change (e.g. "restoring" an inline auto-reconcile,
-        which the stale design doc describes) cannot reintroduce the wedge through
-        a new code path the scenario tests do not cover. A future author who
-        genuinely needs to change this must update this invariant deliberately.
+        The property is also enforced (a) structurally — this test scans the
+        module's direct ``github.<helper>`` usage and asserts it is a SUBSET of an
+        explicit read/merge allowlist (``create_pull_request``,
+        ``merge_pull_request``, ``get_pull_request``, ``get_check_runs_cached``),
+        so ANY branch-write helper — regardless of its name — fails CI; and (b) by
+        per-scenario runtime assertions in test_hotfix_backmerge.py
+        (``commit_mock.assert_not_called()`` and the call-args scan for
+        ``automain``). This static scan locks it as a single invariant so a future
+        change (e.g. "restoring" an inline auto-reconcile, which the stale design
+        doc describes) cannot reintroduce the wedge through a new code path the
+        scenario tests do not cover. A future author who genuinely needs to change
+        this must update this invariant deliberately.
+
+        Allowlist (not denylist) rationale: a denylist of specific write-helper
+        names cannot see a NEWLY-introduced or differently-named branch-write
+        primitive, which is the single most likely way an inline reconcile gets
+        restored. The allowlist inverts the burden — every github helper the
+        block path touches must be a known, justified read/merge call, or the
+        guard trips.
         """
         path = os.path.join(
             os.path.dirname(__file__), "..", "app", "hotfix_backmerge.py"
@@ -318,28 +327,49 @@ class TestSchemaRevisionSync:
         with open(path) as f:
             content = f.read()
 
-        # The GitHub commit/push helper the rollup staging-branch auto-reconcile
-        # path uses (rollup_management._attempt_rollup_migration_reconcile ->
-        # github.commit_file_changes). The back-merge block path must never use
-        # any branch-write helper to inline the renumber.
-        forbidden_write_helpers = [
-            "commit_file_changes",
-            "create_ref",
-            "update_ref",
-            "create_or_update_file",
-        ]
-        offenders = [h for h in forbidden_write_helpers if h in content]
-        assert not offenders, (
-            "hotfix_backmerge.py must NOT reference any inline branch-write helper "
-            f"({', '.join(offenders)}). On an Alembic dual-head `block` verdict the "
+        # Every github helper the back-merge module is allowed to call directly.
+        # All four are read/merge-only — none writes to a branch:
+        #   create_pull_request  — open (or reuse) the back-merge PR (idempotent)
+        #   merge_pull_request   — land the back-merge through the normal merge API
+        #   get_pull_request     — read PR state / mergeability
+        #   get_check_runs_cached — read CI status before attempting the merge
+        # A branch-write helper (e.g. github.commit_file_changes, create_branch,
+        # merge_branch, update_branch, delete_branch — all real symbols in the
+        # app.github namespace) is deliberately absent: inlining the dual-head
+        # renumber onto the live integration branch is the wedge this invariant
+        # forbids. To add a helper here you MUST justify that it cannot push a
+        # renumber to the integration branch before the back-merge lands.
+        ALLOWED_BACKMERGE_GITHUB_HELPERS = {
+            "create_pull_request",
+            "merge_pull_request",
+            "get_pull_request",
+            "get_check_runs_cached",
+        }
+        used = set(re.findall(r"\bgithub\.(\w+)\b", content))
+        unexpected = sorted(used - ALLOWED_BACKMERGE_GITHUB_HELPERS)
+        assert not unexpected, (
+            "hotfix_backmerge.py uses github helper(s) not on the read/merge "
+            f"allowlist: {unexpected}. On an Alembic dual-head `block` verdict the "
             "back-merge must route to a spawned resolution task (the renumber + merge "
             "happens on a fresh branch through the normal PR gate), NEVER push the "
             "renumber to the live integration branch. An inline push leaves a dangling "
             "second Alembic head that wedges `alembic upgrade head` for every concurrent "
             "task until the held-off merge lands (the block-path-pushes-nothing invariant "
-            "of direction d-18cc6131). If you genuinely need to change this, update this "
-            "invariant deliberately and preserve the runtime guards in test_hotfix_backmerge.py."
+            "of direction d-18cc6131). If you genuinely need a new helper, add it to "
+            "ALLOWED_BACKMERGE_GITHUB_HELPERS deliberately, with a justification that it "
+            "cannot push a renumber to the live integration branch, and preserve the "
+            "runtime guards in test_hotfix_backmerge.py."
         )
+
+        # Guard the guard: an accidental "allow everything" (empty-set) regression
+        # would make the subset check vacuous. The allowlist must stay exactly the
+        # four documented read/merge helpers.
+        assert ALLOWED_BACKMERGE_GITHUB_HELPERS == {
+            "create_pull_request",
+            "merge_pull_request",
+            "get_pull_request",
+            "get_check_runs_cached",
+        }, "The back-merge github-helper allowlist must stay the four read/merge helpers."
 
         # The block path must still route to the spawned resolver — if this
         # disappears the renumber has to be happening somewhere, and the only
@@ -349,6 +379,56 @@ class TestSchemaRevisionSync:
             "_spawn_migration_resolution_task. If the spawn route is removed, the "
             "renumber+merge can only be happening via a forbidden inline branch push "
             "(see the block-path-pushes-nothing invariant of direction d-18cc6131)."
+        )
+
+    def test_backmerge_migration_planner_is_read_only(self):
+        """The back-merge migration planner must never push to a branch either.
+
+        ``rollup_migration_validation.py`` holds the back-merge renumber planner
+        (``plan_integration_side_renumber`` etc.) that the dual-head block path
+        depends on to compute the renumber it embeds in the spawned resolution
+        task's prompt. Like ``hotfix_backmerge.py``, this module must only READ
+        from GitHub — it inspects PR diffs and migration sources at refs; it must
+        never call a branch-write helper. The ONLY legitimate inline migration
+        push in the system is the ROLLUP path's staging-branch reconcile
+        (``rollup_management`` -> ``github.commit_file_changes``), which lives in a
+        different module and must stay there.
+
+        Same allowlist-subset pattern as
+        ``test_backmerge_block_path_pushes_nothing``: every ``github.<helper>``
+        token used here must be a known read helper, so a future branch-write
+        primitive — regardless of name — fails CI.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "rollup_migration_validation.py"
+        )
+        with open(path) as f:
+            content = f.read()
+
+        # Read-only GitHub helpers the planner legitimately needs to reconstruct
+        # and validate the migration chain across the two heads:
+        #   get_pr_files / get_pull_request_diff — read the rollup/back-merge diff
+        #   list_versions_at_ref — list alembic/versions filenames at a ref
+        #   get_file_text_at_ref — fetch a single migration file's source at a ref
+        # No branch-write helper may appear: the planner computes a renumber plan,
+        # it never applies one to a live branch.
+        ALLOWED_PLANNER_GITHUB_HELPERS = {
+            "get_pr_files",
+            "get_pull_request_diff",
+            "list_versions_at_ref",
+            "get_file_text_at_ref",
+        }
+        used = set(re.findall(r"\bgithub\.(\w+)\b", content))
+        unexpected = sorted(used - ALLOWED_PLANNER_GITHUB_HELPERS)
+        assert not unexpected, (
+            "rollup_migration_validation.py uses github helper(s) not on the "
+            f"read-only allowlist: {unexpected}. The back-merge migration planner must "
+            "only READ from GitHub (PR diffs, migration sources at refs); it must NEVER "
+            "push a renumber to a branch — that is the block-path-pushes-nothing invariant "
+            "of direction d-18cc6131. The only legitimate inline migration push is the "
+            "ROLLUP staging-branch reconcile in rollup_management, which must stay there. "
+            "If you genuinely need a new helper, add it to ALLOWED_PLANNER_GITHUB_HELPERS "
+            "deliberately, with a justification that it cannot push to a branch."
         )
 
     def test_migration_chain_is_linear(self):
