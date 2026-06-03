@@ -7,12 +7,15 @@ that helper checks ``backend/scripts/analyze_cochange.py``. Keep this shim so
 the path exists and delegates to the canonical root-level entrypoint.
 """
 
-from pathlib import Path
 import runpy
+import sys
+from pathlib import Path
 
 
 if __name__ == "__main__":
-    runpy.run_path(
-        Path(__file__).resolve().parents[2] / "scripts" / "analyze_cochange.py",
-        run_name="__main__",
-    )
+    target = Path(__file__).resolve().parents[2] / "scripts" / "analyze_cochange.py"
+    sys.path.insert(0, str(target.parent))
+    try:
+        runpy.run_path(target, run_name="__main__")
+    finally:
+        sys.path.pop(0)
