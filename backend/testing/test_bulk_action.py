@@ -21,6 +21,8 @@ import pytest
 from httpx import AsyncClient
 
 from app.models import (
+    Artifact,
+    ArtifactType,
     Project,
     ProjectMember,
     ProjectStatus,
@@ -322,6 +324,98 @@ async def test_bulk_approve_rollup_to_promotion_target_merges_without_pr_merged(
     # Merge proceeded, but a landing on the promotion target distinct from the
     # integration branch is never an integration landing, so pr_merged stays unset.
     assert (task.context or {}).get("pr_merged") is not True
+
+
+@pytest.mark.asyncio
+async def test_bulk_approve_critical_merge_blocks_on_dual_head_collision(
+    client: AsyncClient, db_session, mocker
+):
+    project = await _make_project_with_member(db_session)
+    project.integration_branch = "automain"
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Critical approval task",
+        payloads=[{"type": "create", "prompt": "danger", "base_branch": "automain"}],
+        status=TaskStatus.COMPLETED,
+        requires_approval=True,
+        context={"touched_critical": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/123",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/alembic/versions/0002_dupe.py"}],
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new_callable=AsyncMock,
+        return_value=(
+            "diff --git a/backend/alembic/versions/0002_dupe.py "
+            "b/backend/alembic/versions/0002_dupe.py\n"
+            "+++ b/backend/alembic/versions/0002_dupe.py\n"
+            '+revision = "0002"\n'
+            '+down_revision = "0001"\n'
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0001_seed.py", "0002_existing.py"],
+    )
+    merge_pr = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    comment_pr = mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    delete_branch = mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+
+    resp = await client.post(
+        "/api/admin/tasks/bulk-action",
+        json={"action": "approve", "task_ids": [str(task.id)]},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success_count"] == 0
+    assert body["error_count"] == 1
+    assert body["results"][0]["status"] == "error"
+    assert "Alembic combined-chain guard blocked" in body["results"][0]["error"]
+    assert "0002" in body["results"][0]["error"]
+
+    await db_session.refresh(task)
+    assert task.requires_approval is True
+    assert task.status == TaskStatus.COMPLETED
+    assert "Alembic combined-chain guard blocked" in (
+        task.latest_status_message or ""
+    )
+    merge_pr.assert_not_awaited()
+    comment_pr.assert_not_awaited()
+    delete_branch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

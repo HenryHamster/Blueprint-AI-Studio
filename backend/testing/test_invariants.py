@@ -7,6 +7,7 @@ modified by agents. If an agent changes a safety value, CI catches it.
 Run with: pytest testing/test_invariants.py -v --noconftest
 """
 
+import ast
 import os
 import re
 import subprocess
@@ -50,6 +51,212 @@ def _assert_backmerge_modules_do_not_import_rollup_management(
         "keep it out of the back-merge modules and update this invariant with a "
         "clear justification."
     )
+
+
+def _ast_called_name(call: ast.Call) -> str | None:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _ast_refs_names(node: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(node))
+
+
+def _ast_assign_targets_for_predicated_call(
+    stmt: ast.stmt,
+    *,
+    call_predicate,
+) -> set[str]:
+    value = getattr(stmt, "value", None)
+    if value is None or not any(
+        isinstance(n, ast.Call) and call_predicate(n) for n in ast.walk(value)
+    ):
+        return set()
+
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    else:
+        return set()
+
+    names: set[str] = set()
+    for tgt in targets:
+        for n in ast.walk(tgt):
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+    return names
+
+
+def _ast_branch_early_exits(stmts: list[ast.stmt]) -> bool:
+    return any(
+        isinstance(s, (ast.Return, ast.Raise, ast.Continue, ast.Break))
+        for s in stmts
+    )
+
+
+def _ast_branch_implies_verdict(
+    node: ast.AST,
+    *,
+    branch_truth: bool,
+    desired_truth: bool,
+    atom_predicate,
+) -> bool:
+    """Return True only when this branch outcome forces the desired verdict.
+
+    This is intentionally conservative. For composite boolean expressions we
+    only treat a branch as covered when reaching that branch necessarily proves
+    a guard/exclusion atom has the polarity the merge path needs.
+    """
+
+    if atom_predicate(node):
+        return branch_truth == desired_truth
+
+    if isinstance(node, ast.Await):
+        return _ast_branch_implies_verdict(
+            node.value,
+            branch_truth=branch_truth,
+            desired_truth=desired_truth,
+            atom_predicate=atom_predicate,
+        )
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _ast_branch_implies_verdict(
+            node.operand,
+            branch_truth=not branch_truth,
+            desired_truth=desired_truth,
+            atom_predicate=atom_predicate,
+        )
+
+    if isinstance(node, ast.BoolOp):
+        values = list(node.values)
+        if isinstance(node.op, ast.And):
+            if branch_truth:
+                return any(
+                    _ast_branch_implies_verdict(
+                        value,
+                        branch_truth=True,
+                        desired_truth=desired_truth,
+                        atom_predicate=atom_predicate,
+                    )
+                    for value in values
+                )
+            return all(
+                _ast_branch_implies_verdict(
+                    value,
+                    branch_truth=False,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+                for value in values
+            )
+
+        if isinstance(node.op, ast.Or):
+            if branch_truth:
+                return all(
+                    _ast_branch_implies_verdict(
+                        value,
+                        branch_truth=True,
+                        desired_truth=desired_truth,
+                        atom_predicate=atom_predicate,
+                    )
+                    for value in values
+                )
+            return any(
+                _ast_branch_implies_verdict(
+                    value,
+                    branch_truth=False,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+                for value in values
+            )
+
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        op = node.ops[0]
+        left = node.left
+        right = node.comparators[0]
+        bool_side = None
+        expr_side = None
+        if isinstance(left, ast.Constant) and isinstance(left.value, bool):
+            bool_side = left.value
+            expr_side = right
+        elif isinstance(right, ast.Constant) and isinstance(right.value, bool):
+            bool_side = right.value
+            expr_side = left
+        if expr_side is not None and bool_side is not None:
+            if isinstance(op, (ast.Is, ast.Eq)):
+                expr_truth = bool_side if branch_truth else not bool_side
+                return _ast_branch_implies_verdict(
+                    expr_side,
+                    branch_truth=expr_truth,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+            if isinstance(op, (ast.IsNot, ast.NotEq)):
+                expr_truth = (not bool_side) if branch_truth else bool_side
+                return _ast_branch_implies_verdict(
+                    expr_side,
+                    branch_truth=expr_truth,
+                    desired_truth=desired_truth,
+                    atom_predicate=atom_predicate,
+                )
+
+    return False
+
+
+def _ast_branch_implies_named_str_compare(
+    node: ast.AST,
+    *,
+    branch_truth: bool,
+    names: set[str],
+    truthy_literals: set[str],
+) -> bool:
+    """Conservatively match direct ``name == "literal"`` style status checks.
+
+    This is intentionally narrower than ``_ast_branch_implies_verdict``. It is
+    only used for the sibling-after-if propagation path where we want to keep
+    honoring the `_validate_rollup_migration_chain(...)` string-status idiom
+    (`"defer"` / `"block"`) without letting arbitrary guard-shaped `if`
+    statements mark later merges as covered.
+    """
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _ast_branch_implies_named_str_compare(
+            node.operand,
+            branch_truth=not branch_truth,
+            names=names,
+            truthy_literals=truthy_literals,
+        )
+
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        op = node.ops[0]
+        left = node.left
+        right = node.comparators[0]
+        name_node = None
+        literal_node = None
+        if isinstance(left, ast.Name) and left.id in names and isinstance(right, ast.Constant):
+            name_node = left
+            literal_node = right
+        elif isinstance(right, ast.Name) and right.id in names and isinstance(left, ast.Constant):
+            name_node = right
+            literal_node = left
+
+        if (
+            name_node is not None
+            and isinstance(literal_node.value, str)
+            and literal_node.value in truthy_literals
+        ):
+            if isinstance(op, (ast.Eq, ast.Is)):
+                return branch_truth
+            if isinstance(op, (ast.NotEq, ast.IsNot)):
+                return not branch_truth
+
+    return False
 
 
 # ── Safety Constants ────────────────────────────────────────────────────────
@@ -1128,22 +1335,30 @@ class TestPreMergeDualHeadGuardCoverage:
         guard_names: frozenset[str],
         merge_names: frozenset[str],
     ) -> list[str]:
-        import ast
-
         def _called_name(call: "ast.Call") -> str | None:
-            func = call.func
-            if isinstance(func, ast.Name):
-                return func.id
-            if isinstance(func, ast.Attribute):
-                return func.attr
-            return None
+            return _ast_called_name(call)
 
-        def _stmt_references_guard(stmt) -> bool:
+        def _calls_guard(node) -> bool:
+            # A guard/verdict-producing CALL anywhere in the subtree — the
+            # ``enforce_premerge_migration_guard(...)`` on an assignment RHS or
+            # directly as an ``if`` test. A mere reference to a guard NAME (e.g.
+            # an import, or the captured verdict left unused) is deliberately NOT
+            # enough: only an actual call produces a verdict to gate on. This is
+            # the crux of the fail-closed ratchet — "guard symbol present" no
+            # longer counts as "merge covered".
             return any(
-                isinstance(node, ast.Name) and node.id in guard_names
-                or isinstance(node, ast.Attribute)
-                and node.attr in guard_names
-                for node in ast.walk(stmt)
+                isinstance(n, ast.Call) and _called_name(n) in guard_names
+                for n in ast.walk(node)
+            )
+
+        def _assign_verdict_targets(stmt) -> set:
+            # When an assignment's value is (or contains) a guard call, the
+            # assigned name(s) become "verdict variables" that a later ``if`` can
+            # test to gate the merge. Tuple-unpacking (``ok, reason = await
+            # guard(...)``) yields every bound name.
+            return _ast_assign_targets_for_predicated_call(
+                stmt,
+                call_predicate=lambda call: _called_name(call) in guard_names,
             )
 
         def _stmt_merge_calls(stmt):
@@ -1165,56 +1380,148 @@ class TestPreMergeDualHeadGuardCoverage:
                     return True
             return False
 
-        def _scan_body(stmts, guard_seen: bool, func_name: str) -> None:
-            seen = guard_seen
+        def _flag_merges(stmt, covered: bool, func_name: str) -> None:
+            for call in _stmt_merge_calls(stmt):
+                # Coarse whole-function exemption (string-keyed) ...
+                if TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
+                    (os.path.basename(rel), func_name)
+                ):
+                    continue
+                # ... or a granular per-call inline marker that travels with
+                # the specific merge call.
+                if _call_has_exempt_marker(call):
+                    continue
+                if not covered:
+                    offenders.append(
+                        f"  {rel}:{call.lineno} in {func_name}() — PR-merge "
+                        "site not covered by the pre-merge dual-head guard"
+                    )
+
+        def _scan_body(
+            stmts, covered: bool, verdict_vars: set, func_name: str
+        ) -> None:
+            cur = covered
+            vvars = set(verdict_vars)
             for stmt in stmts:
-                if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if isinstance(
+                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
                     continue
 
                 if isinstance(stmt, ast.If):
-                    _scan_body(stmt.body, seen, func_name)
-                    _scan_body(stmt.orelse, seen, func_name)
+                    # A merge inside either branch of an ``if`` that TESTS the
+                    # verdict (the guard call directly, or a verdict variable
+                    # captured above) is covered only when THAT branch outcome
+                    # proves the merge-safe verdict (`ok_to_merge=True`). Mixed
+                    # predicates like `if ok and feature_flag` therefore cover
+                    # only the body, not the else branch where `ok` may be
+                    # false. A sibling merge AFTER such an ``if`` is covered
+                    # only when a blocking-verdict branch early-exits —
+                    # fail-closed gating, not symbol presence.
+                    branch_body_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    branch_else_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    _scan_body(stmt.body, branch_body_cov, vvars, func_name)
+                    _scan_body(stmt.orelse, branch_else_cov, vvars, func_name)
+                    if _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.body):
+                        cur = True
+                    elif _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in guard_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.orelse):
+                        cur = True
+                    elif cur and (
+                        _ast_branch_early_exits(stmt.body)
+                        or _ast_branch_early_exits(stmt.orelse)
+                    ):
+                        cur = True
+                    elif _ast_branch_implies_named_str_compare(
+                        stmt.test,
+                        branch_truth=True,
+                        names=vvars,
+                        truthy_literals={"defer", "block"},
+                    ) and _ast_branch_early_exits(stmt.body):
+                        # `_validate_rollup_migration_chain(...)` yields a
+                        # multi-state string verdict (`ok` / `defer` / `block`)
+                        # that existing callers fail-close with successive
+                        # early-return branches like `if status == "defer":
+                        # return` then `if status == "block": return`. Keep
+                        # treating those sibling-after-if sites as covered,
+                        # but only for explicit non-ok literal comparisons.
+                        cur = True
+                    elif _ast_branch_implies_named_str_compare(
+                        stmt.test,
+                        branch_truth=False,
+                        names=vvars,
+                        truthy_literals={"defer", "block"},
+                    ) and _ast_branch_early_exits(stmt.orelse):
+                        cur = True
                     continue
 
                 if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                    _scan_body(stmt.body, seen, func_name)
-                    _scan_body(stmt.orelse, seen, func_name)
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
                     continue
 
                 if isinstance(stmt, (ast.With, ast.AsyncWith)):
-                    _scan_body(stmt.body, seen, func_name)
+                    _scan_body(stmt.body, cur, vvars, func_name)
                     continue
 
                 if isinstance(stmt, ast.Try):
-                    _scan_body(stmt.body, seen, func_name)
+                    _scan_body(stmt.body, cur, vvars, func_name)
                     for handler in stmt.handlers:
-                        _scan_body(handler.body, seen, func_name)
-                    _scan_body(stmt.orelse, seen, func_name)
-                    _scan_body(stmt.finalbody, seen, func_name)
+                        _scan_body(handler.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    _scan_body(stmt.finalbody, cur, vvars, func_name)
                     continue
 
                 if hasattr(ast, "Match") and isinstance(stmt, ast.Match):
                     for case in stmt.cases:
-                        _scan_body(case.body, seen, func_name)
+                        _scan_body(case.body, cur, vvars, func_name)
                     continue
 
-                for call in _stmt_merge_calls(stmt):
-                    # Coarse whole-function exemption (string-keyed) ...
-                    if TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
-                        (os.path.basename(rel), func_name)
-                    ):
-                        continue
-                    # ... or a granular per-call inline marker that travels with
-                    # the specific merge call.
-                    if _call_has_exempt_marker(call):
-                        continue
-                    if not seen:
-                        offenders.append(
-                            f"  {rel}:{call.lineno} in {func_name}() — PR-merge "
-                            "site not covered by the pre-merge dual-head guard"
-                        )
-                if _stmt_references_guard(stmt):
-                    seen = True
+                _flag_merges(stmt, cur, func_name)
+                vvars |= _assign_verdict_targets(stmt)
 
         offenders: list[str] = []
         tree = ast.parse(source, filename=filename)
@@ -1224,7 +1531,7 @@ class TestPreMergeDualHeadGuardCoverage:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]
         for func in funcs:
-            _scan_body(func.body, False, func.name)
+            _scan_body(func.body, False, set(), func.name)
         return offenders
 
     def test_all_pr_merge_sites_guarded(self):
@@ -1308,6 +1615,146 @@ class TestPreMergeDualHeadGuardCoverage:
         assert offenders == [
             "  synthetic_merge_fixture.py:13 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
         ]
+
+    def test_premerge_guard_verdict_ignored_is_flagged(self):
+        """Fail-closed ratchet: capturing the guard verdict is NOT enough — the
+        verdict must actually GATE the merge.
+
+        This is the documented false-negative the older scan permitted: the
+        guard is called and its verdict assigned, but the result is never tested
+        and the merge proceeds unconditionally. "Guard symbol referenced ⇒
+        covered" would mark this safe; the hardened scan flags it because no
+        branch early-exits on the blocking verdict before the merge.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                ok, reason = await enforce_premerge_migration_guard(
+                    token, owner, repo, pr_number, target_branch
+                )
+                # verdict captured but NEVER tested — merge proceeds regardless
+                await merge_pull_request(
+                    token, owner, repo, pr_number, project_id=project_id
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:7 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ], (
+            "A guard verdict that is captured but ignored (never gates an "
+            "early-exit before the merge) must be flagged — referencing the "
+            "guard symbol is not the same as fail-closing on its verdict."
+        )
+
+    def test_mixed_condition_only_covers_the_guarded_premerge_branch(self):
+        """A mixed predicate like `if ok and feature_flag` covers only the body.
+
+        The else branch is reachable both when the feature flag is false and
+        when the guard blocks (`ok=False`), so a merge there must still be
+        flagged.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                ok, reason = await enforce_premerge_migration_guard(
+                    token, owner, repo, pr_number, target_branch
+                )
+                if ok and feature_flag:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+                else:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number, project_id=project_id
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:11 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_mixed_condition_sibling_early_return_does_not_cover_later_merge(self):
+        """An early return on `if ok and feature_flag` must not cover a sibling
+        merge that remains reachable when the guard blocks (`ok=False`)."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                ok, reason = await enforce_premerge_migration_guard(
+                    token, owner, repo, pr_number, target_branch
+                )
+                if ok and feature_flag:
+                    return reason
+                await merge_pull_request(
+                    token, owner, repo, pr_number, project_id=project_id
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_merge_fixture.py:8 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_multistate_rollup_status_early_returns_cover_later_merge(self):
+        """The `_validate_rollup_migration_chain` status idiom remains covered."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                status, reason = await _validate_rollup_migration_chain(
+                    token, owner, repo, pr_number, target_branch=target_branch
+                )
+                if status == "defer":
+                    return reason
+                if status == "block":
+                    return reason
+                await merge_pull_request(
+                    token, owner, repo, pr_number, project_id=project_id
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_merge_fixture.py",
+            rel="synthetic_merge_fixture.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == []
 
     def test_exempt_marker_exempts_only_the_marked_call(self):
         """The inline marker exempts the SPECIFIC call it sits on — not its
@@ -1562,6 +2009,70 @@ class TestMergePrimitiveLock:
         re.compile(r"enablePullRequestAutoMerge"),
     ]
 
+    # ── Transport-level raw-merge scanner ─────────────────────────────────
+    #
+    # The helper-layer lock must catch a raw merge issued via ANY transport,
+    # not just ``_github_request``. A future direct ``httpx.AsyncClient().put(
+    # .../pulls/N/merge)`` or ``client.post(graphql, …enablePullRequestAutoMerge
+    # …)`` from outside ``github_pulls.py`` would otherwise bypass a scan keyed
+    # solely on ``_github_request``. The endpoint SIGNATURE (REST merge path +
+    # PUT, or the GraphQL mutation name) is what classifies a call; the transport
+    # openers below merely anchor where to look.
+    _TRANSPORT_OPENERS = re.compile(
+        r"(?:_github_request|httpx\.[A-Za-z_]+|\.(?:put|post|patch|request))\s*\(",
+        re.DOTALL,
+    )
+    _RAW_MERGE_PATH_RE = re.compile(r"/pulls[^\"']*?/merge")
+    _PUT_METHOD_LITERAL_RE = re.compile(r"""["']PUT["']""")
+    # The opener's own HTTP verb is PUT (e.g. ``client.put(...)`` /
+    # ``httpx.put(...)``) — "put" not preceded by an identifier character.
+    _PUT_VERB_OPENER_RE = re.compile(r"(?<![A-Za-z_])put\s*\(")
+    _RAW_AUTOMERGE_MUTATION_RE = re.compile(r"enablePullRequestAutoMerge")
+
+    @staticmethod
+    def _scan_raw_merge_endpoint_offenders(content: str, *, rel: str) -> list:
+        """Flag raw GitHub merge-endpoint / GraphQL auto-merge calls issued via
+        ANY transport, not only ``_github_request``.
+
+        Two endpoint signatures classify a transport-call window as a raw merge:
+          * REST — the ``/pulls/{n}/merge`` path with a PUT method, whether PUT
+            is an explicit ``"PUT"`` argument (the ``_github_request`` shape) or
+            the transport verb itself (a lower-level ``client.put(.../merge)``).
+          * GraphQL — the ``enablePullRequestAutoMerge`` mutation in the body.
+
+        Returns one offender line per (line, kind). Whole-content scanning makes
+        it immune to ``# noqa`` and to multi-line call construction (it searches
+        a window past each opener rather than a single line).
+        """
+        cls = TestMergePrimitiveLock
+        found: set = set()
+        for m in cls._TRANSPORT_OPENERS.finditer(content):
+            opener = m.group(0)
+            start = m.start()
+            window = content[start : min(start + 1500, len(content))]
+            line_num = content[:start].count("\n") + 1
+            if cls._RAW_MERGE_PATH_RE.search(window) and (
+                cls._PUT_METHOD_LITERAL_RE.search(window)
+                or cls._PUT_VERB_OPENER_RE.search(opener)
+            ):
+                found.add((line_num, "rest"))
+            if cls._RAW_AUTOMERGE_MUTATION_RE.search(window):
+                found.add((line_num, "graphql"))
+
+        offenders = []
+        for line_num, kind in sorted(found):
+            if kind == "rest":
+                offenders.append(
+                    f"  {rel}:{line_num}: raw PUT /pulls/.../merge endpoint call "
+                    "detected outside the helper layer"
+                )
+            else:
+                offenders.append(
+                    f"  {rel}:{line_num}: raw enablePullRequestAutoMerge "
+                    "mutation call detected outside the helper layer"
+                )
+        return offenders
+
     def test_all_merge_issuing_functions_are_registered(self):
         """Every function in github_pulls.py that calls the GitHub merge endpoint
         or GraphQL mutation must be in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES.
@@ -1634,14 +2145,16 @@ class TestMergePrimitiveLock:
         Fix by calling the appropriate primitive from github_pulls.py instead of
         issuing the endpoint directly.
 
-        This scan detects:
-        - REST endpoint calls: _github_request(..., PUT, ..., .../pulls/.../merge, ...)
-          across multiple lines, immune to # noqa
-        - GraphQL mutation calls: calls to graphql endpoint with enablePullRequestAutoMerge
-          mutation, immune to # noqa and multi-line construction
+        This scan detects (via the shared _scan_raw_merge_endpoint_offenders):
+        - REST endpoint calls: a PUT to .../pulls/.../merge across any transport
+          (_github_request OR a lower-level httpx/client call), multi-line,
+          immune to # noqa
+        - GraphQL mutation calls: any transport call whose body carries the
+          enablePullRequestAutoMerge mutation, multi-line, immune to # noqa
 
-        False-positives from docstrings are avoided by scanning for actual
-        _github_request / httpx calls, not prose mentioning the endpoint.
+        False-positives from docstrings are avoided by anchoring on an actual
+        transport call and requiring the concrete endpoint signature, not prose
+        mentioning the endpoint.
         """
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
 
@@ -1663,37 +2176,9 @@ class TestMergePrimitiveLock:
                     content = f.read()
 
                 rel = os.path.relpath(fpath, app_dir)
-
-                # Detect raw REST merge endpoint calls: _github_request(...PUT..../pulls/.../merge...)
-                # Uses DOTALL to match across line boundaries within function calls.
-                # Strategy: look for _github_request with PUT and the merge endpoint path
-                # in the same ~500-character window (avoids backtracking issues with [^)]).
-                for match in re.finditer(r"_github_request\s*\(", content, re.DOTALL):
-                    start = match.start()
-                    # Grab a reasonable window past this point to search for PUT + merge endpoint
-                    window_end = min(start + 1000, len(content))
-                    window = content[start:window_end]
-                    # Check for PUT and the merge endpoint path in the window
-                    if re.search(r'PUT.*(?:api\.github\.com)?.*?/repos[^"\']*?/pulls[^"\']*?/merge', window, re.DOTALL):
-                        line_num = content[:match.start()].count('\n') + 1
-                        offenders.append(
-                            f"  {rel}:{line_num}: raw _github_request PUT /pulls/.../merge call detected"
-                        )
-
-                # Detect raw GraphQL auto-merge calls: _github_request to graphql endpoint
-                # with enablePullRequestAutoMerge mutation in the call or nearby.
-                # Strategy: look for _github_request(...POST...graphql...) with enablePullRequestAutoMerge
-                # in a ~1000-character window to avoid backtracking issues.
-                for match in re.finditer(r"_github_request\s*\(", content, re.DOTALL):
-                    start = match.start()
-                    window_end = min(start + 1500, len(content))
-                    window = content[start:window_end]
-                    # Check for POST to graphql endpoint with enablePullRequestAutoMerge
-                    if re.search(r'POST.*?graphql.*?enablePullRequestAutoMerge', window, re.DOTALL):
-                        line_num = content[:match.start()].count('\n') + 1
-                        offenders.append(
-                            f"  {rel}:{line_num}: raw POST graphql enablePullRequestAutoMerge call detected"
-                        )
+                offenders.extend(
+                    self._scan_raw_merge_endpoint_offenders(content, rel=rel)
+                )
 
         assert not offenders, (
             "Found backend/app file(s) that call the raw GitHub merge endpoint or "
@@ -1707,15 +2192,14 @@ class TestMergePrimitiveLock:
         )
 
     def test_scan_detects_multiline_raw_merge_rest_endpoint(self):
-        """Verify the scan detects multi-line-constructed raw merge REST endpoint calls.
+        """Verify the shared scanner detects multi-line-constructed raw merge
+        REST endpoint calls.
 
-        Regression test: a raw merge call is NOT detected when the _github_request
-        call itself spans multiple lines. This fixture encodes a multi-line raw
-        merge call and asserts the scan flags it.
+        Regression test: a raw merge call must be detected even when the
+        ``_github_request`` call itself spans multiple lines.
         """
-        # This is a synthetic pattern that should be flagged by the scan.
-        # The key vulnerability: a direct call to _github_request with the merge endpoint,
-        # spanning multiple lines, which the old line-by-line scan would miss.
+        # Synthetic pattern: a direct _github_request call with the merge
+        # endpoint, spanning multiple lines, which a line-by-line scan misses.
         test_pattern = '''
 async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
     response = await _github_request(
@@ -1725,30 +2209,24 @@ async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
         json={"merge_method": "squash"},
     )
 '''
-        # Use the same scan logic as the invariant test to verify it detects this.
-        found = False
-        for match in re.finditer(r"_github_request\s*\(", test_pattern, re.DOTALL):
-            start = match.start()
-            window_end = min(start + 1000, len(test_pattern))
-            window = test_pattern[start:window_end]
-            if re.search(r'PUT.*(?:api\.github\.com)?.*?/repos[^"\']*?/pulls[^"\']*?/merge', window, re.DOTALL):
-                found = True
-                break
-        assert found, (
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="synthetic.py"
+        )
+        assert any("/pulls/.../merge" in o for o in offenders), (
             "Regression test: the hardened scan must detect multi-line-constructed "
-            "raw merge REST endpoint calls. The pattern above should have been flagged."
+            f"raw merge REST endpoint calls. Offenders: {offenders}"
         )
 
     def test_scan_detects_multiline_raw_merge_graphql_mutation(self):
-        """Verify the scan detects multi-line-constructed raw GraphQL auto-merge mutations.
+        """Verify the shared scanner detects multi-line-constructed raw GraphQL
+        auto-merge mutations.
 
-        Regression test: a raw GraphQL auto-merge call is NOT detected when the
-        _github_request call spans multiple lines and the enablePullRequestAutoMerge
-        mutation is in the body across multiple lines. This fixture encodes this
-        pattern and asserts the scan flags it.
+        Regression test: a raw GraphQL auto-merge call must be detected when the
+        ``_github_request`` call spans multiple lines and the
+        ``enablePullRequestAutoMerge`` mutation is in the body.
         """
-        # Synthetic pattern: _github_request POST to graphql endpoint with enablePullRequestAutoMerge
-        # in the JSON body, spanning multiple lines.
+        # Synthetic pattern: _github_request POST to graphql endpoint with
+        # enablePullRequestAutoMerge in the JSON body, spanning multiple lines.
         test_pattern = '''
 async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
     response = await _github_request(
@@ -1763,30 +2241,22 @@ async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
         },
     )
 '''
-        # Use the same scan logic as the invariant test.
-        found = False
-        for match in re.finditer(r"_github_request\s*\(", test_pattern, re.DOTALL):
-            start = match.start()
-            window_end = min(start + 1500, len(test_pattern))
-            window = test_pattern[start:window_end]
-            if re.search(r'POST.*?graphql.*?enablePullRequestAutoMerge', window, re.DOTALL):
-                found = True
-                break
-        assert found, (
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="synthetic.py"
+        )
+        assert any("enablePullRequestAutoMerge" in o for o in offenders), (
             "Regression test: the hardened scan must detect multi-line GraphQL "
-            "auto-merge mutations. The pattern above should have been flagged."
+            f"auto-merge mutations. Offenders: {offenders}"
         )
 
     def test_scan_flags_noqa_tagged_raw_merge_calls(self):
-        """Verify the scan flags raw merge calls even when tagged with # noqa.
+        """Verify the shared scanner flags raw merge calls even when tagged with
+        ``# noqa``.
 
-        Regression test: the old line-by-line scan could be defeated by a
-        trailing '# noqa' comment. The hardened scan must detect vulnerable
-        calls regardless of noqa tags, as the noqa bypass is the vulnerability
-        we are closing.
+        Regression test: a line-by-line scan can be defeated by a trailing
+        ``# noqa`` comment. The whole-content scanner detects the call
+        regardless, since the noqa bypass is itself the vulnerability.
         """
-        # Pattern with # noqa on same line: old scan would skip entire line.
-        # New scan works on whole content so noqa doesn't bypass the check.
         test_pattern = '''
 async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
     response = await _github_request(  # noqa
@@ -1796,19 +2266,62 @@ async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
         json={"merge_method": "squash"},
     )
 '''
-        # Use the same scan logic as the invariant test.
-        found = False
-        for match in re.finditer(r"_github_request\s*\(", test_pattern, re.DOTALL):
-            start = match.start()
-            window_end = min(start + 1000, len(test_pattern))
-            window = test_pattern[start:window_end]
-            if re.search(r'PUT.*(?:api\.github\.com)?.*?/repos[^"\']*?/pulls[^"\']*?/merge', window, re.DOTALL):
-                found = True
-                break
-        assert found, (
-            "Regression test: the scan must flag raw merge calls even when "
-            "they carry a '# noqa' comment. The noqa bypass itself is the "
-            "vulnerability we are closing."
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="synthetic.py"
+        )
+        assert any("/pulls/.../merge" in o for o in offenders), (
+            "Regression test: the scan must flag raw merge calls even when they "
+            f"carry a '# noqa' comment. Offenders: {offenders}"
+        )
+
+    def test_scan_detects_raw_merge_via_lower_level_http_client(self):
+        """The broadened scanner must catch a raw REST merge issued WITHOUT
+        ``_github_request`` — a direct lower-level HTTP client call.
+
+        This is the transport-evasion false-negative the old ``_github_request``-
+        only scan missed entirely: the merge endpoint is hit via
+        ``client.put(.../pulls/N/merge)``, where the HTTP verb is the call itself
+        (no explicit ``"PUT"`` argument). The scanner recognizes the opener verb
+        as the method.
+        """
+        test_pattern = '''
+async def evade_via_client(token: str, owner: str, repo: str, pr_number: int):
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+            json={"merge_method": "squash"},
+            headers=headers,
+        )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="evil.py"
+        )
+        assert any("/pulls/.../merge" in o for o in offenders), (
+            "The hardened scan must detect a raw REST merge issued via a "
+            "lower-level HTTP client (client.put), not only _github_request. "
+            f"Offenders: {offenders}"
+        )
+
+    def test_scan_detects_graphql_auto_merge_via_lower_level_http_client(self):
+        """The broadened scanner must catch a raw GraphQL auto-merge mutation
+        issued WITHOUT ``_github_request`` — a direct lower-level HTTP client
+        POST whose body carries ``enablePullRequestAutoMerge``.
+        """
+        test_pattern = '''
+async def evade_auto_merge(token: str, pr_node_id: str):
+    response = await client.post(
+        "https://api.github.com/graphql",
+        json={"query": "mutation { enablePullRequestAutoMerge(input: {pullRequestId: $id}) { clientMutationId } }"},
+        headers=headers,
+    )
+'''
+        offenders = self._scan_raw_merge_endpoint_offenders(
+            test_pattern, rel="evil.py"
+        )
+        assert any("enablePullRequestAutoMerge" in o for o in offenders), (
+            "The hardened scan must detect a raw GraphQL auto-merge mutation "
+            "issued via a lower-level HTTP client (client.post), not only "
+            f"_github_request. Offenders: {offenders}"
         )
 
 
@@ -1885,23 +2398,23 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
         exclusion_names: frozenset,
         automerge_names: frozenset,
     ) -> list:
-        import ast
-
         def _called_name(call):
-            func = call.func
-            if isinstance(func, ast.Name):
-                return func.id
-            if isinstance(func, ast.Attribute):
-                return func.attr
-            return None
+            return _ast_called_name(call)
 
-        def _refs_exclusion(node) -> bool:
+        def _calls_exclusion(node) -> bool:
+            # An actual ``pr_touches_migrations(...)`` CALL anywhere in the
+            # subtree — as an ``if`` test or on an assignment RHS. A bare
+            # reference to the name (e.g. the captured verdict left unused) does
+            # NOT count: only a call produces a verdict to gate the delegation.
             return any(
-                isinstance(n, ast.Name)
-                and n.id in exclusion_names
-                or isinstance(n, ast.Attribute)
-                and n.attr in exclusion_names
+                isinstance(n, ast.Call) and _called_name(n) in exclusion_names
                 for n in ast.walk(node)
+            )
+
+        def _assign_verdict_targets(stmt) -> set:
+            return _ast_assign_targets_for_predicated_call(
+                stmt,
+                call_predicate=lambda call: _called_name(call) in exclusion_names,
             )
 
         def _stmt_automerge_calls(stmt):
@@ -1914,8 +2427,11 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
 
         offenders: list = []
 
-        def _scan_body(stmts, seen: bool, func_name: str) -> None:
-            cur = seen
+        def _scan_body(
+            stmts, covered: bool, verdict_vars: set, func_name: str
+        ) -> None:
+            cur = covered
+            vvars = set(verdict_vars)
             for stmt in stmts:
                 if isinstance(
                     stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -1923,47 +2439,106 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
                     continue
 
                 if isinstance(stmt, ast.If):
-                    # An `if pr_touches_migrations(...)` test dominates BOTH
-                    # branches: the True branch parks, the else delegates only
-                    # when the PR is migration-free.
-                    branch = cur or _refs_exclusion(stmt.test)
-                    _scan_body(stmt.body, branch, func_name)
-                    _scan_body(stmt.orelse, branch, func_name)
-                elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                    _scan_body(stmt.body, cur, func_name)
-                    _scan_body(stmt.orelse, cur, func_name)
-                elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-                    _scan_body(stmt.body, cur, func_name)
-                elif isinstance(stmt, ast.Try):
-                    _scan_body(stmt.body, cur, func_name)
-                    for handler in stmt.handlers:
-                        _scan_body(handler.body, cur, func_name)
-                    _scan_body(stmt.orelse, cur, func_name)
-                    _scan_body(stmt.finalbody, cur, func_name)
-                elif hasattr(ast, "Match") and isinstance(stmt, ast.Match):
-                    for case in stmt.cases:
-                        _scan_body(case.body, cur, func_name)
-                else:
-                    for call in _stmt_automerge_calls(stmt):
-                        if (
-                            os.path.basename(rel),
-                            func_name,
-                        ) in TestNativeAutoMergeMigrationExclusionCoverage._EXEMPT_SITES:
-                            continue
-                        if not cur:
-                            offenders.append(
-                                f"  {rel}:{call.lineno} in {func_name}() — "
-                                "enable_auto_merge site not guarded by a "
-                                "pr_touches_migrations exclusion (native "
-                                "auto-merge TOCTOU window)"
-                            )
+                    # An ``if pr_touches_migrations(...)`` test (or an ``if`` on a
+                    # verdict variable captured above) covers only the branch
+                    # whose outcome proves `pr_touches_migrations=False`.
+                    # Mixed predicates like `if (not touches) and feature_flag`
+                    # therefore cover only the body, not the else branch where
+                    # `touches` may still be true. A delegation AFTER such an
+                    # ``if`` is covered only when a migration-touching branch
+                    # early-exits — fail-closed, not symbol presence.
+                    branch_body_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    branch_else_cov = cur or _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=False,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    )
+                    _scan_body(stmt.body, branch_body_cov, vvars, func_name)
+                    _scan_body(stmt.orelse, branch_else_cov, vvars, func_name)
+                    if _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=True,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.body):
+                        cur = True
+                    elif _ast_branch_implies_verdict(
+                        stmt.test,
+                        branch_truth=False,
+                        desired_truth=True,
+                        atom_predicate=lambda node: (
+                            isinstance(node, ast.Call)
+                            and _called_name(node) in exclusion_names
+                        )
+                        or (
+                            isinstance(node, ast.Name) and node.id in vvars
+                        ),
+                    ) and _ast_branch_early_exits(stmt.orelse):
+                        cur = True
+                    elif cur and (
+                        _ast_branch_early_exits(stmt.body)
+                        or _ast_branch_early_exits(stmt.orelse)
+                    ):
+                        cur = True
+                    continue
 
-                # Sibling-level early-return guard: a prior statement that
-                # references the exclusion (the release_promotion `if
-                # pr_touches: return` idiom placed BEFORE the auto-merge sibling)
-                # covers all later siblings.
-                if _refs_exclusion(stmt):
-                    cur = True
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    continue
+                if isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    continue
+                if isinstance(stmt, ast.Try):
+                    _scan_body(stmt.body, cur, vvars, func_name)
+                    for handler in stmt.handlers:
+                        _scan_body(handler.body, cur, vvars, func_name)
+                    _scan_body(stmt.orelse, cur, vvars, func_name)
+                    _scan_body(stmt.finalbody, cur, vvars, func_name)
+                    continue
+                if hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+                    for case in stmt.cases:
+                        _scan_body(case.body, cur, vvars, func_name)
+                    continue
+
+                for call in _stmt_automerge_calls(stmt):
+                    if (
+                        os.path.basename(rel),
+                        func_name,
+                    ) in TestNativeAutoMergeMigrationExclusionCoverage._EXEMPT_SITES:
+                        continue
+                    if not cur:
+                        offenders.append(
+                            f"  {rel}:{call.lineno} in {func_name}() — "
+                            "enable_auto_merge site not guarded by a "
+                            "pr_touches_migrations exclusion (native "
+                            "auto-merge TOCTOU window)"
+                        )
+                vvars |= _assign_verdict_targets(stmt)
 
         tree = ast.parse(source, filename=filename)
         for func in [
@@ -1971,7 +2546,7 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
             for node in ast.walk(tree)
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ]:
-            _scan_body(func.body, False, func.name)
+            _scan_body(func.body, False, set(), func.name)
         return offenders
 
     def test_all_native_auto_merge_sites_exclude_migrations(self):
@@ -2099,6 +2674,92 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
         )
 
         assert offenders == []
+
+    def test_native_auto_merge_exclusion_verdict_ignored_is_flagged(self):
+        """Fail-closed ratchet (native auto-merge): capturing the
+        ``pr_touches_migrations`` verdict is NOT enough — it must gate the
+        delegation.
+
+        The documented false-negative: the exclusion is called and its result
+        assigned, but the value is never tested and ``enable_auto_merge`` is
+        delegated unconditionally. "Exclusion symbol referenced ⇒ covered" would
+        mark this safe; the hardened scan flags it because no branch early-exits
+        on the migration-touching verdict before the delegation.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                touches = await pr_touches_migrations(
+                    token, owner, repo, pr_number
+                )
+                # verdict captured but ignored — delegation proceeds regardless
+                await enable_auto_merge(
+                    token, owner, repo, pr_number
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_auto_merge_fixture.py:7 in demo() — enable_auto_merge "
+            "site not guarded by a pr_touches_migrations exclusion (native "
+            "auto-merge TOCTOU window)"
+        ], (
+            "A pr_touches_migrations verdict that is captured but ignored "
+            "(never gates an early-exit before enable_auto_merge) must be "
+            "flagged — referencing the exclusion symbol is not the same as "
+            "fail-closing on its verdict."
+        )
+
+    def test_mixed_condition_only_covers_the_guarded_automerge_branch(self):
+        """A mixed predicate like `if (not touches) and feature_flag` covers
+        only the body.
+
+        The else branch is reachable both when the feature flag is false and
+        when `touches=True`, so a delegated native auto-merge there must still
+        be flagged.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                touches = await pr_touches_migrations(
+                    token, owner, repo, pr_number
+                )
+                if (not touches) and feature_flag:
+                    await enable_auto_merge(
+                        token, owner, repo, pr_number
+                    )
+                else:
+                    await enable_auto_merge(
+                        token, owner, repo, pr_number
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_auto_merge_fixture.py:11 in demo() — enable_auto_merge "
+            "site not guarded by a pr_touches_migrations exclusion (native "
+            "auto-merge TOCTOU window)"
+        ]
 
 
 # ── Operator message arming gate coverage (whole-package) ─────────────────
