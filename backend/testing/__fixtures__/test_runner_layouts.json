@@ -298,6 +298,17 @@
     "family": "script"
   },
   {
+    "name": "test_sh_root_convention",
+    "files": [
+      {
+        "path": "test.sh",
+        "content": "#!/usr/bin/env bash\nexit 0\n"
+      }
+    ],
+    "detectable": true,
+    "family": "script"
+  },
+  {
     "name": "empty_repo",
     "files": [],
     "detectable": false,

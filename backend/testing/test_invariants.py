@@ -4762,10 +4762,15 @@ AGENT_TEST_RUNNER_COMMANDS = {
     "php": "vendor/bin/phpunit",
     "composer": "composer test",
     # Dynamic-arg case: the agent emits ``{ cmd: 'bash', args: [script] }`` where
-    # ``script`` ranges over a literal list; the ``scripts/test.sh`` member is the
-    # one the shared fixture's ``script`` layout exercises. The fixture names this
-    # family ``script`` (bash fallbacks => family 'script'), so the table key
-    # matches the fixture's detectable-family set exactly.
+    # ``script`` ranges over a literal list (``test.sh``, ``run-tests.sh``,
+    # ``run_tests.sh``, ``scripts/test.sh``). The shared fixture exercises two of
+    # those members under this same family: ``scripts_test_sh_root_convention``
+    # (=> ``bash scripts/test.sh``) and ``test_sh_root_convention`` (=> the
+    # root-level ``bash test.sh`` convention). All bash fallbacks collapse to
+    # family ``script``, so one representative command below suffices and the
+    # table key still matches the fixture's detectable-family set exactly; the
+    # per-member command variance is covered by the ``_AGENT_DYNAMIC_ARG_FAMILIES``
+    # skip, which verifies this family via its script-list literal instead.
     "script": "bash scripts/test.sh",
 }
 
@@ -5011,9 +5016,10 @@ class TestAgentTestRunnerSourceParity:
 
     def test_agent_emits_shell_script_runner(self):
         """The dynamic-arg ``script`` family: the agent must emit a ``bash`` runner
-        and its script list must include ``scripts/test.sh`` (the fixture's member).
+        and its script list must include all four shell-script variants: test.sh,
+        run-tests.sh, run_tests.sh, and scripts/test.sh.
 
-        Verified via the script-list literal because the command is built from a
+        Verified via the script-list literals because the command is built from a
         loop variable, not a literal ``args`` array.
         """
         source = self._read_agent_source()
@@ -5024,12 +5030,16 @@ class TestAgentTestRunnerSourceParity:
             f"agent/src/utils/test-runners.ts no longer emits a {cmd!r} runner; "
             f"the shell family ({shell_command!r}) cannot be produced."
         )
-        assert f"'{script}'" in source, (
-            f"agent/src/utils/test-runners.ts no longer lists {script!r} in its "
-            f"shell-script fallback list; the fixture's shell layout "
-            f"({shell_command!r}) would no longer be detected. Reconcile the "
-            "script list with AGENT_TEST_RUNNER_COMMANDS['shell']."
-        )
+        # Verify all four shell-script paths are present as string literals.
+        # If any were silently dropped, no detection would occur for repos using
+        # that convention.
+        shell_scripts = ['test.sh', 'run-tests.sh', 'run_tests.sh', 'scripts/test.sh']
+        for sh_script in shell_scripts:
+            assert f"'{sh_script}'" in source, (
+                f"agent/src/utils/test-runners.ts no longer lists {sh_script!r} in its "
+                f"shell-script fallback list; repos using this convention would no longer "
+                f"be detected. Reconcile the script list with AGENT_TEST_RUNNER_COMMANDS['script']."
+            )
 
     def test_agent_extra_family_runners_are_all_in_table(self):
         """Reverse direction: every command the divergent-family helper emits must
