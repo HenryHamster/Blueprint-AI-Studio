@@ -337,15 +337,18 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
 
     // --- Nested monorepo / external-layout detection (only if no root-level or
     //     Blueprint-specific runner was found above). Brings the agent runtime
-    //     fallback to parity with the backend onboarding detector
-    //     (admin_onboard.py::_detect_build_config), which walks nested subdirs
-    //     and emits per-directory test commands. This lets an external no-CI
-    //     repo whose suites live under services/*, apps/*, packages/*, or a
-    //     src/ package directory run its REAL suite instead of falling through
-    //     to an UNVERIFIED merge. Inspects ONLY the already-cloned local
-    //     workspace, so there is zero GitHub-API cost. CONSERVATIVE: a runner is
-    //     emitted only when a real manifest/test entrypoint is actually present.
-    //     Multiple sibling packages each emit their own runner.
+    //     fallback to TRUE parity with the backend onboarding detector
+    //     (admin_onboard.py::_detect_build_config), which BFS-walks EVERY
+    //     subdirectory of the repo — not a fixed container allowlist. We mirror
+    //     that with a generic depth-bounded directory walk (see below), so an
+    //     external no-CI repo whose suites live under ANY top-level directory —
+    //     services/, apps/, packages/ AND server/, web/, api/, app/ (singular),
+    //     tools/, or a project-specific monorepo container name — runs its REAL
+    //     suite instead of falling through to an UNVERIFIED merge. Inspects ONLY
+    //     the already-cloned local workspace, so there is zero GitHub-API cost.
+    //     CONSERVATIVE: a runner is emitted only when a real manifest/test
+    //     entrypoint is actually present. Multiple sibling packages each emit
+    //     their own runner.
     //
     //     NOTE: the Blueprint self-repo (root/backend/agent) always produces a
     //     runner above, so noRunners() is false here and this scan never fires
@@ -409,29 +412,58 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         } catch { /* defensive: any fs error — skip this package */ }
       };
 
-      // Scan a container's immediate child directories, emitting a runner per
-      // child package. Skips silently when the container is absent or unreadable.
-      const scanContainer = (container: string): void => {
-        const containerAbs = `${WORKSPACE}/${container}`;
-        if (!existsSync(containerAbs)) return;
-        let children: string[];
-        try {
-          children = readdirSync(containerAbs) as unknown as string[];
-        } catch { return; /* unreadable container — skip */ }
-        if (!Array.isArray(children)) return;
-        for (const child of children) {
-          if (typeof child !== 'string') continue;
-          pushRunnerForPackageDir(`${container}/${child}`);
-        }
+      // Generic depth-bounded directory walk over the local workspace, mirroring
+      // the backend onboarding BFS bounds (admin_onboard.py:
+      // _BUILD_CONFIG_SCAN_MAX_DEPTH=2, _BUILD_CONFIG_SCAN_MAX_DIRECTORIES=40).
+      // Every top-level directory is treated BOTH as a candidate package
+      // directory (depth 1) AND as a container scanned one level deeper
+      // (depth 2) — exactly the dirs the backend walks. This replaces the old
+      // fixed allowlist (services/apps/packages/libs/modules/crates/cmd/pkg/src),
+      // which silently missed suites under any other top-level dir.
+      //
+      // Well-known vendored / dependency / build directories that exist only in
+      // the local clone (node_modules, vendor, .venv, venv, target, dist, build)
+      // and every dotdir (.git, .github, .pytest_cache, …) are skipped so a large
+      // external repo cannot blow up the scan or emit spurious runners. The scan
+      // is bounded to SCAN_MAX_DIRECTORIES inspected package dirs to match the
+      // backend directory cap. First-match-wins per dir; no bare `pytest` is ever
+      // emitted (C19); every fs access is defensive.
+      const SKIP_DIRS = new Set([
+        'node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build',
+      ]);
+      const skipDir = (name: string): boolean => name.startsWith('.') || SKIP_DIRS.has(name);
+      const SCAN_MAX_DIRECTORIES = 40;
+      let inspectedDirs = 0;
+      const inspectPackageDir = (relPath: string): void => {
+        if (inspectedDirs >= SCAN_MAX_DIRECTORIES) return;
+        inspectedDirs++;
+        pushRunnerForPackageDir(relPath);
       };
 
-      for (const container of ['services', 'apps', 'packages', 'libs', 'modules', 'crates', 'cmd', 'pkg']) {
-        scanContainer(container);
+      let topLevelEntries: string[];
+      try {
+        topLevelEntries = readdirSync(WORKSPACE) as unknown as string[];
+      } catch { topLevelEntries = []; /* unreadable workspace — skip nested scan */ }
+      if (Array.isArray(topLevelEntries)) {
+        for (const entry of topLevelEntries) {
+          if (typeof entry !== 'string' || skipDir(entry)) continue;
+          if (inspectedDirs >= SCAN_MAX_DIRECTORIES) break;
+          // depth 1: the top-level entry may itself be a package directory.
+          inspectPackageDir(entry);
+          // depth 2: scan its immediate children as package dirs too. A
+          // top-level file (not a dir) makes readdirSync throw → caught → skip.
+          let children: string[];
+          try {
+            children = readdirSync(`${WORKSPACE}/${entry}`) as unknown as string[];
+          } catch { continue; /* not a directory / unreadable — skip */ }
+          if (!Array.isArray(children)) continue;
+          for (const child of children) {
+            if (typeof child !== 'string' || skipDir(child)) continue;
+            if (inspectedDirs >= SCAN_MAX_DIRECTORIES) break;
+            inspectPackageDir(`${entry}/${child}`);
+          }
+        }
       }
-      // `src/` is treated as a single package directory (manifest at src/ itself)
-      // AND scanned for child packages, matching the backend's depth-bounded walk.
-      pushRunnerForPackageDir('src');
-      scanContainer('src');
     }
   }
 

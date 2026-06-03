@@ -636,9 +636,11 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
       fsMock.readdirSync.mockImplementation((p: string) => {
         const rel = toWorkspaceRelativePath(p);
         if (rel === WORKSPACE || rel === '') {
-          return layout.files
-            .map((item) => item.path)
-            .filter((path) => !path.includes('/'));
+          // The workspace root listing exposes BOTH top-level files (so the
+          // .NET detector can glob for *.sln/*.csproj) AND top-level
+          // directories (so the generic depth-bounded walk discovers nested
+          // packages under any container name, not a fixed allowlist).
+          return Array.from(dirChildren.get('') ?? []);
         }
         const children = dirChildren.get(rel);
         return children ? Array.from(children) : [];
@@ -684,9 +686,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/services' || p.endsWith('/services/api/pyproject.toml'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/services') ? ['api'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['services'];
+      return p.endsWith('/services') ? ['api'] : [];
+    });
     fs.readFileSync.mockImplementation((p: string) =>
       p.endsWith('pyproject.toml') ? '[tool.pytest.ini_options]\n' : '',
     );
@@ -704,9 +707,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/apps' || p.endsWith('/apps/web/package.json'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/apps') ? ['web'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['apps'];
+      return p.endsWith('/apps') ? ['web'] : [];
+    });
     fs.readFileSync.mockImplementation((p: string) =>
       p.endsWith('package.json') ? JSON.stringify({ scripts: { test: 'vitest run' } }) : '',
     );
@@ -724,9 +728,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/apps' || p.endsWith('/apps/web/package.json'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/apps') ? ['web'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['apps'];
+      return p.endsWith('/apps') ? ['web'] : [];
+    });
     fs.readFileSync.mockImplementation((p: string) =>
       p.endsWith('package.json') ? JSON.stringify({ scripts: { build: 'tsc' } }) : '',
     );
@@ -743,9 +748,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
       p.endsWith('/packages/core/Cargo.toml') ||
       p.endsWith('/packages/svc/go.mod'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/packages') ? ['core', 'svc'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['packages'];
+      return p.endsWith('/packages') ? ['core', 'svc'] : [];
+    });
 
     const runners = detectTestRunners(undefined);
 
@@ -762,9 +768,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/services' || p.endsWith('/services/api/pom.xml'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/services') ? ['api'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['services'];
+      return p.endsWith('/services') ? ['api'] : [];
+    });
 
     const runners = detectTestRunners(undefined);
 
@@ -781,9 +788,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
       p.endsWith('/packages/web/Gemfile') ||
       p.endsWith('/packages/web/Rakefile'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/packages') ? ['web'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['packages'];
+      return p.endsWith('/packages') ? ['web'] : [];
+    });
 
     const runners = detectTestRunners(undefined);
 
@@ -797,8 +805,9 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     const fs = mockFs;
     fs.existsSync.mockImplementation((p: string) => p === '/tmp/workspace/apps');
     fs.readdirSync.mockImplementation((p: string) => {
-      if (p.endsWith('/apps')) return ['svc'];
+      if (p === '/tmp/workspace') return ['apps'];
       if (p.endsWith('/apps/svc')) return ['Service.csproj'];
+      if (p.endsWith('/apps')) return ['svc'];
       return [];
     });
 
@@ -827,8 +836,11 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/src' || p === '/tmp/workspace/src/pytest.ini',
     );
-    // readdirSync of src/ returns no child dirs → only the src-itself package fires.
-    fs.readdirSync.mockReturnValue([]);
+    // Workspace root lists `src`; src/ itself has no child dirs → only the
+    // src-itself package fires.
+    fs.readdirSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace' ? ['src'] : [],
+    );
 
     const runners = detectTestRunners(undefined);
 
@@ -845,9 +857,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
       p.endsWith('/services/a/setup.cfg') ||
       p.endsWith('/services/b/Cargo.toml'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/services') ? ['a', 'b'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['services'];
+      return p.endsWith('/services') ? ['a', 'b'] : [];
+    });
     fs.readFileSync.mockImplementation((p: string) =>
       p.endsWith('setup.cfg') ? '[tool:pytest]\naddopts = -q\n' : '',
     );
@@ -862,9 +875,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
   it('nested package with no manifest → no runner (graceful)', () => {
     const fs = mockFs;
     fs.existsSync.mockImplementation((p: string) => p === '/tmp/workspace/services');
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/services') ? ['empty-pkg'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['services'];
+      return p.endsWith('/services') ? ['empty-pkg'] : [];
+    });
 
     const runners = detectTestRunners(undefined);
 
@@ -886,9 +900,10 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/services' || p.endsWith('/services/api/pytest.ini'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/services') ? ['api'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['services'];
+      return p.endsWith('/services') ? ['api'] : [];
+    });
 
     const runners = detectTestRunners(undefined);
 
@@ -939,6 +954,139 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     expect(runners[0].cmd).toBe('bash');
     expect(runners[0].args[0]).toBe('scripts/test-backend.sh');
   });
+
+  // ── Non-allowlist top-level containers (the bug this fix closes) ───────────
+  // The old fixed allowlist (services/apps/packages/libs/modules/crates/cmd/pkg
+  // /src) silently missed suites under any other top-level directory. The
+  // generic walk discovers them in the same dirs the backend BFS walks.
+
+  it('server/api/pytest.ini (NON-allowlist container) → python3 -m pytest', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/server' || p.endsWith('/server/api/pytest.ini'),
+    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['server'];
+      return p.endsWith('/server') ? ['api'] : [];
+    });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/server/api');
+  });
+
+  it('web/app/package.json with scripts.test (NON-allowlist) → npm test at web/app', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/web' || p.endsWith('/web/app/package.json'),
+    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['web'];
+      return p.endsWith('/web') ? ['app'] : [];
+    });
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('package.json') ? JSON.stringify({ scripts: { test: 'vitest run' } }) : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('npm');
+    expect(runners[0].cwd).toBe('/tmp/workspace/web/app');
+  });
+
+  it('tools/cli/go.mod (NON-allowlist container) → go test ./... at tools/cli', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/tools' || p.endsWith('/tools/cli/go.mod'),
+    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['tools'];
+      return p.endsWith('/tools') ? ['cli'] : [];
+    });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('go');
+    expect(runners[0].args).toEqual(['test', './...']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/tools/cli');
+  });
+
+  it('app/Cargo.toml (singular, NON-allowlist top-level package) → cargo test at app', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/app' || p.endsWith('/app/Cargo.toml'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace' ? ['app'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('cargo');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/app');
+  });
+
+  it('skips vendored/dependency/build dirs and dotdirs (no spurious runner from node_modules)', () => {
+    const fs = mockFs;
+    // node_modules contains a package.json with a test script, but it must be
+    // skipped — only the real suite under server/ should emit a runner.
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/server' ||
+      p.endsWith('/server/api/pytest.ini') ||
+      p.endsWith('/node_modules/foo/package.json') ||
+      p.endsWith('/.git/pkg/package.json'),
+    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['server', 'node_modules', '.git', 'vendor', '.venv'];
+      if (p.endsWith('/server')) return ['api'];
+      if (p.endsWith('/node_modules')) return ['foo'];
+      if (p.endsWith('/.git')) return ['pkg'];
+      return [];
+    });
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('package.json') ? JSON.stringify({ scripts: { test: 'vitest' } }) : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    // Only the server/api pytest suite — node_modules/.git/vendor/.venv skipped.
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cwd).toBe('/tmp/workspace/server/api');
+    expect(runners[0].cmd).toBe('python3');
+  });
+
+  it('bounds the walk to ~40 directories (no runaway emission on a huge repo)', () => {
+    const fs = mockFs;
+    // 100 top-level package dirs, each carrying a real Cargo.toml. A bounded
+    // walk must emit far fewer than 100 runners (cap is 40 inspected dirs).
+    const topDirs = Array.from({ length: 100 }, (_, i) => `pkg${i}`);
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Cargo.toml'));
+    fs.readdirSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace' ? topDirs : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners.length).toBeGreaterThan(0);
+    expect(runners.length).toBeLessThanOrEqual(40);
+  });
+
+  it('unreadable workspace root → no runner (readdirSync(WORKSPACE) throws, caught)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockReturnValue(false);
+    fs.readdirSync.mockImplementation(() => { throw new Error('EACCES'); });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
 });
 
 describe('detectAutoTestRunners — buildConfig-suppressed auto-detection (stale-command self-heal)', () => {
@@ -960,9 +1108,10 @@ describe('detectAutoTestRunners — buildConfig-suppressed auto-detection (stale
     fs.existsSync.mockImplementation((p: string) =>
       p === '/tmp/workspace/services' || p.endsWith('/services/api/pytest.ini'),
     );
-    fs.readdirSync.mockImplementation((p: string) =>
-      p.endsWith('/services') ? ['api'] : [],
-    );
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p === '/tmp/workspace') return ['services'];
+      return p.endsWith('/services') ? ['api'] : [];
+    });
 
     const auto = detectAutoTestRunners();
     const baseline = detectTestRunners(undefined);

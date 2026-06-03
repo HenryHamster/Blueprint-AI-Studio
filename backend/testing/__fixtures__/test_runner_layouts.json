@@ -343,5 +343,46 @@
     ],
     "detectable": true,
     "family": "cargo"
+  },
+  {
+    "name": "server_python_pytest_nonallowlist_nested",
+    "files": [
+      {
+        "path": "server/api/pytest.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "web_node_with_scripts_test_nonallowlist_nested",
+    "files": [
+      {
+        "path": "web/app/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest run\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "tools_cli_go_mod_nonallowlist_nested",
+    "files": [
+      {
+        "path": "tools/cli/go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "app_singular_cargo_nonallowlist_nested",
+    "files": [
+      {
+        "path": "app/Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
   }
 ]
