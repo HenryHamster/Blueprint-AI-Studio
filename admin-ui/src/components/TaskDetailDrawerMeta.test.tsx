@@ -96,4 +96,34 @@ describe('DetailsTab — Merge Test Gate', () => {
     render(<DetailsTab task={task} />);
     expect(screen.queryByText('Merge Test Gate')).toBeNull();
   });
+
+  it('renders an UNVERIFIED verdict with the mapped reason when no artifact exists', () => {
+    const task = makeTask({ unverified_merge_reason: 'no_detectable_test_command' });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Merge Test Gate')).toBeInTheDocument();
+    expect(screen.getByText('Merged unverified')).toBeInTheDocument();
+    expect(screen.getByText(/no runnable test command could be detected/)).toBeInTheDocument();
+  });
+
+  it('renders the raw reason key when it is unmapped', () => {
+    const task = makeTask({ unverified_merge_reason: 'some_future_reason' });
+    render(<DetailsTab task={task} />);
+    expect(screen.getByText('Merged unverified')).toBeInTheDocument();
+    expect(screen.getByText(/some_future_reason/)).toBeInTheDocument();
+  });
+
+  it('reason label takes precedence when both an undetected artifact and a reason are present', () => {
+    const task = makeTask({
+      unverified_merge_reason: 'kill_switch_off',
+      artifacts: [mergeTestArtifact({ detected: false, passed: false, tests: [], output: 'No test runner detected' })],
+    });
+    render(<DetailsTab task={task} />);
+    // The reason-driven UNVERIFIED verdict wins over the artifact's 'undetected'.
+    expect(screen.getByText('Merged unverified')).toBeInTheDocument();
+    expect(screen.queryByText('No suite detected')).toBeNull();
+    expect(screen.getByText(/kill-switch off/)).toBeInTheDocument();
+    // Captured test output from the artifact is still surfaced.
+    expect(screen.getByText('Test Output')).toBeInTheDocument();
+    expect(screen.getByText(/No test runner detected/)).toBeInTheDocument();
+  });
 });

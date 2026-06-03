@@ -58,6 +58,12 @@ export interface Task {
     cgroup_limit_mb?: number;
   } | null;
   last_tool_use_at?: string | null;
+  // Slim, read-only mirror of the no-CI merge gate's UNVERIFIED-merge reason
+  // (backend admin.py mirrors review_loop["unverified_merge_reason"]). Null /
+  // absent for CI-verified, tests-gated, or otherwise normal merges. The Task
+  // Detail drawer's Merge Test Gate section reads this to render the UNVERIFIED
+  // verdict + human-readable reason when no MERGE_TEST_RESULT artifact exists.
+  unverified_merge_reason?: string | null;
   payloads?: Record<string, unknown>[];
   artifacts?: Array<{artifact_type: string; pr_url?: string; commit_hash?: string; repo_url?: string; logs?: string; iteration: number; created_at?: string}>;
   pr_url?: string;

@@ -362,6 +362,12 @@ async def get_all_tasks(
                 for k, v in (t.context or {}).items()
                 if not k.startswith("max_plan_")
             },
+            # Slim, read-only mirror of the no-CI gate's UNVERIFIED-merge reason
+            # (review_loop["unverified_merge_reason"]). None for verified /
+            # normal merges. See the detail endpoint for rationale.
+            "unverified_merge_reason": (t.context or {})
+            .get("review_loop", {})
+            .get("unverified_merge_reason"),
             "archived": t.archived,
             "artifacts": artifacts_map.get(str(t.id), []),
             "pr_url": pr_map.get(str(t.id)),
@@ -995,6 +1001,13 @@ async def get_task(
             for k, v in (task.context or {}).items()
             if not k.startswith("max_plan_")
         },
+        # Slim, read-only mirror of the no-CI gate's UNVERIFIED-merge reason
+        # (review_loop["unverified_merge_reason"]). None for verified / normal
+        # merges. Lets the Task Detail drawer surface why a merge bypassed
+        # verification without digging into raw nested context shape.
+        "unverified_merge_reason": (task.context or {})
+        .get("review_loop", {})
+        .get("unverified_merge_reason"),
         "archived": task.archived,
         "artifacts": artifacts_list,
         "pr_url": pr_url,

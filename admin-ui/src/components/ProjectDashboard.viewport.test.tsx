@@ -38,6 +38,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     autonomous_enabled: true,
     directions: [],
     created_at: '2026-01-01T00:00:00Z',
+    merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
     ...overrides,
   };
 }
@@ -64,8 +65,19 @@ describe('ProjectDashboard — viewport regression', () => {
 
     const projects = [
       makeProject({ id: 'p1', name: 'Platform', status: 'active' }),
-      makeProject({ id: 'p2', name: 'Mobile App', status: 'paused', autonomous_enabled: false }),
-      makeProject({ id: 'p3', name: 'Data Pipeline', status: 'active' }),
+      makeProject({
+        id: 'p2',
+        name: 'Mobile App',
+        status: 'paused',
+        autonomous_enabled: false,
+        merge_verification_verdict: { state: 'unverified', test_commands: [] },
+      }),
+      makeProject({
+        id: 'p3',
+        name: 'Data Pipeline',
+        status: 'active',
+        build_config: { has_ci: false, requires_ci_checks: true },
+      }),
     ];
 
     await expectNoOverflowAt(375, async () => {

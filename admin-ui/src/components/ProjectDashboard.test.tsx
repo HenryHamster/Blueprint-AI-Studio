@@ -40,6 +40,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     autonomous_enabled: true,
     directions: [{ id: 'd-1', text: 'Ship the retry fix', priority: 'high', status: 'active', added_at: '2026-04-24T00:00:00Z' }],
     created_at: '2026-04-23T10:00:00Z',
+    merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
     ...overrides,
   };
 }
@@ -157,6 +158,48 @@ describe('ProjectDashboard', () => {
     );
     expect(screen.getByText('Deploying')).toBeInTheDocument();
     expect(screen.getByText('Failed')).toBeInTheDocument();
+  });
+
+  it('renders the merge-gate posture badge for each verdict state', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[
+          makeProject({
+            id: 'proj-ci',
+            name: 'CI Project',
+            merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+          }),
+          makeProject({
+            id: 'proj-tests',
+            name: 'Tests Project',
+            merge_verification_verdict: {
+              state: 'tests_gated',
+              test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+            },
+          }),
+          makeProject({
+            id: 'proj-unverified',
+            name: 'Unverified Project',
+            merge_verification_verdict: { state: 'unverified', test_commands: [] },
+          }),
+          makeProject({
+            id: 'proj-stall',
+            name: 'Stall Risk Project',
+            build_config: { has_ci: false, requires_ci_checks: true },
+            merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+          }),
+        ]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText('CI gated')).toHaveLength(1);
+    expect(screen.getByText('Tests gated')).toBeInTheDocument();
+    expect(screen.getByText('UNVERIFIED')).toBeInTheDocument();
+    expect(screen.getByText('Stall risk')).toBeInTheDocument();
   });
 
   it('counts paused projects from the paused flag in the summary strip', () => {

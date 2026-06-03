@@ -10,6 +10,18 @@ import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel, getLogEntryColor } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel } from './TaskDetailDrawerFailureDetail';
 
+// Human-readable labels for the no-CI UNVERIFIED-merge reason keys. Mirrors
+// backend _UNVERIFIED_REASON_LABELS (backend/app/alert_dispatch.py) — keep keys
+// in sync. The orchestrator writes the reason KEY into
+// review_loop["unverified_merge_reason"]; admin.py exposes it as
+// task.unverified_merge_reason.
+const UNVERIFIED_REASON_LABELS: Record<string, string> = {
+  no_detectable_test_command: 'no runnable test command could be detected',
+  kill_switch_off: 'the no-CI test-gate is disabled (kill-switch off)',
+  internal_staging_base: 'the PR targets an internal staging branch (CI is path-filtered there)',
+  undetected_runtime: 'the detected test suite produced no usable verdict',
+};
+
 function CopyableId({ value }: { value: string }) {
   const [copied, setCopied] = useState(false);
 
@@ -194,7 +206,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       .catch(() => {});
   }, [task.project_id, provenanceDirectionId]);
 
-  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict } = useMemo(() => {
+  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict, unverifiedMergeReason } = useMemo(() => {
     const artifacts = task.artifacts ?? [];
     // Surface the no-CI merge gate's verdict. The verify_tests handler posts a
     // MERGE_TEST_RESULT artifact whose `logs` carry the JSON verdict
@@ -224,8 +236,9 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       commitArtifacts: artifacts.filter(a => a.artifact_type === 'GIT_COMMIT'),
       investigationArtifacts: artifacts.filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
       mergeTestVerdict,
+      unverifiedMergeReason: typeof task.unverified_merge_reason === 'string' ? task.unverified_merge_reason : null,
     };
-  }, [task.artifacts]);
+  }, [task.artifacts, task.unverified_merge_reason]);
   // Group PR and commit artifacts by iteration for display
   const artifactIterations: { iteration: number; prs: typeof prArtifacts; commits: typeof commitArtifacts }[] = [];
   if (task.artifacts && task.artifacts.length > 0) {
@@ -665,8 +678,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })() : null}
 
-      {mergeTestVerdict && (() => {
-        const config: Record<'pass' | 'fail' | 'undetected', { label: string; badge: string; note: string }> = {
+      {(mergeTestVerdict || unverifiedMergeReason) && (() => {
+        const config: Record<'pass' | 'fail' | 'undetected' | 'unverified', { label: string; badge: string; note: string }> = {
           pass: {
             label: 'Passed',
             badge: 'text-emerald-400 bg-emerald-950/30 border-emerald-800/40',
@@ -682,8 +695,26 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
             badge: 'text-neutral-400 bg-neutral-800/40 border-neutral-700/40',
             note: 'No runnable test suite was detected on the PR head — the gate fell back to proceeding unverified.',
           },
+          unverified: {
+            label: 'Merged unverified',
+            badge: 'text-amber-400 bg-amber-950/30 border-amber-800/40',
+            // Reason appended below; this note is the generic fallback.
+            note: 'The merge bypassed test verification.',
+          },
         };
-        const v = config[mergeTestVerdict.outcome];
+        // The persisted unverified-merge reason is an independent signal that
+        // opens this section and selects the UNVERIFIED verdict. When both an
+        // artifact verdict and a reason are present, the reason takes precedence
+        // for the verdict label/note while any captured test output still shows.
+        const outcome: 'pass' | 'fail' | 'undetected' | 'unverified' =
+          unverifiedMergeReason || !mergeTestVerdict ? 'unverified' : mergeTestVerdict.outcome;
+        const v = config[outcome];
+        const reasonLabel = unverifiedMergeReason
+          ? (UNVERIFIED_REASON_LABELS[unverifiedMergeReason] ?? unverifiedMergeReason)
+          : null;
+        const note = reasonLabel
+          ? `The merge bypassed test verification — ${reasonLabel}.`
+          : v.note;
         return (
           <>
             <SectionHeader>Merge Test Gate</SectionHeader>
@@ -694,8 +725,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                   {v.label}
                 </span>
               </div>
-              <p className="text-xs text-neutral-400 break-words">{v.note}</p>
-              {mergeTestVerdict.output && (
+              <p className="text-xs text-neutral-400 break-words">{note}</p>
+              {mergeTestVerdict?.output && (
                 <div className="flex items-start gap-2">
                   <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Test Output</span>
                   <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{mergeTestVerdict.output}</pre>

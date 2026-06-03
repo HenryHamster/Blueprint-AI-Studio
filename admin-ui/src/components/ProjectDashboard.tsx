@@ -59,6 +59,45 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   };
 }
 
+function getMergeGateBadge(project: Project) {
+  const verdict = project.merge_verification_verdict ?? { state: 'ci_checks' as const, test_commands: [] };
+  const buildConfig = project.build_config ?? null;
+
+  if (
+    verdict.state === 'ci_checks' &&
+    buildConfig?.has_ci === false &&
+    buildConfig.requires_ci_checks !== false
+  ) {
+    return {
+      label: 'Stall risk',
+      classes: 'bg-red-500/15 text-red-300 border-red-500/20',
+      title: 'No CI detected while required CI checks remain on. PRs will stall until the merge backstop times out.',
+    };
+  }
+
+  if (verdict.state === 'tests_gated') {
+    return {
+      label: 'Tests gated',
+      classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20',
+      title: "Blueprint will run the project's detected test command(s) before merging PRs.",
+    };
+  }
+
+  if (verdict.state === 'unverified') {
+    return {
+      label: 'UNVERIFIED',
+      classes: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
+      title: 'No test command was detected. PRs merge without verification.',
+    };
+  }
+
+  return {
+    label: 'CI gated',
+    classes: 'bg-blue-500/15 text-blue-300 border-blue-500/20',
+    title: "Blueprint will wait for the repository's GitHub CI checks before merging PRs.",
+  };
+}
+
 export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectProject, showMembers, onToggleMembers, userRole, onNewProject, onOpenSetupGuide, onProjectDeleted, onProjectReset, onProjectPaused, onProjectArchived, onProjectUnarchived }: ProjectDashboardProps) {
   const [collapsed, setCollapsed] = useState(() => {
     const stored = localStorage.getItem('projectDashboardCollapsed');
@@ -368,6 +407,17 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                         <span
                           className={`text-[9px] font-bold rounded px-1 py-0.5 ${badge.classes}`}
                           title={`Project status: ${badge.label}`}
+                        >
+                          {badge.label}
+                        </span>
+                      );
+                    })()}
+                    {(() => {
+                      const badge = getMergeGateBadge(project);
+                      return (
+                        <span
+                          className={`flex items-center gap-0.5 text-[9px] font-bold rounded px-1 py-0.5 border ${badge.classes}`}
+                          title={badge.title}
                         >
                           {badge.label}
                         </span>
