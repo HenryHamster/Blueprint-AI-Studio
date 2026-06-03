@@ -919,7 +919,21 @@ describe('handleReview — verdict file parsing', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
     expect(promptMod.formatProjectContext).toHaveBeenCalledWith(
-      { foo: 'bar' }, 'review', 'small', 'd-abc123',
+      { foo: 'bar' }, 'review', 'small', 'd-abc123', 0,
+    );
+  });
+
+  it('forwards the related-files count to formatProjectContext', async () => {
+    const promptMod = await import('../prompt.js');
+    vi.mocked(promptMod.formatProjectContext).mockClear();
+    await handleReview(
+      'task-pc-rf',
+      { ...basePayload, related_files: ['a.ts', 'b.ts'] },
+      { context: { scope: 'medium', direction_id: 'd-xyz' }, project_context: { foo: 'bar' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(promptMod.formatProjectContext).toHaveBeenCalledWith(
+      { foo: 'bar' }, 'review', 'medium', 'd-xyz', 2,
     );
   });
 
