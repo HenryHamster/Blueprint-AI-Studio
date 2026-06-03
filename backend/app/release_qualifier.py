@@ -717,6 +717,160 @@ async def _resolve_ci_at_finalize(
 # ---------------------------------------------------------------------------
 
 
+async def _is_target_absorbed(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    target_head: str,
+    candidate_sha: str,
+    project_id: str,
+) -> bool | None:
+    """Sync-gate check: is the promotion-target HEAD absorbed into the candidate?
+
+    A thin wrapper over ``github.is_ancestor_of`` so the qualify-on-synced gate
+    has its OWN mockable seam — ``is_ancestor_of`` is also used by ``promote()``
+    (promote-idempotency: "is this candidate already on main?") and tested
+    directly, so the gate must not share their mock. Returns True (absorbed /
+    synced), False (not absorbed), or None (indeterminate compare).
+    """
+    return await github.is_ancestor_of(
+        token, owner, repo, target_head, candidate_sha, project_id=project_id
+    )
+
+
+async def _check_lts_sync_gate(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+    integration_branch: str,
+    promotion_target: str,
+) -> dict[str, Any] | None:
+    """Qualify-on-synced gate: don't score a candidate that is behind ``main``.
+
+    Under an LTS split, a candidate snapshotted from the integration branch can
+    be BEHIND the promotion target — ``main`` landed commits the integration
+    branch has not back-merged yet. Scoring such a candidate wastes a full audit:
+    the eventual ``release-vN -> main`` promotion merge can break CI on a
+    *semantic* conflict and bounce the version back to stabilize. Qualifying only
+    a SYNCED candidate (whose tree already contains ``main``) makes that break
+    structurally impossible.
+
+    Returns ``None`` to PROCEED — synced, an indeterminate compare, or the
+    bounded fall-through fired — or a retryable ``{"status": "deferred_unsynced",
+    ...}`` to DEFER. A deferral is NEVER dropped: the strategic ``qualify_request``
+    / cadence re-emits and this re-gates each attempt, while ``first_deferred_at``
+    (persisted on ``last_qualification``) bounds the wait so a wedged back-merge
+    can never starve promotion.
+
+    Degrade-safe: any GitHub error or indeterminate result PROCEEDS rather than
+    blocks — the promotion bounce + back-merge CI-fix loop remain the backstop,
+    and the gate must never become a wedge of its own.
+    """
+    # Promotion-target HEAD — one extra read; on any failure, proceed ungated.
+    try:
+        target_head = await github.get_branch_sha(token, owner, repo, promotion_target)
+    except Exception as exc:  # noqa: BLE001 — a flaky read must not block qualification
+        logger.warning(
+            "[RELEASE_QUALIFIER] sync-gate: could not resolve %s HEAD (%s) — "
+            "proceeding ungated",
+            promotion_target,
+            exc,
+        )
+        return None
+
+    # Is the promotion target already absorbed into the candidate's tree?
+    absorbed = await _is_target_absorbed(
+        token,
+        owner,
+        repo,
+        target_head=target_head,
+        candidate_sha=candidate_sha,
+        project_id=str(version.project_id),
+    )
+    if absorbed is not False:
+        # True (synced) or None (indeterminate compare) → proceed. A later
+        # normal last_qualification write replaces any prior deferral note.
+        return None
+
+    # absorbed is False → main has commits the candidate lacks → unsynced.
+    prior = version.last_qualification or {}
+    first = _utcnow()
+    if prior.get("status") == "deferred_unsynced" and prior.get("first_deferred_at"):
+        try:
+            parsed = datetime.fromisoformat(
+                str(prior["first_deferred_at"]).replace("Z", "+00:00")
+            )
+            first = parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+        except (ValueError, TypeError):
+            pass  # malformed — restart the clock from now (fail toward firing sooner)
+    waited_min = max(0.0, (_utcnow() - first).total_seconds() / 60.0)
+    fall_through_min = _runtime_config.get("qualify_unsynced_fall_through_minutes", 30)
+
+    if fall_through_min and waited_min >= fall_through_min:
+        # Bounded fall-through: a wedged back-merge must never starve promotion.
+        logger.warning(
+            "[RELEASE_QUALIFIER] sync-gate: v%d candidate %s has been behind %s "
+            "for %.0fmin (>= %smin) — qualifying ANYWAY; the %s -> %s back-merge "
+            "may be stuck",
+            version.version_number,
+            candidate_sha[:8],
+            promotion_target,
+            waited_min,
+            fall_through_min,
+            promotion_target,
+            integration_branch,
+        )
+        await _notify_operator(
+            session,
+            version,
+            "qualify_unsynced_fall_through",
+            (
+                f"v{version.version_number}: {integration_branch} has not absorbed "
+                f"{promotion_target} for {waited_min:.0f}min, so the qualify-sync "
+                f"gate's fall-through fired — scoring the candidate anyway. Check "
+                f"the {promotion_target} -> {integration_branch} back-merge."
+            ),
+            extra={
+                "candidate_sha": candidate_sha,
+                "waited_minutes": round(waited_min),
+                "fall_through_minutes": fall_through_min,
+            },
+        )
+        return None
+
+    # Defer (retryable — the re-emitted qualify_request / cadence re-enters).
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": candidate_sha,
+        "promotion_target": promotion_target,
+        "first_deferred_at": first.isoformat(),
+        "deferred_at": _utcnow().isoformat(),
+        "reason": (
+            f"{integration_branch} has not absorbed {promotion_target} "
+            f"(a {promotion_target} -> {integration_branch} back-merge is "
+            f"pending); deferring to avoid scoring a candidate that would fail "
+            f"the promotion merge"
+        ),
+    }
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    logger.info(
+        "[RELEASE_QUALIFIER] sync-gate: deferring qualification of v%d — "
+        "candidate %s is behind %s (waited %.0f/%smin); retries when synced",
+        version.version_number,
+        candidate_sha[:8],
+        promotion_target,
+        waited_min,
+        fall_through_min,
+    )
+    return {"status": "deferred_unsynced", "candidate_sha": candidate_sha}
+
+
 async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -888,6 +1042,26 @@ async def run_qualification(
     )
     ci_green = ci_resolution["ci_green"]
     ci_state = ci_resolution["state"]
+
+    # 3b. Qualify-on-synced gate (LTS split only).  Don't score a candidate that
+    #     is behind the promotion target — it would fail the promotion merge and
+    #     bounce the version back to stabilize, burning a full re-audit.  Bounded,
+    #     degrade-safe, and never drops the request (see _check_lts_sync_gate).
+    #     Runs pre-lock (read-only GitHub I/O) like the candidate snapshot + CI
+    #     check above, so no row lock is held across the compare.
+    if integration_branch != promotion_target:
+        _sync_gate = await _check_lts_sync_gate(
+            session,
+            version,
+            token=token,
+            owner=owner,
+            repo=repo,
+            candidate_sha=candidate_sha,
+            integration_branch=integration_branch,
+            promotion_target=promotion_target,
+        )
+        if _sync_gate is not None:
+            return _sync_gate
 
     # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
     #    qualify_request path and the admin POST /qualify endpoint can both

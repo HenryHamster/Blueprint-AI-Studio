@@ -360,6 +360,17 @@ def summarize_qualification_state(
             "state": "promoted",
             "summary": "Candidate was promoted — the version was cut.",
         }
+    if status == "deferred_unsynced":
+        return {
+            "state": "deferred_unsynced",
+            "summary": (
+                "Qualification is DEFERRED: the integration branch hasn't "
+                "absorbed the promotion target yet (a back-merge is pending), so "
+                "scoring now would cut a candidate that fails the promotion merge. "
+                "It auto-retries once synced — no action needed (a bounded "
+                "fall-through qualifies anyway if the back-merge stalls)."
+            ),
+        }
     return {"state": status, "summary": f"Qualification status: {status}."}
 
 
