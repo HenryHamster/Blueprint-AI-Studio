@@ -14,6 +14,7 @@ from app.problem_model import (
     REVISION_LOG_MAX,
     SELF_REFLECTION_LOG_MAX,
     Capability,
+    ColdStartWipeError,
     Friction,
     Gap,
     Intent,
@@ -490,6 +491,98 @@ def test_apply_agent_update_no_changes_still_logs():
     assert diff == {}
     assert len(new_raw["revision_log"]) == 1
     assert new_raw["revision_log"][0]["summary"] == "no structural changes"
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — cold-start wipe protection (bootstrap-over-mature)
+# ---------------------------------------------------------------------------
+
+
+def _mature_current() -> dict:
+    """A non-empty durable model with content in all three agent-owned
+    collections — the kind a blind cold-start bootstrap would silently erase."""
+    return {
+        "revision": 7,
+        "capabilities": [
+            {"name": "Billing", "status": "working"},
+            {"name": "Metering", "status": "partial"},
+        ],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "active"}],
+    }
+
+
+def test_apply_agent_update_genuine_empty_current_first_cycle_passes():
+    """A genuine first cycle (current is empty) bootstrapping an empty model
+    must succeed — the guard only fires against a mature current."""
+    new_raw, _ = apply_agent_update(
+        None,
+        {"intent": {"purpose": "Bootstrap the project."}},
+        "2026-04-21T12:00:00",
+    )
+    assert new_raw["revision"] == 1
+    assert new_raw["capabilities"] == []
+    assert new_raw["gaps"] == []
+    assert new_raw["friction"] == []
+
+
+def test_apply_agent_update_rejects_bootstrap_over_mature():
+    """The catastrophic case: a rich current model and a cold-start proposed
+    model that empties all three agent-owned collections is refused loudly."""
+    current = _mature_current()
+    proposed = {"intent": {"purpose": "Fresh start.", "current_focus": "begin"}}
+    with pytest.raises(ColdStartWipeError) as exc:
+        apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    # Error is actionable: tells the agent to fetch + edit, not replace.
+    assert "fetch" in str(exc.value).lower()
+
+
+def test_apply_agent_update_rejects_explicit_empty_collections_over_mature():
+    """Explicitly submitting empty arrays for all three collections over a
+    mature model is the same wipe signature and is refused."""
+    current = _mature_current()
+    proposed = {"capabilities": [], "gaps": [], "friction": []}
+    with pytest.raises(ColdStartWipeError):
+        apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+
+
+def test_apply_agent_update_close_by_status_edit_passes():
+    """Retiring a gap by marking it closed keeps the gap in the submission, so
+    not all collections are empty — a normal edit that must still apply."""
+    current = _mature_current()
+    proposed = {
+        "capabilities": [{"name": "Billing", "status": "working"}],
+        # The retired gap is still present (status=closed) → gaps non-empty.
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "closed"}],
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "active"}],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["revision"] == 8
+    # Closed gap was archived, not wiped.
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-1"}
+    assert diff["gaps_closed"] == ["g-1"]
+
+
+def test_apply_agent_update_partial_proposed_not_treated_as_wipe():
+    """Pruning to a single non-empty collection is a legitimate trim, not a
+    wipe — the guard keys on ALL three being empty, not per-item omission."""
+    current = _mature_current()
+    proposed = {"capabilities": [{"name": "Billing", "status": "working"}]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert {c["name"] for c in new_raw["capabilities"]} == {"Billing"}
+
+
+def test_apply_agent_update_archived_only_current_not_treated_as_mature():
+    """A model holding only archived_gaps (all gaps already closed) is not a
+    wipe target — archived history is carried forward regardless."""
+    current = {
+        "revision": 4,
+        "archived_gaps": [{"id": "g-old", "name": "done", "status": "closed"}],
+    }
+    proposed: dict = {"intent": {"purpose": "Next phase."}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["revision"] == 5
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-old"}
 
 
 # ---------------------------------------------------------------------------

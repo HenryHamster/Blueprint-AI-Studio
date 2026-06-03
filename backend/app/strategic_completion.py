@@ -2114,7 +2114,7 @@ async def _handle_strategic_completion(
         try:
             from pydantic import ValidationError as _PmValidationError
 
-            from app.problem_model import apply_agent_update
+            from app.problem_model import ColdStartWipeError, apply_agent_update
 
             # Resolve the cycle's baseline problem model (snapshot at spawn) for
             # the 3-way operator-wins merge, mirroring the vision baseline
@@ -2137,6 +2137,16 @@ async def _handle_strategic_completion(
                     proposed_raw=new_problem_model,
                     now_iso=_utcnow().isoformat(),
                     baseline_raw=pm_baseline,
+                )
+            except ColdStartWipeError as pm_wipe:
+                # Bootstrap-over-mature: the agent's final-output model would
+                # wipe a non-empty model's agent-owned collections (the payload
+                # likely dropped the existing model). Refuse loudly and keep the
+                # prior durable state rather than silently erasing it.
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: refused cold-start wipe of "
+                    f"non-empty problem_model for project {project.id} — keeping "
+                    f"prior state. Reason: {pm_wipe}"
                 )
             except _PmValidationError as pm_err:
                 logger.warning(

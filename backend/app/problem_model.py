@@ -532,6 +532,54 @@ def _diff_summary(diff: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+class ColdStartWipeError(ValueError):
+    """Raised when an agent update would silently wipe a non-empty problem_model.
+
+    The strategic payload is assembled under a byte budget; under pressure the
+    ``problem_model`` section can be dropped or heavily trimmed. The agent then
+    believes it is the first cycle and writes a fresh cold-start ("bootstrap")
+    model from scratch — empty ``capabilities``/``gaps``/``friction`` — which a
+    wholesale replacement would use to erase the mature durable model.
+
+    :func:`apply_agent_update` refuses that destructive write loudly by raising
+    this error instead of overwriting. Callers surface it (the API path returns
+    a 409 with the actionable message; the strategic-completion fallback logs a
+    warning and keeps the prior state) so the wipe is never silent. The agent
+    should fetch the current model and edit it incrementally rather than replace
+    it from scratch.
+    """
+
+
+def _is_bootstrap_over_mature(current: ProblemModel, proposed: ProblemModel) -> bool:
+    """True for the catastrophic bootstrap-over-mature signature.
+
+    Fires only when the proposed update reduces ALL THREE agent-owned
+    collections (``capabilities``, ``gaps``, ``friction``) to empty while the
+    current durable model already holds real content in at least one of them.
+
+    Keyed deliberately on the all-collections-to-empty case, not per-item
+    omission: an agent retiring a gap marks it ``closed``/``abandoned`` (so the
+    gap is still present in the submission and gets archived), and may prune
+    individual capabilities — those leave at least one collection non-empty and
+    do NOT trip this guard. Only a wholesale cold-start replacement of an
+    already-mature model matches.
+
+    Operator-owned fields (``intent``/``context``/``constraints``) are protected
+    separately by :func:`_preserve_operator_intent` /
+    :func:`_merge_operator_owned_fields`; ``archived_gaps`` and ``revision_log``
+    are carried forward unconditionally — none of them count toward "mature"
+    here, so a model holding only operator intent or only archived history is
+    not treated as a wipe target.
+    """
+    proposed_collections_empty = (
+        not proposed.capabilities and not proposed.gaps and not proposed.friction
+    )
+    current_has_content = bool(
+        current.capabilities or current.gaps or current.friction
+    )
+    return proposed_collections_empty and current_has_content
+
+
 # ---------------------------------------------------------------------------
 # User-editable intent updates
 # ---------------------------------------------------------------------------
@@ -762,6 +810,13 @@ def apply_agent_update(
     Raises :class:`pydantic.ValidationError` if ``proposed_raw`` is malformed.
     Callers should catch and keep the current state on validation failure.
 
+    Raises :class:`ColdStartWipeError` when the current durable model is
+    non-empty but the proposed update reduces all agent-owned collections
+    (``capabilities``/``gaps``/``friction``) to empty — the bootstrap-over-mature
+    signature (see :func:`_is_bootstrap_over_mature`). The destructive write is
+    refused loudly rather than silently overwriting the mature model; callers
+    surface the error and keep the current state.
+
     Operator intent is protected, not frozen: a genuine, explicit, non-empty
     agent change to ``intent.purpose`` / ``context`` / ``constraints`` still
     applies and still bumps the revision when the operator did NOT also touch
@@ -785,6 +840,25 @@ def apply_agent_update(
     """
     proposed = ProblemModel.model_validate(proposed_raw)
     current = parse_problem_model(current_raw)
+
+    # Refuse a cold-start wipe loudly: a non-empty durable model whose
+    # agent-owned collections would all be reduced to empty is the
+    # bootstrap-over-mature signature (the payload likely dropped the existing
+    # model). Reject before any mutation so the prior state survives intact; the
+    # agent must fetch and edit the model rather than replace it from scratch.
+    if _is_bootstrap_over_mature(current, proposed):
+        raise ColdStartWipeError(
+            "Refusing to overwrite a non-empty problem_model with an empty "
+            f"cold-start bootstrap: the current model holds "
+            f"{len(current.capabilities)} capabilities, {len(current.gaps)} "
+            f"gaps, and {len(current.friction)} friction entries, but the "
+            "proposed update reduces all three agent-owned collections to "
+            "empty. This is the bootstrap-over-mature signature — the payload "
+            "likely dropped the existing model under byte pressure. Fetch the "
+            "current problem_model (GET /api/agent/projects/{project_id}/"
+            "problem-model or `./fetch problem-model`) and edit it "
+            "incrementally instead of replacing it from scratch."
+        )
 
     proposed.revision = current.revision + 1
     proposed.last_updated = now_iso

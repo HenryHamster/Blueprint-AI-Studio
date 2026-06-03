@@ -5345,6 +5345,139 @@ async def test_set_problem_model_ignores_invalid_version_phase_decision(
     assert "_strategic_version_phase_decision" not in (task.context or {})
 
 
+# ── cold-start-wipe protection (never silently wipe a mature problem_model) ───
+
+
+def _mature_problem_model() -> dict:
+    """A non-empty durable model with content in all three agent-owned
+    collections — the kind a blind cold-start bootstrap would silently erase."""
+    return {
+        "revision": 7,
+        "capabilities": [{"name": "Billing", "status": "working"}],
+        "gaps": [{"id": "g-1", "name": "invoicing", "status": "active"}],
+        "friction": [{"id": "f-1", "name": "flaky CI", "status": "active"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_api_refuses_cold_start_wipe_of_mature(
+    client, db_session
+):
+    """API seam: a bootstrap-over-mature set_problem_model (empties all three
+    agent-owned collections over a non-empty durable model) must return 409 — not
+    a 500, not a silent 200 — and leave the stored problem_model untouched.
+
+    Guards the 'never silently wiped' guarantee end-to-end through
+    /api/agent/strategic (admin_agent_ops.strategic_operation catches
+    ColdStartWipeError and maps it to 409).
+    """
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+
+    project = Project(
+        name="PM-WIPE-409",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model=_mature_problem_model(),
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-pm-wipe",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-pm-wipe", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            # Cold-start bootstrap: only intent, no agent-owned collections —
+            # the bootstrap-over-mature signature (payload dropped the model).
+            "data": {"intent": {"purpose": "Fresh start."}},
+        },
+        headers={"x-agent-token": token},
+    )
+    # Refused loudly with 409, and the error is actionable (fetch + edit).
+    assert resp.status_code == 409, resp.text
+    assert "fetch" in resp.text.lower()
+
+    # The mature model survives intact — never silently wiped.
+    await db_session.refresh(project)
+    assert project.problem_model["revision"] == 7
+    assert len(project.problem_model["capabilities"]) == 1
+    assert len(project.problem_model["gaps"]) == 1
+    assert len(project.problem_model["friction"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_strategic_completion_keeps_prior_model_on_cold_start_wipe(
+    db_session, mocker
+):
+    """Completion-handler fallback: when the agent's final-output problem_model
+    would wipe a non-empty durable model (the payload dropped it), the handler
+    catches ColdStartWipeError, logs, and KEEPS the prior state rather than
+    silently erasing it. Mirrors the API-seam 409 guarantee on the
+    parse-from-logs path that _handle_strategic_completion uses.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="PM-WIPE-KEEP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model=_mature_problem_model(),
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Final output that drops the mature model down to a cold-start bootstrap.
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "problem_model": {"intent": {"purpose": "Fresh start."}},
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    # Prior durable state preserved — not advanced, not wiped.
+    await db_session.refresh(project)
+    assert project.problem_model["revision"] == 7
+    assert len(project.problem_model["capabilities"]) == 1
+    assert len(project.problem_model["gaps"]) == 1
+    assert len(project.problem_model["friction"]) == 1
+
+
 # ── qualify_request transport (automain LTS Phase 3 / batch 3b) ──────────────
 
 

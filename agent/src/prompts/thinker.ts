@@ -45,6 +45,16 @@ export interface ThinkerPromptParams {
   packerMetaSection: string;
   strategicContext: string;
   problemModelSection: string;
+  /**
+   * Distinguishes how the problem_model reached this cycle so the prompt can
+   * steer bootstrap-vs-recover correctly:
+   *  - 'present' — full model shipped in the payload (normal cycle).
+   *  - 'fetch'   — a durable model EXISTS but was dropped/summarized by the
+   *                packer under the byte budget. The agent must `./fetch
+   *                problem-model` and EDIT, never bootstrap from scratch.
+   *  - 'empty'   — genuinely no model yet (true first cycle). Bootstrap.
+   */
+  problemModelRecovery: 'present' | 'fetch' | 'empty';
   verificationFailuresSection?: string;
   reflectionSection: string;
   selfImprovementBlock: string;
@@ -72,6 +82,24 @@ export interface ThinkerPromptParams {
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
+  // Bootstrap-vs-recover branch. A genuinely empty model gets the cold-start
+  // bootstrap path. A model that EXISTS but was dropped/summarized by the
+  // packer (recovery === 'fetch') must NOT be bootstrapped from scratch — that
+  // would wipe real durable state when the Executor submits the full
+  // replacement. Steer it to fetch-then-edit instead. A present model needs
+  // neither block.
+  const bootstrapOrRecoverSection =
+    p.problemModelRecovery === 'empty'
+      ? `# Bootstrap (when the problem_model is empty)
+
+Populate intent from: the existing vision field (if any), the conversation_thread (the user's own words), and rejected_proposals (they tell you what the user does NOT want). Populate capabilities from: what shipped work and active directions observably demonstrate the project does. Open initial gaps for: anything in conversation_thread the user explicitly asked for that isn't yet a capability; anything in the vision's stated direction not reflected in shipped work. Bootstrapped models are imperfect by design — subsequent cycles refine. Don't fail to populate because you're uncertain.`
+      : p.problemModelRecovery === 'fetch'
+      ? `# Recover your durable model (fetch-then-edit)
+
+Your problem_model was NOT shipped in full this cycle — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). It EXISTS; **this is not the first cycle.** Do NOT bootstrap a cold-start model from the sections above: when the Executor submits your output as a full replacement, a cold-start model would WIPE the real durable capabilities, gaps, and friction.
+
+Instead: run \`./fetch problem-model\` to retrieve the full current model, then EDIT it in place — refine intent, open/close gaps, upgrade capabilities, record friction — and submit the edited whole.`
+      : '';
   return `${p.contextPrefix}You own this project's direction. Not as a task runner, not as a scheduler — as the mind responsible for where it goes.
 
 Each cycle you look at what's happening and decide whether it's still on the right track. If it is, keep going. If it isn't, change course. You're allowed to be wrong; you're not allowed to defer. The problem_model below is your working understanding of the project — nothing else has more authority. Update it, defend it, rewrite it when you see a better shape. The user hired you for judgment, not for audit trails or incremental polish.
@@ -142,9 +170,7 @@ On **every** \`create-direction\` and \`update-direction\` call, emit a \`recomm
 
 ${p.selfImprovementBlock}
 
-# Bootstrap (when the problem_model is empty)
-
-Populate intent from: the existing vision field (if any), the conversation_thread (the user's own words), and rejected_proposals (they tell you what the user does NOT want). Populate capabilities from: what shipped work and active directions observably demonstrate the project does. Open initial gaps for: anything in conversation_thread the user explicitly asked for that isn't yet a capability; anything in the vision's stated direction not reflected in shipped work. Bootstrapped models are imperfect by design — subsequent cycles refine. Don't fail to populate because you're uncertain.
+${bootstrapOrRecoverSection}
 
 # Running update: what the user reads
 
@@ -223,7 +249,7 @@ Write the full refined running_update as markdown to \`/tmp/running_update_${p.t
 Only if something this cycle was hard in a way worth remembering. Fields: what_was_hard, missing_context, proposed_self_improvement. Empty is fine. Don't fill with platitudes.
 
 ## 6. Problem model (full replacement)
-Write the full updated problem_model as JSON to \`/tmp/problem_model_${p.taskId}.json\` (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). This is the entire model, not a delta — you're replacing the prior state with a new consistent one. The Executor reads this file verbatim; if it's missing the cycle fails loudly rather than fabricating.
+Write the full updated problem_model as JSON to \`/tmp/problem_model_${p.taskId}.json\` (use a code block in your analysis for auditability AND write the file — the file is the authoritative handoff to the Executor). This is the entire model, not a delta — you're replacing the prior state with a new consistent one. The Executor reads this file verbatim; if it's missing the cycle fails loudly rather than fabricating.${p.problemModelRecovery === 'fetch' ? `\n\n**Recovery caveat (your model was not shipped in full this cycle):** the "full replacement" you write MUST be the model you retrieved via \`./fetch problem-model\`, edited — NOT a cold-start bootstrap reconstructed from the sections above. Replacing from scratch wipes durable capabilities, gaps, and friction.` : ''}
 
 # Problem model shape (quick reference)
 

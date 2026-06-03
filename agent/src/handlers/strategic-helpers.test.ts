@@ -68,9 +68,21 @@ describe('writeStrategicHelpers', () => {
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
     expect(content).toContain(`PROJECT="${projectId}"`);
+    expect(content).toContain('problem-model');
     expect(content).toContain('direction');
     expect(content).toContain('playbook');
     expect(content).toContain('gap');
+  });
+
+  it('allows fetching the full problem model without an id', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap [id]');
+    expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
+    expect(content).toContain('fetch $KIND requires an id argument');
   });
 
   it('embeds taskId in design-doc script safely', () => {

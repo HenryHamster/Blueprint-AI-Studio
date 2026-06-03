@@ -2,6 +2,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Capture the prompt the handler hands to the thinker (analysis) pass.
 let capturedThinkerPrompt: string | undefined;
+// Capture the params the handler passes to buildThinkerPrompt so tests can
+// assert on derived values (problem_model recovery framing).
+let capturedThinkerParams: Record<string, unknown> | undefined;
 
 vi.mock('fs', () => ({
   default: {
@@ -56,7 +59,10 @@ vi.mock('./research-direction-context.js', () => ({
 
 vi.mock('../prompts/thinker.js', () => ({
   computeResearchPlanPromptFingerprint: () => 'fp',
-  buildThinkerPrompt: () => 'BASE_THINKER_PROMPT',
+  buildThinkerPrompt: (p: Record<string, unknown>) => {
+    capturedThinkerParams = p;
+    return 'BASE_THINKER_PROMPT';
+  },
   // Capture the rendered prompt, then short-circuit so the executor pass never runs.
   runThinkerWithGate: vi.fn((prompt: string) => {
     capturedThinkerPrompt = prompt;
@@ -102,6 +108,85 @@ describe('renderStrategicPromptSuffix', () => {
   it('returns empty string when prompt_suffix is absent', () => {
     expect(renderStrategicPromptSuffix({})).toBe('');
     expect(renderStrategicPromptSuffix({ prompt_suffix: '' })).toBe('');
+  });
+});
+
+describe('handleStrategic problem_model recovery framing', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('dropped-but-nonempty: packer dropped problem_model → steer to fetch, not bootstrap', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      // problem_model absent from payload (dropped under byte budget)
+      _packer_meta: {
+        dropped: [{ key: 'problem_model', reason: 'exceeds remaining budget even after summarize' }],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-d', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params).toBeDefined();
+    expect(params?.problemModelRecovery).toBe('fetch');
+    const section = String(params?.problemModelSection);
+    // Must NOT present this as a first cycle...
+    expect(section).not.toContain('this is the first cycle');
+    // ...and must steer to fetch-the-full-model-then-edit.
+    expect(section).toContain('./fetch problem-model');
+    expect(section).toContain('EXISTS but was not shipped in full');
+  });
+
+  it('trimmed/summarized: packer summarized problem_model → steer to fetch even with partial JSON', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: { intent: { purpose: 'partial' } },
+      _packer_meta: {
+        dropped: [],
+        trimmed: [{ key: 'problem_model', kind: 'summarized' }],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-t', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('fetch');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('./fetch problem-model');
+    expect(section).not.toContain('this is the first cycle');
+  });
+
+  it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      // no problem_model, no packer meta naming it
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-e', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('empty');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('this is the first cycle');
+    expect(section).not.toContain('./fetch problem-model');
+  });
+
+  it('present: full model shipped → present framing, no fetch steering', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      problem_model: { intent: { purpose: 'real' }, capabilities: [], gaps: [] },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-p', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const params = capturedThinkerParams;
+    expect(params?.problemModelRecovery).toBe('present');
+    const section = String(params?.problemModelSection);
+    expect(section).toContain('```json');
+    expect(section).not.toContain('this is the first cycle');
+    expect(section).not.toContain('EXISTS but was not shipped in full');
   });
 });
 

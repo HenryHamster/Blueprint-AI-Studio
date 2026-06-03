@@ -138,3 +138,20 @@ async def agent_fetch_gap(
                     "from_archive": archived_flag,
                 }
     raise HTTPException(status_code=404, detail="Gap not found")
+
+
+@router.get("/projects/{project_id}/problem-model")
+@limiter.limit("60/minute")
+async def agent_fetch_problem_model(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the full durable ``problem_model`` for the agent's project.
+
+    This bypasses the strategic-payload budget entirely so the agent can
+    reconstruct the whole current model when the packer trims or drops it.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+    return {"status": "success", "data": project.problem_model or {}}

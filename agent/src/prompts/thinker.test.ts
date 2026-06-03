@@ -45,6 +45,7 @@ describe('buildThinkerPrompt', () => {
     packerMetaSection: '',
     strategicContext: '',
     problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    problemModelRecovery: 'empty',
     reflectionSection: '## What you previously said was hard\n_(no prior)_',
     selfImprovementBlock: '',
     runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
@@ -123,11 +124,32 @@ describe('buildThinkerPrompt', () => {
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
     const prompt = buildThinkerPrompt({
       ...base,
+      problemModelRecovery: 'empty',
       problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
     });
     expect(prompt).toContain('_(empty — bootstrap)_');
     // Bootstrap guidance section should also be present
     expect(prompt).toContain('# Bootstrap (when the problem_model is empty)');
+    // ...and the fetch-then-edit recovery block must NOT appear on a true first cycle
+    expect(prompt).not.toContain('# Recover your durable model (fetch-then-edit)');
+  });
+
+  it('renders the fetch-then-edit recovery block (not bootstrap) when recovery is fetch', () => {
+    const prompt = buildThinkerPrompt({ ...base, problemModelRecovery: 'fetch' });
+    // Recovery wording present; bootstrap absent
+    expect(prompt).toContain('# Recover your durable model (fetch-then-edit)');
+    expect(prompt).toContain('./fetch problem-model');
+    expect(prompt).not.toContain('# Bootstrap (when the problem_model is empty)');
+    // Section 6 carries the recovery caveat so the full replacement is the
+    // fetched model edited, never a cold-start reconstruction.
+    expect(prompt).toContain('Recovery caveat');
+  });
+
+  it('renders neither bootstrap nor recovery block when the model is present', () => {
+    const prompt = buildThinkerPrompt({ ...base, problemModelRecovery: 'present' });
+    expect(prompt).not.toContain('# Bootstrap (when the problem_model is empty)');
+    expect(prompt).not.toContain('# Recover your durable model (fetch-then-edit)');
+    expect(prompt).not.toContain('Recovery caveat');
   });
 
   it('vision section rendered only when visionJson is non-empty', () => {
@@ -426,6 +448,7 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     packerMetaSection: '',
     strategicContext: '',
     problemModelSection: '## Your current understanding (problem_model)\n_(empty)_',
+    problemModelRecovery: 'empty',
     reflectionSection: '## What you previously said was hard\n_(no prior)_',
     selfImprovementBlock: '',
     runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
@@ -481,6 +504,7 @@ describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler co
     packerMetaSection: '',
     strategicContext: '',
     problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    problemModelRecovery: 'empty',
     reflectionSection: '## What you previously said was hard\n_(no prior)_',
     selfImprovementBlock: '',
     runningUpdateSection: '## Running update\n_(empty)_',
