@@ -294,6 +294,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     # Guard: autonomous must be enabled and the project must not be archived.
     # Archiving halts all of a project's work, including autonomous spawning.
+    # We deliberately do NOT post an operator deferral notice here: an operator
+    # steering a project whose autonomy is intentionally off (or which is
+    # archived) is steering an intentionally-paused project, so a "your steering
+    # is queued" notice would be misleading — the work is paused by design, not
+    # transiently deferred. The marker persists and is delivered if autonomy is
+    # re-enabled.
     if not project.autonomous_enabled or project.archived:
         return
 
@@ -310,6 +316,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     if not has_available:
         logger.info(
             f"[AUTONOMOUS] Skipping research for {project.name} — no available accounts"
+        )
+        # Operator steering must never be a silent swallow: if an operator-origin
+        # refresh marker is pending, tell them their steering is queued and why
+        # before bailing. The marker itself is left intact (we only return), so
+        # the steering is still delivered on a later tick once accounts recover.
+        await _maybe_notify_operator_refresh_deferred(
+            project, session, "paused while no model accounts are available"
         )
         return
     # Guard: circuit breaker must allow spawning
@@ -329,6 +342,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             logger.warning(
                 f"[CIRCUIT BREAKER] Skipping autonomous research spawn for project={project.id} "
                 f"— circuit breaker state=OPEN (still in cooldown)"
+            )
+            # A struggling project (breaker OPEN) is exactly when an operator is
+            # most likely to steer; never swallow that silently. Notify (once)
+            # that steering is queued while the breaker cools down. The marker is
+            # preserved — only the spawn returns — so steering still lands once
+            # the breaker clears.
+            await _maybe_notify_operator_refresh_deferred(
+                project, session, "paused while the research circuit breaker is open"
             )
             return  # Still in cooldown
     elif breaker["state"] == "HALF_OPEN":
@@ -353,6 +374,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     session,
                     f"HALF_OPEN test task stuck for 30m+ — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
                 )
+                # Re-opened breaker is still a circuit-breaker halt: surface the
+                # deferral to any pending operator steering (once). Marker is
+                # preserved. Placed after the breaker mutation/alert so the
+                # helper's commit also flushes the alert.
+                await _maybe_notify_operator_refresh_deferred(
+                    project,
+                    session,
+                    "paused while the research circuit breaker is open",
+                )
                 return  # Back to cooldown
             elif not test_task:
                 logger.warning(
@@ -366,6 +396,15 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     project.id,
                     session,
                     f"HALF_OPEN test task deleted/reaped — circuit breaker re-opened (cooldown: {breaker['cooldown_seconds']}s)",
+                )
+                # Re-opened breaker is still a circuit-breaker halt: surface the
+                # deferral to any pending operator steering (once). Marker is
+                # preserved. Placed after the breaker mutation/alert so the
+                # helper's commit also flushes the alert.
+                await _maybe_notify_operator_refresh_deferred(
+                    project,
+                    session,
+                    "paused while the research circuit breaker is open",
                 )
                 return  # Back to cooldown
     # Guard: must have active directions that aren't in cooldown or mid-cycle

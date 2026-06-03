@@ -999,6 +999,134 @@ class TestPreMergeDualHeadGuardCoverage:
         )
 
 
+# ── Operator message arming gate coverage (whole-package) ─────────────────
+
+
+class TestOperatorMessageArmingGateCoverage:
+    """Whole-package invariant: EVERY backend/app/ site that constructs an
+    operator-authored ProjectMessage (``from_type='user'``) must either route
+    its wake decision through the shared operator arming gate or be explicitly
+    exempted with a documented reason.
+
+    WHY: the live-chat endpoint and the project-scoped CLI endpoint were once
+    able to diverge on strategist wake behavior. This scan catches future
+    source-level message creation sites without executing any endpoint.
+
+    Modeled on the os.walk whole-package invariants in this module. The scan is
+    source-only (AST), function-scoped, and carries a tiny allowlist for the one
+    legitimate exception we have today.
+    """
+
+    _GATE_NAME = "maybe_arm_operator_refresh"
+    _MESSAGE_CLASS = "ProjectMessage"
+
+    # Allowlisted (file, function) sites that intentionally seed an operator
+    # message without a wake decision. The onboarding goal setter writes a
+    # passive NOTE before any strategic loop exists, so arming the strategist is
+    # unnecessary there.
+    _EXEMPT_SITES = {
+        (
+            "routers/admin_onboard.py",
+            "_seed_strategic_intent",
+        ): (
+            "seeds the onboarding goal as a passive NOTE before any strategic "
+            "loop exists; intentionally does not wake the strategist"
+        ),
+    }
+
+    def test_all_operator_message_sites_route_through_shared_gate(self):
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        gate_name = self._GATE_NAME
+        message_class = self._MESSAGE_CLASS
+
+        def _called_name(call: "ast.Call") -> str | None:
+            """Return the bare callee name for ``foo(...)`` or ``mod.foo(...)``."""
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id
+            if isinstance(func, ast.Attribute):
+                return func.attr
+            return None
+
+        def _references_gate(node) -> bool:
+            """True if the shared arming gate is referenced anywhere below node."""
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id == gate_name:
+                    return True
+                if isinstance(n, ast.Attribute) and n.attr == gate_name:
+                    return True
+            return False
+
+        def _is_operator_message_call(node: "ast.Call") -> bool:
+            """True for `ProjectMessage(..., from_type="user", ...)` calls."""
+            if _called_name(node) != message_class:
+                return False
+            for kw in node.keywords:
+                if (
+                    kw.arg == "from_type"
+                    and isinstance(kw.value, ast.Constant)
+                    and kw.value.value == "user"
+                ):
+                    return True
+            return False
+
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, app_dir)
+                with open(fpath, encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=fpath)
+
+                funcs = [
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    if not _is_operator_message_call(node):
+                        continue
+
+                    # Resolve the innermost enclosing function for an actionable
+                    # offender message and a function-scoped guard check.
+                    enclosing = None
+                    for fn in funcs:
+                        if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
+                            if enclosing is None or fn.lineno > enclosing.lineno:
+                                enclosing = fn
+                    func_name = enclosing.name if enclosing is not None else "<module>"
+
+                    if (rel, func_name) in self._EXEMPT_SITES:
+                        continue
+
+                    covered = enclosing is not None and _references_gate(enclosing)
+                    if not covered:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} in {func_name}() — operator "
+                            "ProjectMessage site not covered by the shared arming gate"
+                        )
+
+        assert not offenders, (
+            "Found operator-authored ProjectMessage site(s) under backend/app/ "
+            "that do NOT route their wake decision through the shared operator "
+            f"arming gate ({gate_name}, in app/strategic_trigger.py).\n"
+            "Fix each site by calling maybe_arm_operator_refresh(...) in the "
+            "enclosing function, OR — if the site is intentionally exempt — add "
+            "its (file, function) to "
+            "TestOperatorMessageArmingGateCoverage._EXEMPT_SITES with a documented "
+            "reason.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
 

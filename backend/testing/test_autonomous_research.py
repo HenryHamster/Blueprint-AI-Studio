@@ -11159,3 +11159,205 @@ async def test_post_merge_research_skips_paused_project(db_session, mocker):
     spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
     assert active.id in spawned_ids, "Non-paused project should spawn research"
     assert paused.id not in spawned_ids, "Paused project must be skipped"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator steering deferral at HALT early-returns (not just spawn-decision skips)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _deferred_steering_messages(msgs):
+    """Filter helper: system messages carrying the deferral event_type."""
+    return [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_deferred"
+    ]
+
+
+async def _system_messages(db_session, project_id):
+    return (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_on_circuit_breaker_open_posts_once(db_session):
+    """An operator steering marker pending while the research circuit breaker is
+    OPEN (still cooling down) must surface a one-time deferral notice — the breaker
+    halt early-returns BEFORE the strategic block, but operator steering must never
+    be a silent swallow. The marker must be preserved (only the spawn returns) so
+    the steering still lands once the breaker clears, and a second tick must stay
+    quiet via the notified flag."""
+    project = Project(
+        name="Operator deferred on CB open",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cbdef01")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Trip breaker — opened just now, 30-min cooldown has NOT elapsed.
+    _shared_state.circuit_breakers[str(project.id)] = {
+        "state": "OPEN",
+        "failure_count": 3,
+        "success_count": 0,
+        "opened_at": datetime.utcnow(),
+        "cooldown_seconds": 1800,
+        "base_cooldown": 1800,
+        "half_open_task_id": None,
+    }
+    try:
+        await _spawn_research_task(project, db_session)
+
+        # No task spawned — the breaker halt aborts before the strategic block.
+        tasks = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalars().all()
+        assert len(tasks) == 0, "No task spawned while circuit breaker OPEN"
+
+        # Marker preserved (steering not lost) and stamped notified.
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None, "operator marker must persist across the halt"
+        assert marker.get("notified") is True
+
+        steering = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering) == 1, "breaker-open halt must post exactly one notice"
+
+        # Second tick (still OPEN) must stay quiet — notified flag suppresses it.
+        await _spawn_research_task(project, db_session)
+        steering2 = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+    finally:
+        _shared_state.circuit_breakers.pop(str(project.id), None)
+
+
+@pytest.mark.asyncio
+async def test_operator_refresh_deferred_on_no_accounts_posts_once(
+    db_session, monkeypatch
+):
+    """An operator steering marker pending when the user has NO available model
+    accounts must surface a one-time deferral notice — the no-accounts guard is the
+    earliest halt early-return, well before the strategic block. Marker preserved,
+    second tick quiet."""
+    project = Project(
+        name="Operator deferred on no accounts",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-nodef01")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Empty the user's account pool and clear the env fallback so has_available
+    # is False (mirrors the no-accounts halt). The autouse fixture seeds an
+    # account; drop it for the duration of this test.
+    uid = "test-user-123"
+    saved_pool = list(_max_plan_pools.get(uid, []))
+    _max_plan_pools[uid] = []
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    try:
+        await _spawn_research_task(project, db_session)
+
+        tasks = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalars().all()
+        assert len(tasks) == 0, "No task spawned when no accounts available"
+
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker is not None, "operator marker must persist across the halt"
+        assert marker.get("notified") is True
+
+        steering = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering) == 1, "no-accounts halt must post exactly one notice"
+
+        # Second tick (still no accounts) must stay quiet.
+        await _spawn_research_task(project, db_session)
+        steering2 = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering2) == 1, "deferral notice must not re-emit every tick"
+    finally:
+        _max_plan_pools[uid] = saved_pool
+
+
+@pytest.mark.asyncio
+async def test_qualification_refresh_on_circuit_breaker_open_stays_silent(db_session):
+    """A QUALIFICATION-origin refresh marker pending while the breaker is OPEN must
+    NOT post an operator-facing notice — the deferral visibility is reserved for
+    operator intent (automated refreshes park silently)."""
+    project = Project(
+        name="Qualification silent on CB open",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-cbqual1")],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification",
+                "count": 1,
+                "origin": "qualification",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _shared_state.circuit_breakers[str(project.id)] = {
+        "state": "OPEN",
+        "failure_count": 3,
+        "success_count": 0,
+        "opened_at": datetime.utcnow(),
+        "cooldown_seconds": 1800,
+        "base_cooldown": 1800,
+        "half_open_task_id": None,
+    }
+    try:
+        await _spawn_research_task(project, db_session)
+
+        steering = _deferred_steering_messages(
+            await _system_messages(db_session, project.id)
+        )
+        assert len(steering) == 0, "qualification-origin marker must stay silent"
+    finally:
+        _shared_state.circuit_breakers.pop(str(project.id), None)
