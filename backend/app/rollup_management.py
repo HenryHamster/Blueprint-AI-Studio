@@ -11,6 +11,7 @@ and preserve test-patchability.
 
 # fmt: off
 import logging
+import time
 from datetime import timedelta
 
 from fastapi import HTTPException
@@ -72,6 +73,20 @@ from app.shared_state import (
 from app.task_locking import with_directions_locked
 
 logger = logging.getLogger(__name__)
+
+# Duplicate-create guard: when a rollup parent is about to POST its rollup PR it
+# stakes a ``rollup_pr_creating_at`` claim (epoch seconds) in parent.context
+# UNDER the parent lock, BEFORE releasing it around the slow create_pull_request
+# call. A concurrent _check_and_trigger_rollup invocation (sibling children
+# completing together, reaper + completion event both firing) that observes a
+# FRESH claim and no ``rollup_pr_number`` marker defers instead of POSTing a
+# second PR — GitHub enforces one-open-PR-per-(head, base) only best-effort, so
+# two near-simultaneous POSTs can both return 201 (incident #7350/#7351). A
+# claim older than this TTL is treated as stale (peer crashed mid-create) and
+# ignored so creation is never wedged. Paired with the idempotent pre-check in
+# github_pulls.create_pull_request, which catches any duplicate that still slips
+# through GitHub's non-atomic enforcement.
+_ROLLUP_PR_CREATE_CLAIM_TTL_S = 300
 
 
 async def _classify_merged_rollup_landing(
@@ -1409,6 +1424,26 @@ async def _check_and_trigger_rollup(
 
                 # Resume from prior crash — skip PR creation if already done
                 existing_pr = parent_ctx.get("rollup_pr_number")
+                # ── Duplicate-create guard ──
+                # No PR marker yet, but a peer invocation may be mid-create: it
+                # stakes ``rollup_pr_creating_at`` under the lock just before the
+                # release-window around create_pull_request below. Observing a
+                # FRESH claim here means a concurrent worker is already POSTing the
+                # rollup PR, so defer rather than POST a duplicate (GitHub's
+                # one-open-PR rule is best-effort — incident #7350/#7351). A stale
+                # claim (peer crashed mid-create) past the TTL falls through and we
+                # re-create.
+                if not existing_pr:
+                    _claim_ts = parent_ctx.get("rollup_pr_creating_at")
+                    if isinstance(_claim_ts, (int, float)) and (
+                        time.time() - _claim_ts
+                    ) < _ROLLUP_PR_CREATE_CLAIM_TTL_S:
+                        logger.info(
+                            f"[ROLLUP] Parent {parent_id_local} rollup PR creation "
+                            f"already in progress (claim {time.time() - _claim_ts:.0f}s "
+                            f"old) — deferring to avoid a duplicate PR"
+                        )
+                        return
                 if existing_pr:
                     # ── Phase B3: release lock around get_pull_request ──
                     pre_existing_pr_snapshot = await _release_parent_lock(
@@ -1576,7 +1611,21 @@ async def _check_and_trigger_rollup(
                     # MUST validate and persist before any other writer can
                     # observe an empty marker.
                     project_id_str = str(parent.project_id)
-                    pre_create_snapshot = await _release_parent_lock(parent, session)
+                    # Stake a creation claim UNDER the lock before releasing it
+                    # around the slow create_pull_request call below. A concurrent
+                    # invocation that grabs the lock during the create window will
+                    # observe this claim (the guard near ``existing_pr`` above) and
+                    # defer instead of POSTing a duplicate rollup PR (#7350/#7351).
+                    # context_dirty=True forces the JSONB write so the claim is
+                    # actually persisted before the lock is released.
+                    parent.context = {
+                        **parent_ctx,
+                        "rollup_pr_creating_at": time.time(),
+                    }
+                    parent_ctx = parent.context
+                    pre_create_snapshot = await _release_parent_lock(
+                        parent, session, context_dirty=True
+                    )
 
                     pr_result = await create_pull_request(
                         gh_token,
@@ -1645,9 +1694,14 @@ async def _check_and_trigger_rollup(
                     )
 
                     # Commit marker immediately — if we crash after this point,
-                    # restart will find the marker and skip PR creation
+                    # restart will find the marker and skip PR creation. Drop the
+                    # creation claim now that the durable marker supersedes it.
                     parent.context = {
-                        **parent_ctx,
+                        **{
+                            k: v
+                            for k, v in parent_ctx.items()
+                            if k != "rollup_pr_creating_at"
+                        },
                         "rollup_pr_number": rollup_pr_number,
                         "rollup_pr_url": rollup_pr_url,
                     }
@@ -3102,9 +3156,16 @@ async def _check_and_trigger_rollup(
                 if is_transient and rollup_retries <= (
                     max_rollup := _runtime_config.get("max_rollup_retries", 5)
                 ):
-                    # Transient GitHub error — leave parent EVALUATING, retry next cycle
+                    # Transient GitHub error — leave parent EVALUATING, retry next
+                    # cycle. Drop our own creation claim so the retry isn't blocked
+                    # by it; create_pull_request's idempotent pre-check catches any
+                    # PR that a lost-response POST actually created.
                     parent.context = {
-                        **(parent.context or {}),
+                        **{
+                            k: v
+                            for k, v in (parent.context or {}).items()
+                            if k != "rollup_pr_creating_at"
+                        },
                         "_rollup_retries": rollup_retries,
                     }
                     parent.latest_status_message = f"Rollup PR creation failed (attempt {rollup_retries}/{max_rollup}), will retry: {type(e).__name__}"

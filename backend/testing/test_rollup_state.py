@@ -18,9 +18,11 @@ class TestClearRollupTransientState:
     def test_empty_returns_empty_dict(self):
         assert _clear_rollup_transient_state({}) == {}
 
-    def test_strips_all_ten_transient_keys(self):
+    def test_strips_all_eleven_transient_keys(self):
         ctx = dict.fromkeys(_ROLLUP_TRANSIENT_CTX_KEYS, "v")
-        assert len(ctx) == 10
+        assert len(ctx) == 11
+        # The duplicate-create guard claim is a per-cycle transient too.
+        assert "rollup_pr_creating_at" in _ROLLUP_TRANSIENT_CTX_KEYS
         assert _clear_rollup_transient_state(ctx) == {}
 
     def test_preserves_non_transient_keys(self):

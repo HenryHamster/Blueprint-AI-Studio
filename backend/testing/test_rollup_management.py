@@ -791,6 +791,170 @@ async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
     assert "rollup_pr_url" not in ctx
 
 
+# ── Duplicate-create guard (rollup_pr_creating_at claim) ──────────────────────
+# Two concurrent _check_and_trigger_rollup invocations (sibling children
+# completing together, reaper + completion event both firing) raced in the
+# lock-released window around create_pull_request and both POSTed, leaving a
+# duplicate rollup PR (incident #7350/#7351). The fix stakes a
+# `rollup_pr_creating_at` claim under the lock before the create window; a peer
+# that sees a fresh claim defers. These tests lock the behavior in.
+
+
+def _mock_rollup_create_path(mocker, *, create_return=None):
+    """Mock deps so a rollup parent with NO existing PR reaches the PR-creation
+    branch. ``create_pull_request`` is mocked so a (would-be duplicate) POST is
+    observable via the returned mock."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+    return mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value=create_return
+        or {"number": 5555, "html_url": "https://x/pull/5555"},
+    )
+
+
+async def _make_rollup_parent_no_pr(session, project_id, *, extra_context=None):
+    """Rollup parent in EVALUATING with NO rollup_pr_number — the first-time
+    create path (mirrors _make_rollup_parent_with_pr minus the PR marker)."""
+    ctx = {
+        "research_branch": "research/dup-stg",
+        "parent_base": "research/dup-base",
+    }
+    if extra_context:
+        ctx.update(extra_context)
+    return await _make_task(
+        session,
+        project_id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context=ctx,
+        plan_output="some plan",
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_defers_when_peer_is_creating_pr(cleanup_db, mocker):
+    """A FRESH rollup_pr_creating_at claim means a peer invocation is mid-create:
+    a concurrent _check_and_trigger_rollup must DEFER instead of POSTing a
+    duplicate rollup PR (#7350/#7351). The claim is preserved for the peer."""
+    import time as _time
+
+    mock_create = _mock_rollup_create_path(mocker)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(
+        cleanup_db,
+        project.id,
+        extra_context={"rollup_pr_creating_at": _time.time()},
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    # Claim preserved so the peer that staked it still owns the create.
+    assert (parent.context or {}).get("rollup_pr_creating_at") is not None
+
+
+@pytest.mark.asyncio
+async def test_rollup_creates_when_claim_is_stale(cleanup_db, mocker):
+    """A STALE claim (peer crashed mid-create, past the TTL) must NOT wedge
+    creation — the rollup proceeds to create the PR, and the stale claim is
+    scrubbed on the terminal transition."""
+    import time as _time
+    from app.rollup_management import _ROLLUP_PR_CREATE_CLAIM_TTL_S
+
+    # Empty-diff create result → COMPLETED via a short terminal path.
+    mock_create = _mock_rollup_create_path(
+        mocker,
+        create_return={"empty_diff": True, "merged": True, "html_url": "", "number": 0},
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "rollup_pr_creating_at": _time.time() - _ROLLUP_PR_CREATE_CLAIM_TTL_S - 10
+        },
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert "rollup_pr_creating_at" not in (parent.context or {}), (
+        "stale claim must be scrubbed on the terminal transition"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_create_clears_claim_on_marker_commit(cleanup_db, mocker):
+    """On a successful create the durable rollup_pr_number marker supersedes the
+    transient claim — `rollup_pr_creating_at` must be dropped when the marker is
+    persisted (it must never outlive the create). The parent starts with NO claim
+    (a fresh claim would trip the defer guard); the create path stakes the claim
+    internally, then the marker commit must drop it."""
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    # Full create→auto-merge path; get_pull_request as a constant so the create
+    # path's call count (no resume-time fetch) doesn't desync a side_effect list.
+    mock_merge, _ = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 10, "deletions": 5, "merged": False, "state": "open"},
+    )
+    mock_create = mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={"number": 6001, "html_url": "https://x/pull/6001"},
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_awaited_once()
+    mock_merge.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    ctx = parent.context or {}
+    assert ctx.get("rollup_pr_number") == 6001
+    assert "rollup_pr_creating_at" not in ctx, (
+        "the creation claim must be dropped once the durable marker lands"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Merge-boundary promotion-target safety (branch-resolver PR)
 #
@@ -818,7 +982,7 @@ async def _make_distinct_branch_project(session):
 async def test_rollup_targeting_promotion_target_is_held_not_merged(cleanup_db, mocker):
     """A completed rollup whose target == promotion (distinct from integration)
     is HELD for approval instead of merged."""
-    mock_merge, mock_spawn = _mock_automerge_deps(
+    mock_merge, _ = _mock_automerge_deps(
         mocker, pr_files=_files("backend/app/models.py"), diff=""
     )
 

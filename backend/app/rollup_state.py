@@ -23,6 +23,12 @@ _ROLLUP_TRANSIENT_CTX_KEYS = frozenset(
         "_refetch_failure_count",
         "_behind_update_retries",
         "_rollup_retries",
+        # Duplicate-create guard: a per-cycle stake (epoch seconds) that a peer
+        # invocation is mid-create of the rollup PR. It must never outlive the
+        # cycle — a stale claim would block the next rollup attempt until its
+        # TTL expires. Scrub it on every terminal transition. See
+        # rollup_management._ROLLUP_PR_CREATE_CLAIM_TTL_S.
+        "rollup_pr_creating_at",
     }
 )
 
