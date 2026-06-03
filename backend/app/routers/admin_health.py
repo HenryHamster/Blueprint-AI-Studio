@@ -219,19 +219,32 @@ async def _compute_health_overview(
     }
 
     # --- 2. Active tasks for stuck-task detection and queue depth ---
-    active_statuses = [
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-    ]
-    active_filters = [Task.status.in_(active_statuses), Task.archived.is_(False)]
+    active_filters = [Task.archived.is_(False)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
     _ACTIVE_TASKS_LIMIT = 5000
-    active_result = await session.execute(
+
+    # The active-tasks scan is split by status to avoid two failure modes at once:
+    #
+    #   1. MissingGreenlet (the /api/admin/health-overview 500 cluster, 2026-06-03):
+    #      _build_stuck_tasks — and the reaper's _heartbeat_stale_cutoff it calls —
+    #      read vm_provisioned_at, attempt_count, latest_status_message, and the
+    #      heavy JSONB columns context / payloads / status_log. A load_only() that
+    #      omits any of them makes the first access lazy-load via sync IO under
+    #      async → sqlalchemy.exc.MissingGreenlet → 500.
+    #   2. OOM (this endpoint has a history of it): those JSONB columns can be
+    #      large and the QUEUED backlog can be deep (the pipeline fans out wide).
+    #      Loading context/payloads/status_log for up to _ACTIVE_TASKS_LIMIT QUEUED
+    #      rows is exactly the wrong direction.
+    #
+    # QUEUED tasks only ever hit the cheap-column branch of _build_stuck_tasks
+    # (status/created_at/depends_on), so load only scalar columns for them — this
+    # is the set that can be large. The heavy-column branches run exclusively for
+    # PROVISIONING / IN_PROGRESS / EVALUATING tasks, which are bounded by fleet
+    # capacity, so load those in full and the diagnostic reads stay in-memory.
+    queued_result = await session.execute(
         select(Task)
-        .where(*active_filters)
+        .where(*active_filters, Task.status == TaskStatus.QUEUED)
         .options(
             load_only(
                 Task.id,
@@ -247,8 +260,27 @@ async def _compute_health_overview(
         )
         .limit(_ACTIVE_TASKS_LIMIT)
     )
-    active_tasks = active_result.scalars().all()
-    if len(active_tasks) >= _ACTIVE_TASKS_LIMIT:
+    queued_tasks = list(queued_result.scalars().all())
+    nonqueued_result = await session.execute(
+        select(Task)
+        .where(
+            *active_filters,
+            Task.status.in_(
+                [
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]
+            ),
+        )
+        .limit(_ACTIVE_TASKS_LIMIT)
+    )
+    nonqueued_tasks = list(nonqueued_result.scalars().all())
+    active_tasks = queued_tasks + nonqueued_tasks
+    if (
+        len(queued_tasks) >= _ACTIVE_TASKS_LIMIT
+        or len(nonqueued_tasks) >= _ACTIVE_TASKS_LIMIT
+    ):
         logger.warning(
             "[HEALTH-OVERVIEW] active-tasks scan hit cap=%d rows — "
             "stuck-task diagnostics and queue-depth counts are truncated; "

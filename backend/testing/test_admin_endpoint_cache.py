@@ -64,6 +64,85 @@ async def test_health_overview_caches_repeated_calls_within_ttl(
 
 
 @pytest.mark.asyncio
+async def test_health_overview_stuck_tasks_no_missing_greenlet(client, db_session):
+    """Regression: the REAL _compute_health_overview must not raise MissingGreenlet
+    on active tasks whose stuck-task diagnostics read columns the active-tasks scan
+    used to defer via load_only.
+
+    Prod 2026-06-03: `/api/admin/health-overview` 500'd (MissingGreenlet) because
+    the active-tasks query load_only()'d a column subset, but _build_stuck_tasks
+    (and the reaper's _heartbeat_stale_cutoff it calls) read vm_provisioned_at,
+    context, payloads, and status_log — the first deferred access lazy-loaded via
+    sync IO under async. The heavy-column branches run for PROVISIONING /
+    IN_PROGRESS / EVALUATING tasks, so seed one of each. Not mocked — the whole
+    point is to exercise the real query + attribute reads.
+    """
+    from datetime import timedelta
+
+    from app.models import Project, Task, TaskStatus, _utcnow
+
+    fresh_cache = DigestCache(default_ttl=60.0)
+    app.dependency_overrides[get_digest_cache] = lambda: fresh_cache
+
+    proj = Project(name="Health OV Stuck", user_id="health-ov-user")
+    db_session.add(proj)
+    await db_session.commit()
+    await db_session.refresh(proj)
+
+    now = _utcnow()
+    db_session.add_all(
+        [
+            # provision_timeout branch → reads vm_provisioned_at + context
+            Task(
+                project_id=proj.id,
+                status=TaskStatus.PROVISIONING,
+                vm_provisioned_at=now - timedelta(hours=2),
+                last_heartbeat=None,
+                payloads=[{"type": "research"}],
+                context={"provision_zone": "us-central1-a"},
+            ),
+            # no_heartbeat branch → _heartbeat_stale_cutoff reads context + payloads
+            Task(
+                project_id=proj.id,
+                status=TaskStatus.IN_PROGRESS,
+                last_heartbeat=now - timedelta(hours=2),
+                payloads=[{"type": "research", "scope": "small"}],
+                context={},
+            ),
+            # evaluation_timeout branch → reads context + status_log
+            Task(
+                project_id=proj.id,
+                status=TaskStatus.EVALUATING,
+                started_at=now - timedelta(hours=6),
+                payloads=[{"type": "research"}],
+                context={},
+            ),
+        ]
+    )
+    await db_session.commit()
+    # Drop the just-created instances from the identity map so the request's
+    # active-tasks query reloads them fresh — otherwise the in-memory objects
+    # already have every column populated and the deferred-load path is skipped.
+    db_session.expire_all()
+
+    try:
+        resp = await client.get("/api/admin/health-overview")
+    finally:
+        app.dependency_overrides.pop(get_digest_cache, None)
+
+    assert resp.status_code == 200, (
+        f"health-overview must not 500 on stuck active tasks (MissingGreenlet "
+        f"from deferred columns); got {resp.status_code}: {resp.text}"
+    )
+    # The PROVISIONING task is well past the provision timeout → it should surface
+    # as an actionable issue, proving the heavy-column branch actually ran.
+    issues = resp.json().get("actionable_issues", [])
+    assert any(
+        i.get("category") == "stuck_tasks" for i in issues
+    ), f"expected a stuck-task issue to be reported; got {issues}"
+
+
+@pytest.mark.asyncio
 async def test_health_overview_recomputes_after_ttl(
     client: AsyncClient, db_session, mocker
 ):
