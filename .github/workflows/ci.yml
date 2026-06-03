@@ -275,12 +275,20 @@ jobs:
             exit 0
           fi
           echo "deps image missing — building --target deps and pushing $IMG:$REQHASH"
-          # python:3.11-slim base pull can hit a Docker Hub blip; retry it (mirrors
-          # the postgres/playwright retries elsewhere).
-          for i in 1 2 3; do
-            docker pull python:3.11-slim && break
-            echo "::warning::python:3.11-slim pull failed (attempt $i/3) — retrying"
-            sleep $((i * 10))
+          # python:3.11-slim base pull can hit a Docker Hub connectivity blip;
+          # retry, then fall back to Google's Docker Hub mirror and retag so the
+          # FROM in ./backend/Dockerfile resolves the image locally (no re-pull).
+          ok=
+          for src in python:3.11-slim mirror.gcr.io/library/python:3.11-slim; do
+            for i in 1 2 3; do
+              docker pull "$src" && { ok=1; break; }
+              echo "::warning::$src pull failed (attempt $i/3) — retrying"
+              sleep $((i * 10))
+            done
+            if [ -n "$ok" ]; then
+              [ "$src" = python:3.11-slim ] || docker tag "$src" python:3.11-slim
+              break
+            fi
           done
           docker build --target deps -t "$IMG:$REQHASH" ./backend \
             || { echo "::warning::deps build failed — shards will build locally and surface the error"; exit 0; }
@@ -333,13 +341,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start PostgreSQL (pull with retry)
+      - name: Start PostgreSQL (pull with retry + mirror fallback)
         run: |
-          for i in 1 2 3 4 5; do
-            docker pull postgres:15 && break
-            echo "::warning::postgres:15 pull failed (attempt $i/5) — backing off"
-            sleep $((i * 10))
+          # registry-1.docker.io (Docker Hub) intermittently times out from GH
+          # runners ("context deadline exceeded" on the /v2/ handshake) — a
+          # connectivity blip, not a rate limit. When it outlasts the retry
+          # window the shard hard-fails (exit 125: the loop falls through and
+          # docker run re-pulls and dies). mirror.gcr.io is Google's public
+          # pull-through cache of Docker Hub's library images; it rides a
+          # different network path, so we fall back to it and retag to
+          # postgres:15 (docker run below is then unchanged).
+          ok=
+          for src in postgres:15 mirror.gcr.io/library/postgres:15; do
+            for i in 1 2 3; do
+              docker pull "$src" && { ok=1; break; }
+              echo "::warning::$src pull failed (attempt $i/3) — backing off"
+              sleep $((i * 10))
+            done
+            if [ -n "$ok" ]; then
+              [ "$src" = postgres:15 ] || docker tag "$src" postgres:15
+              break
+            fi
           done
+          if [ -z "$ok" ]; then
+            echo "::error::could not pull postgres:15 from Docker Hub or mirror.gcr.io"
+            exit 1
+          fi
           docker run -d --name postgres --network host \
             -e POSTGRES_USER=test \
             -e POSTGRES_PASSWORD=test \
@@ -373,10 +400,17 @@ jobs:
             echo "image=$IMG:$REQHASH" >> "$GITHUB_OUTPUT"
           else
             echo "::warning::deps image unavailable — building --target deps locally"
-            for i in 1 2 3; do
-              docker pull python:3.11-slim && break
-              echo "::warning::python:3.11-slim pull failed (attempt $i/3) — retrying"
-              sleep $((i * 10))
+            ok=
+            for src in python:3.11-slim mirror.gcr.io/library/python:3.11-slim; do
+              for i in 1 2 3; do
+                docker pull "$src" && { ok=1; break; }
+                echo "::warning::$src pull failed (attempt $i/3) — retrying"
+                sleep $((i * 10))
+              done
+              if [ -n "$ok" ]; then
+                [ "$src" = python:3.11-slim ] || docker tag "$src" python:3.11-slim
+                break
+              fi
             done
             docker build --target deps -t "backend-test-deps:${REQHASH:-local}" ./backend
             echo "image=backend-test-deps:${REQHASH:-local}" >> "$GITHUB_OUTPUT"
