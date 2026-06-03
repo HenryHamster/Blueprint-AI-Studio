@@ -818,12 +818,38 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 )
             ).scalar() or 0
             if recent_strategic > 0:
-                logger.info(
-                    f"[STRATEGIC] Skipping strategic spawn — {recent_strategic} strategic "
-                    f"task(s) created in last {cooldown_minutes}min for project {project.id} "
-                    f"(force_strategic={force_strategic}); falling through to tactical"
+                # A pending strategic-refresh marker (set by a resolved
+                # qualification verdict that couldn't spawn while a cycle was
+                # active) is a LEGITIMATE reason to bypass this anti-spam
+                # cooldown — distinct from the cancel/fail loop the cooldown
+                # guards against. Gated by the _strategic_failures breaker (< 3)
+                # and a min-interval floor, so a broken request that keeps
+                # failing stops bypassing instead of looping.
+                from app.strategic_trigger import strategic_refresh_due
+
+                _refresh_min_interval = _runtime_config.get(
+                    "strategic_refresh_min_interval_seconds", 120
                 )
-                is_strategic = False
+                _refresh_due = strategic_failures < 3 and strategic_refresh_due(
+                    project.vision, now, min_interval_seconds=_refresh_min_interval
+                )
+                if _refresh_due:
+                    logger.info(
+                        "[STRATEGIC] bypassing %dmin spawn-cooldown for project %s "
+                        "— a strategic-refresh is pending (%s)",
+                        cooldown_minutes,
+                        project.id,
+                        (project.vision or {}).get("_strategic_refresh", {}).get(
+                            "reason"
+                        ),
+                    )
+                else:
+                    logger.info(
+                        f"[STRATEGIC] Skipping strategic spawn — {recent_strategic} strategic "
+                        f"task(s) created in last {cooldown_minutes}min for project {project.id} "
+                        f"(force_strategic={force_strategic}); falling through to tactical"
+                    )
+                    is_strategic = False
 
     if is_strategic:
         # Determine if this strategic cycle should also include architecture review.
@@ -926,6 +952,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # stall investigation keep flagging a bloat condition that has
                 # already recovered.
                 vision.pop("_strategic_payload_bloat_skip", None)
+                # Consume any pending strategic-refresh marker — this spawn
+                # satisfies the owed refresh (and stamps the fire time so the
+                # min-interval floor measures refresh-driven fires).
+                from app.strategic_trigger import clear_strategic_refresh
+
+                clear_strategic_refresh(vision, now)
 
             await with_vision_locked(session, project.id, _record_strategic_spawn)
             # 2026-05-03: commit BEFORE the tactical-research early-returns

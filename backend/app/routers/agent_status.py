@@ -959,6 +959,27 @@ async def update_agent_status(
                 session.add(task)
                 await session.commit()
                 return result
+            except PostCommitLocked:
+                # Pure row contention: a peer (the post-commit sweep at
+                # recovery_sweeps.py:2095, or another instance's retry) holds
+                # the task row and is running this same post-commit. The
+                # write-ahead marker is still set (that's why we entered this
+                # branch), so that peer — or the sweep — owns the retry.
+                # PostCommitLocked is documented (task_lifecycle.py:149) as a
+                # "retryable pending, not an error": surfacing it as a 5xx makes
+                # Cloud Run flag a ContainerError and quarantine the instance,
+                # exactly the failure mode the row-lock guard above (line ~891)
+                # converts to a 429 for. Leave post_commit_pending set and
+                # return a clean retry-pending instead of re-raising → 500.
+                logger.info(
+                    f"[PIPELINE] Post-commit retry for terminal task "
+                    f"{_task_id_str} hit row contention (held by peer); "
+                    f"leaving post_commit_pending set for sweep",
+                )
+                return {
+                    "status": "post_commit_retry_pending",
+                    "task_id": _task_id_str,
+                }
             except PostCommitFinalCommitFailed as e:
                 # C1: the retry re-ran post-commit but its FINAL commit failed
                 # again — the deferred side effects are still unpersisted. Do
@@ -3150,7 +3171,15 @@ async def update_agent_status(
             # persist itself also failed (then there is no retry record and we
             # must surface the failure so the agent's retry re-runs post-commit
             # via the idempotency guard, which re-arms the marker).
-            if is_final_commit and _persist_err is None:
+            #
+            # A row-contention lock (PostCommitLocked) is the same shape: the
+            # marker is now persisted so the sweep owns the retry, and
+            # PostCommitLocked is documented (task_lifecycle.py:149) as a
+            # "retryable pending, not an error". Re-raising it would surface a
+            # 5xx → Cloud Run ContainerError for what is benign contention with a
+            # peer post-commit driver, exactly the case the row-lock guard above
+            # converts to a 429. So treat it like the final-commit case.
+            if (is_final_commit or is_locked) and _persist_err is None:
                 return {
                     "status": "post_commit_retry_pending",
                     "task_id": str(task.id),

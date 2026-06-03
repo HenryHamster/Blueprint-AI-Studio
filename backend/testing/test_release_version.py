@@ -612,6 +612,17 @@ def test_qual_state_promoted():
     assert state["state"] == "promoted"
 
 
+def test_qual_state_deferred_unsynced():
+    """The qualify-on-synced gate's deferral renders as an explicit, no-action
+    sub-state (not the bare forward-compat fallback)."""
+    state = rv.summarize_qualification_state(
+        {"status": "deferred_unsynced", "candidate_sha": "abc"}
+    )
+    assert state["state"] == "deferred_unsynced"
+    assert "deferred" in state["summary"].lower()
+    assert "auto-retries" in state["summary"].lower()
+
+
 def test_qual_state_unknown_status_passes_through():
     """Forward-compat: an unrecognized status is echoed, never crashes."""
     state = rv.summarize_qualification_state({"status": "some_new_status"})

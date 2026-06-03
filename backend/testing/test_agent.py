@@ -6931,6 +6931,70 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(
 
 
 @pytest.mark.asyncio
+async def test_post_commit_lock_on_retry_returns_pending_not_500(
+    client: AsyncClient, db_session, mocker
+):
+    """A PostCommitLocked during the terminal-task post-commit RETRY path is pure
+    row contention (the sweep or a peer instance holds the row and is running the
+    same post-commit). It must NOT surface as a 500 — Cloud Run classifies any 5xx
+    as a ContainerError and quarantines the instance. The endpoint must return a
+    clean 200 ``post_commit_retry_pending`` and leave ``post_commit_pending`` set
+    so the sweep keeps ownership of the deferred work.
+
+    Regression guard for the root cause of the ``[3x] task_lifecycle.py:465 ->
+    [2x] ContainerError`` orchestrator errors: PostCommitLocked is documented as
+    a "retryable pending, not an error" but the retry path re-raised it as 500.
+    """
+    from app.task_lifecycle import PostCommitLocked
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    pc = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        side_effect=PostCommitLocked("task held by peer after 3 retries"),
+    )
+
+    project = Project(name="PostCommit Lock Test", user_id="test-user-pc-lock")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Terminal task with the write-ahead marker already set: this is exactly the
+    # state the agent's HTTP retry hits when the original post-commit deferred its
+    # side effects to the sweep.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-pc-lock",
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pc-lock")
+    headers = {"x-agent-token": token}
+    payload = {"task_id": str(task.id), "status": "COMPLETED"}
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+
+    assert resp.status_code == 200, (
+        f"row contention must not 500 (Cloud Run flags 5xx as ContainerError); "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    assert resp.json().get("status") == "post_commit_retry_pending"
+    pc.assert_awaited()  # the retry path actually attempted post-commit
+
+    # The marker must remain set so _sweep_post_commit_pending still owns the retry.
+    await db_session.refresh(task)
+    assert task.post_commit_pending is True, (
+        "post_commit_pending must stay set on contention — the sweep owns the retry"
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "requested_model", ["gemini-3.1-pro-preview", "gemini-3-pro-preview"]
 )

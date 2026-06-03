@@ -4,7 +4,13 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
   plugins: [react()],
   test: {
-    environment: 'jsdom',
+    // happy-dom instead of jsdom: jsdom's per-file environment instantiation
+    // dominated the unit-suite wall-clock on CI's 2-core runners (~60s of the
+    // step was pure `environment` setup). happy-dom is Vitest's first-class
+    // alternative and sets up far faster; the suite uses no layout/CSS (that's
+    // the separate browser-mode viewport suite), so the no-layout DOM is
+    // equivalent for these tests.
+    environment: 'happy-dom',
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'eslint-rules/**/*.test.{js,ts}'],

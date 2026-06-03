@@ -104,10 +104,13 @@ export function ProjectApprovalGateSection({ data, canSave, onSave }: ProjectApp
   const [critical, setCritical] = useState<string[]>(data?.approval_gate_config.critical_files ?? []);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Collapsed until the operator opts in; auto-expands below when files exist.
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     setInfra(data?.approval_gate_config.infra_files ?? []);
     setCritical(data?.approval_gate_config.critical_files ?? []);
+    setExpanded(false);
   }, [data]);
 
   const setters: Record<keyof ApprovalGateConfig, (next: string[]) => void> = {
@@ -143,25 +146,45 @@ export function ProjectApprovalGateSection({ data, canSave, onSave }: ProjectApp
     }
   };
 
+  const isEmpty = infra.length === 0 && critical.length === 0;
+
+  // Empty / onboarding is a first-class, accepted state — a freshly onboarded
+  // repo legitimately has no approval-gate files yet. Collapse to a single line
+  // plus an opt-in button so it doesn't dominate the settings panel; expand only
+  // when the project already has files or the operator chooses to add some.
+  if (isEmpty && !expanded) {
+    return (
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="min-w-0">
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider">
+            Approval-Gate Files
+            <span className="ml-2 text-[10px] font-normal normal-case tracking-normal text-neutral-600">optional · none set</span>
+          </h3>
+          <p className="text-[11px] text-neutral-600 mt-0.5">
+            PRs touching configured paths require human approval — add some when you onboard a repo.
+          </p>
+        </div>
+        {canSave && (
+          <button
+            onClick={() => setExpanded(true)}
+            className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg px-4 py-2 text-xs transition-colors shrink-0"
+          >
+            + Add files
+          </button>
+        )}
+      </div>
+    );
+  }
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div>
-        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Approval-Gate Files</h3>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-2">Approval-Gate Files</h3>
         <p className="text-[11px] text-neutral-600 mb-3">
-          When a PR touches one of these repo-relative paths, the reviewer escalates effort and the merge requires human approval.
-          A freshly onboarded repo starts empty — configuring these is a real onboarding step. Changes take effect for agents immediately.
+          PRs touching these repo-relative paths require human approval to merge. Empty is fine — changes take effect immediately.
         </p>
 
-        <div className="flex items-center gap-2 mb-4">
-          <span className="text-xs text-neutral-400 shrink-0">Status</span>
-          {data?.is_default ? (
-            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">empty default</span>
-          ) : (
-            <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50">customized</span>
-          )}
-        </div>
-
-        <div className="space-y-6">
+        <div className="space-y-4">
           {LIST_META.map(meta => (
             <PathListEditor
               key={meta.key}
@@ -177,7 +200,7 @@ export function ProjectApprovalGateSection({ data, canSave, onSave }: ProjectApp
 
       {error && <p className="text-[11px] text-red-400">{error}</p>}
 
-      <div className="flex items-center justify-between pt-2 gap-3 flex-wrap">
+      <div className="flex items-center justify-between pt-1 gap-3 flex-wrap">
         {canSave ? (
           <button
             onClick={handleSave}

@@ -2368,6 +2368,15 @@ def _qualifier_ci_resolves_green(mocker):
         "app.github.list_pull_requests_for_commit",
         new=AsyncMock(return_value=[]),
     )
+    # Default the qualify-on-synced gate to SYNCED so the overwhelming majority
+    # of run_qualification tests (which assume the candidate is promotable)
+    # proceed without a real compare call. Patches the gate's OWN seam (not the
+    # shared github.is_ancestor_of, which promote-idempotency + TestIsAncestorOf
+    # depend on). Tests that exercise the gate re-patch it; the later patch wins.
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed",
+        new=AsyncMock(return_value=True),
+    )
 
 
 # ===========================================================================
@@ -2586,6 +2595,111 @@ async def test_run_qualification_no_credentials(db_session, mocker):
         .all()
     )
     assert len(tasks) == 0
+
+
+# ===========================================================================
+# run_qualification — qualify-on-synced gate (LTS split)
+# ===========================================================================
+
+
+async def _audit_tasks(db_session, project_id):
+    rows = (
+        (await db_session.execute(select(Task).where(Task.project_id == project_id)))
+        .scalars()
+        .all()
+    )
+    return [t for t in rows if t.first_payload.get("type") == "release_audit"]
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_proceeds_when_synced(db_session, mocker):
+    """When the promotion target is already absorbed into the candidate (synced),
+    the gate is a no-op and qualification proceeds normally (pending verdict)."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True))
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_defers_when_candidate_behind_main(db_session, mocker):
+    """A candidate the promotion target is NOT yet absorbed into is DEFERRED, not
+    scored: no audit child spawns, and the version records a retryable
+    deferred_unsynced state (regression for the 2026-06-02 stale-candidate
+    promotion break)."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    # main NOT absorbed into the candidate.
+    mocker.patch("app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False))
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "deferred_unsynced"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "deferred_unsynced"
+    assert version.last_qualification["first_deferred_at"]
+    # A deferral is not a qualification attempt and spawns nothing.
+    assert version.qualification_attempts == 0
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_fall_through_when_unsynced_too_long(
+    db_session, mocker
+):
+    """Bounded fall-through: a candidate behind main for >= the fall-through
+    window qualifies ANYWAY — a wedged back-merge must never starve promotion."""
+    from datetime import datetime, timedelta
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Pre-seed a stale deferral so the accumulated wait exceeds the 30-min window.
+    version.last_qualification = {
+        "status": "deferred_unsynced",
+        "first_deferred_at": (datetime.utcnow() - timedelta(minutes=45)).isoformat(),
+    }
+    db_session.add(version)
+    await db_session.commit()
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False))
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Fell through → scored anyway.
+    assert result["status"] == "spawned"
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_no_sync_gate_for_single_branch(db_session, mocker):
+    """Single-branch projects (integration == promotion) have no back-merge
+    concept — the sync gate is skipped entirely and never runs the compare, even
+    when is_ancestor_of would report not-absorbed."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.integration_branch = "main"
+    project.promotion_target = "main"
+    db_session.add(project)
+    await db_session.commit()
+    mocker.patch(
+        "app.github.get_branch_sha", new=AsyncMock(return_value="cafe1234" * 5)
+    )
+    anc = mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=False)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    anc.assert_not_called()  # the gate is short-circuited before any compare
 
 
 @pytest.mark.asyncio
@@ -6606,6 +6720,34 @@ async def test_strategic_trigger_swallows_spawn_failure(db_session, mocker):
         version.id,
         {"status": "not_promoted"},
         session_factory=_shared_session_factory(db_session),
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_trigger_queues_refresh_when_cycle_active(db_session, mocker):
+    """When a strategic cycle is already active the spawn no-ops (returns False) —
+    the verdict trigger must NOT be dropped. It coalesces into a durable refresh
+    marker the autonomous loop consumes (regression for the 2026-06-02 dropped-
+    trigger starvation: v3 promoted while a cycle ran and directions stayed 0)."""
+    project, version = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=False),  # a cycle is already active
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "promoted"},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    await db_session.refresh(project)
+    from app.strategic_trigger import strategic_refresh_pending
+
+    assert strategic_refresh_pending(project.vision) is True
+    assert (
+        "post_qualification:promoted"
+        in (project.vision or {})["_strategic_refresh"]["reason"]
     )
 
 

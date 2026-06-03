@@ -1481,6 +1481,37 @@ async def handle_ci_completion(
             )
             return True
 
+        # ── Setup-phase infra rerun gate (repo-agnostic) ──
+        # If the CI failure is purely a GitHub built-in setup-step failure
+        # (container/runner init) rather than a code defect, it's a transient
+        # infra flake — re-run the failed jobs ONCE before treating it as real,
+        # so a Docker-Hub/runner blip doesn't burn a cold-VM fix cycle. Keys off
+        # GitHub's own setup-step vocabulary (github_checks), never log content,
+        # so it's repo-agnostic. Capped at one rerun per task via a context flag:
+        # a genuinely broken setup fails the rerun too and falls through to the
+        # normal fix path on the next poll.
+        if ci_result.get("setup_phase_failure") and not (task.context or {}).get(
+            "ci_infra_rerun_done"
+        ):
+            from app.github_checks import rerun_failed_jobs
+
+            _reran_any = False
+            for _run_id in ci_result.get("failed_run_ids") or []:
+                if await rerun_failed_jobs(gh_token, owner, repo, _run_id):
+                    _reran_any = True
+            if _reran_any:
+                _ctx = dict(task.context or {})
+                _ctx["ci_infra_rerun_done"] = True
+                task.context = _ctx
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} CI failure is setup-phase infra — "
+                    f"re-ran failed jobs, deferring fix spawn to next poll ({source})"
+                )
+                return False
+
         ci_errors = ci_result.get("failed_logs", "CI checks failed")
 
         # ── C2 lock-window break (CI-failure path) ──

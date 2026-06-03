@@ -20,6 +20,30 @@ def _github_request(*args, **kwargs):
     return _gh._github_request(*args, **kwargs)
 
 
+# GitHub-generated setup-phase step names. These are emitted by GitHub Actions
+# for every job (repo-agnostic, not workflow config). A job whose *only* failed
+# steps are these failed during infra setup — container/runner init, before any
+# user step ran — which is a transient infra flake, not a code defect.
+_GITHUB_SETUP_STEPS = frozenset(
+    {"Set up job", "Initialize containers", "Set up runner"}
+)
+
+
+def _job_failed_only_at_setup(job: dict) -> bool:
+    """True when a failed job's failed steps are ALL GitHub built-in setup steps.
+
+    That means it died during infra setup (container/runner init) before any
+    user step ran — a transient infra flake, not a code defect. False when any
+    failed step is real work, or when the job has no failed steps at all.
+    """
+    failed_steps = [
+        s.get("name", "")
+        for s in (job.get("steps") or [])
+        if s.get("conclusion") == "failure"
+    ]
+    return bool(failed_steps) and all(s in _GITHUB_SETUP_STEPS for s in failed_steps)
+
+
 async def update_commit_status(
     token: str,
     owner: str,
@@ -294,6 +318,10 @@ async def get_check_runs(
 
     # Collect failure details — prefer actual job logs, fall back to annotations
     failed_logs = ""
+    # setup_phase_failure: at least one failed job failed ONLY at GitHub built-in
+    # setup steps (infra flake). failed_run_ids: the workflow run(s) to re-run.
+    setup_phase_failure = False
+    failed_run_ids: list[int] = []
     if failed_names:
         log_lines = []
 
@@ -318,12 +346,19 @@ async def get_check_runs(
                     for wf_run in wf_runs
                 ]
                 jobs_results = await asyncio.gather(*jobs_coros, return_exceptions=True)
-                for result in jobs_results:
+                for wf_run, result in zip(wf_runs, jobs_results, strict=True):
                     if isinstance(result, Exception) or result.status_code != 200:
                         continue
+                    run_has_failed_job = False
                     for job in result.json().get("jobs", []):
-                        if job.get("conclusion") == "failure":
-                            job_id_by_name[job.get("name", "")] = job["id"]
+                        if job.get("conclusion") != "failure":
+                            continue
+                        run_has_failed_job = True
+                        job_id_by_name[job.get("name", "")] = job["id"]
+                        if _job_failed_only_at_setup(job):
+                            setup_phase_failure = True
+                    if run_has_failed_job:
+                        failed_run_ids.append(wf_run["id"])
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"[GITHUB] Workflow runs pre-fetch failed for {ref}: {exc}")
 
@@ -413,7 +448,43 @@ async def get_check_runs(
         "conclusion": agg_conclusion,
         "details": details,
         "failed_logs": failed_logs,
+        "setup_phase_failure": setup_phase_failure,
+        "failed_run_ids": failed_run_ids,
     }
+
+
+async def rerun_failed_jobs(
+    token: str, owner: str, repo: str, run_id: int
+) -> bool:
+    """Re-run only the failed jobs of a workflow run (GitHub Actions API).
+
+    Used to absorb transient setup-phase infra failures (container/runner init)
+    without spawning a fix task. Returns True when GitHub accepts the request
+    (HTTP 201/202); False on any non-accept or error (caller falls back to the
+    normal fix path).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        resp = await _github_request(
+            "POST",
+            f"https://api.github.com/repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs",
+            headers,
+            timeout=10.0,
+        )
+        if resp.status_code in (201, 202):
+            return True
+        logger.warning(
+            f"[CI] rerun-failed-jobs for run {run_id} returned "
+            f"{resp.status_code}: {resp.text[:200]}"
+        )
+        return False
+    except Exception:  # noqa: BLE001
+        logger.exception(f"[CI] rerun-failed-jobs request failed for run {run_id}")
+        return False
 
 
 # ─── Short-lived dedup cache for check-runs lookups ─────────────────────────

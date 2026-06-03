@@ -6,3 +6,18 @@ import '@testing-library/jest-dom/vitest';
 if (!Element.prototype.scrollTo) {
   Element.prototype.scrollTo = function () {};
 }
+
+// happy-dom (unlike jsdom) does not implement the window dialog methods
+// confirm/alert/prompt. Several tests `vi.spyOn(window, 'confirm')`, which
+// requires the method to already exist as a function before it can be wrapped.
+// Define no-op stubs when missing; under jsdom these guards are no-ops since
+// jsdom already provides them.
+if (typeof window.confirm !== 'function') {
+  window.confirm = () => false;
+}
+if (typeof window.alert !== 'function') {
+  window.alert = () => {};
+}
+if (typeof window.prompt !== 'function') {
+  window.prompt = () => null;
+}
