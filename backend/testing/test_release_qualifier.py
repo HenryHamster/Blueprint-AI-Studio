@@ -6724,6 +6724,34 @@ async def test_strategic_trigger_swallows_spawn_failure(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_strategic_trigger_queues_refresh_when_cycle_active(db_session, mocker):
+    """When a strategic cycle is already active the spawn no-ops (returns False) —
+    the verdict trigger must NOT be dropped. It coalesces into a durable refresh
+    marker the autonomous loop consumes (regression for the 2026-06-02 dropped-
+    trigger starvation: v3 promoted while a cycle ran and directions stayed 0)."""
+    project, version = await _make_project_and_version(db_session)
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=False),  # a cycle is already active
+    )
+
+    await rq._maybe_trigger_strategic_after_qualification(
+        version.id,
+        {"status": "promoted"},
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    await db_session.refresh(project)
+    from app.strategic_trigger import strategic_refresh_pending
+
+    assert strategic_refresh_pending(project.vision) is True
+    assert (
+        "post_qualification:promoted"
+        in (project.vision or {})["_strategic_refresh"]["reason"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_finalize_in_dedicated_session_triggers_strategic_on_miss(
     db_session, mocker
 ):

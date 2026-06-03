@@ -402,6 +402,143 @@ async def test_all_paused_directions_skip_when_backstop_not_due(db_session, mock
     assert len(result.scalars().all()) == 0
 
 
+def _recent_strategic_task(project_id, minutes_ago: int) -> Task:
+    """A terminal strategic task created within the spawn-cooldown window."""
+    return Task(
+        project_id=project_id,
+        title="Recent strategic cycle",
+        payloads=[{"type": "design_doc_update", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_marker_bypasses_spawn_cooldown_and_clears(db_session, mocker):
+    """A pending strategic-refresh marker (set by a resolved verdict that couldn't
+    spawn during an active cycle) must bypass the 30-min spawn-cooldown so the
+    refresh fires promptly — and the marker is consumed on spawn. Regression for
+    the 2026-06-02 dropped-trigger starvation."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Refresh bypasses cooldown",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],  # frontier drained (post-promotion) → force_strategic
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # A strategic task 5 min ago — inside the 30-min cooldown that would normally
+    # suppress the spawn.
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, (
+        "a pending refresh marker must bypass the spawn-cooldown"
+    )
+    await db_session.refresh(project)
+    # Consumed: marker gone, fire time stamped (so the min-interval floor applies).
+    assert (project.vision or {}).get("_strategic_refresh") is None
+    assert (project.vision or {}).get("_strategic_refresh_last_fired_at")
+
+
+@pytest.mark.asyncio
+async def test_spawn_cooldown_holds_without_refresh_marker(db_session, mocker):
+    """Companion: with no refresh marker, the spawn-cooldown still suppresses a
+    recent-spawn — the bypass is gated strictly on a pending refresh, so it can't
+    reintroduce the cancel/fail spam loop the cooldown guards against."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Cooldown holds without marker",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],  # force_strategic, but recent spawn within cooldown
+        vision={"purpose": "test"},  # no refresh marker
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not strategic_review_mock.called and not design_doc_mock.called, (
+        "the spawn-cooldown must still suppress when no refresh is pending"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_marker_parks_when_breaker_tripped(db_session, mocker):
+    """A broken request must not loop: with the _strategic_failures breaker tripped
+    (>= 3, not decayed), a pending refresh does NOT fire — it parks (marker kept)
+    until the breaker decays, instead of bypassing the cooldown forever."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    design_doc_mock = mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Breaker parks refresh",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_failures": 3,
+            "_strategic_failures_at": datetime.utcnow().isoformat(),  # recent → no decay
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "post_qualification:promoted",
+                "count": 1,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not strategic_review_mock.called and not design_doc_mock.called, (
+        "a tripped breaker must park the refresh, not fire it"
+    )
+    await db_session.refresh(project)
+    # Marker preserved — it fires once the breaker decays, nothing is lost.
+    assert (project.vision or {}).get("_strategic_refresh") is not None
+
+
 @pytest.mark.asyncio
 async def test_all_paused_skip_log_distinguishes_cooling_from_wedge(db_session, mocker):
     """The all-paused skip log must not read as a starvation wedge when a non-paused

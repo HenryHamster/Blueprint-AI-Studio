@@ -1964,6 +1964,29 @@ async def _maybe_trigger_strategic_after_qualification(
                     version.version_number,
                     project.id,
                 )
+            else:
+                # A strategic cycle is already active, so the spawn no-op'd.
+                # DON'T drop the trigger (incident 2026-06-02: a dropped
+                # post-promotion refresh let the pipeline idle with 0 directions
+                # until the 30-min strategic_spawn_cooldown elapsed). Coalesce it
+                # into a durable refresh marker; the autonomous loop fires it as
+                # soon as the active cycle clears, bypassing the cooldown.
+                from app.strategic_trigger import request_strategic_refresh
+
+                await request_strategic_refresh(
+                    session,
+                    project.id,
+                    f"post_qualification:{result.get('status')}",
+                )
+                await session.commit()
+                logger.info(
+                    "[RELEASE_QUALIFIER] qualification resolved (%s) for v%d but a "
+                    "strategic cycle is active — queued a coalesced refresh for "
+                    "project %s",
+                    result.get("status"),
+                    version.version_number,
+                    project.id,
+                )
     except PayloadTooLargeError as exc:
         # The strategic payload outgrew the cap; the autonomous loop surfaces a
         # dedicated alert for this case and the wall-clock backstop retries.
