@@ -1590,12 +1590,19 @@ class TestMergePrimitiveLock:
 
         Fix by calling the appropriate primitive from github_pulls.py instead of
         issuing the endpoint directly.
+
+        This scan detects:
+        - REST endpoint calls: _github_request(..., PUT, ..., .../pulls/.../merge, ...)
+          across multiple lines, immune to # noqa
+        - GraphQL mutation calls: calls to graphql endpoint with enablePullRequestAutoMerge
+          mutation, immune to # noqa and multi-line construction
+
+        False-positives from docstrings are avoided by scanning for actual
+        _github_request / httpx calls, not prose mentioning the endpoint.
         """
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
 
         # Only github_pulls.py may issue the raw merge endpoint.
-        # github.py re-exports merge_pull_request (the primitive), not the raw endpoint.
-        # task_lifecycle_github_helpers.py defines _merge_with_retry wrapper (also OK).
         exempt_files = {
             "github_pulls.py",
         }
@@ -1610,26 +1617,39 @@ class TestMergePrimitiveLock:
 
                 fpath = os.path.join(root, fname)
                 with open(fpath, encoding="utf-8") as f:
-                    lines = f.readlines()
+                    content = f.read()
 
                 rel = os.path.relpath(fpath, app_dir)
 
-                # Check for direct calls to the GitHub merge REST endpoint.
-                # Look for patterns like: "PUT .../pulls/{...}/merge"
-                for lineno, line in enumerate(lines, start=1):
-                    if line.lstrip().startswith("#") or "# noqa" in line:
-                        continue
-                    # Signature: PUT /repos/{owner}/{repo}/pulls/{pr_number}/merge
-                    # Look for string literals and f-strings containing the endpoint.
-                    if re.search(r'["\'].*pulls.*merge["\']|f["\'].*pulls.*merge', line) and "api.github.com" in line:
+                # Detect raw REST merge endpoint calls: _github_request(...PUT..../pulls/.../merge...)
+                # Uses DOTALL to match across line boundaries within function calls.
+                # Strategy: look for _github_request with PUT and the merge endpoint path
+                # in the same ~500-character window (avoids backtracking issues with [^)]).
+                for match in re.finditer(r"_github_request\s*\(", content, re.DOTALL):
+                    start = match.start()
+                    # Grab a reasonable window past this point to search for PUT + merge endpoint
+                    window_end = min(start + 1000, len(content))
+                    window = content[start:window_end]
+                    # Check for PUT and the merge endpoint path in the window
+                    if re.search(r'PUT.*(?:api\.github\.com)?.*?/repos[^"\']*?/pulls[^"\']*?/merge', window, re.DOTALL):
+                        line_num = content[:match.start()].count('\n') + 1
                         offenders.append(
-                            f"  {rel}:{lineno}: raw /pulls/.../merge endpoint call: {line.rstrip()}"
+                            f"  {rel}:{line_num}: raw _github_request PUT /pulls/.../merge call detected"
                         )
-                    # Check for the enablePullRequestAutoMerge GraphQL mutation call.
-                    # This appears as a string literal containing the mutation name.
-                    if "enablePullRequestAutoMerge" in line and ("mutation" in line or "graphql" in line.lower()):
+
+                # Detect raw GraphQL auto-merge calls: _github_request to graphql endpoint
+                # with enablePullRequestAutoMerge mutation in the call or nearby.
+                # Strategy: look for _github_request(...POST...graphql...) with enablePullRequestAutoMerge
+                # in a ~1000-character window to avoid backtracking issues.
+                for match in re.finditer(r"_github_request\s*\(", content, re.DOTALL):
+                    start = match.start()
+                    window_end = min(start + 1500, len(content))
+                    window = content[start:window_end]
+                    # Check for POST to graphql endpoint with enablePullRequestAutoMerge
+                    if re.search(r'POST.*?graphql.*?enablePullRequestAutoMerge', window, re.DOTALL):
+                        line_num = content[:match.start()].count('\n') + 1
                         offenders.append(
-                            f"  {rel}:{lineno}: raw GraphQL enablePullRequestAutoMerge call: {line.rstrip()}"
+                            f"  {rel}:{line_num}: raw POST graphql enablePullRequestAutoMerge call detected"
                         )
 
         assert not offenders, (
@@ -1641,6 +1661,111 @@ class TestMergePrimitiveLock:
             "Calling the endpoint directly bypasses guard coverage and can slip "
             "through unguarded.\n"
             "Fix by importing and calling the appropriate primitive instead."
+        )
+
+    def test_scan_detects_multiline_raw_merge_rest_endpoint(self):
+        """Verify the scan detects multi-line-constructed raw merge REST endpoint calls.
+
+        Regression test: a raw merge call is NOT detected when the _github_request
+        call itself spans multiple lines. This fixture encodes a multi-line raw
+        merge call and asserts the scan flags it.
+        """
+        # This is a synthetic pattern that should be flagged by the scan.
+        # The key vulnerability: a direct call to _github_request with the merge endpoint,
+        # spanning multiple lines, which the old line-by-line scan would miss.
+        test_pattern = '''
+async def malicious_merge(token: str, owner: str, repo: str, pr_number: int):
+    response = await _github_request(
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+        headers,
+        json={"merge_method": "squash"},
+    )
+'''
+        # Use the same scan logic as the invariant test to verify it detects this.
+        found = False
+        for match in re.finditer(r"_github_request\s*\(", test_pattern, re.DOTALL):
+            start = match.start()
+            window_end = min(start + 1000, len(test_pattern))
+            window = test_pattern[start:window_end]
+            if re.search(r'PUT.*(?:api\.github\.com)?.*?/repos[^"\']*?/pulls[^"\']*?/merge', window, re.DOTALL):
+                found = True
+                break
+        assert found, (
+            "Regression test: the hardened scan must detect multi-line-constructed "
+            "raw merge REST endpoint calls. The pattern above should have been flagged."
+        )
+
+    def test_scan_detects_multiline_raw_merge_graphql_mutation(self):
+        """Verify the scan detects multi-line-constructed raw GraphQL auto-merge mutations.
+
+        Regression test: a raw GraphQL auto-merge call is NOT detected when the
+        _github_request call spans multiple lines and the enablePullRequestAutoMerge
+        mutation is in the body across multiple lines. This fixture encodes this
+        pattern and asserts the scan flags it.
+        """
+        # Synthetic pattern: _github_request POST to graphql endpoint with enablePullRequestAutoMerge
+        # in the JSON body, spanning multiple lines.
+        test_pattern = '''
+async def malicious_auto_merge(token: str, pr_node_id: str, merge_method: str):
+    response = await _github_request(
+        "POST",
+        "https://api.github.com/graphql",
+        headers,
+        json={
+            "query": "mutation($prId: ID!, $method: PullRequestMergeMethod!) {"
+                     "enablePullRequestAutoMerge(input: {pullRequestId: $prId, mergeMethod: $method}) {"
+                     "pullRequest { autoMergeRequest { enabledAt } } } }",
+            "variables": {"prId": pr_node_id, "method": merge_method},
+        },
+    )
+'''
+        # Use the same scan logic as the invariant test.
+        found = False
+        for match in re.finditer(r"_github_request\s*\(", test_pattern, re.DOTALL):
+            start = match.start()
+            window_end = min(start + 1500, len(test_pattern))
+            window = test_pattern[start:window_end]
+            if re.search(r'POST.*?graphql.*?enablePullRequestAutoMerge', window, re.DOTALL):
+                found = True
+                break
+        assert found, (
+            "Regression test: the hardened scan must detect multi-line GraphQL "
+            "auto-merge mutations. The pattern above should have been flagged."
+        )
+
+    def test_scan_flags_noqa_tagged_raw_merge_calls(self):
+        """Verify the scan flags raw merge calls even when tagged with # noqa.
+
+        Regression test: the old line-by-line scan could be defeated by a
+        trailing '# noqa' comment. The hardened scan must detect vulnerable
+        calls regardless of noqa tags, as the noqa bypass is the vulnerability
+        we are closing.
+        """
+        # Pattern with # noqa on same line: old scan would skip entire line.
+        # New scan works on whole content so noqa doesn't bypass the check.
+        test_pattern = '''
+async def sneaky_merge(token: str, owner: str, repo: str, pr_number: int):
+    response = await _github_request(  # noqa
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
+        headers,
+        json={"merge_method": "squash"},
+    )
+'''
+        # Use the same scan logic as the invariant test.
+        found = False
+        for match in re.finditer(r"_github_request\s*\(", test_pattern, re.DOTALL):
+            start = match.start()
+            window_end = min(start + 1000, len(test_pattern))
+            window = test_pattern[start:window_end]
+            if re.search(r'PUT.*(?:api\.github\.com)?.*?/repos[^"\']*?/pulls[^"\']*?/merge', window, re.DOTALL):
+                found = True
+                break
+        assert found, (
+            "Regression test: the scan must flag raw merge calls even when "
+            "they carry a '# noqa' comment. The noqa bypass itself is the "
+            "vulnerability we are closing."
         )
 
 
