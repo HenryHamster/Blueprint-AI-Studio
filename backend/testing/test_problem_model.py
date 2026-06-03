@@ -517,7 +517,7 @@ def test_apply_agent_update_preserves_operator_intent_when_omitted():
     """Agent omits intent/context/constraints entirely → operator values kept."""
     current = _operator_seeded_current()
     proposed: dict = {"gaps": [{"id": "g1", "name": "x", "status": "active"}]}
-    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
     assert new_raw["intent"]["source"]["type"] == "user_message"
     assert new_raw["context"]["project_type"] == "startup"
@@ -532,7 +532,7 @@ def test_apply_agent_update_preserves_operator_intent_when_blanked():
         "context": {},
         "constraints": [],
     }
-    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
     assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
     assert new_raw["intent"]["source"]["type"] == "user_message"
     assert new_raw["context"]["project_type"] == "startup"
@@ -866,6 +866,217 @@ def test_apply_user_intent_patch_rejects_malformed_subset():
             {"intent": {"purpose": 123}},  # purpose must be a str
             "2026-06-02T12:00:00",
         )
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — non-destructive merge of AGENT-OWNED collections
+#
+# capabilities/gaps/friction/pending advance freely each cycle, but the agent
+# often acts on a trimmed or dropped payload view. These tests pin that a write
+# can only ADD or MODIFY those collections — never silently wipe an entry the
+# agent didn't echo back. Removal is explicit via _deletions. (Operator-owned
+# fields — purpose/context/constraints — have their own merge above.)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_preserves_omitted_capabilities():
+    """An agent that omits a capability (didn't see it) must not delete it."""
+    current = {
+        "revision": 1,
+        "capabilities": [
+            {"name": "CapA", "status": "working"},
+            {"name": "CapB", "status": "working"},
+        ],
+    }
+    proposed = {"capabilities": [{"name": "CapA", "status": "partial"}]}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    by_name = {c["name"]: c["status"] for c in new_raw["capabilities"]}
+    assert by_name == {"CapA": "partial", "CapB": "working"}
+
+
+def test_merge_preserves_omitted_gaps_and_friction():
+    current = {
+        "revision": 1,
+        "gaps": [
+            {"id": "g-seen", "name": "seen", "status": "active"},
+            {"id": "g-unseen", "name": "trimmed away", "status": "active"},
+        ],
+        "friction": [
+            {"id": "f-seen", "name": "seen"},
+            {"id": "f-unseen", "name": "trimmed away"},
+        ],
+    }
+    # Agent only echoes back the gap/friction it saw.
+    proposed = {
+        "gaps": [{"id": "g-seen", "name": "seen", "status": "active"}],
+        "friction": [{"id": "f-seen", "name": "seen", "status": "active"}],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-seen", "g-unseen"}
+    assert {f["id"] for f in new_raw["friction"]} == {"f-seen", "f-unseen"}
+
+
+def test_merge_preserves_omitted_pending_confirmation():
+    current = {
+        "revision": 1,
+        "pending_user_confirmation": [
+            {"id": "p-creds", "type": "credentials_needed", "proposal": "need a key"}
+        ],
+    }
+    proposed: dict = {"gaps": []}  # agent wrote without the pending queue
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-creds"}
+
+
+def test_merge_unions_gap_history_so_trimmed_tail_does_not_truncate():
+    """The payload trims per-gap history to the last N. If the agent echoes
+    that tail back, the full history must survive (union), and any new event
+    the agent added is appended."""
+    full_history = [
+        {"ts": f"2026-05-{d:02d}T00:00:00", "event": "opened"} for d in range(1, 9)
+    ]
+    current = {
+        "revision": 1,
+        "gaps": [
+            {"id": "g1", "name": "x", "status": "active", "history": full_history}
+        ],
+    }
+    # Agent saw only the last 3 entries (trimmed) and adds one new event.
+    proposed_history = [
+        *full_history[-3:],
+        {"ts": "2026-05-09T00:00:00", "event": "priority_raised"},
+    ]
+    proposed = {
+        "gaps": [
+            {"id": "g1", "name": "x", "status": "active", "history": proposed_history}
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    merged_history = new_raw["gaps"][0]["history"]
+    # All 8 original + 1 new, none duplicated.
+    assert len(merged_history) == 9
+    assert merged_history[-1]["event"] == "priority_raised"
+    assert [h["ts"] for h in merged_history[:8]] == [h["ts"] for h in full_history]
+
+
+def test_merge_unions_gap_past_moves():
+    current = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g1",
+                "name": "x",
+                "status": "active",
+                "past_moves": ["d-1", "d-2", "d-3"],
+            }
+        ],
+    }
+    # Agent saw only the recent tail and attached a new move.
+    proposed = {
+        "gaps": [
+            {"id": "g1", "name": "x", "status": "active", "past_moves": ["d-3", "d-4"]}
+        ]
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert new_raw["gaps"][0]["past_moves"] == ["d-1", "d-2", "d-3", "d-4"]
+
+
+def test_explicit_deletions_remove_named_agent_owned_entries():
+    current = {
+        "revision": 1,
+        "capabilities": [
+            {"name": "CapA", "status": "working"},
+            {"name": "CapStale", "status": "planned"},
+        ],
+        "gaps": [
+            {"id": "g-keep", "name": "k", "status": "active"},
+            {"id": "g-wrong", "name": "w", "status": "active"},
+        ],
+        "friction": [{"id": "f-gone", "name": "obsolete"}],
+    }
+    proposed = {
+        "_deletions": {
+            "capabilities": ["CapStale"],
+            "gaps": ["g-wrong"],
+            "friction": ["f-gone"],
+        }
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert {c["name"] for c in new_raw["capabilities"]} == {"CapA"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-keep"}
+    assert new_raw["friction"] == []
+    # Deletions surface in the structured change log.
+    assert diff.get("gaps_deleted") == ["g-wrong"]
+    assert diff.get("capabilities_deleted") == ["CapStale"]
+    assert diff.get("friction_deleted") == ["f-gone"]
+
+
+def test_deletions_removes_archived_gap_by_id():
+    current = {
+        "revision": 1,
+        "archived_gaps": [{"id": "g-old", "name": "old", "status": "closed"}],
+    }
+    proposed = {"_deletions": {"gaps": ["g-old"]}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert new_raw["archived_gaps"] == []
+
+
+def test_deletions_tolerates_junk_shape():
+    """A malformed _deletions must not crash the update — it's just ignored."""
+    current = {"revision": 1, "gaps": [{"id": "g1", "name": "x", "status": "active"}]}
+    proposed = {"_deletions": "not-a-dict"}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert {g["id"] for g in new_raw["gaps"]} == {"g1"}
+
+
+def test_deletions_field_not_persisted_in_model():
+    """_deletions is a transient directive — it must never land in the saved
+    model (which is extra='forbid')."""
+    current = {"revision": 1}
+    proposed = {
+        "intent": {"purpose": "p"},
+        "_deletions": {"gaps": ["nonexistent"]},
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert "_deletions" not in new_raw
+    # Round-trips cleanly through the strict schema.
+    parse_problem_model(new_raw)
+
+
+def test_merge_close_by_status_still_archives():
+    """Status-based close (the normal lifecycle) still auto-archives under the
+    merge path — closing is NOT a deletion."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-done", "name": "done", "status": "active"}],
+    }
+    proposed = {"gaps": [{"id": "g-done", "name": "done", "status": "closed"}]}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert new_raw["gaps"] == []
+    assert {g["id"] for g in new_raw["archived_gaps"]} == {"g-done"}
+    assert diff["gaps_closed"] == ["g-done"]
+
+
+def test_merge_empty_proposed_preserves_agent_owned_collections():
+    """The pathological case the fix exists for: the model was dropped from the
+    payload entirely and the agent wrote a near-empty model. The agent-owned
+    collections survive intact."""
+    current = {
+        "revision": 4,
+        "capabilities": [{"name": "CapA", "status": "working"}],
+        "gaps": [{"id": "g1", "name": "x", "status": "active"}],
+        "friction": [{"id": "f1", "name": "y"}],
+        "pending_user_confirmation": [
+            {"id": "p1", "type": "access_needed", "proposal": "grant access"}
+        ],
+    }
+    proposed: dict = {}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert new_raw["revision"] == 5
+    assert {c["name"] for c in new_raw["capabilities"]} == {"CapA"}
+    assert {g["id"] for g in new_raw["gaps"]} == {"g1"}
+    assert {f["id"] for f in new_raw["friction"]} == {"f1"}
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p1"}
 
 
 # ---------------------------------------------------------------------------

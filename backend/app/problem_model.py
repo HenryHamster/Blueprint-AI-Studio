@@ -27,6 +27,7 @@ are a projected view over directions, not a separate store.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -739,6 +740,137 @@ def _merge_operator_owned_fields(
     return rejected
 
 
+# ---------------------------------------------------------------------------
+# Agent-owned collection merge — non-destructive write
+#
+# The agent-owned collections (capabilities, gaps, friction,
+# pending_user_confirmation) are NOT operator-protected: they advance freely
+# each cycle. But the strategic-spawn payload packs problem_model under a byte
+# budget (pack_under_budget, 120 KB) and trims it (per-gap history/past_moves
+# capped, archived_gaps dropped) or drops it entirely under pressure. A
+# full-replace write would then silently wipe entries the agent never received
+# (the "capability map and friction I can't see" trap). So these collections
+# MERGE: proposed entries upsert by stable key, entries the agent omitted are
+# preserved, and per-gap append-only logs union so a trimmed tail echoed back
+# can't truncate the full record. Intentional removal is explicit
+# (``_deletions``), never by omission. Operator-owned fields (intent.purpose,
+# context, constraints) are untouched here — they keep their 3-way merge above.
+
+
+def _as_str_list(deletions: Any, key: str) -> list[str]:
+    """Pull ``deletions[key]`` as a list of strings, tolerating junk."""
+    if not isinstance(deletions, dict):
+        return []
+    val = deletions.get(key)
+    return [str(x) for x in val] if isinstance(val, list) else []
+
+
+def _entry_key(x: Any) -> str:
+    """Canonical JSON key for an append-only-log entry (str or model/dict)."""
+    if isinstance(x, BaseModel):
+        x = x.model_dump()
+    return json.dumps(x, sort_keys=True, default=str)
+
+
+def _merge_append_log(current_list: list, proposed_list: list) -> list:
+    """Union two append-only logs: keep the full *current* list (the agent may
+    have only seen a trimmed tail) and append any *proposed* entries not already
+    present. Order-stable: current first, then genuinely-new proposed."""
+    out = list(current_list)
+    seen = {_entry_key(x) for x in out}
+    for x in proposed_list:
+        k = _entry_key(x)
+        if k not in seen:
+            out.append(x)
+            seen.add(k)
+    return out
+
+
+def _upsert_by_key(
+    current: list,
+    proposed: list,
+    key_fn,
+    deleted: set[str],
+    merge_fn=None,
+) -> list:
+    """Upsert *proposed* into *current* keyed by ``key_fn``.
+
+    - present in both: replaced by proposed (or ``merge_fn(cur, prop)`` for
+      deep merges)
+    - only in current: preserved (omission never deletes)
+    - only in proposed: appended (new)
+    - keys in *deleted*: dropped
+
+    Order-stable: current order preserved (updated in place), new proposed
+    entries appended in their own order.
+    """
+    prop_by_key = {key_fn(p): p for p in proposed}
+    used: set[str] = set()
+    result: list = []
+    for c in current:
+        k = key_fn(c)
+        if k in deleted:
+            continue
+        if k in prop_by_key:
+            p = prop_by_key[k]
+            result.append(merge_fn(c, p) if merge_fn else p)
+            used.add(k)
+        else:
+            result.append(c)
+    for p in proposed:
+        k = key_fn(p)
+        if k in used or k in deleted:
+            continue
+        result.append(p)
+    return result
+
+
+def _merge_gap(current: Gap, proposed: Gap) -> Gap:
+    """Upsert one gap: proposed wins for every field EXCEPT the append-only
+    logs (``history``, ``past_moves``), which union current+proposed so a
+    trimmed tail echoed back by the agent cannot truncate the full record."""
+    merged = proposed.model_copy(deep=True)
+    merged.history = _merge_append_log(current.history, proposed.history)
+    merged.past_moves = _merge_append_log(current.past_moves, proposed.past_moves)
+    return merged
+
+
+def _merge_agent_owned_collections(
+    current: ProblemModel, proposed: ProblemModel, deletions: Any
+) -> None:
+    """Replace ``proposed``'s agent-owned collections with a non-destructive
+    merge over ``current`` (mutates ``proposed`` in place). Removal is explicit
+    via ``deletions`` — a dict of ``{capabilities|gaps|friction|
+    pending_user_confirmation: [key, ...]}``. ``constraints`` is NOT here: it is
+    operator-owned and handled by the 3-way merge / blank backstop."""
+    del_caps = set(_as_str_list(deletions, "capabilities"))
+    del_gaps = set(_as_str_list(deletions, "gaps"))
+    del_friction = set(_as_str_list(deletions, "friction"))
+    del_pending = set(_as_str_list(deletions, "pending_user_confirmation"))
+
+    proposed.capabilities = _upsert_by_key(
+        current.capabilities, proposed.capabilities, lambda c: c.name, del_caps
+    )
+    proposed.gaps = _upsert_by_key(
+        current.gaps, proposed.gaps, lambda g: g.id, del_gaps, merge_fn=_merge_gap
+    )
+    proposed.friction = _upsert_by_key(
+        current.friction, proposed.friction, lambda f: f.id, del_friction
+    )
+    proposed.pending_user_confirmation = _upsert_by_key(
+        current.pending_user_confirmation,
+        proposed.pending_user_confirmation,
+        lambda p: p.id,
+        del_pending,
+    )
+    # archived_gaps was already set to current+proposed archived; honor an
+    # explicit gap deletion against it too.
+    if del_gaps:
+        proposed.archived_gaps = [
+            g for g in proposed.archived_gaps if g.id not in del_gaps
+        ]
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,
@@ -782,7 +914,23 @@ def apply_agent_update(
     None (legacy task with no cycle row, or no baseline resolvable), the merge
     is skipped and behavior is byte-identical to the blank-preservation-only
     path. The blank-preservation backstop runs in both cases.
+
+    Agent-owned collections (capabilities, gaps, friction,
+    pending_user_confirmation) MERGE non-destructively rather than replace: the
+    agent often acts on a trimmed or dropped payload view, so an omitted entry
+    is preserved and per-gap append-only logs union (see
+    :func:`_merge_agent_owned_collections`). Intentional removal is explicit via
+    an optional top-level ``_deletions`` key on ``proposed_raw`` —
+    ``{"capabilities": [name], "gaps": [id], "friction": [id],
+    "pending_user_confirmation": [id]}`` — lifted out before validation
+    (``ProblemModel`` is ``extra="forbid"``). Removal by omission is impossible,
+    so an agent on a partial view cannot wipe what it could not see.
     """
+    # Lift the explicit-deletion directive out before validation — it is not
+    # part of the durable model (extra="forbid" would reject it).
+    proposed_raw = dict(proposed_raw)
+    deletions = proposed_raw.pop("_deletions", None)
+
     proposed = ProblemModel.model_validate(proposed_raw)
     current = parse_problem_model(current_raw)
 
@@ -809,10 +957,25 @@ def apply_agent_update(
     # non-blank concurrent edits; this fills agent omissions/blanks.
     _preserve_operator_intent(current, proposed)
 
+    # Non-destructive merge of agent-owned collections: an agent acting on a
+    # trimmed/dropped payload view must not wipe entries it never saw. Runs
+    # before the diff so the diff reflects the true merged state.
+    _merge_agent_owned_collections(current, proposed, deletions)
+
     # Compute diff before archival so closed gaps are still visible on
     # proposed.gaps — otherwise _compute_diff can't see what got closed
     # this cycle.
     diff = _compute_diff(current, proposed)
+    # Surface explicit deletions in the structured change log (otherwise they
+    # are invisible to _compute_diff, which only sees current vs merged state).
+    for diff_key, del_key in (
+        ("gaps_deleted", "gaps"),
+        ("capabilities_deleted", "capabilities"),
+        ("friction_deleted", "friction"),
+    ):
+        removed = sorted(_as_str_list(deletions, del_key))
+        if removed:
+            diff[diff_key] = removed
 
     archive_closed_gaps(proposed)
 

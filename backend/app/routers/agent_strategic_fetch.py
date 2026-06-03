@@ -114,6 +114,23 @@ async def agent_fetch_playbook_entry(
     return {"status": "success", "data": {"key": full_key, "entry": entry}}
 
 
+@router.get("/projects/{project_id}/problem_model")
+@limiter.limit("30/minute")
+async def agent_fetch_problem_model(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the FULL untrimmed problem_model. Used when the strategic
+    payload trimmed (per-gap arrays capped, archived_gaps dropped) or dropped
+    problem_model under budget pressure and the agent wants the complete
+    current state before writing — writes merge non-destructively, so this is
+    for reading the whole record, not a precondition for a safe write."""
+    project = await _resolve_agent_project(project_id, token, session)
+    return {"status": "success", "data": project.problem_model or {}}
+
+
 @router.get("/projects/{project_id}/gaps/{gap_id}")
 @limiter.limit("60/minute")
 async def agent_fetch_gap(

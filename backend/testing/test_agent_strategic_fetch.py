@@ -236,6 +236,78 @@ async def test_agent_fetch_playbook_entry_pending_source_visibility(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_problem_model_returns_full_untrimmed(
+    client: AsyncClient, db_session
+):
+    """The whole-model fetch returns the full problem_model — including
+    archived_gaps and uncapped per-gap history — for when the strategic
+    payload trimmed or dropped it under budget."""
+    project = Project(
+        name="PM Fetch Test",
+        user_id="test-user-pmf",
+        problem_model={
+            "revision": 7,
+            "intent": {"purpose": "Ship the thing."},
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "Big gap",
+                    "history": [{"ts": f"t{i}", "event": "x"} for i in range(40)],
+                }
+            ],
+            "archived_gaps": [{"id": "g-old", "name": "done", "status": "closed"}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-pmf")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pmf")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/problem_model",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["revision"] == 7
+    # Full, untrimmed: archived gaps present and per-gap history not capped.
+    assert {g["id"] for g in data["archived_gaps"]} == {"g-old"}
+    assert len(data["gaps"][0]["history"]) == 40
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_problem_model_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Token for project A can't read project B's problem_model (404)."""
+    project_a = Project(name="PMA", user_id="u-a")
+    project_b = Project(
+        name="PMB", user_id="u-b", problem_model={"intent": {"purpose": "secret"}}
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-pma")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-pma")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/problem_model",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_gap_handles_active_and_archived(
     client: AsyncClient, db_session
 ):
