@@ -58,7 +58,9 @@ _RETRY_DELAYS: tuple[int, ...] = (30, 120, 600)
 
 # System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
 # These must always survive paging regardless of routine message volume (see
-# admin_notifications.list_messages guaranteed-query logic). Escalation types
+# admin_notifications.list_messages guaranteed-query logic). This includes the
+# operator-steering receipt/confirmation pair so the interim queued receipt is
+# visible while it waits behind an active cycle. Escalation types
 # (auto_fix_escalated, residual_fix_escalated, etc.) are already safe because they emit
 # as BLOCKER messages — not NOTE — so they don't belong here.
 # Source of truth: backend/testing/event_type_snapshot.json (classification=high_signal).
@@ -74,6 +76,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "release_stabilize_stalled",  # post_version_stabilize_stalled_message
         "release_ci_unresolved_stall",  # post_version_ci_unresolved_stall_message
         "release_auto_merge_stalled",  # post_version_auto_merge_stall_message
+        "strategic_steering_deferred",  # post_strategic_steering_deferred_message
         "strategic_steering_acted",  # post_strategic_steering_acted_message
     }
 )

@@ -188,7 +188,7 @@
     },
     {
       "name": "strategic_steering_deferred",
-      "classification": "routine",
+      "classification": "high_signal",
       "message_type": "NOTE",
       "source_fn": "post_strategic_steering_deferred_message"
     },

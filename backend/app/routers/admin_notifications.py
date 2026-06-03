@@ -127,8 +127,10 @@ ROUTINE_EVENT_TYPES: frozenset = frozenset(
 
 # System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
 # These must always survive paging regardless of routine message volume, identical to
-# how BLOCKER/FEEDBACK/BUG_REPORT are guaranteed.  Escalation types (auto_fix_escalated,
-# residual_fix_escalated, etc.) are already safe because they emit as BLOCKER messages.
+# how BLOCKER/FEEDBACK/BUG_REPORT are guaranteed.  This includes the operator steering
+# receipt/confirmation pair so the queued receipt remains visible while it waits behind
+# an active cycle. Escalation types (auto_fix_escalated, residual_fix_escalated, etc.)
+# are already safe because they emit as BLOCKER messages.
 HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
     {
         "failure_alert",
@@ -141,6 +143,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
         "release_auto_merge_stalled",
+        "strategic_steering_deferred",
         "strategic_steering_acted",
     }
 )

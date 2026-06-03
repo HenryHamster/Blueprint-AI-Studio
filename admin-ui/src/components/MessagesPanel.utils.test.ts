@@ -272,6 +272,13 @@ describe('escalation event invariants', () => {
     const base = { from_type: 'system', message_type: 'NOTE' as const };
     expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
   });
+
+  test('strategic_steering_deferred is high-signal, info toast, and badge-labeled', () => {
+    const base = { from_type: 'system', message_type: 'NOTE' as const, context: { event_type: 'strategic_steering_deferred' } };
+    expect(classifySignalLevel(base)).toBe('high');
+    expect(getToastSeverity(base)).toBe('info');
+    expect(HIGH_SIGNAL_NOTE_BADGE_LABELS.strategic_steering_deferred).toBe('Steering Queued');
+  });
 });
 
 describe('HIGH_SIGNAL_NOTE_BADGE_LABELS invariants', () => {

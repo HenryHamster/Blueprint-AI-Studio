@@ -3166,6 +3166,7 @@ class TestMessages:
             "release_build_stalled",
             "release_stabilize_stalled",
             "release_ci_unresolved_stall",
+            "strategic_steering_deferred",
         ],
     )
     async def test_list_messages_guarantees_high_signal_notes_with_routine_flood(
