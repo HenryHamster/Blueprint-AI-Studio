@@ -117,6 +117,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_target_size",
         "warm_pool_target_size_by_project",
         "warm_pool_idle_ttl_secs",
+        "warm_pool_account_retarget_enabled",
+        "warm_pool_cross_provider_retarget_enabled",
     }
 )
 
@@ -320,6 +322,12 @@ async def get_settings(
             _runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
         "warm_pool_enabled": bool(_runtime_config.get("warm_pool_enabled", False)),
+        "warm_pool_account_retarget_enabled": bool(
+            _runtime_config.get("warm_pool_account_retarget_enabled", False)
+        ),
+        "warm_pool_cross_provider_retarget_enabled": bool(
+            _runtime_config.get("warm_pool_cross_provider_retarget_enabled", False)
+        ),
         "warm_pool_project_allowlist": sorted(
             _normalize_warm_pool_allowlist(
                 _runtime_config.get("warm_pool_project_allowlist") or []
@@ -767,6 +775,22 @@ async def _apply_settings(
                 status_code=400, detail="warm_pool_enabled must be a boolean"
             )
         _runtime_config["warm_pool_enabled"] = val
+    if "warm_pool_account_retarget_enabled" in payload:
+        val = payload["warm_pool_account_retarget_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pool_account_retarget_enabled must be a boolean",
+            )
+        _runtime_config["warm_pool_account_retarget_enabled"] = val
+    if "warm_pool_cross_provider_retarget_enabled" in payload:
+        val = payload["warm_pool_cross_provider_retarget_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pool_cross_provider_retarget_enabled must be a boolean",
+            )
+        _runtime_config["warm_pool_cross_provider_retarget_enabled"] = val
     if "warm_pool_project_allowlist" in payload:
         raw = payload["warm_pool_project_allowlist"]
         # Accept a JSON list, a comma-separated string, or a single id — the
@@ -1895,6 +1919,16 @@ async def _apply_settings(
                     ),
                     "warm_pool_enabled": bool(
                         _runtime_config.get("warm_pool_enabled", False)
+                    ),
+                    "warm_pool_account_retarget_enabled": bool(
+                        _runtime_config.get(
+                            "warm_pool_account_retarget_enabled", False
+                        )
+                    ),
+                    "warm_pool_cross_provider_retarget_enabled": bool(
+                        _runtime_config.get(
+                            "warm_pool_cross_provider_retarget_enabled", False
+                        )
                     ),
                     # Persist the per-project enablement scope so a per-project
                     # enable (via /warm-pool/enable or the raw PATCH) survives a

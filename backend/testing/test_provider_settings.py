@@ -202,6 +202,49 @@ async def test_get_settings_includes_provider_settings_defaults(client):
     assert isinstance(body["provider_settings_defaults"]["anthropic"], dict)
 
 
+async def test_patch_settings_accepts_warm_pool_account_retarget(client):
+    """The warm-pool account-retarget flags must be settable via PATCH /settings.
+
+    They lived in the code gate (``is_warm_pool_account_retarget_enabled``) but
+    were absent from the validated settings allowlist, so the operator had no way
+    to enable account-agnostic leasing — which is why a small pool never hit on a
+    multi-account fleet (every member is pinned to one account; strict equality
+    misses the rest). Mutates the shared runtime_config, so it restores defaults.
+    """
+    from app.shared_state import runtime_config
+    from app.warm_pool import (
+        is_warm_pool_account_retarget_enabled,
+        is_warm_pool_cross_provider_retarget_enabled,
+    )
+
+    try:
+        res = await client.patch(
+            "/api/admin/settings",
+            json={
+                "warm_pool_account_retarget_enabled": True,
+                "warm_pool_cross_provider_retarget_enabled": False,
+            },
+        )
+        assert res.status_code == 200, res.text
+        assert is_warm_pool_account_retarget_enabled() is True
+        assert is_warm_pool_cross_provider_retarget_enabled() is False
+
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["warm_pool_account_retarget_enabled"] is True
+        assert body["warm_pool_cross_provider_retarget_enabled"] is False
+    finally:
+        runtime_config["warm_pool_account_retarget_enabled"] = False
+        runtime_config["warm_pool_cross_provider_retarget_enabled"] = False
+
+
+async def test_patch_settings_rejects_non_bool_account_retarget(client):
+    res = await client.patch(
+        "/api/admin/settings",
+        json={"warm_pool_account_retarget_enabled": "yes"},
+    )
+    assert res.status_code == 400
+
+
 async def test_patch_settings_accepts_valid_provider_settings_bag(client):
     payload = {
         "provider_settings_defaults": {
