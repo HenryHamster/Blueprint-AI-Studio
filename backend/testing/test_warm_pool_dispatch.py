@@ -804,3 +804,45 @@ async def test_cost_guard_disengaged_allows_lease(db_session, warm_pool_on):
 # warm_backlog_reuse (record_pool_lease_hit / record_pool_cold_dispatch /
 # record_pool_lease_miss); its coverage is in test_warm_pool_cost_metrics.py.
 # The duplicate trio that used to live in warm_pool was removed.
+
+
+@pytest.mark.asyncio
+async def test_no_idle_member_miss_is_attributed_to_account(db_session, warm_pool_on):
+    """A no_idle_member lease miss is attributed to the resolved account in the
+    funnel's by_account breakdown, not lumped under 'unattributed'.
+
+    Before this, try_pool_dispatch called record_pool_lease_miss('no_idle_member')
+    with no account, so every pool miss (and hit) showed as 'unattributed' in the
+    operator panel — the warm pool ran 0% hit for days and the breakdown gave no
+    clue why. The account makes per-account misses diagnosable.
+    """
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        get_pool_funnel_snapshot,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    project = await _make_project(db_session, name="Miss Attribution")
+    # No idle member exists for this project, so the lease misses (no_idle_member).
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+
+    leased = await _dispatch(db_session, task, account="acct-xyz")
+    assert leased is None
+
+    snap = get_pool_funnel_snapshot()
+    assert snap["lease_miss_by_reason"].get("no_idle_member") == 1
+    by_account = snap["by_account"]
+    assert by_account.get("acct-xyz", {}).get("lease_miss_total") == 1
+    assert (
+        by_account.get("acct-xyz", {})
+        .get("lease_miss_by_reason", {})
+        .get("no_idle_member")
+        == 1
+    )
+    # Not lumped into the unattributed bucket anymore.
+    assert by_account.get("unattributed", {}).get("lease_miss_total", 0) == 0

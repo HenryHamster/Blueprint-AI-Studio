@@ -739,7 +739,7 @@ async def try_pool_dispatch(
         return None
 
     if member is None:
-        record_pool_lease_miss("no_idle_member")
+        record_pool_lease_miss("no_idle_member", account=required_account)
         return None
 
     # In-flight-delete guard: never land a lease on a VM the orchestrator already

@@ -32,6 +32,25 @@ const stateWithFunnel: WarmVmStateResponse = {
   },
 };
 
+const stateWithPoolMisses: WarmVmStateResponse = {
+  ...baseState,
+  pool_metrics: {
+    enabled: true,
+    target_size: 2,
+    current_size: 2,
+    idle_count: 2,
+    funnel: {
+      window_hours: 24,
+      pool_lease_hits: 5,
+      cold_dispatches: 6,
+      total_dispatches: 11,
+      pool_hit_rate: 0.4545,
+      lease_miss_by_reason: { no_idle_member: 6 },
+      lease_miss_total: 6,
+    },
+  },
+};
+
 // Mutable cell so the payoff-verdict describe can inject an efficiency-axes
 // response (optionally carrying pool_payoff_verdict) without affecting the rest
 // of the suite, which keeps the default (no verdict → row absent).
@@ -211,6 +230,18 @@ describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
 
     await screen.findByText('backlog reuse');
     expect(screen.queryByText('Chain Continuity Funnel (24h)')).toBeNull();
+  });
+
+  test('renders pool lease-miss reasons when the funnel reports misses', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithPoolMisses), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const misses = await screen.findByTestId('pool-lease-misses');
+    expect(misses.textContent).toContain('misses');
+    expect(misses.textContent).toContain('6');
+    expect(misses.textContent).toContain('no_idle_member');
   });
 
   test('renders spawn pin funnel with mixed skip reasons when present', async () => {

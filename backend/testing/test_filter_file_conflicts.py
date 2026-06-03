@@ -13,22 +13,24 @@ from app.orchestrator_filters import filter_file_conflicts
 from testing.factories import make_task
 
 
-def _queued(project_id, files, scope="small", ttype="fix"):
+def _queued(project_id, files, scope="small", ttype="fix", parent=None):
     task = make_task(
         project_id=project_id,
         status=TaskStatus.QUEUED,
         context={"related_files": files, "scope": scope},
         payloads=[{"type": ttype}],
+        parent_task_id=parent,
     )
     return task
 
 
-def _in_progress(project_id, files):
+def _in_progress(project_id, files, parent=None):
     return make_task(
         project_id=project_id,
         status=TaskStatus.IN_PROGRESS,
         context={"related_files": files},
         payloads=[{"type": "fix"}],
+        parent_task_id=parent,
     )
 
 
@@ -68,10 +70,114 @@ class TestFilterFileConflicts:
         assert "file conflict" in (c.latest_status_message or "")
 
     @pytest.mark.asyncio
-    async def test_plan_type_deferred_on_single_file_overlap(self):
+    async def test_review_type_never_deferred_even_on_full_overlap(self):
+        """A review is read-only — it posts a verdict, not a diff — so it can
+        never conflict and must never be held behind in-flight writes (the
+        2026-06-03 spurious-hold bug: Review PR #7411 blocked by Fix #7415 on
+        hot-file overlap)."""
+        pid = uuid.uuid4()
+        # Full overlap + large scope: a WRITE task here would be deferred.
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="review")
+        ip = _in_progress(pid, ["a.py", "b.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_plan_type_not_deferred_because_read_only(self):
+        """plan is a read-only type (it produces a plan + spawns children, no PR),
+        so it is exempt from the write-conflict gate. (Previously plan deferred on
+        any overlap — that mis-applied a write-conflict gate to a no-diff task.)"""
         pid = uuid.uuid4()
         c = _queued(pid, ["a.py", "b.py"], scope="small", ttype="plan")
         ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+
+    @pytest.mark.asyncio
+    async def test_research_type_not_deferred_read_only(self):
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py"], scope="large", ttype="research")
+        ip = _in_progress(pid, ["a.py", "b.py", "c.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+
+    @pytest.mark.asyncio
+    async def test_write_type_still_deferred_on_overlap(self):
+        """Regression guard: WRITE types (fix here) are still gated — the
+        exemption must not disable the conflict filter for code-producing work."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="fix")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_cross_parent_overlap_not_deferred(self):
+        """Two WRITE tasks under DIFFERENT parents (different rollups) overlapping
+        a hot file are NOT held — they target different branches, so it's rarely a
+        real conflict; the merge/back-merge resolver catches the rare one."""
+        pid = uuid.uuid4()
+        parent_a, parent_b = uuid.uuid4(), uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="small", parent=parent_a)
+        ip = _in_progress(pid, ["a.py", "b.py"], parent=parent_b)
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_same_parent_overlap_still_deferred(self):
+        """Same-parent siblings (one plan's coordinated decomposition) merge to the
+        same rollup branch — keep gating their file overlap."""
+        pid = uuid.uuid4()
+        parent = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="small", parent=parent)
+        ip = _in_progress(pid, ["a.py", "b.py"], parent=parent)
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_large_scope_cross_parent_still_deferred(self):
+        """Large-scope tasks (wide rewrites) conflict broadly even across rollups —
+        the cross-parent looseness must NOT exempt them."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", parent=uuid.uuid4())
+        ip = _in_progress(pid, ["a.py"], parent=uuid.uuid4())
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_null_parent_overlap_stays_conservative_and_defers(self):
+        """Missing parent on either side → can't confirm independence → keep the
+        hold (conservative)."""
+        pid = uuid.uuid4()
+        # candidate has a parent, blocker does not → not confidently cross-parent.
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="small", parent=uuid.uuid4())
+        ip = _in_progress(pid, ["a.py", "b.py"], parent=None)
         session = MagicMock()
         broadcast_fn = AsyncMock()
 
