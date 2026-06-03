@@ -288,6 +288,7 @@ export async function handleStrategic(
         '  - `./fetch direction <id>` — full direction record (research_history capped at 20 cycles)',
         '  - `./fetch playbook <key>` — single playbook entry (e.g. `./fetch playbook frontend-build`)',
         '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
+        '  - `./fetch problem-model` — the FULL untrimmed problem_model (all gaps, friction, archived) if it was trimmed/dropped above',
       );
       return lines.join('\n');
     };

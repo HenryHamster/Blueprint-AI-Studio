@@ -5360,16 +5360,18 @@ def _mature_problem_model() -> dict:
 
 
 @pytest.mark.asyncio
-async def test_set_problem_model_api_refuses_cold_start_wipe_of_mature(
+async def test_set_problem_model_api_preserves_mature_on_bootstrap_payload(
     client, db_session
 ):
-    """API seam: a bootstrap-over-mature set_problem_model (empties all three
-    agent-owned collections over a non-empty durable model) must return 409 — not
-    a 500, not a silent 200 — and leave the stored problem_model untouched.
+    """API seam: a bootstrap-looking set_problem_model (only intent, no
+    agent-owned collections) over a non-empty durable model must succeed (200)
+    AND leave the existing capabilities/gaps/friction intact — the
+    non-destructive merge preserves entries the agent never echoed back.
 
     Guards the 'never silently wiped' guarantee end-to-end through
-    /api/agent/strategic (admin_agent_ops.strategic_operation catches
-    ColdStartWipeError and maps it to 409).
+    /api/agent/strategic: with merge semantics (main #7449) omission can no
+    longer wipe, so the prior reject-with-409 path is gone — preservation is
+    proven by the surviving collections, not a raised error.
     """
     from app.auth import create_agent_token
     from app.models import TaskStatus
@@ -5410,27 +5412,27 @@ async def test_set_problem_model_api_refuses_cold_start_wipe_of_mature(
         },
         headers={"x-agent-token": token},
     )
-    # Refused loudly with 409, and the error is actionable (fetch + edit).
-    assert resp.status_code == 409, resp.text
-    assert "fetch" in resp.text.lower()
+    # Accepted (200) — the merge applies the intent and bumps the revision.
+    assert resp.status_code == 200, resp.text
 
-    # The mature model survives intact — never silently wiped.
+    # The mature model's agent-owned collections survive intact — never wiped,
+    # even though the proposal omitted them entirely.
     await db_session.refresh(project)
-    assert project.problem_model["revision"] == 7
+    assert project.problem_model["revision"] == 8
     assert len(project.problem_model["capabilities"]) == 1
     assert len(project.problem_model["gaps"]) == 1
     assert len(project.problem_model["friction"]) == 1
 
 
 @pytest.mark.asyncio
-async def test_handle_strategic_completion_keeps_prior_model_on_cold_start_wipe(
+async def test_handle_strategic_completion_preserves_collections_on_bootstrap(
     db_session, mocker
 ):
-    """Completion-handler fallback: when the agent's final-output problem_model
-    would wipe a non-empty durable model (the payload dropped it), the handler
-    catches ColdStartWipeError, logs, and KEEPS the prior state rather than
-    silently erasing it. Mirrors the API-seam 409 guarantee on the
-    parse-from-logs path that _handle_strategic_completion uses.
+    """Completion-handler path: when the agent's final-output problem_model omits
+    the agent-owned collections (the payload dropped them), the non-destructive
+    merge preserves the prior capabilities/gaps/friction rather than erasing
+    them. Mirrors the API-seam preservation guarantee on the parse-from-logs
+    path that _handle_strategic_completion uses.
     """
     import json
     from unittest.mock import AsyncMock
@@ -5460,7 +5462,8 @@ async def test_handle_strategic_completion_keeps_prior_model_on_cold_start_wipe(
     await db_session.commit()
     await db_session.refresh(task)
 
-    # Final output that drops the mature model down to a cold-start bootstrap.
+    # Final output that omits the agent-owned collections (the payload dropped
+    # them) and carries only intent.
     logs = json.dumps(
         {
             "vision": {"purpose": "test", "revision": 2},
@@ -5470,9 +5473,10 @@ async def test_handle_strategic_completion_keeps_prior_model_on_cold_start_wipe(
 
     await _handle_strategic_completion(task, logs, db_session)
 
-    # Prior durable state preserved — not advanced, not wiped.
+    # Agent-owned collections preserved by the merge — never wiped. The model
+    # advances (revision bumps) since the merged update is applied.
     await db_session.refresh(project)
-    assert project.problem_model["revision"] == 7
+    assert project.problem_model["revision"] == 8
     assert len(project.problem_model["capabilities"]) == 1
     assert len(project.problem_model["gaps"]) == 1
     assert len(project.problem_model["friction"]) == 1
