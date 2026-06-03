@@ -1954,6 +1954,14 @@ async def _handle_design_doc_completion(
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
     from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
     from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
+    from app.strategic_events import emit_strategic_cycle_completed  # noqa: PLC0415
+
+    # Phase 1 emitted strategic_cycle_started at spawn time. Every path out of
+    # this handler that does NOT chain to Phase 2 must pair it with a
+    # strategic_cycle_completed so the frontend "Strategist working…" indicator
+    # never sticks on. Only a successful _spawn_strategic_review (which emits its
+    # own Phase-2 started) is exempt — that keeps the cycle visibly active.
+    phase2_spawned = False
 
     if project is None:
         # Legacy / direct-caller path: acquire the lock here. Post-commit
@@ -1980,6 +1988,8 @@ async def _handle_design_doc_completion(
                 session,
                 f"Design doc update failed: project not found (task {str(task.id)[:8]})",
             )
+            # Phase 1 ended without chaining — close the cycle for the UI.
+            await emit_strategic_cycle_completed(task.project_id, task.id, 1)
             return
         logger.warning(
             f"[DESIGN DOC] Task {task.id}: project {task.project_id} held under contention "
@@ -1990,6 +2000,8 @@ async def _handle_design_doc_completion(
             session,
             f"Design doc update: project row contended (task {str(task.id)[:8]}) — strategic chain deferred",
         )
+        # Phase 1 ended without chaining — close the cycle for the UI.
+        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
         return
 
     doc = project.design_doc or {}
@@ -2018,6 +2030,7 @@ async def _handle_design_doc_completion(
         # strategic-completion handlers.
         spawned = await _spawn_strategic_review(project, session, cycle_id=cycle_id)
         if spawned:
+            phase2_spawned = True
             task.latest_status_message = (
                 f"Design doc: {page_count} pages, rev {rev} — strategic review spawned"
             )
@@ -2081,6 +2094,12 @@ async def _handle_design_doc_completion(
     # eventual strategic cycle_summary carries the user-facing narrative.
     session.add(task)
     await session.commit()
+    # Post-commit: when Phase 2 was NOT spawned (deferred because an active
+    # strategic task exists, or the spawn raised), the Phase-1 started event is
+    # otherwise never paired. Emit completed so the indicator clears. A
+    # successful spawn already emitted a Phase-2 started, so it is skipped.
+    if not phase2_spawned:
+        await emit_strategic_cycle_completed(task.project_id, task.id, 1)
 
 
 async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) -> None:

@@ -1688,6 +1688,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         baseline_problem_model=project.problem_model or {},
     )
     await session.commit()
+    # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
+    from app.strategic_events import emit_strategic_cycle_started
+
+    await emit_strategic_cycle_started(project.id, new_task.id, 1)
     logger.info(
         f"[STRATEGIC] Spawned design_doc_update task {new_task.id} for project {project.id} (cycle {cycle_id})"
     )
@@ -2831,6 +2835,10 @@ async def _spawn_strategic_review(
             phase2_task_id=new_task.id,
         )
     await session.commit()
+    # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
+    from app.strategic_events import emit_strategic_cycle_started
+
+    await emit_strategic_cycle_started(project.id, new_task.id, 2)
     logger.info(
         f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project.id}"
     )

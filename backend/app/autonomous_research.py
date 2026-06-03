@@ -130,6 +130,55 @@ async def _spawn_research_task(project: Project, session: AsyncSession):
         return await _spawn_research_task_inner(project, session)
 
 
+async def _maybe_notify_operator_refresh_deferred(
+    project: Project, session: AsyncSession, reason: str
+) -> None:
+    """Surface, exactly once, that an operator steering refresh was deferred.
+
+    An operator steering request routes through the coalesced strategic-refresh
+    marker. When it cannot schedule the strategist immediately (a cycle is
+    already running, or a residual gate holds it), the operator must be told
+    *why* rather than left with silence — never a silent swallow. Only fires for
+    an operator-origin pending marker that has not already been notified; sets
+    the ``notified`` flag so subsequent ticks stay quiet until the request
+    re-arms or is consumed. Best-effort and non-fatal.
+    """
+    from app.strategic_trigger import (
+        ORIGIN_OPERATOR,
+        mark_strategic_refresh_notified,
+        strategic_refresh_notified,
+        strategic_refresh_origin,
+    )
+
+    vision = project.vision or {}
+    if strategic_refresh_origin(vision) != ORIGIN_OPERATOR:
+        return
+    if strategic_refresh_notified(vision):
+        return
+    try:
+        from app.notification_dispatch import (
+            post_strategic_steering_deferred_message,
+        )
+
+        await post_strategic_steering_deferred_message(session, project.id, reason)
+        await with_vision_locked(
+            session, project.id, mark_strategic_refresh_notified
+        )
+        await session.commit()
+        logger.info(
+            "[STRATEGIC] operator steering refresh deferred for project %s (%s) "
+            "— posted one-time deferral notice",
+            project.id,
+            reason,
+        )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] failed to post operator steering deferral notice for "
+            "project %s",
+            project.id,
+        )
+
+
 async def _fetch_direction_reasoning_memos(
     project_id,
     direction_id: str,
@@ -457,6 +506,19 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         or not any_active_in_project
         or all_dirs_saturated
     )
+    # An operator steering refresh must schedule the strategist promptly even
+    # when the failure breaker would otherwise suppress forcing (and the
+    # `not active_directions` early-return below) — that is exactly the moment an
+    # operator needs to intervene. The active-cycle / min-interval gates in the
+    # spawn block still apply (and surface a one-time deferral notice); only the
+    # _strategic_failures breaker is bypassed for operator intent.
+    from app.strategic_trigger import (
+        ORIGIN_OPERATOR as _ORIGIN_OPERATOR,
+        strategic_refresh_origin as _strategic_refresh_origin,
+    )
+
+    if _strategic_refresh_origin(vision_data) == _ORIGIN_OPERATOR:
+        force_strategic = True
     # Wall-clock backstop: must drive force_strategic so it bypasses the
     # `not active_directions` early return below. Without this promotion, when
     # every active direction has an in-flight child (busy_direction_ids),
@@ -796,6 +858,14 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 f"[STRATEGIC] Skipping strategic spawn — {has_active_strategic} active "
                 f"strategic task(s) exist for project {project.id}; falling through to tactical"
             )
+            # An operator steering request is deferred behind the running cycle
+            # (it will consume on the follow-up tick). Surface that once so the
+            # operator knows their message is queued, not silently swallowed.
+            await _maybe_notify_operator_refresh_deferred(
+                project,
+                session,
+                "queued behind an active strategic cycle",
+            )
             is_strategic = (
                 False  # skip the spawn block; tactical research below may still fire
             )
@@ -825,12 +895,23 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # guards against. Gated by the _strategic_failures breaker (< 3)
                 # and a min-interval floor, so a broken request that keeps
                 # failing stops bypassing instead of looping.
-                from app.strategic_trigger import strategic_refresh_due
+                from app.strategic_trigger import (
+                    refresh_breaker_applies,
+                    strategic_refresh_due,
+                )
 
                 _refresh_min_interval = _runtime_config.get(
                     "strategic_refresh_min_interval_seconds", 120
                 )
-                _refresh_due = strategic_failures < 3 and strategic_refresh_due(
+                # Operator steering bypasses the _strategic_failures breaker — an
+                # explicit human request is exactly when an operator needs to
+                # intervene (and exactly when the breaker is likely tripped).
+                # Automated qualification refreshes still park under the breaker.
+                _breaker_gate_ok = (
+                    not refresh_breaker_applies(project.vision)
+                    or strategic_failures < 3
+                )
+                _refresh_due = _breaker_gate_ok and strategic_refresh_due(
                     project.vision, now, min_interval_seconds=_refresh_min_interval
                 )
                 if _refresh_due:

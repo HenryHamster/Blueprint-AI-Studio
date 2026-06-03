@@ -1928,6 +1928,11 @@ async def _handle_strategic_completion(
             session, project, task, retired_ids, retired_rationales
         )
         await session.commit()
+        # Post-commit: the live strategic ops already emitted per-write
+        # `strategic_updated` events during execution; here we close the cycle.
+        from app.strategic_events import emit_strategic_cycle_completed
+
+        await emit_strategic_cycle_completed(task.project_id, task.id, 2)
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
         )
@@ -1964,6 +1969,10 @@ async def _handle_strategic_completion(
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
         await session.commit()
+        # Post-commit: the cycle ended (in failure) — close it for the UI.
+        from app.strategic_events import emit_strategic_cycle_completed
+
+        await emit_strategic_cycle_completed(task.project_id, task.id, 2)
         failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
         logger.warning(
             f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})"
@@ -2837,6 +2846,23 @@ async def _handle_strategic_completion(
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status
+    # Post-commit: notify the admin UI of every strategist output this
+    # legacy-parse path wrote, then close the cycle. Tiny refetch signals.
+    from app.strategic_events import (
+        STRATEGIC_KIND_DIRECTIONS,
+        STRATEGIC_KIND_PROBLEM_MODEL,
+        STRATEGIC_KIND_RUNNING_UPDATE,
+        emit_strategic_cycle_completed,
+        emit_strategic_updated,
+    )
+
+    if isinstance(new_running_update, str):
+        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_RUNNING_UPDATE)
+    if new_problem_model and isinstance(new_problem_model, dict):
+        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_PROBLEM_MODEL)
+    if ops_applied or retires_applied:
+        await emit_strategic_updated(task.project_id, STRATEGIC_KIND_DIRECTIONS)
+    await emit_strategic_cycle_completed(task.project_id, task.id, 2)
     logger.info(
         f"[STRATEGIC] Task {task.id} complete: vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} msgs created, {msgs_resolved} resolved"
     )

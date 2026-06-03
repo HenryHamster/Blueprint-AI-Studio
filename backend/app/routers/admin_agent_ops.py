@@ -22,6 +22,12 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.database import get_session
+from app.strategic_events import (
+    STRATEGIC_KIND_DIRECTIONS,
+    STRATEGIC_KIND_PROBLEM_MODEL,
+    STRATEGIC_KIND_RUNNING_UPDATE,
+    emit_strategic_updated,
+)
 from app.direction_lifecycle import _reset_outcome_detection_state
 from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.payload_schemas import (
@@ -603,6 +609,14 @@ async def strategic_operation(
             body["warnings"] = list(warnings)
         return body
 
+    async def _emit_updated(kind: str) -> None:
+        """Post-commit refetch signal for a strategist output change.
+
+        Must be awaited only AFTER the op's ``session.commit()``; the lock is
+        already released by then, mirroring the established broadcast pattern.
+        """
+        await emit_strategic_updated(project.id, kind)
+
     if payload.op == "set_vision":
         if not isinstance(data, dict) or not data.get("purpose"):
             raise HTTPException(
@@ -770,6 +784,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
             f"[STRATEGIC API] Created direction '{text[:60]}' for project {project.id}"
         )
@@ -924,6 +939,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
         return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
 
@@ -966,6 +982,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
         # Advisory (non-blocking): each active direction is one parallel work-lane
         # the fleet fans out across, so retiring below the healthy floor caps max
@@ -1051,6 +1068,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
             f"[STRATEGIC API] Approved proposal {dir_id} for project {project.id}"
         )
@@ -1132,6 +1150,7 @@ async def strategic_operation(
             # router, and _ensure_vm_deleted is defined in main.py.
             from app.vm_lifecycle import _ensure_vm_deleted as _main_ensure_vm_deleted
             await _main_ensure_vm_deleted(vm_id, reason="proposal_rejected")
+        await _emit_updated(STRATEGIC_KIND_DIRECTIONS)
         logger.info(
             f"[STRATEGIC API] Rejected proposal {dir_id} for project {project.id} (cancelled {len(cancelled_tasks)} tasks)"
         )
@@ -1439,6 +1458,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_PROBLEM_MODEL)
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
             f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"
@@ -1497,6 +1517,7 @@ async def strategic_operation(
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
+        await _emit_updated(STRATEGIC_KIND_RUNNING_UPDATE)
         logger.info(
             f"[STRATEGIC API] Set running_update for project {project.id} "
             f"(length: {len(doc)} chars)"

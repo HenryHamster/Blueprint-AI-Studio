@@ -502,6 +502,28 @@ async def post_event_message(
     return msg
 
 
+async def post_strategic_steering_deferred_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    reason: str,
+) -> ProjectMessage:
+    """Post a visible system message when an operator steering request is deferred.
+
+    An operator steering message routes through the coalesced strategic-refresh
+    marker. When it cannot schedule the strategist immediately (a strategic
+    cycle is already running, or a residual gate holds it), the operator must be
+    told *why* rather than left with silence. ``reason`` is a short
+    human-readable explanation (e.g. "queued behind an active strategic cycle").
+    """
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="strategic_steering_deferred",
+        summary=f"Strategic steering request deferred — {reason}",
+        context={"reason": reason},
+    )
+
+
 async def post_pr_merged_message(
     session: AsyncSession,
     project_id: uuid.UUID,

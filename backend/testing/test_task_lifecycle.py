@@ -2527,6 +2527,55 @@ async def test_process_post_commit_omits_unsent_timing_fields(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_type,expected_phase",
+    [("design_doc_update", 1), ("strategic_review", 2)],
+)
+@pytest.mark.parametrize(
+    "status", [TaskStatus.FAILED, TaskStatus.CANCELLED]
+)
+async def test_process_post_commit_emits_cycle_completed_on_terminal_strategic(
+    tl_db, mocker, task_type, expected_phase, status
+):
+    """A strategic task that terminates FAILED/CANCELLED never reaches the
+    COMPLETED completion handlers, so the lifecycle backstop must emit
+    strategic_cycle_completed to clear the frontend "Strategist working…"
+    indicator (review iter-1 MAJOR, task_lifecycle.py:4006)."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type=task_type, status=status
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    payload = AgentStatusPayload(task_id=task.id, status=status)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    emit.assert_awaited_once_with(task.project_id, task.id, expected_phase)
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_no_cycle_completed_for_nonstrategic_failure(
+    tl_db, mocker
+):
+    """The terminal-failure backstop is gated on strategic task types — a
+    non-strategic FAILED task must NOT emit strategic_cycle_completed."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session, project.id, task_type="fix", status=TaskStatus.FAILED
+    )
+    emit = AsyncMock()
+    mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.FAILED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_process_post_commit_transient_handler_failure_requeues_after_rollback(
     tl_db, mocker
 ):

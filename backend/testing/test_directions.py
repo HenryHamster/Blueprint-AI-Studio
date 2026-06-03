@@ -7417,3 +7417,38 @@ async def test_operator_message_burst_coalesces_into_one_slot(
     # Single slot — two messages bumped the observability count, not stacked.
     assert marker["count"] == 2
     assert marker["reason"] == "operator_message"
+
+
+@pytest.mark.asyncio
+async def test_add_direction_emits_strategic_updated(client: AsyncClient, mocker):
+    """POST /directions broadcasts a strategic_updated(directions) refetch signal."""
+    project_id = await _deploy_project(client, mocker)
+    bcast = mocker.patch(
+        "app.strategic_events.broadcast_to_project", new=AsyncMock()
+    )
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions",
+        json={"text": "Live-refresh signal", "priority": "medium"},
+    )
+    assert resp.status_code == 200, resp.text
+    events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
+    assert len(events) == 1, "expected one strategic_updated broadcast"
+    assert events[0][0] == str(project_id)
+    assert events[0][2] == {"kind": "directions"}
+
+
+@pytest.mark.asyncio
+async def test_remove_direction_emits_strategic_updated(client: AsyncClient, mocker):
+    """DELETE /directions/{id} broadcasts a strategic_updated(directions) signal."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+    bcast = mocker.patch(
+        "app.strategic_events.broadcast_to_project", new=AsyncMock()
+    )
+    resp = await client.delete(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}"
+    )
+    assert resp.status_code == 200, resp.text
+    events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
+    assert len(events) == 1
+    assert events[0][2] == {"kind": "directions"}

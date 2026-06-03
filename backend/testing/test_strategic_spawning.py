@@ -6489,3 +6489,76 @@ async def test_deploy_framing_uses_project_branch_names_not_hardcoded(db_session
     # No Blueprint-specific branch literals leak into a non-Blueprint project.
     assert "automain" not in suffix
     assert "`main`" not in suffix
+
+
+# ── Realtime strategic_cycle_started emission (see app.strategic_events) ───────
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_emits_cycle_started(db_session):
+    """_spawn_strategic_review broadcasts strategic_cycle_started (phase 2) post-commit."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-evt01",
+                "status": "active",
+                "text": "A direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    with patch(
+        "app.strategic_events.broadcast_to_project", new=AsyncMock()
+    ) as mock_bcast:
+        spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    started = [
+        c.args
+        for c in mock_bcast.await_args_list
+        if c.args[1] == "strategic_cycle_started"
+    ]
+    assert len(started) == 1, "expected exactly one strategic_cycle_started broadcast"
+    _proj_id, _event, data = started[0]
+    assert _proj_id == str(project.id)
+    assert data["phase"] == 2
+    assert data.get("task_id")
+
+
+@pytest.mark.asyncio
+async def test_arch_cycle_emits_cycle_started_phase1(db_session):
+    """A design_doc_update spawn broadcasts strategic_cycle_started with phase 1."""
+    project = _make_project(
+        vision={
+            "_strategic_cycle_count": 2,
+            "_research_spawn_count": 5,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
+    _shared_state.runtime_config["architecture_review_frequency"] = 3
+    try:
+        with patch(
+            "app.strategic_events.broadcast_to_project", new=AsyncMock()
+        ) as mock_bcast:
+            await _spawn_research_task(project, db_session)
+    finally:
+        _shared_state.runtime_config["architecture_review_frequency"] = old
+
+    started = [
+        c.args
+        for c in mock_bcast.await_args_list
+        if c.args[1] == "strategic_cycle_started"
+    ]
+    assert len(started) == 1, "expected one strategic_cycle_started for the arch spawn"
+    assert started[0][2]["phase"] == 1

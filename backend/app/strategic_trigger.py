@@ -51,16 +51,34 @@ _LAST_FIRED_KEY = "_strategic_refresh_last_fired_at"
 
 DEFAULT_MIN_INTERVAL_SECONDS = 120
 
+# Marker origins. ``qualification`` is the original automated trigger (a
+# resolved qualification verdict); ``operator`` is an explicit human steering
+# request routed through the live-chat foundation. Operator intent outranks the
+# automated path: it bypasses the failure breaker (an operator steers *because*
+# the strategist is failing) and its deferral is surfaced to the operator
+# rather than silently parked.
+ORIGIN_QUALIFICATION = "qualification"
+ORIGIN_OPERATOR = "operator"
 
-async def request_strategic_refresh(session, project_id, reason: str) -> None:
+
+async def request_strategic_refresh(
+    session, project_id, reason: str, *, origin: str = ORIGIN_QUALIFICATION
+) -> None:
     """Coalesced: record that the strategic loop owes a refresh.
 
     Single-slot — repeated calls collapse into ONE pending marker (it cannot
-    stack). Called when a trigger (a resolved qualification verdict) could not
-    spawn a strategic_review immediately because a cycle was already active.
-    The autonomous loop consumes the marker as soon as the active cycle clears,
-    bypassing the ``strategic_spawn_cooldown`` that would otherwise delay the
-    refresh.
+    stack). Called when a trigger (a resolved qualification verdict, or an
+    explicit operator steering request) could not spawn a strategic_review
+    immediately because a cycle was already active. The autonomous loop consumes
+    the marker as soon as the active cycle clears, bypassing the
+    ``strategic_spawn_cooldown`` that would otherwise delay the refresh.
+
+    ``origin`` discriminates an automated qualification refresh (default) from a
+    higher-priority operator steering request. When coalescing, an operator
+    origin is *sticky* — it is never downgraded back to qualification, so a
+    human request that lands on top of (or beneath) an automated one keeps its
+    breaker-bypass and visibility semantics. Re-arming also clears any stale
+    ``notified`` flag so a fresh request can re-surface a deferral.
 
     Best-effort and non-fatal: a failure here just falls back to the loop's
     normal cadence/wall-clock backstop. Does NOT commit — the caller owns the
@@ -81,11 +99,20 @@ async def request_strategic_refresh(session, project_id, reason: str) -> None:
             # staleness is visible, refresh the reason, bump an observability count.
             existing["reason"] = reason
             existing["count"] = int(existing.get("count") or 1) + 1
+            # Operator intent is sticky and never downgraded by a later
+            # automated refresh; a later operator refresh upgrades an automated
+            # slot. A fresh request re-arms the one-time deferral notice.
+            if origin == ORIGIN_OPERATOR or existing.get("origin") == ORIGIN_OPERATOR:
+                existing["origin"] = ORIGIN_OPERATOR
+            else:
+                existing["origin"] = origin
+            existing.pop("notified", None)
         else:
             vision[_REFRESH_KEY] = {
                 "requested_at": _utcnow().isoformat(),
                 "reason": reason,
                 "count": 1,
+                "origin": origin,
             }
 
     try:
@@ -113,6 +140,48 @@ async def request_strategic_refresh(session, project_id, reason: str) -> None:
 def strategic_refresh_pending(vision: dict | None) -> bool:
     """True when a refresh marker is set (a refresh is owed)."""
     return isinstance((vision or {}).get(_REFRESH_KEY), dict)
+
+
+def strategic_refresh_origin(vision: dict | None) -> str | None:
+    """Origin of the pending refresh marker, or ``None`` when no marker is set.
+
+    Markers written before the ``origin`` field existed default to
+    ``qualification`` (the only path that set markers then), preserving the
+    legacy park-on-broken-loop behavior.
+    """
+    marker = (vision or {}).get(_REFRESH_KEY)
+    if not isinstance(marker, dict):
+        return None
+    return marker.get("origin") or ORIGIN_QUALIFICATION
+
+
+def refresh_breaker_applies(vision: dict | None) -> bool:
+    """True when the ``_strategic_failures`` breaker should gate the pending refresh.
+
+    Automated (qualification) refreshes keep the breaker gate — a broken loop
+    whose spawned cycles keep failing parks instead of looping. Operator
+    steering refreshes bypass it: an explicit human request is *exactly* when an
+    operator needs to intervene, which is precisely when the breaker would be
+    tripped. With no marker pending the question is moot; return False.
+    """
+    return strategic_refresh_origin(vision) == ORIGIN_QUALIFICATION
+
+
+def strategic_refresh_notified(vision: dict | None) -> bool:
+    """True when the pending marker's one-time deferral notice was already sent."""
+    marker = (vision or {}).get(_REFRESH_KEY)
+    return isinstance(marker, dict) and bool(marker.get("notified"))
+
+
+def mark_strategic_refresh_notified(vision: dict) -> None:
+    """Stamp the pending marker as notified (mutate-fn for ``with_vision_locked``).
+
+    Idempotent: a no-op when no marker is pending. Setting this flag keeps
+    subsequent ticks quiet so a deferral message is emitted exactly once per
+    pending request (re-armed when ``request_strategic_refresh`` re-marks)."""
+    marker = vision.get(_REFRESH_KEY)
+    if isinstance(marker, dict):
+        marker["notified"] = True
 
 
 def strategic_refresh_due(

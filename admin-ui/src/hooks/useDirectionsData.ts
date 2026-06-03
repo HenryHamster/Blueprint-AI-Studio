@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { apiFetch } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
@@ -8,6 +8,9 @@ import type { ProblemModel } from '../types';
 interface UseDirectionsDataDeps {
   selectedProjectId: string | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
+  // Optional ref the live WS handler (useLogViewer) calls to trigger a refetch
+  // when the strategist emits an update. Populated here, reset to a no-op on unmount.
+  fetchDirectionsRef?: React.MutableRefObject<() => void>;
 }
 
 /**
@@ -18,7 +21,7 @@ interface UseDirectionsDataDeps {
  * (rather than in the panel) so they share the same `fetchDirections` /
  * `setError` / `addToast` closures the API handlers below rely on.
  */
-export function useDirectionsData({ selectedProjectId, addToast }: UseDirectionsDataDeps) {
+export function useDirectionsData({ selectedProjectId, addToast, fetchDirectionsRef }: UseDirectionsDataDeps) {
   const [directions, setDirections] = useState<Direction[]>([]);
   const [autonomousEnabled, setAutonomousEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -57,6 +60,21 @@ export function useDirectionsData({ selectedProjectId, addToast }: UseDirections
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProjectId]);
+
+  // Always points at the latest fetchDirections closure (recreated each render).
+  const fetchDirectionsLatestRef = useRef(fetchDirections);
+  fetchDirectionsLatestRef.current = fetchDirections;
+
+  // Register a stable callback into the externally-owned ref so the live WS
+  // handler can trigger a refetch. Reset to a no-op on unmount to avoid a
+  // stale-closure setState after the panel closes.
+  useEffect(() => {
+    if (!fetchDirectionsRef) return;
+    fetchDirectionsRef.current = () => fetchDirectionsLatestRef.current();
+    return () => {
+      fetchDirectionsRef.current = () => {};
+    };
+  }, [fetchDirectionsRef]);
 
   async function fetchDirections() {
     setLoading(true);

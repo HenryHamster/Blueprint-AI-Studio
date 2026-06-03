@@ -1225,6 +1225,8 @@ export default function App() {
           addToast={s.addToast}
           selectedProjectId={s.selectedProjectId}
           projects={s.projects}
+          fetchDirectionsRef={s.fetchDirectionsRef}
+          strategistActive={s.strategistActive}
           onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

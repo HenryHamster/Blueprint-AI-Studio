@@ -3574,6 +3574,69 @@ async def test_strategic_completion_no_api_no_logs_increments_failures(
 
 
 @pytest.mark.asyncio
+async def test_strategic_op_emits_strategic_updated(strategic_db, mocker):
+    """A live strategic write op broadcasts a strategic_updated refetch signal.
+
+    set_running_update → kind 'running_update'; set_problem_model → kind
+    'problem_model'. Each op routes through the shared strategic_events helper
+    AFTER its commit, so the directions view stays live regardless of origin.
+    """
+    from unittest.mock import AsyncMock
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    project = Project(name="P", user_id="u1", vision={"purpose": "p"})
+    strategic_db.add(project)
+    await strategic_db.commit()
+    await strategic_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+    )
+    strategic_db.add(task)
+    await strategic_db.commit()
+    await strategic_db.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield strategic_db
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+    bcast = mocker.patch("app.strategic_events.broadcast_to_project", new=AsyncMock())
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": "# Living update"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+    events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
+    assert len(events) == 1, "expected one strategic_updated broadcast"
+    assert events[0][0] == str(project.id)
+    assert events[0][2] == {"kind": "running_update"}
+
+
+@pytest.mark.asyncio
 async def test_set_vision_preserves_internal_tracking_fields(strategic_db, mocker):
     """set_vision must not wipe _-prefixed internal fields from the old vision."""
     from httpx import AsyncClient, ASGITransport

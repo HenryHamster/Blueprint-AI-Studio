@@ -26,6 +26,7 @@ from app.admin import _get_user_project, _get_user_project_with_role
 from app.payload_schemas import validate_internal_payload
 from app.task_locking import lock_project_or_429, with_directions_locked
 from app.direction_lifecycle import _reset_outcome_detection_state
+from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 
 logger = logging.getLogger(__name__)
 
@@ -233,6 +234,7 @@ async def add_direction(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
     return {"direction": direction}
 
@@ -315,6 +317,7 @@ async def replace_directions(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"directions": normalized}
 
 
@@ -384,6 +387,7 @@ async def remove_direction(
             vm_ids_to_delete.append(t.vm_instance_id)
 
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
     # Delete VMs for cancelled tasks (after commit)
     for vm_id in vm_ids_to_delete:
@@ -434,6 +438,7 @@ async def reorder_directions(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"directions": reordered}
 
 
@@ -737,6 +742,7 @@ async def update_direction(
             headers={"Retry-After": "2"},
         )
     await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"direction": updated_direction[0]}
 
 

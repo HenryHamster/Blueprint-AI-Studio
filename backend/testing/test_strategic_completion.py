@@ -7554,3 +7554,82 @@ class TestRecordOutcomeProgressSnapshotPostReset:
         # No _reset_scaffolding_state_on_outcome_change call → no baseline.
         record_outcome_progress_snapshot(d)
         assert d.get("outcome_progress_ever_met") is True
+
+
+class TestDesignDocCompletionStrategistEvent:
+    """Phase 1 (design_doc_update) must pair its spawn-time
+    strategic_cycle_started with a strategic_cycle_completed on every path that
+    does NOT chain to Phase 2 — otherwise the frontend "Strategist working…"
+    indicator sticks on (review iter-1 MAJOR, task_completion.py:1929)."""
+
+    @pytest.mark.asyncio
+    async def test_emits_completed_when_phase2_deferred(self, strat_fail_db, mocker):
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        task = await _make_failure_task(strat_fail_db, project, task_type="design_doc_update")
+
+        # Phase-2 spawn deferred (active strategic task exists).
+        mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(return_value=False),
+        )
+        emit = AsyncMock()
+        mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        emit.assert_awaited_once_with(project.id, task.id, 1)
+
+    @pytest.mark.asyncio
+    async def test_emits_completed_when_phase2_spawn_raises(self, strat_fail_db, mocker):
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        task = await _make_failure_task(strat_fail_db, project, task_type="design_doc_update")
+
+        mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(side_effect=RuntimeError("spawn boom")),
+        )
+        mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
+        emit = AsyncMock()
+        mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        emit.assert_awaited_once_with(project.id, task.id, 1)
+
+    @pytest.mark.asyncio
+    async def test_no_completed_emit_when_phase2_spawns(self, strat_fail_db, mocker):
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+
+        project = Project(name="P", user_id="u1", vision={"purpose": "test"})
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+        task = await _make_failure_task(strat_fail_db, project, task_type="design_doc_update")
+
+        # Successful Phase-2 spawn emits its OWN started — the cycle stays active,
+        # so Phase 1 must NOT emit completed here.
+        mocker.patch(
+            "app.strategic_spawning._spawn_strategic_review",
+            new=AsyncMock(return_value=True),
+        )
+        emit = AsyncMock()
+        mocker.patch("app.strategic_events.emit_strategic_cycle_completed", new=emit)
+
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        emit.assert_not_awaited()

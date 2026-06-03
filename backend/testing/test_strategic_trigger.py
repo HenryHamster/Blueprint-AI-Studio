@@ -86,6 +86,68 @@ def test_clear_noop_when_no_marker_does_not_stamp():
 
 
 # ===========================================================================
+# Origin discriminator + breaker applicability + notified flag — pure helpers
+# ===========================================================================
+
+
+def test_origin_none_when_no_marker():
+    assert st.strategic_refresh_origin(None) is None
+    assert st.strategic_refresh_origin({}) is None
+
+
+def test_origin_defaults_to_qualification_for_legacy_marker():
+    """A marker written before ``origin`` existed must read as qualification, so
+    the legacy park-on-broken-loop behavior is preserved."""
+    vision = {"_strategic_refresh": {"reason": "r", "count": 1}}
+    assert st.strategic_refresh_origin(vision) == st.ORIGIN_QUALIFICATION
+
+
+def test_origin_reflects_operator_marker():
+    vision = {"_strategic_refresh": {"reason": "r", "origin": st.ORIGIN_OPERATOR}}
+    assert st.strategic_refresh_origin(vision) == st.ORIGIN_OPERATOR
+
+
+def test_breaker_applies_to_qualification_not_operator():
+    qual = {"_strategic_refresh": {"reason": "r", "origin": st.ORIGIN_QUALIFICATION}}
+    oper = {"_strategic_refresh": {"reason": "r", "origin": st.ORIGIN_OPERATOR}}
+    legacy = {"_strategic_refresh": {"reason": "r"}}
+    assert st.refresh_breaker_applies(qual) is True
+    assert st.refresh_breaker_applies(legacy) is True  # legacy → qualification
+    assert st.refresh_breaker_applies(oper) is False  # operator bypasses breaker
+    assert st.refresh_breaker_applies({}) is False  # nothing pending → moot
+
+
+def test_notified_flag_set_and_read():
+    vision = {"_strategic_refresh": {"reason": "r", "origin": st.ORIGIN_OPERATOR}}
+    assert st.strategic_refresh_notified(vision) is False
+    st.mark_strategic_refresh_notified(vision)
+    assert st.strategic_refresh_notified(vision) is True
+    assert vision["_strategic_refresh"]["notified"] is True
+
+
+def test_mark_notified_noop_without_marker():
+    vision = {"other": 1}
+    st.mark_strategic_refresh_notified(vision)  # must not raise / create a slot
+    assert "_strategic_refresh" not in vision
+
+
+def test_clear_drops_origin_and_notified_on_consume():
+    """Consuming clears the whole marker (origin + notified), so a fresh request
+    starts clean."""
+    now = _utcnow()
+    vision = {
+        "_strategic_refresh": {
+            "reason": "r",
+            "origin": st.ORIGIN_OPERATOR,
+            "notified": True,
+        }
+    }
+    st.clear_strategic_refresh(vision, now)
+    assert "_strategic_refresh" not in vision
+    assert st.strategic_refresh_origin(vision) is None
+
+
+# ===========================================================================
 # Durable set + coalescing — with DB
 # ===========================================================================
 
@@ -136,3 +198,72 @@ async def test_request_is_single_slot_coalesced(db_session):
     assert marker["count"] == 6  # coalesced, not 6 separate markers
     assert marker["requested_at"] == first_at  # original request time preserved
     assert marker["reason"] == "post_qualification:not_promoted"  # latest reason
+
+
+@pytest.mark.asyncio
+async def test_request_defaults_origin_to_qualification(db_session):
+    """A positional 3-arg call (the release_qualifier path) must default origin to
+    qualification, preserving the existing breaker-park behavior."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(db_session, project.id, "post_qualification:promoted")
+    await db_session.commit()
+    await db_session.refresh(project)
+    marker = project.vision["_strategic_refresh"]
+    assert marker["origin"] == st.ORIGIN_QUALIFICATION
+    assert st.refresh_breaker_applies(project.vision) is True
+
+
+@pytest.mark.asyncio
+async def test_request_persists_operator_origin(db_session):
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert st.strategic_refresh_origin(project.vision) == st.ORIGIN_OPERATOR
+    assert st.refresh_breaker_applies(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_operator_origin_is_sticky_when_coalesced(db_session):
+    """An operator request must not be downgraded by a later automated refresh,
+    and re-arming must clear a prior one-time deferral notice."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    # Simulate that the deferral notice was already emitted.
+    project.vision["_strategic_refresh"]["notified"] = True
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "vision")
+    await db_session.commit()
+
+    # A later automated (qualification) refresh coalesces in.
+    await st.request_strategic_refresh(db_session, project.id, "post_qualification:promoted")
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    marker = project.vision["_strategic_refresh"]
+    assert marker["origin"] == st.ORIGIN_OPERATOR  # sticky — not downgraded
+    assert "notified" not in marker  # re-armed so a fresh deferral can surface
+    assert marker["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_operator_origin_upgrades_existing_qualification(db_session):
+    """A qualification marker upgraded by a later operator request becomes
+    operator-origin (breaker-bypassing)."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(db_session, project.id, "post_qualification:promoted")
+    await db_session.commit()
+    await st.request_strategic_refresh(
+        db_session, project.id, "operator_steering", origin=st.ORIGIN_OPERATOR
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert st.strategic_refresh_origin(project.vision) == st.ORIGIN_OPERATOR
+    assert st.refresh_breaker_applies(project.vision) is False

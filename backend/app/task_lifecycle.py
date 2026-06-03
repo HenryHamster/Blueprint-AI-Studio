@@ -4100,6 +4100,27 @@ async def _process_post_commit(
             {"task_id": str(task.id), "status": payload.status},
         )
 
+        # Strategist-indicator backstop: a strategic task (design_doc_update /
+        # strategic_review) that terminates FAILED/CANCELLED (VM crash, timeout)
+        # never reaches the COMPLETED completion handlers that emit
+        # strategic_cycle_completed, so the frontend "Strategist working…"
+        # indicator would stick on. Pair the spawn-time strategic_cycle_started
+        # here. COMPLETED is deliberately excluded — the completion handlers own
+        # that emit, and a COMPLETED design_doc_update that chained to Phase 2
+        # must keep the cycle active.
+        _peek_strategic_type = task.first_payload.get("type", "")
+        if _peek_strategic_type in (
+            "design_doc_update",
+            "strategic_review",
+        ) and payload.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+            from app.strategic_events import emit_strategic_cycle_completed
+
+            await emit_strategic_cycle_completed(
+                task.project_id,
+                task.id,
+                1 if _peek_strategic_type == "design_doc_update" else 2,
+            )
+
         return {
             "status": "received",
             "message": f"Status update for task {payload.task_id} recorded.",
