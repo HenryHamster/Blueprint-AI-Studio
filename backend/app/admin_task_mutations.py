@@ -880,16 +880,17 @@ async def _apply_depends_on_mutation(
         except (ValueError, AttributeError):
             raise HTTPException(status_code=400, detail="Invalid UUID in depends_on")
 
-        existing = (
-            (await session.execute(select(Task.id).where(Task.id.in_(dep_uuids))))
+        existing_tasks = (
+            (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
             .scalars()
             .all()
         )
-        if len(existing) != len(dep_uuids):
+        if len(existing_tasks) != len(dep_uuids):
             raise HTTPException(
                 status_code=400,
                 detail="One or more depends_on task IDs do not exist",
             )
+        dep_tasks_by_id = {str(t.id): t for t in existing_tasks}
 
         task_id_str = str(task.id)
         task_cache: dict[str, Task | None] = {}
@@ -919,6 +920,35 @@ async def _apply_depends_on_mutation(
                 raise HTTPException(
                     status_code=400,
                     detail=f"Circular dependency detected: {dep_id} eventually depends on {task_id_str}",
+                )
+
+        # Reject cross-base dependency edges. The dispatch loop only *waits* for
+        # a dependency whose merge lands on the dependent's base branch
+        # (_same_base_branch); a cross-base edge is silently skipped — the
+        # dependent dispatches without ever inheriting the dependency's landed
+        # code. Surface that as a creation-time error rather than letting the
+        # orchestrator drop the wait. Uses the orchestrator's own predicate so
+        # this gate rejects exactly the edges the dispatch loop would skip, with
+        # no false positive on the common None/None default-base case.
+        from app.orchestrator_health import _same_base_branch
+
+        for dep_id in new_deps:
+            dep_task = dep_tasks_by_id[dep_id]
+            if not _same_base_branch(task, dep_task):
+                task_base = (task.first_payload or {}).get("base_branch") or "(default)"
+                dep_base = (
+                    (dep_task.first_payload or {}).get("base_branch") or "(default)"
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cross-base dependency rejected: this task's base branch "
+                        f"'{task_base}' differs from dependency {dep_id}'s base "
+                        f"'{dep_base}'. A dependency only propagates its landed code "
+                        f"when both share a base branch; otherwise the dependent "
+                        f"would dispatch without the prerequisite's changes. Align "
+                        f"the base branches or re-point the dependency."
+                    ),
                 )
 
     task.depends_on = new_deps

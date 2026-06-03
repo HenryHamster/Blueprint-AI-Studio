@@ -12,6 +12,7 @@ slot-capping:
 
 import logging
 import uuid
+from datetime import datetime, timedelta
 from typing import Callable, Coroutine, Any
 
 from sqlalchemy import func
@@ -21,6 +22,7 @@ from sqlmodel import select
 from app.migration_path import is_migration_file
 from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
+from app.time_utils import _utcnow
 from app.task_capabilities import READ_ONLY_TASK_TYPES
 
 logger = logging.getLogger("blueprint")
@@ -31,6 +33,15 @@ logger = logging.getLogger("blueprint")
 # clears within a cycle or two never spams the Alerts banner.
 _PRECONDITION_ESCALATE_THRESHOLD = 3
 
+# Once a candidate has been deferred on the same precondition blocker for
+# ``_PRECONDITION_ESCALATE_THRESHOLD`` consecutive cycles we stop re-judging it
+# on every fast dispatch cycle and instead park it in the first-class BLOCKED
+# state, scheduling the periodic unblock sweep to re-evaluate it no sooner than
+# ``recheck_after``.  This replaces the old "stay QUEUED forever, re-judge every
+# 0.5–5s" churn with one cheap recheck per interval (see
+# ``reaper_sweeps.sweep_unblock_blocked_tasks``).
+_BLOCKED_RECHECK_INTERVAL = timedelta(minutes=5)
+
 
 async def _record_defer_and_maybe_escalate(
     candidate: Task,
@@ -38,6 +49,7 @@ async def _record_defer_and_maybe_escalate(
     *,
     blocker_kind: str,
     detail: str,
+    block_code: str,
     threshold: int = _PRECONDITION_ESCALATE_THRESHOLD,
 ) -> None:
     """Track repeated deferral of *candidate* on the same precondition blocker.
@@ -45,15 +57,24 @@ async def _record_defer_and_maybe_escalate(
     Persists a per-blocker defer counter in
     ``candidate.context['_precondition_defer']`` keyed by ``blocker_kind``
     (the blocker identity — overlapping files or the blocking rollup title).
-    Once the count reaches *threshold* and the blocker has not yet been
-    escalated, raise ONE deduplicated operator alert and stamp
-    ``_precondition_escalated_key`` so it does not re-fire on every subsequent
-    dispatch cycle. The counter (and escalation stamp) reset when the blocker
-    identity changes, so a task that moves from one blocker to a different one
-    starts a fresh persistence count.
+    Once the count reaches *threshold* the candidate is parked in the
+    first-class ``BLOCKED`` state (durable ``blocker_kind`` / ``blocked_reason``
+    / ``blocked_at`` / ``recheck_after`` metadata) so it stops burning fast
+    dispatch cycles — the periodic unblock sweep takes over rechecking it. On
+    the cycle that first crosses the threshold (and only then) we also raise ONE
+    deduplicated operator alert, stamping ``_precondition_escalated_key`` so it
+    does not re-fire every cycle. The counter (and escalation stamp) reset when
+    the blocker identity changes, so a task that moves from one blocker to a
+    different one starts a fresh persistence count.
 
-    Alerting only — the candidate stays QUEUED and is NOT dispatched; we never
-    dispatch work known to be blocked, we just make the blocker visible.
+    ``block_code`` is the short categorical code persisted as ``Task.blocker_kind``
+    (the column is ``VARCHAR(64)``) — e.g. ``"file_conflict"`` or
+    ``"pending_rollup"`` — while ``blocker_kind`` is the human-readable blocker
+    identity used for the defer-counter key and the alert title.
+
+    We never dispatch work known to be blocked: below the threshold the
+    candidate stays QUEUED (deferred this cycle); at/above it the candidate is
+    BLOCKED so the normal queue path skips it entirely.
     """
     ctx = candidate.context or {}
     defer = ctx.get("_precondition_defer") or {}
@@ -64,12 +85,53 @@ async def _record_defer_and_maybe_escalate(
         # stale escalation stamp from a previous, now-cleared blocker.
         count = 1
         ctx.pop("_precondition_escalated_key", None)
+        # Drop a stale first-blocked onset stamp only if it belongs to a
+        # *different* blocker identity. A same-identity stamp must survive
+        # optimistic-requeue episodes: the unblock sweep wipes
+        # ``_precondition_defer`` when it requeues a conflict/rollup blocker, but
+        # the blocker (and therefore its escalation deadline onset) persists.
+        fb = ctx.get("_blocked_first_at") or {}
+        if fb.get("key") != blocker_kind:
+            ctx.pop("_blocked_first_at", None)
     ctx["_precondition_defer"] = {"key": blocker_kind, "count": count}
 
     already_escalated = ctx.get("_precondition_escalated_key") == blocker_kind
     should_escalate = count >= threshold and not already_escalated
     if should_escalate:
         ctx["_precondition_escalated_key"] = blocker_kind
+
+    # At/above the threshold, park the task in BLOCKED so it leaves the QUEUED
+    # candidate pool. The unblock sweep re-evaluates it at/after recheck_after,
+    # moving it back to QUEUED when the precondition clears.
+    if count >= threshold:
+        now = _utcnow()
+        # Preserve the ONSET of this blocker identity across optimistic-requeue
+        # episodes so the deadline escalation (reaper_sweeps,
+        # ``_BLOCKED_ESCALATE_AFTER``) measures from the TRUE first-blocked time.
+        # Conflict/rollup blockers have no dependency edge, so the unblock sweep
+        # requeues them every interval and dispatch re-blocks them here. A fresh
+        # ``blocked_at`` per episode would mean ``now - blocked_at`` never
+        # reaches the deadline, so a permanently-stuck conflict (e.g. a pending
+        # rollup that never merges) would loop indefinitely without the ERROR
+        # escalation. The sweep only wipes ``_blocked_first_at`` on a genuine
+        # dependency clear, so for conflict blockers it survives the requeue.
+        first_blocked = ctx.get("_blocked_first_at") or {}
+        blocked_onset = None
+        if first_blocked.get("key") == blocker_kind and first_blocked.get("at"):
+            try:
+                blocked_onset = datetime.fromisoformat(first_blocked["at"])
+            except (ValueError, TypeError):
+                blocked_onset = None
+        if blocked_onset is None:
+            blocked_onset = now
+            ctx["_blocked_first_at"] = {"key": blocker_kind, "at": now.isoformat()}
+
+        candidate.status = TaskStatus.BLOCKED
+        candidate.blocker_kind = block_code[:64]
+        candidate.blocked_reason = detail
+        candidate.blocked_at = blocked_onset
+        candidate.recheck_after = now + _BLOCKED_RECHECK_INTERVAL
+        candidate.latest_status_message = f"Blocked: {detail}"[:500]
 
     candidate.context = ctx
     flag_modified(candidate, "context")
@@ -83,8 +145,8 @@ async def _record_defer_and_maybe_escalate(
         )
 
         logger.warning(
-            f"[DISPATCH] Escalating persistent precondition blocker on task "
-            f"{candidate.id} after {count} deferrals: {blocker_kind}"
+            f"[DISPATCH] Parking task {candidate.id} in BLOCKED after {count} "
+            f"deferrals on persistent precondition blocker: {blocker_kind}"
         )
         await _maybe_create_precondition_blocker_alert(
             candidate,
@@ -365,6 +427,7 @@ async def filter_file_conflicts(
                 session,
                 blocker_kind=f"file conflict on {overlapping_files}",
                 detail=defer_msg,
+                block_code="file_conflict",
             )
         else:
             non_conflicting.append(eid)
@@ -485,6 +548,7 @@ async def filter_rollup_conflicts(
                 session,
                 blocker_kind=f"pending rollup '{blocking_title[:60]}'",
                 detail=defer_msg,
+                block_code="pending_rollup",
             )
         else:
             if stale_overlap:

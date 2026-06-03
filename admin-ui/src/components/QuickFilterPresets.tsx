@@ -25,7 +25,9 @@ interface QuickFilterPresetsProps {
   setFailureClassFilter?: (v: string[]) => void;
 }
 
-const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
+// Must stay length-aligned with STATUS_OPTIONS in ../constants — preset
+// active-state detection compares statusFilter.length === ALL_STATUSES.length.
+const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'BLOCKED', 'FAILED', 'CANCELLED', 'COMPLETED'];
 const ALL_TYPES = [...FILTER_TASK_TYPE_IDS];
 
 export function QuickFilterPresets({

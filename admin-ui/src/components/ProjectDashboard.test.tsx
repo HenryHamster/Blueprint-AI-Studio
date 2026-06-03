@@ -127,6 +127,24 @@ describe('ProjectDashboard', () => {
     expect(onNewProject).toHaveBeenCalled();
   });
 
+  it('renders a blocked task count distinct from queued', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject()]}
+        tasks={[
+          makeTask('proj-1', 'QUEUED'),
+          makeTask('proj-1', 'BLOCKED'),
+          makeTask('proj-1', 'BLOCKED'),
+        ]}
+        selectedProjectId="proj-1"
+        onSelectProject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('1 queued')).toBeInTheDocument();
+    expect(screen.getByText('2 blocked')).toBeInTheDocument();
+  });
+
   it('renders a per-project status badge', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     render(

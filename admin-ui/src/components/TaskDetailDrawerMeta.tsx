@@ -393,6 +393,34 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
 
+      {(task.status === 'BLOCKED' || task.blocker_kind || task.blocked_reason || task.blocked_at || task.recheck_after) && (
+        <>
+          <SectionHeader>Blocker</SectionHeader>
+          {task.blocker_kind && (
+            <DetailRow label="Kind">
+              <span className="text-xs uppercase tracking-wider font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20 px-2 py-0.5 rounded">{task.blocker_kind}</span>
+            </DetailRow>
+          )}
+          {task.blocked_reason && (
+            <DetailRow label="Reason"><span className="text-sm text-amber-200/90 break-words">{task.blocked_reason}</span></DetailRow>
+          )}
+          {task.blocked_at && <DetailRow label="Blocked at">{formatAbsolute(task.blocked_at)}</DetailRow>}
+          {task.recheck_after && (
+            <DetailRow label="Recheck after">
+              <span className="inline-flex items-center gap-2">
+                <span>{formatAbsolute(task.recheck_after)}</span>
+                {(() => {
+                  const recheckTime = parseTimestamp(task.recheck_after).getTime();
+                  if (recheckTime <= now30) return <span className="text-xs text-amber-400">recheck due</span>;
+                  const mins = Math.max(1, Math.ceil((recheckTime - now30) / 60000));
+                  return <span className="text-xs text-neutral-500 font-mono">in {mins}m</span>;
+                })()}
+              </span>
+            </DetailRow>
+          )}
+        </>
+      )}
+
       {task.description && <>
         <SectionHeader>Description</SectionHeader>
         <pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800">{task.description}</pre>

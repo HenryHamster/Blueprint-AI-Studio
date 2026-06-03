@@ -533,44 +533,57 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             for c in children
         )
         if not has_completed and not has_active:
-            # All children terminal and none succeeded — they're all CANCELLED
-            # or skipped-FAILED (review_cap_exhausted, fix_loop_diverged,
-            # BLOCKED_PRECONDITION, identical-fingerprint). Mark parent FAILED
-            # with the right class so the reaper stops looping. Distinguish
-            # the BLOCKED_PRECONDITION case so operators see "held on upstream"
-            # rather than the generic "nothing to roll up" message.
+            # All children terminal and none succeeded. Distinguish blocked-on-
+            # precondition (recoverable, not a failure) from genuine failure. A
+            # child counts as "blocked" if it is in the first-class BLOCKED state
+            # OR (legacy/compat) FAILED with the BLOCKED_PRECONDITION class
+            # captured in pass 1 (``blocked_count``). Genuine FAILED children are
+            # the terminal failures. CANCELLED children only count as terminal
+            # failures when they are genuine cancellations (review cap exhausted,
+            # fix-loop diverged, operator/manual cancel, etc.), not historical
+            # "Parent requeued — replaced by retry" bookkeeping rows.
             from app.failure_classification import (
                 AGENT_TIMEOUT,
-                BLOCKED_PRECONDITION,
                 persist_failure_category,
             )
+            from app.direction_outcomes import _is_non_genuine_cancelled
 
-            parent.status = TaskStatus.FAILED
-            if blocked_count > 0 and blocked_count == sum(
-                1 for c in children if c.status == TaskStatus.FAILED
-            ):
-                parent_class = BLOCKED_PRECONDITION
-                parent.latest_status_message = (
-                    f"All {blocked_count} subtask(s) blocked on upstream precondition — "
-                    f"manual requeue once it resolves"
-                )
-            else:
-                parent_class = AGENT_TIMEOUT
-                parent.latest_status_message = (
-                    "No failed subtasks to retry and no successful subtasks to roll up"
-                )
-            persist_failure_category(parent, parent_class)
-            _record_parent_failure(parent, parent_class)
-            session.add(parent)
-            await session.commit()
-            await _maybe_create_failure_alert(
-                parent, session, parent.latest_status_message
+            failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+            blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
+            genuine_cancelled_children = [
+                c
+                for c in children
+                if c.status == TaskStatus.CANCELLED
+                and not _is_non_genuine_cancelled(c)
+            ]
+            genuine_failures = (
+                len(failed_children) - blocked_count + len(genuine_cancelled_children)
             )
-            # When the parent failed because every subtask is blocked on an
-            # upstream precondition (not a code failure), raise one
-            # deduplicated, operator-visible precondition-blocker alert so the
-            # real cause is surfaced instead of just a generic FAILED state.
-            if parent_class == BLOCKED_PRECONDITION:
+            total_blocked = blocked_count + len(blocked_children)
+
+            if total_blocked > 0 and genuine_failures <= 0:
+                # Every unsucceeded subtask is waiting on an upstream
+                # precondition — the parent is not a failure, it is BLOCKED.
+                # Move it into the first-class BLOCKED state (no retry-budget
+                # burn, no direction-health ding) and surface ONE deduplicated,
+                # operator-visible precondition-blocker alert instead of a
+                # generic terminal FAILED. Recovery is owned by the auto-unblock
+                # sweep.
+                from app.task_blocked import enter_blocked_state
+
+                msg = (
+                    f"All {total_blocked} subtask(s) blocked on upstream "
+                    f"precondition — awaiting recheck"
+                )
+                enter_blocked_state(
+                    parent,
+                    waiting_on="subtask precondition",
+                    reason=msg,
+                    source="parent",
+                )
+                parent.latest_status_message = msg
+                session.add(parent)
+                await session.commit()
                 from app.alert_dispatch import (
                     _maybe_create_precondition_blocker_alert,
                 )
@@ -581,6 +594,29 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     blocker_kind="upstream dependency",
                     detail=parent.latest_status_message,
                 )
+                await broadcast_to_project(
+                    str(parent.project_id),
+                    "task_updated",
+                    {"task_id": str(parent.id), "status": TaskStatus.BLOCKED},
+                )
+                logger.warning(
+                    f"[REQUEUE] Parent {parent.id} BLOCKED — all {total_blocked} "
+                    f"subtask(s) blocked on upstream precondition"
+                )
+                return 0
+
+            parent.status = TaskStatus.FAILED
+            parent_class = AGENT_TIMEOUT
+            parent.latest_status_message = (
+                "No failed subtasks to retry and no successful subtasks to roll up"
+            )
+            persist_failure_category(parent, parent_class)
+            _record_parent_failure(parent, parent_class)
+            session.add(parent)
+            await session.commit()
+            await _maybe_create_failure_alert(
+                parent, session, parent.latest_status_message
+            )
             await broadcast_to_project(
                 str(parent.project_id),
                 "task_updated",

@@ -91,6 +91,12 @@ router = APIRouter()
 
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
+_AGENT_STATUS_TERMINAL_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.BLOCKED,
+)
 
 
 def record_task_result(
@@ -880,11 +886,7 @@ async def update_agent_status(
         # in-flight lock holder is post-commit processing for a prior POST —
         # this retry would just hit the idempotency guard, so short-circuit
         # without waiting for the lock.
-        if check_task.status in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-        ):
+        if check_task.status in _AGENT_STATUS_TERMINAL_STATUSES:
             return {"status": "already_terminal", "task_id": str(check_task.id)}
         if check_task.status == TaskStatus.EVALUATING:
             return {"status": "already_evaluating", "task_id": str(check_task.id)}
@@ -929,7 +931,7 @@ async def update_agent_status(
     # written by `_persist_post_commit_pending` on a fresh session is visible
     # even though the in-memory `task` object was loaded earlier in the
     # request and has stale context.
-    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED):
+    if task.status in _AGENT_STATUS_TERMINAL_STATUSES:
         pending_row = (
             await session.execute(
                 select(Task.post_commit_pending).where(Task.id == task.id)
@@ -1388,6 +1390,68 @@ async def update_agent_status(
                     task, payload.logs, at_time=task.last_heartbeat or task.started_at
                 )
                 failure_class = classification.failure_class
+
+                # BLOCKED_PRECONDITION: the agent surfaced a "BLOCKER:" (via
+                # ./blocked) — the work is wanted but a precondition is absent
+                # (an upstream dependency/rollup, a base branch or referenced
+                # file). Move the task into the first-class BLOCKED state instead
+                # of re-dispatching it (which would burn the retry budget hitting
+                # the same wall) or terminal-failing it (which would require a
+                # manual requeue). Release the account slot and kill the VM, but
+                # do NOT record a task/direction failure and do NOT increment
+                # attempt_count — BLOCKED is not a failure. Recovery
+                # (recheck/escalate -> QUEUED) is owned by the auto-unblock sweep.
+                from app.failure_classification import BLOCKED_PRECONDITION
+
+                if failure_class == BLOCKED_PRECONDITION:
+                    from app.task_blocked import enter_blocked_state
+
+                    _blk_acct_id = get_task_llm_account_id(task)
+                    if _blk_acct_id and not (task.context or {}).get("_slot_released"):
+                        await release_max_plan_account(_blk_acct_id)
+                        task.context = {**(task.context or {}), "_slot_released": True}
+                    enter_blocked_state(
+                        task,
+                        waiting_on=(task.context or {}).get("blocker_waiting_on")
+                        or "precondition",
+                        reason=task.latest_status_message or "Precondition not met",
+                        source="agent",
+                    )
+                    task.vm_stopped_at = _utcnow()
+                    session.add(task)
+                    await session.commit()
+                    # Surface one deduplicated, operator-visible precondition
+                    # blocker alert so a held task isn't silently parked.
+                    try:
+                        from app.alert_dispatch import (
+                            _maybe_create_precondition_blocker_alert,
+                        )
+
+                        await _maybe_create_precondition_blocker_alert(
+                            task,
+                            session,
+                            blocker_kind="precondition",
+                            detail=task.latest_status_message or "Precondition not met",
+                        )
+                    except Exception as _blk_alert_err:
+                        logger.warning(
+                            f"[AGENT STATUS] precondition-blocker alert failed for "
+                            f"{task.id}: {_blk_alert_err}"
+                        )
+                    await broadcast_to_project(
+                        str(task.project_id),
+                        "task_updated",
+                        {"task_id": str(task.id), "status": TaskStatus.BLOCKED},
+                    )
+                    await _ensure_vm_deleted(
+                        task.vm_instance_id, reason="blocked_precondition"
+                    )
+                    logger.info(
+                        f"[AGENT STATUS] Task {task.id} BLOCKED — precondition not "
+                        f"met; held without burning retry budget"
+                    )
+                    return {"status": "blocked", "task_id": str(task.id)}
+
                 from app.failure_classification import (
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
                     NO_PROGRESS_TIMEOUT,

@@ -299,7 +299,72 @@ class TestFilterFileConflicts:
         await filter_file_conflicts([c.id], [c], [ip_b], session, broadcast_fn)
         assert c.context["_precondition_defer"]["key"] == "file conflict on b.py"
         assert c.context["_precondition_defer"]["count"] == 1
+        # Counter never reached the threshold, so no escalation fired.
         esc.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_persistent_conflict_parks_task_in_blocked(self, mocker):
+        """At the escalation threshold the candidate is parked in BLOCKED with
+        durable blocker metadata so the queue path stops re-judging it."""
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        # Below the threshold the task stays QUEUED (just deferred this cycle).
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.QUEUED
+        assert c.blocker_kind is None
+
+        # Cross the threshold (default 3) → parked in BLOCKED with metadata.
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert c.status == TaskStatus.BLOCKED
+        assert c.blocker_kind == "file_conflict"
+        assert c.blocked_reason and "file conflict" in c.blocked_reason
+        assert c.blocked_at is not None
+        assert c.recheck_after is not None and c.recheck_after > c.blocked_at
+        assert (c.latest_status_message or "").startswith("Blocked:")
+
+    @pytest.mark.asyncio
+    async def test_blocked_at_onset_preserved_across_reblock(self, mocker):
+        """When a same-identity onset stamp survives an optimistic requeue, a
+        re-block measures blocked_at from the original onset — not a fresh now —
+        so the 6h deadline escalation can actually fire for a stuck conflict."""
+        from datetime import datetime, timedelta
+
+        mocker.patch(
+            "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+            new_callable=AsyncMock,
+        )
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        # Simulate the state after an optimistic requeue of a long-standing
+        # conflict: _precondition_defer wiped, but the onset stamp preserved.
+        onset = datetime.fromisoformat(
+            (datetime.now().astimezone() - timedelta(hours=7)).isoformat()
+        )
+        c.context["_blocked_first_at"] = {
+            "key": "file conflict on a.py",
+            "at": onset.isoformat(),
+        }
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        # Three deferrals cross the threshold and re-block the task.
+        for _ in range(3):
+            await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+
+        assert c.status == TaskStatus.BLOCKED
+        # blocked_at reflects the preserved onset (~7h ago), not a fresh now,
+        # so now - blocked_at exceeds the escalation deadline.
+        assert c.blocked_at == onset
 
     @pytest.mark.asyncio
     async def test_shared_test_files_not_deferred(self):

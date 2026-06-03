@@ -708,6 +708,11 @@ async def _check_and_trigger_rollup(
             TaskStatus.PROVISIONING,
             TaskStatus.IN_PROGRESS,
             TaskStatus.EVALUATING,
+            # A BLOCKED child is non-terminal work parked on a precondition; the
+            # auto-unblock sweep is expected to return it to QUEUED. Counting it
+            # as active keeps the rollup waiting rather than rolling up an
+            # incomplete subtree or miscounting it as a silent failure.
+            TaskStatus.BLOCKED,
         ):
             active_count += 1
             all_done = False

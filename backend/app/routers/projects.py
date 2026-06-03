@@ -45,6 +45,13 @@ from app.event_fanout import enqueue_agent_log
 
 logger = logging.getLogger(__name__)
 
+_AGENT_WS_TERMINAL_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+    TaskStatus.BLOCKED,
+)
+
 
 def _truncate_vm_instance_id(vm_instance_id: object) -> str:
     if vm_instance_id is None:
@@ -646,11 +653,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
         from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
 
-        if str(task.id) in _terminated_task_ids or task.status in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-        ):
+        if str(task.id) in _terminated_task_ids or task.status in _AGENT_WS_TERMINAL_STATUSES:
             _log_agent_auth_reject(
                 "ws_task_terminal",
                 path=path,
@@ -748,12 +751,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                         fresh = await rs.get(Task, task_id)
                     if (
                         fresh is None
-                        or fresh.status
-                        in (
-                            TaskStatus.COMPLETED,
-                            TaskStatus.FAILED,
-                            TaskStatus.CANCELLED,
-                        )
+                        or fresh.status in _AGENT_WS_TERMINAL_STATUSES
                         or (
                             payload.get("vm_instance_id")
                             and fresh is not None
@@ -842,12 +840,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                         fresh = await rs.get(Task, task_id)
                     if (
                         fresh is None
-                        or fresh.status
-                        in (
-                            TaskStatus.COMPLETED,
-                            TaskStatus.FAILED,
-                            TaskStatus.CANCELLED,
-                        )
+                        or fresh.status in _AGENT_WS_TERMINAL_STATUSES
                         or (
                             payload.get("vm_instance_id")
                             and fresh is not None

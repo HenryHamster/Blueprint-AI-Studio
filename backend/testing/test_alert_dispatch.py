@@ -14,6 +14,7 @@ from sqlmodel import select as sql_select
 
 from app.alert_dispatch import (
     _UNVERIFIED_REASON_LABELS,
+    _maybe_create_blocked_escalation_alert,
     _maybe_create_pool_payoff_alert,
     _maybe_create_unverified_merge_alert,
 )
@@ -139,6 +140,71 @@ async def test_pool_payoff_alert_distinct_verdict_creates_separate(db_session, m
     assert len(alerts) == 2
     states = {a.title.split(":")[1].split(" on ")[0].strip() for a in alerts}
     assert states == {"COST_REGRESSION", "PROVEN"}
+
+
+# ── _maybe_create_blocked_escalation_alert (terminal BLOCKED escalation) ──────
+
+
+async def _blocked_escalation_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("permanently blocked"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_blocked_escalation_alert_creates_error_and_broadcasts(db_session, mocker):
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(project_id=project.id, status="BLOCKED", blocker_kind="upstream_dependency")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _maybe_create_blocked_escalation_alert(
+        task,
+        db_session,
+        blocker_kind="upstream_dependency",
+        detail="Upstream dependency failed — needs operator intervention.",
+    )
+
+    alerts = await _blocked_escalation_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].task_id == task.id
+    assert "Upstream dependency failed" in alerts[0].message
+    bcast.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_blocked_escalation_alert_dedupes_by_task_and_title(db_session, mocker):
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(project_id=project.id, status="BLOCKED", blocker_kind="file_conflict")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    for _ in range(3):
+        await _maybe_create_blocked_escalation_alert(
+            task,
+            db_session,
+            blocker_kind="file_conflict",
+            detail="Blocker outlived the escalation deadline.",
+        )
+
+    # Same (task_id, title) ⇒ exactly one undismissed ERROR alert.
+    alerts = await _blocked_escalation_alerts(db_session, project.id)
+    assert len(alerts) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -4173,6 +4173,49 @@ class TestClassifyStuckTasksSharedPolicy:
         assert {tid for tid, _ in out} == {a.id, b.id}
 
 
+# ── BLOCKED tasks are undispatchable on the normal queue path ────────────────
+
+
+@pytest.mark.asyncio
+async def test_blocked_task_excluded_from_dispatch_candidates(db_session):
+    """The orchestrator candidate query selects status==QUEUED only, so a BLOCKED
+    task is never picked up for dispatch even though it shares an active project."""
+    from sqlmodel import select as sql_select
+
+    project = make_project(user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    queued = make_task(project_id=project.id, status=TaskStatus.QUEUED, title="runnable")
+    blocked = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        title="parked",
+        blocker_kind="file_conflict",
+        blocked_reason="Waiting: file conflict on a.py",
+    )
+    db_session.add(queued)
+    db_session.add(blocked)
+    await db_session.commit()
+
+    # Mirror the orchestrator's candidate predicate (orchestrator.py ~1647).
+    candidate_stmt = sql_select(Task).where(
+        Task.status == TaskStatus.QUEUED,
+        Task.requires_approval.is_(False),
+        Task.project_id.in_(
+            sql_select(Project.id).where(
+                Project.not_archived(),
+                Project.paused.is_(False),
+            )
+        ),
+    )
+    candidates = (await db_session.execute(candidate_stmt)).scalars().all()
+    candidate_ids = {t.id for t in candidates}
+    assert queued.id in candidate_ids
+    assert blocked.id not in candidate_ids
+
+
 class TestCrossBaseCodeDependencyPolicy:
     """The genuine-vs-ordering-only dependency policy
     (``orchestrator_health.is_genuine_code_dependency``) that decides whether a

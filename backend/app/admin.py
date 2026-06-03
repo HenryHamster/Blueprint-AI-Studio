@@ -350,6 +350,12 @@ async def get_all_tasks(
             if t.last_tool_use_at
             else None,
             "attempt_count": t.attempt_count,
+            # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
+            # non-BLOCKED or pre-migration task; the admin UI guards on presence.
+            "blocker_kind": t.blocker_kind,
+            "blocked_reason": t.blocked_reason,
+            "blocked_at": t.blocked_at.isoformat() if t.blocked_at else None,
+            "recheck_after": t.recheck_after.isoformat() if t.recheck_after else None,
             "payloads": t.payloads,
             "context": {
                 k: v
@@ -975,6 +981,14 @@ async def get_task(
         if task.last_tool_use_at
         else None,
         "attempt_count": task.attempt_count,
+        # Durable BLOCKED-state metadata (alembic 0137). Nullable for any
+        # non-BLOCKED or pre-migration task; the admin UI guards on presence.
+        "blocker_kind": task.blocker_kind,
+        "blocked_reason": task.blocked_reason,
+        "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
+        "recheck_after": task.recheck_after.isoformat()
+        if task.recheck_after
+        else None,
         "payloads": task.payloads,
         "context": {
             k: v

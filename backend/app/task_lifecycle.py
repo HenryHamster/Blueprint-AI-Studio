@@ -3950,15 +3950,31 @@ async def _process_post_commit(
             # task transition. Requiring all-terminal makes the aggregation a
             # no-op for autonomous projects (always something in flight) while
             # preserving finite-project semantics.
+            # BLOCKED counts as terminal-for-now here: in a FINITE project the
+            # all-terminal guard only trips when nothing is in flight, so a
+            # remaining BLOCKED child has no in-project producer left to clear
+            # its precondition and will never un-block on its own. Excluding it
+            # would hang the project forever (previously these were FAILED rows
+            # caught by the `any FAILED` branch); including it preserves the old
+            # rollup, mapping a stuck BLOCKED child to a FAILED project outcome.
             all_terminal = all(
-                s in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+                s
+                in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.BLOCKED,
+                )
                 for s in executable_statuses
             )
             new_project_status = None
             if all_terminal:
                 if all(s == TaskStatus.COMPLETED for s in executable_statuses):
                     new_project_status = ProjectStatus.COMPLETED
-                elif any(s == TaskStatus.FAILED for s in executable_statuses):
+                elif any(
+                    s in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+                    for s in executable_statuses
+                ):
                     new_project_status = ProjectStatus.FAILED
                 elif all(
                     s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED]

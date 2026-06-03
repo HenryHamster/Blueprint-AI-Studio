@@ -458,3 +458,308 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
         await session.commit()
         logger.info(f"[REAPER] Purged {purged} stale routine message(s)")
     return purged
+
+
+# ── Step 12: BLOCKED-task auto-unblock / escalation sweep ──────────────────
+#
+# A task enters the first-class BLOCKED state when a durable precondition is
+# missing — an orchestrator-discovered conflict that persisted past the defer
+# threshold (orchestrator_filters._record_defer_and_maybe_escalate) or an
+# agent/lifecycle "BLOCKER:" with an upstream dependency. BLOCKED tasks are
+# undispatchable on the normal queue path (the candidate query is QUEUED-only)
+# and are excluded from stale-task reaping. This sweep is the recovery path:
+# it cheaply rechecks each BLOCKED task at/after its recheck_after and either
+# moves it back to QUEUED (precondition cleared) or re-arms a later recheck.
+# A blocker that is permanently unsatisfiable (its dependency cascade-cancelled)
+# or that outlives the escalation deadline gets ONE deduplicated operator alert
+# and stops being rechecked.
+
+# Base recheck interval, doubled per consecutive still-blocked recheck up to the
+# cap. Keeps the sweep cheap (no per-cycle re-judging) while staying responsive.
+_BLOCKED_RECHECK_BASE = timedelta(minutes=5)
+_BLOCKED_RECHECK_MAX = timedelta(hours=1)
+# A blocker that never clears within this window is escalated to the operator
+# as permanently blocked (one ERROR alert) and parked.
+_BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
+# Parking horizon for terminally-escalated blockers. On escalation we push
+# ``recheck_after`` far into the future (rather than leaving it NULL) so the row
+# drops out of the due query (``recheck_after IS NULL OR <= now``) and is never
+# re-SELECTed / FOR UPDATE-locked on the reaper hot path again. Leaving it NULL
+# kept escalated rows permanently "due" (sorted first by nullsfirst), where they
+# were re-locked every cycle and could crowd genuinely-due rechecks out of the
+# batch-size window. Recovery has given up on these; an operator re-queues them.
+_BLOCKED_ESCALATED_PARK = timedelta(days=3650)
+
+
+def _next_recheck_delay(attempts: int) -> timedelta:
+    """Exponential backoff for the next recheck, capped at ``_BLOCKED_RECHECK_MAX``."""
+    secs = _BLOCKED_RECHECK_BASE.total_seconds() * (2 ** max(0, attempts))
+    return timedelta(seconds=min(secs, _BLOCKED_RECHECK_MAX.total_seconds()))
+
+
+async def _blocked_precondition_state(task, session, verify_pr_merged) -> str:
+    """Classify whether a BLOCKED task's recorded precondition is now satisfied.
+
+    Returns one of:
+      - ``"clear"``   — the precondition is satisfied (or is a transient conflict
+                        with no dependency edge); requeue and let dispatch run/
+                        re-judge it.
+      - ``"waiting"`` — an upstream dependency is still in flight; stay BLOCKED.
+      - ``"dead"``    — an upstream dependency genuinely failed / was cancelled,
+                        so this work is impossible; escalate terminally.
+
+    Reuses the single source of truth for dependency resolution
+    (``orchestrator_health._check_candidate_task_deps``) rather than
+    reimplementing merge/cancel/scope-empty semantics here.
+    """
+    deps = task.depends_on or []
+    blocker_meta = (task.context or {}).get("blocker") or {}
+    blocker_source = blocker_meta.get("source") if isinstance(blocker_meta, dict) else None
+    if not deps:
+        if task.blocker_kind in {"file_conflict", "pending_rollup"}:
+            # Orchestrator-owned blockers with no dependency edges are still
+            # safe to requeue optimistically: dispatch re-judges and re-blocks
+            # them immediately if the conflict is still live.
+            return "clear"
+        if blocker_source == "parent":
+            children = (
+                (
+                    await session.execute(
+                        select(Task).where(Task.parent_task_id == task.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for child in children:
+                child_ctx = child.context or {}
+                if child.status == TaskStatus.BLOCKED:
+                    return "waiting"
+                if child.status == TaskStatus.FAILED and (
+                    child_ctx.get("failure_category") == "BLOCKED_PRECONDITION"
+                    or child_ctx.get("failure_class") == "BLOCKED_PRECONDITION"
+                    or (child.latest_status_message or "").lstrip().lower().startswith(
+                        "blocker:"
+                    )
+                ):
+                    return "waiting"
+            # Child blockers have cleared; move the parent back into the
+            # rollup/re-evaluation path instead of normal dispatch.
+            return "re_evaluate"
+        if verify_pr_merged is None:
+            return "waiting"
+        # Agent/lifecycle blockers with no explicit dependency edge are durable
+        # preconditions (missing base branch/file, upstream PR not yet landed).
+        # Keep them parked and back off; the deadline escalation path surfaces
+        # long-lived blockers for operator intervention.
+        return "waiting"
+    if verify_pr_merged is None:
+        return "waiting"
+
+    from app.orchestrator_health import _check_candidate_task_deps
+
+    dep_uuids = []
+    for d in deps:
+        try:
+            dep_uuids.append(uuid.UUID(str(d)))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    if not dep_uuids:
+        return "clear"
+    dep_tasks = (
+        (await session.execute(select(Task).where(Task.id.in_(dep_uuids))))
+        .scalars()
+        .all()
+    )
+    result, _ = await _check_candidate_task_deps(
+        task, dep_tasks, dep_uuids, session, verify_pr_merged
+    )
+    if result == "eligible":
+        return "clear"
+    if result == "cascade_cancel":
+        return "dead"
+    return "waiting"
+
+
+def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None:
+    """Reset a task's durable blocker metadata and defer bookkeeping on unblock.
+
+    ``preserve_first_blocked`` keeps the ``_blocked_first_at`` onset stamp so a
+    blocker that is only *optimistically* requeued — a conflict/rollup blocker
+    with no dependency edge, which dispatch may immediately re-block — still
+    measures its escalation deadline from the true onset rather than restarting
+    each requeue episode. A genuine dependency clear wipes everything.
+    """
+    task.blocker_kind = None
+    task.blocked_reason = None
+    task.blocked_at = None
+    task.recheck_after = None
+    ctx = task.context or {}
+    keys = [
+        "_precondition_defer",
+        "_precondition_escalated_key",
+        "_blocked_escalated",
+        "_blocked_recheck_attempts",
+    ]
+    if not preserve_first_blocked:
+        keys.append("_blocked_first_at")
+    for k in keys:
+        ctx.pop(k, None)
+    task.context = ctx
+
+
+async def sweep_unblock_blocked_tasks(
+    session,
+    now: datetime,
+    *,
+    verify_pr_merged=None,
+    batch_size: int = 200,
+) -> int:
+    """Step 12: re-evaluate due BLOCKED tasks; requeue or escalate them.
+
+    Idempotent and concurrency-safe alongside the orchestrator/reaper: due rows
+    are claimed with ``FOR UPDATE SKIP LOCKED`` so two sweeps (or a sweep racing
+    the orchestrator) never double-process the same task.
+
+    Returns the number of tasks moved back to QUEUED.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.alert_dispatch import _maybe_create_blocked_escalation_alert
+    from app.broadcast import broadcast_to_project as _bcast
+
+    if verify_pr_merged is None:
+        from app.rollup_pr_verification import _verify_pr_merged
+        verify_pr_merged = _verify_pr_merged
+
+    due_stmt = (
+        select(Task)
+        .where(
+            Task.status == TaskStatus.BLOCKED,
+            (Task.recheck_after.is_(None)) | (Task.recheck_after <= now),
+        )
+        .order_by(Task.recheck_after.asc().nullsfirst())
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+    due = (await session.execute(due_stmt)).scalars().all()
+    if not due:
+        return 0
+
+    requeued = 0
+    changed = False
+    for task in due:
+        ctx = task.context or {}
+        # Already escalated terminally — leave parked for the operator. On
+        # escalation we push recheck_after to a far-future sentinel so these
+        # rows drop out of the due set entirely. Backstop: if a legacy/None
+        # recheck_after let one resurface here, evict it the same way so it
+        # stops being re-SELECTed and FOR UPDATE-locked every reaper cycle.
+        if ctx.get("_blocked_escalated"):
+            if task.recheck_after is None or task.recheck_after <= now:
+                task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+                session.add(task)
+                changed = True
+            continue
+
+        # Deadline escalation: a blocker that never cleared within the window is
+        # surfaced once and parked (recovery has given up).
+        if task.blocked_at is not None and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER:
+            await _maybe_create_blocked_escalation_alert(
+                task,
+                session,
+                blocker_kind=task.blocker_kind or "unknown",
+                detail=(
+                    f"Task has been blocked since {task.blocked_at:%Y-%m-%d %H:%M} "
+                    f"without clearing: {task.blocked_reason or task.latest_status_message or ''}"
+                ),
+            )
+            ctx["_blocked_escalated"] = True
+            task.context = ctx
+            flag_modified(task, "context")
+            task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+            session.add(task)
+            changed = True
+            continue
+
+        state = await _blocked_precondition_state(task, session, verify_pr_merged)
+        if state == "clear":
+            # A conflict/rollup blocker has no dependency edge and is requeued
+            # optimistically — dispatch may re-block it within a cycle, so keep
+            # the first-blocked onset stamp (so its deadline still measures from
+            # true onset). A genuine dependency clear (had dep edges) resets all.
+            _clear_blocked_fields(
+                task, preserve_first_blocked=not task.depends_on
+            )
+            task.status = TaskStatus.QUEUED
+            task.latest_status_message = "Unblocked — requeued for dispatch"
+            flag_modified(task, "context")
+            session.add(task)
+            requeued += 1
+            changed = True
+            try:
+                await _bcast(
+                    str(task.project_id),
+                    "task_updated",
+                    {"task_id": str(task.id), "status": "QUEUED",
+                     "message": task.latest_status_message},
+                )
+            except Exception:
+                logger.debug(
+                    f"[REAPER] Failed to broadcast unblock for {task.id}",
+                    exc_info=True,
+                )
+        elif state == "re_evaluate":
+            _clear_blocked_fields(task, preserve_first_blocked=False)
+            task.status = TaskStatus.EVALUATING
+            task.latest_status_message = (
+                "Unblocked — awaiting rollup re-evaluation"
+            )
+            flag_modified(task, "context")
+            session.add(task)
+            changed = True
+            try:
+                await _bcast(
+                    str(task.project_id),
+                    "task_updated",
+                    {
+                        "task_id": str(task.id),
+                        "status": "EVALUATING",
+                        "message": task.latest_status_message,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    f"[REAPER] Failed to broadcast blocked-parent re-eval for {task.id}",
+                    exc_info=True,
+                )
+        elif state == "dead":
+            await _maybe_create_blocked_escalation_alert(
+                task,
+                session,
+                blocker_kind=task.blocker_kind or "upstream dependency",
+                detail=(
+                    "Upstream dependency failed or was cancelled — this task can "
+                    "never run as-is and needs operator intervention "
+                    "(re-scope, re-point dependency, or cancel)."
+                ),
+            )
+            ctx["_blocked_escalated"] = True
+            task.context = ctx
+            flag_modified(task, "context")
+            task.recheck_after = now + _BLOCKED_ESCALATED_PARK
+            session.add(task)
+            changed = True
+        else:  # "waiting" — re-arm a later recheck with backoff.
+            attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
+            ctx["_blocked_recheck_attempts"] = attempts
+            task.context = ctx
+            flag_modified(task, "context")
+            task.recheck_after = now + _next_recheck_delay(attempts)
+            session.add(task)
+            changed = True
+
+    if changed:
+        await session.commit()
+    if requeued:
+        logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
+    return requeued

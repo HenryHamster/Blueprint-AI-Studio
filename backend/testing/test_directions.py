@@ -3875,6 +3875,77 @@ async def test_strategic_api_set_running_update_replaces(db_session):
 
 
 @pytest.mark.asyncio
+async def test_strategic_api_set_running_update_rejects_over_limit(db_session):
+    """set_running_update rejects content exceeding 100KB limit."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            # Use size that exceeds 100KB to trigger the payload size check
+            oversized = "x" * 101_000
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_running_update",
+                    "task_id": task_id,
+                    "data": {"markdown": oversized},
+                },
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        msg = body.get("error", {}).get("message", "")
+        assert "too large" in msg or "exceeds" in msg or "character limit" in msg
+        # Verify nothing was set
+        await db_session.refresh(project)
+        assert project.running_update is None or project.running_update == ""
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_create_message_rejects_over_limit(db_session):
+    """create_message rejects content exceeding limit."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.strategic_constants import STRATEGIC_MESSAGE_CONTENT_MAX
+    from app.models import ProjectMessage
+    from sqlmodel import select as sa_select
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            oversized = "x" * (STRATEGIC_MESSAGE_CONTENT_MAX + 1)
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "create_message",
+                    "task_id": task_id,
+                    "data": {"content": oversized, "type": "NOTE"},
+                },
+            )
+        assert resp.status_code == 400
+        body = resp.json()
+        msg = body.get("error", {}).get("message", "")
+        assert "exceeds" in msg or "character limit" in msg
+        # Verify no message was created
+        await db_session.refresh(project)
+        messages = await db_session.execute(
+            sa_select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id
+            )
+        )
+        assert len(messages.scalars().all()) == 0
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_reflect(db_session):
     """op=reflect appends to project.self_reflection_log."""
     from httpx import AsyncClient, ASGITransport

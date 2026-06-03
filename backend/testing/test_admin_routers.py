@@ -6834,6 +6834,63 @@ class TestModifyTaskApplySeam:
         assert "do not exist" in exc_info.value.detail
 
     @pytest.mark.asyncio
+    async def test_apply_depends_on_mutation_rejects_cross_base(self, db_session):
+        """A depends_on edge across different base branches raises 400."""
+        from fastapi import HTTPException
+        from app.admin_task_mutations import _apply_depends_on_mutation
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        task.payloads = [{"type": "create", "base_branch": "plan/a"}]
+        dep_task = await self._make_task(db_session, project.id)
+        dep_task.payloads = [{"type": "create", "base_branch": "plan/b"}]
+        db_session.add_all([task, dep_task])
+        await db_session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _apply_depends_on_mutation(
+                task, {"depends_on": [str(dep_task.id)]}, db_session, {}
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "Cross-base dependency" in exc_info.value.detail
+        assert "plan/a" in exc_info.value.detail
+        assert "plan/b" in exc_info.value.detail
+        # The incompatible edge must NOT be persisted.
+        assert task.depends_on != [str(dep_task.id)]
+
+    @pytest.mark.asyncio
+    async def test_apply_depends_on_mutation_allows_same_base(self, db_session):
+        """Same-base deps (explicit and default None/None) still persist."""
+        from app.admin_task_mutations import _apply_depends_on_mutation
+
+        project = await _make_project(db_session)
+
+        # Explicit shared base branch.
+        task = await self._make_task(db_session, project.id)
+        task.payloads = [{"type": "create", "base_branch": "plan/a"}]
+        dep_task = await self._make_task(db_session, project.id)
+        dep_task.payloads = [{"type": "create", "base_branch": "plan/a"}]
+        db_session.add_all([task, dep_task])
+        await db_session.commit()
+
+        changes: dict = {}
+        await _apply_depends_on_mutation(
+            task, {"depends_on": [str(dep_task.id)]}, db_session, changes
+        )
+        assert task.depends_on == [str(dep_task.id)]
+        assert changes["depends_on"] == [str(dep_task.id)]
+
+        # Default None/None base (no payloads) normalizes to same base.
+        plain_task = await self._make_task(db_session, project.id)
+        plain_dep = await self._make_task(db_session, project.id)
+        changes2: dict = {}
+        await _apply_depends_on_mutation(
+            plain_task, {"depends_on": [str(plain_dep.id)]}, db_session, changes2
+        )
+        assert plain_task.depends_on == [str(plain_dep.id)]
+
+    @pytest.mark.asyncio
     async def test_modify_task_apply_returns_expected_shape(self, db_session):
         """modify_task_apply returns the standard response shape with no mutations."""
         from fastapi import BackgroundTasks

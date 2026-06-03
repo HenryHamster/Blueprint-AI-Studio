@@ -280,6 +280,13 @@ async def test_status_aggregation_mixed(db_session: AsyncSession):
         status=TaskStatus.IN_PROGRESS,
         title="c5",
     )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        title="c6",
+    )
     await db_session.flush()
 
     await _update_direction_research_outcomes(
@@ -294,6 +301,33 @@ async def test_status_aggregation_mixed(db_session: AsyncSession):
     assert entry["tasks_completed"] == 2
     assert entry["tasks_failed"] == 1
     assert entry["tasks_cancelled"] == 1
+    # BLOCKED is counted in its own bucket — NOT folded into the failure tally.
+    assert entry["tasks_blocked"] == 1
+
+
+def test_blocked_status_does_not_count_as_failure():
+    """A BLOCKED task is non-terminal — it must never count as a direction failure
+    (which would inflate failure rates and falsely consume retry budget)."""
+    blocked = Task(
+        project_id=uuid.uuid4(),
+        title="t",
+        description="d",
+        status=TaskStatus.BLOCKED,
+        created_by="u",
+        payloads=[{"type": "fix"}],
+        context={},
+    )
+    assert _counts_as_failure(blocked) is False
+    failed = Task(
+        project_id=uuid.uuid4(),
+        title="t",
+        description="d",
+        status=TaskStatus.FAILED,
+        created_by="u",
+        payloads=[{"type": "fix"}],
+        context={},
+    )
+    assert _counts_as_failure(failed) is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

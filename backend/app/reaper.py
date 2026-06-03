@@ -743,6 +743,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_regression_scan,
     sweep_stuck_qualifications,
     sweep_routine_message_retention,
+    sweep_unblock_blocked_tasks,
 )
 
 # Zero-cycle starvation: a project that should be running the strategic loop but
@@ -3475,6 +3476,19 @@ async def reaper_service():
                         )
                 except Exception as e:
                     logger.error(f"[REAPER] Idle pool VM sweep error: {e}", exc_info=True)
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 12: Auto-unblock / escalate BLOCKED tasks — recheck each
+                # parked precondition blocker, requeue cleared ones to QUEUED,
+                # and escalate permanently-stuck / deadline-expired ones once.
+                _mark_reaper_progress()
+                try:
+                    await sweep_unblock_blocked_tasks(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Unblock sweep error: {e}", exc_info=True
+                    )
                     with contextlib.suppress(Exception):
                         await session.rollback()
             consecutive_errors = 0

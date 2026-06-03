@@ -661,6 +661,59 @@ async def _maybe_create_precondition_blocker_alert(
     )
 
 
+async def _maybe_create_blocked_escalation_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    blocker_kind: str,
+    detail: str,
+) -> None:
+    """Create ONE deduplicated ERROR alert for a permanently-stuck BLOCKED task.
+
+    The terminal escalation path of the unblock sweep
+    (``reaper_sweeps.sweep_unblock_blocked_tasks``): when a BLOCKED task's
+    precondition is genuinely unsatisfiable (its dependency cascade-cancelled)
+    or its blocker outlives the escalation deadline, the sweep stops rechecking
+    and raises this alert so the operator can intervene (requeue, re-scope, or
+    cancel). It is distinct from ``_maybe_create_precondition_blocker_alert``
+    (a WARNING raised the moment a blocker first persists) — this ERROR means
+    "automatic recovery has given up".
+
+    Deduplicated by ``(task_id, title)`` against undismissed alerts, where the
+    title encodes ``blocker_kind``, so the deadline/dead-dependency escalation
+    fires exactly once per blocked task and does not re-fire while the operator
+    still has the alert open.
+    """
+    title = f"Task permanently blocked: {blocker_kind}"[:200]
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=detail[:1000],
+        task_id=task.id,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+        },
+    )
+
+
 async def _maybe_create_cascade_cancel_alert(
     session: AsyncSession,
     project_id: "uuid.UUID",

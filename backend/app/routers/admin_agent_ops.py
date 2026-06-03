@@ -1148,9 +1148,13 @@ async def strategic_operation(
         raw_content = str(data.get("content", "")).strip()
         if not raw_content:
             raise HTTPException(status_code=400, detail="Message content required")
-        content = _cap_str(
-            raw_content, STRATEGIC_MESSAGE_CONTENT_MAX, "content", warnings
-        )
+        if len(raw_content) > STRATEGIC_MESSAGE_CONTENT_MAX:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Message content exceeds {STRATEGIC_MESSAGE_CONTENT_MAX} character limit "
+                f"({len(raw_content)} chars provided). Please resubmit with shorter content.",
+            )
+        content = raw_content
         try:
             msg_type = MessageType(str(data.get("type", "NOTE")).upper())
         except ValueError:
@@ -1475,6 +1479,12 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400,
                 detail="set_running_update requires data={'markdown': '<string>'}",
+            )
+        if len(doc) > 100_000:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Running update exceeds 100KB character limit "
+                f"({len(doc)} chars provided). Please resubmit with shorter content.",
             )
         project.running_update = doc
         session.add(project)

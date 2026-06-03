@@ -722,10 +722,10 @@ async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, 
     """All-children-blocked parent raises ONE deduplicated precondition alert.
 
     When every FAILED child is BLOCKED_PRECONDITION (upstream dependency unmet),
-    the parent terminates as BLOCKED_PRECONDITION rather than a code failure, and
-    a single operator-visible WARNING alert describing the upstream blocker is
-    raised — not a silent generic FAILED. Re-running the requeue must NOT spam a
-    second alert (deduplicated by task + blocker identity).
+    the parent transitions into the first-class BLOCKED state rather than a code
+    failure, and a single operator-visible WARNING alert describing the upstream
+    blocker is raised — not a silent generic FAILED. Re-running the requeue must
+    NOT spam a second alert (deduplicated by task + blocker identity).
     """
     import app.shared_state as _ss
     from app.routers.agent_status import _recorded_task_ids
@@ -751,9 +751,19 @@ async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, 
     await _requeue_parent_task(parent, session)
 
     await session.refresh(parent)
-    assert parent.status == TaskStatus.FAILED
-    # Parent classified as the budget-exempt precondition class, not a code error.
+    assert parent.status == TaskStatus.BLOCKED
+    # Parent retains the budget-exempt precondition class for compatibility with
+    # historical consumers (digest metrics, analytics), even though it is no
+    # longer a FAILED task.
     assert parent.context.get("failure_category") == "BLOCKED_PRECONDITION"
+    # Durable blocker metadata is persisted on the task itself.
+    blocker = parent.context.get("blocker") or {}
+    assert blocker.get("source") == "parent"
+    assert blocker.get("failure_class") == "BLOCKED_PRECONDITION"
+    assert parent.blocker_kind == "upstream_dependency"
+    assert parent.blocked_reason == parent.latest_status_message
+    assert parent.blocked_at is not None
+    assert parent.recheck_after is not None and parent.recheck_after > parent.blocked_at
 
     precondition_alerts = (
         (
@@ -788,6 +798,171 @@ async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, 
         .all()
     )
     assert len(precondition_alerts) == 1
+
+
+def test_enter_blocked_state_persists_metadata_no_budget_burn():
+    """enter_blocked_state moves a task to BLOCKED with durable metadata and
+    preserves the BLOCKED_PRECONDITION class — without touching attempt_count."""
+    from app.task_blocked import enter_blocked_state, get_blocker_metadata
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    enter_blocked_state(
+        task,
+        waiting_on="upstream dependency",
+        reason="BLOCKER: dep not landed",
+    )
+    assert task.status == TaskStatus.BLOCKED
+    # Retry budget untouched.
+    assert task.attempt_count == 0
+    # Classification preserved for historical/analytics consumers.
+    assert task.context["failure_category"] == "BLOCKED_PRECONDITION"
+    assert task.context["failure_class"] == "BLOCKED_PRECONDITION"
+    meta = get_blocker_metadata(task)
+    assert meta["waiting_on"] == "upstream dependency"
+    assert meta["reason"] == "BLOCKER: dep not landed"
+    assert meta["source"] == "agent"
+    assert meta["blocker_kind"] == "upstream_dependency"
+    assert meta["escalated"] is False
+    assert meta["recheck_at"]  # recheck timing persisted
+    assert task.blocker_kind == "upstream_dependency"
+    assert task.blocked_reason == "BLOCKER: dep not landed"
+    assert task.blocked_at is not None
+    assert task.recheck_after is not None and task.recheck_after > task.blocked_at
+
+
+def test_unblock_to_queued_clears_metadata_and_requeues():
+    """unblock_to_queued is the BLOCKED -> QUEUED out-transition: it clears the
+    blocker metadata and re-queues the task for dispatch."""
+    from app.task_blocked import enter_blocked_state, unblock_to_queued
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    assert task.status == TaskStatus.BLOCKED
+
+    unblock_to_queued(task)
+    assert task.status == TaskStatus.QUEUED
+    assert "blocker" not in (task.context or {})
+    assert task.blocker_kind is None
+    assert task.blocked_reason is None
+    assert task.blocked_at is None
+    assert task.recheck_after is None
+
+
+def test_mark_blocker_escalated_sets_marker():
+    """mark_blocker_escalated flips the escalation marker and stamps a time."""
+    from app.task_blocked import (
+        enter_blocked_state,
+        get_blocker_metadata,
+        mark_blocker_escalated,
+    )
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    enter_blocked_state(task, waiting_on="dep", reason="blocked")
+    mark_blocker_escalated(task, detail="deadline elapsed")
+    meta = get_blocker_metadata(task)
+    assert meta["escalated"] is True
+    assert meta["escalated_at"]
+    assert meta["escalation_detail"] == "deadline elapsed"
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_blocked_when_child_in_blocked_state(tl_db, mocker):
+    """A parent whose only unsucceeded child is in the first-class BLOCKED state
+    transitions to BLOCKED (not FAILED) without burning its requeue budget."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+    # Requeue budget untouched — this was not a retry.
+    assert (parent.context or {}).get("_requeue_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_failed_when_blocked_and_genuine_cancelled_child_mixed(
+    tl_db, mocker
+):
+    """A genuine CANCELLED child prevents the parent from parking as BLOCKED."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"failure_detail": "review_cap_exhausted"},
+        latest_status_message="Cancelled after review cap exhausted",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.status != TaskStatus.BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, mocker):
+    """A retry-superseded CANCELLED child does not block parent auto-parking."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
 
 
 @pytest.mark.asyncio

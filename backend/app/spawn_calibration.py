@@ -52,6 +52,10 @@ MEDIUM_ANALYSIS_PLAN_FILE_LIMIT: int = 10
 # the next research cycle.
 _DEGRADED_SPAWN_CAP = 2
 
+# BLOCKED is intentionally absent: a blocked task is parked on an absent
+# precondition, occupies no VM/active slot, and must not count against the
+# active-capacity budget (counting it would throttle spawning of genuinely
+# runnable work behind work that cannot run yet).
 _ACTIVE_SPAWN_HEALTH_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
