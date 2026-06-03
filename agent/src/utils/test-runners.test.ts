@@ -85,6 +85,21 @@ const sharedLayouts = JSON.parse(
   ),
 ) as LayoutFixture[];
 
+// The single cross-language family→command source of truth, consumed BOTH here
+// and by the backend table-vs-fixture / source-scan tests
+// (AGENT_TEST_RUNNER_COMMANDS in backend/testing/test_invariants.py). Loading it
+// the same way as the layout fixture lets the agent parity loop assert the FULL
+// command string the detector emits — not just the family — at parity with the
+// backend source-scan. The `script` family is dynamic-arg (bash <script>) and is
+// asserted family-only, exactly as the backend's _AGENT_DYNAMIC_ARG_FAMILIES skip.
+const runnerCommands = JSON.parse(
+  await readFile(
+    new URL('../../../backend/testing/__fixtures__/test_runner_commands.json', import.meta.url),
+    'utf-8',
+  ),
+) as Record<string, string>;
+const DYNAMIC_ARG_FAMILIES = new Set(['script']);
+
 function toWorkspaceRelativePath(p: string): string {
   const prefix = `${WORKSPACE}/`;
   return p.startsWith(prefix) ? p.slice(prefix.length) : p;
@@ -727,8 +742,51 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
         .sort();
       const actualAgentFamilies = runners.map(familyFromRunner).sort();
       expect(actualAgentFamilies).toEqual(expectedAgentFamilies);
+
+      // Strengthened parity: assert the FULL command (cmd + every arg) the
+      // detector emits, not just the family — so a trailing-argument/flag drift
+      // (e.g. pytest losing its `-x -q`) is caught in the agent's own local loop,
+      // at parity with the backend source-scan. The dynamic-arg `script` family
+      // keeps family-only verification (its two fixture members legitimately emit
+      // `bash scripts/test.sh` vs `bash test.sh`); every other family maps to a
+      // single fixed command in the shared commands fixture.
+      const expectedCommands = expectedAgentFamilies
+        .filter((family) => !DYNAMIC_ARG_FAMILIES.has(family as string))
+        .map((family) => {
+          const command = runnerCommands[family as string];
+          expect(
+            command,
+            `commands fixture has no entry for detectable family '${family}'`,
+          ).toBeTruthy();
+          return command;
+        })
+        .sort();
+      const actualCommands = runners
+        .filter((runner) => !DYNAMIC_ARG_FAMILIES.has(familyFromRunner(runner) as string))
+        .map((runner) => [runner.cmd, ...runner.args].join(' '))
+        .sort();
+      expect(actualCommands).toEqual(expectedCommands);
     });
   }
+
+  it('every detectable non-script family has a non-empty command in the shared fixture', () => {
+    // Guard: catches a missing key in test_runner_commands.json so the per-layout
+    // full-command assertion above can never silently degrade to family-only for a
+    // family whose command entry was dropped.
+    const detectableFamilies = new Set<string>();
+    for (const layout of sharedLayouts) {
+      if (!layout.detectable) continue;
+      for (const family of layout.agent_families ?? [layout.family]) {
+        if (family && !DYNAMIC_ARG_FAMILIES.has(family)) {
+          detectableFamilies.add(family);
+        }
+      }
+    }
+    const missing = [...detectableFamilies].filter(
+      (family) => !runnerCommands[family] || !runnerCommands[family].trim(),
+    );
+    expect(missing).toEqual([]);
+  });
 });
 
 describe('detectTestRunners — nested monorepo / external layouts', () => {

@@ -5802,36 +5802,37 @@ class TestTypedMockAssertConvention:
 #   - the shared fixture test_runner_layouts.json (asserted always-on below), and
 #   - the literal runner objects in agent/src/utils/test-runners.ts (asserted by
 #     the source-scan below when agent/src is mounted).
-# Edit this table AND test-runners.ts together; the source-scan fails otherwise.
-AGENT_TEST_RUNNER_COMMANDS = {
-    "pytest": "python3 -m pytest -x -q",
-    "npm": "npm test",
-    "make": "make test",
-    "just": "just test",
-    "task": "task test",
-    "cargo": "cargo test",
-    "tox": "tox",
-    "nox": "nox",
-    "go": "go test ./...",
-    "ruby": "bundle exec rake test",
-    "gradle": "./gradlew test",
-    "maven": "mvn test",
-    "elixir": "mix test",
-    "dotnet": "dotnet test",
-    "php": "vendor/bin/phpunit",
-    "composer": "composer test",
-    # Dynamic-arg case: the agent emits ``{ cmd: 'bash', args: [script] }`` where
-    # ``script`` ranges over a literal list (``test.sh``, ``run-tests.sh``,
-    # ``run_tests.sh``, ``scripts/test.sh``). The shared fixture exercises two of
-    # those members under this same family: ``scripts_test_sh_root_convention``
-    # (=> ``bash scripts/test.sh``) and ``test_sh_root_convention`` (=> the
-    # root-level ``bash test.sh`` convention). All bash fallbacks collapse to
-    # family ``script``, so one representative command below suffices and the
-    # table key still matches the fixture's detectable-family set exactly; the
-    # per-member command variance is covered by the ``_AGENT_DYNAMIC_ARG_FAMILIES``
-    # skip, which verifies this family via its script-list literal instead.
-    "script": "bash scripts/test.sh",
-}
+#
+# The family→command mapping itself lives in the shared, cross-language fixture
+# ``__fixtures__/test_runner_commands.json`` so the agent vitest parity loop and
+# this backend table consume ONE source of truth (no third hand-synced copy).
+# Edit that JSON AND test-runners.ts together; the source-scan fails otherwise.
+#
+# The ``script`` family is the lone dynamic-arg case: the agent emits
+# ``{ cmd: 'bash', args: [script] }`` where ``script`` ranges over a literal list
+# (``test.sh``, ``run-tests.sh``, ``run_tests.sh``, ``scripts/test.sh``). The
+# shared layout fixture exercises two of those members under this same family:
+# ``scripts_test_sh_root_convention`` (=> ``bash scripts/test.sh``) and
+# ``test_sh_root_convention`` (=> the root-level ``bash test.sh`` convention).
+# All bash fallbacks collapse to family ``script``, so the single representative
+# command in the JSON suffices and the table key still matches the fixture's
+# detectable-family set exactly; the per-member command variance is covered by
+# the ``_AGENT_DYNAMIC_ARG_FAMILIES`` skip, which verifies this family via its
+# script-list literal instead.
+def _load_agent_runner_commands() -> "dict[str, str]":
+    """Load the shared family→command fixture (read-only, single source of truth)."""
+    fixture_path = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__), "__fixtures__", "test_runner_commands.json"
+        )
+    )
+    import json
+
+    with open(fixture_path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+AGENT_TEST_RUNNER_COMMANDS = _load_agent_runner_commands()
 
 # The lone family whose command the agent builds from a loop variable rather than
 # a literal ``args`` array, so it can't be reconstructed from the runner literal

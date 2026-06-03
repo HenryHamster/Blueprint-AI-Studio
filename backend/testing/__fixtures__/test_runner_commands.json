@@ -1,0 +1,19 @@
+{
+  "pytest": "python3 -m pytest -x -q",
+  "npm": "npm test",
+  "make": "make test",
+  "just": "just test",
+  "task": "task test",
+  "cargo": "cargo test",
+  "tox": "tox",
+  "nox": "nox",
+  "go": "go test ./...",
+  "ruby": "bundle exec rake test",
+  "gradle": "./gradlew test",
+  "maven": "mvn test",
+  "elixir": "mix test",
+  "dotnet": "dotnet test",
+  "php": "vendor/bin/phpunit",
+  "composer": "composer test",
+  "script": "bash scripts/test.sh"
+}
