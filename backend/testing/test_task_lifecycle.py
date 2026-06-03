@@ -3709,6 +3709,79 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
+    tl_db, mocker
+):
+    """A blocking pre-merge guard verdict prevents the auto-merge fallback."""
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    direction_id = "dir-auto-approve"
+    project.directions = [{"id": direction_id, "title": "d"}]
+    session.add(project)
+    await session.commit()
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "small clean diff"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new_callable=AsyncMock,
+        return_value=(False, "dual-head: duplicate migration revision"),
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-aa",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    enable_auto_merge_mock.assert_not_called()
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert "dual-head" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_small_scope_intermediate_merge_skips_guard(tl_db, mocker):
     """A staging-branch (intermediate) small-scope merge does NOT invoke the guard."""
     session, factory = tl_db

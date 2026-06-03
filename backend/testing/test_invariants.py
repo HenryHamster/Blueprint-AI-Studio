@@ -845,6 +845,14 @@ class TestPreMergeDualHeadGuardCoverage:
     carry an allowlist of legitimate exceptions, each documenting WHY.
 
     The scan is source-level only (AST) and NEVER executes a merge path.
+
+    Coverage note: because this test is AST-only and function-scoped, removing
+    the guard reference from any of ``_process_post_commit``,
+    ``_check_and_trigger_rollup``, or ``promote`` would create a new offender
+    and fail this invariant. That is deliberate: the invariant catches missing
+    call-site coverage, not the later GitHub merge-time race where
+    ``enable_auto_merge`` may complete after a second migration PR lands.
+    Track that TOCTOU window separately.
     """
 
     # The two shared combined-chain guard entrypoints (app/rollup_migration_validation.py).
@@ -853,10 +861,13 @@ class TestPreMergeDualHeadGuardCoverage:
     )
 
     # Merge symbols the scan treats as a merge SITE: the direct primitive
-    # (``merge_pull_request`` / ``github.merge_pull_request``) and the
+    # (``merge_pull_request`` / ``github.merge_pull_request``), the
     # exponential-backoff wrapper (``_merge_with_retry``, which is always handed
-    # ``merge_pull_request`` as its first argument).
-    _MERGE_NAMES = frozenset({"merge_pull_request", "_merge_with_retry"})
+    # ``merge_pull_request`` as its first argument), and the GitHub
+    # auto-merge primitive (``enable_auto_merge``).
+    _MERGE_NAMES = frozenset(
+        {"merge_pull_request", "_merge_with_retry", "enable_auto_merge"}
+    )
 
     # Whole files that define/re-export the merge primitive or the generic retry
     # wrapper. These make NO integration/promotion-branch merge *decision* (the

@@ -145,6 +145,41 @@ async def test_clean_single_head_migration_rollup_auto_merges(cleanup_db, mocker
 
 
 @pytest.mark.asyncio
+async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
+    """A blocking combined-chain verdict prevents the auto-merge fallback."""
+    diff = _added_file_diff("backend/alembic/versions/0124_a.py", "0124", "0123")
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/alembic/versions/0124_a.py"),
+        diff=diff,
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True, "message": "ok"},
+    )
+    mocker.patch(
+        "app.rollup_management._validate_rollup_migration_chain",
+        new=AsyncMock(return_value=("block", "dual-head: duplicate revision")),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_not_called()
+    enable_auto_merge_mock.assert_not_called()
+    mock_spawn.assert_awaited_once()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "alembic" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_rollup_not_touching_migrations_unaffected(cleanup_db, mocker):
     """A rollup whose diff does not touch alembic/versions auto-merges; the
     guard returns ok without even fetching the diff."""

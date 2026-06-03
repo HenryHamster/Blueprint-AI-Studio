@@ -3673,6 +3673,56 @@ async def test_promote_blocks_on_dual_alembic_head(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_promote_guard_block_skips_auto_merge(db_session, mocker):
+    """A blocking guard verdict prevents promote() from reaching auto-merge."""
+    project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 77, "html_url": "http://pr/77"}),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True}),
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new=AsyncMock(return_value={"enabled": True}),
+    )
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(return_value=(False, "dual-head: duplicate revision")),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        "abcd" * 10,
+        composite={"confidence": 0.95},
+        base_record={"candidate_sha": "abcd" * 10},
+    )
+    await db_session.commit()
+
+    merge_mock.assert_not_called()
+    enable_auto_merge_mock.assert_not_called()
+    assert result["status"] == "promotion_failed"
+    assert result["error"] == "migration_guard_blocked"
+
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "migration_guard_blocked"
+
+
+@pytest.mark.asyncio
 async def test_promote_defers_on_migration_metadata_unfetchable(db_session, mocker):
     """A transient inability to fetch the migration metadata HOLDS the promotion
     (retryable) rather than merging blind — fail-safe, mirroring the other
