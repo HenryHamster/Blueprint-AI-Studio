@@ -7585,6 +7585,56 @@ class TestAgentTestRunnerSourceParity:
                 f"be detected. Reconcile the script list with AGENT_TEST_RUNNER_COMMANDS['script']."
             )
 
+    def test_agent_emits_composer_json_detection_trigger(self):
+        """The ``composer`` family: the agent must look for ``composer.json`` as its
+        detection trigger inside the divergent-family helper, gated by the
+        manifest-content guard, and emit a ``composer`` runner.
+
+        This closes an asymmetry with the shell-``script`` family. For shell
+        scripts, ``test_agent_emits_shell_script_runner`` pins every filename the
+        agent looks for (test.sh, run-tests.sh, …) as a source literal, so a
+        renamed/removed detection trigger fails the parity scan. For composer,
+        only the emitted command (``composer test``) was reconstructed and
+        checked — nothing pinned the ``composer.json`` detection trigger itself.
+        As a result, dropping or mistyping ``has('composer.json')`` while leaving
+        the ``composer test`` command literal alive would silently stop the agent
+        from detecting composer repos at merge time, even though the backend
+        onboarding detector still detects ``composer.json`` — the exact silent
+        cross-detector divergence the parity suite exists to prevent. This test
+        pins the trigger in the same source-scan tier as the script-filename check.
+
+        Scoped to the ``detectExtraFamilyRunner`` region (not anywhere in the
+        file) so the assertion catches the trigger being moved out of the helper,
+        not merely a stray ``composer.json`` string elsewhere.
+        """
+        source = self._read_agent_source()
+        region = _extract_extra_family_region(source)  # raises (loud) on parse miss
+        composer_command = AGENT_TEST_RUNNER_COMMANDS["composer"]
+        # composer_command == "composer test"
+        cmd, _args = composer_command.split(" ", 1)
+        # (a) the composer.json detection trigger literal must live in the helper.
+        assert "'composer.json'" in region, (
+            "agent/src/utils/test-runners.ts no longer looks for 'composer.json' "
+            "in detectExtraFamilyRunner; composer repos would no longer be "
+            "detected at merge time even though the backend onboarding detector "
+            "still detects composer.json. Reconcile the composer detection trigger "
+            "with AGENT_TEST_RUNNER_COMMANDS['composer']."
+        )
+        # (b) the region must still emit a 'composer' runner (the command survives).
+        assert f"cmd: '{cmd}'" in region, (
+            f"agent/src/utils/test-runners.ts no longer emits a {cmd!r} runner in "
+            f"detectExtraFamilyRunner; the composer family ({composer_command!r}) "
+            "cannot be produced."
+        )
+        # (c) the trigger must stay content-gated by the manifest-script guard, so
+        # a composer.json without a real scripts.test still does not falsely detect.
+        assert "manifestDefinesTestScript" in region, (
+            "agent/src/utils/test-runners.ts no longer gates the composer.json "
+            "trigger with manifestDefinesTestScript in detectExtraFamilyRunner; "
+            "the trigger must remain content-gated to match the backend onboarding "
+            "detector's scripts.test requirement."
+        )
+
     def test_agent_extra_family_runners_are_all_in_table(self):
         """Reverse direction: every command the divergent-family helper emits must
         appear in the backend table.
