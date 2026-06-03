@@ -140,9 +140,10 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('# Recover your durable model (fetch-then-edit)');
     expect(prompt).toContain('./fetch problem-model');
     expect(prompt).not.toContain('# Bootstrap (when the problem_model is empty)');
-    // Section 6 carries the recovery caveat so the full replacement is the
-    // fetched model edited, never a cold-start reconstruction.
-    expect(prompt).toContain('Recovery caveat');
+    // Section 6 now uses non-destructive-merge semantics (main #7449): there is
+    // no inline "full replacement" caveat; recovery is steered by the standalone
+    // fetch-then-edit block above plus section 6's own fetch-the-full-state note.
+    expect(prompt).toContain('first to read the full current state');
   });
 
   it('renders neither bootstrap nor recovery block when the model is present', () => {

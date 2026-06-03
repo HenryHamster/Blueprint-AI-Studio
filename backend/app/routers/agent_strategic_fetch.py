@@ -114,6 +114,30 @@ async def agent_fetch_playbook_entry(
     return {"status": "success", "data": {"key": full_key, "entry": entry}}
 
 
+@router.get("/projects/{project_id}/problem_model")
+@router.get("/projects/{project_id}/problem-model")
+@limiter.limit("60/minute")
+async def agent_fetch_problem_model(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the FULL untrimmed problem_model. Used when the strategic
+    payload trimmed (per-gap arrays capped, archived_gaps dropped) or dropped
+    problem_model under budget pressure and the agent wants the complete
+    current state before writing — writes merge non-destructively, so this is
+    for reading the whole record, not a precondition for a safe write.
+
+    Both the underscore (``/problem_model``) and hyphen (``/problem-model``)
+    spellings are served as aliases: ``main`` shipped the underscore route
+    (#7449) and ``automain`` shipped the hyphen route (#7451). Keeping both
+    means agents from either baked image can fetch the model during the
+    image-rollover window."""
+    project = await _resolve_agent_project(project_id, token, session)
+    return {"status": "success", "data": project.problem_model or {}}
+
+
 @router.get("/projects/{project_id}/gaps/{gap_id}")
 @limiter.limit("60/minute")
 async def agent_fetch_gap(
@@ -138,20 +162,3 @@ async def agent_fetch_gap(
                     "from_archive": archived_flag,
                 }
     raise HTTPException(status_code=404, detail="Gap not found")
-
-
-@router.get("/projects/{project_id}/problem-model")
-@limiter.limit("60/minute")
-async def agent_fetch_problem_model(
-    request: Request,
-    project_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    token: dict = Depends(verify_agent_token),
-):
-    """Return the full durable ``problem_model`` for the agent's project.
-
-    This bypasses the strategic-payload budget entirely so the agent can
-    reconstruct the whole current model when the packer trims or drops it.
-    """
-    project = await _resolve_agent_project(project_id, token, session)
-    return {"status": "success", "data": project.problem_model or {}}

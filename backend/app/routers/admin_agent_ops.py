@@ -1388,7 +1388,7 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app import strategic_cycle as _strategic_cycle
-        from app.problem_model import ColdStartWipeError, apply_agent_update
+        from app.problem_model import apply_agent_update
         from app.strategic_completion import (
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
@@ -1437,15 +1437,6 @@ async def strategic_operation(
                 now_iso=_utcnow().isoformat(),
                 baseline_raw=baseline_pm,
             )
-        except ColdStartWipeError as cw:
-            # Bootstrap-over-mature: the proposed update would wipe a non-empty
-            # model's agent-owned collections. Refuse loudly (409) rather than
-            # silently overwriting; the agent must fetch + edit, not replace.
-            logger.warning(
-                f"[STRATEGIC API] Task {task.id}: refused cold-start wipe of "
-                f"non-empty problem_model for project {project.id}: {cw}"
-            )
-            raise HTTPException(status_code=409, detail=str(cw)) from None
         except _PmValidationError as ve:
             raise HTTPException(
                 status_code=400, detail=f"Invalid problem_model: {ve}"

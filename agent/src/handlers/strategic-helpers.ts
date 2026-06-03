@@ -89,6 +89,7 @@ TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; fetch is only usable in strategic-mode tasks" >&2; exit 1; }
 
+# problem-model takes no id; everything else requires one.
 case "$KIND" in
   problem-model) PATH_SUFFIX="problem-model" ;;
   direction)  PATH_SUFFIX="directions/$ID" ;;
