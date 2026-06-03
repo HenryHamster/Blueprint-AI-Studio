@@ -8,20 +8,22 @@ queries off a passed-in ``AsyncSession``. They are imported (and re-exported) by
 """
 
 import logging
+import math
 import statistics
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.time_utils import _to_naive_utc
+from app.landed_signal import has_landed_signal
 from app.models import (
+    Alert,
     Task,
     TaskStatus,
     ReleaseVersion,
-    _utcnow,
 )
 # Remediation funnel + recurring-failure-pattern helpers relocated to their own
 # module. Re-exported here so existing import paths are unchanged.
@@ -202,7 +204,7 @@ def _compute_first_review_approval_breakdowns(
             t
             for t in tasks
             if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
-            and (t.context or {}).get("pr_merged") is True
+            and has_landed_signal(t)
         ]
         if not eligible:
             return None
@@ -253,7 +255,7 @@ def _compute_first_review_approval_breakdowns(
         t
         for t in terminal_tasks
         if (t.first_payload or {}).get("type", "create") in _REVIEW_ELIGIBLE_TYPES
-        and (t.context or {}).get("pr_merged") is True
+        and has_landed_signal(t)
     ]
 
     return {
@@ -559,6 +561,504 @@ def compute_review_cap_exhaustion_summary(
         "avg_cost_usd": round(_cap_total_cost / len(_cap_tasks), 4)
         if _cap_tasks
         else None,
+    }
+
+
+# Reverse of alert_dispatch._ESCALATION_REASON_LABELS — maps the human-readable
+# label embedded in a "Review-fix escalation: <label> on PR #N" Alert title back
+# to its canonical reason key. Kept in lockstep with alert_dispatch; the label
+# strings are part of the deduplicated alert title, so they are stable.
+_ESCALATION_TITLE_PREFIX = "Review-fix escalation: "
+_ESCALATION_LABEL_TO_REASON = {
+    "stuck cycle": "stuck",
+    "dispute standoff": "standoff",
+    "repeat-fingerprint halt": "repeat-fingerprint",
+}
+_TERMINAL_OUTCOME_KEY = "review_loop_terminal_outcome"
+_TERMINAL_OUTCOME_KEYS = frozenset(
+    {
+        "merged",
+        "rejected",
+        "cap_exhausted",
+        "stuck",
+        "standoff",
+        "repeat_fingerprint_halt",
+    }
+)
+_ESCALATION_OUTCOME_KEYS = frozenset(
+    {"stuck", "standoff", "repeat_fingerprint_halt"}
+)
+def _outer_loop_pct(values: List[int], p: int) -> Optional[int]:
+    """Nearest-rank percentile over a list of ints (None when empty)."""
+    if not values:
+        return None
+    s = sorted(values)
+    return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+
+def _outer_loop_chain_key(t: "Task") -> str:
+    """Stable PR-chain identifier for a review-loop task.
+
+    A single PR that takes k review<->fix cycles spawns k Task rows, each
+    carrying ``review_loop`` with the SAME ``original_task_id`` (and
+    ``pr_number``) but an incremented ``iteration``. Grouping on this key
+    collapses those k iteration-tasks back into one PR-chain. Falls back to
+    ``pr_number`` and then the task's own id so a lone iteration with neither
+    key is still its own chain.
+    """
+    rl = (t.context or {}).get("review_loop") or {}
+    oid = rl.get("original_task_id")
+    if oid:
+        return f"orig:{oid}"
+    pr = rl.get("pr_number")
+    if pr is not None:
+        return f"pr:{pr}"
+    return f"task:{t.id}"
+
+
+def _outer_loop_terminal_outcome(t: "Task") -> Optional[str]:
+    """Return the structured or legacy terminal outcome for a task."""
+    ctx = t.context or {}
+    marker = ctx.get(_TERMINAL_OUTCOME_KEY)
+    if isinstance(marker, dict):
+        kind = marker.get("kind") or marker.get("outcome")
+        if kind == "repeat-fingerprint":
+            kind = "repeat_fingerprint_halt"
+        if kind in _TERMINAL_OUTCOME_KEYS:
+            return kind
+    if has_landed_signal(t):
+        return "merged"
+    if (ctx or {}).get("failure_detail") == "review_cap_exhausted":
+        return "cap_exhausted"
+    if (ctx or {}).get("blocked_repeat_fingerprint"):
+        return "repeat_fingerprint_halt"
+    return None
+
+
+def _group_outer_loop_chains(
+    all_tasks: List[Task], window_start: "datetime"
+) -> tuple:
+    """Group in-window review-loop tasks into PR-chains.
+
+    Returns ``(tasks_by_id, chains, task_id_to_chain)`` where ``chains`` maps a
+    chain key (see ``_outer_loop_chain_key``) to its iteration-tasks and
+    ``task_id_to_chain`` maps every iteration-task id AND each chain's
+    ``original_task_id`` (both str and UUID forms) back to the chain key, so an
+    escalation Alert raised against the original resolves to the right chain.
+    Shared by ``compute_outer_loop_convergence`` and ``_resolve_outer_loop_chains``.
+    """
+    tasks_by_id = {str(t.id): t for t in all_tasks}
+    loop_tasks = [
+        t
+        for t in all_tasks
+        if isinstance((t.context or {}).get("review_loop"), dict)
+        and (t.created_at is None or t.created_at >= window_start)
+    ]
+    chains: Dict[str, List[Task]] = defaultdict(list)
+    task_id_to_chain: Dict[Any, str] = {}
+    for t in loop_tasks:
+        key = _outer_loop_chain_key(t)
+        chains[key].append(t)
+        task_id_to_chain[t.id] = key
+        rl = (t.context or {}).get("review_loop") or {}
+        oid = rl.get("original_task_id")
+        if oid:
+            task_id_to_chain[oid] = key
+            try:
+                task_id_to_chain[uuid.UUID(str(oid))] = key
+            except Exception:
+                pass
+    return tasks_by_id, chains, task_id_to_chain
+
+
+def _scan_escalation_alerts(
+    escalation_alerts: List[Alert], task_id_to_chain: Dict[Any, str]
+) -> tuple:
+    """Parse review-fix escalation Alerts into chain-level reason data.
+
+    Returns ``(alert_reasons_by_chain, escalation_by_reason, escalated_task_ids)``.
+    A given ``(task_id, reason)`` pair is counted once in ``escalation_by_reason``
+    even when the same alert title recurs, so the histogram never over-counts
+    relative to the distinct-task escalation total. Shared by the convergence
+    aggregate and the chain drill-down so both read escalations identically.
+    """
+    escalation_by_reason: Dict[str, int] = {
+        "stuck": 0,
+        "standoff": 0,
+        "repeat-fingerprint": 0,
+    }
+    alert_reasons_by_chain: Dict[str, set] = defaultdict(set)
+    seen_task_reason: set = set()
+    escalated_task_ids: set = set()
+    for alert in escalation_alerts:
+        title = alert.title or ""
+        if not title.startswith(_ESCALATION_TITLE_PREFIX):
+            continue
+        if alert.task_id is not None:
+            escalated_task_ids.add(alert.task_id)
+        for label, reason in _ESCALATION_LABEL_TO_REASON.items():
+            if f"{_ESCALATION_TITLE_PREFIX}{label} " in title:
+                pair = (alert.task_id, reason)
+                if pair not in seen_task_reason:
+                    seen_task_reason.add(pair)
+                    escalation_by_reason[reason] += 1
+                    if alert.task_id is not None:
+                        alert_reasons_by_chain[
+                            task_id_to_chain.get(alert.task_id, f"task:{alert.task_id}")
+                        ].add(reason)
+                break
+    return alert_reasons_by_chain, escalation_by_reason, escalated_task_ids
+
+
+def _resolve_chain_outcome(outcome_tasks: List[Task], chain_reasons: set) -> Optional[str]:
+    """Resolve a PR-chain's single terminal outcome.
+
+    Definitive terminal states (merged > cap-exhausted > rejected) win over a
+    possibly stale structured ``review_loop_terminal_outcome`` marker; the
+    alert-derived escalation reasons (standoff > stuck > repeat-fingerprint) are
+    the last-resort fallback. This priority is the SAME one
+    ``compute_outer_loop_convergence`` used inline — extracted so the drill-down
+    endpoint reports outcomes identical to the aggregate. Critically, because
+    ``merged`` is checked first, an escalated-then-merged chain resolves to
+    ``merged`` and is never attributed to its prior escalation reason.
+    """
+    if any(has_landed_signal(t) for t in outcome_tasks):
+        return "merged"
+    if any(
+        (t.context or {}).get("failure_detail") == "review_cap_exhausted"
+        for t in outcome_tasks
+    ):
+        return "cap_exhausted"
+    if any((t.context or {}).get("pr_rejected") is True for t in outcome_tasks):
+        return "rejected"
+    for t in outcome_tasks:
+        structured_outcome = _outer_loop_terminal_outcome(t)
+        if structured_outcome is not None:
+            return structured_outcome
+    if "standoff" in chain_reasons:
+        return "standoff"
+    if "stuck" in chain_reasons:
+        return "stuck"
+    if "repeat-fingerprint" in chain_reasons:
+        return "repeat_fingerprint_halt"
+    return None
+
+
+def _outer_loop_chain_observation(
+    key: str,
+    chain_tasks: List[Task],
+    tasks_by_id: Dict[str, Task],
+    chain_reasons: set,
+) -> Dict[str, Any]:
+    """Reduce one PR-chain's iteration-tasks to a single observation row.
+
+    Folds the chain-original task (which carries terminal flags like
+    ``pr_merged`` but usually no ``review_loop``) into the outcome scan, then
+    computes cycles-to-merge (``max(iteration)``), churn (``max`` of the running
+    ``churn_detections`` total), drift presence, the resolved terminal outcome,
+    and identifying context (``pr_number``, ``task_ids``, ``project_id``). Both
+    the convergence aggregate and the drill-down endpoint build from this row.
+    """
+    outcome_tasks = list(chain_tasks)
+    rl0 = (chain_tasks[0].context or {}).get("review_loop") or {}
+    oid = rl0.get("original_task_id")
+    if oid and str(oid) in tasks_by_id:
+        orig = tasks_by_id[str(oid)]
+        if orig not in outcome_tasks:
+            outcome_tasks.append(orig)
+
+    chain_iters: List[int] = []
+    chain_churn = 0
+    chain_has_drift = False
+    pr_number = rl0.get("pr_number")
+    for t in chain_tasks:
+        rl = (t.context or {}).get("review_loop") or {}
+        if pr_number is None and rl.get("pr_number") is not None:
+            pr_number = rl.get("pr_number")
+        it = rl.get("iteration")
+        if isinstance(it, (int, float)) and it >= 1:
+            chain_iters.append(int(it))
+        # churn_detections is a running total carried forward across iterations,
+        # so the chain's churn is the MAX seen (summing would double-count).
+        chain_churn = max(chain_churn, int(rl.get("churn_detections") or 0))
+        drift = rl.get("drift_signal")
+        if isinstance(drift, dict) and (drift.get("drift_in") or drift.get("drift_out")):
+            chain_has_drift = True
+
+    project_id = None
+    for t in outcome_tasks:
+        if getattr(t, "project_id", None) is not None:
+            project_id = str(t.project_id)
+            break
+
+    return {
+        "chain_key": key,
+        "outcome": _resolve_chain_outcome(outcome_tasks, chain_reasons),
+        "max_iteration": max(chain_iters) if chain_iters else None,
+        "churn_count": chain_churn,
+        "has_drift": chain_has_drift,
+        "original_task_id": str(oid) if oid else None,
+        "pr_number": pr_number,
+        "task_ids": [str(t.id) for t in chain_tasks],
+        "project_id": project_id,
+    }
+
+
+def _resolve_outer_loop_chains(
+    all_tasks: List[Task],
+    escalation_alerts: List[Alert],
+    window_start: "datetime",
+) -> List[Dict[str, Any]]:
+    """Reduce in-window review-loop tasks to one observation row per PR-chain.
+
+    Pure function — no database calls. Reuses the same grouping
+    (``_outer_loop_chain_key``), escalation-alert parsing, and per-chain outcome
+    resolution as ``compute_outer_loop_convergence``, so the chain drill-down
+    endpoint reports outcomes identical to the aggregate summary. Rows are
+    newest-first by the chain's most recent review_loop task creation time.
+    """
+    tasks_by_id, chains, task_id_to_chain = _group_outer_loop_chains(
+        all_tasks, window_start
+    )
+    alert_reasons_by_chain, _by_reason, _escalated_ids = _scan_escalation_alerts(
+        escalation_alerts, task_id_to_chain
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for key, chain_tasks in chains.items():
+        obs = _outer_loop_chain_observation(
+            key, chain_tasks, tasks_by_id, alert_reasons_by_chain.get(key, set())
+        )
+        latest_created = None
+        for t in chain_tasks:
+            created = t.created_at
+            if created is not None and (latest_created is None or created > latest_created):
+                latest_created = created
+        obs["_latest_created"] = latest_created
+        rows.append(obs)
+
+    rows.sort(key=lambda r: r["_latest_created"] or datetime.min, reverse=True)
+    for r in rows:
+        r.pop("_latest_created", None)
+    return rows
+
+
+def compute_outer_loop_convergence(
+    *,
+    all_tasks: List[Task],
+    escalation_alerts: List[Alert],
+    window_start: "datetime",
+) -> Dict[str, Any]:
+    """Aggregate OUTER review<->fix PR-cycle convergence health.
+
+    Pure function — no database calls. The INNER per-task lint/test/check loop is
+    aggregated by ``get_fix_loop_convergence``; this rolls up the OUTER PR cycle
+    (reviewer finds issues -> fixer addresses -> reviewer re-reviews) recorded
+    per-PR in ``task.context["review_loop"]`` plus the early-escalation operator
+    Alerts written by ``alert_dispatch._maybe_create_escalation_alert``.
+
+    Rolls up, over tasks created within the window:
+      - review<->fix cycles-to-merge distribution (iteration median/p95 + buckets)
+      - issue-churn detection totals and the number of PRs that saw churn
+      - drift-signal presence (files leaking in/out across iterations)
+      - terminal outcomes: merged, rejected, cap-exhausted, repeat-fingerprint halt
+      - early-escalation Alert counts by reason (stuck / standoff / repeat-fingerprint)
+
+    ``convergence_rate`` = merged / (merged + rejected + escalations that have not
+    yet reached a merged/rejected terminal), i.e. the fraction of decided-or-stuck
+    outer loops that actually merged. Returns zeros/None on an empty window.
+
+    Aggregation is PER PR-CHAIN, not per review-loop Task. Each review/fix cycle
+    spawns a new Task (review_pipeline._spawn_pipeline_task) carrying review_loop
+    with an incremented ``iteration`` and a shared ``original_task_id``/``pr_number``,
+    so a single k-cycle PR yields k in-window tasks. We group those tasks by chain
+    key (see ``_outer_loop_chain_key``) and reduce each chain to ONE observation:
+    ``max(iteration)`` as cycles-to-merge and a single terminal outcome. The
+    terminal flag is read from the chain's tasks AND the chain-original task
+    (``pr_merged`` is stamped on the original by ci_completion, which does NOT
+    carry review_loop), so merges are attributed even though the original is
+    absent from ``loop_tasks``.
+    """
+    tasks_by_id, chains, task_id_to_chain = _group_outer_loop_chains(
+        all_tasks, window_start
+    )
+
+    iterations: List[int] = []
+    iteration_distribution = {"1": 0, "2": 0, "3": 0, "4+": 0}
+    churn_total = 0
+    churn_pr_count = 0
+    drift_pr_count = 0
+    merged_chains: set = set()
+    rejected_chains: set = set()
+    cap_exhausted = 0
+    repeat_fingerprint_halt = 0
+    terminal_outcome_histogram: Dict[str, int] = {
+        "merged": 0,
+        "rejected": 0,
+        "cap_exhausted": 0,
+        "stuck": 0,
+        "standoff": 0,
+        "repeat_fingerprint_halt": 0,
+    }
+    stuck_pr_count = 0
+    standoff_pr_count = 0
+    repeat_fingerprint_pr_count = 0
+    overall_escalation_pr_count = 0
+
+    # Parse escalation Alerts into per-chain reason sets + the deduped histogram.
+    (
+        alert_reasons_by_chain,
+        escalation_by_reason,
+        escalated_task_ids,
+    ) = _scan_escalation_alerts(escalation_alerts, task_id_to_chain)
+    escalated_chain_keys: set = set()
+
+    # Per-non-converged-chain candidate-cause tallies, used to rank the single
+    # dominant non-convergence blocker. Each non-converged chain (outcome !=
+    # "merged") contributes to every cause it exhibits, so shares are normalised
+    # on ONE common base (non-converged PR-chains) rather than comparing the raw
+    # counts directly — the escalation-reason signals are reason-occurrences on a
+    # different base than the per-chain churn/drift/outcome counts.
+    non_converged_total = 0
+    blocker_cause_counts: Dict[str, int] = {
+        "churn": 0,
+        "drift": 0,
+        "stuck": 0,
+        "standoff": 0,
+        "repeat_fingerprint_halt": 0,
+        "cap_exhausted": 0,
+    }
+
+    for key, chain_tasks in chains.items():
+        obs = _outer_loop_chain_observation(
+            key, chain_tasks, tasks_by_id, alert_reasons_by_chain.get(key, set())
+        )
+
+        max_iteration = obs["max_iteration"]
+        if max_iteration is not None:
+            iterations.append(max_iteration)
+            iteration_distribution[
+                "4+" if max_iteration >= 4 else str(max_iteration)
+            ] += 1
+        chain_churn = obs["churn_count"]
+        if chain_churn > 0:
+            churn_total += chain_churn
+            churn_pr_count += 1
+        if obs["has_drift"]:
+            drift_pr_count += 1
+
+        outcome = obs["outcome"]
+        if outcome in terminal_outcome_histogram:
+            terminal_outcome_histogram[outcome] += 1
+        if outcome == "merged":
+            merged_chains.add(key)
+        elif outcome == "rejected":
+            rejected_chains.add(key)
+        elif outcome == "cap_exhausted":
+            cap_exhausted += 1
+            rejected_chains.add(key)
+        elif outcome == "repeat_fingerprint_halt":
+            repeat_fingerprint_halt += 1
+        if outcome == "stuck":
+            stuck_pr_count += 1
+        if outcome == "standoff":
+            standoff_pr_count += 1
+        if outcome == "repeat_fingerprint_halt":
+            repeat_fingerprint_pr_count += 1
+        if outcome in _ESCALATION_OUTCOME_KEYS:
+            overall_escalation_pr_count += 1
+            escalated_chain_keys.add(key)
+
+        # Tally candidate non-convergence causes for the dominant-blocker ranking.
+        # A chain is non-converged when it did NOT merge; it contributes to every
+        # cause it exhibits (a chain can churn AND drift, etc.).
+        if outcome != "merged":
+            non_converged_total += 1
+            if chain_churn > 0:
+                blocker_cause_counts["churn"] += 1
+            if obs["has_drift"]:
+                blocker_cause_counts["drift"] += 1
+            if outcome in blocker_cause_counts:
+                blocker_cause_counts[outcome] += 1
+
+    # Outer-loops still escalated but not yet merged/rejected count as
+    # non-convergence in the denominator (oscillating / stuck awaiting a human).
+    # Map escalated tasks to their chain so an unresolved escalation counts once
+    # per chain, not once per iteration-task.
+    escalated_chains: set = set()
+    for tid in escalated_task_ids:
+        escalated_chains.add(task_id_to_chain.get(tid, f"task:{tid}"))
+    escalated_chains.update(escalated_chain_keys)
+    escalated_unresolved = escalated_chains - merged_chains - rejected_chains
+    decided = len(merged_chains) + len(rejected_chains) + len(escalated_unresolved)
+    convergence_rate = round(len(merged_chains) / decided, 3) if decided else None
+
+    # Rank the candidate causes and name a single dominant blocker only when one
+    # cause clearly dominates: it must be present in >=2 non-converged chains,
+    # cover >=50% of them, AND strictly outrank the runner-up (an even split is
+    # "no clear dominant"). Mirrors the dominant-failure-class gating in
+    # _build_digest_narrative; emits None on empty/ambiguous windows.
+    dominant_blocker: Optional[Dict[str, Any]] = None
+    if non_converged_total > 0:
+        ranked = sorted(
+            blocker_cause_counts.items(), key=lambda kv: (-kv[1], kv[0])
+        )
+        top_cause, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= 2
+            and top_count / non_converged_total >= 0.5
+            and top_count > second_count
+        ):
+            dominant_blocker = {
+                "cause": top_cause,
+                "count": top_count,
+                "total": non_converged_total,
+                "share": round(top_count / non_converged_total, 3),
+            }
+
+    return {
+        "prs_with_review_loop": len(chains),
+        "iteration_median": _outer_loop_pct(iterations, 50),
+        "iteration_p95": _outer_loop_pct(iterations, 95),
+        "iteration_distribution": iteration_distribution,
+        "churn_total": churn_total,
+        "churn_pr_count": churn_pr_count,
+        "drift_pr_count": drift_pr_count,
+        "outcomes": {
+            "merged": len(merged_chains),
+            "rejected": len(rejected_chains),
+            "cap_exhausted": cap_exhausted,
+            "repeat_fingerprint_halt": repeat_fingerprint_halt,
+        },
+        "terminal_outcome_histogram": terminal_outcome_histogram,
+        "incidence_counts": {
+            "churn": churn_pr_count,
+            "stuck": stuck_pr_count,
+            "standoff": standoff_pr_count,
+            "repeat_fingerprint": repeat_fingerprint_pr_count,
+            "overall_escalations": overall_escalation_pr_count,
+        },
+        "incidence_rates": {
+            "churn": round(churn_pr_count / len(chains), 3) if chains else None,
+            "stuck": round(stuck_pr_count / len(chains), 3) if chains else None,
+            "standoff": round(standoff_pr_count / len(chains), 3) if chains else None,
+            "repeat_fingerprint": round(
+                repeat_fingerprint_pr_count / len(chains), 3
+            )
+            if chains
+            else None,
+            "overall_escalations": round(
+                overall_escalation_pr_count / len(chains), 3
+            )
+            if chains
+            else None,
+        },
+        "escalation_total": len(escalated_task_ids),
+        "escalation_by_reason": escalation_by_reason,
+        "convergence_rate": convergence_rate,
+        "non_converged_total": non_converged_total,
+        "dominant_blocker": dominant_blocker,
     }
 
 
@@ -940,7 +1440,7 @@ def compute_digest_cost_economics(
         t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
         task_type = (t.first_payload or {}).get("type", "unknown")
         _type_cost[task_type] = _type_cost.get(task_type, 0.0) + t_cost
-        if (t.context or {}).get("pr_merged") is True:
+        if has_landed_signal(t):
             _type_merges[task_type] = _type_merges.get(task_type, 0) + 1
     _type_cpms = {
         ttype: _type_cost[ttype] / _type_merges[ttype]
@@ -1031,6 +1531,44 @@ def compute_digest_cost_economics(
     }
 
 
+def compute_churn_direction(buckets: List[Dict[str, Any]]) -> str:
+    """Canonical churn-trend direction for a list of per-day trend buckets.
+
+    Single source of truth shared by the narrative verdict
+    (compute_narrative_summary) and the dashboard widget glyph (consumed via
+    the ``churn_direction`` field on the trend endpoint). Both surfaces MUST
+    derive direction here so the lifted "Review/fix churn is X." sentence can
+    never contradict the rising/falling glyph rendered beside it.
+
+    Compares the first-half vs second-half AVERAGE of per-day churn (robust to
+    single-day endpoint anomalies) with a 1% threshold to avoid flip-flopping
+    on near-equal halves. Returns 'falling' | 'rising' | 'flat'.
+    """
+    if len(buckets) < 2:
+        return "flat"
+
+    def _bucket_churn(bucket: Dict[str, Any]) -> float:
+        incidence = bucket.get("incidence_counts") or {}
+        churn = incidence.get("churn")
+        if churn is None:
+            churn = bucket.get("churn_total")
+        return float(churn or 0)
+
+    midpoint = math.ceil(len(buckets) / 2)
+    first_half = buckets[:midpoint]
+    second_half = buckets[midpoint:]
+    avg_first = sum(_bucket_churn(b) for b in first_half) / len(first_half)
+    avg_second = sum(_bucket_churn(b) for b in second_half) / len(second_half)
+
+    threshold = 0.01 * max(avg_first, avg_second, 1)
+    difference = avg_second - avg_first
+    if difference < -threshold:
+        return "falling"
+    if difference > threshold:
+        return "rising"
+    return "flat"
+
+
 def compute_narrative_summary(
     *,
     hours: int,
@@ -1052,6 +1590,8 @@ def compute_narrative_summary(
     pr_count: int,
     error_log_map: Dict[str, str],
     failed_tasks: List[Task],
+    outer_loop_convergence_summary: Dict[str, Any] | None = None,
+    outer_loop_convergence_trend: Dict[str, Any] | None = None,
 ) -> str:
     """Build the human-readable digest narrative from precomputed metrics."""
     from app.failure_classification import (
@@ -1143,6 +1683,35 @@ def compute_narrative_summary(
                 _tax_msg = _taxonomy_msgs.get(_dom_cat)
                 if _tax_msg:
                     narrative_parts.append(_tax_msg)
+
+    if outer_loop_convergence_summary and outer_loop_convergence_trend:
+        buckets = outer_loop_convergence_trend.get("buckets") or []
+        # Consume the SINGLE canonical churn direction. In production the trend
+        # endpoint already stamps `churn_direction` via compute_churn_direction;
+        # when a caller passes raw buckets without it (e.g. unit tests) fall back
+        # to the SAME helper so the verdict can never diverge from the widget
+        # glyph, which derives from the identical algorithm.
+        churn_dir = outer_loop_convergence_trend.get("churn_direction")
+        if churn_dir not in {"falling", "rising", "flat"}:
+            churn_dir = compute_churn_direction(buckets)
+        if len(buckets) >= 2:
+            has_churn_signal = any(
+                (b.get("incidence_counts", {}).get("churn") or b.get("churn_total") or 0) > 0
+                for b in buckets
+            )
+            if has_churn_signal:
+                verdict = f"Review/fix churn is {churn_dir}"
+                dominant_blocker = outer_loop_convergence_summary.get("dominant_blocker")
+                if (
+                    dominant_blocker
+                    and dominant_blocker.get("count")
+                    and dominant_blocker.get("total")
+                ):
+                    verdict += (
+                        f"; the main blocker is {dominant_blocker['cause'].replace('_', ' ')}"
+                        f" ({dominant_blocker['count']}/{dominant_blocker['total']} non-converged PR chains)"
+                    )
+                narrative_parts.append(verdict + ".")
 
     if completed_count > 0:
         trend_prefix = ""

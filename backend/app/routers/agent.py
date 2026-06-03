@@ -22,6 +22,7 @@ from app.auth import (
     verify_agent_jwt,
     create_agent_token,
     AGENT_TOKEN_TTL_HOURS,
+    VM_SCOPED_TOKEN_SCOPE,
 )
 from app.database import get_session, AsyncSessionLocal, resolve_dialect_name
 from app.models import (
@@ -66,6 +67,8 @@ from app.claim_task_helpers import (
     _compute_failure_stage_pattern,
     _build_vision_summary,
     _build_direction_narrative,
+    _build_problem_model_summary,
+    _build_direction_contract,
 )
 
 logger = logging.getLogger(__name__)
@@ -220,7 +223,28 @@ async def verify_agent_token(
     """
     payload = verify_agent_jwt(x_agent_token)
     task_id = payload.get("sub")
-    if not task_id:
+    # VM-scoped (taskless / warm-pool) token: a pool VM that has not yet claimed
+    # any task. It carries no task ``sub`` — only ``vm_instance_id`` + project
+    # scope, tagged ``token_scope == "vm"``. Accept it here (so the taskless
+    # endpoints vm-heartbeat / next-role can use it; /heartbeat and /claim still
+    # require a task ``sub`` and reject a bare VM-scoped token) and skip
+    # the task-binding / terminal-freshness checks below, which are meaningless
+    # without a task. The endpoints themselves still scope every action by the
+    # JWT's ``vm_instance_id``. The task-scoped path (``sub`` present, no
+    # ``token_scope``) is unchanged. A VM-scoped token MUST carry a
+    # vm_instance_id, or there is nothing to authorize against.
+    if payload.get("token_scope") == VM_SCOPED_TOKEN_SCOPE or not task_id:
+        if not payload.get("vm_instance_id"):
+            _log_agent_auth_reject(
+                "vm_scoped_token_missing_vm",
+                path=request.url.path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
+            raise HTTPException(
+                status_code=401, detail="vm_scoped_token_missing_vm"
+            )
         return payload
     token_vm = payload.get("vm_instance_id")
     # /next-role and /vm-heartbeat are reached AFTER a task has terminated
@@ -404,7 +428,7 @@ async def verify_agent_token(
 # internals / invalidation helper) call sites keep working unchanged.
 # ---------------------------------------------------------------------------
 
-from app.github_token_resolver import (  # noqa: F401
+from app.github_token_resolver import (  # noqa: F401,E402
     _GITHUB_TOKEN_TTL,
     _github_token_cache,
     _github_token_cache_lock,
@@ -594,6 +618,30 @@ async def claim_task(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
+    """Claim a QUEUED or PROVISIONING task for execution.
+
+    Agent VMs call this upon startup to claim their assigned work. Transitions
+    the task from QUEUED/PROVISIONING to IN_PROGRESS and returns full task
+    details including payloads and context.
+
+    Authentication: Agent JWT token (2-hour or 8-hour bootstrap TTL).
+
+    Returns:
+        {
+            "id": str, "vm_instance_id": str, "payloads": list,
+            "context": dict, "parent_task_id": str | null,
+            ... (full Task object)
+        }
+
+    Status codes:
+        200: Task claimed successfully
+        404: No unclaimed task on this VM
+        429: Task locked by another process (retry recommended)
+        401: Invalid or expired token
+
+    Rate limit: 200 requests/minute.
+    Idempotency: Replays last successful claim within 5 minutes if present.
+    """
     vm_id = token.get("vm_instance_id")
     # Phase 2c Race A mitigation: a successful claim is a strong liveness
     # signal — we wouldn't be here without an authenticated VM. Recording
@@ -759,6 +807,7 @@ async def claim_task(
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
             "build_config": _build_cfg,
+            "approval_gate_config": project.approval_gate_config or {},
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
             "enable_parallel_fix": _build_cfg.get("enable_parallel_fix", False),
@@ -1815,6 +1864,13 @@ async def claim_task(
             if k.startswith("playbook/")
         )
         response["first_task_on_repo"] = total_playbook_count == 0
+        # Deterministic empty/near-empty repo signal persisted at onboarding
+        # (build_config.repo_is_empty). Distinct from first_task_on_repo (a
+        # playbook-count proxy): this reflects actual source presence, so the
+        # research prompt can gate bootstrap-from-goal guidance on real code.
+        response["repo_is_empty"] = bool(
+            (project_for_playbook.build_config or {}).get("repo_is_empty")
+        )
         if playbook_entries:
             response["playbook"] = playbook_entries
             # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response
@@ -1844,21 +1900,56 @@ async def claim_task(
                                     entry["stale"] = True
                                     entry["effectiveness_score"] = 0.0
                                 doc[full_key] = entry
-                        # Check file-path references (config-driven; skipped when unset)
+                        # Ground stale playbook file refs AND present-status
+                        # design-doc systems/capabilities against the project's
+                        # REAL integration branch (GitHub contents API) — the same
+                        # mechanism the strategic/research reconcile uses — so the
+                        # downgrade persists even on the backend, which has no local
+                        # checkout. The old local-only path silently skipped on the
+                        # backend (empty playbook_repo_root), giving a false
+                        # impression that grounding occurred.
+                        #
+                        # The GitHub network I/O is kept OFF the per-claim hot path:
+                        # branch_grounding_due() bounds it to at most once per
+                        # cooldown window per project, and the whole pass is
+                        # best-effort (never blocks the claim). When GitHub creds do
+                        # not resolve the branch-aware helpers fall back to the local
+                        # checkout (a no-op when none is configured).
                         try:
-                            from app.playbook_learning import check_and_flag_stale_refs
-
-                            repo_root: str = (
-                                _shared_state.runtime_config.get(
-                                    "playbook_repo_root", ""
-                                )
-                                or ""
+                            from app.playbook_learning import (
+                                branch_grounding_due,
+                                check_and_flag_stale_refs_branch_aware,
+                                ground_design_doc_systems_branch_aware,
+                                mark_branch_grounding_done,
                             )
-                            if repo_root:
-                                doc = check_and_flag_stale_refs(doc, repo_root)
+
+                            if branch_grounding_due(doc):
+                                from app.source_ref_validation import (
+                                    resolve_branch_verification_context,
+                                )
+
+                                repo_root: str = (
+                                    _shared_state.runtime_config.get(
+                                        "playbook_repo_root", ""
+                                    )
+                                    or ""
+                                )
+                                verification_kwargs = (
+                                    await resolve_branch_verification_context(
+                                        session, _pb_proj
+                                    )
+                                )
+                                doc = await check_and_flag_stale_refs_branch_aware(
+                                    doc, repo_root=repo_root, **verification_kwargs
+                                )
+                                doc = await ground_design_doc_systems_branch_aware(
+                                    doc, repo_root=repo_root, **verification_kwargs
+                                )
+                                mark_branch_grounding_done(doc)
                         except Exception:  # noqa: BLE001 — best-effort, never block claim
                             logger.debug(
-                                "[AGENT] Stale-ref check skipped (non-critical)"
+                                "[AGENT] Branch-aware design-doc grounding skipped "
+                                "(non-critical)"
                             )
                         try:
                             from app.playbook_learning import retire_idle_auto_entries
@@ -1910,6 +2001,19 @@ async def claim_task(
             None,
         )
         if direction:
+            # Operator/strategist-authored implementation constraints for whoever
+            # implements this direction (e.g. "Must not modify the public API
+            # surface"). Stored bounded (<=500 chars) by the strategic/admin write
+            # paths; re-cap defensively and only surface non-empty strings so
+            # directions without constraints add nothing to the claim response.
+            _impl_constraints_raw = (direction.get("context") or {}).get(
+                "implementation_constraints"
+            )
+            direction_implementation_constraints = (
+                _impl_constraints_raw.strip()[:500]
+                if isinstance(_impl_constraints_raw, str) and _impl_constraints_raw.strip()
+                else None
+            )
             history = direction.get("research_history", [])
             agg = direction.get("history_aggregate", {})
             total_merged = sum(e.get("prs_merged", 0) for e in history) + (
@@ -2285,6 +2389,10 @@ async def claim_task(
                     "top_first_review_issues": direction_top_first_review_issues,
                     "first_attempt_feedback": direction_first_attempt_feedback,
                 }
+                if direction_implementation_constraints:
+                    response["direction_context"]["implementation_constraints"] = (
+                        direction_implementation_constraints
+                    )
                 if review_iteration_rolling_median is not None:
                     response["direction_context"]["review_iteration_rolling_median"] = (
                         review_iteration_rolling_median
@@ -2588,6 +2696,19 @@ async def claim_task(
             None,
         )
         if direction_for_decomp:
+            # Surface operator/strategist implementation constraints to the planner
+            # too, so decomposition respects them (e.g. "Must not modify the public
+            # API surface"). Same bounded, omit-when-empty contract as the
+            # create/fix/refactor branch above.
+            _plan_impl_constraints = (direction_for_decomp.get("context") or {}).get(
+                "implementation_constraints"
+            )
+            if isinstance(_plan_impl_constraints, str) and _plan_impl_constraints.strip():
+                if "direction_context" not in response:
+                    response["direction_context"] = {}
+                response["direction_context"]["implementation_constraints"] = (
+                    _plan_impl_constraints.strip()[:500]
+                )
             from app.playbook_learning import summarize_decomposition_outcomes
 
             decomposition_outcomes = summarize_decomposition_outcomes(
@@ -2993,13 +3114,24 @@ async def claim_task(
                             "[AGENT] Failed to track arch context injection (non-critical)"
                         )
 
-    # Inject strategic vision so tactical agents understand the "why" behind
-    # their work. Useful for every task type — the orchestrator's strategic
-    # layer publishes this, but until now it was never read by implementers.
+    # Inject strategic intent so tactical agents understand the "why" behind
+    # their work. Useful for every task type. Prefer the LIVE, operator-editable
+    # problem model (onboarding + Problem Model editor write here) so current
+    # steering reaches the very next worker without waiting for a strategic
+    # cycle to mirror it into the legacy vision blob. Fall back to the legacy
+    # vision summary when the problem model is empty/malformed so existing
+    # projects are unaffected. Exactly one source is sent to avoid the agent
+    # double-rendering overlapping "why" sections.
     if project_for_playbook:
-        vision_summary = _build_vision_summary(project_for_playbook.vision)
-        if vision_summary:
-            response["vision"] = vision_summary
+        strategic_intent = _build_problem_model_summary(
+            project_for_playbook.problem_model
+        )
+        if strategic_intent:
+            response["strategic_intent"] = strategic_intent
+        else:
+            vision_summary = _build_vision_summary(project_for_playbook.vision)
+            if vision_summary:
+                response["vision"] = vision_summary
 
     # Inject direction narrative (established findings + open questions + last
     # cycle outcome) for task types that work inside a direction. Gives agents
@@ -3030,6 +3162,14 @@ async def claim_task(
                 if "direction_context" not in response:
                     response["direction_context"] = {}
                 response["direction_context"]["narrative"] = narrative
+            # Surface the current direction's contract (success evidence /
+            # completion criteria / retirement condition) so workers can align
+            # to what "done" means for this direction, not just its analytics.
+            contract = _build_direction_contract(_narrative_direction)
+            if contract:
+                if "direction_context" not in response:
+                    response["direction_context"] = {}
+                response["direction_context"]["contract"] = contract
 
     # Inject build_config so the agent knows how to lint/test/build
     if project_for_playbook and project_for_playbook.build_config:
@@ -3179,8 +3319,32 @@ async def agent_heartbeat(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """
-    Endpoint for agents to send a periodic heartbeat.
+    """Send a keep-alive heartbeat with optional telemetry.
+
+    Agents periodically call this endpoint (~30-60s interval) to signal
+    liveness and optionally report progress, metrics, tool usage, or status
+    beacons. Reaper uses 5-minute heartbeat timeout to detect stuck agents.
+
+    Request body (HeartbeatRequest):
+        {
+            "task_id": str, "status_message": str | null,
+            "metrics": HeartbeatMetrics | null,
+            "tool_traces": list[ToolTraceEntry] | null
+        }
+
+    Returns:
+        {"status": "ok"} | {"status": "locked", "detail": "..."}
+
+    Status codes:
+        200: Heartbeat recorded successfully
+        404: Task not found on this VM
+        409: Task locked or already terminal (retry or stop)
+        401: Invalid token
+        403: Task ID mismatch
+
+    Rate limit: 600 requests/minute.
+    Heartbeat timeout (reaper): 5 minutes.
+    Lock handling: Uses SKIP_LOCKED to avoid stalling on concurrent updates.
     """
     if str(req.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")

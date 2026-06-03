@@ -11,8 +11,6 @@ and preserve test-patchability.
 
 # fmt: off
 import logging
-import time
-import uuid
 from datetime import timedelta
 
 from fastapi import HTTPException
@@ -35,18 +33,39 @@ from app.models import (
     ArtifactType,
 )
 from app.review_pipeline import _spawn_pipeline_task, _is_pipeline_task_stale
+from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for callers/tests
+    _branch_task_id_prefix,
+    _cleanup_branches,
+    _partition_orphan_prs,
+)
 from app.rollup_migration_validation import (  # noqa: F401 - re-exported for callers/tests
     _extract_rollup_migration_sources,
     _touches_alembic_versions,
     _validate_rollup_migration_chain,
 )
+from app.rollup_pr_verification import (  # noqa: F401 — re-exported for callers/tests
+    MAX_REVIEW_RESPAWNS,
+    _PR_MERGE_NEGATIVE_TTL_S,
+    _pr_merge_negative_cache,
+    _record_rollup_failure_signals,
+    _review_respawn_count,
+    _verify_pr_merged,
+)
 from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/tests
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
 )
+from app.branch_resolution import (
+    InvalidProjectBranchConfiguration,
+    _signal_blocking_project_branch_configuration,
+    is_custom_staged_rollup_root,
+    merged_pr_counts_as_integration_landing,
+)
+from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
+    get_project_promotion_target as _get_project_promotion_target,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
     get_project_task_branch_namespace as _get_project_task_branch_namespace,
 )
@@ -55,117 +74,63 @@ from app.task_locking import with_directions_locked
 logger = logging.getLogger(__name__)
 
 
-# Circuit-breaker: cap how many times the stale-PR rollup recovery in
-# ``_check_and_trigger_rollup`` respawns a review for one unmerged child.
-# Without a cap, a review that keeps failing fast — e.g. pre-empted at dispatch
-# — is respawned every rollup cycle unbounded (2026-05-09 incident: 795
-# SCOPE_EMPTY review tasks in 9.5h). Past the cap the rollup escalates the
-# parent to manual approval instead of looping.
-MAX_REVIEW_RESPAWNS = 5
+async def _classify_merged_rollup_landing(
+    parent: Task,
+    project: Project | None,
+    session: AsyncSession,
+    *,
+    pr_number: int | None,
+    target_branch: str,
+    source: str,
+) -> tuple[bool, bool]:
+    """Return ``(integration_landing, terminal_merge)``.
 
-
-def _branch_task_id_prefix(branch: str | None) -> str:
-    """Recover the owning task's id-prefix from an agent work-branch name.
-
-    Agent work branches are ``{namespace}/{prefix}-{8hex}`` where ``8hex`` is
-    the first 8 hex chars of the task UUID (see
-    ``shared_state.derive_task_branch``). Returns that trailing token
-    lowercased, or ``""`` when the branch doesn't match the shape (custom /
-    promotion / CI-fix branches), so callers can fall back to treating the PR
-    as un-attributable.
+    Terminal rollup merges are those that land on either the integration branch
+    or the promotion target. Merges into intermediate staging branches must keep
+    the parent EVALUATING until a later downstream landing completes the chain.
     """
-    if not branch or "/" not in branch:
-        return ""
-    last = branch.rsplit("/", 1)[-1]
-    if "-" not in last:
-        return ""
-    token = last.rsplit("-", 1)[-1].strip().lower()
-    if len(token) == 8 and all(c in "0123456789abcdef" for c in token):
-        return token
-    return ""
-
-
-def _partition_orphan_prs(
-    open_prs: list[dict],
-    cancelled_child_id_prefixes: set[str],
-) -> tuple[list[dict], list[dict]]:
-    """Split staging-branch open PRs into ``(live, orphaned)``.
-
-    A PR is *orphaned* when its head branch maps to a child task that has been
-    CANCELLED: no live task will ever drive it to merge, so blocking the rollup
-    on it strands the parent in EVALUATING forever (incident 2026-05-28: an
-    orphan safeguard PR from a cancelled, retry-replaced child wedged a research
-    rollup — the cancel path left the PR open and it carried 0 CI checks, so the
-    merge gate never fired either).
-
-    Attribution is by the work-branch id-prefix (see
-    :func:`_branch_task_id_prefix`). PRs whose head ref can't be positively
-    attributed to a *cancelled* child are kept **live** — we never close a PR we
-    can't prove belongs to a dead task.
-    """
-    live: list[dict] = []
-    orphan: list[dict] = []
-    for pr in open_prs:
-        head_ref = (pr.get("head") or {}).get("ref") or ""
-        prefix = _branch_task_id_prefix(head_ref)
-        if prefix and prefix in cancelled_child_id_prefixes:
-            orphan.append(pr)
-        else:
-            live.append(pr)
-    return live, orphan
-
-
-def _review_respawn_count(task: Task) -> int:
-    """Times the stale-PR rollup recovery has respawned a review for *task*.
-
-    Stored in ``context._review_respawn_count``; capped by ``MAX_REVIEW_RESPAWNS``.
-    The key is underscore-prefixed so ``_spawn_pipeline_task``'s context
-    propagation (which copies all non-underscore keys onto the spawned review
-    task) drops it — a non-prefixed key would leak a stale count onto every
-    review task spawned for this PR.
-    Tolerates a missing/None context or a non-numeric value (-> 0).
-    """
-    try:
-        return int((task.context or {}).get("_review_respawn_count", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-# Module-level negative cache for PR-merge verification keyed by task.id.
-# When a cycle discovers a child's PR isn't merged yet, the reaper's next
-# 60s tick (plus any fan-out from sibling completion events) would otherwise
-# re-fetch the same PR.  Stamping here is session-independent — unlike a
-# task.context mutation, which only persists if the caller happens to commit
-# the attached object.  A 30s TTL is short enough that a merge happening
-# between checks is detected within one cycle.
-_PR_MERGE_NEGATIVE_TTL_S = 30
-_pr_merge_negative_cache: dict[uuid.UUID, float] = {}
-
-
-def _record_rollup_failure_signals(task: Task, failure_class: str) -> None:
-    """Mirror agent_status's terminal-failure bookkeeping for rollup-side FAILEDs.
-
-    Without this, parent failures terminated inside _check_and_trigger_rollup
-    never reach deploy_monitoring['task_results'] or the per-direction streak,
-    so anomaly detection and direction-hold logic can't see them.
-    """
-    from app.routers.agent_status import record_task_result
-    from app.shared_state import record_direction_result
-
-    record_task_result(
-        success=False,
-        failure_class=failure_class,
-        task_id=str(task.id),
-        task_type=task.first_payload.get("type", ""),
-    )
-    direction_id = str((task.context or {}).get("direction_id") or "")
-    if direction_id:
-        record_direction_result(
-            direction_id,
-            success=False,
-            failure_class=failure_class,
-            project_id=str(task.project_id) if task.project_id else "",
+    integration_branch = _get_project_integration_branch(project)
+    promotion_target = _get_project_promotion_target(project)
+    landed = target_branch == integration_branch
+    promotion_landing = target_branch == promotion_target
+    if not landed and promotion_landing:
+        await merged_pr_counts_as_integration_landing(
+            parent,
+            project,
+            session,
+            pr_number=pr_number,
+            merged_base_branch=target_branch,
+            source=source,
         )
+    return landed, landed or promotion_landing
+
+
+def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
+    """Allow the intentionally-gated hotfix lane to target promotion directly."""
+    if not target_branch:
+        return False
+    payload = parent.first_payload or {}
+    ctx = parent.context or {}
+    return bool(payload.get("hotfix") or ctx.get("hotfix"))
+
+
+async def _hold_rollup_for_branch_safety(
+    parent: Task,
+    project: Project | None,
+    session: AsyncSession,
+    detail: str,
+    *,
+    issue_code: str,
+) -> None:
+    """Persist a loud hold when rollup branch resolution would hit promotion."""
+    if project is not None:
+        _signal_blocking_project_branch_configuration(project, issue_code, detail)
+    if _runtime_config.get("require_approval_gates", True):
+        parent.requires_approval = True
+    parent.latest_status_message = detail[:500]
+    session.add(parent)
+    await session.commit()
+    logger.error("[ROLLUP] %s", detail)
 
 
 # ── FIX A: non-rejection PR-close classification ──────────────────────────
@@ -374,420 +339,6 @@ async def _dispatch_rollup_approval_alert(
         )
     except Exception as e:
         logger.warning(f"[NOTIFY] APPROVAL_NEEDED dispatch setup failed: {e}")
-
-
-async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
-    """Check if a create task's PR is merged. Uses context cache, falls back to GitHub API.
-
-    Uses its own session for DB writes to avoid polluting the caller's session state.
-    The passed session is only used for reads (artifact lookup).
-    """
-    from app.alert_dispatch import _maybe_create_failure_alert
-    from app.routers.agent import get_github_token_for_task
-    from app.github import get_pull_request
-
-    if (task.context or {}).get("pr_merged"):
-        return True
-
-    # Negative-result cache: when a batch of sibling children completes in
-    # quick succession, every completion event triggers _check_and_trigger_rollup
-    # which re-verifies every child.  Without this, 20 children completing at
-    # once == 400 PR lookups in a short window.  Module-level dict keyed by
-    # task.id — session-independent so the check works regardless of whether
-    # the caller commits between fan-out calls.
-    _last_negative = _pr_merge_negative_cache.get(task.id)
-    if (
-        _last_negative is not None
-        and (time.time() - _last_negative) < _PR_MERGE_NEGATIVE_TTL_S
-    ):
-        import app.shared_state as _ss
-
-        _ss.github_cache_hits["pr_merge_negative"] = (
-            _ss.github_cache_hits.get("pr_merge_negative", 0) + 1
-        )
-        return False
-
-    # Look for PR artifact to verify via API
-    art_result = await session.execute(
-        select(Artifact).where(
-            Artifact.task_id == task.id,
-            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-        )
-    )
-    artifact = art_result.scalars().first()
-    if not artifact or not artifact.pr_url:
-        # No PR artifact — task completed without creating a PR (e.g., no changes needed).
-        # Treat as "done" so it doesn't block rollup.
-        # Cache in context so partial-rollup path (which checks context.pr_merged directly)
-        # doesn't see this task as "unmerged".
-        task.context = {**(task.context or {}), "pr_merged": True}
-        return True
-    if artifact and artifact.pr_url:
-        # Shape-validate before parsing. Production incident 2026-05-06: a
-        # haiku retry whose ./check viewport gate was wedged improvised a
-        # `https://github.com/.../compare/main...blueprint/task-<id>` URL into
-        # the wrapper's PR-URL marker file; the wrapper trusted it and saved
-        # a PULL_REQUEST artifact with that pr_url. Without this guard the
-        # int(...) below crashed every rollup cycle (~36x/window) and dirtied
-        # the log with full tracebacks. The wrapper now validates too
-        # (agent/src/handlers/code-change.ts), but bad rows from before that
-        # fix still exist.
-        last_seg = artifact.pr_url.rstrip("/").split("/")[-1]
-        if "/pull/" not in artifact.pr_url or not last_seg.isdigit():
-            logger.warning(
-                f"[PR_VERIFY] Task {task.id} has malformed PR artifact "
-                f"(pr_url={artifact.pr_url!r}); treating as not-merged"
-            )
-            _pr_merge_negative_cache[task.id] = time.time()
-            return False
-        try:
-            pr_number = int(last_seg)
-            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-            try:
-                pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
-            except HTTPException as api_err:
-                if api_err.status_code not in (401, 500, 502, 503):
-                    raise
-                if api_err.status_code != 401:
-                    # Transient GitHub API failure — can't verify now, will retry next cycle
-                    logger.warning(
-                        f"[PR_VERIFY] GitHub API error ({api_err.status_code}) checking PR #{pr_number} for task {task.id} — skipping"
-                    )
-                    return False
-                # Token expired — invalidate cache and retry once with a fresh token
-                from app.routers.agent import invalidate_github_token_cache
-
-                invalidate_github_token_cache(str(task.project_id))
-                logger.warning(
-                    f"[PR_VERIFY] Auth failure for task {task.id} PR #{pr_number} — retrying with fresh token"
-                )
-                gh_token, owner, repo = await get_github_token_for_task(
-                    task.id, session, force_refresh=True
-                )
-                pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
-            if pr_data.get("merged"):
-                # Update in-memory first so caller sees the change even if DB write fails
-                task.context = {**(task.context or {}), "pr_merged": True}
-                # Persist to DB in separate session (best-effort — may fail if caller
-                # holds FOR UPDATE lock on this row, but in-memory update is sufficient
-                # for the current rollup cycle)
-                try:
-                    async with AsyncSessionLocal() as write_session:
-                        db_task = await write_session.get(Task, task.id)
-                        if db_task:
-                            db_task.context = {
-                                **(db_task.context or {}),
-                                "pr_merged": True,
-                            }
-                            write_session.add(db_task)
-                            await write_session.commit()
-                except Exception as write_err:
-                    logger.warning(
-                        f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}"
-                    )
-                return True
-            # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
-            if pr_data.get("state") == "closed" and not pr_data.get("merged"):
-                _ctx = task.context or {}
-                # Distinguish a DELIBERATE success-close from a rejection. A PR
-                # can be closed *because the work was already achieved* — not
-                # rejected:
-                #   • pr_closed_empty   — the empty/branch-equivalent rollup PR
-                #     close (review pipeline) found no diff to merge.
-                #   • pr_closed_success — the same change merged via a sibling /
-                #     dedup PR ("already merged by another task", set by
-                #     ci_completion), or an agent exercised its early-exit right.
-                # In those cases the task's desired outcome IS in the target
-                # branch, so the child is COMPLETED, not FAILED — failing it
-                # mislabels a success and can cascade a rollup parent into a
-                # partial-failure finalize. A genuine rejection (review-cap
-                # exhausted, manual close) carries neither marker → stays FAILED.
-                if _ctx.get("pr_closed_empty") or _ctx.get("pr_closed_success"):
-                    logger.info(
-                        f"[PR_VERIFY] Task {task.id} PR #{pr_number} closed without "
-                        f"merging, but marked as a deliberate success-close (work "
-                        f"landed elsewhere) — completing instead of failing"
-                    )
-                    task.context = {**_ctx, "pr_merged": True}
-                    if task.status != TaskStatus.COMPLETED:
-                        task.status = TaskStatus.COMPLETED
-                    try:
-                        async with AsyncSessionLocal() as write_session:
-                            db_task = await write_session.get(Task, task.id)
-                            if db_task:
-                                db_task.context = {
-                                    **(db_task.context or {}),
-                                    "pr_merged": True,
-                                }
-                                if db_task.status != TaskStatus.COMPLETED:
-                                    db_task.status = TaskStatus.COMPLETED
-                                write_session.add(db_task)
-                                await write_session.commit()
-                    except Exception as _sc_err:
-                        logger.warning(
-                            f"[PR_VERIFY] Failed to persist success-close for task "
-                            f"{task.id}: {_sc_err}"
-                        )
-                    return True
-                # FIX A: a closed-unmerged PR with NO genuine review rejection
-                # (no CHANGES_REQUESTED review, no pr_rejected/review_cap_exhausted
-                # marker) AND a recognized cleanup/supersession signal (approved-
-                # then-closed, supersession/de-scope marker, or Blueprint-bot
-                # authorship) is housekeeping, not a failure. Land it CANCELLED
-                # with failure_detail='pr_closed_non_rejection' and skip the
-                # failure alert so a non-failure neither dings direction health
-                # nor pages the operator. GUARDRAIL: _pr_closed_is_non_rejection
-                # returns False on ANY genuine-rejection signal or absence of a
-                # cleanup signal, so the genuine FAILED path below is preserved.
-                if await _pr_closed_is_non_rejection(
-                    task, pr_data, pr_number, session
-                ):
-                    logger.info(
-                        f"[PR_VERIFY] Task {task.id} PR #{pr_number} closed without "
-                        f"merging with no genuine rejection — treating as a "
-                        f"cleanup/supersession close (CANCELLED, no alert)"
-                    )
-                    from app.failure_classification import (
-                        SCOPE_EMPTY,
-                        persist_failure_category,
-                    )
-
-                    task.context = {
-                        **(task.context or {}),
-                        "pr_closed_unmerged": True,
-                        "failure_detail": "pr_closed_non_rejection",
-                    }
-                    task.status = TaskStatus.CANCELLED
-                    task.latest_status_message = (
-                        f"PR #{pr_number} closed without merging "
-                        f"(no rejection — cleanup/supersession)"
-                    )
-                    # SCOPE_EMPTY-class: the desired change landed elsewhere or
-                    # the PR was de-scoped — an INFRA/no-op class, not a code
-                    # defect. The failure_detail marker is what direction metrics
-                    # key on (direction_outcomes._is_non_genuine_cancelled).
-                    persist_failure_category(task, SCOPE_EMPTY)
-                    try:
-                        async with AsyncSessionLocal() as write_session:
-                            db_task = await write_session.get(Task, task.id)
-                            if db_task:
-                                db_task.context = {
-                                    **(db_task.context or {}),
-                                    "pr_closed_unmerged": True,
-                                    "failure_detail": "pr_closed_non_rejection",
-                                    "failure_category": SCOPE_EMPTY,
-                                }
-                                db_task.status = TaskStatus.CANCELLED
-                                db_task.latest_status_message = (
-                                    f"PR #{pr_number} closed without merging "
-                                    f"(no rejection — cleanup/supersession)"
-                                )
-                                write_session.add(db_task)
-                                await write_session.commit()
-                    except Exception as _nr_err:
-                        logger.warning(
-                            f"[PR_VERIFY] Failed to persist pr_closed_non_rejection "
-                            f"for task {task.id}: {_nr_err}"
-                        )
-                    # Skip _maybe_create_failure_alert by design — non-genuine.
-                    return True
-                logger.warning(
-                    f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected"
-                )
-                # Update in-memory first — set message AND status together so the
-                # outer session's commit always carries the explanatory message,
-                # even if the separate write_session below fails (row lock, etc.).
-                task.context = {**(task.context or {}), "pr_closed_unmerged": True}
-                task.status = TaskStatus.FAILED
-                task.latest_status_message = f"PR #{pr_number} closed without merging"
-                from app.failure_classification import (
-                    classify_failure,
-                    persist_failure_category,
-                )
-
-                _fc = classify_failure(task)
-                persist_failure_category(task, _fc)
-                _record_rollup_failure_signals(task, _fc)
-                try:
-                    async with AsyncSessionLocal() as write_session:
-                        db_task = await write_session.get(Task, task.id)
-                        if db_task:
-                            db_task.context = {
-                                **(db_task.context or {}),
-                                "pr_closed_unmerged": True,
-                                "failure_category": _fc,
-                            }
-                            db_task.status = TaskStatus.FAILED
-                            db_task.latest_status_message = (
-                                f"PR #{pr_number} closed without merging"
-                            )
-                            write_session.add(db_task)
-                            await _maybe_create_failure_alert(
-                                db_task,
-                                write_session,
-                                f"PR #{pr_number} was closed without merging",
-                            )
-                            await write_session.commit()
-                except Exception as write_err:
-                    logger.warning(
-                        f"[PR_VERIFY] Failed to persist pr_closed_unmerged for task {task.id}: {write_err}"
-                    )
-                return True  # Return True so callers don't block — task is now FAILED which they handle
-        except Exception as e:
-            logger.warning(
-                f"[PR_VERIFY] Failed to verify PR merge for task {task.id}: {e}",
-                exc_info=True,
-            )
-    # Stamp the negative cache so the next caller within the TTL skips the
-    # GitHub round-trip.  Lazy eviction: keep it lightweight, drop entries
-    # that are clearly stale whenever we detect the dict is oversized.
-    _pr_merge_negative_cache[task.id] = time.time()
-    if len(_pr_merge_negative_cache) > 2000:
-        cutoff = time.time() - (_PR_MERGE_NEGATIVE_TTL_S * 4)
-        for k in [k for k, ts in _pr_merge_negative_cache.items() if ts < cutoff]:
-            _pr_merge_negative_cache.pop(k, None)
-    return False
-
-
-async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
-    """Delete staging and feature branches that are no longer needed."""
-    from app.routers.agent import get_github_token_for_task
-    from app.github import delete_branch
-
-    ctx = task.context or {}
-    gh_token = owner = repo = None
-
-    async def _ensure_token():
-        nonlocal gh_token, owner, repo
-        if not gh_token:
-            gh_token, owner, repo = await get_github_token_for_task(task.id, session)
-
-    branches_to_delete = []
-
-    # Staging branches (research/*, plan/*) are shared by ALL sibling tasks.
-    # Only delete when the PARENT task completes (rollup), not on individual child completion.
-    # Check if this task IS the parent (has plan_output or is a research task).
-    is_parent = task.plan_output is not None or (task.first_payload).get("type") in (
-        "research",
-        "plan",
-    )
-    if is_parent:
-        # Route by task_type so we only target the staging branch THIS task
-        # itself owns. A plan child of a research task inherits the parent's
-        # research_branch in its own context; the prior
-        # `plan_branch or research_branch` OR-fallback would grab that inherited
-        # value when its own plan_branch was unset and delete the parent's
-        # branch on child cancel — orphaning sibling work that had merged into
-        # it but not yet rolled up to main (incident 2026-05-04: cancelling
-        # plan child b9456e05 of research 4759796b deleted research/4759796b
-        # 670ms before the parent's rollup, stranding PRs #3606/3607/3612/3613).
-        task_type = (task.first_payload).get("type", "")
-        if task_type == "research":
-            staging = ctx.get("research_branch")
-        elif task_type == "plan":
-            staging = ctx.get("plan_branch")
-        else:
-            # is_parent was True via plan_output on a non-research/non-plan
-            # task — we don't know which branch type that should own. Skip
-            # rather than guess (safer than the prior fallback).
-            staging = None
-        if staging:
-            # Guard 1: Don't delete if children are still active (they push to this branch)
-            active_children = (
-                (
-                    await session.execute(
-                        select(Task).where(
-                            Task.parent_task_id == task.id,
-                            Task.status.in_(
-                                [
-                                    TaskStatus.QUEUED,
-                                    TaskStatus.PROVISIONING,
-                                    TaskStatus.IN_PROGRESS,
-                                ]
-                            ),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            if active_children:
-                logger.warning(
-                    f"[CLEANUP] Skipping deletion of {staging} — "
-                    f"{len(active_children)} child task(s) still active"
-                )
-            else:
-                # Guard 2: Don't delete branches that are target branches for other active rollups
-                from sqlalchemy import or_ as sa_or
-
-                referencing_parents = (
-                    (
-                        await session.execute(
-                            select(Task).where(
-                                Task.status == TaskStatus.EVALUATING,
-                                Task.id != task.id,
-                                sa_or(
-                                    Task.context["parent_base"].as_string() == staging,
-                                    Task.context["original_base"].as_string()
-                                    == staging,
-                                ),
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                if referencing_parents:
-                    logger.warning(
-                        f"[CLEANUP] Skipping deletion of {staging} — "
-                        f"{len(referencing_parents)} active parent(s) target it as rollup base"
-                    )
-                else:
-                    # Guard 3: Don't delete if there are still open PRs targeting it
-                    try:
-                        _gh, _owner, _repo = await get_github_token_for_task(
-                            task.id, session
-                        )
-                        from app.github import get_open_pull_requests
-
-                        open_prs = await get_open_pull_requests(
-                            _gh, _owner, _repo, staging
-                        )
-                        if open_prs:
-                            pr_nums = [f"#{p['number']}" for p in open_prs]
-                            logger.warning(
-                                f"[CLEANUP] Skipping deletion of {staging} — {len(open_prs)} open PR(s) targeting it: {', '.join(pr_nums)}"
-                            )
-                        else:
-                            branches_to_delete.append(staging)
-                    except Exception:
-                        # If we can't check, don't delete (safe default)
-                        logger.warning(
-                            f"[CLEANUP] Skipping deletion of {staging} — could not verify open PRs"
-                        )
-
-    # Feature branches after PR merge
-    if ctx.get("pr_merged"):
-        project = await session.get(Project, task.project_id)
-        if not project:
-            # project should never be None in practice (loaded at task creation);
-            # a missing row signals a config bug. Log and skip to avoid silent
-            # cross-project branch mis-cleanup (would occur if using hardcoded 'blueprint/').
-            logger.warning(f"[CLEANUP] Missing project for task {task.id}; skipping branch cleanup")
-        else:
-            for payload in task.payloads or []:
-                branch = payload.get("branch")
-                if branch and branch.startswith(project.task_branch_prefix):
-                    branches_to_delete.append(branch)
-
-    for branch in branches_to_delete:
-        try:
-            await _ensure_token()
-            deleted = await delete_branch(gh_token, owner, repo, branch)
-            if deleted:
-                logger.info(f"[CLEANUP] Deleted branch {branch} (task {task.id})")
-        except Exception as e:  # noqa: PERF203 — per-branch try is required so one delete failure doesn't abort the rest
-            logger.warning(f"[CLEANUP] Failed to delete {branch}: {e}", exc_info=True)
 
 
 def _build_rollup_pr_body(
@@ -1163,7 +714,7 @@ async def _check_and_trigger_rollup(
                 if not pr_art or not pr_art.pr_url:
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.
-                    c.context = {**(c.context or {}), "pr_merged": True}
+                    mark_unblocked_non_merge(c, reason="rollup_no_pr_artifact")
                     session.add(c)
                     logger.info(
                         f"[ROLLUP] Child {str(c.id)[:8]} has no PR artifact — marking as merged"
@@ -1180,7 +731,7 @@ async def _check_and_trigger_rollup(
                         f"{str(c.id)[:8]} — cannot parse PR number; "
                         f"force-setting pr_merged=True so rollup progresses"
                     )
-                    c.context = {**(c.context or {}), "pr_merged": True}
+                    mark_unblocked_non_merge(c, reason="malformed_pr_url")
                     session.add(c)
                     continue
 
@@ -1215,9 +766,9 @@ async def _check_and_trigger_rollup(
                             f"{respawn_count}x without merging — manual intervention required"
                         )
                     elif not gates_on:
+                        mark_unblocked_non_merge(c, reason="review_respawn_cap")
                         c.context = {
                             **(c.context or {}),
-                            "pr_merged": True,
                             "_rollup_skipped_reason": "review_respawn_cap",
                         }
                         session.add(c)
@@ -1259,7 +810,25 @@ async def _check_and_trigger_rollup(
                 branch = resolve_task_branch(
                     c, _get_project_task_branch_namespace(project)
                 )
-                base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
+                try:
+                    base_branch = c_payload.get(
+                        "base_branch"
+                    ) or _get_project_integration_branch(project)
+                # Defense-in-depth: the resolver currently fails SAFE and does not
+                # raise. This guard exists so a future re-introduction of a raising
+                # resolver path holds the rollup instead of aborting the sweep.
+                except InvalidProjectBranchConfiguration as exc:
+                    await _hold_rollup_for_branch_safety(
+                        parent,
+                        project,
+                        session,
+                        (
+                            f"Rollup blocked: child {str(c.id)[:8]} resolved to "
+                            f"an unsafe integration branch. {exc.detail}"
+                        ),
+                        issue_code="child_integration_branch_invalid",
+                    )
+                    return
                 original_prompt = c_payload.get("prompt", c.description or "")
                 respawn_candidates.append(
                     {
@@ -1533,6 +1102,50 @@ async def _check_and_trigger_rollup(
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None
             project = await session.get(Project, parent.project_id)
+            promotion_target = (
+                _get_project_promotion_target(project) if project is not None else None
+            )
+            integration_branch = (
+                _get_project_integration_branch(project)
+                if project is not None
+                else None
+            )
+            # Block ONLY when the rollup would land fleet work on the promotion
+            # target AND that promotion target is genuinely distinct from the
+            # project's integration branch. Single-trunk projects (integration ==
+            # promotion, e.g. a project whose only branch is 'main') legitimately
+            # land every rollup on that shared trunk; holding those would stall
+            # the project entirely. The hotfix lane is the explicit exemption for
+            # the distinct-branch case.
+            #
+            # A custom staged rollup root (e.g. a project whose staging family is
+            # 'release/' rolling up onto 'release/main') is ALSO exempt: landing
+            # on such a staging branch is the intended staged flow even when that
+            # branch happens to coincide with promotion_target. Those merges are
+            # not held but proceed and are classified downstream by
+            # merged_pr_counts_as_integration_landing, which raises the
+            # "Merged PR landed on promotion target before integration" alert and
+            # leaves pr_merged unset. Holding them here would shadow that path and
+            # strand the staged rollup (PR #7064 vs #7105 merge-lane reconciliation).
+            if (
+                promotion_target
+                and target_branch == promotion_target
+                and target_branch != integration_branch
+                and not _promotion_target_rollup_allowed(parent, target_branch)
+                and not is_custom_staged_rollup_root(parent, project, target_branch)
+            ):
+                await _hold_rollup_for_branch_safety(
+                    parent,
+                    project,
+                    session,
+                    (
+                        f"Rollup blocked: target branch '{target_branch}' is this "
+                        f"project's promotion target. Configure a distinct "
+                        "integration branch before landing fleet work."
+                    ),
+                    issue_code="rollup_target_matches_promotion_target",
+                )
+                return
             # Track the rollup PR number/url across the try block so the
             # exception handler can rescue a newly-created PR whose marker
             # commit failed (see orphan-PR rescue below).
@@ -1830,18 +1443,45 @@ async def _check_and_trigger_rollup(
                     elif existing_pr is not None and pr_state is not None:
                         if pr_state.get("merged"):
                             logger.info(
-                                f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED"
+                                f"[ROLLUP] PR #{existing_pr} already merged — classifying landing"
                             )
-                            _integration_br = _get_project_integration_branch(project)
-                            _landed = target_branch == _integration_br
-                            parent.status = TaskStatus.COMPLETED
+                            (_landed, _terminal_rollup_merge) = (
+                                await _classify_merged_rollup_landing(
+                                    parent,
+                                    project,
+                                    session,
+                                    pr_number=existing_pr,
+                                    target_branch=target_branch,
+                                    source="rollup_management.existing_pr_merged",
+                                )
+                            )
+                            parent.status = (
+                                TaskStatus.COMPLETED
+                                if _terminal_rollup_merge
+                                else TaskStatus.EVALUATING
+                            )
                             parent.context = {
                                 **_clear_rollup_transient_state(parent_ctx),
-                                **({"pr_merged": True} if _landed else {}),
                             }
-                            parent.latest_status_message = (
-                                f"Rollup PR #{existing_pr} already merged"
-                            )
+                            if _landed:
+                                apply_merged_landed_signal(
+                                    parent,
+                                    project,
+                                    base_branch=target_branch,
+                                    hotfix_lane=_promotion_target_rollup_allowed(
+                                        parent, target_branch
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
+                            if _terminal_rollup_merge:
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{existing_pr} already merged"
+                                )
+                            else:
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{existing_pr} already merged into "
+                                    f"{target_branch}; awaiting downstream landing"
+                                )
                             session.add(parent)
                             await session.commit()
                             await _cleanup_branches(parent, session)
@@ -1850,7 +1490,7 @@ async def _check_and_trigger_rollup(
                                 "task_updated",
                                 {
                                     "task_id": str(parent.id),
-                                    "status": TaskStatus.COMPLETED,
+                                    "status": parent.status,
                                 },
                             )
                             return
@@ -2126,7 +1766,7 @@ async def _check_and_trigger_rollup(
                 # but no file changes. Close before spawning review/fix VMs.
                 if pr_detail is not None and lines_changed == 0:
                     logger.info(
-                        f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and marking COMPLETED"
+                        f"[ROLLUP] PR #{rollup_pr_number} has zero lines changed — closing and classifying landing"
                     )
                     try:
                         await close_pull_request(
@@ -2155,21 +1795,58 @@ async def _check_and_trigger_rollup(
                     )
                     if parent is None:
                         return
-                    parent.status = TaskStatus.COMPLETED
-                    parent.latest_status_message = f"✓ All {completed_count} subtasks completed — rollup PR #{rollup_pr_number} had no file changes (already on {target_branch})"
+                    (_landed, _terminal_rollup_merge) = (
+                        await _classify_merged_rollup_landing(
+                            parent,
+                            project,
+                            session,
+                            pr_number=rollup_pr_number,
+                            target_branch=target_branch,
+                            source="rollup_management.zero_diff_close",
+                        )
+                    )
+                    parent.status = (
+                        TaskStatus.COMPLETED
+                        if _terminal_rollup_merge
+                        else TaskStatus.EVALUATING
+                    )
+                    if _terminal_rollup_merge:
+                        parent.latest_status_message = (
+                            f"✓ All {completed_count} subtasks completed — rollup PR "
+                            f"#{rollup_pr_number} had no file changes (already on "
+                            f"{target_branch})"
+                        )
+                    else:
+                        parent.latest_status_message = (
+                            f"✓ All {completed_count} subtasks completed — rollup PR "
+                            f"#{rollup_pr_number} had no file changes (already on "
+                            f"{target_branch}); awaiting downstream landing"
+                        )
                     _cleared = _clear_rollup_transient_state(parent.context)
                     parent.context = {
-                        k: v
-                        for k, v in _cleared.items()
-                        if k not in ("rollup_pr_number", "rollup_pr_url")
+                        **{
+                            k: v
+                            for k, v in _cleared.items()
+                            if k not in ("rollup_pr_number", "rollup_pr_url")
+                        },
                     }
+                    if _landed:
+                        apply_merged_landed_signal(
+                            parent,
+                            project,
+                            base_branch=target_branch,
+                            hotfix_lane=_promotion_target_rollup_allowed(
+                                parent, target_branch
+                            ),
+                            non_merge_reason="merged_pr_non_integration_branch",
+                        )
                     session.add(parent)
                     await session.commit()
                     await _cleanup_branches(parent, session)
                     await broadcast_to_project(
                         str(parent.project_id),
                         "task_updated",
-                        {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+                        {"task_id": str(parent.id), "status": parent.status},
                     )
                     return
 
@@ -2497,15 +2174,46 @@ async def _check_and_trigger_rollup(
                         return
                     parent_ctx = parent.context or {}
                     if merge_result.get("merged"):
-                        _integration_br = _get_project_integration_branch(project)
-                        _landed = target_branch == _integration_br
-                        parent.status = TaskStatus.COMPLETED
+                        (_landed, _terminal_rollup_merge) = (
+                            await _classify_merged_rollup_landing(
+                                parent,
+                                project,
+                                session,
+                                pr_number=rollup_pr_number,
+                                target_branch=target_branch,
+                                source="rollup_management.auto_merge_success",
+                            )
+                        )
+                        parent.status = (
+                            TaskStatus.COMPLETED
+                            if _terminal_rollup_merge
+                            else TaskStatus.EVALUATING
+                        )
                         parent.context = {
                             **_clear_rollup_transient_state(parent_ctx),
-                            **({"pr_merged": True} if _landed else {}),
                             "rollup_pr_url": rollup_pr_url,
                         }
-                        parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
+                        if _landed:
+                            apply_merged_landed_signal(
+                                parent,
+                                project,
+                                base_branch=target_branch,
+                                hotfix_lane=_promotion_target_rollup_allowed(
+                                    parent, target_branch
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
+                        if _terminal_rollup_merge:
+                            parent.latest_status_message = (
+                                f"All {completed_count} subtasks merged, rollup PR auto-merged"
+                            )
+                        else:
+                            parent.latest_status_message = (
+                                f"All {completed_count} subtasks merged into "
+                                f"{target_branch}; awaiting downstream landing"
+                            )
+                        session.add(parent)
+                        await session.commit()
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
                         except Exception as del_err:
@@ -2557,6 +2265,18 @@ async def _check_and_trigger_rollup(
                             logger.warning(
                                 f"[ROLLUP] Failed to update viewport_coverage_snapshot: {_snap_e}"
                             )
+                        await session.commit()
+                        if _terminal_rollup_merge:
+                            await _cleanup_branches(parent, session)
+                            await broadcast_to_project(
+                                str(parent.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(parent.id),
+                                    "status": TaskStatus.COMPLETED,
+                                },
+                            )
+                        return
                     else:
                         # Merge failed (conflicts) — spawn review/fix cycle instead of giving up
                         merge_msg = merge_result.get("message", "unknown")

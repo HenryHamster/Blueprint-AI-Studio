@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 import time
 import uuid
 from pathlib import Path
@@ -129,7 +130,14 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     """
     mock_delete = mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
-    project = Project(name="Agent Status Test", user_id="test-user-123")
+    # Finite (non-autonomous) project: terminal-status aggregation only applies
+    # to finite projects — live autonomous projects are never flipped to a
+    # terminal status by task-completion aggregation (see task_lifecycle.py).
+    project = Project(
+        name="Agent Status Test",
+        user_id="test-user-123",
+        autonomous_enabled=False,
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -219,6 +227,124 @@ async def test_agent_status_update_persists_runtime_identity(
         .all()
     )
     assert any(t.id == task.id for t in provider_tasks)
+
+
+@pytest.mark.asyncio
+async def test_completed_teardown_defer_is_provider_aware_noop_single_provider(
+    client: AsyncClient, db_session, mocker, monkeypatch
+):
+    """Single-provider projects still warm-reuse: a COMPLETED VM defers teardown
+    when the project has eligible backlog work whose provider is compatible with
+    the VM's boot manifest.
+
+    Regression guard for the provider-aware teardown-defer in
+    update_agent_status: the eligibility check is now passed the completing
+    task's frozen boot identity (provider/account/model), but a fungible
+    (provider=None) backlog task — the dominant single-provider case — must NOT
+    be filtered out, so the VM is held for warm reuse exactly as before.
+    """
+    import app.shared_state as _ss
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mock_teardown = mocker.patch(
+        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
+    )
+    mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
+
+    project = Project(name="Provider-Aware Defer Noop", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Fungible (provider=None) backlog work — the dominant single-provider case.
+    backlog = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    completing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-defer-noop",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add_all([backlog, completing])
+    await db_session.commit()
+    await db_session.refresh(completing)
+
+    token = create_agent_token(str(completing.id), "agent-vm-defer-noop")
+    payload = {
+        "task_id": str(completing.id),
+        "status": "COMPLETED",
+        "logs": "done",
+        "provider": "anthropic",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    # VM held for warm reuse, NOT torn down on completion.
+    mock_teardown.assert_called_once_with("agent-vm-defer-noop")
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_completed_teardown_proceeds_when_backlog_provider_mismatch(
+    client: AsyncClient, db_session, mocker, monkeypatch
+):
+    """A COMPLETED VM whose only backlog work is pinned to a DIFFERENT provider
+    must NOT defer teardown — that work would run on the wrong frozen account, so
+    it should cold-dispatch and the idle VM should be torn down as before."""
+    import app.shared_state as _ss
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mock_teardown = mocker.patch(
+        "app.vm_lifecycle.schedule_deferred_backlog_teardown"
+    )
+    mock_delete = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
+    monkeypatch.setitem(_ss.runtime_config, "warm_backlog_reuse_enabled", True)
+
+    project = Project(name="Provider-Aware Defer Mismatch", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Backlog work pinned/recorded to a provider the boot VM cannot run.
+    backlog = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        provider="openai",
+    )
+    completing = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-defer-mismatch",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add_all([backlog, completing])
+    await db_session.commit()
+    await db_session.refresh(completing)
+
+    token = create_agent_token(str(completing.id), "agent-vm-defer-mismatch")
+    payload = {
+        "task_id": str(completing.id),
+        "status": "COMPLETED",
+        "logs": "done",
+        "provider": "anthropic",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    # Incompatible backlog → no defer; VM torn down on completion.
+    mock_teardown.assert_not_called()
+    mock_delete.assert_called_once_with(
+        "agent-vm-defer-mismatch", reason="agent_completion"
+    )
 
 
 @pytest.mark.asyncio
@@ -760,6 +886,67 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_session):
+    """The claim response surfaces build_config.repo_is_empty as top-level repo_is_empty.
+
+    This is the deterministic empty-repo signal computed at onboarding; the agent
+    research prompt gates bootstrap-from-goal guidance on it.
+    """
+    project_empty = Project(
+        name="Empty Repo",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="greenfield",
+        build_config={"repo_is_empty": True},
+        design_doc={"vision": "greenfield project"},
+    )
+    db_session.add(project_empty)
+    await db_session.commit()
+    await db_session.refresh(project_empty)
+
+    task_empty = Task(
+        project_id=project_empty.id,
+        payloads=[{"type": "research", "prompt": "do something"}],
+        vm_instance_id="agent-vm-empty-1",
+    )
+    db_session.add(task_empty)
+    await db_session.commit()
+    await db_session.refresh(task_empty)
+
+    token = create_agent_token(str(task_empty.id), "agent-vm-empty-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert resp.json()["repo_is_empty"] is True
+
+    # A project without the signal (older onboarding / detected source) → False.
+    project_mature = Project(
+        name="Mature Repo",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="established",
+        build_config={"language": "python"},
+        design_doc={"vision": "established project"},
+    )
+    db_session.add(project_mature)
+    await db_session.commit()
+    await db_session.refresh(project_mature)
+
+    task_mature = Task(
+        project_id=project_mature.id,
+        payloads=[{"type": "research", "prompt": "do something"}],
+        vm_instance_id="agent-vm-mature-1",
+    )
+    db_session.add(task_mature)
+    await db_session.commit()
+    await db_session.refresh(task_mature)
+
+    token2 = create_agent_token(str(task_mature.id), "agent-vm-mature-1")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+    assert resp2.json()["repo_is_empty"] is False
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_enable_self_improvement_driven_by_build_config(
     client: AsyncClient, db_session
 ):
@@ -849,6 +1036,44 @@ async def test_agent_claim_project_metadata_empty_build_config(
     data = resp.json()
     assert "project_metadata" in data
     assert data["project_metadata"]["build_config"] == {}
+    # Unset approval_gate_config surfaces as an empty dict (does not break response).
+    assert data["project_metadata"]["approval_gate_config"] == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_surfaces_approval_gate_config(client: AsyncClient, db_session):
+    """A project's approval_gate_config is surfaced in project_metadata so the
+    agent's fresh-reviewer can derive per-project sensitive paths."""
+    project = Project(
+        name="Approval Gate Test",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="myapp",
+        approval_gate_config={
+            "infra_files": ["infra/deploy.tf"],
+            "critical_files": ["lib/payments/charge.py"],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-agc-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-agc-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    agc = resp.json()["project_metadata"]["approval_gate_config"]
+    assert agc["infra_files"] == ["infra/deploy.tf"]
+    assert agc["critical_files"] == ["lib/payments/charge.py"]
 
 
 @pytest.mark.asyncio
@@ -2336,6 +2561,600 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
     assert idx["backend/app/db.py"] == "database"
 
 
+@pytest.mark.asyncio
+async def test_design_doc_get_reconciles_absent_capability_entry(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Make the reconcile pass hermetic. The default repo_root (/tmp/workspace)
+    # is absent inside CI containers, and `git` is not installed there, so the
+    # real git-backed existence check degrades to a no-op. Inject a valid
+    # repo_root (tmp_path) so the isdir guard passes, and mock the existence
+    # probe to report the claimed file as absent — mirroring the mocking
+    # pattern in test_source_ref_validation.py.
+    from functools import partial
+
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        srv, "_path_exists_at_head", AsyncMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops.ground_design_doc_value",
+        partial(srv.ground_design_doc_value, repo_root=str(tmp_path)),
+    )
+
+    project = Project(
+        name="Design Doc Capability Presence Test",
+        user_id="test-user-123",
+        design_doc={
+            "capabilities/research": {
+                "status": "working",
+                "notes": "backend/app/definitely-missing.py",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-capability",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-capability", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "capabilities/research"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "missing"
+    assert value["notes"].startswith("backend/app/definitely-missing.py")
+    assert "[reconciled:" in value["notes"]
+    assert "presence_warning" in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_reconciles_against_github_branch_not_local_checkout(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # The on-demand read endpoint must ground presence against the project's
+    # real integration branch via GitHub — not the orchestrator's local
+    # checkout, which is absent in prod/CI. Here we resolve full GitHub
+    # credentials and mock ONLY the GitHub contents probe to report the backing
+    # file absent; no local checkout is consulted, so the entry must still be
+    # downgraded to 'missing'.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(
+            return_value={
+                "token": "gh-token",
+                "owner": "acme",
+                "repo": "widget",
+                "branch": "automain",
+                "project_id": "p-1",
+            }
+        ),
+    )
+    # GitHub reports the backing module missing on the branch. If the endpoint
+    # were still using the local-git path this mock would be ignored.
+    github_probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(srv, "_file_exists_in_repo_branch", github_probe)
+
+    project = Project(
+        name="Design Doc GitHub Grounding Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments_missing.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-github",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-github", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "missing"
+    assert "presence_warning" in value
+    assert "[reconciled:" in value["description"]
+    # The GitHub branch probe — not a local git call — drove the downgrade.
+    github_probe.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_noop_when_github_credentials_unavailable(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # When the project's GitHub credentials don't resolve, the verification
+    # context degrades to branch-only (no token/owner/repo), so the endpoint
+    # falls back to the orchestrator's local git HEAD. On the deployed
+    # orchestrator (and in CI) there's no per-project checkout there, so the
+    # existence probe is indeterminate and reconciliation must gracefully
+    # no-op — the present-status entry is served as-is, NOT downgraded, and the
+    # GitHub branch probe is never reached.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(return_value={"branch": "automain", "project_id": "p-1"}),
+    )
+    # Local git HEAD is indeterminate (no checkout / git unavailable).
+    monkeypatch.setattr(srv, "_path_exists_at_head", AsyncMock(return_value=None))
+    # The GitHub branch probe must NOT be consulted in the no-credential path.
+    github_probe = AsyncMock(return_value=False)
+    monkeypatch.setattr(srv, "_file_exists_in_repo_branch", github_probe)
+
+    project = Project(
+        name="Design Doc No-Credential No-Op Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments_missing.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-nocreds",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-nocreds", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    # Indeterminate presence => graceful no-op: entry served un-downgraded.
+    assert value["status"] == "functional"
+    assert value["description"] == "Payments system."
+    assert "presence_warning" not in value
+    assert "[reconciled:" not in value["description"]
+    # No GitHub probe in the credential-unavailable fallback path.
+    github_probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_symbol_check_uses_github_branch_not_local_checkout(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # The symbol-level grounding (file present, cited symbol gone) must run
+    # against the project's real integration branch via the SAME GitHub context
+    # the file-level reconcile already resolves — not the absent local checkout.
+    # Here the backing file EXISTS on the branch (file-level pass survives) but
+    # its cited symbol is gone, so the entry must be downgraded to 'missing' via
+    # the GitHub content fetch, with no local-git call.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(
+            return_value={
+                "token": "gh-token",
+                "owner": "acme",
+                "repo": "widget",
+                "branch": "automain",
+                "project_id": "p-1",
+            }
+        ),
+    )
+    # File-level pass: the module file still exists on the branch.
+    monkeypatch.setattr(
+        srv, "_file_exists_in_repo_branch", AsyncMock(return_value=True)
+    )
+    # Symbol-level pass: GitHub returns the file content, but the cited symbol
+    # is NOT defined in it -> unambiguous absence. A local-git fallback would
+    # never reach this mock.
+    content_probe = AsyncMock(return_value=(True, "def something_else():\n    pass\n"))
+    monkeypatch.setattr(srv, "_file_content_in_repo_branch", content_probe)
+
+    project = Project(
+        name="Design Doc Symbol GitHub Grounding Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments.py:process_payment"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-symbol-gh",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-symbol-gh", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "missing"
+    assert "presence_warning" in value
+    assert "process_payment" in value["presence_warning"]
+    assert "[reconciled:" in value["description"]
+    # The GitHub content fetch — not a local git call — drove the symbol verdict.
+    content_probe.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_symbol_check_indeterminate_does_not_flag(
+    client: AsyncClient, db_session, monkeypatch
+):
+    # Conservative semantics for the symbol-level path: when the GitHub content
+    # fetch is indeterminate (e.g. transient API error -> (None, None)), the
+    # symbol check must NOT flag, even though the file exists on the branch. The
+    # present-status entry is served as-is.
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops._resolve_branch_verification_context",
+        AsyncMock(
+            return_value={
+                "token": "gh-token",
+                "owner": "acme",
+                "repo": "widget",
+                "branch": "automain",
+                "project_id": "p-1",
+            }
+        ),
+    )
+    # File present on the branch (file-level pass survives).
+    monkeypatch.setattr(
+        srv, "_file_exists_in_repo_branch", AsyncMock(return_value=True)
+    )
+    # Symbol-level fetch is indeterminate -> never flags.
+    monkeypatch.setattr(
+        srv, "_file_content_in_repo_branch", AsyncMock(return_value=(None, None))
+    )
+
+    project = Project(
+        name="Design Doc Symbol Indeterminate Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/payments": {
+                "status": "functional",
+                "description": "Payments system.",
+                "modules": ["backend/app/payments.py:process_payment"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-symbol-indet",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-symbol-indet", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/payments"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    # Indeterminate symbol verdict => graceful no-op: entry served un-downgraded.
+    assert value["status"] == "functional"
+    assert value["description"] == "Payments system."
+    assert "presence_warning" not in value
+    assert "[reconciled:" not in value["description"]
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_leaves_present_system_entry_unchanged(
+    client: AsyncClient, db_session
+):
+    design_doc = {
+        "systems/auth": {
+            "status": "functional",
+            "description": "Authentication code path.",
+            "modules": ["backend/app/source_ref_validation.py"],
+        }
+    }
+    project = Project(
+        name="Design Doc Present System Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-present",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-present", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/auth"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "functional"
+    assert value["description"] == "Authentication code path."
+    assert "presence_warning" not in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_leaves_partial_system_entry_unchanged(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Design Doc Partial System Test",
+        user_id="test-user-123",
+        design_doc={
+            "systems/auth": {
+                "status": "functional",
+                "description": "Partially grounded system.",
+                "modules": [
+                    "backend/app/source_ref_validation.py",
+                    "backend/app/definitely-missing.py",
+                ],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-partial",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-partial", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "systems/auth"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    value = resp.json()["value"]
+    assert value["status"] == "functional"
+    assert value["description"] == "Partially grounded system."
+    assert "presence_warning" not in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_leaves_summary_entry_unchanged(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Design Doc Summary Test",
+        user_id="test-user-123",
+        design_doc={"summary": "Project overview."},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-dd-summary",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-dd-summary", task_type="design_doc_update"
+    )
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": "summary"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["value"] == "Project overview."
+
+
+async def _design_doc_get(client, db_session, key, entry, vm):
+    """Create a project + design-doc task and GET *key*, returning the value."""
+    project = Project(
+        name=f"Design Doc Symbol Test {vm}",
+        user_id="test-user-123",
+        design_doc={key: entry},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id=vm,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), vm, task_type="design_doc_update")
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "get", "key": key},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    return resp.json()["value"]
+
+
+def _patch_grounding(monkeypatch, tmp_path, *, file_present, symbol_verdict):
+    """Make file-level reconcile + symbol resolution hermetic for the read path.
+
+    ``file_present`` controls the file-existence probe; ``symbol_verdict`` is the
+    ``_symbol_defined_at_head`` result (True present / False absent / None
+    indeterminate) used by the symbol-level grounding pass.
+    """
+    from functools import partial
+
+    import app.source_ref_validation as srv
+
+    monkeypatch.setattr(
+        srv, "_path_exists_at_head", AsyncMock(return_value=file_present)
+    )
+    monkeypatch.setattr(
+        srv, "_symbol_defined_at_head", AsyncMock(return_value=symbol_verdict)
+    )
+    monkeypatch.setattr(
+        "app.routers.admin_agent_ops.ground_design_doc_value",
+        partial(srv.ground_design_doc_value, repo_root=str(tmp_path)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_present_file_present_symbol_not_flagged(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Present file + present cited symbol → entry keeps its working status.
+    _patch_grounding(monkeypatch, tmp_path, file_present=True, symbol_verdict=True)
+    value = await _design_doc_get(
+        client,
+        db_session,
+        "capabilities/grounding",
+        {
+            "status": "working",
+            "notes": "Implemented in backend/app/real.py:ground_systems end to end.",
+        },
+        "agent-vm-dd-sym-present",
+    )
+    assert value["status"] == "working"
+    assert "presence_warning" not in value
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_present_file_absent_symbol_downgraded(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Present file + absent cited symbol (post-refactor facade) → treat as missing.
+    _patch_grounding(monkeypatch, tmp_path, file_present=True, symbol_verdict=False)
+    value = await _design_doc_get(
+        client,
+        db_session,
+        "capabilities/grounding",
+        {
+            "status": "working",
+            "notes": "The backend/app/facade.py:ground_systems path handles it.",
+        },
+        "agent-vm-dd-sym-absent",
+    )
+    assert value["status"] == "missing"
+    assert "presence_warning" in value
+    assert "ground_systems" in value["presence_warning"]
+    assert "file exists" in value["presence_warning"]
+    assert "[reconciled:" in value["notes"]
+
+
+@pytest.mark.asyncio
+async def test_design_doc_get_indeterminate_symbol_not_flagged(
+    client: AsyncClient, db_session, tmp_path, monkeypatch
+):
+    # Indeterminate symbol resolution (git unavailable) → never flagged.
+    _patch_grounding(monkeypatch, tmp_path, file_present=True, symbol_verdict=None)
+    value = await _design_doc_get(
+        client,
+        db_session,
+        "systems/core",
+        {
+            "status": "mature",
+            "modules": ["backend/app/facade.py:ground_systems"],
+        },
+        "agent-vm-dd-sym-indeterminate",
+    )
+    assert value["status"] == "mature"
+    assert "presence_warning" not in value
+
+
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_playbook_size_limits(client: AsyncClient, db_session):
@@ -3044,6 +3863,202 @@ async def test_claim_injects_direction_context_for_create_task(
     assert len(dc["recent_outcomes"]) == 2
     assert dc["recent_outcomes"][0]["prs_merged"] == 2
     assert dc["recent_outcomes"][1]["prs_merged"] == 1
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_implementation_constraints_in_direction_context(
+    client: AsyncClient, db_session
+):
+    """Claim surfaces direction context.implementation_constraints for a fix task."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    constraints = "Must not modify the public API surface; keep changes additive."
+    project = Project(name="Impl Constraints Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor internals",
+            "priority": "high",
+            "context": {"implementation_constraints": constraints},
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix the thing"}],
+        vm_instance_id="agent-vm-impl-constraints",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-impl-constraints")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json()["direction_context"]
+    assert dc["implementation_constraints"] == constraints
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_injects_live_strategic_intent_and_contract(
+    client: AsyncClient, db_session
+):
+    """Claim surfaces the LIVE problem_model intent/context/constraints as
+    response['strategic_intent'] and the direction's contract fields under
+    direction_context, for a create task with a direction."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="Live Intent Test", user_id="test-user-live")
+    project.problem_model = {
+        "intent": {
+            "purpose": "Ship a reliable autonomous coding studio.",
+            "current_focus": "Make operator steering reach workers immediately.",
+        },
+        "context": {
+            "project_type": "internal-tool",
+            "team": "solo",
+        },
+        "constraints": ["Never break the main branch", "Keep PRs small"],
+    }
+    project.vision = {"purpose": "stale legacy vision purpose"}
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Carry live intent",
+            "priority": "high",
+            "completion_criteria": "Workers render live intent and contract.",
+            "context": {
+                "success_evidence": "Claim response exposes strategic_intent.",
+                "retirement_condition": "Live intent reaches every worker type.",
+            },
+        }
+    ]
+    flag_modified(project, "problem_model")
+    flag_modified(project, "vision")
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do the work"}],
+        vm_instance_id="agent-vm-live-intent",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-live-intent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    # Live problem model wins over legacy vision (single source, no double-render).
+    assert "strategic_intent" in data, list(data.keys())
+    assert "vision" not in data
+    si = data["strategic_intent"]
+    assert si["purpose"] == "Ship a reliable autonomous coding studio."
+    assert si["current_focus"] == "Make operator steering reach workers immediately."
+    assert si["context"]["project_type"] == "internal-tool"
+    assert si["context"]["team"] == "solo"
+    assert "Never break the main branch" in si["constraints"]
+    assert "Keep PRs small" in si["constraints"]
+
+    # Direction contract fields surfaced under direction_context.
+    contract = data["direction_context"]["contract"]
+    assert contract["completion_criteria"] == "Workers render live intent and contract."
+    assert contract["success_evidence"] == "Claim response exposes strategic_intent."
+    assert contract["retirement_condition"] == "Live intent reaches every worker type."
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_omits_implementation_constraints_when_unset(
+    client: AsyncClient, db_session
+):
+    """direction_context omits implementation_constraints when the direction sets none."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="No Impl Constraints Test", user_id="test-user-123")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Some direction",
+            "priority": "medium",
+            "context": {},
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Build the thing"}],
+        vm_instance_id="agent-vm-no-impl-constraints",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-no-impl-constraints")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    dc = resp.json().get("direction_context") or {}
+    assert "implementation_constraints" not in dc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_falls_back_to_legacy_vision_when_problem_model_empty(
+    client: AsyncClient, db_session
+):
+    """When problem_model is empty, claim falls back to the legacy vision
+    summary and does not emit strategic_intent."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Legacy Vision Fallback", user_id="test-user-legacy")
+    project.problem_model = {}  # empty → no live intent
+    project.vision = {"purpose": "Legacy vision purpose still rendered."}
+    flag_modified(project, "problem_model")
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do the work"}],
+        vm_instance_id="agent-vm-legacy-vision",
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-legacy-vision")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert "strategic_intent" not in data
+    assert data["vision"]["purpose"] == "Legacy vision purpose still rendered."
 
 
 @pytest.mark.smoketest
@@ -6236,10 +7251,85 @@ async def test_failed_with_open_pr_spawn_failure_keeps_recovery_marker(
 
 
 @pytest.mark.asyncio
+async def test_failed_pool_served_task_feeds_pool_breaker(
+    client: AsyncClient, db_session, mocker
+):
+    """A FAILED task that was served by the warm pool feeds the pool-claim
+    circuit breaker.
+
+    Regression guard: the agent-reported FAILED path keys the breaker feed on
+    the exact origin stamped by the pool dispatch path. That stamp is
+    WARM_POOL_ORIGIN ("warm_pool", warm_pool.py / agent_warm_continuity.py),
+    NOT the literal "pool". A mismatch makes the feed dead code so the
+    breaker's primary trip mode (a bad pool image silently failing a stream of
+    tasks) can never fire. This test stamps the REAL origin and asserts the
+    failure is recorded.
+    """
+    import app.shared_state as ss
+    from app.warm_pool import WARM_POOL_ORIGIN
+
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="Pool Breaker Feed", user_id="test-user-pool-breaker")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],
+        vm_instance_id="agent-vm-pool-breaker",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        # Stamp the warm-claim origin exactly as the pool dispatch path does.
+        context={"_timing": {"warm_start": True, "warm_claim_origin": WARM_POOL_ORIGIN}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ss.warm_pool_claim_failure_events.clear()
+    try:
+        token = create_agent_token(str(task.id), "agent-vm-pool-breaker")
+        resp = await client.post(
+            "/api/agent/status",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "status": "FAILED",
+                "failure_category": "fatal",
+                "logs": "boom",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        # The pool-served FAILED task must have fed the pool-claim breaker.
+        assert ss.count_recent_pool_claim_failures() == 1, (
+            "FAILED task stamped warm_claim_origin=WARM_POOL_ORIGIN must record a "
+            "pool-claim failure — the breaker feed is keyed on the wrong literal"
+        )
+    finally:
+        ss.warm_pool_claim_failure_events.clear()
+
+
+@pytest.mark.asyncio
 async def test_failed_with_merged_pr_marks_completed(
     client: AsyncClient, db_session, mocker
 ):
     """PR merged out-of-band before agent reported FAILED → COMPLETED, not retry."""
+    from app.models import Alert
+
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
@@ -6255,17 +7345,22 @@ async def test_failed_with_merged_pr_marks_completed(
     )
     mocker.patch(
         "app.github.get_pull_request",
-        new=AsyncMock(return_value={"state": "closed", "merged": True}),
+        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
     )
 
-    project = Project(name="Merged PR Handoff", user_id="test-user-merged-pr")
+    project = Project(
+        name="Merged PR Handoff",
+        user_id="test-user-merged-pr",
+        integration_branch="main",
+        promotion_target="main",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     task = Task(
         project_id=project.id,
-        payloads=[{"type": "create", "prompt": "do work"}],
+        payloads=[{"type": "create", "prompt": "do work", "base_branch": "automain"}],
         vm_instance_id="agent-vm-merged-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
@@ -6291,10 +7386,201 @@ async def test_failed_with_merged_pr_marks_completed(
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "accepted_pr_merged"
+    await asyncio.sleep(0)
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert (task.context or {}).get("pr_merged") is True
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    dispatch_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_with_merged_pr_on_distinct_promotion_target_alerts_without_pr_merged(
+    client: AsyncClient, db_session, mocker
+):
+    """A merged PR on promotion_target must complete without marking the task landed on integration."""
+    from app.models import Alert, AlertSeverity
+
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": True, "base": {"ref": "main"}}),
+    )
+
+    project = Project(
+        name="Merged Promotion PR Handoff",
+        user_id="test-user-merged-promotion-pr",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "do work", "base_branch": "automain"}
+        ],
+        vm_instance_id="agent-vm-merged-promotion-pr",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4243",
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-merged-promotion-pr")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_merged"
+    await asyncio.sleep(0)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is None
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 4243
+
+
+@pytest.mark.asyncio
+async def test_failed_with_merged_pr_on_intermediate_staged_rollup_stays_evaluating(
+    client: AsyncClient, db_session, mocker
+):
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "closed",
+                "merged": True,
+                "base": {"ref": "release/candidate-1"},
+            }
+        ),
+    )
+
+    project = Project(
+        name="Merged Intermediate Rollup Handoff",
+        user_id="test-user-merged-intermediate-rollup",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "rollup parent",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        vm_instance_id="agent-vm-merged-intermediate-rollup",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={"rollup_pr_number": 4244},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4244",
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-merged-intermediate-rollup")
+    resp = await client.post(
+        "/api/agent/status",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "status": "FAILED", "logs": "boom"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted_pr_merged"
+    await asyncio.sleep(0)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert (task.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (task.latest_status_message or "")
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
 
 
 @pytest.mark.asyncio
@@ -6961,6 +8247,78 @@ async def test_playbook_claim_stale_file_refs_deprioritised(
     assert keys.index("clean-entry") < keys.index("stale-entry"), (
         f"Expected clean-entry before stale-entry, got order: {keys}"
     )
+
+
+@pytest.mark.asyncio
+async def test_playbook_claim_grounds_design_doc_against_integration_branch(
+    client: AsyncClient, db_session, mocker
+):
+    """On claim, a present-status system whose backing file is absent on the
+    REAL integration branch is downgraded to ``missing`` and persisted — even
+    though the backend has no local checkout (``playbook_repo_root`` empty).
+
+    This is the core regression: the old local-only grounding silently skipped
+    on the backend, so design-doc presence was never reconciled on this path.
+    """
+
+    # Branch verification context resolves to real GitHub creds…
+    async def _ctx(session, project):
+        return {
+            "token": "ghs_tok",
+            "owner": "acme",
+            "repo": "widget",
+            "branch": "automain",
+            "project_id": str(project.id),
+        }
+
+    mocker.patch(
+        "app.source_ref_validation.resolve_branch_verification_context",
+        side_effect=_ctx,
+    )
+    # …and the backing module is absent on that branch.
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = Project(name="Branch Grounding", user_id="test-user-branch-ground")
+    project.design_doc = {
+        "playbook/tip": {
+            "content": "a tip",
+            "confirmed_count": 1,
+            "reference_count": 1,
+            "applicable_types": ["create"],
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+        "systems/gone": {
+            "status": "functional",
+            "modules": ["backend/app/deleted_module.py"],
+            "description": "claims to be built",
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build something"}],
+        vm_instance_id="agent-vm-branch-ground-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-branch-ground-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    entry = project.design_doc["systems/gone"]
+    assert entry["status"] == "missing"
+    assert "presence_warning" in entry
+    # The cooldown marker was stamped so a follow-up claim does not re-fire I/O.
+    assert project.design_doc.get("_meta", {}).get("last_branch_grounding_at")
 
 
 @pytest.mark.asyncio
@@ -9310,6 +10668,77 @@ async def test_agent_claim_omits_vision_when_empty(client: AsyncClient, db_sessi
     resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
     assert resp.status_code == 200
     assert "vision" not in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_injects_strategic_intent(client: AsyncClient, db_session):
+    """The operator's current strategic intent (purpose + current_focus) is
+    surfaced on the claim response for tactical task types so tactical agents
+    align with what the operator is steering toward."""
+    project = Project(
+        name="Strategic Intent Inject Test",
+        user_id="test-user-intent",
+        problem_model={
+            "intent": {
+                "purpose": "Build an autonomous coding studio.",
+                "current_focus": "Thread operator steering into tactical prompts.",
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Intent consumer",
+        payloads=[{"type": "fix", "prompt": "Fix the widget"}],
+        vm_instance_id="agent-vm-intent",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-intent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    intent = resp.json().get("strategic_intent")
+    assert intent is not None
+    assert intent["purpose"] == "Build an autonomous coding studio."
+    assert (
+        intent["current_focus"]
+        == "Thread operator steering into tactical prompts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_omits_strategic_intent_when_empty(
+    client: AsyncClient, db_session
+):
+    """A greenfield project with empty intent gets no strategic_intent key."""
+    project = Project(
+        name="Empty Intent",
+        user_id="test-user-empty-intent",
+        problem_model={"intent": {"purpose": "", "current_focus": ""}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="No intent task",
+        payloads=[{"type": "create", "prompt": "x"}],
+        vm_instance_id="agent-vm-nointent",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-nointent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert "strategic_intent" not in resp.json()
 
 
 @pytest.mark.asyncio

@@ -185,6 +185,48 @@ class TestCostSummary:
         assert spot_cost < od_cost
 
     @pytest.mark.asyncio
+    async def test_mixed_machine_types_use_their_own_rates(
+        self, client: AsyncClient, db_session
+    ):
+        project = make_project()
+        db_session.add(project)
+        await db_session.flush()
+
+        now = _utcnow()
+        prov = now - timedelta(hours=2)
+        stop = prov + timedelta(seconds=3600)
+
+        t_small = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            provider="gcp",
+            vm_spot=False,
+            vm_machine_type="e2-standard-2",
+            vm_provisioned_at=prov,
+            vm_stopped_at=stop,
+        )
+        t_large = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            provider="gcp",
+            vm_spot=False,
+            vm_machine_type="e2-standard-4",
+            vm_provisioned_at=prov,
+            vm_stopped_at=stop,
+        )
+        db_session.add(t_small)
+        db_session.add(t_large)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/cost-summary")
+        assert resp.status_code == 200
+        body = resp.json()
+        row = body["by_task_type"]["gcp:on-demand"]
+        expected_cost = 0.067 + 0.134
+        assert abs(row["estimated_cost"] - expected_cost) < 0.0001
+        assert abs(body["total_estimated_cost"] - expected_cost) < 0.0001
+
+    @pytest.mark.asyncio
     async def test_null_provider_shown_as_unknown(
         self, client: AsyncClient, db_session
     ):

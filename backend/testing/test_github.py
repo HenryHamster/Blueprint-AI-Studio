@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -21,6 +22,53 @@ class MockResponse:
 
     def json(self):
         return self._json_data
+
+
+@pytest.mark.asyncio
+async def test_load_tasks_for_artifacts_batches_by_task_id():
+    """Artifact task lookup is batched into one query and deduped by task_id."""
+    from app.routers.github import _load_tasks_for_artifacts
+
+    class _ArtifactStub:
+        def __init__(self, task_id):
+            self.task_id = task_id
+
+    class _TaskStub:
+        def __init__(self, task_id):
+            self.id = task_id
+
+    class _ScalarResultStub:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class _ExecuteResultStub:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def scalars(self):
+            return _ScalarResultStub(self._rows)
+
+    class _SessionStub:
+        def __init__(self, rows):
+            self.rows = rows
+            self.executions = 0
+
+        async def execute(self, _stmt):
+            self.executions += 1
+            return _ExecuteResultStub(self.rows)
+
+    session = _SessionStub([_TaskStub(1), _TaskStub(2)])
+    artifacts = [_ArtifactStub(1), _ArtifactStub(2), _ArtifactStub(1)]
+
+    task_map = await _load_tasks_for_artifacts(session, artifacts)
+
+    assert session.executions == 1
+    assert set(task_map) == {1, 2}
+    assert task_map[1].id == 1
+    assert task_map[2].id == 2
 
 
 @pytest.mark.smoketest
@@ -1439,7 +1487,12 @@ async def test_pr_close_without_merge_unmatched_pr_is_noop(client, db_session, m
 
 
 def _make_pr_merged_payload(
-    owner: str, repo: str, pr_number: int, body: str = ""
+    owner: str,
+    repo: str,
+    pr_number: int,
+    body: str = "",
+    *,
+    base_branch: str = "main",
 ) -> bytes:
     """Build a minimal pull_request closed+merged webhook payload."""
     return json.dumps(
@@ -1449,6 +1502,7 @@ def _make_pr_merged_payload(
                 "number": pr_number,
                 "merged": True,
                 "body": body,
+                "base": {"ref": base_branch},
             },
             "repository": {
                 "full_name": f"{owner}/{repo}",
@@ -1550,7 +1604,8 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     A pull_request webhook with action=closed and merged=True sets pr_merged=True
     on the matching task's context.
     """
-    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+    from sqlmodel import select
+    from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
 
     mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
     mocker.patch(
@@ -1559,7 +1614,7 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     mocker.patch(
         "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
     )
-    mocker.patch(
+    dispatch_mock = mocker.patch(
         "app.notification_dispatch.dispatch_external_notification",
         new_callable=AsyncMock,
     )
@@ -1569,6 +1624,8 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
         user_id="user1",
         github_owner="mergeorg",
         github_repo="mergerepo",
+        integration_branch="main",
+        promotion_target="main",
     )
     db_session.add(project)
     await db_session.commit()
@@ -1577,7 +1634,13 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
     task = Task(
         project_id=project.id,
         title="Add feature",
-        payloads=[{"type": "create", "prompt": "do it"}],
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do it",
+                "base_branch": "automain",
+            }
+        ],
         status=TaskStatus.COMPLETED,
         context={},
         created_by="user1",
@@ -1596,11 +1659,202 @@ async def test_pr_merged_sets_pr_merged_on_matching_task(client, db_session, moc
 
     payload_bytes = _make_pr_merged_payload("mergeorg", "mergerepo", 55)
     resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
 
     assert resp.status_code == 200
 
     await db_session.refresh(task)
     assert task.context.get("pr_merged") is True
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_on_integration_triggers_build_config_refresh(
+    client, db_session, mocker
+):
+    """A merge onto the integration branch invokes the empty-build_config
+    auto-refresh with the landed project."""
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Refresh On Land",
+        user_id="user1",
+        github_owner="refreshorg",
+        github_repo="refreshrepo",
+        integration_branch="main",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload_bytes = _make_pr_merged_payload(
+        "refreshorg", "refreshrepo", 71, base_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    refresh_mock.assert_awaited_once()
+    assert refresh_mock.await_args.args[0].id == project.id
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_on_non_integration_branch_skips_build_config_refresh(
+    client, db_session, mocker
+):
+    """A merge onto a non-integration (staging/promotion) branch must NOT
+    invoke the auto-refresh."""
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="No Refresh Off Integration",
+        user_id="user1",
+        github_owner="skiporg",
+        github_repo="skiprepo",
+        integration_branch="develop",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload_bytes = _make_pr_merged_payload(
+        "skiporg", "skiprepo", 72, base_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    refresh_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_to_distinct_promotion_target_alerts_without_pr_merged(
+    client, db_session, mocker
+):
+    """A merged webhook landing on promotion_target must not mark work as landed on integration."""
+    from sqlmodel import select
+    from app.models import (
+        Alert,
+        AlertSeverity,
+        Artifact,
+        ArtifactType,
+        Project,
+        Task,
+        TaskStatus,
+    )
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Promotion Merge Guard",
+        user_id="user1",
+        github_owner="guardorg",
+        github_repo="guardrepo",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Guarded merge",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do it",
+                "base_branch": "automain",
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        context={},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/guardorg/guardrepo/pull/56",
+        )
+    )
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload(
+        "guardorg", "guardrepo", 56, base_branch="main"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is None
+    rollup_mock.assert_not_called()
+
+    alerts = (
+        (
+            await db_session.execute(select(Alert).where(Alert.task_id == task.id))
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    assert "promotion_target" in alerts[0].message
+    assert "integration_branch" in alerts[0].message
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 56
 
 
 @pytest.mark.asyncio
@@ -1676,6 +1930,78 @@ async def test_pr_merged_dispatches_enriched_payload(client, db_session, mocker)
     assert body["scope"] == "small"
     assert body["changed_files"] == 3
     assert body["repo"] == "enrichorg/enrichrepo"
+
+
+@pytest.mark.asyncio
+async def test_pr_merged_intermediate_rollup_keeps_parent_waiting(
+    client, db_session, mocker
+):
+    """Merged custom staged rollup roots on intermediate branches must not set pr_merged."""
+    from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    mocker.patch(
+        "app.autonomous_research._check_autonomous_research", new_callable=AsyncMock
+    )
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Intermediate Rollup Merge",
+        user_id="user1",
+        github_owner="midorg",
+        github_repo="midrepo",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Intermediate rollup parent",
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "x",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        context={"rollup_pr_number": 57},
+        created_by="user1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/midorg/midrepo/pull/57",
+        )
+    )
+    await db_session.commit()
+
+    payload_bytes = _make_pr_merged_payload(
+        "midorg", "midrepo", 57, base_branch="release/candidate-1"
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+    await asyncio.sleep(0)
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.context.get("pr_merged") is None
+    assert "awaiting downstream landing" in (task.latest_status_message or "")
+    rollup_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -3454,3 +3780,121 @@ def test_is_self_review_422_signal():
     assert _is_self_review_422("YOUR OWN PULL REQUEST")  # case-insensitive
     assert not _is_self_review_422("line must be part of the diff")
     assert not _is_self_review_422("")
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_success_counts_lines(mocker):
+    """A 200 file payload returns (True, newline_count) decoded from base64."""
+    import base64
+
+    from app.github import get_file_content_at_ref
+
+    body = "line1\nline2\nline3\n"
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(
+            200,
+            {
+                "type": "file",
+                "content": base64.b64encode(body.encode()).decode(),
+            },
+        ),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is True
+    assert line_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_404_is_definite_absence(mocker):
+    """A 404 is the only path that returns a definite absence (False)."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(404, {"message": "Not Found"}),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/gone.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is False
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_non_200_is_indeterminate(mocker):
+    """A non-200/non-404 (e.g. 403 rate limit) is indeterminate, NEVER absence."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(403, {"message": "rate limited"}),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is None  # indeterminate — must not flag the citation
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_directory_payload_is_indeterminate(mocker):
+    """A non-file payload (e.g. a directory listing) is indeterminate, not absence."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, [{"type": "file", "name": "a.py"}]),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is None
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_undecodable_body_keeps_existence(mocker):
+    """A file with a missing/garbled content blob stays (True, None) — present,
+    but the line count is unknown so it cannot invalidate a line-number ref."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"type": "file", "content": "!!!not base64!!!"}),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is True
+    assert line_count is None
+
+
+@pytest.mark.asyncio
+async def test_get_file_content_at_ref_request_error_is_indeterminate(mocker):
+    """An exception during the fetch is indeterminate (None), never absence."""
+    from app.github import get_file_content_at_ref
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("boom"),
+    )
+
+    exists, line_count = await get_file_content_at_ref(
+        "backend/app/foo.py", token="t", owner="o", repo="r", ref="integration"
+    )
+    assert exists is None
+    assert line_count is None

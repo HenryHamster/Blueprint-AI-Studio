@@ -33,6 +33,7 @@ from app.warm_vm_state import (
     warm_backlog_first_refusal,
     warm_backlog_reuse_failure_events,
     warm_pin_clear_events,
+    warm_pool_claim_failure_events,
 )
 
 logger = logging.getLogger(__name__)
@@ -368,6 +369,17 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
     ):
         warm_backlog_reuse_failure_events.popleft()
         pruned["warm_backlog_reuse_failure_events"] += 1
+
+    # Pool-claim failure events: bounded deque (maxlen=200) auto-evicts; prune
+    # events older than 24h so count_recent_pool_claim_failures stays cheap.
+    pool_failure_cutoff = now - timedelta(hours=24)
+    pruned["warm_pool_claim_failure_events"] = 0
+    while (
+        warm_pool_claim_failure_events
+        and warm_pool_claim_failure_events[0][0] < pool_failure_cutoff
+    ):
+        warm_pool_claim_failure_events.popleft()
+        pruned["warm_pool_claim_failure_events"] += 1
 
     return pruned
 

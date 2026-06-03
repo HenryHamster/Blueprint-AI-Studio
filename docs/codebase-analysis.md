@@ -1,7 +1,7 @@
 # Blueprint AI Studio — Cross-Cutting Codebase Analysis
 
 > Generated: 2026-04-13  
-> Branch: main  
+> Branch: automain  
 > Scope: Full repository analysis across frontend, backend, agent, and infrastructure
 
 ---
@@ -33,7 +33,7 @@ Blueprint is an **autonomous Claude Code launcher platform** that manages the co
 │  - Clone repo + run Claude Code CLI                              │
 │  - Heartbeat mechanism & log streaming                           │
 │  - Git workflow (branch creation, PR submission)                 │
-│  - 17 task handlers (create, refactor, plan, research, …)       │
+│  - 20 task handlers (create, refactor, plan, research, …)       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,17 +72,20 @@ Admin UI ↔ Orchestrator (Bearer token from Firebase)
 Agent VMs ↔ Orchestrator (short-lived JWT)
   POST /api/agent/status        — task completion report
   POST /api/agent/heartbeat     — 60 s keep-alive
-  POST /api/agent/spawn-task    — create child subtasks
+  POST /api/agent/spawn         — create child subtasks
   POST /api/agent/refresh-token — extend JWT
+  POST /api/agent/artifacts/upload-url — signed GCS URL
+  POST /api/agent/credentials/rotate   — provider secret refresh
   POST /api/agent/github/*      — GitHub API proxy
-  GET  /api/agent/upload-url    — signed GCS URL
+  POST /api/agent/vm-heartbeat  — warm-VM liveness
+  POST /api/agent/next-role     — warm-VM handoff/backlog claim
 ```
 
 ### Asynchronous (WebSocket & events)
 
 ```
 Orchestrator → Admin UI (real-time log streaming)
-  WS /ws/logs/{project_id}?ticket=<signed_1min_JWT>
+  WS /api/projects/{project_id}/ws?ws_ticket=<signed_ticket>
   Messages: {task_id, logs, task_status, metrics}
   Secrets are redacted before broadcast.
 
@@ -204,7 +207,7 @@ QUEUED
 **Plan decomposition flow:**
 1. Clone repo; run Claude Code with decomposition prompt.
 2. Parse JSON subtask array from Claude output.
-3. `POST /api/agent/spawn-task` for each subtask.
+3. `POST /api/agent/spawn` for each subtask.
 4. Orchestrator marks parent `EVALUATING`.
 5. All children reach terminal state → parent → `COMPLETED`.
 

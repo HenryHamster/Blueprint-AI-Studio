@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -94,6 +94,28 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
   if (v === undefined || v === null) throw new Error(msg);
   return v;
 }
+
+const initialPoolPriorTaskId = '00000000-0000-0000-0000-000000000000';
+
+beforeEach(() => {
+  process.env.PROVIDER = 'anthropic';
+  process.env.AUTH_MODE = 'oauth';
+  delete process.env.LLM_MODEL;
+  delete process.env.LLM_SETTINGS;
+  delete process.env.LLM_CLI_TRANSLATION;
+  delete process.env.LLM_EXECUTION_MODE;
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.CODEX_API_KEY;
+  delete process.env.CODEX_HOME;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  delete process.env.GOOGLE_CLOUD_PROJECT;
+  delete process.env.GOOGLE_CLOUD_LOCATION;
+  _resetCredentialStateForTesting();
+  refreshRuntimeState();
+});
 
 // ── computeRefreshDelayMs ─────────────────────────────────────────────────────
 /** Build a minimal JWT with a given exp claim (no real signature needed). */
@@ -2571,6 +2593,68 @@ describe('pollForNextRole', () => {
     expect(clearIntervalSpy).toHaveBeenCalled();
   });
 
+  it('surfaces secret_manifest on an account-divergent warm claim', async () => {
+    let call = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      call += 1;
+      if (call === 1) return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({
+          action: 'claim',
+          task_id: 'next-Z',
+          warm_start: true,
+          agent_token: 'rotated-jwt-Z',
+          secret_manifest: {
+            env: { PROVIDER: 'gemini', GEMINI_API_KEY: 'k' },
+            files: [{ path: '/home/agent/.gemini/settings.json', content: '{}', mode: '0600' }],
+          },
+        }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-3', priorTaskId: 't-3', priorPrNumber: null,
+      apiBase: 'http://api.test', agentJwt: 'jwt3',
+      pollIntervalMs: 10, timeoutMs: 1000, heartbeatIntervalMs: 200,
+    });
+    expect(result.action).toBe('claim');
+    expect(result.taskId).toBe('next-Z');
+    expect(result.agentToken).toBe('rotated-jwt-Z');
+    expect(result.secretManifest).toBeDefined();
+    expect(result.secretManifest?.env?.PROVIDER).toBe('gemini');
+    expect(result.secretManifest?.files?.[0]?.path).toBe('/home/agent/.gemini/settings.json');
+  });
+
+  it('leaves secretManifest undefined on a same-account claim (JWT-only path)', async () => {
+    let call = 0;
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      call += 1;
+      if (call === 1) return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      // Same-account claim: no secret_manifest field at all.
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'claim', task_id: 'next-S', warm_start: true, agent_token: 'jwt-s' }),
+      });
+    });
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-4', priorTaskId: 't-4', priorPrNumber: null,
+      apiBase: 'http://api.test', agentJwt: 'jwt4',
+      pollIntervalMs: 10, timeoutMs: 1000, heartbeatIntervalMs: 200,
+    });
+    expect(result.action).toBe('claim');
+    expect(result.taskId).toBe('next-S');
+    expect(result.agentToken).toBe('jwt-s');
+    expect(result.secretManifest).toBeUndefined();
+  });
+
   it('returns claim with undefined agentToken when backend omits it (deploy mismatch)', async () => {
     let call = 0;
     fetchMock.mockImplementation((input: unknown) => {
@@ -2703,6 +2787,442 @@ describe('pollForNextRole', () => {
       heartbeatIntervalMs: 200,
     });
     expect(result).toEqual({ action: 'exit', reason: 'recovered' });
+  });
+});
+
+// ── performWarmRetarget — account-divergent warm re-target ───────────────────
+describe('performWarmRetarget', () => {
+  afterEach(() => { __setWarmRetargetDepsForTesting(null); });
+
+  it('clears creds, materializes an augmented manifest, then re-execs (in order)', async () => {
+    const calls: string[] = [];
+    let captured: { manifest?: SecretManifest; envPath?: string } = {};
+    __setWarmRetargetDepsForTesting({
+      clearCreds: () => { calls.push('clear'); return Promise.resolve(); },
+      materialize: (m: SecretManifest, envPath: string) => { calls.push('materialize'); captured = { manifest: m, envPath }; },
+      reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+    });
+
+    const inputManifest: SecretManifest = {
+      env: { PROVIDER: 'openai', OPENAI_API_KEY: 'sk-xyz' },
+      files: [{ path: '/opt/agent/openai/auth.json', content: '{}', mode: '0600' }],
+    };
+    await performWarmRetarget(inputManifest, { rotatedJwt: 'ROT.JWT', taskId: 'task-42' });
+
+    // clear-then-write-then-reexec ordering is the credential-leakage guarantee.
+    expect(calls).toEqual(['clear', 'materialize', 'reexec']);
+    expect(captured.envPath).toBe('/etc/agent.env');
+    // The backend strips AGENT_SECRET_TOKEN; the agent re-injects the rotated JWT.
+    expect(captured.manifest?.env?.AGENT_SECRET_TOKEN).toBe('ROT.JWT');
+    expect(captured.manifest?.env?.TASK_ID).toBe('task-42');
+    expect(captured.manifest?.env?.BLUEPRINT_WARM_HANDOFF).toBe('1');
+    expect(captured.manifest?.env?.BLUEPRINT_REEXEC).toBe('1');
+    // Original provider env + files are preserved.
+    expect(captured.manifest?.env?.PROVIDER).toBe('openai');
+    expect(captured.manifest?.env?.OPENAI_API_KEY).toBe('sk-xyz');
+    expect(captured.manifest?.files).toEqual([{ path: '/opt/agent/openai/auth.json', content: '{}', mode: '0600' }]);
+    // The input manifest must not be mutated in place.
+    expect(inputManifest.env?.AGENT_SECRET_TOKEN).toBeUndefined();
+  });
+
+  it('does NOT materialize or re-exec when clearCreds throws (clear-then-write ordering held)', async () => {
+    const calls: string[] = [];
+    __setWarmRetargetDepsForTesting({
+      clearCreds: () => { calls.push('clear'); return Promise.reject(new Error('wipe-failed')); },
+      materialize: () => { calls.push('materialize'); },
+      reexec: () => { calls.push('reexec'); return Promise.resolve(); },
+    });
+    await expect(performWarmRetarget({ env: {} }, { rotatedJwt: 'j', taskId: 't' }))
+      .rejects.toThrow('wipe-failed');
+    expect(calls).toEqual(['clear']);
+  });
+
+  it('default materialize invokes the real helper via sudo python3 against /etc/agent.env', async () => {
+    const execMock = vi.mocked(execFileSync);
+    execMock.mockClear();
+    // Override only clearCreds + reexec; materialize stays the real default so
+    // we exercise the sudo python3 invocation against the baked helper path.
+    __setWarmRetargetDepsForTesting({
+      clearCreds: () => Promise.resolve(),
+      reexec: () => Promise.resolve(),
+    });
+    await performWarmRetarget({ env: { PROVIDER: 'anthropic' } }, { rotatedJwt: 'j', taskId: 't' });
+
+    const sudoCall = execMock.mock.calls.find(
+      c => c[0] === 'sudo' && Array.isArray(c[1]) && c[1][0] === 'python3',
+    );
+    expect(sudoCall).toBeDefined();
+    const args = sudoCall?.[1] as string[];
+    expect(args).toContain(MATERIALIZE_SCRIPT_PATH);
+    expect(args[args.length - 1]).toBe('/etc/agent.env');
+  });
+});
+
+describe('bootstrapPoolMode', () => {
+  const originalTaskId = process.env.TASK_ID;
+  const originalWarmHandoff = process.env.BLUEPRINT_WARM_HANDOFF;
+
+  beforeEach(() => {
+    delete process.env.TASK_ID;
+    delete process.env.BLUEPRINT_WARM_HANDOFF;
+  });
+
+  afterEach(() => {
+    if (originalTaskId !== undefined) process.env.TASK_ID = originalTaskId;
+    else delete process.env.TASK_ID;
+    if (originalWarmHandoff !== undefined) process.env.BLUEPRINT_WARM_HANDOFF = originalWarmHandoff;
+    else delete process.env.BLUEPRINT_WARM_HANDOFF;
+    vi.restoreAllMocks();
+  });
+
+  it('keeps polling across empty windows, then rotates into the first claimed task without warm handoff', async () => {
+    const pollOnce = vi
+      .fn()
+      .mockResolvedValueOnce({ action: 'exit', reason: 'poll_timeout' })
+      .mockResolvedValueOnce({ action: 'claim', taskId: 'pool-task-1', agentToken: 'pool-jwt-1' });
+
+    const result = await bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-1',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-1',
+      maxIdleLifetimeMs: 1_000,
+      pollWindowMs: 250,
+      pollOnce,
+    });
+
+    expect(result).toEqual({ action: 'claim', taskId: 'pool-task-1', agentToken: 'pool-jwt-1' });
+    expect(pollOnce).toHaveBeenCalledTimes(2);
+    expect(pollOnce).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      vmInstanceId: 'pool-vm-1',
+      priorTaskId: initialPoolPriorTaskId,
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-1',
+      timeoutMs: 250,
+    }));
+    expect(process.env.TASK_ID).toBe('pool-task-1');
+    expect(getAgentHeaders()['X-Agent-Token']).toBe('pool-jwt-1');
+    expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
+  });
+
+  it('exits cleanly when max idle lifetime is exhausted without a claim', async () => {
+    let fakeNow = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => fakeNow);
+    const pollOnce = vi.fn().mockImplementation(() => {
+      fakeNow += 60;
+      return { action: 'exit', reason: 'poll_timeout' } as const;
+    });
+
+    const result = await bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-2',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-2',
+      maxIdleLifetimeMs: 100,
+      pollWindowMs: 80,
+      pollOnce,
+    });
+
+    expect(result).toEqual({ action: 'exit', reason: 'max_idle_lifetime_exceeded' });
+    expect(pollOnce).toHaveBeenCalledTimes(2);
+    expect(process.env.TASK_ID).toBeUndefined();
+  });
+
+  it('applies a retarget secret manifest before returning the first claimed task', async () => {
+    mockReadFileSync.mockImplementation((path: string, encoding?: string) => {
+      if (path === '/opt/agent/openai/auth.json' && encoding === undefined) {
+        return Buffer.from('{"tokens":{"access_token":"retargeted"}}');
+      }
+      throw new Error(`unexpected read ${path}`);
+    });
+    const pollOnce = vi.fn().mockResolvedValue({
+      action: 'claim',
+      taskId: 'pool-task-retarget',
+      agentToken: 'pool-jwt-retarget',
+      secretManifest: {
+        env: {
+          PROVIDER: 'openai',
+          AUTH_MODE: 'oauth',
+          LLM_MODEL: 'gpt-5.4',
+          CODEX_HOME: '/opt/agent/openai',
+          LLM_EXECUTION_MODE: 'default',
+        },
+        files: [
+          {
+            path: '/opt/agent/openai/auth.json',
+            content: '{"tokens":{"access_token":"retargeted"}}',
+            mode: '0600',
+          },
+        ],
+        metadata: { retarget: true, provider: 'openai', auth_mode: 'oauth' },
+      },
+    });
+
+    const result = await bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-retarget',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-retarget',
+      maxIdleLifetimeMs: 1_000,
+      pollWindowMs: 250,
+      pollOnce,
+    });
+
+    expect(result.action).toBe('claim');
+    expect(result.taskId).toBe('pool-task-retarget');
+    expect(result.agentToken).toBe('pool-jwt-retarget');
+    expect(result.secretManifest).toBeDefined();
+    expect(process.env.TASK_ID).toBe('pool-task-retarget');
+    expect(process.env.PROVIDER).toBe('openai');
+    expect(process.env.AUTH_MODE).toBe('oauth');
+    expect(process.env.CODEX_HOME).toBe('/opt/agent/openai');
+    expect(getProviderRunner().provider).toBe('openai');
+    expect(getProviderRunner().buildValidationCommand('gpt-5.4')?.command).toBe('codex');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('retarget');
+    expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
+      [
+        '/opt/agent/openai/auth.json',
+        '{"tokens":{"access_token":"retargeted"}}',
+        expect.objectContaining({ mode: 0o600 }),
+      ],
+    ]));
+    expect(mockReadFileSync).toHaveBeenCalledWith('/opt/agent/openai/auth.json');
+  });
+
+  it('restores the boot credential state when the next claim has no secret manifest', () => {
+    process.env.PROVIDER = 'anthropic';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-claude-token';
+    refreshRuntimeState();
+    _captureBootCredentialSnapshotForTesting();
+
+    _materializeClaimCredentialStateForTesting({
+      env: {
+        PROVIDER: 'openai',
+        AUTH_MODE: 'api_key',
+        OPENAI_API_KEY: 'retarget-openai-key',
+        CODEX_API_KEY: 'retarget-openai-key',
+      },
+      metadata: { retarget: true, provider: 'openai', auth_mode: 'api_key' },
+    }, 'test: retarget');
+
+    expect(process.env.PROVIDER).toBe('openai');
+    expect(process.env.OPENAI_API_KEY).toBe('retarget-openai-key');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('retarget');
+
+    _materializeClaimCredentialStateForTesting(undefined, 'test: restore-boot');
+
+    expect(process.env.PROVIDER).toBe('anthropic');
+    expect(process.env.AUTH_MODE).toBe('oauth');
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('boot-claude-token');
+    expect(process.env.OPENAI_API_KEY).toBeUndefined();
+    expect(process.env.CODEX_API_KEY).toBeUndefined();
+    expect(getProviderRunner().provider).toBe('anthropic');
+    expect(_getActiveCredentialStateSourceForTesting()).toBe('boot');
+  });
+
+  it('fails hard on a malformed secret manifest instead of leaving prior credentials active', async () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-claude-token';
+    refreshRuntimeState();
+    const pollOnce = vi.fn().mockResolvedValue({
+      action: 'claim',
+      taskId: 'pool-task-bad-retarget',
+      agentToken: 'pool-jwt-bad-retarget',
+      secretManifest: {
+        env: { PROVIDER: 'openai', AUTH_MODE: 'oauth' },
+        files: [],
+        metadata: {},
+      },
+    });
+
+    await expect(bootstrapPoolMode({
+      vmInstanceId: 'pool-vm-bad-retarget',
+      apiBase: 'http://api.test',
+      agentJwt: 'vm-jwt-bad-retarget',
+      maxIdleLifetimeMs: 1_000,
+      pollWindowMs: 250,
+      pollOnce,
+    })).rejects.toThrow('reset_failed: pool-mode first claim: secret_manifest.metadata.retarget must be true');
+
+    expect(process.env.TASK_ID).toBe('pool-task-bad-retarget');
+    expect(process.env.PROVIDER).toBe('anthropic');
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('boot-claude-token');
+  });
+});
+
+describe('main pool-mode startup ordering', () => {
+  const originalPoolMode = process.env.BLUEPRINT_POOL_MODE;
+  const originalVmInstanceId = process.env.VM_INSTANCE_ID;
+  const originalTaskId = process.env.TASK_ID;
+  const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    process.env.BLUEPRINT_POOL_MODE = '1';
+    process.env.VM_INSTANCE_ID = 'pool-vm-main-test';
+    delete process.env.TASK_ID;
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
+    _setAgentTokenForTesting('vm-bootstrap-jwt');
+    _setAgentRuntimeFingerprintForTesting(null);
+  });
+
+  afterEach(() => {
+    _stopHeartbeatForTesting();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    if (originalPoolMode !== undefined) process.env.BLUEPRINT_POOL_MODE = originalPoolMode;
+    else delete process.env.BLUEPRINT_POOL_MODE;
+    if (originalVmInstanceId !== undefined) process.env.VM_INSTANCE_ID = originalVmInstanceId;
+    else delete process.env.VM_INSTANCE_ID;
+    if (originalTaskId !== undefined) process.env.TASK_ID = originalTaskId;
+    else delete process.env.TASK_ID;
+    if (originalAnthropicApiKey !== undefined) process.env.ANTHROPIC_API_KEY = originalAnthropicApiKey;
+    else delete process.env.ANTHROPIC_API_KEY;
+    _setAgentTokenForTesting('');
+    _setAgentRuntimeFingerprintForTesting(null);
+  });
+
+  it('starts the claimed-task heartbeat before stale-result replay, uses persisted replay tokens, and abandons unrecoverable legacy envelopes', async () => {
+    const makeTaskToken = (sub: string): string => {
+      const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+      const payload = Buffer.from(JSON.stringify({ sub })).toString('base64url');
+      return `${header}.${payload}.sig`;
+    };
+    const now = Date.now();
+    const events: string[] = [];
+    let nextRoleBody: { vm_instance_id?: string; prior_task_id?: string; prior_pr_number?: number | null } | null = null;
+    const statusReplayTokens: string[] = [];
+    const heartbeatTokens: string[] = [];
+    (fs.readdirSync as unknown as ReturnType<typeof vi.fn>).mockImplementation((path: string) => {
+      if (path === '/tmp') events.push('stale-scan');
+      return ['task_stale-persisted_result.json', 'task_stale-legacy_result.json'];
+    });
+    mockReadFileSync.mockImplementation((path: string) => {
+      if (path === '/opt/agent/AGENT_RUNTIME_FINGERPRINT') {
+        events.push('fingerprint-read');
+        return 'AGENT_RUNTIME_FINGERPRINT=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+      }
+      if (path === '/tmp/task_stale-persisted_result.json') {
+        return JSON.stringify({
+          payload: { task_id: 'stale-persisted', status: 'FAILED' },
+          retry: { attempts: 0, createdAt: now - 1_000, nextAttemptAt: now - 1 },
+          agentToken: 'persisted-stale-jwt',
+        });
+      }
+      if (path === '/tmp/task_stale-legacy_result.json') {
+        return JSON.stringify({
+          payload: { task_id: 'stale-legacy', status: 'FAILED' },
+          retry: { attempts: 0, createdAt: now - 1_000, nextAttemptAt: now - 1 },
+        });
+      }
+      return '';
+    });
+
+    (spawn as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      events.push('provider-validation');
+      return {
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+          if (event === 'close') void Promise.resolve().then(() => { handler(0); });
+        }),
+        kill: vi.fn(),
+      };
+    });
+
+    fetchMock.mockImplementation((input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        events.push('vm-heartbeat');
+        return Promise.resolve({
+          status: 204,
+          json: () => Promise.resolve({}),
+        });
+      }
+      if (url.endsWith('/api/agent/heartbeat')) {
+        events.push('task-heartbeat');
+        heartbeatTokens.push((init?.headers as Record<string, string> | undefined)?.['X-Agent-Token'] ?? '');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ status: 'ok' }),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/next-role')) {
+        events.push('next-role');
+        const requestBody = typeof init?.body === 'string' ? init.body : '{}';
+        nextRoleBody = JSON.parse(requestBody) as {
+          vm_instance_id?: string;
+          prior_task_id?: string;
+          prior_pr_number?: number | null;
+        };
+        if (nextRoleBody.prior_task_id !== initialPoolPriorTaskId) {
+          return Promise.resolve({ status: 422, json: () => Promise.resolve({ detail: 'prior_task_id must be a UUID' }) });
+        }
+        return Promise.resolve({
+          status: 200,
+          json: () => Promise.resolve({
+            action: 'claim',
+            task_id: 'pool-task-main-1',
+            agent_token: makeTaskToken('pool-task-main-1'),
+          }),
+        });
+      }
+      if (url === 'http://metadata.google.internal/computeMetadata/v1/instance/image') {
+        events.push('vm-image-fetch');
+        return Promise.resolve({ ok: true, text: () => Promise.resolve('projects/test/global/images/agent-1234567890') });
+      }
+      if (url.endsWith('/api/agent/status')) {
+        const body = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as { task_id?: string };
+        events.push(`status-replay:${body.task_id ?? 'unknown'}`);
+        statusReplayTokens.push((init?.headers as Record<string, string> | undefined)?.['X-Agent-Token'] ?? '');
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ status: 'ok' }),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/claim')) {
+        events.push('claim-replay');
+        return Promise.resolve({ status: 400, ok: false, text: () => Promise.resolve('claim replay stopped test') });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+
+    await expect(main()).rejects.toThrow('POST /api/agent/claim failed (400): claim replay stopped test');
+
+    expect(events.indexOf('vm-heartbeat')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('next-role')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('task-heartbeat')).toBeGreaterThan(events.indexOf('next-role'));
+    // Provider auth is validated pre-claim in pool mode (a bad-cred VM must fail
+    // before bootstrapPoolMode flips a task IN_PROGRESS), so provider-validation
+    // lands BEFORE next-role — see the validate-before-claim block in main().
+    expect(events.indexOf('provider-validation')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('provider-validation')).toBeLessThan(events.indexOf('next-role'));
+    expect(events.indexOf('vm-image-fetch')).toBeGreaterThan(events.indexOf('next-role'));
+    expect(events.indexOf('stale-scan')).toBeGreaterThan(events.indexOf('next-role'));
+    expect(events.indexOf('status-replay:stale-persisted')).toBeGreaterThan(events.indexOf('stale-scan'));
+    expect(events.indexOf('status-replay:stale-persisted')).toBeGreaterThan(events.indexOf('task-heartbeat'));
+    expect(events.indexOf('claim-replay')).toBeGreaterThan(events.indexOf('status-replay:stale-persisted'));
+    expect(events).not.toContain('status-replay:stale-legacy');
+    expect(heartbeatTokens).toEqual([makeTaskToken('pool-task-main-1')]);
+    expect(statusReplayTokens).toEqual(['persisted-stale-jwt']);
+    expect(nextRoleBody).toEqual({
+      vm_instance_id: 'pool-vm-main-test',
+      prior_task_id: initialPoolPriorTaskId,
+      prior_pr_number: null,
+    });
+    expect(process.env.TASK_ID).toBe('pool-task-main-1');
+    expect(getAgentHeaders()['X-Agent-Token']).toBe(makeTaskToken('pool-task-main-1'));
+    expect(process.env.BLUEPRINT_WARM_HANDOFF).toBeUndefined();
+    expect(vi.mocked(fs.unlinkSync).mock.calls).toEqual(expect.arrayContaining([
+      ['/tmp/task_stale-persisted_result.json'],
+      ['/tmp/task_stale-legacy_result.json'],
+    ]));
   });
 });
 

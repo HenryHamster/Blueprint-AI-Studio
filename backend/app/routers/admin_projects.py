@@ -1,3 +1,12 @@
+"""Admin project read/write endpoints for post-onboarding project config.
+
+This router exposes the operator-facing project surface after onboarding:
+list/view endpoints, owner-gated PATCH for project config, and a re-detect
+endpoint that refreshes repo-derived defaults while preserving explicit
+operator overrides for branch naming, cleanup prefixes, Git identity, and
+self-improvement flags.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +25,7 @@ from app.models import (
     Task,
     TaskStatus,
     Project,
+    ProjectStatus,
     ProjectMember,
     _utcnow,
     notify_tasks_terminated,
@@ -33,7 +43,11 @@ router = APIRouter(
 
 
 def _redact_build_config(build_config: dict, role: str) -> dict:
-    """Return build_config with env_vars omitted for non-owner callers."""
+    """Return build_config with env_vars omitted for non-owner callers.
+
+    Owners see the full config because they are responsible for Git identity
+    and environment overrides; members get a redacted copy.
+    """
     if role == "owner":
         return build_config
     result = dict(build_config)
@@ -47,9 +61,17 @@ async def get_all_projects(
     request: Request,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    archived: bool = Query(False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """List the caller's projects with lightweight columns and redacted config.
+
+    By default archived projects are EXCLUDED so they disappear from the active
+    dashboard. Pass ``archived=true`` to fetch only the archived set (the UI's
+    restore view). The ``archived`` flag is returned per item so the frontend
+    can render archive state.
+    """
     # Select only lightweight columns — large JSONB (directions, vision, design_doc,
     # problem_model, self_reflection_log, running_update) are excluded here and
     # available via GET /api/admin/projects/{project_id}.
@@ -64,6 +86,8 @@ async def get_all_projects(
             Project.github_repo,
             Project.is_self_repo,
             Project.autonomous_enabled,
+            Project.paused,
+            Project.archived,
             Project.build_config,
             Project.sr_catch_rate_targets,
             Project.running_update_acknowledged_at,
@@ -73,7 +97,10 @@ async def get_all_projects(
             ProjectMember.role.label("my_role"),
         )
         .join(ProjectMember, ProjectMember.project_id == Project.id)
-        .where(ProjectMember.user_id == current_user["user_id"])
+        .where(
+            ProjectMember.user_id == current_user["user_id"],
+            Project.archived.is_(archived),
+        )
         .order_by(Project.created_at.desc())
         .limit(limit + 1)
         .offset(offset)
@@ -93,6 +120,8 @@ async def get_all_projects(
                 "github_repo": row.github_repo,
                 "is_self_repo": row.is_self_repo,
                 "autonomous_enabled": row.autonomous_enabled,
+                "paused": row.paused,
+                "archived": row.archived,
                 "build_config": _redact_build_config(
                     row.build_config or {}, row.my_role
                 ),
@@ -155,8 +184,10 @@ async def get_project(
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
         "autonomous_enabled": project.autonomous_enabled,
+        "paused": project.paused,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
+        "approval_gate_config": project.approval_gate_config or {},
         "my_role": role,
     }
 
@@ -180,10 +211,23 @@ class ProjectUpdate(BaseModel):
     # User-editable subset of problem_model — intent, constraints, context.
     # Gaps / capabilities / friction are agent-owned and not writable here.
     problem_model_patch: Dict[str, Any] | None = None
+    # Optimistic concurrency: supply the problem_model revision the client
+    # loaded.  Server rejects with 409 if another writer has advanced it.
+    problem_model_base_revision: int | None = None
+    # Per-project approval-gate file lists (infra_files / critical_files).
+    # Partial update: only the keys supplied are replaced. Takes effect for
+    # agents immediately via the existing claim-response seam.
+    approval_gate_config: Dict[str, Any] | None = None
 
 
 _OWNER_ONLY_UPDATE_FIELDS = frozenset(
-    {"build_config", "autonomous_enabled", "design_doc", "vision"}
+    {
+        "build_config",
+        "autonomous_enabled",
+        "design_doc",
+        "vision",
+        "approval_gate_config",
+    }
 )
 
 
@@ -196,6 +240,13 @@ async def update_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """Apply operator updates while preserving project-owned branch metadata.
+
+    Owner-only fields are gated separately. Build-config updates merge onto the
+    stored config so branch namespaces, task prefixes, staging prefixes, stale
+    prefixes, protected branches, and enable_self_improvement survive normal
+    save cycles unless the caller explicitly replaces them.
+    """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
@@ -225,6 +276,8 @@ async def update_project(
         payload.directions is not None
         or payload.design_doc is not None
         or payload.vision is not None
+        or payload.approval_gate_config is not None
+        or payload.problem_model_patch is not None
     )
     if needs_lock:
         project = await lock_project_or_429(session, project.id)
@@ -234,6 +287,8 @@ async def update_project(
                 ("directions", payload.directions),
                 ("design_doc", payload.design_doc),
                 ("vision", payload.vision),
+                ("approval_gate_config", payload.approval_gate_config),
+                ("problem_model", payload.problem_model_patch),
             )
             if p is not None
         ]
@@ -314,8 +369,7 @@ async def update_project(
         try:
             existing_bc = project.build_config or {}
             incoming = dict(payload.build_config)
-            # Preserve task-branch naming when incoming clears them — operators
-            # configure these once and expect them to survive normal config saves.
+            # Preserve operator-owned branch naming on round-trips.
             for _field in (
                 "task_branch_namespace",
                 "task_branch_prefix",
@@ -324,8 +378,7 @@ async def update_project(
                 if not incoming.get(_field) and existing_bc.get(_field):
                     incoming[_field] = existing_bc[_field]
             # Preserve per-project branch config using key-absence semantics:
-            # an explicit empty list [] means "disable" and must not be lost,
-            # so we check key presence rather than falsiness.
+            # an explicit empty list [] means "disable" and must not be lost.
             for _field in (
                 "staging_branch_prefixes",
                 "stale_branch_prefixes",
@@ -356,6 +409,31 @@ async def update_project(
         }
         flag_modified(project, "sr_catch_rate_targets")
 
+    if payload.approval_gate_config is not None:
+        # Reuse the dedicated config router's keys + path validation so both
+        # write paths enforce identical semantics. Partial update: only the
+        # supplied keys are replaced; others are preserved.
+        from app.routers.admin_project_config import (
+            _APPROVAL_GATE_KEYS,
+            _validate_approval_gate_paths,
+        )
+
+        unknown = set(payload.approval_gate_config.keys()) - set(_APPROVAL_GATE_KEYS)
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unknown approval_gate_config fields: {sorted(unknown)}",
+            )
+        cleaned = {
+            key: _validate_approval_gate_paths(key, payload.approval_gate_config[key])
+            for key in _APPROVAL_GATE_KEYS
+            if key in payload.approval_gate_config
+        }
+        config = dict(project.approval_gate_config or {})
+        config.update(cleaned)
+        project.approval_gate_config = config
+        flag_modified(project, "approval_gate_config")
+
     if payload.problem_model_patch is not None:
         # User-editable subset only — intent / context / constraints. Agent-
         # owned fields (gaps, capabilities, friction, archived_gaps,
@@ -375,6 +453,18 @@ async def update_project(
                 f"Editable fields: {sorted(ALLOWED_USER_FIELDS)}",
             )
         current = parse_problem_model(project.problem_model)
+        if (
+            payload.problem_model_base_revision is not None
+            and payload.problem_model_base_revision != current.revision
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"problem_model was modified by another writer "
+                    f"(base_revision={payload.problem_model_base_revision}, current={current.revision}). "
+                    "Reload and retry."
+                ),
+            )
         merged_raw: Dict[str, Any] = current.model_dump()
         merged_raw.update(payload.problem_model_patch)
         try:
@@ -409,6 +499,12 @@ async def detect_project_build_config(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
+    """Re-run repo detection and preserve operator-owned overrides.
+
+    This refreshes repo-derived commands/metadata from GitHub, then re-applies
+    stored Git identity, branch namespace/prefixes, stale/protected branch
+    lists, and enable_self_improvement before validating the final config.
+    """
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
@@ -419,6 +515,7 @@ async def detect_project_build_config(
 
     from pydantic import ValidationError
 
+    from app.build_config_detection import apply_operator_build_config_overrides
     from app.github import get_repo_installation_token
     from app.routers.admin_onboard import _detect_build_config
     from app.schemas import BuildConfig as BuildConfigSchema
@@ -434,35 +531,9 @@ async def detect_project_build_config(
         token, project.github_owner, project.github_repo
     )
 
-    existing = project.build_config or {}
-    if existing.get("git_user_email"):
-        detected["git_user_email"] = existing["git_user_email"]
-    if existing.get("git_user_name"):
-        detected["git_user_name"] = existing["git_user_name"]
-    if "env_vars" in existing:
-        detected["env_vars"] = existing["env_vars"]
-    if "enable_fresh_reviewer" in existing:
-        detected["enable_fresh_reviewer"] = existing["enable_fresh_reviewer"]
-    if "enable_parallel_review" in existing:
-        detected["enable_parallel_review"] = existing["enable_parallel_review"]
-    if "enable_parallel_fix" in existing:
-        detected["enable_parallel_fix"] = existing["enable_parallel_fix"]
-    # Per-project branch/PR naming overrides are user-set and not detectable from repo contents;
-    # preserve them across re-detect so an operator does not silently lose them.
-    if "task_branch_namespace" in existing:
-        detected["task_branch_namespace"] = existing["task_branch_namespace"]
-    if "task_branch_prefix" in existing:
-        detected["task_branch_prefix"] = existing["task_branch_prefix"]
-    if "pr_title_prefix" in existing:
-        detected["pr_title_prefix"] = existing["pr_title_prefix"]
-    if "staging_branch_prefixes" in existing:
-        detected["staging_branch_prefixes"] = existing["staging_branch_prefixes"]
-    if "stale_branch_prefixes" in existing:
-        detected["stale_branch_prefixes"] = existing["stale_branch_prefixes"]
-    if "protected_branches" in existing:
-        detected["protected_branches"] = existing["protected_branches"]
-    if "enable_self_improvement" in existing:
-        detected["enable_self_improvement"] = existing["enable_self_improvement"]
+    detected = apply_operator_build_config_overrides(
+        detected, project.build_config or {}
+    )
 
     try:
         validated = BuildConfigSchema(**detected) if detected else BuildConfigSchema()
@@ -611,6 +682,170 @@ async def delete_project_admin(
     }
 
 
+@router.post("/projects/{project_id}/reset")
+@limiter.limit("10/minute")
+async def reset_project_admin(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Reset a wedged project to a clean, runnable state without deleting it.
+
+    Owner-only. Safely cancels and tears down any active tasks (reusing the
+    same machinery as force-delete), then deletes all of the project's task
+    and alert rows and clears transient runtime state (circuit breakers,
+    in-memory strategic failure counts, persistent anomalies). Durable
+    configuration — directions, vision, design doc, problem model, build
+    config, members — is preserved by construction (never touched). The
+    project is left in DEPLOYING so the orchestrator treats it as runnable.
+    """
+    # Role check first (404/403 before lock contention surfaces as 429), then
+    # acquire the Project row lock — same ordering as delete to close the
+    # heartbeat-arrives-mid-reset race.
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    project = await lock_project_or_429(session, project_id)
+
+    ACTIVE_STATUSES = [
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    ]
+    # Bounded load for per-task VM cleanup; the bulk UPDATE below covers all
+    # matching rows regardless of this cap.
+    active_tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+                .limit(1000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    cancelled_count = 0
+    if active_tasks:
+        # Cancel + tear down active tasks before deleting their rows, reusing
+        # the same safe cancellation/VM-teardown path as force-delete.
+        from app.vm_lifecycle import _ensure_vm_deleted
+
+        all_cancelled_ids = (
+            (
+                await session.execute(
+                    select(Task.id).where(
+                        Task.project_id == project_id,
+                        Task.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        result = await session.execute(
+            update(Task)
+            .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+            .values(
+                status=TaskStatus.CANCELLED,
+                latest_status_message="Project reset to clean",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        cancelled_count = result.rowcount
+        for task in active_tasks:
+            await _ensure_vm_deleted(task, reason="project_reset")
+        from app.jwt_revocation import emit_bulk_task_terminated_notify  # noqa: PLC0415
+
+        await emit_bulk_task_terminated_notify(session, all_cancelled_ids)
+        await session.commit()
+        notify_tasks_terminated(all_cancelled_ids)
+
+    # Wipe all task history + alerts for the project, then return it to a
+    # clean runnable state. Durable config columns are never touched.
+    from app.models import Alert
+
+    tasks_deleted = (
+        await session.execute(delete(Task).where(Task.project_id == project_id))
+    ).rowcount
+    await session.execute(delete(Alert).where(Alert.project_id == project_id))
+    project.status = ProjectStatus.DEPLOYING
+    session.add(project)
+    await session.commit()
+
+    # Clear transient in-memory runtime/recovery state through one named seam.
+    from app.anomaly_state import reset_project_state
+
+    reset_project_state(str(project_id))
+
+    # Evict from GitHub token cache so the next cycle re-fetches cleanly.
+    from app.routers.agent import _github_token_cache
+
+    _github_token_cache.pop(str(project_id), None)
+
+    return {
+        "message": f"Project {project_id} reset to clean",
+        "active_tasks_cancelled": cancelled_count,
+        "tasks_deleted": tasks_deleted,
+    }
+
+
+@router.post("/projects/{project_id}/archive")
+@limiter.limit("10/minute")
+async def archive_project_admin(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Archive a project: hide it from the active list and halt all its work.
+
+    Owner-only and idempotent. Archiving sets ``archived=True`` so the project
+    disappears from the default project list, the orchestrator stops dispatching
+    its queued tasks, and the autonomous scheduler stops generating new work.
+    All project data is retained so it can be unarchived back to normal
+    operation later.
+    """
+    # Role check first (404/403 before lock contention surfaces as 429), then
+    # acquire the Project row lock — same ordering as delete/reset.
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    project = await lock_project_or_429(session, project_id)
+    project.archived = True
+    session.add(project)
+    await session.commit()
+    return {"message": f"Project {project_id} archived", "archived": True}
+
+
+@router.post("/projects/{project_id}/unarchive")
+@limiter.limit("10/minute")
+async def unarchive_project_admin(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Unarchive a project: restore it to the active list and normal eligibility.
+
+    Owner-only and idempotent. Clears ``archived`` so the project reappears in
+    the default list and the orchestrator/autonomous scheduler resume treating
+    it as eligible for work.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    project = await lock_project_or_429(session, project_id)
+    project.archived = False
+    session.add(project)
+    await session.commit()
+    return {"message": f"Project {project_id} unarchived", "archived": False}
+
+
 @router.post("/autonomous/pause-all")
 @limiter.limit("10/minute")
 async def pause_all_autonomous(
@@ -737,6 +972,38 @@ async def toggle_autonomous(
     session.add(project)
     await session.commit()
     return {"autonomous_enabled": project.autonomous_enabled}
+
+
+@router.patch("/projects/{project_id}/pause")
+@limiter.limit("30/minute")
+async def set_project_paused(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Owner-only pause/resume switch for a project.
+
+    Pause is a first-class persisted state, separate from the
+    ``autonomous_enabled`` toggle and from terminal lifecycle ``status``.
+    While paused, the orchestrator selects no new QUEUED work for the project
+    on any dispatch path (cold or warm) and the autonomous spawn entry points
+    skip it; in-flight PROVISIONING/IN_PROGRESS tasks drain. Resuming restores
+    normal dispatch with no re-configuration. ``autonomous_enabled`` is left
+    untouched so the two toggles compose independently.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "paused" not in payload:
+        raise HTTPException(status_code=400, detail="'paused' field required")
+
+    project.paused = bool(payload["paused"])
+    session.add(project)
+    await session.commit()
+    return {"paused": project.paused}
 
 
 @router.get("/autonomous-status")

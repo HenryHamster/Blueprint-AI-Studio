@@ -56,10 +56,11 @@ EXPECTED_TYPES = {
     "self_audit",
     "release_audit",
     "memo",
+    "verify_tests",
 }
 
 
-def test_task_type_enum_has_all_20_types():
+def test_task_type_enum_has_all_21_types():
     values = {t.value for t in TaskType}
     assert values == EXPECTED_TYPES
 
@@ -75,10 +76,10 @@ def test_model_for_type_covers_all_task_types():
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
-def test_model_for_type_count_is_20():
+def test_model_for_type_count_is_21():
     from app.payload_schemas import _MODEL_FOR_TYPE
 
-    assert len(_MODEL_FOR_TYPE) == 20
+    assert len(_MODEL_FOR_TYPE) == 21
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +131,30 @@ def test_fix_passes():
         "smoketest",
         "perf",
         "self_audit",
+        "verify_tests",
     ],
 )
 def test_system_populated_types_pass_with_no_extra_fields(task_type):
     result = _valid({"type": task_type})
     assert result["type"] == task_type
+
+
+def test_verify_tests_payload_with_branch_and_pr_number():
+    raw = {
+        "type": "verify_tests",
+        "branch": "feature/add-widget",
+        "base_branch": "main",
+        "pr_number": 42,
+    }
+    result = _valid(raw)
+    assert result["type"] == "verify_tests"
+    assert result["branch"] == "feature/add-widget"
+    assert result["pr_number"] == 42
+
+
+def test_verify_tests_payload_rejects_bad_branch():
+    msg = _invalid({"type": "verify_tests", "branch": "-bad-branch"})
+    assert "verify_tests" in msg
 
 
 # ---------------------------------------------------------------------------

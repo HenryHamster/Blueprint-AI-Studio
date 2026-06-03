@@ -42,6 +42,11 @@ from app.playbook_learning import (
     RECENT_SUCCESSES_TASK_TYPES,
     summarize_recent_successes,
 )
+from app.source_ref_validation import (
+    classify_existing_paths,
+    detect_absent_symbols,
+    resolve_branch_verification_context,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -204,8 +209,9 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     from app.anomaly_detection import _compute_research_anomalies, check_anomaly_actions
     from app.direction_lifecycle import _process_direction_lifecycle
 
-    # Guard: autonomous must be enabled
-    if not project.autonomous_enabled:
+    # Guard: autonomous must be enabled and the project must not be archived.
+    # Archiving halts all of a project's work, including autonomous spawning.
+    if not project.autonomous_enabled or project.archived:
         return
 
     # Playbook auto-seed removed: the hardcoded seed entries were specific to the
@@ -1260,6 +1266,115 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     continue
                 design_doc_summary[k] = v.get("content", "")
 
+        # Verify design-doc system module paths against the integration-branch
+        # file tree before trusting their status claims. Read-only/advisory: the
+        # stored design_doc is NOT mutated — we only annotate the payload so the
+        # research agent reasons about what actually exists instead of
+        # confabulating phantom code behind a status it trusts. Flat storage
+        # shape: each ``systems/<id>`` key is a dict carrying a ``modules`` list.
+        # Sorted iteration keeps the annotation deterministic for identical input.
+        verification_kwargs = await resolve_branch_verification_context(
+            session, project
+        )
+        system_verification: dict = {}
+        for dkey in sorted(
+            k for k in doc if isinstance(k, str) and k.startswith("systems/")
+        ):
+            dval = doc[dkey]
+            if not isinstance(dval, dict):
+                continue
+            modules = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+            if not modules:
+                continue
+            present, missing = await classify_existing_paths(
+                modules, **verification_kwargs
+            )
+            if not missing:
+                status = "verified"
+            elif present:
+                status = "partial"
+            else:
+                # Every declared module is absent from the integration branch:
+                # the system is claimed but its backing code does not exist.
+                status = "claimed_absent"
+            # Symbol-level depth: a present file can still have lost the cited
+            # symbol. An unambiguously-absent symbol gets the same treat-as-missing
+            # verdict a fully-absent file already receives.
+            absent_symbols = await detect_absent_symbols(
+                dval.get("modules"),
+                [dval.get("description"), dval.get("notes")],
+                **verification_kwargs,
+            )
+            if absent_symbols and status != "claimed_absent":
+                status = "claimed_absent"
+            system_verification[dkey[len("systems/"):]] = {
+                "status": status,
+                "claimed_status": str(dval.get("status", "")),
+                "present": present,
+                "missing": missing,
+                **({"absent_symbols": absent_symbols} if absent_symbols else {}),
+            }
+
+        # Verify design-doc CAPABILITIES the same way as systems above. The
+        # research agent reasons about — and proposes improvements to —
+        # capability behavior; a capability claimed working/partial whose every
+        # backing path is absent on the integration branch describes code that
+        # does not exist. The backend's research-side loop historically covered
+        # only systems/, leaving this gap. Mirror the strategic-side
+        # reconciliation: only PRESENT-status capabilities (working/partial) are
+        # checked, only when the entry carries at least one path pointer (in
+        # ``modules`` or embedded in ``notes``/``description`` free text), and an
+        # all-absent entry is flagged ``claimed_absent`` while a partial hit is
+        # left ``partial`` (conservative). Read-only/advisory: design_doc is
+        # never mutated; the agent renders this as a prominent prompt section
+        # (buildCapabilityVerificationSection).
+        from app.playbook_lifecycle import _extract_file_paths
+
+        _present_cap_statuses = {"working", "partial"}
+        capability_verification: dict = {}
+        for dkey in sorted(
+            k for k in doc if isinstance(k, str) and k.startswith("capabilities/")
+        ):
+            dval = doc[dkey]
+            if not isinstance(dval, dict):
+                continue
+            claimed = str(dval.get("status", "")).lower()
+            if claimed not in _present_cap_statuses:
+                continue  # planned/missing/stub already tells the agent to build
+            cap_paths = [m for m in (dval.get("modules") or []) if isinstance(m, str)]
+            for _field in ("notes", "description"):
+                _txt = dval.get(_field)
+                if isinstance(_txt, str) and _txt:
+                    cap_paths.extend(_extract_file_paths(_txt))
+            cap_paths = list(dict.fromkeys(cap_paths))
+            if not cap_paths:
+                continue  # no path pointer → absence is not evidence of absent code
+            present, missing = await classify_existing_paths(
+                cap_paths, **verification_kwargs
+            )
+            if not missing:
+                status = "verified"
+            elif present:
+                status = "partial"
+            else:
+                status = "claimed_absent"
+            # Symbol-level depth (see systems loop): flag a cited symbol that is
+            # unambiguously gone even though its file is present.
+            absent_symbols = await detect_absent_symbols(
+                dval.get("modules"),
+                [dval.get("notes"), dval.get("description")],
+                **verification_kwargs,
+            )
+            if absent_symbols and status != "claimed_absent":
+                status = "claimed_absent"
+            capability_verification[dkey[len("capabilities/"):]] = {
+                "status": status,
+                "claimed_status": str(dval.get("status", "")),
+                "present": present,
+                "missing": missing,
+                **({"absent_symbols": absent_symbols} if absent_symbols else {}),
+            }
+
         research_payload: dict = {
             "type": "research",
             "directions": direction_summaries,
@@ -1272,6 +1387,10 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             **({"effort": research_effort} if research_effort else {}),
             **({"prompt_suffix": research_suffix} if research_suffix else {}),
         }
+        if system_verification:
+            research_payload["system_verification"] = system_verification
+        if capability_verification:
+            research_payload["capability_verification"] = capability_verification
         if chosen_direction and chosen_direction.get("category") == "product":
             append_prompt_suffix(
                 research_payload,
@@ -1326,6 +1445,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     }
                     if related_caps:
                         relevant["missing_capabilities"] = related_caps
+                # Surface the current direction's system verification verdict
+                # inline so the agent sees claimed-but-absent / partial code
+                # right next to the architecture context it would otherwise trust.
+                if dir_system_id in system_verification:
+                    relevant["verification"] = system_verification[dir_system_id]
                 research_payload["direction_design_context"] = relevant
             if chosen_direction.get("possibly_complete"):
                 research_payload["direction_possibly_complete"] = True
@@ -1699,6 +1823,10 @@ async def _check_autonomous_research(owner: str, repo: str):
                             Project.github_owner == owner,
                             Project.github_repo == repo,
                             Project.autonomous_enabled.is_(True),
+                            # A paused project must not spawn new autonomous
+                            # work even when autonomous_enabled is still True.
+                            Project.paused.is_(False),
+                            Project.not_archived(),
                         )
                     )
                 )
@@ -1740,7 +1868,7 @@ async def _check_autonomous_research(owner: str, repo: str):
 # self-repair apparatus (autonomous_research_investigations) was deleted; the
 # residual create-fix lane is explicitly preserved.
 # ---------------------------------------------------------------------------
-from app.autonomous_research_residual import (
+from app.autonomous_research_residual import (  # noqa: E402
     _spawn_residual_fingerprint_remediation,
 )
 
@@ -1768,7 +1896,14 @@ async def _check_idle_research():
             projects = (
                 (
                     await session.execute(
-                        select(Project).where(Project.autonomous_enabled.is_(True))
+                        select(Project).where(
+                            Project.autonomous_enabled.is_(True),
+                            # Skip paused projects: pause blocks ALL new work
+                            # (research, periodic, and residual remediation)
+                            # regardless of the autonomous_enabled toggle.
+                            Project.paused.is_(False),
+                            Project.not_archived(),
+                        )
                     )
                 )
                 .scalars()

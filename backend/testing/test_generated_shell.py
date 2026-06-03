@@ -36,7 +36,10 @@ from typing import Callable
 import pytest
 
 from app import compute
-from app.compute_startup_script import build_agent_startup_script
+from app.compute_startup_script import (
+    build_agent_startup_script,
+    build_pool_agent_startup_script,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,10 +74,25 @@ def _render_compute_startup_script() -> str:
     )
 
 
+def _render_pool_startup_script() -> str:
+    """Render the TASKLESS warm-pool VM startup script."""
+    return build_pool_agent_startup_script(
+        vm_instance_id="agent-vm-pool-test",
+        secret_version_name="projects/test/secrets/agent/versions/1",
+        orchestrator_url="https://orch.test",
+        # Real embedded base64 so the rendered `base64 -d` produces valid Python.
+        materialize_manifest_b64=compute._MATERIALIZE_MANIFEST_B64,
+    )
+
+
 GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.startup_script",
         render=_render_compute_startup_script,
+    ),
+    ShellGenerator(
+        name="compute.pool_startup_script",
+        render=_render_pool_startup_script,
     ),
     # Future entries: append here. Each renderer returns rendered bash.
 ]

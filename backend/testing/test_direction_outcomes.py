@@ -364,6 +364,50 @@ async def test_pr_metrics_basic(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_pr_metrics_exclude_non_merge_unblocks(db_session: AsyncSession):
+    """Staging/no-op success paths should not inflate prs_merged analytics."""
+    direction_id = "d-prs-non-merge"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="landed",
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False},
+        title="staging-only-success",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 1
+    assert entry["conversion_rate"] == 0.5
+
+
+@pytest.mark.asyncio
 async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
     """conversion_rate is None when tasks_created is 0."""
     direction_id = "d-zerodiv"

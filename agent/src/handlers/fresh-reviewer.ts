@@ -1,6 +1,7 @@
 import fs from 'fs';
 import type WebSocket from 'ws';
 import { sendLog, runClaudeCode, git, apiPost } from '../index.js';
+import type { BuildConfig } from '../index.js';
 
 // ── Fresh-reviewer constants ──────────────────────────────────────────────────
 
@@ -51,18 +52,46 @@ export type SRCatchRateCategory = {
 };
 
 /**
+ * Unions the project's approval-gate infra_files + critical_files into a single
+ * sensitive-path set for reviewer-effort escalation. Mirrors the backend's
+ * `_get_approval_gate_file_lists` semantics: the union of the two lists is the
+ * sensitive set regardless of whether the missing half was inferred (if only
+ * one list is configured, the backend copies it into the other, so the union is
+ * identical to the single configured list). Returns [] when the config is
+ * absent or empty, signalling callers to fall back to the hardcoded
+ * Blueprint `SENSITIVE_PATHS` defaults.
+ */
+export function sensitivePathsFromMetadata(
+  projectMetadata: Record<string, unknown> | undefined,
+): string[] {
+  const agc = projectMetadata?.approval_gate_config as Record<string, unknown> | undefined;
+  if (!agc || typeof agc !== 'object') return [];
+  const asPaths = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((f): f is string => typeof f === 'string' && f.length > 0) : [];
+  const infra = asPaths(agc.infra_files);
+  const critical = asPaths(agc.critical_files);
+  return Array.from(new Set([...infra, ...critical]));
+}
+
+/**
  * Determines the fresh-reviewer effort level based on risk signals.
  * Returns 'medium' when (a) loneCheckerRecovery=true, (b) incompleteSrRecovery=true,
  * (c) diff exceeds threshold (>300 changed lines), or (d) any sensitive file is touched.
  * Otherwise returns 'low'.
+ *
+ * `sensitivePaths`, when non-empty, replaces the hardcoded Blueprint
+ * `SENSITIVE_PATHS` list — letting a non-Blueprint project declare its own
+ * security-sensitive paths (via approval_gate_config). When unset/empty the
+ * Blueprint defaults are used so self-repo behavior is unchanged.
  */
 export function pickFreshReviewerEffort(opts: {
   loneCheckerRecovery?: boolean;
   incompleteSrRecovery?: boolean;
   changedLineCount?: number;
   changedFiles?: string[];
+  sensitivePaths?: string[];
 }): 'low' | 'medium' {
-  const { loneCheckerRecovery, incompleteSrRecovery, changedLineCount = 0, changedFiles = [] } = opts;
+  const { loneCheckerRecovery, incompleteSrRecovery, changedLineCount = 0, changedFiles = [], sensitivePaths } = opts;
 
   // Escalate on recovery paths
   if (loneCheckerRecovery || incompleteSrRecovery) {
@@ -74,9 +103,11 @@ export function pickFreshReviewerEffort(opts: {
     return 'medium';
   }
 
-  // Escalate if any sensitive file is touched
+  // Escalate if any sensitive file is touched. Per-project sensitive paths
+  // (from approval_gate_config) take precedence; fall back to Blueprint defaults.
+  const effectivePaths = sensitivePaths && sensitivePaths.length > 0 ? sensitivePaths : SENSITIVE_PATHS;
   for (const file of changedFiles) {
-    for (const sensitivePrefix of SENSITIVE_PATHS) {
+    for (const sensitivePrefix of effectivePaths) {
       if (file.startsWith(sensitivePrefix)) {
         return 'medium';
       }
@@ -154,14 +185,63 @@ export function getThinningCategories(
 }
 
 /**
+ * Risk-surface category set for a directory's language `type`. Python-style
+ * code carries {security, regression_risk, correctness, error-handling};
+ * node/TypeScript adds type-safety. Used to derive per-project risk surfaces
+ * from build_config.directories.
+ */
+function riskSurfaceForType(type: string): Set<string> {
+  const base = ['security', 'regression_risk', 'correctness', 'error-handling'];
+  if (type === 'node') return new Set([...base, 'type-safety']);
+  return new Set(base);
+}
+
+/**
+ * Derives the risk-surface category set for a set of related files.
+ *
+ * When `buildConfig.directories` is present, matches each related file against
+ * the configured directory prefixes and returns the risk surface for the first
+ * matching directory's language type — so a non-Blueprint layout (e.g. `src/`,
+ * `web/`) maps correctly. When no build_config directories are available, falls
+ * back to today's literal `backend/`/`admin-ui/`/`agent/` mapping so self-repo
+ * behavior is byte-for-byte unchanged. Returns null when nothing matches (no
+ * filtering applied).
+ */
+function riskSurfaceForFiles(
+  relatedFiles: string[],
+  buildConfig?: BuildConfig,
+): Set<string> | null {
+  const dirs = buildConfig?.directories;
+  if (dirs && dirs.length > 0) {
+    for (const dir of dirs) {
+      const prefix = dir.path.endsWith('/') ? dir.path : `${dir.path}/`;
+      if (relatedFiles.some(f => f === dir.path || f.startsWith(prefix))) {
+        return riskSurfaceForType(dir.type);
+      }
+    }
+    return null;
+  }
+  // Fallback: hardcoded Blueprint layout map (self-repo unchanged).
+  return relatedFiles.some(f => f.startsWith('backend/'))
+    ? new Set(['security', 'regression_risk', 'correctness', 'error-handling'])
+    : relatedFiles.some(f => f.startsWith('admin-ui/'))
+    ? new Set(['security', 'correctness', 'type-safety', 'regression_risk'])
+    : relatedFiles.some(f => f.startsWith('agent/'))
+    ? new Set(['security', 'regression_risk', 'correctness', 'error-handling', 'type-safety'])
+    : null;
+}
+
+/**
  * Returns lone-checker categories from project_context that overlap with the
- * task's expected risk surface (derived from related_files path prefixes).
+ * task's expected risk surface (derived from related_files path prefixes, or
+ * from per-project build_config.directories when provided).
  * Used to auto-trigger a fresh-reviewer pass when SR is the sole corroborator
  * for a high-risk category.
  */
 export function loneCheckerCategoriesForTask(
   projectContext: Record<string, unknown> | undefined,
   relatedFiles: string[],
+  buildConfig?: BuildConfig,
 ): string[] {
   const srCatchRate = projectContext?.self_review_catch_rate as {
     categories?: Record<string, SRCatchRateCategory>;
@@ -172,13 +252,7 @@ export function loneCheckerCategoriesForTask(
     .filter(([, data]) => data.time_to_miss_detect_lone_checker === true)
     .map(([cat]) => cat);
   if (loneCheckers.length === 0) return [];
-  const riskSurface = relatedFiles.some(f => f.startsWith('backend/'))
-    ? new Set(['security', 'regression_risk', 'correctness', 'error-handling'])
-    : relatedFiles.some(f => f.startsWith('admin-ui/'))
-    ? new Set(['security', 'correctness', 'type-safety', 'regression_risk'])
-    : relatedFiles.some(f => f.startsWith('agent/'))
-    ? new Set(['security', 'regression_risk', 'correctness', 'error-handling', 'type-safety'])
-    : null;
+  const riskSurface = riskSurfaceForFiles(relatedFiles, buildConfig);
   return riskSurface ? loneCheckers.filter(cat => riskSurface.has(cat)) : loneCheckers;
 }
 
@@ -231,6 +305,7 @@ export async function runFreshReviewerPass(
   loneCheckerRecovery?: boolean,
   operatorRequestedRecovery?: boolean,
   originalTaskId?: string,
+  sensitivePaths?: string[],
 ): Promise<void> {
   let baseCommit = '';
   try { baseCommit = fs.readFileSync(`/tmp/base_commit_${taskId}`, 'utf-8').trim(); } catch { /* ok */ }
@@ -292,6 +367,7 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     incompleteSrRecovery,
     changedLineCount: changed,
     changedFiles: Array.from(changedFiles),
+    sensitivePaths,
   });
 
   const { exitCode, lastResultText } = await runClaudeCode(

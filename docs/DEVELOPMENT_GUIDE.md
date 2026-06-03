@@ -57,7 +57,7 @@ npm run dev
 ### 3. Creating a Feature Branch
 
 ```bash
-git checkout -b feature/my-feature main
+git checkout -b feature/my-feature automain
 # ... make changes ...
 git add <files>
 git commit -m "Describe the change"

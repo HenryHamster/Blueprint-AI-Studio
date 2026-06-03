@@ -11,6 +11,8 @@ from app.models import (
 )
 from app.digest_metrics import (
     _FAILURE_CLASS_LABELS,
+    _compute_first_review_approval_breakdowns,
+    compute_churn_direction,
     compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
@@ -221,6 +223,108 @@ def test_compute_narrative_summary_direction_taxonomy_hint():
 
 def test_compute_narrative_summary_empty_window_fallback():
     assert _build_narrative_summary() == "All quiet — no activity in the last 24h."
+
+
+def test_compute_narrative_summary_convergence_verdict_appears():
+    """When the outer-loop window has churn signal (>=2 trend buckets) and a
+    dominant blocker, the briefing states a falling/rising churn verdict and
+    names the quantified blocker."""
+    narrative = _build_narrative_summary(
+        outer_loop_convergence_summary={
+            "dominant_blocker": {
+                "cause": "cap_exhausted",
+                "count": 3,
+                "total": 4,
+                "share": 0.75,
+            }
+        },
+        outer_loop_convergence_trend={
+            "buckets": [
+                {"incidence_counts": {"churn": 5}, "churn_total": 5},
+                {"incidence_counts": {"churn": 2}, "churn_total": 2},
+            ]
+        },
+    )
+    assert narrative == (
+        "Review/fix churn is falling; the main blocker is cap exhausted "
+        "(3/4 non-converged PR chains)."
+    )
+
+
+def test_compute_narrative_summary_convergence_verdict_suppressed_thin_window():
+    """A thin window (single trend bucket) carries no convergence signal, so the
+    briefing emits no review/fix churn sentence."""
+    narrative = _build_narrative_summary(
+        outer_loop_convergence_summary={
+            "dominant_blocker": {
+                "cause": "cap_exhausted",
+                "count": 3,
+                "total": 4,
+                "share": 0.75,
+            }
+        },
+        outer_loop_convergence_trend={
+            "buckets": [{"incidence_counts": {"churn": 5}, "churn_total": 5}]
+        },
+    )
+    assert "churn" not in narrative.lower()
+    assert narrative == "All quiet — no activity in the last 24h."
+
+
+def test_compute_churn_direction_two_half_average():
+    """Direction is decided by first-half vs second-half AVERAGE, not endpoints —
+    a misleading endpoint spike does not flip an overall-falling window."""
+    # Falling overall despite an 8-churn final spike (avg first half ≈ 8,
+    # second half ≈ 4.67) — endpoints alone (10 vs 8) would read flat/falling.
+    falling = [
+        {"incidence_counts": {"churn": c}, "churn_total": c}
+        for c in (10, 8, 6, 4, 2, 8)
+    ]
+    assert compute_churn_direction(falling) == "falling"
+    # Rising overall despite a low final bucket (avg first half ≈ 5,
+    # second half ≈ 7.3) — endpoints alone (2 vs 3) would read flat.
+    rising = [
+        {"incidence_counts": {"churn": c}, "churn_total": c}
+        for c in (2, 8, 9, 10, 3)
+    ]
+    assert compute_churn_direction(rising) == "rising"
+    # Genuinely stable churn reads flat.
+    flat = [{"incidence_counts": {"churn": 5}, "churn_total": 5} for _ in range(3)]
+    assert compute_churn_direction(flat) == "flat"
+    # Fewer than two buckets carries no direction.
+    assert compute_churn_direction([{"churn_total": 5}]) == "flat"
+    # Falls back to churn_total when incidence_counts.churn is absent.
+    assert (
+        compute_churn_direction([{"churn_total": 9}, {"churn_total": 1}]) == "falling"
+    )
+
+
+def test_compute_narrative_summary_consumes_explicit_churn_direction():
+    """When the trend carries a backend-stamped churn_direction, the narrative
+    verdict uses it verbatim rather than re-deriving — so it can never disagree
+    with the widget glyph that reads the same field."""
+    narrative = _build_narrative_summary(
+        outer_loop_convergence_summary={
+            "dominant_blocker": {
+                "cause": "cap_exhausted",
+                "count": 3,
+                "total": 4,
+                "share": 0.75,
+            }
+        },
+        outer_loop_convergence_trend={
+            "churn_direction": "rising",
+            # Raw endpoints (5 -> 2) would read falling; the stamped direction wins.
+            "buckets": [
+                {"incidence_counts": {"churn": 5}, "churn_total": 5},
+                {"incidence_counts": {"churn": 2}, "churn_total": 2},
+            ],
+        },
+    )
+    assert narrative == (
+        "Review/fix churn is rising; the main blocker is cap exhausted "
+        "(3/4 non-converged PR chains)."
+    )
 
 
 def _make_failed_task(**kwargs):
@@ -757,6 +861,61 @@ def test_compute_digest_cost_economics_cost_per_merge_by_type():
     assert by_type["create"]["merged_count"] == 1
     assert by_type["create"]["cost_per_merge"] is not None
     assert by_type["create"]["total_cost_usd"] > 0.0
+
+
+def test_compute_digest_cost_economics_excludes_non_merge_unblocks():
+    """Cost-per-merge denominators ignore merge-equivalent non-landings."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    landed = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    staging_only = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1, minutes=30),
+        context={"pr_merged": True, "landed_on_integration": False},
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[landed, staging_only],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    by_type = result["cost_per_merge_by_type"]
+    assert by_type["create"]["merged_count"] == 1
+
+
+def test_first_review_approval_breakdowns_exclude_non_merge_unblocks():
+    """Review-eligible merge analytics require an integration-landing signal."""
+    now = _utcnow()
+    result = _compute_first_review_approval_breakdowns(
+        [
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={"pr_merged": True, "landed_on_integration": True},
+                created_at=now - timedelta(hours=1),
+            ),
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={"pr_merged": True, "landed_on_integration": False},
+                created_at=now - timedelta(hours=1),
+            ),
+        ]
+    )
+
+    assert result["overall"] == 1.0
+    assert result["sample_size"] == 1
 
 
 def test_compute_digest_cost_economics_pipeline_aggregates():

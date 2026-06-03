@@ -18,9 +18,11 @@ from sqlmodel import select
 from app.main import app
 from app.models import (
     AllowedUser,
+    Artifact,
     ArtifactType,
     Project,
     ProjectMember,
+    ProjectStatus,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -661,6 +663,47 @@ class TestUpdateProject:
         assert resp.json()["name"] == "Renamed"
 
     @pytest.mark.asyncio
+    async def test_update_approval_gate_config_round_trip(
+        self, client: AsyncClient, db_session
+    ):
+        """Owner can set approval_gate_config and read it back via GET."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "approval_gate_config": {
+                    "infra_files": ["src/main.py", "src/db.py"],
+                    "critical_files": ["src/auth.py"],
+                }
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["approval_gate_config"] == {
+            "infra_files": ["src/main.py", "src/db.py"],
+            "critical_files": ["src/auth.py"],
+        }
+
+        get_resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["approval_gate_config"]["critical_files"] == [
+            "src/auth.py"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_update_approval_gate_config_rejects_bad_path(
+        self, client: AsyncClient, db_session
+    ):
+        """An absolute or traversal path is rejected with 422."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"approval_gate_config": {"infra_files": ["../etc/passwd"]}},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
     async def test_update_autonomous_enabled(self, client: AsyncClient, db_session):
         """Can toggle autonomous_enabled on a project."""
         project = await _make_project(db_session)
@@ -939,6 +982,18 @@ class TestUpdateProjectOwnerOnlyFields:
         assert resp.status_code == 403
 
     @pytest.mark.asyncio
+    async def test_member_cannot_update_approval_gate_config(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change approval_gate_config."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"approval_gate_config": {"infra_files": ["src/main.py"]}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
     async def test_member_can_update_name(self, client: AsyncClient, db_session):
         """Member may still update non-privileged fields like name."""
         project = await self._make_member_project(db_session)
@@ -1069,6 +1124,132 @@ class TestUpdateProjectOwnerOnlyFields:
         assert (project.build_config or {}).get("task_branch_namespace") == "agents"
         assert (project.build_config or {}).get("task_branch_prefix") == "bot/"
         assert (project.build_config or {}).get("pr_title_prefix") == "[bot] "
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_refreshes_repo_is_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-detect overwrites a stale repo_is_empty once the repo is scaffolded.
+
+        A project onboarded empty (repo_is_empty True) should flip to False on
+        re-detect when detection now finds source — repo_is_empty is NOT in the
+        operator-preserve set, so a fresh detection value wins.
+        """
+        project = await _make_project(db_session, name="Detect Repo Emptiness")
+        project.github_owner = "acme"
+        project.github_repo = "scaffolded-repo"
+        project.build_config = {"repo_is_empty": True}
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python", "repo_is_empty": False},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/detect-build-config"
+            )
+
+        assert resp.status_code == 200
+        build_config = resp.json().get("build_config") or {}
+        assert build_config.get("repo_is_empty") is False
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("repo_is_empty") is False
+
+
+class TestApplyOperatorBuildConfigOverrides:
+    """Unit coverage for the shared override-preservation helper."""
+
+    def test_preserves_all_operator_fields(self):
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"language": "typescript", "directories": []}
+        existing = {
+            "git_user_email": "bot@example.com",
+            "git_user_name": "Bot",
+            "env_vars": {"TOKEN": "secret"},
+            "enable_fresh_reviewer": True,
+            "enable_parallel_review": True,
+            "enable_parallel_fix": False,
+            "task_branch_namespace": "agents",
+            "task_branch_prefix": "bot/",
+            "pr_title_prefix": "[bot] ",
+            "staging_branch_prefixes": ["staging/"],
+            "stale_branch_prefixes": ["old/"],
+            "protected_branches": ["main"],
+            "enable_self_improvement": True,
+        }
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        # Detected fields untouched.
+        assert merged["language"] == "typescript"
+        # Every operator-owned field carried forward.
+        assert merged["git_user_email"] == "bot@example.com"
+        assert merged["git_user_name"] == "Bot"
+        assert merged["env_vars"] == {"TOKEN": "secret"}
+        assert merged["enable_fresh_reviewer"] is True
+        assert merged["enable_parallel_review"] is True
+        assert merged["enable_parallel_fix"] is False
+        assert merged["task_branch_namespace"] == "agents"
+        assert merged["task_branch_prefix"] == "bot/"
+        assert merged["pr_title_prefix"] == "[bot] "
+        assert merged["staging_branch_prefixes"] == ["staging/"]
+        assert merged["stale_branch_prefixes"] == ["old/"]
+        assert merged["protected_branches"] == ["main"]
+        assert merged["enable_self_improvement"] is True
+
+    def test_preserves_empty_list_branch_overrides(self):
+        """Empty-list branch overrides are present-keyed, so they survive."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"protected_branches": ["main"], "stale_branch_prefixes": ["x/"]}
+        existing = {
+            "staging_branch_prefixes": [],
+            "stale_branch_prefixes": [],
+            "protected_branches": [],
+        }
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        assert merged["staging_branch_prefixes"] == []
+        assert merged["stale_branch_prefixes"] == []
+        assert merged["protected_branches"] == []
+
+    def test_falsey_git_identity_not_preserved(self):
+        """git_user_* use a truthy check, so empty values do not override."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"language": "go"}
+        existing = {"git_user_email": "", "git_user_name": ""}
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        assert "git_user_email" not in merged
+        assert "git_user_name" not in merged
+
+    def test_empty_existing_is_noop(self):
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        detected = {"language": "rust", "directories": []}
+        merged = apply_operator_build_config_overrides(detected, {})
+        assert merged == {"language": "rust", "directories": []}
 
 
 class TestBuildConfigLintWarnings:
@@ -1287,6 +1468,398 @@ class TestDeleteProject:
         assert resp.status_code == 403
 
 
+class TestResetProject:
+    @pytest.mark.asyncio
+    async def test_reset_project_cancels_active_tasks_and_preserves_config(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Reset cancels/wipes active tasks, tears down VMs, keeps durable config."""
+        ensure_vm = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+        )
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="wedged")
+        project.directions = [{"text": "ship the thing"}]
+        project.vision = {"summary": "the grand vision"}
+        project.build_config = {"directories": [{"path": "./svc", "type": "node"}]}
+        flag_modified(project, "directions")
+        flag_modified(project, "vision")
+        flag_modified(project, "build_config")
+        await db_session.commit()
+        project_id = project.id
+
+        task = Task(
+            project_id=project_id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{project_id}/reset")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["active_tasks_cancelled"] == 1
+        assert body["tasks_deleted"] == 1
+        # VM teardown reused the shared machinery.
+        assert ensure_vm.await_count == 1
+
+        # All task rows for the project are gone.
+        remaining = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert remaining == []
+
+        # Durable config survives and the project is runnable again.
+        refreshed = (
+            await db_session.execute(select(Project).where(Project.id == project_id))
+        ).scalar_one()
+        await db_session.refresh(refreshed)
+        assert refreshed.directions == [{"text": "ship the thing"}]
+        assert refreshed.vision == {"summary": "the grand vision"}
+        assert refreshed.build_config == {
+            "directories": [{"path": "./svc", "type": "node"}]
+        }
+        assert refreshed.status == ProjectStatus.DEPLOYING
+
+    @pytest.mark.asyncio
+    async def test_reset_project_runnable_end_state(
+        self, client: AsyncClient, db_session
+    ):
+        """After reset the project ends in a non-terminal, runnable status."""
+        project = await _make_project(db_session, name="endstate")
+        project.status = ProjectStatus.CANCELLED
+        await db_session.commit()
+        project_id = project.id
+
+        resp = await client.post(f"/api/admin/projects/{project_id}/reset")
+        assert resp.status_code == 200
+
+        refreshed = (
+            await db_session.execute(select(Project).where(Project.id == project_id))
+        ).scalar_one()
+        await db_session.refresh(refreshed)
+        assert refreshed.status == ProjectStatus.DEPLOYING
+        assert refreshed.status not in (
+            ProjectStatus.CANCELLED,
+            ProjectStatus.FAILED,
+            ProjectStatus.COMPLETED,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reset_project_non_owner_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """Member-role (below owner) cannot reset a project."""
+        other = Project(name="Protected", user_id="other-99")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{other.id}/reset")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_reset_project_clears_in_memory_state(
+        self, client: AsyncClient, db_session
+    ):
+        """Reset pops the project's transient circuit-breaker / anomaly state."""
+        from app import anomaly_state
+
+        project = await _make_project(db_session, name="stateful")
+        pid = str(project.id)
+        other_pid = "keep-me"
+        anomaly_state.circuit_breakers[pid] = {"state": "OPEN"}
+        anomaly_state.circuit_breakers[other_pid] = {"state": "CLOSED"}
+        anomaly_state.autonomous_failure_counts[pid] = 7
+        anomaly_state.persistent_anomalies[pid] = {"CODE_ERROR": {}}
+        try:
+            resp = await client.post(f"/api/admin/projects/{project.id}/reset")
+            assert resp.status_code == 200
+            assert pid not in anomaly_state.circuit_breakers
+            assert pid not in anomaly_state.autonomous_failure_counts
+            assert pid not in anomaly_state.persistent_anomalies
+            # Other projects' state is untouched.
+            assert other_pid in anomaly_state.circuit_breakers
+        finally:
+            anomaly_state.circuit_breakers.pop(pid, None)
+            anomaly_state.circuit_breakers.pop(other_pid, None)
+            anomaly_state.autonomous_failure_counts.pop(pid, None)
+            anomaly_state.persistent_anomalies.pop(pid, None)
+
+
+class TestArchiveProject:
+    @pytest.mark.asyncio
+    async def test_archive_hides_project_from_default_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Archiving a project removes it from the default (active) list."""
+        project = await _make_project(db_session, name="to-archive")
+
+        # Present before archiving.
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        ids = {p["id"] for p in resp.json()["items"]}
+        assert str(project.id) in ids
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/archive")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "message": f"Project {project.id} archived",
+            "archived": True,
+        }
+
+        # Gone from the default list.
+        resp = await client.get("/api/admin/projects")
+        ids = {p["id"] for p in resp.json()["items"]}
+        assert str(project.id) not in ids
+
+    @pytest.mark.asyncio
+    async def test_archived_param_returns_only_archived_with_flag(
+        self, client: AsyncClient, db_session
+    ):
+        """archived=true returns the archived set; items carry the archived flag."""
+        active = await _make_project(db_session, name="active")
+        archived = await _make_project(db_session, name="archived")
+        resp = await client.post(f"/api/admin/projects/{archived.id}/archive")
+        assert resp.status_code == 200
+
+        resp = await client.get("/api/admin/projects?archived=true")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        ids = {p["id"] for p in items}
+        assert str(archived.id) in ids
+        assert str(active.id) not in ids
+        target = next(p for p in items if p["id"] == str(archived.id))
+        assert target["archived"] is True
+
+    @pytest.mark.asyncio
+    async def test_default_list_items_include_archived_false(
+        self, client: AsyncClient, db_session
+    ):
+        """Active list items expose archived=False (backward-compatible add)."""
+        project = await _make_project(db_session, name="plain")
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        target = next(
+            p for p in resp.json()["items"] if p["id"] == str(project.id)
+        )
+        assert target["archived"] is False
+
+    @pytest.mark.asyncio
+    async def test_unarchive_restores_to_default_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Unarchiving returns a project to the default list and clears the flag."""
+        project = await _make_project(db_session, name="round-trip")
+        await client.post(f"/api/admin/projects/{project.id}/archive")
+
+        resp = await client.post(f"/api/admin/projects/{project.id}/unarchive")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "message": f"Project {project.id} unarchived",
+            "archived": False,
+        }
+
+        resp = await client.get("/api/admin/projects")
+        ids = {p["id"] for p in resp.json()["items"]}
+        assert str(project.id) in ids
+
+    @pytest.mark.asyncio
+    async def test_archive_is_idempotent(self, client: AsyncClient, db_session):
+        """Archiving an already-archived project is a no-op success."""
+        project = await _make_project(db_session, name="idem")
+        r1 = await client.post(f"/api/admin/projects/{project.id}/archive")
+        r2 = await client.post(f"/api/admin/projects/{project.id}/archive")
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        assert r2.json()["archived"] is True
+
+    @pytest.mark.asyncio
+    async def test_archive_non_owner_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """Member-role (below owner) cannot archive a project."""
+        other = Project(name="Protected", user_id="other-99")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{other.id}/archive")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_unarchive_non_owner_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """Member-role (below owner) cannot unarchive a project."""
+        other = Project(name="Protected", user_id="other-99", archived=True)
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/projects/{other.id}/unarchive")
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_archived_project_excluded_from_orchestrator_dispatch(
+        self, client: AsyncClient, db_session
+    ):
+        """An archived project's QUEUED tasks are filtered out of the
+        orchestrator candidate scan (work halts); unarchiving restores them.
+
+        The candidate filter references ``Project.not_archived()`` — the SAME
+        predicate the production orchestrator candidate-task query uses
+        (orchestrator.py) — so it cannot pass if that production predicate
+        drifts.
+        """
+        project = await _make_project(db_session, name="halt-dispatch")
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "research"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        candidate_filter = Task.project_id.in_(
+            select(Project.id).where(Project.not_archived())
+        )
+
+        # Eligible while active.
+        rows = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.QUEUED, candidate_filter
+                )
+            )
+        ).scalars().all()
+        assert task.id in {t.id for t in rows}
+
+        # Archiving removes the task from the candidate pool.
+        await client.post(f"/api/admin/projects/{project.id}/archive")
+        rows = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.QUEUED, candidate_filter
+                )
+            )
+        ).scalars().all()
+        assert task.id not in {t.id for t in rows}
+
+        # Unarchiving restores eligibility.
+        await client.post(f"/api/admin/projects/{project.id}/unarchive")
+        rows = (
+            await db_session.execute(
+                select(Task).where(
+                    Task.status == TaskStatus.QUEUED, candidate_filter
+                )
+            )
+        ).scalars().all()
+        assert task.id in {t.id for t in rows}
+
+    @pytest.mark.asyncio
+    async def test_archived_project_excluded_from_autonomous_spawning(
+        self, client: AsyncClient, db_session
+    ):
+        """An archived project spawns no autonomous research (work halts)."""
+        from app.autonomous_research import _spawn_research_task
+
+        project = await _make_project(db_session, name="halt-autonomous")
+        project.autonomous_enabled = True
+        project.archived = True
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        result = await _spawn_research_task(project, db_session)
+        assert result is None
+
+        # No task was created for the archived project.
+        count = len(
+            (
+                await db_session.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_autonomous_idle_select_excludes_archived(
+        self, client: AsyncClient, db_session
+    ):
+        """The idle-research project select skips archived projects."""
+        active = await _make_project(db_session, name="idle-active")
+        active.autonomous_enabled = True
+        archived = await _make_project(db_session, name="idle-archived")
+        archived.autonomous_enabled = True
+        archived.archived = True
+        await db_session.commit()
+
+        # Uses Project.not_archived() — the SAME predicate _check_idle_research
+        # selects on in autonomous_research.py — so this cannot pass if the
+        # production exclusion drifts.
+        rows = (
+            await db_session.execute(
+                select(Project).where(
+                    Project.autonomous_enabled.is_(True),
+                    Project.not_archived(),
+                )
+            )
+        ).scalars().all()
+        ids = {p.id for p in rows}
+        assert active.id in ids
+        assert archived.id not in ids
+
+
+class TestResetProjectStateHelper:
+    def test_reset_project_state_clears_only_target(self):
+        """reset_project_state pops one project's keys, leaves others intact."""
+        from app import anomaly_state
+
+        target = "proj-target"
+        other = "proj-other"
+        anomaly_state.circuit_breakers[target] = {"state": "OPEN"}
+        anomaly_state.circuit_breakers[other] = {"state": "CLOSED"}
+        anomaly_state.autonomous_failure_counts[target] = 3
+        anomaly_state.persistent_anomalies[target] = {"X": {}}
+        try:
+            anomaly_state.reset_project_state(target)
+            assert target not in anomaly_state.circuit_breakers
+            assert target not in anomaly_state.autonomous_failure_counts
+            assert target not in anomaly_state.persistent_anomalies
+            assert other in anomaly_state.circuit_breakers
+            # Idempotent — second call is a no-op.
+            anomaly_state.reset_project_state(target)
+        finally:
+            anomaly_state.circuit_breakers.pop(target, None)
+            anomaly_state.circuit_breakers.pop(other, None)
+            anomaly_state.autonomous_failure_counts.pop(target, None)
+            anomaly_state.persistent_anomalies.pop(target, None)
+
+
 class TestAutonomousMode:
     @pytest.mark.asyncio
     async def test_pause_all_autonomous(self, client: AsyncClient, db_session):
@@ -1336,6 +1909,105 @@ class TestAutonomousMode:
             json={"wrong_field": True},
         )
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_pause_project(self, client: AsyncClient, db_session):
+        """Owner can pause a project; pause is independent of autonomous_enabled."""
+        project = await _make_project(db_session)
+        project.autonomous_enabled = True
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": True},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["paused"] is True
+
+        await db_session.refresh(project)
+        assert project.paused is True
+        # Pause must not touch the autonomous toggle.
+        assert project.autonomous_enabled is True
+
+    @pytest.mark.asyncio
+    async def test_resume_project(self, client: AsyncClient, db_session):
+        """Owner can resume (unpause) a paused project."""
+        project = await _make_project(db_session)
+        project.paused = True
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": False},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["paused"] is False
+
+        await db_session.refresh(project)
+        assert project.paused is False
+
+    @pytest.mark.asyncio
+    async def test_pause_project_missing_field_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """Missing 'paused' key returns 400."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"wrong_field": True},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_pause_project_requires_owner(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-owner member cannot pause a project (owner-only mutation)."""
+        owner_project = Project(name="Owner Pause Project", user_id="other-owner")
+        db_session.add(owner_project)
+        await db_session.commit()
+        await db_session.refresh(owner_project)
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id="other-owner", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{owner_project.id}/pause",
+            json={"paused": True},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_paused_field_in_list_and_detail(
+        self, client: AsyncClient, db_session
+    ):
+        """The additive `paused` field appears in both list and detail responses."""
+        project = await _make_project(db_session, name="Paused Field Project")
+        project.paused = True
+        db_session.add(project)
+        await db_session.commit()
+
+        list_resp = await client.get("/api/admin/projects")
+        assert list_resp.status_code == 200
+        target = next(
+            p for p in list_resp.json()["items"] if p["id"] == str(project.id)
+        )
+        assert target["paused"] is True
+
+        detail_resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert detail_resp.status_code == 200
+        assert detail_resp.json()["paused"] is True
 
     @pytest.mark.asyncio
     async def test_get_autonomous_status(self, client: AsyncClient, db_session):
@@ -2705,6 +3377,201 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_warm_pool_project_allowlist_round_trip(
+        self, client: AsyncClient
+    ):
+        """warm_pool_project_allowlist accepts a list, normalizes a CSV string,
+        rejects bad shapes, and round-trips (sorted, de-duped) on GET.
+
+        Also exercises the maintainer contract: a scoped project is held at
+        target while an unscoped demand-active project is forced to drain-only,
+        and an empty allowlist restores fleet-wide behavior.
+        """
+        from app.shared_state import runtime_config as _rc
+        from app.warm_pool import (
+            is_project_warm_pool_scoped,
+            warm_pool_project_scope,
+        )
+
+        original = _rc.get("warm_pool_project_allowlist")
+        try:
+            # List input round-trips sorted + de-duped.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"warm_pool_project_allowlist": ["proj-b", "proj-a", "proj-a"]},
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_project_allowlist"] == ["proj-a", "proj-b"]
+            # The maintainer's scope helper agrees: scoped projects pass, an
+            # unscoped demand-active project does not.
+            assert is_project_warm_pool_scoped("proj-a") is True
+            assert is_project_warm_pool_scoped("proj-unscoped") is False
+
+            # CSV string is normalized into a clean list.
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"warm_pool_project_allowlist": "proj-c, proj-d ,"},
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_project_allowlist"] == ["proj-c", "proj-d"]
+
+            # Empty list restores fleet-wide (legacy) mode: every project scoped.
+            resp = await client.patch(
+                "/api/admin/settings", json={"warm_pool_project_allowlist": []}
+            )
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_project_allowlist"] == []
+            assert warm_pool_project_scope() == set()
+            assert is_project_warm_pool_scoped("any-project") is True
+
+            # Bad shapes rejected (must not silently corrupt the allowlist).
+            bad = await client.patch(
+                "/api/admin/settings", json={"warm_pool_project_allowlist": 123}
+            )
+            assert bad.status_code == 400
+            bad2 = await client.patch(
+                "/api/admin/settings",
+                json={"warm_pool_project_allowlist": [{"id": "x"}]},
+            )
+            assert bad2.status_code == 400
+        finally:
+            if original is not None:
+                _rc["warm_pool_project_allowlist"] = original
+            else:
+                _rc.pop("warm_pool_project_allowlist", None)
+
+    @pytest.mark.asyncio
+    async def test_patch_warm_reuse_tuning_knobs_round_trip(self, client: AsyncClient):
+        """The warm-reuse tuning knobs are PATCHable and visible on GET."""
+        from app.shared_state import runtime_config as _rc
+
+        keys = (
+            "warm_pin_clear_rate_threshold",
+            "warm_continuity_cooldown_seconds",
+            "warm_backlog_reuse_failure_rate_threshold",
+            "warm_backlog_reuse_cooldown_seconds",
+            "warm_backlog_scan_limit",
+            "warm_backlog_teardown_defer_secs",
+        )
+        original = {key: _rc.get(key) for key in keys}
+        payload = {
+            "warm_pin_clear_rate_threshold": 12,
+            "warm_continuity_cooldown_seconds": 2400,
+            "warm_backlog_reuse_failure_rate_threshold": 7,
+            "warm_backlog_reuse_cooldown_seconds": 2400,
+            "warm_backlog_scan_limit": 17,
+            "warm_backlog_teardown_defer_secs": 30,
+        }
+        try:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            for key, expected in payload.items():
+                assert body[key] == expected
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={key: value for key, value in original.items() if value is not None},
+            )
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("warm_pin_clear_rate_threshold", 0),
+            ("warm_pin_clear_rate_threshold", 101),
+            ("warm_continuity_cooldown_seconds", 59),
+            ("warm_continuity_cooldown_seconds", 86401),
+            ("warm_backlog_reuse_failure_rate_threshold", 0),
+            ("warm_backlog_reuse_failure_rate_threshold", 101),
+            ("warm_backlog_reuse_cooldown_seconds", 59),
+            ("warm_backlog_reuse_cooldown_seconds", 86401),
+            ("warm_backlog_scan_limit", 0),
+            ("warm_backlog_scan_limit", 101),
+            ("warm_backlog_teardown_defer_secs", 4),
+            ("warm_backlog_teardown_defer_secs", 121),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_patch_warm_reuse_tuning_knobs_reject_out_of_bounds(
+        self, client: AsyncClient, field: str, bad_value: int
+    ):
+        """Out-of-range warm-reuse tuning values are rejected."""
+        resp = await client.patch("/api/admin/settings", json={field: bad_value})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_patch_warm_pool_config_round_trip(self, client: AsyncClient):
+        """warm_pool_enabled / target_size / idle_ttl_secs PATCH, round-trip on
+        GET, and are independent of the other warm flags."""
+        from app.shared_state import runtime_config as _rc
+
+        keys = (
+            "warm_pool_enabled",
+            "warm_pool_target_size",
+            "warm_pool_idle_ttl_secs",
+            "warm_pool_idle_ttl_seconds",
+        )
+        original = {key: _rc.get(key) for key in keys}
+        payload = {
+            "warm_pool_enabled": True,
+            "warm_pool_target_size": 7,
+            "warm_pool_idle_ttl_secs": 1200,
+        }
+        try:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 200
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["warm_pool_enabled"] is True
+            assert body["warm_pool_target_size"] == 7
+            assert body["warm_pool_idle_ttl_secs"] == 1200
+            # TTL dual-key sync: the idle-reaper in warm_pool_maintainer.py reads
+            # the ``_seconds`` variant, so a PATCH to ``_secs`` MUST also write
+            # ``_seconds`` or operator TTL changes never reach the maintainer
+            # (regressed once — fix commit 560fd11). Assert the runtime_config
+            # value directly, not via GET (GET surfaces only the ``_secs`` key).
+            assert _rc.get("warm_pool_idle_ttl_seconds") == 1200
+            assert _rc.get("warm_pool_idle_ttl_secs") == 1200
+            # Independently switchable: flipping the pool flag must not touch the
+            # chain-continuity flag.
+            assert "warm_continuity_enabled" in body
+
+            # Boolean type-guard on the master switch.
+            bad = await client.patch(
+                "/api/admin/settings", json={"warm_pool_enabled": "true"}
+            )
+            assert bad.status_code == 400
+            bad2 = await client.patch(
+                "/api/admin/settings", json={"warm_pool_enabled": 1}
+            )
+            assert bad2.status_code == 400
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={k: v for k, v in original.items() if v is not None},
+            )
+
+    @pytest.mark.parametrize(
+        "field,bad_value",
+        [
+            ("warm_pool_target_size", -1),
+            ("warm_pool_target_size", 51),
+            ("warm_pool_idle_ttl_secs", 59),
+            ("warm_pool_idle_ttl_secs", 86401),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_patch_warm_pool_config_reject_out_of_bounds(
+        self, client: AsyncClient, field: str, bad_value: int
+    ):
+        """Out-of-range warm-pool sizing values are rejected (target 0..50,
+        idle TTL 60..86400)."""
+        resp = await client.patch("/api/admin/settings", json={field: bad_value})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
         """The automain/LTS release-control flags — promotion_enabled,
         smoketest_enabled — are settable via PATCH and visible on GET
@@ -3620,6 +4487,133 @@ class TestPatchProblemModel:
         assert len(pm["capabilities"]) == 1
         assert pm["revision"] == 4  # bumped
         assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_problem_model_stale_revision_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Supplying an outdated problem_model_base_revision returns 409."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Existing.", "current_focus": ""},
+            "revision": 4,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "Clobber."}},
+                "problem_model_base_revision": 1,
+            },
+        )
+        assert resp.status_code == 409
+        msg = resp.json()["error"]["message"]
+        assert "base_revision=1" in msg
+        assert "current=4" in msg
+
+    @pytest.mark.asyncio
+    async def test_problem_model_current_revision_succeeds_and_bumps(
+        self, client: AsyncClient, db_session
+    ):
+        """Matching base_revision saves the patch and bumps the revision."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Old.", "current_focus": ""},
+            "revision": 2,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "New."}},
+                "problem_model_base_revision": 2,
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "New."
+        assert pm["revision"] == 3
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_problem_model_no_base_revision_always_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting problem_model_base_revision skips the CAS check (back-compat)."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Old.", "current_focus": ""},
+            "revision": 7,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"problem_model_patch": {"intent": {"purpose": "Unconditional."}}},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Unconditional."
+        assert pm["revision"] == 8
+
+    @pytest.mark.asyncio
+    async def test_concurrent_problem_model_write_no_data_loss(
+        self, client: AsyncClient, db_session
+    ):
+        """A second writer with a stale base_revision is rejected; the first
+        writer's edit survives intact."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "intent": {"purpose": "Base.", "current_focus": ""},
+            "revision": 1,
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        # First writer succeeds with the correct base revision.
+        resp_a = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "Writer A."}},
+                "problem_model_base_revision": 1,
+            },
+        )
+        assert resp_a.status_code == 200
+
+        # Second writer with the now-stale base revision must be rejected.
+        resp_b = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "problem_model_patch": {"intent": {"purpose": "Writer B clobber."}},
+                "problem_model_base_revision": 1,
+            },
+        )
+        assert resp_b.status_code == 409
+
+        # Writer A's edit must be intact — not overwritten.
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["intent"]["purpose"] == "Writer A."
+        assert pm["revision"] == 2
 
 
 class TestAcknowledgeRunningUpdate:
@@ -5530,6 +6524,147 @@ class TestModifyTaskApplySeam:
         assert result["status"] == task.status
         assert "requires_approval" in result
 
+    @pytest.mark.asyncio
+    async def test_rollup_pr_approval_skips_pr_merged_on_promotion_target(
+        self, db_session, mocker
+    ):
+        """Human-approved rollup merges to promotion_target stay unqualified."""
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Rollup approval task",
+            payloads=[{"type": "research", "prompt": "rollup", "base_branch": "release/main"}],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 321},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+        changes: dict = {}
+        await _handle_rollup_pr_approval(task, task.context or {}, 321, db_session, changes)
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is None
+        assert changes["merged_pr"] == 321
+
+    @pytest.mark.asyncio
+    async def test_merge_context_records_landed_signal_on_integration_merge(
+        self, db_session
+    ):
+        from app.admin_task_mutations import _merge_context_with_hotfix_non_landing
+
+        project = await _make_project(db_session)
+        project.integration_branch = "main"
+        project.promotion_target = "main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Integration merge task",
+            payloads=[{"type": "research", "prompt": "merge", "base_branch": "main"}],
+            status=TaskStatus.EVALUATING,
+            context={},
+        )
+
+        merged_context = _merge_context_with_hotfix_non_landing(
+            task,
+            project,
+            base_context={"rollup_pr_number": 123},
+            landed_branch="main",
+            record_pr_merged=True,
+        )
+
+        assert merged_context.get("pr_merged") is True
+        assert merged_context.get("landed_on_integration") is True
+        assert merged_context.get("_non_merge_unblock_reason") is None
+
+    @pytest.mark.asyncio
+    async def test_rollup_pr_approval_keeps_custom_staged_root_evaluating(
+        self, db_session, mocker
+    ):
+        """Human-approved custom staged rollup roots must await downstream landing."""
+        from app.admin_task_mutations import _handle_rollup_pr_approval
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Release rollup approval task",
+            payloads=[
+                {
+                    "type": "research",
+                    "prompt": "rollup",
+                    "base_branch": "release/candidate-1",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            context={"rollup_pr_number": 654},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+        changes: dict = {}
+        await _handle_rollup_pr_approval(task, task.context or {}, 654, db_session, changes)
+        await db_session.refresh(task)
+
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("pr_merged") is None
+        assert "awaiting downstream landing" in (task.latest_status_message or "")
+        assert changes["merged_pr"] == 654
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_operator_triggers.py — Manual Operator Triggers
@@ -5571,6 +6706,271 @@ class TestClearWaveDeps:
         assert resp.status_code == 200
         assert resp.json()["cleared"] == 0
         assert resp.json()["total_queued"] == 0
+
+
+class TestBulkApprove:
+    @pytest.mark.asyncio
+    async def test_bulk_approve_critical_merge_to_promotion_target_returns_error(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Critical approval task",
+            payloads=[{"type": "create", "prompt": "danger", "base_branch": "release/main"}],
+            status=TaskStatus.COMPLETED,
+            requires_approval=True,
+            context={"touched_critical": True},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/123",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        merge_pr = mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "approve", "task_ids": [str(task.id)]},
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success_count"] == 0
+        assert body["error_count"] == 1
+        assert body["results"][0]["status"] == "error"
+        assert "promotion target" in body["results"][0]["error"]
+        await db_session.refresh(task)
+        assert task.requires_approval is True
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is None
+        merge_pr.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bulk_approve_rollup_keeps_custom_staged_root_evaluating(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Custom staged approval task",
+            payloads=[
+                {
+                    "type": "research",
+                    "prompt": "danger",
+                    "base_branch": "release/candidate-1",
+                }
+            ],
+            status=TaskStatus.EVALUATING,
+            requires_approval=True,
+            context={"rollup_pr_number": 456, "touched_critical": True},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+        mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+        resp = await client.post(
+            "/api/admin/tasks/bulk-action",
+            json={"action": "approve", "task_ids": [str(task.id)]},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(task)
+        assert task.requires_approval is False
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("pr_merged") is None
+        assert "awaiting downstream landing" in (task.latest_status_message or "")
+
+
+class TestTriggerRollup:
+    @pytest.mark.asyncio
+    async def test_intermediate_rollup_auto_merge_keeps_custom_staged_root_evaluating(
+        self, db_session, mocker
+    ):
+        from app.routers.admin_operator_triggers import trigger_rollup
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        project.build_config = {"staging_branch_prefixes": ["release/"]}
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "release/candidate-1",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={
+                "html_url": "https://github.com/owner/repo/pull/654",
+                "number": 654,
+            },
+        )
+        mocker.patch(
+            "app.github.merge_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merged": True},
+        )
+        delete_branch_mock = mocker.patch(
+            "app.github.delete_branch", new_callable=AsyncMock
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        assert result["rollup_pr_number"] == 654
+        assert task.status == TaskStatus.EVALUATING
+        assert (task.context or {}).get("pr_merged") is None
+        assert (task.context or {}).get("rollup_pr_number") == 654
+        assert "awaiting downstream landing" in (task.latest_status_message or "")
+        delete_branch_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_already_merged_rollup_skips_pr_merged_on_promotion_target(
+        self, db_session, mocker
+    ):
+        from app.routers.admin_operator_triggers import trigger_rollup
+        from app.review_pipeline import SPAWN_REASON_ALREADY_MERGED, SPAWN_REASON_KEY
+
+        project = await _make_project(db_session)
+        project.integration_branch = "automain"
+        project.promotion_target = "release/main"
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            title="Manual rollup",
+            payloads=[{"type": "research", "prompt": "rollup"}],
+            status=TaskStatus.EVALUATING,
+            context={
+                "plan_branch": "research/abc12345",
+                "parent_base": "release/main",
+                "direction_id": "dir-1",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        async def _mark_already_merged(*args, **kwargs):
+            source_task = args[0]
+            source_task.context = {
+                **(source_task.context or {}),
+                SPAWN_REASON_KEY: SPAWN_REASON_ALREADY_MERGED,
+            }
+            source_task.latest_status_message = "already merged upstream"
+            return None, False
+
+        mocker.patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new_callable=AsyncMock,
+            return_value=("token", "owner", "repo"),
+        )
+        mocker.patch(
+            "app.github.create_pull_request",
+            new_callable=AsyncMock,
+            return_value={"html_url": "https://github.com/owner/repo/pull/456", "number": 456},
+        )
+        mocker.patch(
+            "app.review_pipeline._spawn_pipeline_task",
+            new=_mark_already_merged,
+        )
+
+        result = await trigger_rollup(
+            task.id,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        await db_session.refresh(task)
+        assert result["rollup_pr_number"] == 456
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is None
 
 
 class TestGetProjectFindings:

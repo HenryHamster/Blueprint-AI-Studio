@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 20 handler types
+  - TaskType enum listing all 21 handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -277,6 +277,23 @@ class SmokestestPayload(_SystemPopulated):
     health_check_urls: list[str] | None = None
 
 
+class VerifyTestsPayload(_SystemPopulated):
+    """Payload for the verify_tests merge-gate task.
+
+    Like other pipeline tasks it carries the PR head ``branch`` plus
+    ``base_branch`` (validated on BasePayload). ``pr_number`` is optional so the
+    backend can correlate the verdict artifact with the PR being gated.
+    """
+
+    branch: str | None = None
+    pr_number: int | None = None
+
+    @field_validator("branch")
+    @classmethod
+    def _check_branch(cls, v: str | None) -> str | None:
+        return _validate_branch_name(v)
+
+
 class DebugPayload(_SystemPopulated):
     failed_task_id: str | None = None
     failed_task_title: str | None = None
@@ -331,6 +348,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.self_audit: SelfAuditPayload,
     TaskType.release_audit: ReleaseAuditPayload,
     TaskType.memo: MemoPayload,
+    TaskType.verify_tests: VerifyTestsPayload,
 }
 
 

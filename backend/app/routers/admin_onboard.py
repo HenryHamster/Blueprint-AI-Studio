@@ -1,4 +1,10 @@
-"""Project onboarding endpoint with build config auto-detection."""
+"""Project onboarding endpoint with build config auto-detection.
+
+The onboarding flow creates the project row, assigns owner membership, tries
+to infer build commands from the GitHub repository root, seeds a stable
+task-branch namespace, and then validates the merged configuration against the
+BuildConfig schema before saving it.
+"""
 
 import logging
 import re
@@ -11,7 +17,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter
-from app.models import Project, ProjectMember, ProjectStatus
+from app.models import Project, ProjectMember, ProjectStatus, ProjectMessage, MessageType
 from app.auth import get_current_user, require_admin
 from app.schemas import OnboardPayload
 from app.task_locking import with_design_doc_locked
@@ -36,9 +42,123 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
     return slug[:40] if slug else "project"
 
+# Backend onboarding must stay aligned with the agent prompt-time greenfield
+# detector: same threshold and same "real source" exclusions live there in
+# agent/src/constants.ts and agent/src/prompts/discovery.ts.
+GREENFIELD_SOURCE_FILE_THRESHOLD = 8
+_NON_SOURCE_FILE_EXTENSIONS = (
+    ".md",
+    ".markdown",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".txt",
+    ".lock",
+    ".lockb",
+)
+_NON_SOURCE_FILE_BASENAMES = frozenset(
+    {
+        "license",
+        "licence",
+        "notice",
+        "authors",
+        "codeowners",
+        "dockerfile",
+        "makefile",
+        "procfile",
+        "go.mod",
+        ".gitignore",
+        ".gitattributes",
+        ".editorconfig",
+        ".gitmodules",
+        ".dockerignore",
+        ".npmrc",
+        ".nvmrc",
+        ".prettierrc",
+        ".eslintrc",
+        ".pre-commit-config.yaml",
+    }
+)
+_NON_SOURCE_FILE_PREFIXES = (
+    "readme",
+    "contributing",
+    "changelog",
+    "security",
+)
 
-async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, Any]:
-    """Auto-detect build configuration by inspecting the repo's root files via GitHub API."""
+
+def _is_real_source_file(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1].strip().lower()
+    if not base or base.startswith("."):
+        return False
+    if base in _NON_SOURCE_FILE_BASENAMES:
+        return False
+    if any(base.startswith(prefix) for prefix in _NON_SOURCE_FILE_PREFIXES):
+        return False
+    if any(base.endswith(ext) for ext in _NON_SOURCE_FILE_EXTENSIONS):
+        return False
+    return True
+
+
+def _classify_repo_emptiness(
+    root_items: list[Dict[str, Any]], listing_complete: bool = True
+) -> bool:
+    """Classify a repo as empty / near-empty from fetched contents listings.
+
+    Returns True ONLY when the repository was read successfully and completely
+    AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across
+    the fetched root listing and the already-fetched first-level subdirectory
+    listings. Documentation/config/data files, dotfiles, and common manifests
+    are not counted as source.
+
+    ``listing_complete`` is the positive confirmation that every listing needed
+    to make this determination was fetched. When it is False (e.g. a
+    first-level subdirectory listing failed to fetch), emptiness is
+    indeterminate and this returns False (treat-as-non-empty) — a repo whose
+    real source lives in a subdirectory we could not read must never be
+    bootstrapped as greenfield on a transient fetch error.
+
+    ``root_items`` is the raw GitHub ``contents/`` listings already fetched by
+    :func:`_detect_build_config`, so it adds zero GitHub cost.
+    """
+    if not listing_complete:
+        return False
+
+    source_file_count = 0
+    for item in root_items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        item_type = item.get("type")
+        if item_type != "file":
+            continue
+        if _is_real_source_file(name):
+            source_file_count += 1
+            if source_file_count > GREENFIELD_SOURCE_FILE_THRESHOLD:
+                return False
+
+    return True
+
+
+async def _detect_build_config(
+    token: str, owner: str, repo: str, ref: str | None = None
+) -> Dict[str, Any]:
+    """Auto-detect build configuration by inspecting the repo's root files.
+
+    The detector is intentionally shallow: it looks at the repository root and
+    one level of subdirectories to seed directory-specific install/lint/build
+    commands, then returns a BuildConfig-shaped dict that onboarding can merge
+    with operator overrides.
+
+    When ``ref`` is provided, every GitHub contents API call targets that
+    branch/ref instead of the repository's default branch. When ``ref`` is
+    None the requests are identical to the default-branch behavior.
+    """
     from app.github import _github_request
 
     headers = {
@@ -46,6 +166,9 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    # Only attach ?ref=... when a ref was requested, so default-branch
+    # detection issues byte-identical requests to before.
+    params = {"ref": ref} if ref is not None else None
 
     # Fetch root directory listing
     resp = await _github_request(
@@ -53,6 +176,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         f"https://api.github.com/repos/{owner}/{repo}/contents/",
         headers,
         max_retries=2,
+        params=params,
     )
     if resp.status_code != 200:
         logger.warning(
@@ -60,11 +184,17 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         )
         return {}
 
-    root_files = {item["name"]: item for item in resp.json() if isinstance(item, dict)}
+    root_listing = [item for item in resp.json() if isinstance(item, dict)]
+    root_files = {item["name"]: item for item in root_listing}
     root_names = set(root_files.keys())
 
     directories: list[Dict[str, Any]] = []
     languages: list[str] = []
+    source_items: list[Dict[str, Any]] = list(root_listing)
+    # Positive confirmation that every listing needed for the emptiness
+    # determination was fetched. Any failed first-level subdirectory fetch
+    # flips this to False so the repo is not falsely classified as greenfield.
+    listing_complete = True
 
     # Detect Python project
     if (
@@ -131,10 +261,21 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             f"https://api.github.com/repos/{owner}/{repo}/contents/{subdir}",
             headers,
             max_retries=1,
+            params=params,
         )
         if sub_resp.status_code != 200:
+            # We could not fully read this subdirectory. Record the incomplete
+            # read so emptiness classification degrades to "not empty" rather
+            # than silently concluding greenfield over a partial listing.
+            logger.warning(
+                f"[ONBOARD] Failed to list subdir {subdir} for {owner}/{repo}: "
+                f"{sub_resp.status_code}; treating repo read as incomplete"
+            )
+            listing_complete = False
             continue
-        sub_files = {item["name"] for item in sub_resp.json() if isinstance(item, dict)}
+        sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
+        source_items.extend(sub_listing)
+        sub_files = {item["name"] for item in sub_listing}
 
         if "package.json" in sub_files and not any(
             d["path"] == f"{subdir}/" for d in directories
@@ -178,9 +319,84 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         "directories": directories,
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
+        # Deterministic empty/near-empty signal from the already-fetched root
+        # + first-level subdirectory listings (zero extra GitHub cost). Must
+        # stay aligned with agent/src/prompts/discovery.ts and the threshold in
+        # agent/src/constants.ts.
+        "repo_is_empty": _classify_repo_emptiness(
+            source_items, listing_complete=listing_complete
+        ),
     }
 
     return config
+
+
+def _seed_strategic_intent(
+    project: Project, goal: str | None, steering: Dict[str, Any] | None
+) -> ProjectMessage | None:
+    """Seed the user's onboarding goal into the project's strategic intent.
+
+    Blueprint's bootstrap reads the user's intent from two channels on the first
+    strategic cycle: ``problem_model.intent`` and the user-message conversation
+    thread. This writes the goal into BOTH so cycle 1 reasons from the user's
+    actual ask rather than a blank slate:
+
+    1. ``problem_model.intent.purpose`` + ``current_focus`` (with a
+       ``user_message`` provenance source), plus any optional steering merged
+       into the same user-editable ``context`` / ``constraints`` subset the
+       post-creation PATCH path accepts.
+    2. A returned ``from_type='user'`` ProjectMessage carrying the goal verbatim
+       so it lands in ``conversation_thread``.
+
+    Returns ``None`` and makes no changes when the goal is empty, preserving
+    today's behavior for users who skip it.
+    """
+    goal = (goal or "").strip()
+    if not goal:
+        return None
+
+    from pydantic import ValidationError
+    from app.problem_model import (
+        apply_user_intent_patch,
+        parse_problem_model,
+        Source,
+    )
+
+    message = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content=goal,
+    )
+
+    pm = parse_problem_model(project.problem_model)
+    pm.intent.purpose = goal
+    pm.intent.current_focus = goal
+    pm.intent.source = Source(
+        type="user_message", message_id=str(message.id), excerpt=goal[:120]
+    )
+    if steering:
+        # Reuse only the user-editable subset (context / constraints); ignore
+        # any agent-owned keys a caller might pass. Route the merge through the
+        # shared apply_user_intent_patch helper so steering is validated the
+        # same way the post-creation project-config edits are — a malformed
+        # value (e.g. a bare string where ProjectContext is expected) surfaces
+        # as a clean 400 rather than an unhandled ValidationError 500.
+        patch = {k: steering[k] for k in ("context", "constraints") if k in steering}
+        if patch:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            try:
+                pm = apply_user_intent_patch(pm.model_dump(), patch, now_iso)
+            except (ValueError, ValidationError) as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid initial_steering: {e}",
+                ) from e
+    pm.last_updated_by = "user"
+    project.problem_model = pm.model_dump()
+    flag_modified(project, "problem_model")
+
+    return message
 
 
 @router.post("/projects/onboard")
@@ -191,7 +407,17 @@ async def onboard_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Create a new project with auto-detected build configuration from the GitHub repo."""
+    """Create a new project, seed membership, and persist detected build config.
+
+    Flow:
+    1. Create the Project row in DEPLOYING state.
+    2. Add the caller as owner via ProjectMember.
+    3. Attempt GitHub-based build-config detection.
+    4. Seed ``task_branch_namespace`` from the repo name when missing.
+    5. Apply any caller-provided build_config_override on top of detection.
+    6. Validate against ``BuildConfig`` and store the validated shape when
+       possible, or the raw detected dict if validation fails.
+    """
 
     # Create project record
     project_name = payload.name or f"{payload.github_owner}/{payload.github_repo}"
@@ -236,13 +462,16 @@ async def onboard_project(
             exc_info=True,
         )
 
-    # Seed per-project task-branch namespace (override may overwrite this below)
+    # Seed per-project task-branch namespace. Operator overrides can still
+    # replace it, but later project PATCH/re-detect flows intentionally preserve
+    # the stored value once it exists.
     build_config.setdefault(
         "task_branch_namespace",
         _derive_task_branch_namespace(payload.github_repo),
     )
 
-    # Merge override on top of detected config (validate shape)
+    # Merge caller-supplied overrides on top of detected config so explicit
+    # onboarding input wins over repo heuristics.
     if payload.build_config_override:
         build_config.update(payload.build_config_override)
 
@@ -333,6 +562,18 @@ async def onboard_project(
 
     await session.flush()
     await with_design_doc_locked(session, project.id, _seed_remediation_config)
+
+    # Seed the user's goal + optional steering into strategic intent so the
+    # first strategic cycle reasons from it. Read defensively: the OnboardPayload
+    # schema field lands via a sibling task, so until then this is a no-op.
+    seeded_message = _seed_strategic_intent(
+        project,
+        getattr(payload, "goal", None),
+        getattr(payload, "initial_steering", None),
+    )
+    if seeded_message is not None:
+        session.add(seeded_message)
+        session.add(project)
 
     await session.commit()
     await session.refresh(project)

@@ -1,3 +1,14 @@
+"""Authentication and authorization dependencies for the orchestrator API.
+
+Covers the platform's authentication schemes: Firebase ID tokens for
+admin/operator users (verified via the Firebase Admin SDK, initialized at
+module load), an ``ADMIN_API_KEY`` shared-secret path for programmatic
+access, and short-lived agent JWTs for VM-side requests. Also provides
+helpers for minting and verifying agent JWTs and WebSocket admission tickets,
+plus the ``get_current_user`` / ``require_admin`` FastAPI dependencies that
+resolve the caller against the ``AllowedUser`` table.
+"""
+
 from fastapi import Security, HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -116,6 +127,48 @@ def create_agent_token(
     }
     encoded_jwt = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
     return encoded_jwt
+
+
+# Token-scope marker for VM-scoped (taskless) agent JWTs. A normal agent token
+# is TASK-scoped: ``sub`` carries the task_id and per-endpoint authz validates
+# the task binding. A warm-pool VM, however, boots *before* it has claimed any
+# task, so it cannot hold a task-scoped token. A VM-scoped token carries
+# ``vm_instance_id`` + ``project_id`` and ``token_scope == "vm"`` but NO task
+# ``sub`` — the taskless endpoints (vm-heartbeat / next-role) accept it and
+# scope every action by ``vm_instance_id`` instead of a task. (/heartbeat and
+# /claim still require a task ``sub`` and reject a bare VM-scoped token; a pool
+# VM only reaches those AFTER /next-role rotates it to a task-scoped token.)
+VM_SCOPED_TOKEN_SCOPE = "vm"
+
+
+def create_vm_scoped_token(
+    vm_instance_id: str,
+    project_id: str,
+    ttl_hours: int = AGENT_BOOTSTRAP_TOKEN_TTL_HOURS,
+) -> str:
+    """Mint a VM-scoped (taskless) agent JWT for a warm-pool VM.
+
+    Unlike ``create_agent_token`` this token has NO task ``sub`` — it identifies
+    only the VM (``vm_instance_id``) and its tenant (``project_id``) and is
+    tagged ``token_scope = "vm"``. It authenticates a pool VM that has not yet
+    claimed a task on the taskless agent endpoints; once the VM claims/leases a
+    task it is handed a fresh task-scoped token (e.g. via the warm-claim
+    finalizer), exactly like a cold VM.
+
+    Defaults to the long bootstrap TTL because, like a cold-start VM, a freshly
+    booted pool VM has not yet proven it can refresh; the dispatch path rotates
+    it down to the short TTL once it claims work.
+    """
+    expire = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
+    to_encode = {
+        # No task ``sub``: this token is not bound to any task.
+        "token_scope": VM_SCOPED_TOKEN_SCOPE,
+        "vm_instance_id": vm_instance_id,
+        "project_id": project_id,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
 
 
 def verify_agent_jwt(token: str) -> dict:

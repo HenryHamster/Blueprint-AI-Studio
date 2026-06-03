@@ -11,17 +11,19 @@ import {
 } from '../index.js';
 import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
-import { runFreshReviewerPass } from './standard.js';
+import { runFreshReviewerPass, sensitivePathsFromMetadata } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT, shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
 } from '../prompt.js';
+import { formatProjectVision, formatStrategicIntent } from '../prompts/context-prefix.js';
 import { resolveBuildConfig } from '../build-config.js';
 import {
   REVIEW_CLAUDEMD_PROMPT_HEADER, REVIEW_CLAUDEMD_PROMPT_FOOTER,
@@ -50,7 +52,8 @@ export type { AnnotatedIssue, AnnotatedEntry } from './review-fix-issue-dedup.js
 import type { DriftSignal } from './review-fix-history.js';
 import { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection } from './review-fix-history.js';
 export { computeMaxFixIterations, REVIEW_FEEDBACK_HISTORY_CHARS, formatTrajectorySection, formatDriftSection, verifyStepsOk } from './review-fix-history.js';
-import { ALEMBIC_VERSIONS_DIR, detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
+import { resolveMigrationLayout } from './specialized.js';
 export { detectMigrationConflict, buildMigrationConflictGuidance } from './review-fix-migration.js';
 export type { MigrationConflict } from './review-fix-migration.js';
 
@@ -791,13 +794,23 @@ export async function handleFix(
   // migration revision chain. Run unconditionally so silent revision-number
   // collisions are surfaced to Claude alongside any textual conflicts.
   try {
+    // Resolve the per-project alembic versions directory (falls back to
+    // Blueprint's backend/alembic/versions when config is unset). The layout
+    // returns no trailing slash; the conflict-detection helpers expect a
+    // trailing-slash prefix, so normalize it here exactly as the migrate
+    // handler does for its own path filters.
+    const migrationLayout = resolveMigrationLayout(fixBuildConfig);
+    const versionsDir = `${migrationLayout.versionsDir}/`;
     const prFiles = git(['diff', '--name-only', `origin/${baseBranch}...HEAD`])
       .split('\n').map(s => s.trim()).filter(Boolean);
-    const baseFiles = git(['ls-tree', '-r', '--name-only', `origin/${baseBranch}`, ALEMBIC_VERSIONS_DIR])
+    const baseFiles = git(['ls-tree', '-r', '--name-only', `origin/${baseBranch}`, versionsDir])
       .split('\n').map(s => s.trim()).filter(Boolean);
-    const migrationConflict = detectMigrationConflict(prFiles, baseFiles);
+    const migrationConflict = detectMigrationConflict(prFiles, baseFiles, versionsDir);
     if (migrationConflict.detected) {
-      const guidance = buildMigrationConflictGuidance(migrationConflict);
+      const guidance = buildMigrationConflictGuidance(
+        migrationConflict, versionsDir,
+        migrationLayout.schemaRevisionFile, migrationLayout.schemaRevisionConst,
+      );
       enrichedPrompt = `${guidance}${enrichedPrompt}`;
       sendLog(ws, `Migration revision conflict detected: PR=${migrationConflict.prMigrations.join(',')} base-new=${migrationConflict.baseNewMigrations.join(',')}\n`);
     }
@@ -874,6 +887,20 @@ export async function handleFix(
     // If currentMergeable is null/undefined (couldn't query), leave basePrompt alone.
   }
 
+  // Surface operator/strategist implementation constraints authored on the
+  // direction (e.g. "Must not modify the public API surface"). The fix path
+  // builds its prompt manually and bypasses buildContextPrefix, so wire the
+  // field in directly here. Bounded backend-side; omit cleanly when absent.
+  const fixImplConstraints = strVal(
+    (task.direction_context as Record<string, unknown> | undefined)?.implementation_constraints,
+  );
+  if (fixImplConstraints) {
+    enrichedPrompt =
+      `## Implementation Constraints\n` +
+      `The direction author set these constraints for whoever implements this work. Respect them:\n${fixImplConstraints}\n\n` +
+      enrichedPrompt;
+  }
+
   // Prepend parent context if this fix agent is part of a larger initiative
   const fixParentCtx = (task.context as Record<string, unknown> | undefined)?.parent_context as Record<string, unknown> | undefined;
   if (fixParentCtx?.parent_prompt) {
@@ -914,6 +941,26 @@ export async function handleFix(
       `## Reviewer's Working Set\n` +
       `The reviewer Read/Edit/Grep'd these paths while forming the verdict above. Start your investigation here — they are the most likely place the cited issues live. You may look elsewhere if the trail leads there:\n${formatted}\n\n` +
       enrichedPrompt;
+  }
+
+  // Prepend the shared Project Vision block so review-driven fixes inherit the
+  // same strategic "why" as standard task agents.
+  const fixProjectVision = formatProjectVision(
+    task.vision as Record<string, unknown> | undefined,
+  );
+  if (fixProjectVision) {
+    enrichedPrompt = `${fixProjectVision}${enrichedPrompt}`;
+  }
+
+  // Prepend operator steering (current strategic intent). The fix path
+  // assembles its prompt independently and does NOT call buildContextPrefix, so
+  // it must render the same Operator Steering section explicitly — alongside the
+  // existing CI/review/error context, never replacing it.
+  const fixStrategicIntent = formatStrategicIntent(
+    task.strategic_intent as Record<string, unknown> | undefined,
+  );
+  if (fixStrategicIntent) {
+    enrichedPrompt = `${fixStrategicIntent}\n${enrichedPrompt}`;
   }
 
   // Prepend CLAUDE.md instructions + playbook
@@ -958,7 +1005,7 @@ export async function handleFix(
     }
   }
   const parallelFixBlock = parallelFixInjected ? `\n\n${PARALLEL_FIX_GUIDANCE}` : '';
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${buildCodeChangeHelperGuidance({ buildConfig: fixBuildConfig, owner, repo })}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
@@ -1042,7 +1089,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
-  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget });
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget, codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: fixBuildConfig, owner, repo }) });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before the fix session starts so fast fix/rebase tasks still
@@ -1095,6 +1142,8 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
       statusRef,
       model,
       task.project_context as Record<string, unknown> | undefined,
+      undefined, undefined, undefined, undefined,
+      sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined),
     );
   }
 }

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.auth import get_current_user
+from app.branch_resolution import classify_rollup_merge_outcome
 from app.database import get_session
 from app.github import (
     GITHUB_CLIENT_ID,
@@ -27,6 +28,7 @@ from app.github import (
     get_user_installations,
     validate_fine_grained_pat,
 )
+from app.landed_signal import apply_merged_landed_signal
 from app.models import (
     Artifact,
     ArtifactType,
@@ -54,6 +56,19 @@ _webhook_delivery_ids: OrderedDict = (
 _webhook_dedup_lock = asyncio.Lock()
 _WEBHOOK_DEDUP_MAX = 1000
 _WEBHOOK_DEDUP_TTL = 600  # 10 minutes
+
+
+async def _load_tasks_for_artifacts(
+    session: AsyncSession, artifacts: list[Artifact]
+) -> dict:
+    task_ids = {art.task_id for art in artifacts if art.task_id is not None}
+    if not task_ids:
+        return {}
+
+    task_rows = (
+        await session.execute(select(Task).where(Task.id.in_(task_ids)))
+    ).scalars().all()
+    return {task.id: task for task in task_rows}
 
 
 class GitHubPATInstallRequest(BaseModel):
@@ -379,6 +394,9 @@ async def github_webhook(
 
                 # Propagate pr_merged to tasks that created this PR
                 pr_number = data["pull_request"].get("number")
+                pr_base_branch = (data.get("pull_request", {}).get("base") or {}).get(
+                    "ref"
+                )
                 if pr_number:
                     pr_url_suffix = f"/{owner}/{repo}/pull/{pr_number}"
                     art_result = await session.execute(
@@ -395,21 +413,68 @@ async def github_webhook(
                         logger.info(
                             f"[WEBHOOK] PR {pr_url_suffix} merged but no matching artifacts found — agent may not have reported yet"
                         )
+                    task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
                     affected_tasks = []
+                    mutated_tasks = False
                     for art in pr_artifacts:
-                        pr_task = await session.get(Task, art.task_id)
+                        pr_task = task_map.get(art.task_id)
                         if pr_task and not (pr_task.context or {}).get("pr_merged"):
-                            pr_task.context = {
-                                **(pr_task.context or {}),
-                                "pr_merged": True,
-                            }
-                            session.add(pr_task)
-                            affected_tasks.append(pr_task)
-                            logger.info(
-                                f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})"
+                            (
+                                record_pr_merged,
+                                terminal_rollup_merge,
+                                landed_branch,
+                            ) = await classify_rollup_merge_outcome(
+                                pr_task,
+                                project,
+                                session,
+                                pr_number=pr_number,
+                                merged_base_branch=pr_base_branch,
+                                source="github.pull_request.closed",
                             )
-                    if affected_tasks:
+                            if record_pr_merged:
+                                apply_merged_landed_signal(
+                                    pr_task,
+                                    project,
+                                    base_branch=landed_branch,
+                                    hotfix_lane=bool(
+                                        (pr_task.first_payload or {}).get("hotfix")
+                                        or (pr_task.context or {}).get("hotfix")
+                                    ),
+                                    non_merge_reason="merged_pr_non_integration_branch",
+                                )
+                                affected_tasks.append(pr_task)
+                                logger.info(
+                                    f"[WEBHOOK] Set pr_merged on task {pr_task.id} (PR #{pr_number})"
+                                )
+                            elif (
+                                not terminal_rollup_merge
+                                and pr_task.status == TaskStatus.EVALUATING
+                            ):
+                                pr_task.latest_status_message = (
+                                    f"Rollup PR merged into {landed_branch}; "
+                                    "awaiting downstream landing"
+                                )
+                            session.add(pr_task)
+                            mutated_tasks = True
+                    if mutated_tasks:
                         await session.commit()
+                    # Once a bootstrapped repo gains a project structure on its
+                    # integration branch, refresh an empty build_config so
+                    # verification commands exist without a manual admin step.
+                    # Best-effort + idempotent (cheap in-memory directories
+                    # guard); skip staging/rollup merges by gating on the
+                    # integration branch.
+                    if pr_base_branch and pr_base_branch == (
+                        get_project_integration_branch(project)
+                    ):
+                        from app.build_config_detection import (
+                            maybe_refresh_empty_build_config,
+                        )
+
+                        await maybe_refresh_empty_build_config(
+                            project, session, ref=pr_base_branch
+                        )
+                    if affected_tasks:
                         from app.rollup_management import _check_and_trigger_rollup
 
                         for at in affected_tasks:
@@ -537,8 +602,9 @@ async def github_webhook(
                     if pr_artifacts:
                         pr_body = data.get("pull_request", {}).get("body") or ""
                         rejection_note = pr_body[:500] if pr_body else None
+                        task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
                         for art in pr_artifacts:
-                            pr_task = await session.get(Task, art.task_id)
+                            pr_task = task_map.get(art.task_id)
                             if pr_task and not (pr_task.context or {}).get(
                                 "pr_rejected"
                             ):
@@ -781,8 +847,9 @@ async def github_webhook(
         ).endswith("[bot]")
 
         signals_recorded = []
+        task_map = await _load_tasks_for_artifacts(session, pr_artifacts)
         for art in pr_artifacts:
-            pr_task = await session.get(Task, art.task_id)
+            pr_task = task_map.get(art.task_id)
             if not pr_task:
                 continue
 

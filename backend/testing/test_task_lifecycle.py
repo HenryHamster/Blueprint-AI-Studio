@@ -24,11 +24,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
-from app.models import Project, Task, TaskStatus, ArtifactType
+from app.models import Project, Task, TaskStatus, ArtifactType, Alert, AlertSeverity
 from app.schemas import AgentStatusPayload
 from app.task_lifecycle import (
     _has_active_strategic_task,
     _increment_research_spawn_count,
+    _mark_dependents_warm_claimable,
     _requeue_parent_task,
     _merge_with_retry,
     _comment_with_retry,
@@ -714,6 +715,79 @@ async def test_requeue_no_children_to_retry_records_deploy_monitoring_result(tl_
     entries = list(_ss.deploy_monitoring["task_results"])
     matching = [e for e in entries if e[1] == "failure" and e[2] == "AGENT_TIMEOUT"]
     assert matching, f"expected an AGENT_TIMEOUT failure entry, got {entries}"
+
+
+@pytest.mark.asyncio
+async def test_requeue_all_children_blocked_escalates_precondition_alert(tl_db, mocker):
+    """All-children-blocked parent raises ONE deduplicated precondition alert.
+
+    When every FAILED child is BLOCKED_PRECONDITION (upstream dependency unmet),
+    the parent terminates as BLOCKED_PRECONDITION rather than a code failure, and
+    a single operator-visible WARNING alert describing the upstream blocker is
+    raised — not a silent generic FAILED. Re-running the requeue must NOT spam a
+    second alert (deduplicated by task + blocker identity).
+    """
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.deploy_monitoring["task_results"].clear()
+    _recorded_task_ids.clear()
+    # The precondition-blocker helper broadcasts via app.alert_dispatch; suppress
+    # the socket call but keep the real (dedup) helper so we exercise idempotence.
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    # Single FAILED child whose status message routes to BLOCKED_PRECONDITION.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: upstream PR #42 not yet merged",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    # Parent classified as the budget-exempt precondition class, not a code error.
+    assert parent.context.get("failure_category") == "BLOCKED_PRECONDITION"
+
+    precondition_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(precondition_alerts) == 1
+    alert = precondition_alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "upstream dependency" in alert.title
+
+    # Re-run: dedup must hold — still exactly one precondition alert.
+    await _requeue_parent_task(parent, session)
+    precondition_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(precondition_alerts) == 1
 
 
 @pytest.mark.asyncio
@@ -4368,8 +4442,8 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-from sqlalchemy import text as _sa_text
-from sqlalchemy.exc import (
+from sqlalchemy import text as _sa_text  # noqa: E402
+from sqlalchemy.exc import (  # noqa: E402
     IntegrityError as _IntegrityError,
     PendingRollbackError as _PendingRollbackError,
 )
@@ -4872,3 +4946,59 @@ class TestResolveFallbackVerdict:
     def test_no_verdict_returns_none(self):
         assert _resolve_fallback_verdict("just some unrelated log output") is None
         assert _resolve_fallback_verdict("") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _mark_dependents_warm_claimable — completion-side warm-reuse trigger
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMarkDependentsWarmClaimable:
+    """The in-process merge paths (small-scope auto-merge, review-approved merge)
+    delegate to the single authoritative orchestrator implementation to stamp the
+    sticky ``_deps_satisfied`` readiness marker on dependents a landing unblocks,
+    so the just-completed task's warm VM can claim follow-on work inside its
+    teardown-defer grace window. The wrapper must (1) delegate with the landed
+    task + the GitHub-aware PR-merge verifier, and (2) never let a failure abort
+    post-commit processing."""
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_orchestrator_with_landed_task(self, tl_db, mocker):
+        session, _ = tl_db
+        project = await _make_project(session)
+        landed = await _make_task(
+            session, project.id, task_type="research", status=TaskStatus.COMPLETED
+        )
+
+        spy = mocker.patch(
+            "app.orchestrator._mark_unblocked_dependents",
+            new_callable=AsyncMock,
+            return_value=2,
+        )
+        verifier = object()
+        mocker.patch("app.rollup_management._verify_pr_merged", verifier)
+
+        await _mark_dependents_warm_claimable(landed)
+
+        spy.assert_awaited_once()
+        # The landed task and the authoritative PR-merge verifier are forwarded.
+        assert spy.await_args.args[0] is landed
+        assert spy.await_args.args[1] is verifier
+
+    @pytest.mark.asyncio
+    async def test_swallows_delegate_failure(self, tl_db, mocker):
+        """A failure in the marking pass must never abort post-commit work."""
+        session, _ = tl_db
+        project = await _make_project(session)
+        landed = await _make_task(
+            session, project.id, task_type="research", status=TaskStatus.COMPLETED
+        )
+
+        mocker.patch(
+            "app.orchestrator._mark_unblocked_dependents",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        )
+
+        # Must not raise.
+        assert await _mark_dependents_warm_claimable(landed) is None

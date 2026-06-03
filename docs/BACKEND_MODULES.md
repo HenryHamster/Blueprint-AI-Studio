@@ -9,14 +9,18 @@ Guide to `backend/app/` modules and their responsibilities.
 ### `main.py`
 
 FastAPI application entry point. Defines:
-- HTTP routes (admin, projects, agent, GitHub proxy)
+- Registers the router families under `backend/app/routers/`, including the
+  public project/task routes, admin dashboard routes, agent lifecycle routes,
+  GitHub proxy routes, warm-continuity routes, and deploy-state routes
 - WebSocket handlers for real-time log streaming
 - Request/response validation via Pydantic schemas
 - CORS, rate limiting, error handling middleware
 - Lifecycle hooks (startup, shutdown)
 - VM deletion tracking (`_orchestrator_deleted_vms`) to distinguish orchestrator cleanup from GCP preemption
 
-**Key functions:**
+**Key functions** (canonical implementations live in `vm_lifecycle.py`; `main.py`
+re-exports them with `# noqa: F401` for back-compat — new code should import from
+`app.vm_lifecycle` directly):
 - `_ensure_vm_deleted()` — Retry-safe VM deletion with GCP coordination
 - `fire_and_forget_vm_delete()` — Non-blocking background VM cleanup
 - `is_orchestrator_initiated_delete()` — Check if VM was deleted by orchestrator (for reaper)
@@ -26,7 +30,7 @@ FastAPI application entry point. Defines:
 TASK_PRIORITY_MAP = {"high": 100, "medium": 50, "low": 0}
 ```
 
-**Schema revision:** Always matches the latest Alembic migration (currently `0125`).
+**Schema revision:** Always matches the latest Alembic migration (currently `0131`).
 
 ---
 
@@ -43,11 +47,11 @@ SQLModel data models (ORM) for all database tables. ~2600 lines covering:
 **Enums:**
 - `TaskStatus` — QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, COMPLETED, FAILED, CANCELLED
 - `ProjectStatus` — DRAFT, DEPLOYING, COMPLETED, FAILED, CANCELLED
-- `ArtifactType` — 12 types (GIT_COMMIT, PULL_REQUEST, ERROR_LOG, RESEARCH_FINDINGS, etc.)
+- `ArtifactType` — 13 types (GIT_COMMIT, PULL_REQUEST, ERROR_LOG, RESEARCH_FINDINGS, etc.)
 
 **Auth & integration:**
 - `AllowedUser` — Access control
-- `UserIntegration` — OAuth tokens (GitHub, Anthropic, etc.) with encryption
+- `UserIntegration` — Per-user GitHub credentials (App installation ID or fine-grained PAT)
 
 **Strategic research mode:**
 - `Direction` state management (stored as JSONB in `Project.directions`)
@@ -66,8 +70,8 @@ Pydantic request/response DTOs for API endpoints.
 
 **Key schemas:**
 - `DeployPayload` — Launch task request
-- `AgentStatusPayload` — Task completion/failure report (~200 fields for telemetry)
-- `HeartbeatRequest` — Agent keep-alive (~100 fields for metrics)
+- `AgentStatusPayload` — Task completion/failure report (many optional telemetry fields)
+- `HeartbeatRequest` — Agent keep-alive (carries optional metrics/tool-trace fields)
 - `SpawnTaskRequest` — Child task creation
 - `GitHubPRReviewRequest` — PR review submission
 - `HeartbeatMetrics`, `ToolTraceEntry` — Structured telemetry
@@ -107,6 +111,18 @@ Authentication & authorization.
 
 ---
 
+### `lifecycle.py`
+
+Application startup/shutdown lifecycle (extracted from `main.py`). Responsibilities:
+- Launches and supervises the background worker tasks (`orchestrator_worker`,
+  `reaper_service`, `gcp_cleanup_service`, `secret_reconciliation_service`,
+  `pipeline_alert_scan_service`, `digest_precompute_service`, and others)
+- Session-scoped advisory-lock leader election (only the leader instance runs the
+  full worker set; non-leaders run a reduced set)
+- Background-task crash monitoring with operator alerts
+
+---
+
 ## Orchestration
 
 ### `orchestrator.py`
@@ -120,8 +136,12 @@ Main coordination loop. Implements:
 - **Circuit breaker** — Halts new tasks if a project exceeds failure threshold
 
 **Key functions:**
-- `orchestrator_worker()` — Main polling loop (runs every 10s)
-- `_provision_task()` — Handles the transition from QUEUED → PROVISIONING → (awaiting agent claim)
+- `orchestrator_worker()` — Main polling loop (runs every 10s); also drives
+  autonomous-research spawning by calling `_check_idle_research()` each cycle
+- `_lock_provisioning_task_for_vm()` — Locks an existing PROVISIONING task to a VM
+  before handing it to the agent (the provisioning flow is spread across
+  `orchestrator_worker()` and its inner `_provision_and_handle()` helper rather
+  than a single `_provision_task()` entry point)
 
 ---
 
@@ -134,6 +154,22 @@ Background worker that kills VMs on heartbeat timeout.
 - For timed-out IN_PROGRESS tasks, marks task as FAILED and deletes VM
 - Uses `is_orchestrator_initiated_delete()` to avoid misclassifying orchestrator-initiated cleanup as spot preemption
 - Logs all preemptions and orphan cleanup for metrics
+
+---
+
+### `vm_lifecycle.py`
+
+Canonical home for orchestrator-side VM deletion tracking (extracted from `main.py`,
+which re-exports for back-compat).
+
+**Key functions:**
+- `_ensure_vm_deleted()` — Retry-safe VM deletion coordinated with GCP
+- `fire_and_forget_vm_delete()` — Non-blocking background VM cleanup
+- `is_orchestrator_initiated_delete()` — Distinguish orchestrator cleanup from GCP
+  preemption so the reaper does not misclassify it
+
+Also maintains the in-process set of orchestrator-deleted VMs and GCP VM-count
+caching used for concurrency limits.
 
 ---
 
@@ -180,9 +216,12 @@ High-level task state machine.
 - IN_PROGRESS → FAILED (agent reported failure)
 
 **Functions:**
-- `transition_task_status()` — Atomically update task status with validation
-- `record_task_history()` — Audit trail entry
-- `_verify_state_transition()` — Enforce valid state machine
+- `_process_post_commit()` — The async entry point that processes an agent's
+  terminal status report: resolves the verdict, advances the task through its
+  terminal states, records history, and triggers follow-on work. State-transition
+  and history logic is embedded here and in `lifecycle.py` rather than in
+  standalone `transition_task_status()` / `record_task_history()` helpers.
+- `_has_active_strategic_task()`, `_increment_research_spawn_count()` — strategic-cycle helpers
 
 ---
 
@@ -208,12 +247,83 @@ Task type → handler mapping and validation.
 - Code changes: `create`, `refactor`, `fix`, `qa`
 - Review: `review`
 - Planning & research: `plan`, `research`, `strategic_review`, `design_doc_update`
-- Specialized: `security_audit`, `perf`, `debug`, `investigate`
+- Specialized: `security_audit`, `perf`, `debug`, `investigate`, `smoketest`, `migrate`
 - Docs: `docs`
-- Ops: `deps`, `migrate`, `smoketest`
-- System/diagnostic: `self_audit`, `release_audit`, `memo`
+- Ops/system: `deps`, `self_audit`, `release_audit`, `memo`
 
 Each type has a handler in `agent/src/handlers/`.
+
+---
+
+## HTTP Routers
+
+### `backend/app/routers/projects.py`
+
+Public project/task launch endpoints under `/api/*`.
+
+**Routes:**
+- `POST /api/deploy`
+- `GET /api/projects`
+- `GET /api/projects/{project_id}`
+- `GET /api/projects/{project_id}/tasks`
+- `POST /api/projects/{project_id}/ws-ticket`
+- `POST /api/projects/{project_id}/cancel`
+- `GET /api/projects/{project_id}/status`
+
+### `backend/app/routers/agent.py`
+
+Primary agent lifecycle surface under `/api/agent/*`.
+
+**Routes:**
+- `POST /api/agent/claim`
+- `POST /api/agent/status`
+- `POST /api/agent/heartbeat`
+- `POST /api/agent/spawn`
+- `POST /api/agent/refresh-token`
+- `POST /api/agent/artifacts/upload-url`
+- `POST /api/agent/viewport/failure-screenshot-upload-url`
+- `GET /api/agent/github/token`
+- `GET /api/agent/github/check-runs`
+- `POST /api/agent/github/commit-status`
+- `POST /api/agent/github/pr-comment`
+- `POST /api/agent/github/pr-review-comment`
+- `POST /api/agent/github/pr-review`
+- `POST /api/agent/github/issues`
+- `GET /api/agent/github/issues`
+- `POST /api/agent/github/branches`
+- `POST /api/agent/github/pull-requests`
+- `POST /api/agent/tasks/{original_task_id}/reviewer-merge`
+
+### `backend/app/routers/agent_warm_continuity.py`
+
+Warm-VM continuity and backlog-reuse endpoints under `/api/agent/*`.
+
+**Routes:**
+- `POST /api/agent/vm-heartbeat`
+- `POST /api/agent/next-role`
+
+### `backend/app/routers/github.py`
+
+GitHub OAuth, PAT, and webhook integration under `/api/github/*`.
+
+**Routes:**
+- `POST /api/github/pat`
+- `GET /api/github/oauth/authorize`
+- `GET /api/github/oauth/callback`
+- `POST /api/github/webhook`
+
+### `backend/app/routers/deploy.py`
+
+Deployment-state and zone-health operational routes.
+
+**Routes:**
+- `GET /deploy-state`
+- `POST /deploy-state/pause`
+- `POST /deploy-state/resume`
+- `POST /deploy-state/reset-health`
+- `POST /deploy-state/mark-stable`
+- `POST /deploy-state/rollback`
+- `GET /zone-health`
 
 ---
 
@@ -235,11 +345,15 @@ Main loop for autonomous task spawning.
 
 ### `strategic_spawning.py`
 
-Decides which directions to spawn from and creates research tasks.
+Builds the enriched payload (design-doc view, problem model, system-maturity rows,
+efficiency snapshot) that is shipped to the strategic agent each cycle. It is a
+context/payload builder, **not** the spawner — the actual direction selection and
+research-task creation live in `autonomous_research.py` (`_spawn_research_task`,
+`_check_idle_research`).
 
 **Functions:**
-- `select_direction_for_spawn()` — Pick an active direction using weighted random selection
-- `spawn_research_task()` — Create a child research task
+- `_agent_view_design_doc()` — Strip operator-only keys from the design doc before it goes to the agent
+- `_agent_view_problem_model()` — Trim per-gap history to stay under the payload size cap
 
 ---
 
@@ -271,12 +385,9 @@ Direction state management (pause, resume, complete).
 
 ---
 
-### `autonomous_research_diagnosis.py`
-
-Auto-pause investigation. When a direction is auto-paused:
-1. Spawns an `investigate` task to diagnose the issue
-2. Stores investigation findings in the direction
-3. Recommends whether to resume or mark completed
+> **Note:** auto-pause diagnosis is not a standalone module. The
+> `diagnosis_in_progress` / `diagnosis_task_id` markers on a direction (see
+> `docs/DATA_MODELS.md`) are managed within `direction_lifecycle.py`.
 
 ---
 
@@ -483,9 +594,12 @@ GCS artifact storage interface.
 
 ---
 
-### `telemetry.py`
+### `fix_loop_telemetry.py`
 
-Distributed tracing setup (OpenTelemetry / Cloud Trace integration).
+Records per-iteration fix-loop telemetry (lint/test fix attempts and outcomes)
+reported by agents. (There is no general `telemetry.py` / OpenTelemetry tracing
+module; execution metrics arrive on the agent status and heartbeat payloads and
+are aggregated by `digest_metrics.py`.)
 
 ---
 
@@ -493,13 +607,17 @@ Distributed tracing setup (OpenTelemetry / Cloud Trace integration).
 
 ### `routers/projects.py`
 
-Project CRUD, deployment, WebSocket for logs.
+Project CRUD, deployment, cancellation, status, and WebSocket for logs.
 
 **Endpoints:**
 - `POST /api/deploy` — Launch task
+- `GET /api/projects` — List visible projects
 - `GET /api/projects/{id}` — Fetch project
 - `GET /api/projects/{id}/tasks` — List tasks
-- `WebSocket /api/projects/{id}/logs` — Real-time logs
+- `POST /api/projects/{id}/ws-ticket` — Issue WebSocket ticket
+- `POST /api/projects/{id}/cancel` — Cancel project
+- `GET /api/projects/{id}/status` — Project status summary
+- `WebSocket /api/projects/{id}/ws` — Real-time logs
 
 ---
 
@@ -509,11 +627,78 @@ Agent VM endpoints.
 
 **Endpoints:**
 - `POST /api/agent/claim` — Task claim
-- `POST /api/agent/status` — Terminal status report
 - `POST /api/agent/heartbeat` — Keep-alive
-- `POST /api/agent/spawn-task` — Create child task
+- `POST /api/agent/spawn` — Create child task
 - `POST /api/agent/refresh-token` — JWT renewal
-- GitHub proxy: `POST /api/agent/github/*`
+- `POST /api/agent/artifacts/upload-url` — Signed artifact upload URL
+- `POST /api/agent/viewport/failure-screenshot-upload-url` — Signed viewport screenshot upload URL
+- `POST /api/agent/tasks/{original_task_id}/reviewer-merge` — Reviewer merge helper
+
+### `routers/agent_status.py`
+
+Terminal agent status updates and task result recording.
+
+**Endpoints:**
+- `POST /api/agent/status` — Terminal status report
+
+---
+
+### `routers/agent_warm_continuity.py`
+
+Warm-VM continuity for task chaining and backlog reuse.
+
+**Endpoints:**
+- `POST /api/agent/vm-heartbeat` — VM-scoped heartbeat
+- `POST /api/agent/next-role` — Warm handoff / backlog claim
+
+---
+
+### `routers/agent_credentials.py`
+
+Credential rotation for running agents.
+
+**Endpoints:**
+- `POST /api/agent/credentials/rotate` — Propagate refreshed provider secret
+
+### `routers/agent_strategic_fetch.py`
+
+Read-only endpoints for an agent to pull full detail on strategic-payload items
+that were trimmed at claim time (agent JWT, rate-limited 60/min).
+
+**Endpoints:**
+- `GET /api/agent/projects/{project_id}/directions/{direction_id}`
+- `GET /api/agent/projects/{project_id}/playbook/{key:path}`
+- `GET /api/agent/projects/{project_id}/gaps/{gap_id}`
+
+---
+
+### `routers/agent_github.py`
+
+Agent-side GitHub API proxy.
+
+**Endpoints:**
+- `GET /api/agent/github/token`
+- `GET /api/agent/github/check-runs`
+- `POST /api/agent/github/commit-status`
+- `POST /api/agent/github/pr-comment`
+- `POST /api/agent/github/pr-review-comment`
+- `POST /api/agent/github/pr-review`
+- `POST /api/agent/github/issues`
+- `GET /api/agent/github/issues`
+- `POST /api/agent/github/branches`
+- `POST /api/agent/github/pull-requests`
+
+---
+
+### `routers/github.py`
+
+User GitHub OAuth flow and webhook ingestion.
+
+**Endpoints:**
+- `POST /api/github/pat`
+- `GET /api/github/oauth/authorize`
+- `GET /api/github/oauth/callback`
+- `POST /api/github/webhook`
 
 ---
 
@@ -588,6 +773,52 @@ GitHub issue integration: when an issue receives a trigger label (default: `auto
 ---
 
 ## Advanced Modules
+
+### Branch & Release Model
+
+#### `branch_resolution.py`
+
+Per-project branch/namespace resolution and agent work-branch naming (split out of
+`shared_state.py`). This is the single source of truth for **which branch a task
+targets**, so the merge/promotion gates never hardcode `automain`/`main` — they
+resolve through these helpers instead.
+
+**Branch model:** Agent PRs target a project's *integration branch* (the
+qualification trunk, `"automain"` for Blueprint's self-repo, the GitHub default
+branch for an onboarded external repo). Promotion lands on the *promotion target*
+(`"main"`). When the two coincide, the long-term-support (LTS) release model is
+inactive and the project is "single-branch".
+
+**Key functions:**
+- `get_project_integration_branch(project)` — Integration/qualification branch.
+  Fallback chain: `project.integration_branch` column → `"automain"` (self-repo)
+  → `"main"`. Fails *safe* (never raises) so it is callable from read endpoints,
+  recovery loops, and hot paths; it stages an operator signal when the column is
+  unset.
+- `get_project_promotion_target(project)` — Promotion/release branch.
+  `project.promotion_target` column → `"main"`.
+- `is_single_branch_project(project)` — Canonical "LTS model inactive" predicate:
+  `True` when integration branch == promotion target. The release machinery keys
+  several short-circuits on this (`release_promotion.promote`,
+  `hotfix_backmerge`, `release_reconciliation`).
+- `get_project_task_branch_namespace(project)` — Branch namespace
+  (`build_config['task_branch_namespace']` → global default `"blueprint"`).
+- `derive_task_branch(...)` / `resolve_task_branch(task, namespace)` — Synthesize
+  or look up the agent work branch (`{namespace}/{prefix}-{8hex}`).
+  `resolve_task_branch` prefers the branch the agent actually pushed
+  (`context["review_loop"]["branch"]` → `first_payload["branch"]` →
+  `context["branch"]`) and only synthesizes a name as a last resort.
+- `get_project_pr_title_prefix(project)` / `ensure_project_pr_title_prefix(...)` —
+  Read and idempotently apply a project's configured PR title prefix.
+- `backfill_branch_columns(session, project_id=None)` — Startup backfill that
+  populates NULL `integration_branch` / `promotion_target` from GitHub defaults;
+  only writes still-NULL columns, so it is safe to re-run.
+
+`InvalidProjectBranchConfiguration` is raised when a project's integration branch
+would route work directly to the promotion target — a gate-bypass guard enforced
+at the merge/rollup boundary.
+
+---
 
 ### Release Qualification & Promotion
 
@@ -676,9 +907,13 @@ Spawns research tasks from strategic directions without manual intervention.
 4. Deduplication: avoids re-proposing completed work
 
 **Functions:**
-- `autonomous_research_worker()` — Main background loop
-- `_select_eligible_direction()` — Ranking & conflict-free selection
-- `_spawn_research_task()` — Create task from direction
+- `_check_idle_research()` — Idle-pipeline entry point; called each `orchestrator_worker()`
+  cycle (there is no dedicated `autonomous_research_worker` loop — autonomy piggybacks
+  on the orchestrator loop)
+- `_check_autonomous_research(owner, repo)` — Event-driven entry point invoked from the
+  GitHub webhook handler
+- `_spawn_research_task()` / `_spawn_research_task_inner()` — Create a research task from a direction
+- `_spawn_periodic_task()` — Spawn periodic non-research strategic tasks
 
 ---
 
@@ -704,17 +939,12 @@ Handles completion of strategic-mode tasks (design doc updates, reviews, etc.).
 
 ### Telemetry & Analytics
 
-#### `telemetry.py`
+#### Execution metrics
 
-Collects execution metrics from agent heartbeats.
-
-**Metrics:**
-- Token usage
-- Time per phase (planning, coding, review)
-- Tool invocations
-- Error types and frequencies
-
-Used for cost reporting and performance analysis.
+Execution metrics (token usage, time per phase, tool invocations, error
+frequencies) are not collected by a dedicated `telemetry.py`. They arrive on
+the `AgentStatusPayload` (terminal report) and `HeartbeatRequest` (keep-alive)
+schemas and are aggregated for cost/performance reporting by the modules below.
 
 ---
 
@@ -780,6 +1010,104 @@ Used by orchestrator to validate incoming task payloads before queueing.
 
 ---
 
+### CI & Merge Workflows
+
+#### `ci_completion.py`
+
+Processes CI check results for tasks waiting on CI.
+
+**Responsibilities:**
+- Poll or receive GitHub check-run status
+- Merge on success (via merge decision logic)
+- Spawn fix tasks on failure
+- Handle edge cases: merge conflicts, race conditions, abandoned PRs
+
+**Key functions:**
+- `handle_ci_completion()` — Main handler called from webhook or polling loop
+
+---
+
+#### `ci_merge_helpers.py`
+
+Handles merge decisions and conflict resolution.
+
+**Functions:**
+- `_review_approved()` — Validate the review loop reached approval
+- `_capture_merge_snapshot()` — Snapshot gate fields before releasing the row lock
+- `_relock_merge_task()` — Re-acquire the lock and re-validate against the snapshot
+- `_normalize_merge_error()` / `_is_deterministic_merge_error()` — Classify merge errors
+- `_post_merge_summary()` — Post the post-merge summary comment
+
+---
+
+### Monitoring & Alerting
+
+#### `alert_dispatch.py`
+
+Sends operator alerts for high-severity issues.
+
+**Triggers:**
+- Circuit breaker opened (repeated failures)
+- Zone exhaustion
+- GitHub rate limit exceeded
+- Provider quota reached
+
+**Delivery:** Webhook/Slack/email (via `notification_service`).
+
+---
+
+#### `anomaly_detection.py`
+
+Detects pipeline anomalies in real time.
+
+**Signals:**
+- Success rate drops below threshold
+- Token cost spike
+- Latency spike
+- Failure clustering
+
+**Response:**
+- Auto-throttle concurrency
+- Pause autonomous research
+- Create operator alert
+
+---
+
+#### `deploy_health.py`
+
+Monitors deployment health after a new release.
+
+**Checks:**
+- Error rate within baseline
+- Latency within baseline
+- No cascading failures
+
+**Actions:**
+- Mark deploy as STABLE when safe
+- Trigger rollback if unsafe
+
+---
+
+### Utilities & Helpers
+
+#### `admin.py`
+
+Admin-only endpoints and helpers (re-exported from main.py).
+
+---
+
+#### `admin_helpers.py`
+
+Utilities for admin operations (project config, user management).
+
+---
+
+#### `admin_task_mutations.py`
+
+Helpers for admin-triggered task operations (spawn, cancel, pause).
+
+---
+
 ## Testing Patterns
 
 ### `testing/conftest.py`
@@ -811,13 +1139,35 @@ Test files mirror source structure:
 
 | Module | Purpose | Key Dependency |
 |--------|---------|-----------------|
+| **Core Infrastructure** | | |
 | main.py | FastAPI app + routes | schemas, models, orchestrator |
 | models.py | ORM/database schema | database.py |
 | database.py | Async PostgreSQL | SQLAlchemy |
+| schemas.py | Pydantic request/response DTOs | fastapi |
+| auth.py | Firebase, JWT, API key auth | firebase_admin |
+| **Orchestration** | | |
 | orchestrator.py | Task queue polling | task_lifecycle, compute |
-| compute.py | GCP VM lifecycle | google-cloud-compute |
-| task_lifecycle.py | State machine | models |
-| github.py | GitHub API client | httpx, async |
-| autonomous_research.py | Research task spawning | task_lifecycle, strategic_spawning |
-| failure_classification.py | Error categorization | — |
 | reaper.py | Heartbeat timeout handler | task_lifecycle, compute |
+| compute.py | GCP VM lifecycle | google-cloud-compute |
+| compute_manifest.py | Agent secret manifest building | models |
+| **Task Management** | | |
+| task_lifecycle.py | State machine | models |
+| task_completion.py | Terminal status handling | task_lifecycle |
+| ci_completion.py | CI result processing | github, task_lifecycle |
+| task_capabilities.py | Task type → handler mapping | — |
+| **GitHub & Repositories** | | |
+| github.py | GitHub API client | httpx, async |
+| branch_resolution.py | Per-project branch/promotion resolution | models |
+| **Autonomous Research** | | |
+| autonomous_research.py | Research task spawning | task_lifecycle, strategic_spawning |
+| strategic_spawning.py | Context building for strategic agent | models |
+| strategic_completion.py | Post-research processing | models |
+| direction_lifecycle.py | Direction state management | models |
+| **Monitoring & Diagnostics** | | |
+| failure_classification.py | Error categorization | — |
+| ci_merge_helpers.py | Merge decision logic | github, task_lifecycle |
+| alert_dispatch.py | Operator alert delivery | models |
+| anomaly_detection.py | Pipeline anomalies | models |
+| **Utilities** | | |
+| lifecycle.py | Background workers startup/shutdown | asyncio |
+| payload_schemas.py | Task payload validation | models |

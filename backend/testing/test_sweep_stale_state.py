@@ -198,4 +198,5 @@ class TestSweepSummary:
             "warm_pin_clear_events",
             "warm_backlog_first_refusal",
             "warm_backlog_reuse_failure_events",
+            "warm_pool_claim_failure_events",
         }

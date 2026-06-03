@@ -1,6 +1,7 @@
 import { AlertTriangle, CheckCircle } from 'lucide-react';
 import { Skeleton } from './DashboardMetricCards';
 import { timeAgo } from '../utils/time';
+import { splitConvergenceVerdict } from '../utils/convergenceVerdict';
 import type { DigestData } from './DashboardHome';
 
 export interface LatestCycle {
@@ -28,6 +29,10 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
   const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
 
+  // Lift the convergence verdict out of the prose via the shared helper so this
+  // card and CatchUpNarrativeSummary surface it identically.
+  const { verdict: convergenceVerdict, prose } = splitConvergenceVerdict(digest?.narrative_summary);
+
   return (
     <section>
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">System Status</h2>
@@ -38,8 +43,16 @@ export function SystemStatusCard({ digest, loading }: SystemStatusCardProps) {
           <p className="text-neutral-500 text-xs">No recent activity</p>
         ) : (
           <>
-            {digest?.narrative_summary && (
-              <p className="text-sm text-neutral-300 leading-relaxed">{digest.narrative_summary}</p>
+            {prose && (
+              <p className="text-sm text-neutral-300 leading-relaxed">{prose}</p>
+            )}
+            {convergenceVerdict && (
+              <p
+                className="text-xs font-medium text-amber-300/90 leading-relaxed mt-1.5"
+                aria-label="Review/fix convergence verdict"
+              >
+                {convergenceVerdict}
+              </p>
             )}
             {cycle && (
               <>

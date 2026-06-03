@@ -1,5 +1,7 @@
 import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
+import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
+import type { ProblemModelPatch } from './types';
 
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -189,6 +191,144 @@ export async function fetchResearchActionability(
     `/api/admin/projects/${encodeURIComponent(projectId)}/research-actionability?cycles=${cycles}`,
   );
   if (!res.ok) throw new Error(`Failed to fetch research actionability: ${res.status}`);
+  return res.json();
+}
+
+export interface OuterLoopOutcomeCounts {
+  merged?: number;
+  rejected?: number;
+  cap_exhausted?: number;
+  stuck?: number;
+  standoff?: number;
+  repeat_fingerprint_halt?: number;
+  [key: string]: number | undefined;
+}
+
+export interface OuterLoopIncidenceCounts {
+  churn?: number;
+  stuck?: number;
+  standoff?: number;
+  repeat_fingerprint?: number;
+  overall_escalations?: number;
+  [key: string]: number | undefined;
+}
+
+export interface OuterLoopIncidenceRates {
+  churn?: number | null;
+  stuck?: number | null;
+  standoff?: number | null;
+  repeat_fingerprint?: number | null;
+  overall_escalations?: number | null;
+  [key: string]: number | null | undefined;
+}
+
+export interface OuterLoopDominantBlocker {
+  cause: string;
+  count: number;
+  total: number;
+  share: number;
+}
+
+export interface OuterLoopConvergenceSummary {
+  window_hours: number;
+  prs_with_review_loop: number;
+  iteration_median: number | null;
+  iteration_p95: number | null;
+  iteration_distribution: Record<string, number>;
+  churn_total: number;
+  churn_pr_count: number;
+  drift_pr_count: number;
+  outcomes: OuterLoopOutcomeCounts;
+  terminal_outcome_histogram?: OuterLoopOutcomeCounts;
+  incidence_counts?: OuterLoopIncidenceCounts;
+  incidence_rates?: OuterLoopIncidenceRates;
+  escalation_total: number;
+  escalation_by_reason: Record<string, number>;
+  convergence_rate: number | null;
+  non_converged_total?: number;
+  dominant_blocker?: OuterLoopDominantBlocker | null;
+}
+
+export interface OuterLoopConvergenceTrendBucket {
+  date: string;
+  pr_count: number;
+  convergence_rate: number | null;
+  escalation_total: number;
+  churn_total: number;
+  terminal_outcome_histogram?: OuterLoopOutcomeCounts;
+  incidence_counts?: OuterLoopIncidenceCounts;
+  incidence_rates?: OuterLoopIncidenceRates;
+}
+
+export interface OuterLoopConvergenceTrendResponse {
+  days: number;
+  buckets: OuterLoopConvergenceTrendBucket[];
+  // Canonical churn-trend direction computed by the backend
+  // (digest_metrics.compute_churn_direction). Consumed by the widget glyph so
+  // it can never disagree with the narrative's "Review/fix churn is X." verdict,
+  // which reads the same value. Optional for back-compat with older backends.
+  churn_direction?: 'falling' | 'rising' | 'flat';
+}
+
+export async function fetchOuterLoopConvergence(
+  hours = 24,
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<OuterLoopConvergenceSummary> {
+  const params = new URLSearchParams({ hours: String(hours) });
+  if (projectId) params.set('project_id', projectId);
+  const res = await apiFetch(`/api/admin/outer-loop-convergence?${params.toString()}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch outer-loop convergence: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchOuterLoopConvergenceTrend(
+  days: 7 | 14 | 30,
+  projectId?: string,
+  signal?: AbortSignal,
+): Promise<OuterLoopConvergenceTrendResponse> {
+  const params = new URLSearchParams({ days: String(days) });
+  if (projectId) params.set('project_id', projectId);
+  const res = await apiFetch(`/api/admin/outer-loop-convergence-trend?${params.toString()}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch outer-loop convergence trend: ${res.status}`);
+  return res.json();
+}
+
+/** A single outer review<->fix PR-chain behind a terminal outcome / blocker. */
+export interface OuterLoopChain {
+  pr_number: number | null;
+  task_ids: string[];
+  max_iteration: number;
+  churn_count: number;
+  terminal_reason: string | null;
+  project_id: string | null;
+}
+
+export interface OuterLoopChainsResponse {
+  window_hours: number;
+  reason_filter: string | null;
+  total: number;
+  chains: OuterLoopChain[];
+}
+
+/**
+ * List the specific PR-chains behind a terminal outcome / blocker reason.
+ * When `reason` is omitted the backend returns all non-merged chains (the
+ * actionable set). Mirrors the retry/timeout/abort semantics of the other
+ * outer-loop fetchers.
+ */
+export async function fetchOuterLoopChains(
+  hours = 24,
+  projectId?: string,
+  reason?: string,
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<OuterLoopChainsResponse> {
+  const params = new URLSearchParams({ hours: String(hours), limit: String(limit) });
+  if (projectId) params.set('project_id', projectId);
+  if (reason) params.set('reason', reason);
+  const res = await apiFetch(`/api/admin/outer-loop-chains?${params.toString()}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch outer-loop chains: ${res.status}`);
   return res.json();
 }
 
@@ -575,11 +715,26 @@ export async function onboardProject(
   name?: string,
   buildConfigOverride?: Record<string, unknown>,
   promotionTarget?: string,
+  goal?: string,
+  initialSteering?: Pick<ProblemModelPatch, 'context' | 'constraints'>,
 ): Promise<{ project_id: string; build_config: Record<string, unknown> }> {
   const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
   if (name) body.name = name;
   if (buildConfigOverride) body.build_config_override = buildConfigOverride;
   if (promotionTarget) body.promotion_target = promotionTarget;
+  if (goal) body.goal = goal;
+  if (initialSteering) {
+    const steering: Record<string, unknown> = {};
+    const contextEntries = Object.entries(initialSteering.context ?? {})
+      .map(([key, value]) => [key, typeof value === 'string' ? value.trim() : ''] as const)
+      .filter(([, value]) => value.length > 0);
+    if (contextEntries.length > 0) steering.context = Object.fromEntries(contextEntries);
+
+    const constraints = initialSteering.constraints?.map((constraint) => constraint.trim()).filter((constraint) => constraint.length > 0);
+    if (constraints && constraints.length > 0) steering.constraints = constraints;
+
+    if (Object.keys(steering).length > 0) body.initial_steering = steering;
+  }
   const res = await apiFetch('/api/admin/projects/onboard', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -601,10 +756,43 @@ export interface EfficiencyAxis {
   history: EfficiencyHistoryPoint[];
 }
 
+// Per-project warm-pool payoff verdict: a single synthesized answer to "did
+// enabling the pool produce a measured reuse lift WITHOUT a cost regression?",
+// folded from the pool-origin warm-start share + dispatch-funnel hit rate (lift)
+// and the idle-inclusive cost-per-merged-PR drift (no-regression). Optional so
+// the panel degrades silently on an older backend that omits it.
+export type PoolPayoffState =
+  | 'PROVEN'
+  | 'COST_REGRESSION'
+  | 'NO_LIFT'
+  | 'INSUFFICIENT_DATA';
+
+export interface PoolPayoffVerdict {
+  state: PoolPayoffState;
+  supporting: {
+    pool_origin_share: number | null;
+    pool_warm_starts: number | null;
+    pool_hit_rate: number | null;
+    total_pool_dispatches: number | null;
+    cost_drift_pct: number | null;
+    cost_incl_idle_current: number | null;
+    cost_baseline: number | null;
+  };
+  recommended_action: string;
+}
+
 export interface EfficiencyAxesResponse {
   axes: Record<string, EfficiencyAxis>;
   baseline_captured_at: string | null;
   last_snapshot_at: string | null;
+  // Idle-inclusive cost-per-merged-PR as a companion trended axis (current +
+  // history + a baseline sourced from the immutable pre-pool cost axis), so the
+  // warm-reuse-vs-cost trend can chart true cost regression beside the headline
+  // idle-exclusive cost line. Absent on older snapshots → optional.
+  cost_per_merged_pr_incl_pool_idle_axis?: EfficiencyAxis;
+  // Synthesized warm-pool payoff verdict (see PoolPayoffVerdict). Optional so
+  // older backends that omit it degrade silently.
+  pool_payoff_verdict?: PoolPayoffVerdict;
 }
 
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
@@ -975,6 +1163,173 @@ export async function updateStagingBranchPrefixes(
   return res.json();
 }
 
+export interface ApprovalGateConfig {
+  infra_files: string[];
+  critical_files: string[];
+}
+
+export interface ApprovalGateConfigResponse {
+  project_id: string;
+  approval_gate_config: ApprovalGateConfig;
+  /** True when both lists are empty (freshly onboarded repo, never customized). */
+  is_default: boolean;
+}
+
+/**
+ * Validate a single approval-gate path against the same rules the API enforces
+ * (admin_project_config._validate_approval_gate_paths): no leading slash, no
+ * parent-directory traversal segment, and only `[A-Za-z0-9._-/]` characters
+ * (rejects shell metacharacters). Returns a human-readable error string, or
+ * `null` when the path is valid. Lets the editor surface feedback inline
+ * instead of only failing on submit.
+ */
+export function validateApprovalGatePath(path: string): string | null {
+  const trimmed = path.trim();
+  if (!trimmed) return 'Path must not be empty';
+  if (trimmed.startsWith('/')) return 'Path must be repo-relative (no leading "/")';
+  if (trimmed.split('/').includes('..')) return 'Path must not contain ".." traversal';
+  if (!/^[A-Za-z0-9._\-/]+$/.test(trimmed)) return 'Path may only contain letters, digits, and . _ - /';
+  return null;
+}
+
+export async function fetchApprovalGateConfig(
+  projectId: string,
+): Promise<ApprovalGateConfigResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/approval-gate-config`);
+  if (!res.ok) throw new Error(`Failed to fetch approval-gate config: ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Partial update of the approval-gate file lists (owner-only on the server).
+ * Pass only the list(s) you want to change. Takes effect for agents
+ * immediately via the existing claim-response seam.
+ */
+export async function updateApprovalGateConfig(
+  projectId: string,
+  config: Partial<ApprovalGateConfig>,
+): Promise<ApprovalGateConfigResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/approval-gate-config`,
+    { method: 'PATCH', body: JSON.stringify(config) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to update approval-gate config: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update approval-gate config: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Owner-only project delete. The backend cascades to tasks/artifacts/history
+ * and, when `force` is true, bulk-cancels active tasks and tears down their VMs
+ * before removing the project. Without `force` the server refuses (409) if the
+ * project still has active tasks. Surfaces the server `detail` (403 permission,
+ * 409 active-tasks, 429 contention) as the thrown error message.
+ */
+export async function deleteProject(
+  projectId: string,
+  force = false,
+): Promise<{ message: string; active_tasks_cancelled: number }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}?force=${force}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to delete project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to delete project: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function resetProject(
+  projectId: string,
+): Promise<{ message: string; active_tasks_cancelled: number; tasks_deleted: number }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/reset`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to reset project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to reset project: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function setProjectPaused(
+  projectId: string,
+  paused: boolean,
+): Promise<{ paused: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/pause`,
+    { method: 'PATCH', body: JSON.stringify({ paused }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to update pause state: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update pause state: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Owner-only project archive. Sets `archived=True` so the project disappears
+ * from the active dashboard and stops generating/dispatching new work; all
+ * project data is retained for a later unarchive. Idempotent on the server.
+ * Surfaces the server `detail` (403 permission, etc.) as the thrown error.
+ */
+export async function archiveProject(
+  projectId: string,
+): Promise<{ message: string; archived: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/archive`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to archive project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to archive project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Owner-only project unarchive. Clears `archived` so the project reappears in
+ * the active list and regains normal eligibility. Idempotent on the server.
+ */
+export async function unarchiveProject(
+  projectId: string,
+): Promise<{ message: string; archived: boolean }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/unarchive`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.error?.message) || (data?.detail) || `Failed to unarchive project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to unarchive project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
+ * Fetch the archived-only project set (the restore view). The active project
+ * list is fetched elsewhere (useProjectsState); this dedicated helper requests
+ * `GET /api/admin/projects?archived=true` and returns the lightweight `items`
+ * array. Each item carries `archived: true`.
+ */
+export async function fetchArchivedProjects(
+  limit = 100,
+): Promise<import('./types/project').Project[]> {
+  const res = await apiFetch(`/api/admin/projects?archived=true&limit=${limit}`);
+  if (!res.ok) throw new Error(`Failed to fetch archived projects: ${res.status}`);
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
 export interface NullBranchConfigEntry {
   id: string;
   name: string;
@@ -1002,6 +1357,63 @@ export async function backfillProjectBranches(projectId: string): Promise<unknow
     { method: 'POST' },
   );
   if (!res.ok) throw new Error(`Failed to backfill branches: ${res.status}`);
+  return res.json();
+}
+
+// Enable the warm pool for a single project: scopes the allowlist to it, forces
+// the master switch on, establishes a sensible target, and warms first members.
+// Backs POST /api/admin/projects/{id}/warm-pool/enable.
+export async function enableWarmPoolForProject(projectId: string): Promise<unknown> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/warm-pool/enable`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to enable warm pool: ${res.status}`);
+  return res.json();
+}
+
+// Disable the warm pool for a single project: drains its members and removes it
+// from the allowlist without affecting peers that are still scoped.
+// Backs POST /api/admin/projects/{id}/warm-pool/disable.
+export async function disableWarmPoolForProject(projectId: string): Promise<unknown> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/warm-pool/disable`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to disable warm pool: ${res.status}`);
+  return res.json();
+}
+
+// Read the current per-project warm-pool TARGET map (and the global fallback)
+// from the settings endpoint. Returns the two target fields; the rest of the
+// settings payload is ignored. An older backend that predates per-project
+// targets omits the map — coerce that to {} so callers always get a record.
+export async function fetchWarmPoolTargets(): Promise<WarmPoolTargets> {
+  const res = await apiFetch('/api/admin/settings');
+  if (!res.ok) throw new Error(`Failed to fetch warm-pool targets: ${res.status}`);
+  const data = await res.json();
+  return {
+    warm_pool_target_size: Number(data?.warm_pool_target_size ?? 0),
+    warm_pool_target_size_by_project: data?.warm_pool_target_size_by_project ?? {},
+  };
+}
+
+// Set (targetSize 0..50) or clear (null) a single project's explicit warm-pool
+// target. Backs POST /api/admin/projects/{id}/warm-pool/target with body
+// {target_size}. Clearing falls the project back to the global default.
+export async function setWarmPoolTargetForProject(
+  projectId: string,
+  targetSize: number | null,
+): Promise<WarmPoolTargetSetResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/warm-pool/target`,
+    { method: 'POST', body: JSON.stringify({ target_size: targetSize }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to set warm-pool target: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to set warm-pool target: ${res.status}`);
+  }
   return res.json();
 }
 

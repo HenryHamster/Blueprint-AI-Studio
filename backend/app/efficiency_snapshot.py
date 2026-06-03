@@ -21,9 +21,10 @@ import logging
 import statistics
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -32,7 +33,11 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
+from app.landed_signal import has_merge_unblock_signal, is_merged_completion
 from app.models import (
+    PoolIdleCostLedger,
+    PoolVm,
+    PoolVmState,
     Project,
     Task,
     TaskStatus,
@@ -41,6 +46,7 @@ from app.models import (
     get_task_total_vm_cost_usd,
 )
 from app.task_locking import project_lock
+from app.vm_cost_rates import idle_cost_usd
 
 router = APIRouter()
 
@@ -130,6 +136,13 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
 
 DESIGN_DOC_KEY = "efficiency_baseline"
 
+# Sub-key under the efficiency_baseline container recording the last warm-pool
+# payoff verdict state we raised an operator alert for. The per-project
+# transition check (:func:`maybe_alert_pool_payoff_transition`) compares the
+# current verdict against this marker so it fires once per decision-boundary
+# crossing rather than every hourly tick.
+LAST_ALERTED_PAYOFF_KEY = "last_alerted_payoff_verdict"
+
 # Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
@@ -167,6 +180,7 @@ async def _load_recent_tasks(
                 Task.status,
                 Task.context,
                 Task.vm_spot,
+                Task.vm_machine_type,
                 Task.vm_provisioned_at,
                 Task.vm_stopped_at,
                 Task.vm_cold_start_ms,
@@ -182,17 +196,620 @@ async def _load_recent_tasks(
     return list((await session.execute(stmt)).scalars().all())
 
 
-def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
-    """Total VM cost / merged PR count over the window. None when no merges."""
+def _cost_and_merges(tasks: list[Task]) -> tuple[float, int]:
+    """Return (total task-attached VM cost, merged-PR count) over the window."""
     total_cost = 0.0
     merged = 0
     for t in tasks:
         total_cost += get_task_total_vm_cost_usd(t)
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+        if is_merged_completion(t):
             merged += 1
+    return total_cost, merged
+
+
+def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
+    """Total VM cost / merged PR count over the window. None when no merges."""
+    total_cost, merged = _cost_and_merges(tasks)
     if not merged:
         return None
     return round(total_cost / merged, 4)
+
+
+# ---------------------------------------------------------------------------
+# Warm-pool idle-VM cost accounting (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# Idle pool members still bill GCE wall-clock even though they carry no task, so
+# task-attached cost (get_task_total_vm_cost_usd) understates real spend once a
+# pool exists — pre-warming could make cost_per_merged_pr look BETTER while
+# total spend rises. We make that honest two ways:
+#   1. settle_pool_vm_idle_cost() banks elapsed idle seconds * the fleet
+#      per-second rate onto PoolVm.idle_cost_banked when a member leaves IDLE
+#      (the lease / reaper paths in app.warm_pool are the intended callers).
+#   2. compute_pool_idle_cost() sums that banked cost AND the live (not-yet-
+#      settled) accrual of currently-IDLE members, so the figure is correct even
+#      before any settle call fires.
+# The figure is surfaced as a clearly-labelled companion to cost_per_merged_pr
+# (cost_per_merged_pr_incl_pool_idle) rather than folded into the immutable
+# baseline axis, so existing drift comparisons stay apples-to-apples.
+
+
+def settle_pool_vm_idle_cost(
+    member: PoolVm, *, now: Optional[datetime] = None
+) -> float:
+    """Bank elapsed idle cost onto ``member.idle_cost_banked``; return the amount.
+
+    Computes ``(now - idle_since) * fleet_rate`` at the fleet machine type /
+    spot mode, adds it to the running ``idle_cost_banked`` total, and advances
+    ``idle_since`` to ``now`` so the same span is never billed twice. A no-op
+    (returns 0.0) when the member is not currently idle or no time has elapsed.
+    The caller owns the transaction (commit).
+    """
+    if member.idle_since is None:
+        return 0.0
+    if now is None:
+        now = _utcnow()
+    elapsed = (now - member.idle_since).total_seconds()
+    if elapsed <= 0:
+        return 0.0
+    cost = idle_cost_usd(elapsed)
+    member.idle_cost_banked = (member.idle_cost_banked or 0.0) + cost
+    member.idle_since = now
+    return cost
+
+
+async def compute_pool_idle_cost(
+    session: AsyncSession, project_id: Optional[uuid.UUID] = None
+) -> Dict[str, Any]:
+    """Aggregate warm-pool size + idle cost (banked + live accrual).
+
+    When ``project_id`` is given the scan is scoped to that tenant's members;
+    otherwise it spans every pool member (the fleet-wide admin view).
+
+    ``pool_size`` counts live members (PROVISIONING/IDLE/LEASED); RETIRING
+    members are excluded from the size but their already-banked idle cost is
+    still summed so teardown never erases measured spend. ``live_idle_cost_usd``
+    is the not-yet-settled accrual of currently-IDLE members.
+
+    Because the idle reaper HARD-DELETES a member's row on teardown, the banked
+    cost of every already-reaped member is carried in the durable
+    ``PoolIdleCostLedger`` (written atomically with the delete). That carry-
+    forward is summed into ``settled_idle_cost_usd`` here so spend survives the
+    delete — without it the metric would only ever see members that happen to
+    still exist at snapshot time, undercounting by the bulk of pool idle cost.
+
+    ``by_account`` breaks idle cost down by the member's pinned ``account_id`` so
+    an operator can read which account's idle members drive cost during a
+    controlled enable. It covers LIVE members only (banked + live accrual of
+    rows that still exist); the ledger carry-forward of already-reaped members
+    cannot be attributed per account (``PoolIdleCostLedger`` carries no
+    ``account_id``), so it stays in the fleet-wide ``retired_idle_cost_usd`` and
+    is intentionally absent from the per-account totals.
+    """
+    from app.warm_backlog_reuse import _account_label  # noqa: PLC0415
+
+    stmt = select(PoolVm)
+    if project_id is not None:
+        stmt = stmt.where(PoolVm.project_id == project_id)
+    members = list((await session.execute(stmt)).scalars().all())
+
+    now = _utcnow()
+    settled = 0.0
+    live = 0.0
+    pool_size = 0
+    idle_count = 0
+    by_account: Dict[str, Dict[str, Any]] = {}
+
+    def _bucket(member: PoolVm) -> Dict[str, Any]:
+        return by_account.setdefault(
+            _account_label(member.account_id),
+            {
+                "settled_idle_cost_usd": 0.0,
+                "live_idle_cost_usd": 0.0,
+                "member_count": 0,
+                "idle_count": 0,
+            },
+        )
+
+    for m in members:
+        banked = m.idle_cost_banked or 0.0
+        settled += banked
+        bucket = _bucket(m)
+        bucket["settled_idle_cost_usd"] += banked
+        if m.state == PoolVmState.RETIRING:
+            continue
+        pool_size += 1
+        bucket["member_count"] += 1
+        if m.state == PoolVmState.IDLE and m.idle_since is not None:
+            idle_count += 1
+            elapsed = (now - m.idle_since).total_seconds()
+            if elapsed > 0:
+                accrued = idle_cost_usd(elapsed)
+                live += accrued
+                bucket["live_idle_cost_usd"] += accrued
+                bucket["idle_count"] += 1
+
+    for bucket in by_account.values():
+        bucket["settled_idle_cost_usd"] = round(bucket["settled_idle_cost_usd"], 6)
+        bucket["live_idle_cost_usd"] = round(bucket["live_idle_cost_usd"], 6)
+        bucket["total_idle_cost_usd"] = round(
+            bucket["settled_idle_cost_usd"] + bucket["live_idle_cost_usd"], 6
+        )
+
+    # Carry-forward: durable idle spend of members already reaped (rows deleted).
+    ledger_stmt = select(
+        func.coalesce(func.sum(PoolIdleCostLedger.idle_cost_usd), 0.0)
+    )
+    if project_id is not None:
+        ledger_stmt = ledger_stmt.where(
+            PoolIdleCostLedger.project_id == project_id
+        )
+    retired_idle = float((await session.execute(ledger_stmt)).scalar() or 0.0)
+    settled += retired_idle
+
+    return {
+        "pool_size": pool_size,
+        "idle_count": idle_count,
+        "settled_idle_cost_usd": round(settled, 6),
+        "retired_idle_cost_usd": round(retired_idle, 6),
+        "live_idle_cost_usd": round(live, 6),
+        "total_idle_cost_usd": round(settled + live, 6),
+        "by_account": by_account,
+    }
+
+
+def compute_pool_cost_amortization(
+    idle_cost_usd: float, funnel: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Cost-amortization view of the warm pool over the funnel's window.
+
+    Combines the warm-pool idle-cost accrual with the pool dispatch funnel so
+    operators can see whether idle spend is being amortized by warm-start hits —
+    the same two live signals the maintainer's cost-aware auto-drain guard acts
+    on (see ``app.warm_pool_maintainer.evaluate_pool_cost_guard``), surfaced
+    read-only here. ``cost_per_pool_hit_usd`` is the idle dollars spent per warm
+    start over the window (``None`` when no hit has landed yet — idle spend is
+    not being amortized at all).
+    """
+    hits = int(funnel.get("pool_lease_hits") or 0)
+    idle = round(float(idle_cost_usd or 0.0), 6)
+    return {
+        "window_hours": funnel.get("window_hours"),
+        "pool_idle_cost_usd": idle,
+        "pool_lease_hits": hits,
+        "pool_hit_rate": funnel.get("pool_hit_rate"),
+        "total_dispatches": funnel.get("total_dispatches", 0),
+        "cost_per_pool_hit_usd": round(idle / hits, 6) if hits else None,
+    }
+
+
+def compute_pool_cost_amortization_by_account(
+    idle_by_account: Dict[str, Any], funnel: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Per-account cost-amortization: join per-account pool idle cost with the
+    per-account dispatch funnel.
+
+    Lets an operator answer, PER ACCOUNT, how many dispatches the pool served
+    warm, the per-account hit rate, the per-account (live-member) idle cost, and
+    the idle dollars spent per warm start — the breakdown a controlled enable's
+    'retire on success or pivot' decision depends on. ``idle_by_account`` is the
+    ``by_account`` map from :func:`compute_pool_idle_cost`; ``funnel`` is
+    :func:`app.warm_backlog_reuse.get_pool_funnel_snapshot`. Accounts present on
+    only one side are still emitted (idle members but no dispatch yet, or
+    dispatches but no live member). ``cost_per_pool_hit_usd`` is ``None`` when
+    that account has no warm hit yet — its idle spend is not being amortized.
+    """
+    funnel_accounts = funnel.get("by_account") or {}
+    out: Dict[str, Any] = {}
+    for label in set(idle_by_account) | set(funnel_accounts):
+        idle = idle_by_account.get(label) or {}
+        fb = funnel_accounts.get(label) or {}
+        hits = int(fb.get("pool_lease_hits") or 0)
+        idle_cost = round(float(idle.get("total_idle_cost_usd") or 0.0), 6)
+        out[label] = {
+            "pool_idle_cost_usd": idle_cost,
+            "pool_lease_hits": hits,
+            "cold_dispatches": int(fb.get("cold_dispatches") or 0),
+            "total_dispatches": int(fb.get("total_dispatches") or 0),
+            "pool_hit_rate": fb.get("pool_hit_rate"),
+            "cost_per_pool_hit_usd": round(idle_cost / hits, 6) if hits else None,
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Per-project warm-pool PAYOFF VERDICT (direction d-… bounded-enable proof)
+# ---------------------------------------------------------------------------
+# The backend already assembles every signal needed to judge whether a bounded
+# single-project warm-pool enable paid off — the idle-inclusive cost-per-merged-
+# PR drift (NO-regression half) and the POOL-origin warm-start share + pool
+# dispatch-funnel hit rate (LIFT half). What it lacks is a single synthesized
+# answer. This classifier folds those raw numbers into one of four verdict
+# states with the supporting numbers and a recommended next action, so an
+# operator managing the pool sees the direction question — "did enabling the
+# pool produce a measured reuse lift WITHOUT a cost regression?" — answered in
+# one place instead of cross-referencing several figures and a trend chart.
+#
+# GROUNDING RULES (mirrors the codebase warnings in _compute_warm_start_origin_
+# breakdown and warm_pool_maintainer.evaluate_pool_cost_guard):
+#   * Read LIFT off the POOL-specific signals — the pool dispatch-funnel hit
+#     rate and the pool-origin SHARE of warm starts — NOT the aggregate
+#     vm_reuse_rate, which is contaminated by chain-continuity / backlog-reuse /
+#     fix-loop reruns.
+#   * Read NO-REGRESSION off the idle-inclusive cost-per-merged-PR drift versus
+#     the immutable pre-pool baseline (that axis already folds pool idle spend
+#     into the numerator, so its drift directly answers the cost question).
+# It is a PURE, DB-free synthesis over fields already on the efficiency-axes
+# response — no new data collection, schema, or migration — so the operator
+# gets a fresh judgment on demand (the cost side updates with the daily
+# snapshot, which is fine for a multi-day proven-over-the-window verdict).
+
+# Verdict states.
+POOL_PAYOFF_PROVEN = "PROVEN"
+POOL_PAYOFF_COST_REGRESSION = "COST_REGRESSION"
+POOL_PAYOFF_NO_LIFT = "NO_LIFT"
+POOL_PAYOFF_INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+
+# Thresholds. The hit-rate floor and minimum dispatch sample size deliberately
+# mirror the warm-pool cost-guard defaults (warm_pool_cost_guard_min_hit_rate /
+# warm_pool_cost_guard_min_dispatches in warm_pool_maintainer) so the verdict's
+# "is the pool serving / do we have enough dispatches to judge" bar matches the
+# guard the maintainer actually drains on. The cost tolerance is a small slack
+# band on the idle-inclusive cost drift — within it, the pool has NOT regressed
+# cost per PR.
+POOL_PAYOFF_HIT_RATE_FLOOR = 0.10
+POOL_PAYOFF_ORIGIN_SHARE_FLOOR = 0.10
+POOL_PAYOFF_MIN_POOL_DISPATCHES = 20
+POOL_PAYOFF_COST_TOLERANCE_PCT = 5.0
+
+# Minimum pool-origin warm starts before a PROVEN verdict is worth an operator
+# alert. PROVEN on only a couple of warm starts is statistically thin — wait for
+# material volume before recommending a wider scope. COST_REGRESSION has no such
+# floor: a cost regression on a bounded enable is actionable immediately.
+POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
+
+
+def compute_pool_payoff_verdict(
+    origin_breakdown: Optional[Dict[str, Any]],
+    cost_incl_axis: Optional[Dict[str, Any]],
+    pool_funnel: Optional[Dict[str, Any]],
+    *,
+    hit_rate_floor: float = POOL_PAYOFF_HIT_RATE_FLOOR,
+    origin_share_floor: float = POOL_PAYOFF_ORIGIN_SHARE_FLOOR,
+    min_pool_dispatches: int = POOL_PAYOFF_MIN_POOL_DISPATCHES,
+    cost_tolerance_pct: float = POOL_PAYOFF_COST_TOLERANCE_PCT,
+) -> Dict[str, Any]:
+    """Synthesize the warm-pool payoff verdict for one project.
+
+    ``origin_breakdown`` is :func:`_compute_warm_start_origin_breakdown`'s output
+    (``pool_origin_share`` + per-origin counts) or ``None``. ``cost_incl_axis``
+    is the ``cost_per_merged_pr_incl_pool_idle_axis`` block
+    (``current``/``baseline``/``drift_pct``) or ``None``. ``pool_funnel`` is the
+    persisted ``pool_dispatch_funnel`` block (``pool_hit_rate`` +
+    ``total_dispatches``) or ``None``. Pure and DB-free so it is unit-testable
+    over synthetic axis inputs.
+
+    Returns ``{state, supporting, recommended_action}`` where ``state`` is one of
+    the ``POOL_PAYOFF_*`` constants and ``supporting`` carries the numbers the
+    classification was read off so the operator can see WHY.
+
+    Classification (checked in order):
+      * ``INSUFFICIENT_DATA`` — no cost baseline/current, or too few pool
+        dispatches to judge lift. Nothing to conclude yet; keep measuring.
+      * ``COST_REGRESSION`` — idle-inclusive cost per merged PR is materially
+        above the pre-pool baseline (``drift_pct`` over tolerance). The headline
+        stop signal regardless of lift: you are paying more per PR.
+      * ``NO_LIFT`` — the pool is barely serving (BOTH the funnel hit rate and
+        the pool-origin share below their floors) so idle spend is not being
+        amortized, even though cost has not (yet) materially regressed.
+      * ``PROVEN`` — the pool is measurably serving warm starts (hit rate OR
+        pool-origin share at/above floor) AND cost per merged PR is within
+        tolerance of the pre-pool baseline.
+    """
+    cost = cost_incl_axis or {}
+    cost_current = cost.get("current")
+    cost_baseline = cost.get("baseline")
+    cost_drift_pct = cost.get("drift_pct")
+
+    funnel = pool_funnel or {}
+    hit_rate = funnel.get("pool_hit_rate")
+    total_dispatches = int(funnel.get("total_dispatches") or 0)
+
+    breakdown = origin_breakdown or {}
+    pool_origin_share = breakdown.get("pool_origin_share")
+    pool_warm_starts = int(breakdown.get("warm_pool") or 0)
+
+    supporting = {
+        "pool_origin_share": pool_origin_share,
+        "pool_warm_starts": pool_warm_starts,
+        "pool_hit_rate": hit_rate,
+        "total_pool_dispatches": total_dispatches,
+        "cost_drift_pct": cost_drift_pct,
+        "cost_incl_idle_current": cost_current,
+        "cost_baseline": cost_baseline,
+    }
+
+    def _result(state: str, recommended_action: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "supporting": supporting,
+            "recommended_action": recommended_action,
+        }
+
+    # INSUFFICIENT_DATA: no baseline/snapshot to compare cost against, or too
+    # few pool dispatches to read lift off the funnel.
+    has_cost = (
+        isinstance(cost_current, (int, float))
+        and isinstance(cost_baseline, (int, float))
+        and cost_baseline != 0
+    )
+    if not has_cost or total_dispatches < min_pool_dispatches:
+        return _result(
+            POOL_PAYOFF_INSUFFICIENT_DATA,
+            "Keep measuring — not enough merged PRs, pool dispatches, or "
+            "baseline yet to judge payoff.",
+        )
+
+    # COST_REGRESSION: idle-inclusive cost per merged PR materially above the
+    # pre-pool baseline. The headline stop signal — flag it regardless of lift.
+    if isinstance(cost_drift_pct, (int, float)) and cost_drift_pct > cost_tolerance_pct:
+        return _result(
+            POOL_PAYOFF_COST_REGRESSION,
+            "Reduce the pool target or disable — idle-inclusive cost per merged "
+            "PR has regressed above the pre-pool baseline.",
+        )
+
+    # NO_LIFT: the pool is barely serving (hit rate AND pool-origin share both
+    # below floor) so idle spend is not being amortized.
+    serving = (isinstance(hit_rate, (int, float)) and hit_rate >= hit_rate_floor) or (
+        isinstance(pool_origin_share, (int, float))
+        and pool_origin_share >= origin_share_floor
+    )
+    if not serving:
+        return _result(
+            POOL_PAYOFF_NO_LIFT,
+            "Tune the pool target or disable — the pool is barely serving warm "
+            "starts, so idle spend is not being amortized.",
+        )
+
+    # PROVEN: measurably serving AND cost within tolerance of the baseline.
+    return _result(
+        POOL_PAYOFF_PROVEN,
+        "Keep the pool — it is serving warm starts without regressing cost per "
+        "merged PR. Consider widening scope.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-enable counterfactual warm-pool hit-rate estimate (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# The warm pool ships dark and is unexercised in prod (pool_hit_rate=0), so no
+# operator will enable it for a project without evidence it will pay off. This
+# is an OFFLINE, READ-ONLY estimate of the pool hit rate a project WOULD achieve
+# at a candidate target size, derived purely from durable data we already record
+# (per-task resolved account + dispatch timestamps on recent terminal tasks).
+#
+# It is deliberately a COARSE counterfactual, not a discrete-event simulation: a
+# defensible number grounded in the real arrival pattern is more useful than a
+# precise-looking model that is hard to trust. The model replays the per-account
+# dispatch sequence over a small simulated idle pool:
+#   * ``target_size`` idle members are spread across the project's demand-active
+#     accounts (demand-weighted even split), mirroring how the maintainer steers
+#     a small pool across a project's account mix (reconcile_project_pool /
+#     _pick_demand_weighted_account). With ``account_retarget`` ON, a single
+#     shared pool of ``target_size`` members can serve ANY account (the
+#     secret-manifest retarget path), so the slots are not account-pinned.
+#   * A dispatch is a likely WARM HIT iff a compatible member is plausibly idle
+#     at that moment. Serving a member leases it; a replacement is ready only
+#     after ``replenish_seconds`` (the maintainer interval) — so a tight arrival
+#     burst that exceeds the idle supply spills to cold dispatch.
+#   * A member left idle past ``idle_ttl_seconds`` is reaped and re-provisioned
+#     (a ``replenish_seconds`` gap), so a longer TTL keeps sparse-but-steady
+#     demand warm while a short TTL churns it cold.
+# NOTHING here touches the dispatch/claim path or provisions anything — it reads
+# history and computes a number.
+
+
+def _estimate_pool_hit_rate(
+    dispatches: list[tuple[Optional[str], Optional[datetime]]],
+    *,
+    target_size: int,
+    replenish_seconds: float,
+    idle_ttl_seconds: float,
+    account_retarget: bool = False,
+) -> Dict[str, Any]:
+    """Coarse counterfactual: pool hit rate a candidate ``target_size`` would yield.
+
+    ``dispatches`` is a list of ``(account_label, dispatched_at)`` tuples (the
+    account is the resolved LLM account the dispatch was served for; use
+    :func:`app.warm_backlog_reuse._account_label` so ``None`` collapses to the
+    unattributed bucket). Entries without a timestamp are ignored. Pure and
+    DB-free so it is unit-testable over synthetic histories.
+
+    Returns ``estimated_hit_rate`` (None only when there are no timestamped
+    dispatches), the warm-hit count, and a ``by_account`` breakdown. Works in
+    seconds relative to the first dispatch, so it is timezone-agnostic.
+    """
+    items = [(label, ts) for (label, ts) in dispatches if ts is not None]
+    total = len(items)
+    target_size = max(0, int(target_size))
+    replenish = max(0.0, float(replenish_seconds))
+    ttl = max(0.0, float(idle_ttl_seconds))
+
+    if total == 0:
+        return {
+            "target_size": target_size,
+            "total_dispatches": 0,
+            "estimated_warm_hits": 0,
+            "estimated_hit_rate": None,
+            "by_account": {},
+            "account_retarget": account_retarget,
+        }
+
+    items.sort(key=lambda x: x[1])
+    t0 = items[0][1]
+    seq = [(label, (ts - t0).total_seconds()) for label, ts in items]
+
+    from collections import Counter  # noqa: PLC0415
+
+    demand = Counter(label for label, _ in seq)
+    # Demand-active accounts, busiest first — so a pool smaller than the account
+    # count covers the heaviest-demand accounts (mirrors the maintainer's
+    # demand-weighted water-fill steering).
+    accounts = [a for a, _ in demand.most_common()]
+    n = len(accounts)
+
+    # Allocate slots. Each slot is its next-available time (relative seconds);
+    # all members start ready at t0 (pool pre-warmed at window start).
+    alloc: Dict[Optional[str], int] = {a: 0 for a in accounts}
+    if account_retarget:
+        shared_slots = [0.0] * target_size
+    else:
+        if n > 0 and target_size > 0:
+            base = target_size // n
+            rem = target_size % n
+            for i, a in enumerate(accounts):
+                alloc[a] = base + (1 if i < rem else 0)
+        slots: Dict[Optional[str], list[float]] = {
+            a: [0.0] * alloc[a] for a in accounts
+        }
+
+    def _serve(slot_list: list[float], t: float) -> bool:
+        """Lease the first compatible idle member at time ``t``; True iff warm."""
+        for i, free_at in enumerate(slot_list):
+            fa = free_at
+            # Reap + re-provision cycles for a member left idle past the TTL.
+            # cycle = ttl + replenish > 0 (ttl > 0), so this always terminates.
+            if ttl > 0:
+                cycle = ttl + replenish
+                while fa <= t and (t - fa) >= ttl:
+                    fa += cycle
+            slot_list[i] = fa
+            if fa <= t:
+                # Idle and ready — lease it; a replacement is ready after replenish.
+                slot_list[i] = t + replenish
+                return True
+        return False
+
+    hits_by_acct: Dict[Optional[str], int] = {a: 0 for a in accounts}
+    for label, t in seq:
+        if account_retarget:
+            if _serve(shared_slots, t):
+                hits_by_acct[label] = hits_by_acct.get(label, 0) + 1
+        else:
+            sl = slots.get(label)
+            if sl and _serve(sl, t):
+                hits_by_acct[label] += 1
+
+    total_hits = sum(hits_by_acct.values())
+    by_account: Dict[str, Any] = {}
+    for a in accounts:
+        d = demand[a]
+        h = hits_by_acct.get(a, 0)
+        by_account[str(a)] = {
+            "total_dispatches": d,
+            "estimated_warm_hits": h,
+            "estimated_hit_rate": round(h / d, 4) if d else None,
+            "allocated_slots": target_size if account_retarget else alloc[a],
+        }
+    return {
+        "target_size": target_size,
+        "total_dispatches": total,
+        "estimated_warm_hits": total_hits,
+        "estimated_hit_rate": round(total_hits / total, 4) if total else None,
+        "by_account": by_account,
+        "account_retarget": account_retarget,
+    }
+
+
+_POOL_ESTIMATE_ASSUMPTIONS = (
+    "Coarse offline estimate, NOT a measurement: replays recent per-account "
+    "dispatch timestamps over a simulated idle pool of the candidate target "
+    "size. A dispatch counts as a likely warm hit when a compatible idle member "
+    "would plausibly be ready — leasing a member costs one replenish interval "
+    "before a replacement is ready, and a member idle past the TTL is reaped and "
+    "re-provisioned. Assumes the pool was pre-warmed at the window start and "
+    "ignores provider/model compatibility beyond the resolved account. The "
+    "account-retarget scenario lets any idle member serve any account."
+)
+
+
+async def estimate_pool_hit_rate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    target_size: int,
+    window_days: int = _AXIS_WINDOW_DAYS,
+    runtime_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Offline pool hit-rate estimate for a project at a candidate target size.
+
+    Loads recent terminal tasks via :func:`_load_recent_tasks` (already carries
+    ``vm_dispatched_at`` + ``context``), buckets each dispatch by its resolved
+    LLM account, and runs the pure :func:`_estimate_pool_hit_rate` counterfactual
+    twice: account-pinned (the maintainer's per-account spread) and with
+    account-retarget on (any idle member serves any account). Read-only — it
+    provisions nothing and never touches the dispatch path.
+
+    ``replenish_seconds`` and ``idle_ttl_seconds`` are read from runtime config
+    (the maintainer interval and the pool idle TTL) but threaded through as
+    explicit params to the pure helper for deterministic testing.
+    """
+    from app.max_plan_pool import get_task_llm_account_id  # noqa: PLC0415
+    from app.warm_backlog_reuse import _account_label  # noqa: PLC0415
+
+    if runtime_config is None:
+        from app.shared_state import runtime_config as _rc  # noqa: PLC0415
+
+        runtime_config = _rc
+
+    try:
+        replenish = int(
+            runtime_config.get("warm_pool_maintainer_interval_seconds", 120) or 120
+        )
+    except (TypeError, ValueError):
+        replenish = 120
+    try:
+        idle_ttl = int(runtime_config.get("warm_pool_idle_ttl_seconds", 1800) or 1800)
+    except (TypeError, ValueError):
+        idle_ttl = 1800
+
+    tasks = await _load_recent_tasks(session, project_id, window_days=window_days)
+    dispatches: list[tuple[Optional[str], Optional[datetime]]] = []
+    for t in tasks:
+        if t.vm_dispatched_at is None:
+            continue
+        dispatches.append((_account_label(get_task_llm_account_id(t)), t.vm_dispatched_at))
+
+    pinned = _estimate_pool_hit_rate(
+        dispatches,
+        target_size=target_size,
+        replenish_seconds=replenish,
+        idle_ttl_seconds=idle_ttl,
+        account_retarget=False,
+    )
+    retarget = _estimate_pool_hit_rate(
+        dispatches,
+        target_size=target_size,
+        replenish_seconds=replenish,
+        idle_ttl_seconds=idle_ttl,
+        account_retarget=True,
+    )
+    return {
+        "project_id": str(project_id),
+        "target_size": int(max(0, target_size)),
+        "window_days": window_days,
+        "replenish_seconds": replenish,
+        "idle_ttl_seconds": idle_ttl,
+        "total_dispatches": pinned["total_dispatches"],
+        "estimated_warm_hits": pinned["estimated_warm_hits"],
+        "estimated_hit_rate": pinned["estimated_hit_rate"],
+        "by_account": pinned["by_account"],
+        "account_retarget_scenario": {
+            "estimated_warm_hits": retarget["estimated_warm_hits"],
+            "estimated_hit_rate": retarget["estimated_hit_rate"],
+        },
+        "assumptions": _POOL_ESTIMATE_ASSUMPTIONS,
+    }
 
 
 def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
@@ -206,7 +823,7 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
             if pricing:
                 input_rate, output_rate = pricing
                 total_cost += input_tokens * input_rate + output_tokens * output_rate
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+        if is_merged_completion(t):
             merged += 1
     if not merged:
         return None
@@ -427,11 +1044,14 @@ def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
     """warm / participating. None when no VMs participated.
 
     Reads ``context['_timing']['warm_start']`` — the same source the
-    ``/pipeline-efficiency`` endpoint uses. The ``vm_warm_start`` column is
-    only ever written ``False`` at cold-provision time; warm-claim and
-    next-role telemetry land in ``context['_timing']``, so reading the column
-    pinned this axis at 0%. A task participates when it has a non-empty
-    ``_timing`` dict OR a recorded ``vm_provisioned_at``.
+    ``/pipeline-efficiency`` endpoint uses, and the canonical signal stamped by
+    the warm-claim / backlog-reuse path
+    (``routers/agent_warm_continuity._finalize_warm_claim``). Cold dispatch
+    writes ``vm_warm_start=False``; the warm-claim path writes both
+    ``vm_warm_start=True`` and ``_timing['warm_start']=True``, so the column and
+    ``_timing`` now agree on warm tasks. The metric keys on ``_timing`` because
+    it is the agent-authoritative source. A task participates when it has a
+    non-empty ``_timing`` dict OR a recorded ``vm_provisioned_at``.
     """
     warm = 0
     total = 0
@@ -444,6 +1064,57 @@ def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
     if not total:
         return None
     return round(warm / total, 4)
+
+
+def _compute_warm_start_origin_breakdown(
+    tasks: list[Task],
+) -> Optional[Dict[str, Any]]:
+    """Break the warm-start population down by claim origin over the window.
+
+    Reads ``context['_timing']['warm_claim_origin']`` for every task whose
+    ``_timing['warm_start'] is True`` and buckets it into one of three origins:
+    ``warm_pool`` (a pre-provisioned pool member served the dispatch),
+    ``backlog_reuse`` (a finishing VM picked up an unrelated QUEUED task from the
+    same project's backlog), and ``chain_continuity`` (the PR-chain follow-on
+    path, origin ``next_role_endpoint`` or legacy-unset).
+
+    The aggregate :func:`_compute_vm_reuse_rate` sums every origin into one
+    number; this companion isolates the POOL-ORIGIN share so an operator who
+    enables the pool can confirm it lifted reuse above the floor (the pool's
+    entire reason to exist) rather than reading lift that chain-continuity or
+    backlog-reuse actually contributed. Returns None when no warm starts exist
+    in the window (nothing to attribute). ``pool_origin_share`` is the pool
+    bucket as a fraction of all warm starts (``None`` only when ``warm_total``
+    is 0, which already returns None above).
+    """
+    from app.warm_pool import WARM_POOL_ORIGIN  # noqa: PLC0415
+
+    warm_pool = 0
+    backlog_reuse = 0
+    chain_continuity = 0
+    for t in tasks:
+        timing = (t.context or {}).get("_timing") or {}
+        if timing.get("warm_start") is not True:
+            continue
+        origin = timing.get("warm_claim_origin")
+        if origin == WARM_POOL_ORIGIN:
+            warm_pool += 1
+        elif origin == "backlog_reuse":
+            backlog_reuse += 1
+        else:
+            # "next_role_endpoint" or legacy-unset — the chain-continuity path.
+            chain_continuity += 1
+
+    warm_total = warm_pool + backlog_reuse + chain_continuity
+    if not warm_total:
+        return None
+    return {
+        "warm_pool": warm_pool,
+        "backlog_reuse": backlog_reuse,
+        "chain_continuity": chain_continuity,
+        "warm_total": warm_total,
+        "pool_origin_share": round(warm_pool / warm_total, 4),
+    }
 
 
 def _compute_median_api_calls_per_task(tasks: list[Task]) -> Optional[float]:
@@ -467,7 +1138,7 @@ def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
             n = loop.get("iteration")
             if isinstance(n, int) and n >= 0:
                 iters.append(n)
-        elif ctx.get("pr_merged"):
+        elif has_merge_unblock_signal(t):
             # Review was skipped (e.g. auto-approved small diff) — counts as 0 iterations.
             # Excluding these tasks inflates the median whenever the pipeline gets more
             # efficient by skipping review, inverting the signal.
@@ -531,16 +1202,59 @@ async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
 ) -> Dict[str, Any]:
     """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
+    from app.warm_backlog_reuse import (  # noqa: PLC0415
+        compute_dominant_pool_miss,
+        compute_dominant_reuse_dropout,
+    )
+
     tasks = await _load_recent_tasks(session, project_id)
+    pool_metrics = await compute_pool_idle_cost(session, project_id)
+
+    # Honest net-cost companion: fold the project's warm-pool idle cost into the
+    # cost_per_merged_pr numerator so pre-warming a pool can't make the headline
+    # axis look better while real spend rises. Kept SEPARATE from the immutable
+    # AXIS_COST_PER_MERGED_PR baseline (drift comparisons stay apples-to-apples).
+    total_vm_cost, merged = _cost_and_merges(tasks)
+    cost_incl_pool_idle: Optional[float] = (
+        round((total_vm_cost + pool_metrics["total_idle_cost_usd"]) / merged, 4)
+        if merged
+        else None
+    )
+
     return {
         AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
         AXIS_VM_COLD_START_P50_MS: _compute_vm_cold_start_p50_ms(tasks),
         AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
+        # Per-origin companion to the aggregate vm_reuse_rate: isolates the
+        # pool-origin share of warm starts so an operator can confirm the pool
+        # (not chain-continuity/backlog-reuse) lifted reuse above the floor.
+        # Kept ALONGSIDE the immutable aggregate axis, like pool_metrics.
+        "warm_start_origin_breakdown": _compute_warm_start_origin_breakdown(tasks),
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
         "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
+        "pool_idle_cost_usd": pool_metrics["total_idle_cost_usd"],
+        "pool_metrics": pool_metrics,
+        "cost_per_merged_pr_incl_pool_idle": cost_incl_pool_idle,
+        # Durable snapshot of the warm-reuse drop-out ranking. The live funnel
+        # counters are in-memory and reset on every deploy/restart (frequent on
+        # Cloud Run); folding the ranked breakdown into the daily snapshot makes
+        # the dominant drop-out survive restarts and trendable day over day
+        # (surfaced via read_baseline_with_drift -> the warm-VM admin view).
+        "reuse_dropout": compute_dominant_reuse_dropout(),
+        # Durable snapshot of the warm-POOL dispatch funnel (a DIFFERENT funnel
+        # from reuse_dropout above — do not conflate). The live pool funnel
+        # counters (lease hits, cold dispatches, lease-miss-by-reason, per-account
+        # hit rates) are in-memory and reset on every deploy/restart (frequent on
+        # Cloud Run); folding the aggregates + the dominant-miss-reason call-out
+        # into the daily snapshot makes the dispatch funnel survive restarts and
+        # trendable day over day. This is what tells an operator enabling the pool
+        # not just whether it is hitting but, when it misses, WHY (no idle member
+        # vs no compatible member vs lost-lease race) — the answer that drives the
+        # next tuning action. Surfaced via read_baseline_with_drift -> warm-VM view.
+        "pool_dispatch_funnel": compute_dominant_pool_miss(),
     }
 
 
@@ -651,17 +1365,76 @@ async def read_baseline_with_drift(
     counters (see :func:`app.warm_backlog_reuse.get_reuse_funnel_snapshot`).
     These counters are in-memory and instance-local; they reset on restart and
     are not stored in the efficiency baseline snapshot.
+
+    ``reuse_dropout`` is the latest *persisted* warm-reuse drop-out ranking
+    (see :func:`app.warm_backlog_reuse.compute_dominant_reuse_dropout`), folded
+    into each daily snapshot so it survives the restarts that wipe
+    ``reuse_funnel``. ``reuse_dropout_trend`` is the oldest-first day-over-day
+    series of ``{captured_at, dominant_reason, dominant_share, dropout_total}``
+    so an operator can confirm a widening change reduced the dominant leak.
     """
-    from app.warm_backlog_reuse import get_reuse_funnel_snapshot  # noqa: PLC0415
+    from app.warm_backlog_reuse import (  # noqa: PLC0415
+        get_pool_funnel_snapshot,
+        get_reuse_funnel_snapshot,
+    )
 
     project = await session.get(Project, project_id)
     if project is None:
         raise ValueError(f"Project {project_id} not found")
 
+    pool_funnel = get_pool_funnel_snapshot()
+
     container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
     snapshots = container.get("snapshots") or []
     latest = snapshots[-1] if snapshots else {}
+
+    # Durable warm-reuse drop-out: the latest persisted ranking plus a day-over-
+    # day trend of the dominant reason / its share / the drop-out total, so an
+    # operator can confirm a widening change reduced the dominant leak even
+    # across the restarts that wipe the in-memory ``reuse_funnel`` counters.
+    reuse_dropout_trend = [
+        {
+            "captured_at": snap.get("captured_at"),
+            "dominant_reason": (
+                (snap.get("reuse_dropout") or {}).get("dominant_dropout") or {}
+            ).get("reason"),
+            "dominant_share": (
+                (snap.get("reuse_dropout") or {}).get("dominant_dropout") or {}
+            ).get("share"),
+            "dropout_total": (snap.get("reuse_dropout") or {}).get("dropout_total"),
+        }
+        for snap in snapshots
+        if snap.get("reuse_dropout")
+    ]
+
+    # Durable warm-POOL dispatch funnel: the latest persisted funnel block plus a
+    # day-over-day trend of the key aggregates (hit rate, hits/cold counts) and
+    # the dominant lease-miss reason, so an operator can read the WHY-it-missed
+    # breakdown across the multi-day windows even though the live pool funnel
+    # counters reset on every restart. A DIFFERENT funnel from reuse_dropout_trend.
+    pool_dispatch_funnel_trend = [
+        {
+            "captured_at": snap.get("captured_at"),
+            "pool_lease_hits": (snap.get("pool_dispatch_funnel") or {}).get(
+                "pool_lease_hits"
+            ),
+            "cold_dispatches": (snap.get("pool_dispatch_funnel") or {}).get(
+                "cold_dispatches"
+            ),
+            "pool_hit_rate": (snap.get("pool_dispatch_funnel") or {}).get(
+                "pool_hit_rate"
+            ),
+            "lease_miss_total": (snap.get("pool_dispatch_funnel") or {}).get(
+                "lease_miss_total"
+            ),
+            "dominant_miss_reason": (
+                (snap.get("pool_dispatch_funnel") or {}).get("dominant_miss") or {}
+            ).get("reason"),
+        }
+        for snap in snapshots
+        if snap.get("pool_dispatch_funnel")
+    ]
 
     axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
@@ -689,12 +1462,112 @@ async def read_baseline_with_drift(
             "history": history,
         }
 
+    # Idle-inclusive cost-per-merged-PR as a companion trended axis. The
+    # per-snapshot ``cost_per_merged_pr_incl_pool_idle`` already folds warm-pool
+    # idle spend into the numerator (see compute_current_axes); here we surface
+    # it as a full {current, baseline, drift_pct, history} series so an operator
+    # can read TRUE cost regression in the same trend as the headline axis.
+    #
+    # Baseline is deliberately the immutable pre-pool ``cost_per_merged_pr``
+    # baseline (idle cost was zero before the pool existed), so drift directly
+    # answers "did enabling the pool regress cost per PR?". We do NOT add this to
+    # ALL_AXES — that would seed a separate immutable inclusive baseline and a
+    # migration, defeating the apples-to-apples separation the headline axis keeps.
+    incl_current = latest.get("cost_per_merged_pr_incl_pool_idle")
+    incl_baseline = baseline.get(AXIS_COST_PER_MERGED_PR)
+    if (
+        incl_current is None
+        or incl_baseline is None
+        or not isinstance(incl_current, (int, float))
+        or not isinstance(incl_baseline, (int, float))
+        or incl_baseline == 0
+    ):
+        incl_drift_pct = None
+    else:
+        incl_drift_pct = round(
+            ((incl_current - incl_baseline) / incl_baseline) * 100.0, 2
+        )
+    cost_incl_pool_idle_axis = {
+        "current": incl_current,
+        "baseline": incl_baseline,
+        "drift_pct": incl_drift_pct,
+        "history": [
+            {
+                "captured_at": snap.get("captured_at"),
+                "value": snap.get("cost_per_merged_pr_incl_pool_idle"),
+            }
+            for snap in snapshots
+        ],
+    }
+
     return {
         "axes": axes,
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
         "reuse_funnel": get_reuse_funnel_snapshot(),
+        # Durable (restart-surviving) warm-reuse drop-out ranking from the latest
+        # snapshot, plus its day-over-day trend. Unlike ``reuse_funnel`` above
+        # (live in-memory counters), these persist in the efficiency snapshot.
+        "reuse_dropout": latest.get("reuse_dropout"),
+        "reuse_dropout_trend": reuse_dropout_trend,
+        # Durable (restart-surviving) warm-POOL dispatch funnel from the latest
+        # snapshot — lease hits, cold dispatches, overall + per-account hit rate,
+        # the lease-miss-by-reason breakdown, and the single dominant-miss-reason
+        # call-out — plus its day-over-day trend. A DIFFERENT funnel from
+        # ``reuse_dropout`` above; both are persisted in the efficiency snapshot
+        # specifically because the live in-memory funnel counters reset on restart.
+        "pool_dispatch_funnel": latest.get("pool_dispatch_funnel"),
+        "pool_dispatch_funnel_trend": pool_dispatch_funnel_trend,
+        # Warm-pool idle cost from the latest snapshot, plus the net-cost
+        # companion that folds it into cost_per_merged_pr (see compute_current_axes).
+        "pool_idle_cost_usd": latest.get("pool_idle_cost_usd"),
+        "pool_metrics": latest.get("pool_metrics"),
+        "cost_per_merged_pr_incl_pool_idle": latest.get(
+            "cost_per_merged_pr_incl_pool_idle"
+        ),
+        # Idle-inclusive cost as a full trended axis (current/baseline/drift/
+        # history), baselined against the immutable pre-pool cost_per_merged_pr so
+        # its drift directly answers "did enabling the pool regress cost per PR?".
+        # Charted alongside the headline cost line in the warm-reuse-vs-cost trend.
+        "cost_per_merged_pr_incl_pool_idle_axis": cost_incl_pool_idle_axis,
+        # Per-origin warm-start breakdown (pool vs chain-continuity vs backlog-
+        # reuse) + the pool-origin share, from the latest snapshot. Sits next to
+        # the pool idle cost and both cost-per-merged-PR figures so an operator
+        # can confirm BOTH halves of the goal — reuse lift above the floor AND no
+        # cost regression — from one place.
+        "warm_start_origin_breakdown": latest.get("warm_start_origin_breakdown"),
+        # Cost-amortization companion: the latest snapshot's pool idle cost
+        # against the live (instance-local) pool dispatch funnel, so operators
+        # can see whether idle spend is being amortized by warm-start hits — the
+        # same signal the maintainer's cost-aware auto-drain guard acts on.
+        "pool_cost_amortization": compute_pool_cost_amortization(
+            latest.get("pool_idle_cost_usd") or 0.0,
+            pool_funnel,
+        ),
+        # Per-account-mix view: joins the latest snapshot's per-account idle cost
+        # with the per-account dispatch funnel so an operator can answer, PER
+        # ACCOUNT, warm-vs-cold dispatch counts, hit rate, idle cost, and cost
+        # per warm start during a controlled enable — pool lift is read off the
+        # funnel hit rate, NOT the fix-loop-contaminated vm_reuse_rate.
+        "pool_cost_amortization_by_account": compute_pool_cost_amortization_by_account(
+            (latest.get("pool_metrics") or {}).get("by_account") or {},
+            pool_funnel,
+        ),
+        # Synthesized per-project warm-pool PAYOFF VERDICT: folds the LIFT half
+        # (pool-origin warm-start share + pool dispatch-funnel hit rate) and the
+        # NO-regression half (idle-inclusive cost-per-merged-PR drift vs. the
+        # immutable pre-pool baseline) into a single PROVEN / COST_REGRESSION /
+        # NO_LIFT / INSUFFICIENT_DATA answer with supporting numbers and a
+        # recommended action. Read off the POOL-specific signals, NOT the
+        # fix-loop-contaminated vm_reuse_rate (see compute_pool_payoff_verdict).
+        # Lift is read off the persisted snapshot funnel so it reflects the same
+        # multi-day window as the cost drift.
+        "pool_payoff_verdict": compute_pool_payoff_verdict(
+            latest.get("warm_start_origin_breakdown"),
+            cost_incl_pool_idle_axis,
+            latest.get("pool_dispatch_funnel"),
+        ),
     }
 
 
@@ -751,6 +1624,100 @@ async def maybe_write_daily_snapshot(
     if not _last_run_due(container.get("last_run_at"), now):
         return None
     return await write_snapshot(session, project_id)
+
+
+async def maybe_alert_pool_payoff_transition(
+    session: AsyncSession, project_id: uuid.UUID
+) -> Optional[str]:
+    """Raise an operator Alert when a scoped project's warm-pool payoff verdict
+    crosses a decision boundary, deduplicated per project + verdict.
+
+    Closes the loop on a *bounded* warm-pool enable: a controlled single-project
+    enable otherwise relies on the operator remembering to come back and read the
+    payoff verdict off the warm-VM panel. This per-project check — run every
+    hourly snapshot tick, independent of the daily snapshot-write cadence — emits
+    a deduplicated Alert when the verdict transitions to ``COST_REGRESSION``
+    (WARNING; recommend reducing the target or disabling) or to ``PROVEN`` with
+    material warm-start volume (INFO; recommend considering a wider scope), so the
+    keep / widen / disable decision is driven without polling.
+
+    Reuses the verdict synthesized by :func:`read_baseline_with_drift` (which
+    folds in :func:`compute_pool_payoff_verdict`) rather than re-deriving
+    thresholds. ``NO_LIFT`` and ``INSUFFICIENT_DATA`` are not alert-worthy (the
+    operator should keep measuring / tune, not be paged). DISTINCT from the
+    silent fleet-wide cost-guard auto-drain in ``warm_pool_maintainer``: that
+    protects spend automatically; this informs a per-project strategic decision.
+
+    The transition edge is detected against ``last_alerted_payoff_verdict`` in the
+    efficiency-baseline container (locked read-modify-write, mirroring
+    :func:`write_snapshot`); the Alert title dedup is the cross-instance backstop.
+    Gated on :func:`app.warm_pool.is_project_warm_pool_scoped` so only the scoped
+    bounded-enable projects are evaluated. Returns the verdict state when an alert
+    fired, else ``None``.
+    """
+    from app.alert_dispatch import _maybe_create_pool_payoff_alert  # noqa: PLC0415
+    from app.models import AlertSeverity  # noqa: PLC0415
+    from app.task_locking import with_design_doc_locked  # noqa: PLC0415
+    from app.warm_pool import is_project_warm_pool_scoped  # noqa: PLC0415
+
+    if not is_project_warm_pool_scoped(project_id):
+        return None
+
+    drift = await read_baseline_with_drift(session, project_id)
+    verdict = drift.get("pool_payoff_verdict") or {}
+    state = verdict.get("state")
+    supporting = dict(verdict.get("supporting") or {})
+    recommended_action = verdict.get("recommended_action") or ""
+
+    # Decide alert-worthiness + severity. COST_REGRESSION always alerts; PROVEN
+    # only with material warm-start volume; NO_LIFT / INSUFFICIENT_DATA never.
+    if state == POOL_PAYOFF_COST_REGRESSION:
+        severity = AlertSeverity.WARNING
+    elif (
+        state == POOL_PAYOFF_PROVEN
+        and int(supporting.get("pool_warm_starts") or 0)
+        >= POOL_PAYOFF_PROVEN_MIN_WARM_STARTS
+    ):
+        severity = AlertSeverity.INFO
+    else:
+        return None
+
+    # Transition edge: only fire when the alert-worthy state differs from the
+    # last state we alerted on. Locked read-modify-write via the canonical
+    # design_doc helper so a concurrent snapshot writer cannot clobber the
+    # marker; the lock is held until the alert helper commits, so the marker
+    # advance and the Alert row land atomically.
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        if container.get(LAST_ALERTED_PAYOFF_KEY) == state:
+            return  # no transition — leave the marker untouched
+        container[LAST_ALERTED_PAYOFF_KEY] = state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = True
+
+    await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if not changed["fire"]:
+        return None
+
+    await _maybe_create_pool_payoff_alert(
+        project_id,
+        session,
+        verdict_state=state,
+        supporting=supporting,
+        recommended_action=recommended_action,
+        severity=severity,
+    )
+    logger.info(
+        "[POOL_PAYOFF_ALERT] project=%s verdict=%s severity=%s",
+        project_id,
+        state,
+        severity.value,
+    )
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -884,3 +1851,59 @@ async def get_llm_cost_breakdown(
         "generated_at": _utcnow().isoformat(),
         **breakdown,
     }
+
+
+@router.get("/projects/{project_id}/pool-hit-rate-estimate")
+async def get_pool_hit_rate_estimate(
+    project_id: uuid.UUID,
+    target_size: int = Query(..., ge=0, le=100),
+    window_days: int = Query(default=7, ge=1, le=30),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Offline counterfactual estimate of the warm-pool hit rate a project would
+    achieve at a candidate ``target_size``, before any idle cost is paid.
+
+    The warm pool ships disabled, so its observed hit rate is 0 and no operator
+    has evidence that enabling it for a project will pay off. This read-only
+    endpoint replays the project's recent per-account dispatch history
+    (``vm_dispatched_at`` + resolved account on recently-terminal tasks within
+    ``window_days``) over a simulated idle pool of ``target_size`` members and
+    reports the share of dispatches that would plausibly have been served warm —
+    so an operator can size the pool before enabling it, and re-run to tune N.
+
+    It does NOT change the dispatch/claim path or provision anything; the window
+    is bounded (``window_days`` ≤ 30, ≤ 5000 tasks) so it stays cheap on large
+    histories. See :func:`estimate_pool_hit_rate` for the model and
+    ``assumptions`` for the stated caveats.
+
+    Response shape::
+
+        {
+          "project_id": str,
+          "target_size": int,
+          "window_days": int,
+          "replenish_seconds": int,
+          "idle_ttl_seconds": int,
+          "total_dispatches": int,
+          "estimated_warm_hits": int,
+          "estimated_hit_rate": float|None,   # None when no dispatches in window
+          "by_account": {"<account>": {
+              "total_dispatches": int,
+              "estimated_warm_hits": int,
+              "estimated_hit_rate": float|None,
+              "allocated_slots": int
+          }, ...},
+          "account_retarget_scenario": {
+              "estimated_warm_hits": int,
+              "estimated_hit_rate": float|None
+          },
+          "assumptions": str
+        }
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return await estimate_pool_hit_rate(
+        session, project_id, target_size=target_size, window_days=window_days
+    )

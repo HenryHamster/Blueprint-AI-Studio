@@ -128,6 +128,20 @@ anomaly_adjustments: Dict[str, Any] = {
 circuit_breakers: Dict[str, Dict] = {}  # project_id -> breaker state
 
 
+def reset_project_state(project_id: str) -> None:
+    """Drop all transient autonomous-loop state for one project.
+
+    Called by the reset-to-clean operation: pops the project's entry from the
+    circuit-breaker map, the autonomous failure-count map, and the persistent
+    anomaly cache so a wedged project starts its next cycle from a clean slate.
+    Other projects' state is untouched. Idempotent — missing keys are ignored.
+    """
+    key = str(project_id)
+    circuit_breakers.pop(key, None)
+    autonomous_failure_counts.pop(key, None)
+    persistent_anomalies.pop(key, None)
+
+
 def get_circuit_breaker(project_id: str) -> Dict:
     """Get or create circuit breaker state for a project."""
     if project_id not in circuit_breakers:

@@ -15,12 +15,18 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from sqlalchemy import select
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskStatus, RECOMMENDED_MODE_META_KEY
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    ProjectMessage,
+    RECOMMENDED_MODE_META_KEY,
+)
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
@@ -69,6 +75,8 @@ def _make_project(**kwargs) -> Project:
         "autonomous_enabled": True,
         "directions": [],
         "vision": {},
+        "integration_branch": "automain",
+        "promotion_target": "main",
     }
     defaults.update(kwargs)
     return Project(**defaults)
@@ -2592,6 +2600,324 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
 
 
 @pytest.mark.asyncio
+async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
+    db_session, mocker
+):
+    """Phase 1 payload ships the reconciled design doc built with GitHub context."""
+    from app.strategic_spawning import _agent_view_design_doc
+
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "automain",
+        "project_id": "proj-123",
+    }
+    reconciled_design_doc = {
+        "systems/api": {
+            "status": "missing",
+            "presence_warning": "reconciled against integration branch",
+        }
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "functional",
+                "modules": ["backend/app/api.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_shipped_changes_manifest",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    reconcile_mock = mocker.patch(
+        "app.strategic_spawning.ground_design_doc",
+        new=AsyncMock(return_value=reconciled_design_doc),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    assert payload["design_doc"] == reconciled_design_doc
+    reconcile_mock.assert_awaited_once_with(
+        _agent_view_design_doc(project.design_doc), **verification_context
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_payload_downgrades_symbol_absent_entry(
+    db_session, mocker
+):
+    """A FILE-PRESENT but SYMBOL-ABSENT entry is downgraded to missing in the payload.
+
+    Exercises the real symbol-aware ``ground_design_doc`` walker (NOT mocked):
+    the backing file still exists on the branch (file-level pass leaves the entry
+    alone), but the specifically-cited ``path:symbol`` was deleted, so the
+    symbol-level pass downgrades the entry to ``missing`` with a presence_warning
+    naming the absent symbol — the post-refactor facade case file-level grounding
+    cannot see.
+    """
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "automain",
+        "project_id": "proj-789",
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "functional",
+                "modules": ["backend/app/api.py"],
+                "description": "Serves requests via backend/app/api.py:deleted_func.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_shipped_changes_manifest",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+    # File still present on the branch → file-level pass does NOT downgrade.
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        new=AsyncMock(return_value=True),
+    )
+    # Cited symbol is unambiguously absent from the present file → symbol-level
+    # pass downgrades the entry.
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=False),
+    )
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    assert entry["status"] == "missing"
+    assert "backend/app/api.py:deleted_func" in entry["presence_warning"]
+    assert "[reconciled:" in entry["description"]
+
+
+@pytest.mark.asyncio
+async def test_spawn_design_doc_update_symbol_indeterminate_leaves_entry(
+    db_session, mocker
+):
+    """An indeterminate symbol result never downgrades a file-present entry."""
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "automain",
+        "project_id": "proj-790",
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        vision={"purpose": "test"},
+        design_doc={
+            "systems/api": {
+                "status": "functional",
+                "modules": ["backend/app/api.py"],
+                "description": "Serves requests via backend/app/api.py:maybe_func.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_spawning.validate_internal_payload",
+        side_effect=lambda p, _src: p,
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_shipped_changes_manifest",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.source_ref_validation._file_exists_in_repo_branch",
+        new=AsyncMock(return_value=True),
+    )
+    # Indeterminate (None) and present (True) symbol results must NOT downgrade.
+    mocker.patch(
+        "app.source_ref_validation._symbol_defined_at_head",
+        new=AsyncMock(return_value=None),
+    )
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    assert len(tasks) == 1
+    entry = tasks[0].payloads[0]["design_doc"]["systems/api"]
+    assert entry["status"] == "functional"
+    assert "presence_warning" not in entry
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_uses_reconciled_design_doc(
+    db_session, mocker
+):
+    """Phase 2 payload ships the reconciled design doc built with GitHub context."""
+    from app.strategic_spawning import _agent_view_design_doc
+
+    verification_context = {
+        "token": "gh-token",
+        "owner": "acme",
+        "repo": "studio",
+        "branch": "main",
+        "project_id": "proj-456",
+    }
+    reconciled_design_doc = {
+        "capabilities/search": {
+            "status": "missing",
+            "presence_warning": "reconciled against integration branch",
+        }
+    }
+    project = _make_project(
+        id=uuid.uuid4(),
+        integration_branch="main",
+        promotion_target="main",
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": "d-reconcile",
+                "status": "active",
+                "text": "Verify strategic payload grounding",
+                "priority": "medium",
+            }
+        ],
+        design_doc={
+            "capabilities/search": {
+                "status": "working",
+                "modules": ["backend/app/search.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.strategic_cycle.recent_for_agent_context",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_recent_interventions",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.strategic_spawning.resolve_branch_verification_context",
+        new=AsyncMock(return_value=verification_context),
+    )
+    reconcile_mock = mocker.patch(
+        "app.strategic_spawning.ground_design_doc",
+        new=AsyncMock(return_value=reconciled_design_doc),
+    )
+    mocker.patch(
+        "app.strategic_spawning._verify_capability_backing_paths",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.strategic_spawning._build_system_maturity_payload",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.drift_detection.compute_direction_drift",
+        new=AsyncMock(return_value={}),
+    )
+    mocker.patch(
+        "app.drift_detection.persist_drift_snapshot",
+        new=AsyncMock(return_value=None),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert len(tasks) == 1
+    payload = tasks[0].payloads[0]
+    assert payload["design_doc"] == reconciled_design_doc
+    reconcile_mock.assert_awaited_once_with(
+        _agent_view_design_doc(project.design_doc), **verification_context
+    )
+
+
+@pytest.mark.asyncio
 async def test_strategic_review_payload_includes_calibration_factor(db_session):
     """prediction_calibration_factor and note are always present in strategic payload."""
     project = _make_project(
@@ -3816,7 +4142,7 @@ async def test_version_phase_includes_recent_versions(
 
 @pytest.mark.asyncio
 async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
-    """Version-phase LTS context follows integration_branch != promotion_target."""
+    """Version-phase LTS context is active only when the resolver sees distinct branches."""
     await _ensure_releaseversion_table(db_session)
 
     _patch_spawning_deps(mocker)
@@ -3838,6 +4164,9 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(skipped_project)
 
+    # integration == promotion: the version-phase LTS context is gated off
+    # (the resolver fails safe instead of raising), so the review still spawns
+    # but without invoking the version lifecycle.
     assert await _spawn_strategic_review(skipped_project, db_session) is True
     assert current_open_version.call_count == 0
     assert ensure_initial_release_version.call_count == 0
@@ -4027,6 +4356,308 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
         {"severity": "high", "summary": "Token baked into VM image."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+    # Audit (0.74) is the lowest active sub-score here, so it IS the binding
+    # constraint and the hint should frame it that way.
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+
+
+async def _spawn_and_get_stabilize_suffix(project, db_session):
+    """Helper: spawn a strategic review and return its prompt_suffix string."""
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    return tasks[0].payloads[0].get("prompt_suffix", "")
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
+    db_session, mocker, _lts_split_active
+):
+    """When audit flagged findings but test_erosion is the LOWER sub-score,
+    the hint must NOT claim audit is the binding constraint — it should point at
+    test_erosion as the real limiting dimension."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.6,
+            "blocker": None,
+            "sub_scores": {"audit": 0.80, "test_erosion": 0.42},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+    assert "test_erosion sub-score" in suffix
+    assert "audit is not the limiting dimension" in suffix
+    assert "the audit sub-score is the binding constraint on promotion" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
+    db_session, mocker, _lts_split_active
+):
+    """When a hard blocker fired, the hint must name the blocker as the binding
+    constraint rather than asserting audit (or any numeric sub-score) is."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.0,
+            "blocker": "ci_not_green",
+            "sub_scores": {"audit": 0.0, "test_erosion": 0.0},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+    assert "hard blocker (ci_not_green)" in suffix
+    assert "the audit sub-score is the binding constraint on promotion" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_stabilize_hint_excludes_disabled_smoketest_from_binding(
+    db_session, mocker, _lts_split_active
+):
+    """A disabled smoketest dimension carries a 0.0 placeholder that must not be
+    treated as the binding constraint — audit (the lowest REAL dimension) is."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.6,
+            "blocker": None,
+            "smoketest_enabled": False,
+            "sub_scores": {"audit": 0.55, "test_erosion": 0.90, "smoketest": 0.0},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    suffix = await _spawn_and_get_stabilize_suffix(project, db_session)
+    # audit (0.55) is the lowest REAL dimension; the smoketest 0.0 placeholder
+    # must not win the binding determination.
+    assert "the audit sub-score is the binding constraint on promotion" in suffix
+    assert "smoketest sub-score" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_qualification_substate_hint_promotion_in_flight(
+    db_session, mocker, _lts_split_active
+):
+    """status='pending' WITH promotion_pending (audit passed, promotion PR open)
+    must be surfaced as PROMOTION_IN_FLIGHT — not read as 'audit still running'.
+    Regression for incident 2026-06-02 where the agent waited on a promotion it
+    should have been watching."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://github.com/x/y/pull/7357",
+                "auto_merge_enabled": True,
+            },
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_IN_FLIGHT" in suffix, f"Expected sub-state hint; got: {suffix}"
+    assert "already cleared" in suffix
+    assert "still running" in suffix  # the explicit "do NOT read as ..." clause
+
+    vp = payload.get("version_phase") or {}
+    assert vp.get("qualification_state", {}).get("state") == "promotion_in_flight"
+
+
+@pytest.mark.asyncio
+async def test_qualification_substate_hint_promotion_failed(
+    db_session, mocker, _lts_split_active
+):
+    """status='promotion_failed' (passed audit, merge failed) must be surfaced as
+    PROMOTION_FAILED with the failure reason and a 'fresh qualify' directive —
+    not left to read as a still-pending audit."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "promotion_failed",
+            "error": "pr_ci_red",
+            "detail": "PR #7357 CI conclusively failed",
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_FAILED" in suffix, f"Expected sub-state hint; got: {suffix}"
+    assert "pr_ci_red" in suffix
+    assert "fresh qualify" in suffix.lower()
+
+    vp = payload.get("version_phase") or {}
+    assert vp.get("qualification_state", {}).get("state") == "promotion_failed"
+
+
+@pytest.mark.asyncio
+async def test_qualification_substate_hint_absent_while_auditing(
+    db_session, mocker, _lts_split_active
+):
+    """Bare status='pending' (audit genuinely scoring) must NOT emit the
+    promotion sub-state hint — the agent SHOULD wait in that case."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "pending"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    payload = tasks[0].payloads[0]
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_IN_FLIGHT" not in suffix
+    assert "PROMOTION_FAILED" not in suffix
+    vp = payload.get("version_phase") or {}
+    assert vp.get("qualification_state", {}).get("state") == "qualifying"
 
 
 @pytest.mark.asyncio
@@ -4740,7 +5371,13 @@ async def test_on_main_mirrors_on_automain_without_lts_split(db_session):
     """With no LTS split (integration branch == promotion target), on_main equals
     on_automain and undeployed_directions is empty — there is no 'landed but not
     deployed' state when merges deploy directly."""
-    project = _make_project(vision={"purpose": "test"})  # default branches: main == main
+    # No LTS split: integration branch IS the promotion target. _make_project now
+    # defaults to a split (automain/main), so request matching branches explicitly.
+    project = _make_project(
+        vision={"purpose": "test"},
+        integration_branch="main",
+        promotion_target="main",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -5383,18 +6020,26 @@ async def test_on_automain_false_for_root_task_ancestry_api_exception(
 class TestGetProjectIntegrationBranch:
     """get_project_integration_branch() — the canonical column-based resolver.
 
-    Per-project value lives on the project.integration_branch column; when the
-    column is unset, the helper falls back to the literal default 'main'.
+    The resolver fails SAFE and never raises, so it is safe to call from read
+    endpoints, background recovery loops, and the protected_branches property.
+    Self-repos map an unset integration branch to automain; non-self repos with
+    an unset integration branch fall back to main. Refusing to land work on the
+    promotion target is enforced at the merge/rollup boundary, not here.
     """
 
-    def test_unset_column_returns_global_default(self):
-        """Project with integration_branch=None resolves to the literal default."""
-        project = _make_project(integration_branch=None)
-        assert _shared_state.get_project_integration_branch(project) == "main"
+    def test_self_repo_without_integration_branch_resolves_to_automain(self):
+        """Self-repos preserve the documented automain fallback when unset."""
+        project = _make_project(
+            integration_branch=None,
+            promotion_target=None,
+            is_self_repo=True,
+            github_repo="BlueprintAIStudio",
+        )
+        assert _shared_state.get_project_integration_branch(project) == "automain"
 
-    def test_unset_column_ignores_global_state(self):
-        """A missing column no longer consults global runtime_config state."""
-        project = _make_project(integration_branch=None)
+    def test_non_self_repo_without_integration_branch_falls_back_to_main(self):
+        """External repos with an unset integration branch fall back to main."""
+        project = _make_project(integration_branch=None, is_self_repo=False)
         assert _shared_state.get_project_integration_branch(project) == "main"
 
     def test_column_override_used(self):
@@ -5415,13 +6060,310 @@ class TestGetProjectIntegrationBranch:
         assert _shared_state.get_project_integration_branch(project_b) == "trunk-b"
 
     def test_project_with_override_and_project_without_are_independent(self):
-        """A project with a column value and one without resolve independently."""
+        """A configured project is unaffected by another project's unset column."""
         project_with = _make_project(integration_branch="custom-trunk")
-        project_without = _make_project(integration_branch=None)
+        project_without = _make_project(integration_branch=None, is_self_repo=False)
         assert (
             _shared_state.get_project_integration_branch(project_with) == "custom-trunk"
         )
         assert _shared_state.get_project_integration_branch(project_without) == "main"
+
+    def test_same_branch_as_promotion_target_returns_configured_value(self):
+        """The resolver returns the configured value even when it equals promotion.
+
+        Refusing to land integration work on the promotion target is enforced at
+        the merge/rollup boundary; the hot-path resolver must not raise.
+        """
+        project = _make_project(integration_branch="release", promotion_target="release")
+        assert _shared_state.get_project_integration_branch(project) == "release"
+
+
+# ── _verify_capability_backing_paths: advisory capability verification ────────
+
+
+class TestVerifyCapabilityBackingPaths:
+    """The strategic payload annotates each capability with advisory backing-
+    path verification, never mutating the durable problem_model.
+
+    classify_existing_paths is patched per-test so the cases are deterministic
+    and don't depend on the integration-branch file tree.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_pm_returns_empty(self):
+        from app.strategic_spawning import _verify_capability_backing_paths
+
+        assert await _verify_capability_backing_paths(None) == {}
+        assert await _verify_capability_backing_paths({}) == {}
+
+    @pytest.mark.asyncio
+    async def test_no_backing_paths_is_unverified(self):
+        from app import strategic_spawning
+
+        pm = {"capabilities": [{"name": "CapA", "status": "working"}]}
+        # classify must never be called when there are no paths to check.
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(side_effect=AssertionError("should not be called")),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "unverified"
+        assert ver["present"] == [] and ver["missing"] == []
+
+    @pytest.mark.asyncio
+    async def test_all_present_preserves_status(self):
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py", "b.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=(["a.py", "b.py"], [])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "working"
+        assert ver["present"] == ["a.py", "b.py"]
+        assert ver["missing"] == []
+
+    @pytest.mark.asyncio
+    async def test_mixed_presence_is_partial(self):
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py", "gone.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=(["a.py"], ["gone.py"])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "partial"
+        assert ver["present"] == ["a.py"]
+        assert ver["missing"] == ["gone.py"]
+
+    @pytest.mark.asyncio
+    async def test_all_missing_is_absent(self):
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["gone1.py", "gone2.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=([], ["gone1.py", "gone2.py"])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        ver = out["capabilities"][0]["verification"]
+        assert ver["effective_status"] == "absent"
+        assert ver["present"] == []
+        assert ver["missing"] == ["gone1.py", "gone2.py"]
+
+    @pytest.mark.asyncio
+    async def test_does_not_mutate_input(self):
+        """The durable problem_model dict passed in is never mutated — only a
+        copy is annotated."""
+        from app import strategic_spawning
+
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py"],
+                }
+            ]
+        }
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(return_value=(["a.py"], [])),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(pm)
+        # Input capability is untouched (no verification key added in place).
+        assert "verification" not in pm["capabilities"][0]
+        assert out is not pm
+        assert out["capabilities"][0] is not pm["capabilities"][0]
+
+    @pytest.mark.asyncio
+    async def test_passes_repo_branch_context_to_classifier(self):
+        from app import strategic_spawning
+
+        seen_kwargs = {}
+        pm = {
+            "capabilities": [
+                {
+                    "name": "CapA",
+                    "status": "working",
+                    "backing_paths": ["a.py"],
+                }
+            ]
+        }
+
+        async def _classify(paths, **kwargs):
+            seen_kwargs.update(kwargs)
+            return (paths, [])
+
+        with patch.object(
+            strategic_spawning,
+            "classify_existing_paths",
+            new=AsyncMock(side_effect=_classify),
+        ):
+            out = await strategic_spawning._verify_capability_backing_paths(
+                pm,
+                token="ghs_test",
+                owner="acme",
+                repo="widget",
+                branch="automain",
+                project_id="proj-123",
+            )
+        assert out["capabilities"][0]["verification"]["effective_status"] == "working"
+        assert seen_kwargs == {
+            "token": "ghs_test",
+            "owner": "acme",
+            "repo": "widget",
+            "branch": "automain",
+            "project_id": "proj-123",
+        }
+
+
+# ── Onboarding goal reaches the first strategic cycle's payload ─────────────────
+#
+# The New Project onboarding flow seeds the user's goal into BOTH channels the
+# strategic agent's bootstrap reads on cycle 1: problem_model.intent (purpose +
+# current_focus) and a from_type='user' ProjectMessage that lands in the
+# conversation thread. These tests lock in that the seeded intent and message
+# actually reach the spawned strategic-cycle payloads, and that an empty goal
+# leaves today's blank-slate behavior intact.
+
+_ONBOARD_GOAL = "Ship a self-serve billing portal for small teams"
+
+
+def _seeded_problem_model(goal: str) -> dict:
+    """Build a problem_model dict shaped exactly like onboarding's seed.
+
+    Mirrors admin_onboard._seed_strategic_intent: purpose + current_focus set
+    to the goal with a user_message provenance source, validated through the
+    real model so the test exercises the same payload the agent receives.
+    """
+    from app.problem_model import parse_problem_model, Source
+
+    pm = parse_problem_model(None)
+    pm.intent.purpose = goal
+    pm.intent.current_focus = goal
+    pm.intent.source = Source(type="user_message", excerpt=goal[:120])
+    pm.last_updated_by = "user"
+    return pm.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_seeded_goal_reaches_strategic_review_payload(db_session):
+    """Goal seeded at onboarding is visible to the first strategic_review cycle.
+
+    Asserts both bootstrap channels carry it: problem_model.intent.purpose and
+    the from_type='user' message in conversation_thread + open_messages.
+    """
+    project = _make_project(
+        vision={},  # blank-slate vision, as a freshly-onboarded project has
+        problem_model=_seeded_problem_model(_ONBOARD_GOAL),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id, from_type="user", content=_ONBOARD_GOAL
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # Channel 1: intent/purpose
+    assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    # Channel 2: user-message conversation history
+    thread_contents = [m["content"] for m in payload["conversation_thread"]]
+    assert _ONBOARD_GOAL in thread_contents
+    open_contents = [m["content"] for m in payload["open_messages"]]
+    assert _ONBOARD_GOAL in open_contents
+
+
+@pytest.mark.asyncio
+async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
+    """Goal seeded at onboarding is visible to the Phase-1 design_doc_update cycle."""
+    project = _make_project(
+        vision={},
+        problem_model=_seeded_problem_model(_ONBOARD_GOAL),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id, from_type="user", content=_ONBOARD_GOAL
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
+    open_contents = [m["content"] for m in payload["open_messages"]]
+    assert _ONBOARD_GOAL in open_contents
+
+
+@pytest.mark.asyncio
+async def test_empty_goal_leaves_strategic_payload_blank(db_session):
+    """A skipped goal preserves today's blank-slate behavior — no seeded
+    purpose and no seeded user message reach the strategic payload."""
+    project = _make_project(vision={}, problem_model={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    # No purpose was seeded (empty/absent problem_model intent).
+    assert not (payload.get("problem_model") or {}).get("intent", {}).get("purpose")
+    assert payload["conversation_thread"] == []
+    assert payload["open_messages"] == []
 
 
 class TestParallelismHint:

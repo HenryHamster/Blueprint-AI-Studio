@@ -23,6 +23,7 @@ from sqlmodel import select
 
 from app.models import Project, Task, _utcnow
 from app.playbook_capacity import _PLAYBOOK_ARCHIVE_MAX_DEFAULT
+from app.source_ref_validation import partition_missing
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,10 @@ def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
         paths = _extract_file_paths(content)
         if not paths:
             continue
-        any_missing = any(not os.path.isfile(os.path.join(repo_root, p)) for p in paths)
+        _present, _missing = partition_missing(
+            paths, lambda p: os.path.isfile(os.path.join(repo_root, p))
+        )
+        any_missing = bool(_missing)
         if any_missing and not v.get("stale_file_refs"):
             entry = dict(v)
             entry["stale_file_refs"] = True
@@ -106,7 +110,7 @@ def check_and_flag_stale_refs(doc: dict, repo_root: str) -> dict:
             logger.debug(
                 "[PLAYBOOK] Flagged '%s' as stale_file_refs (missing paths: %s)",
                 k,
-                [p for p in paths if not os.path.isfile(os.path.join(repo_root, p))],
+                _missing,
             )
         elif not any_missing and v.get("stale_file_refs"):
             # All referenced files now exist — clear the flag

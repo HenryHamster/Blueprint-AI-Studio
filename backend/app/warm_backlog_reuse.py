@@ -21,12 +21,101 @@ from typing import Optional
 
 from sqlalchemy import or_, select
 
-from app.models import Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
+
+
+def _norm(value) -> Optional[str]:
+    """Lowercased, stripped string, or None for empty/non-string values."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def _task_pinned_providers(task_provider, ctx) -> set[str]:
+    """Provider set a backlog task is constrained to (empty == unconstrained).
+
+    Combines the recorded ``Task.provider`` column (what a re-queued task last
+    ran on) with an explicit per-task ``context['provider_preference']`` pin.
+    An empty set means the task is provider-fungible, so any boot account may
+    run it warm.
+    """
+    constrained: set[str] = set()
+    recorded = _norm(task_provider)
+    if recorded:
+        constrained.add(recorded)
+    pref = ctx.get("provider_preference")
+    if isinstance(pref, str):
+        p = _norm(pref)
+        if p:
+            constrained.add(p)
+    elif isinstance(pref, list):
+        for item in pref:
+            p = _norm(item)
+            if p:
+                constrained.add(p)
+    return constrained
+
+
+def _retarget_enabled() -> bool:
+    """True iff warm-VM re-targeting is enabled (default-off ``warm_retarget_enabled``).
+
+    When on, the warm-claim finalizer re-materializes the resolved account's
+    credentials onto the VM, so boot-identity divergence no longer needs to
+    disqualify a candidate (see ``_vm_boot_incompatible``).
+    """
+    return bool(_runtime_config.get("warm_retarget_enabled", False))
+
+
+def _vm_boot_incompatible(
+    vm_boot, task_provider, task_account_id, task_model, ctx
+) -> bool:
+    """True iff a backlog task is pinned/recorded to provider/account/model
+    material incompatible with the reusing VM's frozen boot manifest.
+
+    A reused VM runs every role on the LLM provider/account/model baked into
+    its boot manifest — the warm claim only mints a fresh JWT and never
+    re-materializes credentials. So a task whose resolved/pinned provider,
+    account, or model differs from the boot identity would silently run on the
+    wrong account; such tasks must cold-dispatch instead of being warm-claimed.
+
+    EXCEPTION — warm re-targeting (``warm_retarget_enabled``): when on, the
+    warm-claim finalizer re-resolves the task's LLM runtime and re-materializes
+    the resolved account's secret manifest onto the VM, so provider/account/
+    model divergence is fully re-targetable and no longer disqualifies. The
+    only remaining isolation boundary is same-project scoping, which the caller
+    already enforces — so this gate becomes a pure no-op. With the flag OFF the
+    original boot-compat behavior below is byte-for-byte unchanged.
+
+    Deliberately a NO-OP (returns False) when ``vm_boot`` is absent or its
+    provider is unknown, and for single-provider/single-account projects where
+    tasks carry no divergent constraint — so those (dominant) projects keep
+    warm-reusing exactly as before. This is the cheap pre-check the poll path
+    needs: it never runs full per-candidate account selection.
+    """
+    if not vm_boot:
+        return False
+    if _retarget_enabled():
+        return False
+    vm_provider = _norm(vm_boot.get("provider"))
+    if vm_provider is None:
+        return False
+    constrained = _task_pinned_providers(task_provider, ctx)
+    if constrained and vm_provider not in constrained:
+        return True
+    vm_account = _norm(vm_boot.get("account_id"))
+    task_account = _norm(task_account_id)
+    if vm_account and task_account and task_account != vm_account:
+        return True
+    vm_model = _norm(vm_boot.get("model"))
+    task_model_n = _norm(task_model)
+    if vm_model and task_model_n and task_model_n != vm_model:
+        return True
+    return False
 
 # Bounded window (seconds) for which a COMPLETED task's VM teardown is held so
 # the agent can poll /api/agent/next-role and claim backlog work before the VM
@@ -59,11 +148,60 @@ def _backlog_scan_limit() -> int:
 
 
 def _teardown_defer_secs() -> int:
+    # Unconditional minimum hold (seconds) before activity-gating begins. Covers
+    # the first /api/agent/next-role poll round-trip, which records the VM
+    # heartbeat the grace loop's activity gate then reads — so the gate never
+    # evicts a VM before its agent has had a chance to poll even once.
     return _runtime_int(
         "warm_backlog_teardown_defer_secs",
         20,
         min_value=5,
         max_value=120,
+    )
+
+
+def _grace_window_secs() -> int:
+    # Bounded ceiling (seconds) for the activity-gated teardown grace window:
+    # the longest a just-idle COMPLETED VM with eligible backlog is held while
+    # its agent keeps polling /api/agent/next-role. Sized to the agent's poll
+    # ceiling (next_role_poll_timeout_secs, default 180) so the held VM lives no
+    # longer than the agent actually polls. The activity gate (below) releases
+    # sooner if the agent stops heartbeating, so this is a worst-case cap, not a
+    # fixed hold. The teardown loop floors this at _teardown_defer_secs() so the
+    # ceiling can never undercut the unconditional minimum hold.
+    return _runtime_int(
+        "warm_backlog_grace_window_secs",
+        180,
+        min_value=5,
+        max_value=600,
+    )
+
+
+def _grace_idle_cutoff_secs() -> int:
+    # Activity gate threshold (seconds). If the held VM has not heartbeated (via
+    # its /next-role poll or vm-heartbeat) within this many seconds, the agent is
+    # treated as gone (gave up / process exited / VM preempted) and teardown is
+    # released early rather than holding an idle VM to the ceiling. Comfortably
+    # exceeds the agent's ~5s poll cadence so a couple of missed polls do not
+    # evict a still-live agent.
+    return _runtime_int(
+        "warm_backlog_grace_idle_secs",
+        30,
+        min_value=10,
+        max_value=120,
+    )
+
+
+def _grace_poll_interval_secs() -> int:
+    # How often the teardown loop re-checks (claimed-work + liveness) while
+    # holding the VM. Kept at the agent's poll cadence so the loop reacts within
+    # one agent round-trip; clamped so a misconfigured value cannot busy-spin or
+    # overshoot the gate.
+    return _runtime_int(
+        "warm_backlog_grace_poll_interval_secs",
+        5,
+        min_value=1,
+        max_value=30,
     )
 
 
@@ -95,6 +233,7 @@ async def _eligible_backlog_ids(
     vm_instance_id: str,
     *,
     in_progress_files: Optional[set[str]] = None,
+    vm_boot: Optional[dict] = None,
 ) -> list[uuid.UUID]:
     """QUEUED task ids in *project_id* an idle VM may claim, priority-ordered.
 
@@ -103,10 +242,19 @@ async def _eligible_backlog_ids(
       - status == QUEUED, same project_id
       - not requires_approval (orchestrator skips these too)
       - retry_after_until null or already elapsed
-      - no ``depends_on`` (avoids re-implementing dependency / PR-merge
-        resolution; dependency-bearing tasks simply cold-dispatch as before)
+      - either no ``depends_on`` OR the orchestrator has already resolved
+        every dependency and durably stamped ``context["_deps_satisfied"]``
+        (avoids re-implementing dependency / PR-merge resolution on the hot
+        path — the marker is the orchestrator's authoritative, GitHub-aware
+        readiness signal). A dependency-bearing task whose deps are still
+        unresolved carries no marker and continues to cold-dispatch as before.
       - not pinned to a *different* VM via ``warm_target_vm_id`` (a pin to
         this VM is the chain path's job; a pin elsewhere must not be stolen)
+      - provider/account/model compatible with the reusing VM's boot manifest
+        when ``vm_boot`` is supplied (see ``_vm_boot_incompatible``); a task
+        pinned/recorded to a different provider cold-dispatches instead of
+        running on the wrong frozen account. Omitting ``vm_boot`` disables the
+        guard, and it is a no-op for single-provider projects either way.
       - no related_files overlap with an IN_PROGRESS task in the same project
 
     Any task type is runnable by any agent VM (the workspace is re-cloned per
@@ -120,17 +268,28 @@ async def _eligible_backlog_ids(
     returned rows, so an empty backlog never pays for the IN_PROGRESS scan.
     """
     now = _utcnow()
+    # A paused project's backlog is never warm-claimable. Pause is a
+    # first-class persisted switch (distinct from terminal status and from
+    # autonomous_enabled) that blocks ALL new dispatch — the orchestrator's
+    # cold path filters it in its candidate query, and this idle-VM next-role
+    # reuse path must filter it identically so a paused project can't keep
+    # claiming warm VMs. The join is safe: project_id is a non-nullable FK.
     rows = (
         await session.execute(
             select(
                 Task.id,
                 Task.depends_on,
                 Task.context,
+                Task.provider,
+                Task.account_id,
+                Task.model,
             )
+            .join(Project, Task.project_id == Project.id)
             .where(
                 Task.status == TaskStatus.QUEUED,
                 Task.project_id == project_id,
                 Task.requires_approval.is_(False),
+                Project.paused.is_(False),
                 or_(
                     Task.retry_after_until.is_(None),
                     Task.retry_after_until <= now,
@@ -162,14 +321,30 @@ async def _eligible_backlog_ids(
     skipped_depends_on = 0
     skipped_pinned_vm = 0
     skipped_file_conflict = 0
+    skipped_provider_mismatch = 0
 
-    for task_id, depends_on, ctx in rows:
-        if depends_on:
+    for task_id, depends_on, ctx, t_provider, t_account_id, t_model in rows:
+        ctx = ctx or {}
+        # Dependency-bearing tasks are claimable warm ONLY once the
+        # orchestrator's authoritative dep resolution has marked them ready
+        # (``_deps_satisfied``). Without the marker the deps are still
+        # unresolved, so the task stays ineligible and cold-dispatches — the
+        # warm check is thus never looser than the cold dispatcher's gate.
+        if depends_on and not ctx.get("_deps_satisfied"):
             skipped_depends_on += 1
             continue
-        ctx = ctx or {}
         pinned_vm = ctx.get("warm_target_vm_id")
         if pinned_vm and pinned_vm != vm_instance_id:
+            skipped_pinned_vm += 1
+            continue
+        if _vm_boot_incompatible(vm_boot, t_provider, t_account_id, t_model, ctx):
+            skipped_provider_mismatch += 1
+            continue
+        # A warm-pool pin is owned exclusively by the warm-pool dispatch path
+        # (claimed via the /next-role pool branch, origin "warm_pool"). Backlog
+        # reuse must never claim it — that would mis-attribute the lift and
+        # bypass the pool's lease accounting — even when it is pinned to THIS VM.
+        if ctx.get("warm_pool_pin"):
             skipped_pinned_vm += 1
             continue
         if in_progress_files:
@@ -187,13 +362,16 @@ async def _eligible_backlog_ids(
         record_scan_skipped_pinned_vm()
     if skipped_file_conflict > 0:
         record_scan_skipped_file_conflict()
+    if skipped_provider_mismatch > 0:
+        record_scan_skipped_provider_mismatch()
     if saturated:
         record_scan_saturated()
 
     logger.debug(
         "[BACKLOG-REUSE] scan project_id=%s vm_instance_id=%s "
         "rows_fetched=%d rows_eligible=%d saturated=%s "
-        "skipped_depends_on=%d skipped_pinned_vm=%d skipped_file_conflict=%d",
+        "skipped_depends_on=%d skipped_pinned_vm=%d skipped_file_conflict=%d "
+        "skipped_provider_mismatch=%d",
         project_id,
         vm_instance_id,
         rows_fetched,
@@ -202,6 +380,7 @@ async def _eligible_backlog_ids(
         skipped_depends_on,
         skipped_pinned_vm,
         skipped_file_conflict,
+        skipped_provider_mismatch,
     )
 
     return eligible
@@ -213,6 +392,7 @@ async def has_eligible_backlog_task(
     vm_instance_id: str,
     *,
     in_progress_files: Optional[set[str]] = None,
+    vm_boot: Optional[dict] = None,
 ) -> bool:
     """True iff *project_id* has at least one backlog task this VM could claim.
 
@@ -221,10 +401,16 @@ async def has_eligible_backlog_task(
 
     Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
     set (see ``_eligible_backlog_ids``) when this gate is paired with a claim.
+    Pass ``vm_boot`` to enforce provider/account/model compatibility with the
+    reusing VM's boot manifest (see ``_vm_boot_incompatible``).
     """
     return bool(
         await _eligible_backlog_ids(
-            session, project_id, vm_instance_id, in_progress_files=in_progress_files
+            session,
+            project_id,
+            vm_instance_id,
+            in_progress_files=in_progress_files,
+            vm_boot=vm_boot,
         )
     )
 
@@ -235,6 +421,7 @@ async def select_backlog_reuse_candidate(
     vm_instance_id: str,
     *,
     in_progress_files: Optional[set[str]] = None,
+    vm_boot: Optional[dict] = None,
 ) -> Optional[Task]:
     """Atomically lock the next claimable backlog task for an idle VM, or None.
 
@@ -249,7 +436,10 @@ async def select_backlog_reuse_candidate(
 
     Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
     set (see ``_eligible_backlog_ids``) when this claim follows an eligibility
-    gate in the same flow, so the file-conflict scan is not run twice.
+    gate in the same flow, so the file-conflict scan is not run twice. Pass
+    ``vm_boot`` to enforce provider/account/model compatibility with the
+    reusing VM's boot manifest (see ``_vm_boot_incompatible``); incompatible
+    tasks are excluded from the candidate set and cold-dispatch as before.
 
     Records the funnel skip reason for the two None-returning cases, which the
     caller cannot distinguish on its own: ``no_eligible`` when no backlog task
@@ -257,16 +447,30 @@ async def select_backlog_reuse_candidate(
     claimer won the SKIP-LOCKED row.
     """
     eligible = await _eligible_backlog_ids(
-        session, project_id, vm_instance_id, in_progress_files=in_progress_files
+        session,
+        project_id,
+        vm_instance_id,
+        in_progress_files=in_progress_files,
+        vm_boot=vm_boot,
     )
     if not eligible:
         record_claim_skipped("no_eligible")
         return None
     result = await session.execute(
         select(Task)
-        .where(Task.id.in_(eligible), Task.status == TaskStatus.QUEUED)
+        .join(Project, Task.project_id == Project.id)
+        .where(
+            Task.id.in_(eligible),
+            Task.status == TaskStatus.QUEUED,
+            Project.paused.is_(False),
+        )
         .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
-        .with_for_update(skip_locked=True)
+        # of=Task locks ONLY the candidate Task row, not the joined Project
+        # row. All backlog candidates belong to one project, so locking the
+        # shared Project row would let skip_locked silently drop a claimable
+        # task whenever a sibling claim in the same project held it (mirrors
+        # agent_warm_continuity.py:750/:926).
+        .with_for_update(skip_locked=True, of=Task)
         .limit(1)
     )
     claimed = result.scalars().first()
@@ -295,6 +499,16 @@ _teardown_defers_events: deque = deque(maxlen=500)
 _next_role_polls_during_defer_events: deque = deque(maxlen=500)
 _warm_claims_succeeded_events: deque = deque(maxlen=500)
 _claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
+# Completion-side trigger stage: each entry is a (datetime, count) tuple, one
+# per COMPLETION event that proactively stamped ``_deps_satisfied`` on >=1
+# just-unblocked dependent (so the just-completed VM can warm-claim that
+# follow-on work inside its teardown-defer grace window rather than tearing
+# down cold while the dependent waits for a later dispatch scan). count is the
+# number of dependents marked by that event. Recorded by the completion-side
+# trigger that owns the marking (orchestrator/lifecycle/reaper termination
+# paths); surfaced here so the trigger's lift is visible alongside the
+# unresolved-dependency scan skips it is designed to drive down.
+_completion_dependents_marked_events: deque = deque(maxlen=500)  # (datetime, count)
 
 # Eligibility-scan skip-reason events. Each entry is a single _utcnow() per
 # poll where that reason fired (one or more rows skipped). This per-poll
@@ -303,7 +517,16 @@ _claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
 _scan_skipped_depends_on_events: deque = deque(maxlen=500)
 _scan_skipped_pinned_vm_events: deque = deque(maxlen=500)
 _scan_skipped_file_conflict_events: deque = deque(maxlen=500)
+_scan_skipped_provider_mismatch_events: deque = deque(maxlen=500)
 _scan_saturated_events: deque = deque(maxlen=500)
+
+# Grace-window (activity-gated teardown hold) stage events. Each entry is a
+# single _utcnow() per occurrence. Extensions count how many poll intervals a
+# held VM survived because its agent was still polling; idle-releases and
+# ceiling-releases count the two bounded exits when no claim happened.
+_grace_window_extension_events: deque = deque(maxlen=500)
+_grace_idle_release_events: deque = deque(maxlen=500)
+_grace_ceiling_release_events: deque = deque(maxlen=500)
 
 
 def record_scan_skipped_depends_on() -> None:
@@ -321,10 +544,34 @@ def record_scan_skipped_file_conflict() -> None:
     _scan_skipped_file_conflict_events.append(_utcnow())
 
 
+def record_scan_skipped_provider_mismatch() -> None:
+    """Stage A: an eligibility scan skipped >=1 candidate whose pinned/recorded
+    provider/account/model is incompatible with the reusing VM's boot manifest."""
+    _scan_skipped_provider_mismatch_events.append(_utcnow())
+
+
 def record_scan_saturated() -> None:
     """Stage A: an eligibility scan hit the per-poll _backlog_scan_limit()
     (runtime key ``warm_backlog_scan_limit``)."""
     _scan_saturated_events.append(_utcnow())
+
+
+def record_grace_window_extension() -> None:
+    """Grace stage: a held VM survived another poll interval because its agent
+    was still actively polling (activity gate held the VM open)."""
+    _grace_window_extension_events.append(_utcnow())
+
+
+def record_grace_idle_release() -> None:
+    """Grace stage: a held VM was torn down early because its agent stopped
+    heartbeating before the bounded ceiling (activity gate fired)."""
+    _grace_idle_release_events.append(_utcnow())
+
+
+def record_grace_ceiling_release() -> None:
+    """Grace stage: a held VM reached the bounded grace ceiling without claiming
+    work and was torn down."""
+    _grace_ceiling_release_events.append(_utcnow())
 
 
 def record_vm_with_eligible_backlog() -> None:
@@ -356,6 +603,18 @@ def record_claim_skipped(reason: str) -> None:
     _claim_skipped_events.append((_utcnow(), reason))
 
 
+def record_completion_dependents_marked(count: int) -> None:
+    """Completion-side trigger: a finished task proactively stamped the sticky
+    ``_deps_satisfied`` readiness marker on *count* just-unblocked QUEUED
+    dependents, making them warm-claimable within the just-completed VM's
+    teardown-defer grace window instead of waiting for a later dispatch scan.
+
+    No-ops on a non-positive count so callers can record unconditionally.
+    """
+    if count and count > 0:
+        _completion_dependents_marked_events.append((_utcnow(), count))
+
+
 def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
     """Return rolling funnel counts for the warm-reuse claim pipeline.
 
@@ -380,6 +639,9 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         "warm_claims_succeeded": sum(
             1 for ts in _warm_claims_succeeded_events if ts >= cutoff
         ),
+        "completion_dependents_marked": sum(
+            count for ts, count in _completion_dependents_marked_events if ts >= cutoff
+        ),
         "claim_skipped_by_reason": skipped_by_reason,
         "claim_skipped_total": sum(skipped_by_reason.values()),
         "scan_polls_with_depends_on_skip": sum(
@@ -391,9 +653,280 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         "scan_polls_with_file_conflict_skip": sum(
             1 for ts in _scan_skipped_file_conflict_events if ts >= cutoff
         ),
+        "scan_polls_with_provider_mismatch_skip": sum(
+            1 for ts in _scan_skipped_provider_mismatch_events if ts >= cutoff
+        ),
         "scan_polls_saturated": sum(
             1 for ts in _scan_saturated_events if ts >= cutoff
         ),
+        "grace_window_extensions": sum(
+            1 for ts in _grace_window_extension_events if ts >= cutoff
+        ),
+        "grace_idle_releases": sum(
+            1 for ts in _grace_idle_release_events if ts >= cutoff
+        ),
+        "grace_ceiling_releases": sum(
+            1 for ts in _grace_ceiling_release_events if ts >= cutoff
+        ),
+    }
+
+
+# Gate for naming a single dominant reuse drop-out. Mirrors the
+# dominant-blocker gating in digest_metrics: a reason is named the leader only
+# when it is present at meaningful volume (>=2 events), covers at least half the
+# non-converting population, AND strictly outranks the runner-up (an even split
+# names no leader). Below the gate, dominant_dropout is None.
+_DOMINANT_DROPOUT_MIN_COUNT = 2
+_DOMINANT_DROPOUT_MIN_SHARE = 0.5
+
+# Human-readable funnel keys that represent a completed-VM-with-eligible-backlog
+# failing to convert to a warm claim, mapped to a ranking reason label. Each is
+# an independent rolling event stream (per-poll or per-occurrence), NOT a per-VM
+# record, so the ranking reflects event magnitude over the window rather than
+# exact per-VM causation (stated in attribution_note below).
+_DROPOUT_REASON_KEYS = (
+    ("grace_idle_releases", "grace_idle_release"),
+    ("grace_ceiling_releases", "grace_ceiling_release"),
+    ("scan_polls_with_depends_on_skip", "scan_depends_on"),
+    ("scan_polls_with_pinned_vm_skip", "scan_pinned_vm"),
+    ("scan_polls_with_file_conflict_skip", "scan_file_conflict"),
+    ("scan_polls_saturated", "scan_saturated"),
+)
+
+
+def compute_dominant_reuse_dropout(window_hours: int = 24) -> dict:
+    """Rank where warm-reuse leaks and name the single dominant drop-out.
+
+    Derives a per-reason drop-out breakdown from the rolling reuse funnel
+    (``get_reuse_funnel_snapshot``): every per-claim skip reason plus the
+    grace-window releases and eligibility-scan skips that prevented a completed
+    VM with eligible backlog from converting to a warm claim. The dominant
+    drop-out is named only when one reason clearly dominates the non-converting
+    population (see the gating constants); otherwise ``dominant_dropout`` is
+    None. Suitable for daily persistence (efficiency snapshot) and admin
+    surfacing so a widening change can be confirmed to reduce the leader.
+    """
+    snap = get_reuse_funnel_snapshot(window_hours)
+    dropout_by_reason: dict = {}
+    for reason, count in (snap.get("claim_skipped_by_reason") or {}).items():
+        if count:
+            dropout_by_reason[f"claim_{reason}"] = count
+    for key, reason in _DROPOUT_REASON_KEYS:
+        count = snap.get(key) or 0
+        if count:
+            dropout_by_reason[reason] = count
+
+    total = sum(dropout_by_reason.values())
+    dominant = None
+    if total > 0:
+        ranked = sorted(dropout_by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_reason, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= _DOMINANT_DROPOUT_MIN_COUNT
+            and top_count / total >= _DOMINANT_DROPOUT_MIN_SHARE
+            and top_count > second_count
+        ):
+            dominant = {
+                "reason": top_reason,
+                "count": top_count,
+                "total": total,
+                "share": round(top_count / total, 3),
+            }
+    return {
+        "window_hours": window_hours,
+        "dropout_by_reason": dropout_by_reason,
+        "dropout_total": total,
+        "dominant_dropout": dominant,
+        "attribution_note": (
+            "Drop-out reasons are independent rolling event-stream counts, not "
+            "per-VM-linked records; the ranking reflects event magnitude over "
+            "the window rather than exact per-VM causation."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Warm-POOL dispatch funnel observability counters (direction d-5fd69fe1)
+# ---------------------------------------------------------------------------
+# Pool-hit-vs-cold-dispatch funnel for the pre-provisioned VM pool. Mirrors the
+# backlog-reuse funnel above: bounded rolling deques of UTC timestamps (plus a
+# (datetime, reason) tuple for the multi-reason lease-miss stage), maxlen=500 to
+# bound memory on a long-lived process. The dispatch hook (sibling task) calls
+# these as it decides between leasing an IDLE pool member (a "hit") and
+# cold-provisioning a fresh VM (a "cold dispatch"); get_pool_funnel_snapshot
+# rolls them up for the operator panel.
+#
+# Per-account-mix dimension (direction d-5fd69fe1, telemetry cluster): each
+# hit / cold / miss event carries the resolved account label of the dispatch
+# so an operator can answer, PER ACCOUNT, how many dispatches the pool served
+# warm vs cold and the per-account hit rate -- the judgment a controlled
+# enable's 'retire on success or pivot' decision depends on. The ``account``
+# argument is optional and defaults to None so existing call sites keep working
+# unchanged; un-attributed events bucket under ``_UNATTRIBUTED_ACCOUNT`` in the
+# per-account breakdown while still counting toward the fleet-wide totals.
+
+_pool_lease_hit_events: deque = deque(maxlen=500)  # (datetime, account)
+_pool_cold_dispatch_events: deque = deque(maxlen=500)  # (datetime, account)
+_pool_lease_miss_events: deque = deque(maxlen=500)  # (datetime, reason, account)
+
+# Bucket label for dispatches recorded without a resolved account (e.g. legacy
+# call sites that have not yet been wired to pass identity).
+_UNATTRIBUTED_ACCOUNT = "unattributed"
+
+
+def _account_label(account: Optional[str]) -> str:
+    return account or _UNATTRIBUTED_ACCOUNT
+
+
+def record_pool_lease_hit(account: Optional[str] = None) -> None:
+    """A queued task was served warm by leasing an IDLE pool member.
+
+    ``account`` is the resolved account id the dispatch was served for; pass it
+    to attribute the warm claim in the per-account breakdown.
+    """
+    _pool_lease_hit_events.append((_utcnow(), account))
+
+
+def record_pool_cold_dispatch(account: Optional[str] = None) -> None:
+    """A queued task cold-provisioned a VM (pool disabled, empty, or no match).
+
+    ``account`` is the resolved account id the dispatch was served for; pass it
+    to attribute the cold dispatch in the per-account breakdown.
+    """
+    _pool_cold_dispatch_events.append((_utcnow(), account))
+
+
+def record_pool_lease_miss(reason: str, account: Optional[str] = None) -> None:
+    """The pool was consulted but no member could be leased.
+
+    reason should be one of: "no_idle_member" (pool empty / all leased),
+    "no_compatible_member" (idle members exist but identity/tenant mismatch),
+    "disabled" (warm_pool_enabled off), "out_of_scope" (task project not in the
+    warm-pool allowlist — dispatch honors the same per-project scope the
+    maintainer enforces), "lost_lease_race" (a peer dispatcher won the
+    SKIP-LOCKED row). ``account`` is the resolved account id the lease was
+    attempted for; pass it to attribute the miss per account.
+    """
+    _pool_lease_miss_events.append((_utcnow(), reason, account))
+
+
+def get_pool_funnel_snapshot(window_hours: int = 24) -> dict:
+    """Return rolling funnel counts for the warm-pool dispatch path.
+
+    All counts cover the trailing ``window_hours`` (default 24h). ``pool_hit_rate``
+    is hits / (hits + cold dispatches), or None when no dispatch was recorded.
+
+    ``by_account`` breaks the same funnel down by resolved account so an operator
+    can read, per account, the warm-claim / cold-dispatch counts, hit rate, and
+    lease-miss reasons during a controlled enable. Events recorded without an
+    account bucket under ``_UNATTRIBUTED_ACCOUNT``.
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+
+    def _new_bucket() -> dict:
+        return {
+            "pool_lease_hits": 0,
+            "cold_dispatches": 0,
+            "lease_miss_by_reason": {},
+        }
+
+    by_account: dict = {}
+    miss_by_reason: dict = {}
+    hits = 0
+    cold = 0
+    for ts, account in _pool_lease_hit_events:
+        if ts >= cutoff:
+            hits += 1
+            by_account.setdefault(_account_label(account), _new_bucket())[
+                "pool_lease_hits"
+            ] += 1
+    for ts, account in _pool_cold_dispatch_events:
+        if ts >= cutoff:
+            cold += 1
+            by_account.setdefault(_account_label(account), _new_bucket())[
+                "cold_dispatches"
+            ] += 1
+    for ts, reason, account in _pool_lease_miss_events:
+        if ts >= cutoff:
+            miss_by_reason[reason] = miss_by_reason.get(reason, 0) + 1
+            bucket = by_account.setdefault(_account_label(account), _new_bucket())
+            bucket["lease_miss_by_reason"][reason] = (
+                bucket["lease_miss_by_reason"].get(reason, 0) + 1
+            )
+
+    # Finalize each account bucket with its own totals + hit rate.
+    for bucket in by_account.values():
+        acct_total = bucket["pool_lease_hits"] + bucket["cold_dispatches"]
+        bucket["total_dispatches"] = acct_total
+        bucket["pool_hit_rate"] = (
+            round(bucket["pool_lease_hits"] / acct_total, 4) if acct_total else None
+        )
+        bucket["lease_miss_total"] = sum(bucket["lease_miss_by_reason"].values())
+
+    total = hits + cold
+    return {
+        "window_hours": window_hours,
+        "pool_lease_hits": hits,
+        "cold_dispatches": cold,
+        "total_dispatches": total,
+        "pool_hit_rate": round(hits / total, 4) if total else None,
+        "lease_miss_by_reason": miss_by_reason,
+        "lease_miss_total": sum(miss_by_reason.values()),
+        "by_account": by_account,
+    }
+
+
+def compute_dominant_pool_miss(window_hours: int = 24) -> dict:
+    """Rank pool lease-miss reasons and name the single dominant miss.
+
+    Mirrors :func:`compute_dominant_reuse_dropout` for the POOL dispatch funnel
+    (a DIFFERENT funnel from the backlog reuse-dropout one): derives the
+    lease-miss-by-reason breakdown from :func:`get_pool_funnel_snapshot` and
+    names a ``dominant_miss`` reason only when one clearly dominates the miss
+    population — present at meaningful volume (>=2 events), covering at least
+    half the misses, AND strictly outranking the runner-up (an even split names
+    no leader). The full funnel aggregates (hits, cold dispatches, overall and
+    per-account hit rate, the miss breakdown) ride along so the whole block can
+    be folded into the daily efficiency snapshot and survive the restarts that
+    wipe the in-memory funnel counters.
+
+    Why the miss breakdown matters: when the pool is missing, WHY drives the
+    next action. A funnel dominated by ``no_compatible_member`` (idle VM on the
+    wrong account/provider/model) says enable account-retarget or rebalance
+    provisioning; one dominated by ``no_idle_member`` says grow the pool or the
+    demand is too bursty for the current target size. Losing that breakdown on
+    every restart makes the enable-and-tune loop blind.
+    """
+    snap = get_pool_funnel_snapshot(window_hours)
+    miss_by_reason = dict(snap.get("lease_miss_by_reason") or {})
+    total = sum(miss_by_reason.values())
+    dominant = None
+    if total > 0:
+        ranked = sorted(miss_by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
+        top_reason, top_count = ranked[0]
+        second_count = ranked[1][1] if len(ranked) > 1 else 0
+        if (
+            top_count >= _DOMINANT_DROPOUT_MIN_COUNT
+            and top_count / total >= _DOMINANT_DROPOUT_MIN_SHARE
+            and top_count > second_count
+        ):
+            dominant = {
+                "reason": top_reason,
+                "count": top_count,
+                "total": total,
+                "share": round(top_count / total, 3),
+            }
+    return {
+        "window_hours": snap.get("window_hours"),
+        "pool_lease_hits": snap.get("pool_lease_hits"),
+        "cold_dispatches": snap.get("cold_dispatches"),
+        "total_dispatches": snap.get("total_dispatches"),
+        "pool_hit_rate": snap.get("pool_hit_rate"),
+        "lease_miss_by_reason": miss_by_reason,
+        "lease_miss_total": snap.get("lease_miss_total"),
+        "dominant_miss": dominant,
+        "by_account": snap.get("by_account"),
     }
 
 
@@ -499,7 +1032,8 @@ def record_spawn_pin_skipped(reason: str) -> None:
     "breaker_tripped" (is_warm_continuity_suppressed() true),
     "caller_suppressed" (suppress_warm_handoff=True),
     "source_cold" (source task has no vm_instance_id),
-    "stale_source" (source heartbeat older than WARM_HANDOFF_WINDOW_SECS).
+    "stale_source" (source heartbeat older than WARM_HANDOFF_WINDOW_SECS),
+    "project_paused" (owning project is paused — no new dispatch on any path).
     """
     _spawn_pin_skipped_events.append((_utcnow(), reason))
 

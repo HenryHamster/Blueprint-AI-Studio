@@ -46,12 +46,10 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import cast, func, select
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.sql import ColumnElement
 
-from app.database import resolve_dialect_name
+from app.landed_signal import landed_signal_predicate
 from app.models import ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -214,28 +212,6 @@ async def ensure_initial_release_version(
     )
 
 
-def _pr_merged_predicate(session: AsyncSession) -> ColumnElement[bool]:
-    """Return a dialect-appropriate ``task.context['pr_merged'] is true`` filter.
-
-    ``Task.context`` is already a JSONB column (see ``models.py``), so the
-    predicate never casts the column — only the literal, matching the codebase
-    pattern in ``anomaly_detection.py``.
-
-    - Postgres: ``context @> '{"pr_merged": true}'::jsonb`` — index-friendly
-      containment that ``ix_task_context_gin`` can serve.
-    - SQLite (test fixtures): ``json_extract(context, '$.pr_merged')`` reads
-      the boolean as a primitive (``1`` for ``true``), so an equality check
-      against ``True`` matches the Python-written boolean value.
-
-    Only the canonical boolean ``True`` is matched — the convention
-    throughout admin.py / rollup_management.py is ``context["pr_merged"] = True``;
-    there is no string ``"true"`` form to accommodate.
-    """
-    dialect_name = resolve_dialect_name(session)
-    if dialect_name == "sqlite":
-        return func.json_extract(Task.context, "$.pr_merged") == True  # noqa: E712
-    return Task.context.op("@>")(cast({"pr_merged": True}, JSONB))
-
 
 async def count_merged_since(
     session: AsyncSession,
@@ -244,15 +220,8 @@ async def count_merged_since(
 ) -> int:
     """Count tasks for ``project_id`` whose PR was merged at or after ``since``.
 
-    "Merged" is defined as ``task.status = COMPLETED`` AND
-    ``task.context['pr_merged'] is true`` AND ``task.updated_at >= since``.
-    This mirrors the convention established throughout admin.py and
-    rollup_management.py where a successful merge sets
-    ``task.context["pr_merged"] = True``.
-
-    The ``pr_merged`` filter is applied on both Postgres and SQLite via
-    :func:`_pr_merged_predicate` — a COMPLETED task without ``pr_merged``
-    is never counted on either dialect.
+    "Merged" is defined as ``task.status = COMPLETED`` AND the task carrying
+    the canonical integration-landing signal at or after ``since``.
 
     ``updated_at`` is used as a proxy for merge time because no dedicated
     merged-at column exists on Task.  It is set via ``onupdate`` so it
@@ -266,7 +235,7 @@ async def count_merged_since(
             Task.project_id == project_id,
             Task.status == TaskStatus.COMPLETED,
             Task.updated_at >= since,
-            _pr_merged_predicate(session),
+            landed_signal_predicate(session),
         )
     )
     result = await session.execute(stmt)
@@ -297,6 +266,103 @@ async def recent_closed_versions(
     return list((await session.execute(stmt)).scalars().all())
 
 
+def summarize_qualification_state(
+    last_qualification: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Disambiguate the overloaded ``last_qualification.status`` for the agent.
+
+    ``status == "pending"`` collapses two very different situations:
+
+    * the qualification **audit is still scoring** the candidate (wait), and
+    * the audit **PASSED and a promotion PR is open** with auto-merge armed —
+      ``promote()`` records a ``promotion_pending`` sub-key for this case. It is
+      NOT "still auditing": the promotion PR can fail its own CI and bounce the
+      version back to stabilize.
+
+    The strategic agent reads ``last_qualification`` as the source of truth for
+    "what is happening with qualification", so a bare ``status="pending"`` made
+    it conflate "audit in flight, wait" with "audit passed, promotion failing"
+    and burn whole cycles waiting (incident 2026-06-02). This derives a single
+    explicit sub-state from the raw verdict — pure data, no I/O.
+
+    Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
+    ``promotion_in_flight`` | ``promotion_failed`` | ``not_promoted`` |
+    ``dry_run`` | ``promoted``), or ``None`` when unqualified (no verdict yet).
+    """
+    lq = last_qualification or {}
+    status = lq.get("status")
+    if not lq or status is None:
+        return None
+    if status == "pending":
+        promo = lq.get("promotion_pending")
+        if isinstance(promo, dict):
+            armed = promo.get("auto_merge_enabled")
+            return {
+                "state": "promotion_in_flight",
+                "summary": (
+                    "Audit PASSED; a promotion PR is open and auto-merge is "
+                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
+                    "auditing' — the audit already cleared. Watch the promotion "
+                    "PR's CI: if it goes red the version bounces back to "
+                    "stabilize and needs a fresh qualify on a synced candidate."
+                ),
+                "promotion_pr_number": promo.get("pr_number"),
+                "promotion_pr_url": promo.get("pr_url"),
+            }
+        return {
+            "state": "qualifying",
+            "summary": (
+                "Qualification audit is in flight (scoring the candidate). Wait "
+                "for the verdict — re-requesting while one is pending is ignored."
+            ),
+        }
+    if status == "promotion_failed":
+        reason = lq.get("error")
+        return {
+            "state": "promotion_failed",
+            "summary": (
+                "The last promotion FAILED after a PASSING audit"
+                + (f" ({reason})" if reason else "")
+                + ". The version is back in stabilize. This is not a pending "
+                "audit — it needs a FRESH qualify on a candidate synced with the "
+                "promotion target; waiting for a verdict will not unblock it."
+            ),
+            "error": reason,
+            "detail": lq.get("detail"),
+        }
+    if status == "not_promoted":
+        conf = lq.get("confidence")
+        thr = lq.get("threshold")
+        return {
+            "state": "not_promoted",
+            "summary": (
+                "Candidate scored BELOW the promotion threshold"
+                + (
+                    f" (confidence {conf}, threshold {thr})"
+                    if conf is not None
+                    else ""
+                )
+                + ". Resolve the binding blocker, then re-qualify."
+            ),
+            "blocker": lq.get("blocker"),
+        }
+    if status == "dry_run":
+        return {
+            "state": "dry_run",
+            "summary": (
+                "Candidate PASSED qualification in dry-run (promotion disabled). "
+                "It is promotion-ready — no further audit work is needed to clear "
+                "the bar; enabling promotion is the remaining step."
+            ),
+        }
+    if status == "promoted":
+        return {
+            "state": "promoted",
+            "summary": "Candidate was promoted — the version was cut.",
+        }
+    return {"state": status, "summary": f"Qualification status: {status}."}
+
+
 def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
     """Return a compact dict for embedding in the strategic agent's payload.
 
@@ -312,6 +378,9 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
         else None,
         "phase_reasoning": version.phase_reasoning,
         "last_qualification": version.last_qualification,
+        "qualification_state": summarize_qualification_state(
+            version.last_qualification
+        ),
     }
 
 

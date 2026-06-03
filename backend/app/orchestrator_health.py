@@ -52,14 +52,34 @@ def _find_cycle_members(adj: Dict[str, list]) -> set:
     return members
 
 
-def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
-    """Return [(task_id, reason)] for tasks whose depends_on should be cleared.
+async def _classify_stuck_tasks(
+    stuck, dep_map, dep_tasks_by_id, stuck_ids, session, verify_pr_merged
+) -> list:
+    """Return [(task_id, reason)] for stuck QUEUED tasks needing intervention.
 
-    reason is 'cycle' (true dependency cycle) or 'dead_deps' (all deps are
-    FAILED/CANCELLED/deleted with none stuck or active).
+    ``reason`` is one of:
+      - ``'cycle'``          — a true dependency cycle; clear depends_on and dispatch.
+      - ``'cascade_cancel'`` — a real prerequisite genuinely FAILED (or was deleted /
+                               permanently cancelled). The dependent is impossible
+                               work and must be cancelled, NOT dispatched.
+      - ``'dead_deps'``      — every dependency is terminal and satisfied/non-blocking
+                               (e.g. SCOPE_EMPTY or a merged completion). Safe to clear
+                               depends_on and dispatch.
+
+    Dependency-death semantics are delegated to :func:`_check_candidate_task_deps`
+    so this deadlock-breaker and the main dispatch loop share ONE source of truth:
+    SCOPE_EMPTY-cancelled deps count as satisfied, requeue-cancelled deps remap to
+    their live replacement clone (and the dependent keeps waiting), and a genuinely
+    failed dep cascade-cancels rather than being cleared-and-dispatched.
+
+    ``dep_tasks_by_id`` maps dependency UUID -> the fully-loaded ``Task`` row (every
+    column present, so the attribute reads inside ``_check_candidate_task_deps``
+    cannot trip an async lazy-load). A dependency absent from the map is a deleted
+    row — ``_check_candidate_task_deps`` treats it as failed.
     """
     adj = {str(t.id): [str(d) for d in dep_map[t.id] if d in stuck_ids] for t in stuck}
     cycle_m = _find_cycle_members(adj)
+    _terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
     out = []
     for t in stuck:
         deps = dep_map[t.id]
@@ -68,13 +88,26 @@ def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
         if str(t.id) in cycle_m:
             out.append((t.id, "cycle"))
             continue
-        # Dead-dep: no dep is stuck (resolvable) or active
-        if not any(
+        # Still waiting on a resolvable (stuck) or in-flight (non-terminal)
+        # dependency — not a deadlock. Leave it for a later cycle, exactly as the
+        # main path waits rather than forcing the issue.
+        if any(
             d in stuck_ids
-            or dep_status.get(d) not in (None, TaskStatus.FAILED, TaskStatus.CANCELLED)
+            or (d in dep_tasks_by_id and dep_tasks_by_id[d].status not in _terminal)
             for d in deps
         ):
+            continue
+        # Every dependency is terminal (or deleted). Resolve it through the main
+        # path's policy so the death-reason actually drives the outcome.
+        dep_tasks = [dep_tasks_by_id[d] for d in deps if d in dep_tasks_by_id]
+        result, _ = await _check_candidate_task_deps(
+            t, dep_tasks, list(deps), session, verify_pr_merged
+        )
+        if result == "cascade_cancel":
+            out.append((t.id, "cascade_cancel"))
+        elif result == "eligible":
             out.append((t.id, "dead_deps"))
+        # result == "waiting" (e.g. a requeue clone still in flight) → keep waiting.
     return out
 
 

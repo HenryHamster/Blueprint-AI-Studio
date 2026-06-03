@@ -789,3 +789,285 @@ async def test_rollup_resume_closed_without_pending_reopen_clears_marker(
         "so the rollup is retried."
     )
     assert "rollup_pr_url" not in ctx
+
+
+# ---------------------------------------------------------------------------
+# Merge-boundary promotion-target safety (branch-resolver PR)
+#
+# The hot-path resolver fails SAFE and never raises; refusing to land fleet
+# work on the promotion target is enforced here, at the merge/rollup boundary.
+# The guard fires ONLY when the landing target == promotion target AND that
+# target is distinct from the integration branch (single-trunk projects, where
+# integration == promotion, legitimately land every rollup on the shared
+# trunk). A 'hotfix' marker on the parent/task is the explicit exemption.
+# ---------------------------------------------------------------------------
+
+
+async def _make_distinct_branch_project(session):
+    """Project whose integration branch ('automain') differs from its promotion
+    target (NULL -> 'main'), so the promotion-target guard can fire."""
+    project = await _make_project(session)
+    project.integration_branch = "automain"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_rollup_targeting_promotion_target_is_held_not_merged(cleanup_db, mocker):
+    """A completed rollup whose target == promotion (distinct from integration)
+    is HELD for approval instead of merged."""
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker, pr_files=_files("backend/app/models.py"), diff=""
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_distinct_branch_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"parent_base": "main"}
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "promotion target" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_rollup_targeting_promotion_target_allowed_for_hotfix(cleanup_db, mocker):
+    """A hotfix-marked rollup bypasses the promotion-target safety hold.
+
+    Without the hotfix marker this exact configuration (target 'main' ==
+    promotion, distinct from integration 'automain') is held — see
+    test_rollup_targeting_promotion_target_is_held_not_merged. The marker is the
+    explicit exemption, so the branch-safety hold must NOT fire.
+    """
+    _mock_automerge_deps(mocker, pr_files=_files("backend/app/models.py"), diff="")
+    mock_hold = mocker.patch(
+        "app.rollup_management._hold_rollup_for_branch_safety", new_callable=AsyncMock
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_distinct_branch_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"parent_base": "main", "hotfix": True}
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_hold.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_single_trunk_rollup_to_shared_trunk_not_held(cleanup_db, mocker):
+    """Single-trunk project (integration == promotion == 'main'): a rollup
+    landing on that shared trunk must NOT be held for branch safety — the guard
+    requires the target to be distinct from the integration branch."""
+    _mock_automerge_deps(mocker, pr_files=_files("backend/app/models.py"), diff="")
+    mock_hold = mocker.patch(
+        "app.rollup_management._hold_rollup_for_branch_safety", new_callable=AsyncMock
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    # _make_project leaves integration_branch NULL -> resolver returns "main",
+    # matching the NULL promotion_target -> "main": a single-trunk project.
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"parent_base": "main"}
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_hold.assert_not_called()
+
+
+def test_promotion_target_rollup_allowed_gate():
+    """The hotfix gate: allowed only when a hotfix marker is present and the
+    target is non-empty."""
+    from app.models import Task
+    from app.rollup_management import _promotion_target_rollup_allowed
+
+    # No hotfix marker -> not allowed.
+    assert _promotion_target_rollup_allowed(Task(payloads=[{}], context={}), "main") is False
+    # Hotfix marker but empty target -> not allowed.
+    assert (
+        _promotion_target_rollup_allowed(Task(payloads=[{"hotfix": True}], context={}), "")
+        is False
+    )
+    # Hotfix in payload -> allowed.
+    assert (
+        _promotion_target_rollup_allowed(Task(payloads=[{"hotfix": True}], context={}), "main")
+        is True
+    )
+    # Hotfix in context -> allowed.
+    assert (
+        _promotion_target_rollup_allowed(Task(payloads=[{}], context={"hotfix": True}), "main")
+        is True
+    )
+
+
+def test_promotion_target_merge_allowed_gate():
+    """Admin-merge hotfix gate: both branches (allowed / not allowed)."""
+    from app.models import Task
+    from app.admin_task_mutations import _promotion_target_merge_allowed
+
+    assert _promotion_target_merge_allowed(Task(payloads=[{}], context={}), "main") is False
+    assert (
+        _promotion_target_merge_allowed(Task(payloads=[{"hotfix": True}], context={}), "")
+        is False
+    )
+    assert (
+        _promotion_target_merge_allowed(Task(payloads=[{"hotfix": True}], context={}), "main")
+        is True
+    )
+    assert (
+        _promotion_target_merge_allowed(Task(payloads=[{}], context={"hotfix": True}), "main")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_admin_task_merge_to_promotion_target_returns_409(cleanup_db):
+    """Approving a task merge whose base == promotion (distinct from integration)
+    returns 409 and leaves the task requires_approval=True without merging."""
+    from app.admin_task_mutations import _handle_task_pr_approval
+    from app.models import Artifact, ArtifactType
+
+    project = await _make_distinct_branch_project(cleanup_db)
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "base_branch": "main"}],
+    )
+    task.requires_approval = True
+    cleanup_db.add(task)
+    # The handler resolves the PR number from the task's PULL_REQUEST artifact
+    # before reaching the promotion-target guard, so the task needs one.
+    cleanup_db.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/acme/repo/pull/4242",
+        )
+    )
+    await cleanup_db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await _handle_task_pr_approval(
+            task, task.context or {}, task.first_payload, cleanup_db, {}
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "promotion target" in exc_info.value.detail
+    await cleanup_db.refresh(task)
+    assert task.requires_approval is True
+
+
+@pytest.mark.asyncio
+async def test_admin_rollup_merge_to_promotion_target_proceeds_unqualified(
+    cleanup_db, mocker
+):
+    """A human-approved rollup merge whose base == promotion (distinct from
+    integration) PROCEEDS rather than dead-ending with a 409 (PR #7064 superseded
+    the earlier hard-refuse of PR #6995 for the human-approval lane). The merge
+    lands but stays unqualified: pr_merged is left unset and the out-of-band
+    promotion-target alert is raised. The autonomous rollup path still holds such
+    landings for approval first; this handler IS that approval."""
+    from app.admin_task_mutations import _handle_rollup_pr_approval
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mock_merge = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "message": "ok"},
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_distinct_branch_project(cleanup_db)
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"rollup_pr_number": 4242},
+        payloads=[{"type": "research", "base_branch": "main"}],
+    )
+    task.requires_approval = True
+    cleanup_db.add(task)
+    await cleanup_db.commit()
+
+    changes: dict = {}
+    await _handle_rollup_pr_approval(task, task.context or {}, 4242, cleanup_db, changes)
+
+    mock_merge.assert_awaited_once()
+    assert changes.get("merged_pr") == 4242
+    await cleanup_db.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is None
+
+
+@pytest.mark.asyncio
+async def test_admin_rollup_hotfix_to_promotion_target_merges(cleanup_db, mocker):
+    """A hotfix-marked approved rollup IS allowed to merge to the promotion
+    target (positive branch of the hotfix exemption)."""
+    from app.admin_task_mutations import _handle_rollup_pr_approval
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mock_merge = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "message": "ok"},
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.admin_task_mutations._maybe_spawn_rollup_smoketest", new_callable=AsyncMock
+    )
+
+    project = await _make_distinct_branch_project(cleanup_db)
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"rollup_pr_number": 4242},
+        payloads=[{"type": "research", "base_branch": "main", "hotfix": True}],
+    )
+    changes: dict = {}
+
+    await _handle_rollup_pr_approval(task, task.context or {}, 4242, cleanup_db, changes)
+
+    mock_merge.assert_awaited_once()
+    assert changes.get("merged_pr") == 4242
+    await cleanup_db.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is True
+    assert (task.context or {}).get("landed_on_integration") is False
+    assert (
+        (task.context or {}).get("_non_merge_unblock_reason")
+        == "merged_pr_non_integration_branch"
+    )

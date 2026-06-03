@@ -740,6 +740,31 @@ export default function App() {
         userRole={s.userRole}
         onNewProject={() => setShowNewProjectModal(true)}
         onOpenSetupGuide={(projectId) => setSetupProjectId(projectId)}
+        onProjectDeleted={(projectId) => {
+          if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
+          void s.fetchProjects(true);
+        }}
+        onProjectReset={() => {
+          // The project row survives; its tasks were wiped. Refetch both so
+          // the dashboard reflects the cleared task history and new status.
+          void s.fetchProjects(true);
+          void s.fetchTasks();
+        }}
+        onProjectPaused={() => {
+          // Pause is a reversible flag on the project row; refetch so the
+          // dashboard reflects the new paused state (pill + menu label).
+          void s.fetchProjects(true);
+        }}
+        onProjectArchived={(projectId) => {
+          // Archived projects drop out of the active list; clear any selection
+          // pointing at the now-hidden project and refetch the active set.
+          if (s.selectedProjectId === projectId) s.setSelectedProjectId(null);
+          void s.fetchProjects(true);
+        }}
+        onProjectUnarchived={() => {
+          // The project reappears in the active list — refetch it back in.
+          void s.fetchProjects(true);
+        }}
       />
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
@@ -803,7 +828,7 @@ export default function App() {
 
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 
-      <WarmVmPanel onViewTask={handleViewTask} />
+      <WarmVmPanel onViewTask={handleViewTask} projects={s.projects} />
 
 
       {s.error && (

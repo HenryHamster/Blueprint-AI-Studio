@@ -16,10 +16,11 @@ import {
   extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
-  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
+  PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, type PlaybookEntry,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
+import { reconcileSystemEntry, reconcileMissingCapabilities } from '../utils/design-doc-presence.js';
 import {
   differentiationHintFor,
   formatCochangeHints,
@@ -446,6 +447,233 @@ export function buildUserPausedSection(
   return `\n## User-Paused Directions\nThese directions were paused by the user (not auto-paused by the system). Treat as an explicit user constraint — do NOT unpause, retire, or duplicate them without a strong reason backed by user intent.\n${lines.join('\n')}\n`;
 }
 
+const QUALIFICATION_SCORE_KEYS = ['audit', 'test_erosion', 'smoketest'] as const;
+const QUALIFICATION_SEVERITY_ORDER: Record<string, number> = {
+  blocker: 0,
+  critical: 1,
+  high: 2,
+  medium: 3,
+  moderate: 3,
+  warning: 4,
+  low: 5,
+  info: 6,
+};
+
+function formatBlockerProvenance(qualification: Record<string, unknown>, blocker: string): string | null {
+  // Surface the blocker's provenance when available. For CI blockers, include
+  // the resolution state/detail. For audit blockers, include the missing reason.
+  if (blocker.startsWith('ci_')) {
+    const ciResolution = qualification.ci_resolution;
+    if (ciResolution && typeof ciResolution === 'object' && !Array.isArray(ciResolution)) {
+      const ciRes = ciResolution as Record<string, unknown>;
+      const state = typeof ciRes.state === 'string' ? ciRes.state : null;
+      const detail = typeof ciRes.detail === 'string' ? ciRes.detail : null;
+      if (state || detail) {
+        const parts: string[] = [];
+        if (state) parts.push(`state: ${state}`);
+        if (detail) parts.push(detail);
+        return parts.join(', ');
+      }
+    }
+  } else if (blocker === 'audit_missing') {
+    const reason = typeof qualification.audit_missing_reason === 'string'
+      ? qualification.audit_missing_reason
+      : null;
+    if (reason) return `reason: ${reason}`;
+  }
+  return null;
+}
+
+function formatQualificationDetails(qualification: Record<string, unknown>): string[] {
+  const lines: string[] = [];
+
+  // When the smoketest subsystem was disabled for the qualifying run it spawned
+  // no smoketest child, so its sub-score is an unconditional 0.0 placeholder —
+  // NOT a real low score. Mirror the backend (`smoketest_enabled` defaults True
+  // for legacy records that predate the flag) and exclude the dimension from
+  // both the rendered sub-scores and the binding determination when disabled.
+  const smoketestEnabled = qualification.smoketest_enabled !== false;
+  // A hard blocker (CI states, deleted test, missing audit, smoketest startup
+  // failure) forces the composite to zero — the named blocker, not a numeric
+  // minimum over placeholder scores, is the true constraint. Some blockers (CI
+  // states) map to no sub-score at all.
+  const blocker = typeof qualification.blocker === 'string' && qualification.blocker
+    ? qualification.blocker
+    : null;
+
+  const subScoresRaw = qualification.sub_scores;
+  if (subScoresRaw && typeof subScoresRaw === 'object' && !Array.isArray(subScoresRaw)) {
+    const subScores = subScoresRaw as Record<string, unknown>;
+    const scoreBits: string[] = [];
+    let bindingKey: string | null = null;
+    let bindingValue: number | null = null;
+    for (const key of QUALIFICATION_SCORE_KEYS) {
+      if (key === 'smoketest' && !smoketestEnabled) continue;
+      const value = typeof subScores[key] === 'number' ? subScores[key] : null;
+      if (value === null) continue;
+      scoreBits.push(`${key}=${value.toFixed(2)}`);
+      if (bindingValue === null || value < bindingValue) {
+        bindingKey = key;
+        bindingValue = value;
+      }
+    }
+    if (scoreBits.length > 0) {
+      let bindingClause: string | null = null;
+      if (blocker) {
+        // A hard blocker is the constraint regardless of the numeric minimum.
+        // Surface the blocker's provenance when available.
+        const provenance = formatBlockerProvenance(qualification, blocker);
+        bindingClause = provenance ? `binding=${blocker} (${provenance})` : `binding=${blocker}`;
+      } else if (bindingKey !== null && bindingValue !== null) {
+        bindingClause = `binding=${bindingKey}=${bindingValue.toFixed(2)}`;
+      }
+      const suffix = bindingClause ? ` (${bindingClause})` : '';
+      lines.push(`  Qualification details: sub-scores: ${scoreBits.join(', ')}${suffix}`);
+    }
+  }
+
+  // Audit-score caveat — the audit sub-score reflects only *verified* findings;
+  // higher-severity findings lacking a substantive verification note were
+  // excluded from the score (their deductions never applied). Surface how many
+  // were excluded, and any material model-reported-vs-findings-derived score
+  // divergence the verdict already recorded, so the agent does not read an
+  // inflated audit sub-score as a clean audit.
+  const reconRaw = qualification.audit_reconciliation;
+  if (reconRaw && typeof reconRaw === 'object' && !Array.isArray(reconRaw)) {
+    const recon = reconRaw as Record<string, unknown>;
+    const excludedCount = typeof recon.excluded_findings_count === 'number'
+      ? recon.excluded_findings_count : 0;
+    if (excludedCount > 0) {
+      const bits: string[] = [
+        `audit sub-score reflects only verified findings; ${excludedCount} higher-severity finding${excludedCount === 1 ? '' : 's'} excluded for lacking verification`,
+      ];
+      const modelScore = typeof recon.model_reported_score === 'number' ? recon.model_reported_score : null;
+      const derivedScore = typeof recon.findings_derived_score === 'number' ? recon.findings_derived_score : null;
+      const delta = typeof recon.score_delta === 'number' ? recon.score_delta : null;
+      if (modelScore !== null && derivedScore !== null && delta !== null && delta >= 0.10) {
+        bits.push(`model-reported audit ${modelScore.toFixed(2)} vs findings-derived ${derivedScore.toFixed(2)} (Δ${delta.toFixed(2)})`);
+      }
+      lines.push(`  Audit score caveat: ${bits.join('; ')}`);
+    }
+  }
+
+  const findingsRaw = qualification.audit_findings;
+  if (Array.isArray(findingsRaw) && findingsRaw.length > 0) {
+    const findings = findingsRaw
+      .map((finding, idx) => {
+        if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return null;
+        const rec = finding as Record<string, unknown>;
+        const severity = typeof rec.severity === 'string' ? rec.severity.trim() : '';
+        const summary = typeof rec.summary === 'string' ? rec.summary.trim() : '';
+        if (!severity || !summary) return null;
+        return {
+          severity,
+          summary,
+          order: QUALIFICATION_SEVERITY_ORDER[severity.toLowerCase()] ?? 99,
+          idx,
+        };
+      })
+      .filter((finding): finding is { severity: string; summary: string; order: number; idx: number } => finding !== null)
+      .sort((a, b) => (a.order - b.order) || (a.idx - b.idx))
+      .slice(0, 3);
+
+    if (findings.length > 0) {
+      const moreCount = findingsRaw.length - findings.length;
+      const findingBits = findings.map(f => `${f.severity}: ${f.summary}`);
+      const tail = moreCount > 0 ? ` (+${moreCount} more)` : '';
+      lines.push(`  Audit findings: ${findingBits.join('; ')}${tail}`);
+    }
+  }
+
+  // Excluded audit findings — higher-severity findings the verification gate
+  // dropped from scoring (and from `audit_findings`). Rendered explicitly as
+  // UNVERIFIED so the agent can investigate the omitted risk behind an inflated
+  // audit sub-score rather than assume the audit was clean. These are NOT
+  // confirmed blockers.
+  const excludedRaw = qualification.excluded_audit_findings;
+  if (Array.isArray(excludedRaw) && excludedRaw.length > 0) {
+    const excluded = excludedRaw
+      .map((finding, idx) => {
+        if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return null;
+        const rec = finding as Record<string, unknown>;
+        const severity = typeof rec.severity === 'string' ? rec.severity.trim() : '';
+        const summary = typeof rec.summary === 'string' ? rec.summary.trim() : '';
+        if (!severity || !summary) return null;
+        return {
+          severity,
+          summary,
+          order: QUALIFICATION_SEVERITY_ORDER[severity.toLowerCase()] ?? 99,
+          idx,
+        };
+      })
+      .filter((finding): finding is { severity: string; summary: string; order: number; idx: number } => finding !== null)
+      .sort((a, b) => (a.order - b.order) || (a.idx - b.idx))
+      .slice(0, 3);
+
+    if (excluded.length > 0) {
+      const moreCount = excludedRaw.length - excluded.length;
+      const excludedBits = excluded.map(f => `${f.severity}: ${f.summary}`);
+      const tail = moreCount > 0 ? ` (+${moreCount} more)` : '';
+      lines.push(`  Excluded audit findings (UNVERIFIED — not confirmed blockers): ${excludedBits.join('; ')}${tail}`);
+    }
+  }
+
+  // Test-erosion detail — the specific deleted test files / negative deltas
+  // behind a low (or hard-blocking) test-erosion sub-score, so the agent can
+  // scope "restore file X" / "recover N assertions" instead of blind cleanup.
+  const erosionRaw = qualification.test_erosion_detail;
+  if (erosionRaw && typeof erosionRaw === 'object' && !Array.isArray(erosionRaw)) {
+    const erosion = erosionRaw as Record<string, unknown>;
+    const bits: string[] = [];
+    const deleted = Array.isArray(erosion.deleted_test_files)
+      ? erosion.deleted_test_files.filter((p): p is string => typeof p === 'string' && p.trim() !== '')
+      : [];
+    if (deleted.length > 0) {
+      const moreDeleted = typeof erosion.deleted_test_files_truncated === 'number'
+        ? erosion.deleted_test_files_truncated : 0;
+      const tail = moreDeleted > 0 ? ` (+${moreDeleted} more)` : '';
+      bits.push(`deleted ${deleted.join(', ')}${tail}`);
+    }
+    if (typeof erosion.test_count_delta === 'number' && erosion.test_count_delta < 0) {
+      bits.push(`${erosion.test_count_delta} tests`);
+    }
+    if (typeof erosion.assertion_delta === 'number' && erosion.assertion_delta < 0) {
+      bits.push(`${erosion.assertion_delta} assertions`);
+    }
+    if (bits.length > 0) {
+      lines.push(`  Test erosion: ${bits.join('; ')}`);
+    }
+  }
+
+  // Smoketest detail — which suite / named tests failed behind a low (or
+  // hard-blocking) smoketest sub-score, so the agent can target the failing
+  // startup suite or the named tests instead of generic stabilize work.
+  const smokeRaw = qualification.smoketest_detail;
+  if (smokeRaw && typeof smokeRaw === 'object' && !Array.isArray(smokeRaw)) {
+    const smoke = smokeRaw as Record<string, unknown>;
+    const bits: string[] = [];
+    if (smoke.startup_failed === true) {
+      bits.push('startup suite failed');
+    } else if (typeof smoke.failed_suite === 'string' && smoke.failed_suite.trim()) {
+      bits.push(`suite ${smoke.failed_suite.trim()} failed`);
+    }
+    const failedTests = Array.isArray(smoke.failed_tests)
+      ? smoke.failed_tests.filter((t): t is string => typeof t === 'string' && t.trim() !== '')
+      : [];
+    if (failedTests.length > 0) {
+      const moreFailed = typeof smoke.failed_tests_truncated === 'number'
+        ? smoke.failed_tests_truncated : 0;
+      const tail = moreFailed > 0 ? ` (+${moreFailed} more)` : '';
+      bits.push(`failed: ${failedTests.join(', ')}${tail}`);
+    }
+    if (bits.length > 0) {
+      lines.push(`  Smoketest: ${bits.join('; ')}`);
+    }
+  }
+
+  return lines;
+}
+
 /**
  * Builds the version-phase status block for the strategic thinker prompt.
  * Explains the current phase, what each phase means, and instructs the agent
@@ -515,6 +743,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       qualBits.push(`would_promote=true`);
     }
     parts.push(`Last qualification: ${qualBits.join(', ')}`);
+    parts.push(...formatQualificationDetails(lastQualification));
     if (qualificationPending) {
       parts.push(
         `A qualification is currently **PENDING** (running now). Do NOT emit ` +
@@ -588,6 +817,9 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       if (lqBlocker) lqBits.push(`blocker=${lqBlocker}`);
       const lqSuffix = lqBits.length > 0 ? ` [${lqBits.join(', ')}]` : '';
       rvLines.push(`  - v${rvNum} (${rvStatus})${lqSuffix}`);
+      if (lqRec) {
+        rvLines.push(...formatQualificationDetails(lqRec).map(line => `    ${line.trimStart()}`));
+      }
     }
     if (rvLines.length > 1) parts.push(rvLines.join('\n'));
   }
@@ -839,6 +1071,86 @@ export function buildPortfolioComposition(
   return lines.join('\n');
 }
 
+/**
+ * Bootstrap-from-goal research guidance, gated on the unified greenfield
+ * predicate (`isGreenfieldRepo`) so the research bootstrap gate and the plan
+ * handler's GREENFIELD-MODE gate consult the identical signal and can never
+ * disagree. The predicate is greenfield when the durable onboarding signal
+ * (`task.repo_is_empty`, persisted as `build_config.repo_is_empty`) is truthy
+ * OR the live full-clone `detectGreenfield()` scan says so.
+ *
+ * Returns the "nearly empty codebase → bootstrap the foundation" paragraph ONLY
+ * when the repo is greenfield. Mature-repo agents get `''`, so the guidance
+ * stops appearing as noise in every research prompt. The leading blank line
+ * keeps spacing when the paragraph is interpolated between other mission
+ * bullets.
+ */
+export function buildEmptyRepoGuidance(task: Record<string, unknown>): string {
+  if (!isGreenfieldRepo(task)) return '';
+  return `\n**If the codebase is nearly empty** (few source files, mostly config/scaffolding): this is
+normal for new projects. Use the design doc specs and the project's config files to create
+foundational structure. Output a large-scope finding that bootstraps the target system.\n`;
+}
+
+/**
+ * Renders the CAPABILITY VERIFICATION section for the tactical research prompt,
+ * mirroring the inline SYSTEM VERIFICATION block. The backend's research-side
+ * verification loop historically classified only design-doc `systems/` entries;
+ * design-doc CAPABILITIES claimed working/partial were never verified for the
+ * research agent. So a capability whose backing code is absent on the
+ * integration branch slipped through, and the agent reasoned about — and
+ * proposed improvements to — behavior that does not exist.
+ *
+ * The backend now emits a parallel `capability_verification` map (same shape as
+ * `system_verification`: per-capability `status` of claimed_absent/partial/
+ * verified plus `claimed_status`/`present`/`missing`). This helper surfaces it
+ * as a prominent prompt section the agent cannot miss. The classification is
+ * conservative by construction (computed backend-side the same way systems are):
+ * a capability is flagged claimed_absent only when EVERY referenced backing path
+ * is absent; a present path makes it `partial`; a capability with no path
+ * pointer is never classified and so never appears here. Returns '' when no
+ * verification map is provided, so existing prompts are unchanged.
+ */
+export function buildCapabilityVerificationSection(
+  capVerif: Record<string, Record<string, unknown>> | undefined,
+): string {
+  if (!capVerif || typeof capVerif !== 'object' || Object.keys(capVerif).length === 0) return '';
+  const absent: string[] = [];
+  const partial: string[] = [];
+  const verified: string[] = [];
+  for (const capName of Object.keys(capVerif).sort()) {
+    const v = capVerif[capName];
+    const status = strVal(v.status as string);
+    const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
+    const present = Array.isArray(v.present) ? v.present as string[] : [];
+    const claimed = strVal(v.claimed_status as string);
+    const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
+    if (status === 'claimed_absent') {
+      absent.push(`- **${capName}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared backing path(s) missing: ${missing.join(', ')}`);
+    } else if (status === 'partial') {
+      partial.push(`- **${capName}**${claimedNote}: PARTIAL — missing: ${missing.join(', ')}; present: ${present.join(', ')}`);
+    } else if (status === 'verified') {
+      verified.push(`- **${capName}**: verified — ${present.length} declared path(s) exist`);
+    }
+  }
+  if (absent.length === 0 && partial.length === 0 && verified.length === 0) return '';
+  const vlines: string[] = ['# CAPABILITY VERIFICATION (code existence vs. design-doc claims)'];
+  vlines.push('The backend verified each design-doc capability\'s declared backing paths against the integration-branch file tree. Do NOT trust a capability\'s status over this evidence — if a capability is flagged below, treat its claimed status (working/partial) as unreliable, design from what actually exists, and do NOT propose improvements to behavior that is not built.');
+  if (absent.length > 0) {
+    vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');
+    vlines.push(...absent);
+  }
+  if (partial.length > 0) {
+    vlines.push('\n## ⚠️ Partial (some declared backing paths missing)');
+    vlines.push(...partial);
+  }
+  if (verified.length > 0) {
+    vlines.push('\n## Verified (all declared backing paths present)');
+    vlines.push(...verified);
+  }
+  return vlines.join('\n') + '\n\n';
+}
+
 // ── Handler: Plan (decompose complex task into subtasks) ───────────────────
 export async function handlePlan(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -859,6 +1171,11 @@ export async function handlePlan(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: DEFAULT_CLONE_DEPTH,
   });
+  // Positively confirm the clone delivered the expected tree before any
+  // greenfield conclusion is drawn below — a successful-but-empty clone of a
+  // repo the durable signal says is NOT empty must fail loudly, not be
+  // misread as a greenfield bootstrap.
+  verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('plan');
@@ -878,13 +1195,24 @@ export async function handlePlan(
   const cochangeHintsSection = formatCochangeHints(task.direction_context as Record<string, unknown> | undefined);
   const decompositionOutcomesSection = formatDecompositionOutcomes(task.direction_context as Record<string, unknown> | undefined);
 
+  // Greenfield mode: when the cloned tree has effectively no source (only
+  // config/scaffolding), the plan agent must NOT treat absent code as "nothing
+  // to decompose". Mirror the research agent's "if the codebase is nearly empty"
+  // branch and decompose "build the foundation for <goal>" instead.
+  const isGreenfield = isGreenfieldRepo(task);
+  const greenfieldBranch = isGreenfield ? `
+**GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).**
+Do NOT treat absent source as "nothing to decompose". This is a first-class bootstrap case: your job is to decompose **"build the foundation for the project goal"** into ordered implementation subtasks. Drive the foundation from the **Project Vision / goal above** and any design-doc specs — pick the structure, entry points, and core modules the goal requires, and order them so later subtasks build on earlier ones. An empty repo with a stated goal is NOT a valid no-op.
+
+` : '';
+
   const planPrompt = `${claudeMdPrefix}${planPlaybookSection}${planRetryContext}${contextPrefix}${cochangeHintsSection}${decompositionOutcomesSection}You are a planning agent. Your job is to analyze this codebase and decompose the following task into concrete, ordered subtasks that can each be implemented as a single pull request.
 
 Task to decompose:
 ${prompt}
-
+${greenfieldBranch}
 Instructions:
-1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.
+1. Explore the codebase thoroughly. Read key files, understand the architecture, find relevant patterns.${isGreenfield ? ' (On a greenfield repo there is little to read — lean on the project goal and design-doc specs to decide the foundation.)' : ''}
 2. Decompose into substantial subtasks. Prefer fewer, larger subtasks over many tiny ones. A single subtask that modifies 200+ lines across 5+ files is fine — the implementing agent is capable. Only split when subtasks are genuinely independent or have different risk profiles.
 3. Identify dependencies between subtasks — which must complete before others can start.
 4. Write clear, self-contained prompts for each subtask. Describe the PROBLEM and desired outcome — do not prescribe exact line numbers. The implementing agent has full repo access and will figure out the details.
@@ -925,7 +1253,9 @@ If — and ONLY if — your exploration shows there is genuinely nothing to buil
   "no_op_reason": "Specific, verified reason (at least 30 chars) naming exactly what is already present / why no code subtasks are needed — cite the concrete files, symbols, or sibling work you checked, e.g. 'app/config.py already loads repo layout from settings.REPO_LAYOUT and shared_state.py:get_repo_root() derives all paths from it; no hardcoded layout remains to de-hardcode'."
 }
 
-The no_op_reason MUST be at least 30 characters and name the concrete evidence you verified. This is the ONLY clean way for a plan to complete with zero subtasks — an empty "subtasks" array WITHOUT a specific no_op_reason is treated as a failed plan. This is NOT a give-up path: only use it when you have actually VERIFIED the work is already done or genuinely needs no code change. If you simply could not figure out how to decompose the task, that is a real plan failure — let the agent exit non-zero rather than emitting a bogus no_op_reason.
+The no_op_reason MUST be at least 30 characters and name the concrete evidence you verified. This is the ONLY clean way for a plan to complete with zero subtasks — an empty "subtasks" array WITHOUT a specific no_op_reason is treated as a failed plan. This is NOT a give-up path: only use it when you have actually VERIFIED the work is already done or genuinely needs no code change. If you simply could not figure out how to decompose the task, that is a real plan failure — let the agent exit non-zero rather than emitting a bogus no_op_reason.${isGreenfield ? `
+
+GREENFIELD CAVEAT: on this empty/near-empty repo, "there is no source code to change" or "the codebase is empty" is NOT a valid no_op_reason. Absent source is exactly the signal to bootstrap — decompose "build the foundation for the goal" into ordered subtasks driven by the Project Vision / goal and any design-doc specs. Only emit a no-op here if the foundation the goal requires already exists on this branch.` : ''}
 
 Risk guidance:
 - risk=high: changes to auth flows, JWT/token handling, database models (models.py), Alembic migrations, core orchestration (main.py worker loops), VM provisioning (compute.py), any change that if wrong could cause data loss or security breach
@@ -1024,6 +1354,11 @@ export async function handleResearch(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
   });
+  // Positively confirm the clone delivered the expected tree before the
+  // greenfield/empty-repo guidance gate runs — a successful-but-empty clone of
+  // a repo the durable signal says is NOT empty must fail loudly, not be
+  // misread as greenfield.
+  verifyCloneDelivered(task, baseBranch);
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode as string, 'research');
@@ -1198,7 +1533,11 @@ ${hotspotsSection}
   let designDocHighlight = '';
   if (dirDesignCtx) {
     const lines: string[] = ['# YOUR DIRECTION\'S ARCHITECTURE CONTEXT'];
-    const sys = dirDesignCtx.system as Record<string, unknown> | undefined;
+    // Reconcile the claimed system status against the cloned file tree before
+    // formatting — a present-status system whose backing modules are all gone
+    // is downgraded to `missing` so the MISSION's "IMPROVE if partial/functional/
+    // mature" branch never fires on code that does not exist.
+    const sys = reconcileSystemEntry(dirDesignCtx.system as Record<string, unknown> | undefined, WORKSPACE);
     if (sys) {
       lines.push(`System: ${strVal(sys.name as string)} (${strVal(sys.id as string)}) — status: **${strVal(sys.status as string)}**`);
       if (sys.description) lines.push(`Description: ${strVal(sys.description as string)}`);
@@ -1214,7 +1553,23 @@ ${hotspotsSection}
     } else {
       lines.push(`System ${strVal(dirDesignCtx.system_id as string)}: not yet documented in design doc`);
     }
-    const missingCaps = dirDesignCtx.missing_capabilities as Record<string, Record<string, string>> | undefined;
+    const dirVerif = dirDesignCtx.verification as Record<string, unknown> | undefined;
+    if (dirVerif) {
+      const vstatus = strVal(dirVerif.status as string);
+      const missing = Array.isArray(dirVerif.missing) ? dirVerif.missing as string[] : [];
+      const present = Array.isArray(dirVerif.present) ? dirVerif.present as string[] : [];
+      if (vstatus === 'claimed_absent') {
+        lines.push(`⚠️ CODE VERIFICATION: this system is CLAIMED-BUT-ABSENT — every declared module is missing from the integration branch. Treat its status as effectively missing/unverified and design from what actually exists. Missing: ${missing.join(', ')}`);
+      } else if (vstatus === 'partial') {
+        lines.push(`⚠️ CODE VERIFICATION: this system is PARTIAL — some declared modules are missing. Verify before relying on the claimed status. Missing: ${missing.join(', ')}; Present: ${present.join(', ')}`);
+      } else if (vstatus === 'verified') {
+        lines.push(`CODE VERIFICATION: all ${present.length} declared module(s) exist on the integration branch (status verified).`);
+      }
+    }
+    const missingCaps = reconcileMissingCapabilities(
+      dirDesignCtx.missing_capabilities as Record<string, Record<string, string>> | undefined,
+      WORKSPACE,
+    );
     if (missingCaps && Object.keys(missingCaps).length > 0) {
       lines.push('Missing/partial capabilities relevant to your direction:');
       for (const [name, cap] of Object.entries(missingCaps)) {
@@ -1242,8 +1597,62 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
 `;
   }
 
+  // System verification: backend checked each design-doc system's declared
+  // module paths against the integration-branch file tree. Surface flagged
+  // (claimed-but-absent / partial) systems prominently so tactical research
+  // reasons about what actually exists instead of trusting a stale status.
+  let systemVerificationSection = '';
+  const sysVerif = payload.system_verification as Record<string, Record<string, unknown>> | undefined;
+  if (sysVerif && Object.keys(sysVerif).length > 0) {
+    const absent: string[] = [];
+    const partial: string[] = [];
+    const verified: string[] = [];
+    for (const sysId of Object.keys(sysVerif).sort()) {
+      const v = sysVerif[sysId];
+      const status = strVal(v.status as string);
+      const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
+      const present = Array.isArray(v.present) ? v.present as string[] : [];
+      const claimed = strVal(v.claimed_status as string);
+      const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
+      if (status === 'claimed_absent') {
+        absent.push(`- **${sysId}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared module(s) missing: ${missing.join(', ')}`);
+      } else if (status === 'partial') {
+        partial.push(`- **${sysId}**${claimedNote}: PARTIAL — missing: ${missing.join(', ')}; present: ${present.join(', ')}`);
+      } else if (status === 'verified') {
+        verified.push(`- **${sysId}**: verified — ${present.length} declared module(s) exist`);
+      }
+    }
+    if (absent.length > 0 || partial.length > 0 || verified.length > 0) {
+      const vlines: string[] = ['# SYSTEM VERIFICATION (code existence vs. design-doc claims)'];
+      vlines.push('The backend verified each design-doc system\'s declared module paths against the integration-branch file tree. Do NOT trust a system\'s status over this evidence — if a system is flagged below, treat its claimed status as unreliable and design from what actually exists.');
+      if (absent.length > 0) {
+        vlines.push('\n## ⚠️ Claimed-but-absent (effectively missing — backing code does not exist)');
+        vlines.push(...absent);
+      }
+      if (partial.length > 0) {
+        vlines.push('\n## ⚠️ Partial (some declared modules missing)');
+        vlines.push(...partial);
+      }
+      if (verified.length > 0) {
+        vlines.push('\n## Verified (all declared modules present)');
+        vlines.push(...verified);
+      }
+      systemVerificationSection = vlines.join('\n') + '\n\n';
+    }
+  }
+
+  // Capability verification: the design-doc-system check above covers only
+  // `systems/` entries. The backend now emits a parallel verdict map for
+  // design-doc CAPABILITIES claimed working/partial — surface it the same way so
+  // the research agent never proposes improving a capability whose backing code
+  // is absent on the integration branch.
+  const capabilityVerificationSection = buildCapabilityVerificationSection(
+    payload.capability_verification as Record<string, Record<string, unknown>> | undefined,
+  );
+
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
+  const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
   const researchPrompt = `${contextPrefix}${researchPlaybookSection}${researchRetryContext}You are a codebase research agent inside Blueprint, an autonomous AI coding system. Your findings spawn implementing agents, get reviewed, and merge as PRs.
 
 # MISSION
@@ -1261,14 +1670,14 @@ full codebase and wrote that spec to fit the existing stack. Follow its approach
 choices, and integration points. You should still explore the codebase to verify the spec
 makes sense, but don't redesign from scratch when a spec exists.
 
-**If the codebase is nearly empty** (few source files, mostly config/scaffolding): this is
-normal for new projects. Use the design doc specs and the project's config files to create
-foundational structure. Output a large-scope finding that bootstraps the target system.
-
+${researchEmptyRepoGuidance}
 **If a direction targets something EXISTING** (the design document shows it as partial, functional,
 or mature): your job is to IMPROVE it. Find specific, high-impact changes — missing capabilities,
 broken assumptions, architectural bottlenecks, or small fixes that prevent cascade failures.
 Quality over quantity — 2 real findings beats 10 incremental ones.
+(Note: any entry tagged with a "[reconciled: …]" / "presence_warning" annotation has been
+downgraded to "missing" because its referenced module files are absent on this branch — treat it
+as MISSING to DESIGN, never as something to IMPROVE, and do not confabulate its behavior.)
 
 **Sequencing matters.** If your findings have dependencies (e.g., "build cache infrastructure"
 must come before "add caching to user API"), use depends_on_indices to order them. The pipeline
@@ -1281,7 +1690,7 @@ additional structural refinement. Don't re-propose foundations that are already 
 # CODEBASE CONTEXT
 
 ${codebaseSummary}${fileTreeSection}${gitHistorySection}
-${designDocHighlight}${designDocSection}# DIRECTIONS
+${designDocHighlight}${designDocSection}${systemVerificationSection}${capabilityVerificationSection}# DIRECTIONS
 ${userPrompt ? `Research focus: ${userPrompt}\n\n` : ''}${directionsText}${crossDirSection}
 ${pipelineScopeRatesSection}${anomalySection}
 # DEDUP — do not re-propose these

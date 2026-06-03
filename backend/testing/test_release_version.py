@@ -2,10 +2,10 @@
 (automain LTS Phase 2).
 
 Focus areas:
-  * count_merged_since — the ``pr_merged`` filter MUST be applied on both
-    dialects: a COMPLETED task without ``context["pr_merged"] = True`` is
-    never counted; a non-COMPLETED task with the flag is never counted;
-    the ``since`` lower bound is exclusive-of-older rows.
+  * count_merged_since — the landed-on-integration filter MUST be applied on
+    both dialects: a COMPLETED task without a landed signal is never counted;
+    a merge-equivalent non-landing is excluded; a non-COMPLETED task with the
+    flag is never counted; the ``since`` lower bound is exclusive-of-older rows.
   * open_version / current_open_version — insert + single-open-row read,
     including the multiple-open-rows anomaly path.
   * set_version_phase — valid transitions, idempotent no-op, invalid phase
@@ -66,7 +66,7 @@ async def _make_task(
 
 
 # ===========================================================================
-# count_merged_since — the pr_merged filter must be applied
+# count_merged_since — the landed signal filter must be applied
 # ===========================================================================
 
 
@@ -144,6 +144,34 @@ async def test_count_merged_since_mixed_only_counts_merged(db_session):
 
     count = await rv.count_merged_since(db_session, project.id, since)
     assert count == 3
+
+
+@pytest.mark.asyncio
+async def test_count_merged_since_excludes_non_merge_unblocks(db_session):
+    project = await _make_project(db_session)
+    since = _utcnow() - timedelta(hours=1)
+
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        updated_at=_utcnow(),
+    )
+    await _make_task(
+        db_session,
+        project,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+        updated_at=_utcnow(),
+    )
+
+    count = await rv.count_merged_since(db_session, project.id, since)
+    assert count == 1
 
 
 @pytest.mark.asyncio
@@ -479,6 +507,115 @@ def test_to_phase_block_handles_none_phase_changed_at():
     )
     block = rv.to_phase_block(version)
     assert block["phase_changed_at"] is None
+
+
+def test_to_phase_block_carries_qualification_state():
+    """to_phase_block exposes the disambiguated qualification_state alongside the
+    raw last_qualification (incident 2026-06-02: raw status='pending' was
+    ambiguous)."""
+    version = ReleaseVersion(
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"status": "pending"},
+    )
+    block = rv.to_phase_block(version)
+    # raw status stays untouched; the derived sub-state is added.
+    assert block["last_qualification"] == {"status": "pending"}
+    assert block["qualification_state"]["state"] == "qualifying"
+
+
+def test_to_phase_block_qualification_state_none_when_unqualified():
+    """An unqualified version (no verdict) yields qualification_state=None."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification=None,
+    )
+    assert rv.to_phase_block(version)["qualification_state"] is None
+
+
+# ===========================================================================
+# summarize_qualification_state — disambiguates the overloaded status="pending"
+# ===========================================================================
+
+
+def test_qual_state_none_when_no_verdict():
+    assert rv.summarize_qualification_state(None) is None
+    assert rv.summarize_qualification_state({}) is None
+    assert rv.summarize_qualification_state({"confidence": 0.9}) is None
+
+
+def test_qual_state_pending_audit_is_qualifying():
+    """Bare status='pending' (no promotion_pending) = audit still scoring."""
+    state = rv.summarize_qualification_state({"status": "pending"})
+    assert state["state"] == "qualifying"
+    assert "audit" in state["summary"].lower()
+
+
+def test_qual_state_pending_with_promotion_is_promotion_in_flight():
+    """status='pending' WITH a promotion_pending sub-key = audit passed, the
+    promotion PR is open — the case the agent misread as 'still auditing'."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://example/pr/7357",
+                "auto_merge_enabled": True,
+            },
+        }
+    )
+    assert state["state"] == "promotion_in_flight"
+    assert state["promotion_pr_number"] == 7357
+    assert state["promotion_pr_url"] == "https://example/pr/7357"
+    # The summary must NOT tell the agent the audit is still running.
+    assert "passed" in state["summary"].lower()
+    assert "armed" in state["summary"].lower()
+
+
+def test_qual_state_promotion_failed_surfaces_reason():
+    state = rv.summarize_qualification_state(
+        {"status": "promotion_failed", "error": "pr_ci_red", "detail": "shard 8"}
+    )
+    assert state["state"] == "promotion_failed"
+    assert state["error"] == "pr_ci_red"
+    assert "pr_ci_red" in state["summary"]
+    assert "fresh qualify" in state["summary"].lower()
+
+
+def test_qual_state_not_promoted_includes_scores():
+    state = rv.summarize_qualification_state(
+        {
+            "status": "not_promoted",
+            "confidence": 0.62,
+            "threshold": 0.9,
+            "blocker": "audit",
+        }
+    )
+    assert state["state"] == "not_promoted"
+    assert state["blocker"] == "audit"
+    assert "0.62" in state["summary"]
+
+
+def test_qual_state_dry_run_is_promotion_ready():
+    state = rv.summarize_qualification_state({"status": "dry_run"})
+    assert state["state"] == "dry_run"
+    assert "promotion-ready" in state["summary"].lower()
+
+
+def test_qual_state_promoted():
+    state = rv.summarize_qualification_state({"status": "promoted"})
+    assert state["state"] == "promoted"
+
+
+def test_qual_state_unknown_status_passes_through():
+    """Forward-compat: an unrecognized status is echoed, never crashes."""
+    state = rv.summarize_qualification_state({"status": "some_new_status"})
+    assert state["state"] == "some_new_status"
 
 
 # ===========================================================================

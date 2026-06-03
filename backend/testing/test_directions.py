@@ -3689,6 +3689,101 @@ async def test_strategic_api_set_problem_model_rejects_malformed(db_session):
 
 
 @pytest.mark.asyncio
+async def test_strategic_api_set_problem_model_accepts_capability_backing_paths(
+    db_session,
+):
+    """The richer capability shape (with backing_paths) validates cleanly and
+    persists; transient sibling fields are still stripped from the durable
+    model."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "capabilities": [
+                            {
+                                "name": "Auth",
+                                "status": "working",
+                                "backing_paths": [
+                                    "backend/app/auth.py",
+                                    "backend/app/models.py",
+                                ],
+                            },
+                            # Old-shape capability (no backing_paths) in the
+                            # same write must still validate.
+                            {"name": "Legacy", "status": "partial"},
+                        ],
+                        # Transient per-cycle siblings — must be stripped, not
+                        # persisted, and must not cause a 400.
+                        "version_phase_decision": {"phase": "stabilize"},
+                        "qualify_request": {"reason": "ready"},
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "set_problem_model"
+        assert body["revision"] == 1
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        caps = pm["capabilities"]
+        assert caps[0]["backing_paths"] == [
+            "backend/app/auth.py",
+            "backend/app/models.py",
+        ]
+        # Old-shape capability defaulted to empty list.
+        assert caps[1]["backing_paths"] == []
+        # Transient siblings never leak into the durable model.
+        assert "version_phase_decision" not in pm
+        assert "qualify_request" not in pm
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_problem_model_accepts_old_shape_capability(db_session):
+    """A write with only old-shape capabilities (predating backing_paths)
+    still validates — full backward compatibility for stored agent payloads."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_problem_model",
+                    "task_id": task_id,
+                    "data": {
+                        "capabilities": [
+                            {"name": "CapA", "status": "working"},
+                            {"name": "CapB", "status": "planned"},
+                        ]
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert all(c["backing_paths"] == [] for c in pm["capabilities"])
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_set_running_update(db_session):
     """op=set_running_update with {markdown: str} replaces project.running_update."""
     from httpx import AsyncClient, ASGITransport

@@ -27,6 +27,11 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.source_ref_validation import (
+    classify_existing_paths,
+    ground_design_doc,
+    resolve_branch_verification_context,
+)
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
@@ -150,6 +155,84 @@ def _agent_view_problem_model(pm: dict | None) -> dict:
             new_gaps.append(g2)
         trimmed["gaps"] = new_gaps
     return trimmed
+
+
+async def _verify_capability_backing_paths(
+    pm: dict | None,
+    *,
+    token: str | None = None,
+    owner: str | None = None,
+    repo: str | None = None,
+    branch: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Annotate each capability in *pm* with advisory backing-path verification.
+
+    Mirrors the design-doc ``systems/<id>.modules`` verification in
+    ``autonomous_research.py``: for every capability that declares
+    ``backing_paths``, classify those paths against the integration-branch
+    file tree (prefer the project's real GitHub repo/branch when available,
+    else local git HEAD via :func:`classify_existing_paths`) and attach a
+    per-capability ``verification`` block::
+
+        {"present": [...], "missing": [...], "effective_status": "..."}
+
+    ``effective_status`` framing so downstream prompts reason about what the
+    code actually shows rather than trusting the stored status verbatim:
+      - ``backing_paths`` empty → ``"unverified"`` (no linkage to check)
+      - all paths present → the capability's own stored status (verified)
+      - mixed presence → ``"partial"``
+      - all paths missing → ``"absent"`` (claimed but no backing code exists)
+
+    Operates on a copy: the input *pm* (and therefore the durable
+    ``project.problem_model``) is never mutated. *pm* is expected to already
+    be ``_agent_view_problem_model``-trimmed; this helper only adds keys.
+    """
+    if not pm:
+        return {}
+    annotated = dict(pm)
+    caps = annotated.get("capabilities") or []
+    if not isinstance(caps, list):
+        return annotated
+    new_caps: list = []
+    for cap in caps:
+        if not isinstance(cap, dict):
+            new_caps.append(cap)
+            continue
+        cap2 = dict(cap)
+        paths = [p for p in (cap2.get("backing_paths") or []) if isinstance(p, str)]
+        if not paths:
+            cap2["verification"] = {
+                "present": [],
+                "missing": [],
+                "effective_status": "unverified",
+            }
+            new_caps.append(cap2)
+            continue
+        present, missing = await classify_existing_paths(
+            paths,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+        if not missing:
+            effective_status = str(cap2.get("status", "")) or "unverified"
+        elif present:
+            effective_status = "partial"
+        else:
+            # Every declared backing path is absent from the integration
+            # branch: the capability is claimed but its code does not exist.
+            effective_status = "absent"
+        cap2["verification"] = {
+            "present": present,
+            "missing": missing,
+            "effective_status": effective_status,
+        }
+        new_caps.append(cap2)
+    annotated["capabilities"] = new_caps
+    return annotated
 
 
 # Per-system maturity rows can be heavy if `top_issues` and `evidence` carry
@@ -1540,14 +1623,27 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
 
+    verification_kwargs = await resolve_branch_verification_context(session, project)
+
+    # Ground the design doc against the real integration branch before shipping
+    # it: present-but-absent systems/capabilities are downgraded so the agent
+    # never sees a status the backing code can't support. Read-only/advisory —
+    # the stored design_doc is untouched; reconcile operates on the agent view.
+    reconciled_design_doc = await ground_design_doc(
+        _agent_view_design_doc(project.design_doc), **verification_kwargs
+    )
+
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
-            "design_doc": _agent_view_design_doc(project.design_doc),
+            "design_doc": reconciled_design_doc,
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},
-            "problem_model": _agent_view_problem_model(project.problem_model),
+            "problem_model": await _verify_capability_backing_paths(
+                _agent_view_problem_model(project.problem_model),
+                **verification_kwargs,
+            ),
             "open_messages": open_msgs,
             "shipped_changes_manifest": shipped_changes_manifest,
             "base_branch": get_project_integration_branch(project),
@@ -1589,6 +1685,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         cycle_id=cycle_id,
         phase1_task_id=new_task.id,
         baseline_vision=project.vision or {},
+        baseline_problem_model=project.problem_model or {},
     )
     await session.commit()
     logger.info(
@@ -1885,6 +1982,7 @@ async def _spawn_strategic_review(
     recent_interventions = await _build_recent_interventions(
         project, session, last_strategic_at=last_strategic_at
     )
+    verification_kwargs = await resolve_branch_verification_context(session, project)
     # Mode-aware additions: per-system maturity snapshots + short-window
     # claim-vs-shipped drift. Both are best-effort: empty/None when the
     # project has no SystemMaturity rows or no in-window task data.
@@ -1956,6 +2054,7 @@ async def _spawn_strategic_review(
                 current_open_version,
                 ensure_initial_release_version,
                 recent_closed_versions,
+                summarize_qualification_state,
                 to_phase_block,
             )
 
@@ -2035,6 +2134,9 @@ async def _spawn_strategic_review(
                             "status": v.status,
                             "phase": v.phase,
                             "last_qualification": v.last_qualification,
+                            "qualification_state": summarize_qualification_state(
+                                v.last_qualification
+                            ),
                         }
                         for v in _closed
                     ]
@@ -2332,6 +2434,33 @@ async def _spawn_strategic_review(
             if prompt_suffix
             else _post_promote_hint
         )
+    # Qualification sub-state directive — last_qualification.status is overloaded
+    # ("pending" = audit-scoring OR promotion-PR-open-and-auto-merging), which
+    # made the agent conflate "wait for the audit" with "the promotion is
+    # failing" and burn whole cycles waiting (incident 2026-06-02). Surface the
+    # disambiguated sub-state as an explicit directive for the two states the
+    # agent misreads as "still auditing, wait". Local import keeps this resilient
+    # to integration-branch refactors of release_version on back-merge.
+    if _open_version is not None:
+        from app.release_version import (
+            summarize_qualification_state as _summarize_qual_state,
+        )
+
+        _qual_state = _summarize_qual_state(_open_version.last_qualification)
+        if _qual_state and _qual_state.get("state") in {
+            "promotion_in_flight",
+            "promotion_failed",
+        }:
+            _qual_hint = (
+                f"Qualification sub-state: {_qual_state['state'].upper()} — "
+                f"{_qual_state['summary']} Do NOT read "
+                "version_phase.last_qualification.status='pending' as 'the audit "
+                "is still running'; version_phase.qualification_state is the "
+                "disambiguated source of truth."
+            )
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_qual_hint}" if prompt_suffix else _qual_hint
+            )
     # Stabilize phase directive — when the open version is in stabilize, bias the
     # strategic agent's work-mix toward audit/cleanup/hardening so the version
     # converges toward qualification rather than accumulating net-new feature work.
@@ -2342,10 +2471,14 @@ async def _spawn_strategic_review(
             "for active directions. Defer new feature directions — do not propose "
             "net-new feature work while the version is stabilizing."
         )
-        # When the last qualification carried audit findings, the audit sub-score
-        # is the binding constraint — point the agent at the specific findings so
-        # it creates a TARGETED direction (recommended_mode='audit') rather than
-        # doing blind generic cleanup that may never touch the actual blockers.
+        # When the last qualification carried audit findings, point the agent at
+        # the specific findings so it creates a TARGETED direction
+        # (recommended_mode='audit') rather than doing blind generic cleanup that
+        # may never touch the actual blockers.  Audit is NOT automatically the
+        # binding constraint just because it flagged findings — frame it as such
+        # only when audit is genuinely the limiting dimension; otherwise name the
+        # real constraint (a hard blocker, or a lower sub-score) so hardening is
+        # scoped at what actually blocks promotion.
         _last_qual = _open_version.last_qualification or {}
         _carried_findings = _last_qual.get("audit_findings")
         if isinstance(_carried_findings, list) and _carried_findings:
@@ -2354,12 +2487,57 @@ async def _spawn_strategic_review(
                 for f in _carried_findings[:5]
                 if isinstance(f, dict)
             )
+            # Determine the dimension that actually limits promotion.  A hard
+            # blocker forces confidence to zero regardless of sub-scores; with no
+            # blocker the binding dimension is the lowest active sub-score (the
+            # smoketest dimension is excluded when the subsystem was disabled —
+            # its 0.0 is a meaningless placeholder, not a real low score).
+            _blocker = _last_qual.get("blocker")
+            _sub_scores = _last_qual.get("sub_scores")
+            _smoke_enabled = bool(_last_qual.get("smoketest_enabled", True))
+            _binding_desc = "the audit sub-score is the binding constraint on promotion"
+            if _blocker:
+                _binding_desc = (
+                    f"a hard blocker ({_blocker}) is the binding constraint on "
+                    f"promotion — it forces confidence to zero regardless of the "
+                    f"sub-scores, so resolving it is the priority"
+                )
+            elif isinstance(_sub_scores, dict):
+                _active = {
+                    _k: _v
+                    for _k, _v in (
+                        ("audit", _sub_scores.get("audit")),
+                        ("test_erosion", _sub_scores.get("test_erosion")),
+                        *(
+                            (("smoketest", _sub_scores.get("smoketest")),)
+                            if _smoke_enabled
+                            else ()
+                        ),
+                    )
+                    if isinstance(_v, (int, float)) and not isinstance(_v, bool)
+                }
+                if _active:
+                    _binding_key = min(_active, key=lambda _k: _active[_k])
+                    if _binding_key == "audit":
+                        _binding_desc = (
+                            "the audit sub-score is the binding constraint on "
+                            "promotion"
+                        )
+                    else:
+                        _binding_desc = (
+                            f"the {_binding_key} sub-score "
+                            f"({_active[_binding_key]:.2f}) is the binding "
+                            f"constraint on promotion — it is lower than audit "
+                            f"({_active.get('audit', 0.0):.2f}), so audit is not "
+                            f"the limiting dimension even though it flagged "
+                            f"findings; address {_binding_key} alongside the "
+                            f"audit findings"
+                        )
             _stabilize_hint += (
                 f" The last qualification's audit flagged {len(_carried_findings)} "
                 f"finding(s) — full list in "
-                f"version_phase.last_qualification.audit_findings — and the audit "
-                f"sub-score is the binding constraint on promotion. Top "
-                f"findings: {_top}."
+                f"version_phase.last_qualification.audit_findings — and "
+                f"{_binding_desc}. Top findings: {_top}."
             )
             # Only audit/fundamentals-mode directions do remediation work; a
             # ship/pause direction that merely mentions the audit topic does
@@ -2535,9 +2713,14 @@ async def _spawn_strategic_review(
         {
             "type": "strategic_review",
             "research_mode": "strategic",
-            "design_doc": _agent_view_design_doc(project.design_doc),
+            "design_doc": await ground_design_doc(
+                _agent_view_design_doc(project.design_doc), **verification_kwargs
+            ),
             "vision": project.vision or {},
-            "problem_model": _agent_view_problem_model(project.problem_model),
+            "problem_model": await _verify_capability_backing_paths(
+                _agent_view_problem_model(project.problem_model),
+                **verification_kwargs,
+            ),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()

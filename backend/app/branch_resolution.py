@@ -6,15 +6,18 @@ populate the corresponding columns. Re-exported from :mod:`app.shared_state` as
 a thin facade so existing importers are unaffected. Behaviour-preserving.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict
 
-from sqlalchemy.orm import object_session
 from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 
 from app.runtime_config_state import runtime_config
 
 logger = logging.getLogger(__name__)
+
+SELF_REPO_INTEGRATION_BRANCH = "automain"
 
 # Canonical default for task scope when not explicitly set.
 # Operational modules (orchestrator, review pipeline, research completion) use this.
@@ -67,6 +70,26 @@ TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
 
 
 _missing_project_branch_alerts: set[tuple[str, str]] = set()
+_blocking_project_branch_alerts: set[tuple[str, str]] = set()
+
+# Process-local queue of branch-misconfiguration alert intents recorded by the
+# SYNCHRONOUS resolvers (which run on async orchestrator/reaper hot loops and
+# must never issue DB I/O). Each item is a dict carrying ``project_id``,
+# ``title``, ``message`` and ``severity``. The orchestrator drains this queue
+# asynchronously via :func:`flush_pending_branch_alerts`, which performs the
+# durable, idempotent SELECT-then-INSERT so exactly one undismissed alert
+# exists per (project, missing column) — surviving restarts (the in-memory
+# dedup sets above forget across restarts; the DB-level dedup does not).
+_pending_durable_branch_alerts: list[dict] = []
+
+
+class InvalidProjectBranchConfiguration(RuntimeError):
+    """Raised when a project's integration branch would route work to promotion."""
+
+    def __init__(self, project_id: Any, detail: str):
+        self.project_id = project_id
+        self.detail = detail
+        super().__init__(detail)
 
 
 def derive_task_branch(
@@ -88,46 +111,279 @@ def derive_task_branch(
     return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
-def _signal_missing_project_branch(project, column_name: str, alert_title: str) -> None:
+def _project_id_str(project) -> str:
     project_id = getattr(project, "id", None)
-    project_id_str = str(project_id) if project_id is not None else "<unknown>"
-    dedupe_key = (project_id_str, column_name)
-    if dedupe_key in _missing_project_branch_alerts:
+    return str(project_id) if project_id is not None else "<unknown>"
+
+
+def _stage_project_branch_alert(
+    project,
+    *,
+    dedupe_bucket: set[tuple[str, str]],
+    dedupe_key_suffix: str,
+    title: str,
+    message: str,
+    log_level: int,
+    severity: str = "ERROR",
+) -> None:
+    project_id = getattr(project, "id", None)
+    project_id_str = _project_id_str(project)
+    dedupe_key = (project_id_str, dedupe_key_suffix)
+    if dedupe_key in dedupe_bucket:
         return
-    _missing_project_branch_alerts.add(dedupe_key)
-    logger.warning(
-        "[BRANCH_RESOLVER] project %s missing %s; falling back to main",
-        project_id_str,
-        column_name,
+    dedupe_bucket.add(dedupe_key)
+    logger.log(log_level, "[BRANCH_RESOLVER] %s", message)
+
+    # These resolvers are SYNCHRONOUS and called from async orchestrator/reaper
+    # hot loops, so we MUST NOT issue DB I/O here (a sync query from an async
+    # context risks MissingGreenlet, and per-resolve I/O would load the hot
+    # path). Instead record intent into a process-local queue that the
+    # orchestrator drains asynchronously via flush_pending_branch_alerts(),
+    # which performs the durable, idempotent persist. The in-memory dedupe
+    # bucket above keeps this to one enqueue per (project, column) per process.
+    # Skip when there is no real project id to key the durable dedup on (fake
+    # test doubles / detached objects lacking ``id``).
+    if project_id is None:
+        return
+    _pending_durable_branch_alerts.append(
+        {
+            "project_id": project_id,
+            "title": title,
+            "message": message,
+            "severity": severity,
+        }
     )
 
-    try:
-        session = object_session(project)
-    except Exception:  # noqa: BLE001
-        session = None
+
+async def flush_pending_branch_alerts(session) -> int:
+    """Drain the pending branch-misconfiguration queue into durable Alerts.
+
+    Called from the orchestrator's periodic monitoring seam in an async-safe
+    context (off the synchronous resolver hot path). For each queued intent it
+    performs a SELECT-then-INSERT keyed on an *undismissed*, task-less
+    ``(project_id, title)`` Alert — mirroring
+    :func:`app.alert_dispatch._create_strategic_alert` — so exactly one
+    undismissed alert exists per (project, missing column).
+
+    This makes the missing-branch signal durable and idempotent across
+    restarts: the in-memory dedupe sets forget on restart and the resolver
+    re-enqueues, but the SELECT prevents creating a second row when an
+    undismissed alert already exists. The signal clears naturally once the
+    column is populated (the resolver stops enqueuing) or the alert is
+    dismissed (a fresh row is then created on the next encounter).
+
+    Never raises — per-item failures are logged and the item is re-queued for a
+    later flush so a transient DB error does not silently drop the signal.
+    Returns the number of new alerts created.
+    """
+    global _pending_durable_branch_alerts
+    if not _pending_durable_branch_alerts:
+        return 0
+    pending = _pending_durable_branch_alerts
+    _pending_durable_branch_alerts = []
+
+    from sqlmodel import select
+
+    from app.broadcast import broadcast_to_project
+    from app.models import Alert, AlertSeverity
+
+    created = 0
+    failed: list[dict] = []
+    for item in pending:
+        project_id = item.get("project_id")
+        title = item.get("title")
+        if project_id is None or not title:
+            continue
+        try:
+            existing = await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.title == title,
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+            if existing.scalars().first() is not None:
+                continue
+            try:
+                severity = AlertSeverity(item.get("severity") or "ERROR")
+            except ValueError:
+                severity = AlertSeverity.ERROR
+            alert = Alert(
+                project_id=project_id,
+                severity=severity,
+                title=title,
+                message=item.get("message") or title,
+            )
+            session.add(alert)
+            created += 1
+            await broadcast_to_project(
+                str(project_id),
+                "alert_created",
+                {
+                    "alert_id": str(alert.id),
+                    "severity": severity.value,
+                    "title": title,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            failed.append(item)
+            logger.warning(
+                "[BRANCH_RESOLVER] could not persist pending branch alert for "
+                "project %s (will retry next flush)",
+                project_id,
+            )
+    if failed:
+        _pending_durable_branch_alerts.extend(failed)
+    return created
+
+
+def _signal_missing_project_branch(
+    project,
+    column_name: str,
+    alert_title: str,
+    *,
+    fallback_branch: str,
+) -> None:
+    project_id = getattr(project, "id", None)
+    project_id_str = str(project_id) if project_id is not None else "<unknown>"
+    _stage_project_branch_alert(
+        project,
+        dedupe_bucket=_missing_project_branch_alerts,
+        dedupe_key_suffix=column_name,
+        title=alert_title,
+        message=(
+            f"Project {project_id_str} has NULL {column_name}; "
+            f"falling back to {fallback_branch} until the column is populated."
+        ),
+        log_level=logging.WARNING,
+    )
+
+
+def _signal_blocking_project_branch_configuration(
+    project,
+    issue_code: str,
+    detail: str,
+) -> None:
+    _stage_project_branch_alert(
+        project,
+        dedupe_bucket=_blocking_project_branch_alerts,
+        dedupe_key_suffix=issue_code,
+        title="Blocking branch configuration",
+        message=detail,
+        log_level=logging.ERROR,
+    )
+
+
+# Stable, escalated title for the blocking-class branch-safety signal. Used as
+# the database-existence dedupe key (project_id + this title + not-dismissed) so
+# the loud signal survives a process restart and is shared across backend
+# instances — unlike the in-process ``_blocking_project_branch_alerts`` set,
+# which resets on restart and is poisoned by a rolled-back caller. No new
+# severity tier is introduced: the house convention is top severity (ERROR) +
+# this escalated title + a paired BLOCKER operator message.
+_UNSAFE_BRANCH_ALERT_TITLE = (
+    "Unsafe branch configuration — fleet work would route to the promotion target"
+)
+
+
+async def signal_unsafe_branch_configuration(
+    session,
+    project,
+    *,
+    issue_code: str,
+    detail: str,
+) -> None:
+    """Durably raise the loud, blocking-class operator signal for an unsafe
+    branch configuration and commit it.
+
+    Mirrors the release-stall pattern (an Alert paired with a high-visibility
+    BLOCKER operator message). Both halves are deduplicated by a
+    database-existence check rather than an in-process set, so the signal
+    survives a restart and is shared across instances, and neither half is
+    silently dropped by a rolled-back caller because this commits its own work.
+
+    The Alert is emitted at the top severity (``ERROR``) under the stable
+    escalated title :data:`_UNSAFE_BRANCH_ALERT_TITLE`; the paired
+    :class:`ProjectMessage` is of type ``BLOCKER`` and carries its own stable
+    dedupe key in ``context`` so it lands on the operator's high-signal message
+    board exactly once per (project, issue) until resolved.
+
+    Callers that raise the blocking signal from an async write path (rollup /
+    admin merge gates) should ``await`` this instead of the best-effort sync
+    :func:`_signal_blocking_project_branch_configuration`.
+    """
+    from sqlmodel import select
+
+    from app.models import Alert, AlertSeverity, MessageType, ProjectMessage
+
+    project_id = getattr(project, "id", None)
+    logger.error("[BRANCH_RESOLVER] %s", detail)
     if session is None or project_id is None:
         return
 
-    from app.models import Alert, AlertSeverity
-
-    try:
+    # Alert: database-existence dedupe on (project, stable title, not dismissed).
+    existing_alert = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.title == _UNSAFE_BRANCH_ALERT_TITLE,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    if existing_alert.scalars().first() is None:
         session.add(
             Alert(
                 project_id=project_id,
                 severity=AlertSeverity.ERROR,
-                title=alert_title,
-                message=(
-                    f"Project {project_id_str} has NULL {column_name}; "
-                    "falling back to main until the column is populated."
-                ),
+                title=_UNSAFE_BRANCH_ALERT_TITLE,
+                message=detail,
             )
         )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[BRANCH_RESOLVER] project %s missing %s; alert could not be staged",
-            project_id_str,
-            column_name,
+
+    # Paired BLOCKER operator message, deduped by its own stable context key.
+    dedupe_key = f"unsafe_branch_configuration:{project_id}:{issue_code}"
+    open_blockers = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.message_type == MessageType.BLOCKER,
+            ProjectMessage.status == "open",
         )
+    )
+    already_posted = any(
+        (msg.context or {}).get("dedupe_key") == dedupe_key
+        for msg in open_blockers.scalars().all()
+    )
+    if not already_posted:
+        session.add(
+            ProjectMessage(
+                project_id=project_id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content=detail,
+                context={
+                    "event_type": "unsafe_branch_configuration",
+                    "issue_code": issue_code,
+                    "dedupe_key": dedupe_key,
+                },
+            )
+        )
+
+    await session.commit()
+
+
+def _uses_legacy_branch_resolver_shape(project) -> bool:
+    """Keep partial test doubles on the old fallback contract.
+
+    Real Project rows expose both integration and promotion columns plus the
+    self-repo metadata. Some older unit tests still use a minimal stub with only
+    ``integration_branch``; preserve the legacy `'main'` fallback for those
+    detached shapes so the runtime safety hardening only applies to real
+    project-like objects.
+    """
+    return project is not None and not any(
+        hasattr(project, attr)
+        for attr in ("promotion_target", "is_self_repo", "github_repo")
+    )
 
 
 def resolve_task_branch(task: Any, namespace: str) -> str:
@@ -173,16 +429,42 @@ def get_project_integration_branch(project) -> str:
 
     Fallback chain:
       1. project.integration_branch (per-project column, added by migration 0122+)
-      2. "main"
+      2. "automain" for self-repo projects (qualification trunk)
+      3. "main" for non-self-repo projects (promotion/release target)
 
     The deprecated runtime_config bridge was removed after the per-project
     column stabilized across the migration/backfill rollout.
     """
+    if _uses_legacy_branch_resolver_shape(project):
+        integration_branch = getattr(project, "integration_branch", None)
+        return integration_branch or "main"
+
     integration_branch = getattr(project, "integration_branch", None)
     if integration_branch:
         return integration_branch
+
+    # Per-project column is unset. Fail SAFE (never raise) so the resolver can
+    # be called from read endpoints, background recovery loops, agent-facing
+    # completion handlers, and the ``Project.protected_branches`` property
+    # without a misconfiguration aborting the whole sweep or 500ing a request.
+    # Self-repo projects map an unset integration branch to the qualification
+    # trunk ("automain"); every other project falls back to "main". The
+    # operator-facing signal is still staged so the unset column stays visible.
+    # Promotion-target safety is enforced at the merge/rollup boundary (see
+    # rollup_management/admin_task_mutations), not in this hot-path resolver.
+    if _is_blueprint_self_repo(project):
+        _signal_missing_project_branch(
+            project,
+            "integration_branch",
+            "Missing integration_branch",
+            fallback_branch=SELF_REPO_INTEGRATION_BRANCH,
+        )
+        return SELF_REPO_INTEGRATION_BRANCH
     _signal_missing_project_branch(
-        project, "integration_branch", "Missing integration_branch"
+        project,
+        "integration_branch",
+        "Missing integration_branch",
+        fallback_branch="main",
     )
     return "main"
 
@@ -261,9 +543,297 @@ def get_project_promotion_target(project) -> str:
     if promotion_target:
         return promotion_target
     _signal_missing_project_branch(
-        project, "promotion_target", "Missing promotion_target"
+        project,
+        "promotion_target",
+        "Missing promotion_target",
+        fallback_branch="main",
     )
     return "main"
+
+
+_PROMOTION_TARGET_LANDING_ALERT_TITLE = (
+    "Merged PR landed on promotion target before integration"
+)
+
+
+def _promotion_target_landing_reason(
+    *,
+    pr_label: str,
+    landed_branch: str,
+    integration_branch: str,
+    source: str,
+) -> str:
+    return (
+        f"{pr_label} landed on {landed_branch!r} via {source}, which matches "
+        f"promotion_target and is distinct from integration_branch "
+        f"{integration_branch!r}. The merge does not count as landing on the "
+        "integration trunk, so pr_merged was left unset."
+    )
+
+
+async def _create_promotion_target_landing_alert(
+    task: Any,
+    session,
+    *,
+    pr_number: int | None,
+    landed_branch: str,
+    integration_branch: str,
+    source: str,
+) -> None:
+    from app.broadcast import broadcast_to_project
+    from app.models import Alert, AlertSeverity
+    from app.notification_dispatch import dispatch_external_notification
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == getattr(task, "id", None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == _PROMOTION_TARGET_LANDING_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+
+    pr_label = f"PR #{pr_number}" if pr_number is not None else "A merged PR"
+    reason = _promotion_target_landing_reason(
+        pr_label=pr_label,
+        landed_branch=landed_branch,
+        integration_branch=integration_branch,
+        source=source,
+    )
+    alert = Alert(
+        project_id=getattr(task, "project_id"),
+        severity=AlertSeverity.ERROR,
+        title=_PROMOTION_TARGET_LANDING_ALERT_TITLE,
+        message=reason,
+        task_id=getattr(task, "id", None),
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(getattr(task, "project_id")),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+    )
+
+    try:
+        ctx = getattr(task, "context", None) or {}
+        payload = getattr(task, "first_payload", None) or {}
+        pr_url = (
+            ctx.get("pr_url") or ctx.get("rollup_pr_url") or payload.get("pr_url") or ""
+        )
+        if not pr_url and pr_number is not None:
+            repo_full = ctx.get("repo_full_name") or ctx.get("repo") or ""
+            if repo_full:
+                pr_url = f"https://github.com/{repo_full}/pull/{pr_number}"
+        raw_critical = (
+            ctx.get("critical_files") or ctx.get("_pr_changed_files") or []
+        )
+        critical_files = (
+            [f for f in raw_critical if isinstance(f, str)][:10]
+            if isinstance(raw_critical, list)
+            else []
+        )
+        direction_text = (
+            ctx.get("direction_text") or payload.get("direction_text") or ""
+        )
+        scope = ctx.get("scope") or payload.get("scope") or ""
+        asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                getattr(task, "project_id"),
+                "APPROVAL_NEEDED",
+                {
+                    "task_id": str(getattr(task, "id", "")),
+                    "task_title": getattr(task, "title", None)
+                    or str(getattr(task, "id", ""))[:8],
+                    "pr_number": pr_number,
+                    "reason": reason,
+                    "approval_reason": reason,
+                    "pr_url": pr_url,
+                    "critical_files": critical_files,
+                    "direction_id": ctx.get("direction_id") or "",
+                    "direction_text": direction_text[:200],
+                    "scope": scope,
+                },
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[NOTIFY] promotion-target APPROVAL_NEEDED dispatch setup failed: %s",
+            exc,
+        )
+
+
+def resolve_pr_landing_branch(
+    task: Any, project, *, merged_base_branch: str | None = None
+) -> str:
+    """Return the branch a merged PR actually landed on for ``pr_merged`` decisions.
+
+    Prefer the authoritative GitHub/webhook base branch when available. Fall back
+    to the task's review-loop / payload base_branch so recovery paths still make a
+    deterministic decision when the API payload omits ``base.ref``.
+    """
+    if merged_base_branch:
+        return merged_base_branch
+    ctx = getattr(task, "context", None) or {}
+    review_loop = ctx.get("review_loop") or {}
+    branch = review_loop.get("base_branch")
+    if branch:
+        return branch
+    payload = getattr(task, "first_payload", None) or {}
+    branch = payload.get("base_branch")
+    if branch:
+        return branch
+    return get_project_integration_branch(project)
+
+
+def is_custom_staged_rollup_root(task: Any, project, base_branch: str | None) -> bool:
+    """True when a rollup/root task landed on a configured custom staging branch.
+
+    The deferred-downstream semantics only apply to projects that replaced the
+    default ``research/`` / ``plan/`` staging prefixes with a custom family
+    such as ``release/``. Default Blueprint research/plan review merges keep
+    their historical terminal behavior.
+    """
+    if project is None or not getattr(project, "is_staging_branch", None):
+        return False
+    if not project.is_staging_branch(base_branch):
+        return False
+    if project.staging_branch_prefixes == ("research/", "plan/"):
+        return False
+
+    ctx = getattr(task, "context", None) or {}
+    if ctx.get("rollup_pr_number") or bool(ctx.get("_is_rollup_review")):
+        return True
+
+    payload = getattr(task, "first_payload", None) or {}
+    return payload.get("type") in {"research", "plan"}
+
+
+async def classify_rollup_merge_outcome(
+    task: Any,
+    project,
+    session,
+    *,
+    pr_number: int | None,
+    merged_base_branch: str | None = None,
+    source: str,
+) -> tuple[bool, bool, str]:
+    """Return ``(record_pr_merged, terminal_rollup_merge, landed_branch)``.
+
+    Custom staged rollup roots stay non-terminal when they land on an
+    intermediate staging branch. Promotion-target landings are terminal but do
+    not count as integration landings when promotion and integration differ.
+    """
+    landed_branch = resolve_pr_landing_branch(
+        task, project, merged_base_branch=merged_base_branch
+    )
+    if is_custom_staged_rollup_root(task, project, landed_branch) and project is not None:
+        integration_branch = get_project_integration_branch(project)
+        promotion_target = get_project_promotion_target(project)
+        landed_on_integration = landed_branch == integration_branch
+        landed_on_promotion = landed_branch == promotion_target
+        if not landed_on_integration and landed_on_promotion:
+            await merged_pr_counts_as_integration_landing(
+                task,
+                project,
+                session,
+                pr_number=pr_number,
+                merged_base_branch=landed_branch,
+                source=source,
+            )
+        return (
+            landed_on_integration,
+            landed_on_integration or landed_on_promotion,
+            landed_branch,
+        )
+
+    return (
+        await merged_pr_counts_as_integration_landing(
+            task,
+            project,
+            session,
+            pr_number=pr_number,
+            merged_base_branch=landed_branch,
+            source=source,
+        ),
+        True,
+        landed_branch,
+    )
+
+
+async def merged_pr_counts_as_integration_landing(
+    task: Any,
+    project,
+    session,
+    *,
+    pr_number: int | None,
+    merged_base_branch: str | None = None,
+    source: str,
+) -> bool:
+    """Return whether a merged PR should set ``context['pr_merged']``.
+
+    The one disallowed case is a merge that landed on the project's configured
+    ``promotion_target`` while that branch is distinct from the resolved
+    ``integration_branch``. In that case an ERROR alert is raised so operators
+    see the out-of-band promotion landing immediately, and callers must leave
+    ``pr_merged`` unset.
+    """
+    if project is None or session is None:
+        return True
+
+    integration_branch = get_project_integration_branch(project)
+    promotion_target = get_project_promotion_target(project)
+    landed_branch = resolve_pr_landing_branch(
+        task, project, merged_base_branch=merged_base_branch
+    )
+    if landed_branch != promotion_target or promotion_target == integration_branch:
+        return True
+
+    await _create_promotion_target_landing_alert(
+        task,
+        session,
+        pr_number=pr_number,
+        landed_branch=landed_branch,
+        integration_branch=integration_branch,
+        source=source,
+    )
+
+    logger.error(
+        "[PR_BRANCH_GUARD] Task %s PR #%s landed on promotion target %s "
+        "(integration=%s) via %s; leaving pr_merged unset",
+        getattr(task, "id", None),
+        pr_number,
+        landed_branch,
+        integration_branch,
+        source,
+    )
+    return False
+
+
+def is_single_branch_project(project) -> bool:
+    """True when a project's integration branch IS its promotion target.
+
+    This is the canonical "LTS model inactive" predicate: when the branch the
+    pipeline builds on (:func:`get_project_integration_branch`) coincides with
+    the branch promotions land on (:func:`get_project_promotion_target`) there
+    is no separate release trunk.  It is the common default for an onboarded
+    external repo (both columns backfilled to the GitHub default branch), versus
+    Blueprint's own self-repo pair (``automain`` integration / ``main``
+    promotion), where the two differ and the LTS model is active.
+
+    The release machinery keys several short-circuits on this exact comparison —
+    ``release_promotion.promote`` records an inert already-landed success rather
+    than opening a ``release-vN -> promotion_target`` PR that would target the
+    very branch work already merges to; ``hotfix_backmerge`` skips the
+    ``promotion_target -> integration_branch`` back-merge as ``lts_inactive``;
+    and ``release_reconciliation`` bails out rather than reconciling a candidate
+    against a branch it already lives on.  Resolving both names through the
+    per-project resolver here keeps that decision in one tested place instead of
+    re-deriving the literal comparison at each call site.
+    """
+    return get_project_integration_branch(project) == get_project_promotion_target(
+        project
+    )
 
 
 async def backfill_branch_columns(session, project_id=None) -> dict:
@@ -271,10 +841,11 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
 
     Runs once at startup (called from main.py lifespan) after migrations finish.
     Only writes to columns that are still NULL — skips rows already populated so
-    the function is safe to re-run.  Self-repo projects with NULL integration_branch
-    are left untouched (migration 0124 already set them to 'automain'; if still NULL
-    they are in a state the LTS workflow manages separately).  Self-repo projects
-    with NULL promotion_target get 'main' without a GitHub round-trip.
+    the function is safe to re-run.  Self-repo projects with NULL
+    integration_branch are left untouched; the runtime resolver maps that state
+    to ``automain`` while preserving the explicit operator-facing signal that the
+    column is still unset.  Self-repo projects with NULL promotion_target get
+    'main' without a GitHub round-trip.
 
     For non-self-repo projects, resolves GitHub credentials and calls
     get_repo_default_branch().  When the GitHub API call fails, emits a per-project
@@ -321,8 +892,9 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
             summary["skipped"] += 1
             continue
 
-        # Self-repo: integration_branch managed by the LTS workflow — leave NULL
-        # as-is (migration 0124 already backfilled is_self_repo rows to 'automain').
+        # Self-repo: leave NULL as-is. The live resolver treats the self-repo's
+        # unset integration branch as automain without silently rewriting the
+        # column behind the operator's back.
         if project.is_self_repo and need_integration:
             summary["self_repo_skipped"] += 1
             need_integration = False

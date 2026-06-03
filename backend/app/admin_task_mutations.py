@@ -19,6 +19,13 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
+from app.branch_resolution import (
+    InvalidProjectBranchConfiguration,
+    _signal_blocking_project_branch_configuration,
+    classify_rollup_merge_outcome,
+    merged_pr_counts_as_integration_landing,
+)
+from app.landed_signal import apply_merged_landed_signal, mark_unblocked_non_merge
 from app.models import (
     Artifact,
     ArtifactType,
@@ -40,6 +47,78 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
+
+
+def _promotion_target_merge_allowed(task: Task, target_branch: str) -> bool:
+    """Allow the intentionally-gated hotfix lane to merge to promotion."""
+    if not target_branch:
+        return False
+    payload = task.first_payload or {}
+    ctx = task.context or {}
+    return bool(payload.get("hotfix") or ctx.get("hotfix"))
+
+
+def _merge_context_with_hotfix_non_landing(
+    task: Task,
+    project: Project | None,
+    *,
+    base_context: Dict[str, Any],
+    landed_branch: str,
+    record_pr_merged: bool,
+    preserve_hotfix_non_landing: bool = True,
+) -> Dict[str, Any]:
+    """Preserve merge-equivalent unblock semantics for hotfix promotion merges."""
+    task.context = dict(base_context)
+
+    if record_pr_merged:
+        apply_merged_landed_signal(
+            task,
+            project,
+            base_branch=landed_branch,
+            hotfix_lane=_promotion_target_merge_allowed(task, landed_branch),
+            non_merge_reason="merged_pr_non_integration_branch",
+        )
+        return dict(task.context or {})
+
+    if (
+        not preserve_hotfix_non_landing
+        or project is None
+        or not _promotion_target_merge_allowed(task, landed_branch)
+    ):
+        return dict(base_context)
+
+    from app.shared_state import get_project_promotion_target
+
+    promotion_target = get_project_promotion_target(project)
+    integration_branch = get_project_integration_branch(project)
+    if (
+        landed_branch == promotion_target
+        and landed_branch != integration_branch
+    ):
+        mark_unblocked_non_merge(
+            task,
+            reason="merged_pr_non_integration_branch",
+        )
+        return dict(task.context or {})
+
+    return dict(base_context)
+
+
+async def _block_admin_merge_for_branch_safety(
+    task: Task,
+    project: Project | None,
+    session: AsyncSession,
+    detail: str,
+    *,
+    issue_code: str,
+) -> None:
+    """Keep the task approval-gated and persist a branch-safety alert."""
+    if project is not None:
+        _signal_blocking_project_branch_configuration(project, issue_code, detail)
+    task.requires_approval = True
+    task.latest_status_message = detail[:500]
+    session.add(task)
+    await session.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -307,23 +386,94 @@ async def _handle_rollup_pr_approval(
     changes: Dict[str, Any],
 ) -> None:
     """Merge the rollup PR and optionally spawn a smoketest on human approval."""
+    _project = await session.get(Project, task.project_id)
+    try:
+        base_branch = (task.first_payload).get(
+            "base_branch"
+        ) or get_project_integration_branch(_project)
+    # Defense-in-depth: the resolver currently fails SAFE and does not raise.
+    # This guard exists so a future re-introduction of a raising resolver path
+    # refuses the merge cleanly instead of 500ing after the row is committed.
+    except InvalidProjectBranchConfiguration as exc:
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            f"Approved rollup merge refused: {exc.detail}",
+            issue_code="admin_rollup_integration_branch_invalid",
+        )
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+
+    from app.shared_state import (
+        get_project_promotion_target as _get_project_promotion_target,
+    )
+
+    _promotion_target = _get_project_promotion_target(_project)
+    # A human has explicitly approved this rollup merge, so we do NOT refuse a
+    # landing on the promotion target here (PR #7064 superseded the earlier
+    # hard-refuse of PR #6995 for the human-approval lane). Instead the merge
+    # proceeds and classify_rollup_merge_outcome below decides the outcome:
+    # a landing on a distinct promotion target raises the out-of-band alert and
+    # leaves pr_merged unset so the rollup stays unqualified, rather than
+    # dead-ending the operator's explicit approval with a 409. The autonomous
+    # rollup path (rollup_management) still HOLDS such landings for human
+    # approval first; this handler IS that approval.
+
     try:
         from app.routers.agent import get_github_token_for_task
-        from app.shared_state import (
-            runtime_config as _runtime_config,
-            get_project_promotion_target as _get_project_promotion_target,
-        )
+        from app.shared_state import runtime_config as _runtime_config
         from app.rollup_management import _cleanup_branches
         from app.github import merge_pull_request, create_pr_comment
 
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
         if merge_result.get("merged"):
-            task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True}
-            task.latest_status_message = (
-                f"Human-approved merge of rollup PR #{rollup_pr_number}"
+            _project = await session.get(Project, task.project_id)
+            base_branch = (task.first_payload).get(
+                "base_branch"
+            ) or get_project_integration_branch(_project)
+            (
+                record_pr_merged,
+                terminal_rollup_merge,
+                landed_branch,
+            ) = await classify_rollup_merge_outcome(
+                task,
+                _project,
+                session,
+                pr_number=rollup_pr_number,
+                merged_base_branch=base_branch,
+                source="admin_task_mutations.rollup_pr_approval",
             )
+            task.status = (
+                TaskStatus.COMPLETED
+                if terminal_rollup_merge
+                else TaskStatus.EVALUATING
+            )
+            # The hotfix lane is intentionally allowed to merge to the promotion
+            # target (see _promotion_target_merge_allowed). When it does, the
+            # work never landed on the integration branch, so record_pr_merged
+            # is False — but it must still unblock the rollup as a
+            # merge-equivalent non-landing. Preserve that hotfix unblock here so
+            # the hotfix path stamps pr_merged=True / landed_on_integration=False
+            # while the non-hotfix promotion-target landing stays unqualified
+            # (pr_merged unset).
+            task.context = _merge_context_with_hotfix_non_landing(
+                task,
+                _project,
+                base_context=ctx,
+                landed_branch=landed_branch,
+                record_pr_merged=record_pr_merged,
+                preserve_hotfix_non_landing=True,
+            )
+            if terminal_rollup_merge:
+                task.latest_status_message = (
+                    f"Human-approved merge of rollup PR #{rollup_pr_number}"
+                )
+            else:
+                task.latest_status_message = (
+                    f"Human-approved merge of rollup PR #{rollup_pr_number} "
+                    f"into {landed_branch}; awaiting downstream landing"
+                )
             await create_pr_comment(
                 gh_token,
                 owner,
@@ -338,11 +488,6 @@ async def _handle_rollup_pr_approval(
             session.add(task)
             await session.commit()
             await _cleanup_branches(task, session)
-            _project = await session.get(Project, task.project_id)
-            base_branch = (task.first_payload).get(
-                "base_branch"
-            ) or get_project_integration_branch(_project)
-            _promotion_target = _get_project_promotion_target(_project)
             if base_branch == _promotion_target and _runtime_config.get(
                 "smoketest_enabled"
             ):
@@ -461,9 +606,49 @@ async def _handle_task_pr_approval(
     task_payload = task.first_payload
     _project = await session.get(Project, task.project_id)
     branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
-    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
-        _project
+    try:
+        base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+            _project
+        )
+    # Defense-in-depth: the resolver currently fails SAFE and does not raise.
+    # This guard exists so a future re-introduction of a raising resolver path
+    # refuses the merge cleanly instead of 500ing after the row is committed.
+    except InvalidProjectBranchConfiguration as exc:
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            f"Approved merge refused: {exc.detail}",
+            issue_code="admin_task_integration_branch_invalid",
+        )
+        raise HTTPException(status_code=409, detail=exc.detail) from exc
+    from app.shared_state import (
+        get_project_promotion_target as _get_project_promotion_target,
     )
+
+    promotion_target = _get_project_promotion_target(_project)
+    integration_branch = get_project_integration_branch(_project)
+    # Refuse ONLY when the merge would land on the promotion target AND that
+    # target is distinct from the integration branch. Single-trunk projects
+    # (integration == promotion) legitimately merge onto the shared trunk.
+    if (
+        base_branch == promotion_target
+        and base_branch != integration_branch
+        and not _promotion_target_merge_allowed(task, base_branch)
+    ):
+        detail = (
+            f"Approved merge refused: target branch '{base_branch}' is this "
+            "project's promotion target. Configure a distinct integration branch "
+            "before landing fleet work."
+        )
+        await _block_admin_merge_for_branch_safety(
+            task,
+            _project,
+            session,
+            detail,
+            issue_code="admin_task_target_matches_promotion_target",
+        )
+        raise HTTPException(status_code=409, detail=detail)
 
     if ctx.get("touched_critical"):
         await _merge_critical_pr(
@@ -498,8 +683,26 @@ async def _merge_critical_pr(
         gh_token, owner, repo = await get_github_token_for_task(task.id, session)
         merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
         if merge_result.get("merged"):
+            _project = await session.get(Project, task.project_id)
+            base_branch = (task.first_payload).get(
+                "base_branch"
+            ) or get_project_integration_branch(_project)
+            record_pr_merged = await merged_pr_counts_as_integration_landing(
+                task,
+                _project,
+                session,
+                pr_number=pr_number,
+                merged_base_branch=base_branch,
+                source="admin_task_mutations.critical_pr_approval",
+            )
             task.status = TaskStatus.COMPLETED
-            task.context = {**ctx, "pr_merged": True}
+            task.context = _merge_context_with_hotfix_non_landing(
+                task,
+                _project,
+                base_context=ctx,
+                landed_branch=base_branch,
+                record_pr_merged=record_pr_merged,
+            )
             task.latest_status_message = f"Human-approved merge of PR #{pr_number}"
             await create_pr_comment(
                 gh_token,

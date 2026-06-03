@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 
 from sqlalchemy import select
 
-from app.models import Project, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
 from app.review_pipeline import (
     MAX_REVIEW_FIX_ITERATIONS,
     PIPELINE_TASK_STALE_MINUTES,
@@ -314,9 +314,9 @@ class TestMaxReviewIterations:
 # ── DB-backed helpers ─────────────────────────────────────────────────────────
 
 
-async def _make_db_project(db_session) -> Project:
+async def _make_db_project(db_session, **project_kwargs) -> Project:
     """Persist a project and return the refreshed instance."""
-    project = make_project()
+    project = make_project(**project_kwargs)
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -641,6 +641,86 @@ class TestShouldAutoApproveSmallDiff:
         assert "disabled" in reason
 
 
+# ── _spawn_pipeline_task: verify_tests fast-path ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_verify_tests_creates_task_and_bypasses_cap(db_session, mocker):
+    """_spawn_pipeline_task('verify_tests', ...) creates a one-shot verify_tests
+    task on the PR head, bypassing the review-fix iteration caps (a 99-iteration
+    chain that would block a review/fix spawn must NOT block verify_tests), and
+    dedups a second spawn to the same active task."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 222,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            # A 99-iteration chain would trip the per-chain review-fix cap for a
+            # review/fix spawn; verify_tests deliberately ignores it.
+            "review_loop": {
+                "iteration": 99,
+                "original_task_id": str(original_task.id),
+            },
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    task, created = await _spawn_pipeline_task(
+        source_task,
+        "verify_tests",
+        db_session,
+        pr_number=222,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created is True
+    assert task is not None
+    assert task.first_payload.get("type") == "verify_tests"
+    assert task.first_payload.get("branch") == "feat/x"
+    assert task.first_payload.get("pr_number") == 222
+    assert task.first_payload.get("base_branch") == "main"
+    assert task.status == TaskStatus.QUEUED
+
+    # Second spawn for the same PR dedups to the same active task.
+    task2, created2 = await _spawn_pipeline_task(
+        source_task,
+        "verify_tests",
+        db_session,
+        pr_number=222,
+        branch="feat/x",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert created2 is False
+    assert task2 is not None
+    assert task2.id == task.id
+
+
 # ── _spawn_pipeline_task: iteration cap ───────────────────────────────────────
 
 
@@ -742,6 +822,9 @@ async def test_global_cap_blocks_spawn(db_session, mocker):
         "Global cap must tag failure_detail=review_cap_exhausted so the rollup respawn "
         "loop can skip this child and the parent can finalize."
     )
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "cap_exhausted"
+    assert terminal_outcome.get("reason") == "review_cap_exhausted"
     assert (original_task.context or {}).get("pr_rejected") is True, (
         "Global cap must preempt the webhook by setting pr_rejected=True before closing the PR"
     )
@@ -861,6 +944,9 @@ async def test_cap_paths_symmetric_terminal_state(db_session, mocker):
         assert (root.context or {}).get("failure_detail") == "review_cap_exhausted", (
             f"{label} cap must tag failure_detail=review_cap_exhausted"
         )
+        terminal_outcome = (root.context or {}).get("review_loop_terminal_outcome")
+        assert terminal_outcome and terminal_outcome.get("kind") == "cap_exhausted"
+        assert terminal_outcome.get("reason") == "review_cap_exhausted"
         assert root.requires_approval is True, (
             f"{label} cap must preserve requires_approval"
         )
@@ -6062,6 +6148,127 @@ async def test_second_churn_detection_uses_one_half_reduction(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_churn_cap_reduction_durable_across_spawns(db_session, mocker):
+    """When churn is detected, the reduced cap must persist across spawns via
+    _churn_cap_reduction so that subsequent spawns honor the earlier reduction
+    and _max_review_iterations returns the reduced cap instead of the base cap."""
+    from app.review_pipeline import _max_review_iterations
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    # Setup: build a review_history with 2 entries, each having 2 CRITICAL issues
+    # (distinct descriptions with low token overlap → evades stuck detection but is churn).
+    # Use completely different issue names to avoid Jaccard similarity matching.
+    prior_history = [
+        {
+            "iteration": 0,
+            "feedback": "f0",
+            "issues": [_issue("missing null check in function_alpha"), _issue("off by one in loop_beta")],
+        },
+        {
+            "iteration": 1,
+            "feedback": "f1",
+            "issues": [_issue("array bounds in handler_gamma"), _issue("type mismatch in parser_delta")],
+        },
+    ]
+    # First spawn: iteration 2, detects churn, reduces cap.
+    first_source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 704,
+                "branch": "b1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={
+            "scope": "medium",
+            "review_loop": {
+                "iteration": 2,
+                "original_task_id": str(original_task.id),
+                "pr_number": 704,
+                "branch": "b1",
+                "base_branch": "main",
+                "review_history": prior_history,
+            },
+        },
+    )
+    db_session.add(first_source_task)
+    await db_session.commit()
+    await db_session.refresh(first_source_task)
+
+    # First spawn: iteration 3 will detect churn (counts [2, 2, 2] → non-decreasing).
+    # medium scope baseline=12, iteration=3, remaining=9 → reduced_cap = 3 + 9//2 = 7.
+    first_result, _ = await _spawn_pipeline_task(
+        first_source_task,
+        "fix",
+        db_session,
+        pr_number=704,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Please fix.",
+        current_feedback="f2",
+        current_issues=[_issue("undefined reference in context_epsilon"), _issue("missing import in config_zeta")],
+    )
+
+    assert first_result is not None
+    first_ctx = first_result.context or {}
+    first_review_loop = first_ctx.get("review_loop", {})
+
+    # Verify: first spawn's context has the reduced cap stored.
+    assert first_review_loop.get("max_iterations") == 7
+    assert first_ctx.get("_churn_cap_reduction") == 7, (
+        "Churn cap reduction must be persisted to _churn_cap_reduction"
+    )
+
+    # Second spawn: use the first spawn's result as the source task.
+    # Iteration 4: reduce issue count to [2, 1] (decreasing) → no churn detected.
+    # The prior _churn_cap_reduction (7) must be respected in _max_review_iterations.
+    second_source_task = first_result
+    second_result, _ = await _spawn_pipeline_task(
+        second_source_task,
+        "fix",
+        db_session,
+        pr_number=704,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Further fix.",
+        current_feedback="f3",
+        current_issues=[_issue("race condition in thread_handler")],
+    )
+
+    assert second_result is not None
+    second_ctx = second_result.context or {}
+
+    # Verify: second spawn's _max_review_iterations honors the prior churn reduction.
+    # Without the fix, _max_review_iterations would return 12 (baseline for medium scope).
+    # With the fix, it must return 7 (the reduced cap from the first spawn).
+    computed_cap = _max_review_iterations(second_result)
+    assert computed_cap == 7, (
+        f"_max_review_iterations must honor persisted churn reduction: "
+        f"expected 7 (reduced cap), got {computed_cap}"
+    )
+
+    # Also verify: the persisted _churn_cap_reduction is carried forward.
+    assert second_ctx.get("_churn_cap_reduction") == 7
+
+
+@pytest.mark.asyncio
 async def test_mid_budget_injects_narrow_focus_without_cap_reduction(
     db_session, mocker
 ):
@@ -8244,6 +8451,12 @@ def _mock_merge_success_deps(mocker):
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True, "message": "ok"}),
     )
+    mocker.patch(
+        "app.github.submit_pr_review",
+        new=AsyncMock(return_value={"id": 1}),
+    )
+    mocker.patch("app.github.get_check_runs_cached", new=AsyncMock(return_value=[]))
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
     mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
     # Branch cleanup + playbook touch GitHub/DB — no-op them (they're guarded
@@ -8253,6 +8466,37 @@ def _mock_merge_success_deps(mocker):
         "app.review_learning.extract_review_feedback_to_playbook",
         new=AsyncMock(return_value=None),
     )
+
+
+def _mock_small_auto_merge_deps(mocker):
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "tiny diff"),
+    )
+    mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=1.0)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new=AsyncMock(
+            return_value={
+                "blocked": False,
+                "findings": [],
+                "summary": "ok",
+                "report": "",
+            }
+        ),
+    )
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new=AsyncMock(return_value={"merged": True, "message": "ok"}),
+    )
+    mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.task_lifecycle._cleanup_branches", new=AsyncMock(return_value=None))
 
 
 @pytest.mark.skipif(
@@ -8443,6 +8687,702 @@ async def test_merge_success_caller_runs_one_shots_when_uncontended(
     assert (refetched_parent.context or {}).get("pr_merged") is True
 
 
+@pytest.mark.asyncio
+async def test_small_auto_merge_to_distinct_promotion_target_alerts_without_pr_merged(
+    db_session, mocker
+):
+    import asyncio
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ArtifactType
+
+    _mock_small_auto_merge_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="automain",
+        promotion_target="main",
+        directions=[{"id": "dir-1"}],
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": "dir-1"},
+    )
+    await _persist(db_session, task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs="done",
+        pr_url="https://github.com/owner/repo/pull/5150",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(task.id, payload, _session_factory=_factory)
+    await asyncio.sleep(0)
+
+    async with _factory() as fresh:
+        refetched_task = await fresh.get(Task, task.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == task.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_task.status == TaskStatus.COMPLETED
+    assert (refetched_task.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 5150
+
+
+@pytest.mark.asyncio
+async def test_small_auto_merge_on_single_branch_sets_pr_merged(
+    db_session, mocker
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from app.models import ArtifactType
+
+    _mock_small_auto_merge_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="main",
+        promotion_target="main",
+        directions=[{"id": "dir-1"}],
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build it", "base_branch": "main"}],
+        context={"scope": "small", "direction_id": "dir-1"},
+    )
+    await _persist(db_session, task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs="done",
+        pr_url="https://github.com/owner/repo/pull/5151",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_task = await fresh.get(Task, task.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == task.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_task.status == TaskStatus.COMPLETED
+    assert (refetched_task.context or {}).get("pr_merged") is True
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_review_merge_to_distinct_promotion_target_alerts_without_pr_merged(
+    db_session, mocker
+):
+    import asyncio
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    _mock_merge_success_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6262,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 6262,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-promo-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+    await asyncio.sleep(0)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == parent.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_parent.status == TaskStatus.COMPLETED
+    assert (refetched_parent.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 6262
+
+
+def test_is_custom_staged_rollup_root_true_for_release_candidate_root():
+    from app.branch_resolution import is_custom_staged_rollup_root
+
+    project = make_project(
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={"_is_rollup_review": True, "rollup_pr_number": 6264},
+    )
+
+    assert (
+        is_custom_staged_rollup_root(parent, project, "release/candidate-1") is True
+    )
+
+
+def test_is_custom_staged_rollup_root_false_for_default_research_branch():
+    from app.branch_resolution import is_custom_staged_rollup_root
+
+    project = make_project(
+        integration_branch="automain",
+        promotion_target="release/main",
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={"rollup_pr_number": 4343},
+    )
+
+    assert is_custom_staged_rollup_root(parent, project, "research/c4-base") is False
+
+
+@pytest.mark.asyncio
+async def test_review_empty_pr_close_on_intermediate_staged_rollup_stays_evaluating(
+    db_session, mocker
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    mocker.patch(
+        "app.github.close_pull_request",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch("app.github.create_pr_comment", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={"rollup_pr_number": 6265},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6265,
+                "branch": "release/rollup-stg",
+                "base_branch": "release/candidate-1",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 6265,
+                "branch": "release/rollup-stg",
+                "base_branch": "release/candidate-1",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+            }
+        },
+        latest_status_message="REQUEST_CHANGES",
+    )
+    review_task.vm_instance_id = f"agent-vm-empty-rollup-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="REQUEST_CHANGES",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == parent.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_parent.status == TaskStatus.EVALUATING
+    assert (refetched_parent.context or {}).get("pr_closed_empty") is True
+    assert (refetched_parent.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (
+        refetched_parent.latest_status_message or ""
+    )
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_review_merge_on_single_branch_sets_pr_merged(db_session, mocker):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+
+    _mock_merge_success_deps(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = await _make_db_project(
+        db_session,
+        integration_branch="main",
+        promotion_target="main",
+    )
+    parent = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        context={},
+    )
+    await _persist(db_session, parent)
+
+    review_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6263,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 6263,
+                "branch": "research/promo-stg",
+                "base_branch": "main",
+                "original_task_id": str(parent.id),
+                "iteration": 1,
+                "review_approved": True,
+                "ci_passed": True,
+            }
+        },
+        latest_status_message="APPROVE",
+    )
+    review_task.vm_instance_id = f"agent-vm-promo-{uuid.uuid4().hex[:8]}"
+    await _persist(db_session, review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        logs="APPROVE",
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(review_task.id, payload, _session_factory=_factory)
+
+    async with _factory() as fresh:
+        refetched_parent = await fresh.get(Task, parent.id)
+        alerts = (
+            (await fresh.execute(select(Alert).where(Alert.task_id == parent.id)))
+            .scalars()
+            .all()
+        )
+
+    assert refetched_parent.status == TaskStatus.COMPLETED
+    assert (refetched_parent.context or {}).get("pr_merged") is True
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+# ── Early-escalation operator Alerts ──────────────────────────────────────────
+#
+# The review-fix loop's three early-escalation outcomes (stuck cycle, standoff/
+# dispute, repeat-fingerprint halt) must each surface a deduplicated operator
+# Alert — the same place cap-exhaustion alerts appear — regardless of whether
+# manual approval gates are enabled. See alert_dispatch._maybe_create_escalation_alert.
+
+
+async def _escalation_alerts(db_session, task_id):
+    """Return undismissed review-fix escalation Alert rows tied to a task."""
+    rows = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.task_id == task_id,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [r for r in rows if r.title.startswith("Review-fix escalation:")]
+
+
+async def _build_stuck_scenario(db_session, *, pr_number, fix_agent_responses=None):
+    """Persist an original + source task primed to trip stuck-cycle detection."""
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    review_loop = {
+        "iteration": 1,
+        "original_task_id": str(original_task.id),
+        "pr_number": pr_number,
+        "branch": "b1",
+        "base_branch": "main",
+        "review_history": [
+            {
+                "iteration": 0,
+                "feedback": "prev feedback",
+                "issues": [_issue("null pointer dereference", "CRITICAL")],
+            },
+        ],
+    }
+    if fix_agent_responses is not None:
+        review_loop["fix_agent_responses"] = fix_agent_responses
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": pr_number,
+                "branch": "b1",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"scope": "medium", "review_loop": review_loop},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    return original_task, source_task
+
+
+async def _trigger_stuck(db_session, source_task, original_task, pr_number):
+    return await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=pr_number,
+        branch="b1",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+        fix_prompt="Still the same issue",
+        current_feedback="Still the same issue",
+        current_issues=[_issue("null pointer dereference", "CRITICAL")],
+    )
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_creates_escalation_alert(db_session, mocker):
+    """A stuck cycle fires a deduplicated WARNING Alert tied to the chain
+    original, identifying the PR + reason + iteration count."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    original_task, source_task = await _build_stuck_scenario(db_session, pr_number=401)
+    result, _ = await _trigger_stuck(db_session, source_task, original_task, 401)
+    assert result is None
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "stuck cycle" in alert.title
+    assert "PR #401" in alert.title
+    assert "1" in alert.message  # iteration count
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_escalation_alert_fires_with_gates_off(db_session, mocker):
+    """Even with require_approval_gates OFF, the durable Alert must still fire —
+    the whole point is surfacing the escalation without operator babysitting."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"require_approval_gates": False}
+    )
+
+    original_task, source_task = await _build_stuck_scenario(db_session, pr_number=402)
+    result, _ = await _trigger_stuck(db_session, source_task, original_task, 402)
+    assert result is None
+
+    await db_session.refresh(original_task)
+    # Gates off → no approval flag, but the Alert still surfaces.
+    assert original_task.requires_approval is not True
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    assert "stuck cycle" in alerts[0].title
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "stuck"
+    assert terminal_outcome.get("reason") == "stuck"
+
+
+@pytest.mark.asyncio
+async def test_stuck_cycle_escalation_alert_deduplicated_on_reentry(db_session, mocker):
+    """Re-entering the same stuck escalation must NOT create a second Alert."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    original_task, source_task = await _build_stuck_scenario(db_session, pr_number=403)
+    await _trigger_stuck(db_session, source_task, original_task, 403)
+    await _trigger_stuck(db_session, source_task, original_task, 403)
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_standoff_creates_escalation_alert_with_standoff_reason(
+    db_session, mocker
+):
+    """A standoff (fix-agent rationale rejected, issue re-raised) fires an Alert
+    labelled with the 'dispute standoff' reason rather than plain 'stuck'."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    # A prior fix-agent response carrying an issue_id makes the repeated issue a
+    # standoff (dispute) rather than the agent simply not trying.
+    original_task, source_task = await _build_stuck_scenario(
+        db_session,
+        pr_number=404,
+        fix_agent_responses=[{"issue_id": "abc123", "rationale": "intended"}],
+    )
+    result, _ = await _trigger_stuck(db_session, source_task, original_task, 404)
+    assert result is None
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    assert "dispute standoff" in alerts[0].title
+    assert "PR #404" in alerts[0].title
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "standoff"
+    assert terminal_outcome.get("reason") == "standoff"
+
+
+@pytest.mark.asyncio
+async def test_repeat_fingerprint_creates_escalation_alert(db_session, mocker):
+    """A repeat-fingerprint halt fires a WARNING Alert labelled 'repeat-fingerprint
+    halt', tied to the chain original, and deduplicated on re-entry."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    original_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "build", "base_branch": "main"}],
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    common_failure = (
+        "[wrapper] ./check failed: error while loading shared libraries: libatk-1.0.so.0"
+    )
+    earlier_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 905,
+                "branch": "fix/905",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"review_loop": {"original_task_id": str(original_task.id)}},
+        latest_status_message=f"[2026-05-06T09:11:42] iter=2 vm=agent-vm-aaa {common_failure}",
+    )
+    most_recent_fix = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 905,
+                "branch": "fix/905",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+            }
+        ],
+        context={"review_loop": {"original_task_id": str(original_task.id)}},
+        latest_status_message=f"[2026-05-06T09:42:08] iter=3 vm=agent-vm-bbb {common_failure}",
+    )
+    await _persist(db_session, earlier_fix, most_recent_fix)
+
+    result, was_created = await _spawn_pipeline_task(
+        most_recent_fix,
+        "review",
+        db_session,
+        pr_number=905,
+        branch="fix/905",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    assert result is None and was_created is False
+
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+    assert "repeat-fingerprint halt" in alerts[0].title
+    assert "PR #905" in alerts[0].title
+    terminal_outcome = (original_task.context or {}).get("review_loop_terminal_outcome")
+    assert terminal_outcome and terminal_outcome.get("kind") == "repeat_fingerprint_halt"
+    assert terminal_outcome.get("reason") == "repeat-fingerprint"
+
+    # Re-entry (idempotent halt) must not create a second Alert.
+    await _spawn_pipeline_task(
+        most_recent_fix,
+        "review",
+        db_session,
+        pr_number=905,
+        branch="fix/905",
+        base_branch="main",
+        original_task_id=str(original_task.id),
+    )
+    alerts = await _escalation_alerts(db_session, original_task.id)
+    assert len(alerts) == 1
+
+
 # ── FIX #1: fix-all-occurrences class detection ──────────────────────────────
 
 
@@ -8490,6 +9430,14 @@ class TestDetectFixAllIssueClass:
             _issue("Use timezone-aware datetime in a.py", "MINOR"),
             _issue("Use timezone-aware datetime in b.py", "MINOR"),
         ]
+        assert detect_fix_all_issue_class(issues) is False
+
+    def test_minor_with_pattern_cue_does_not_trigger(self):
+        # The pattern-cue path is gated BEHIND the critical/major severity
+        # filter (review_heuristics.detect_fix_all_issue_class), so a minor
+        # nit that happens to mention "all instances" must NOT escalate into a
+        # repo-wide grep mandate — the docstring's "isolated nit" guarantee.
+        issues = [_issue("Fix all instances of this minor style nit", "MINOR")]
         assert detect_fix_all_issue_class(issues) is False
 
     def test_empty_issues_does_not_trigger(self):
@@ -9189,3 +10137,120 @@ async def test_no_reconcile_clause_without_fix_all_directive(db_session, mocker)
     assert "ISSUE CHURN DETECTED" in prompt  # churn still fired
     assert "FIX ALL OCCURRENCES" not in prompt
     assert "takes precedence" not in prompt
+
+
+# ── _pr_number_match: None-bind dialect resolution regression ────────────────
+
+
+def test_pr_number_match_picks_sqlite_branch_on_none_bind_session():
+    """Regression for the None-bind dialect footgun (PR #7099 class).
+
+    ``_pr_number_match`` builds a dialect-conditional WHERE clause. A session
+    whose ``.bind`` is None still resolves a real engine lazily at execute-time.
+    The old idiom (``session.bind.dialect.name if session.bind else "postgresql"``)
+    defaulted to the Postgres ``.as_string()`` branch on such a session, emitting
+    JSON-path SQL that SQLite cannot run. Routing through ``resolve_dialect_name``
+    resolves the dialect via ``get_bind()`` instead, so a None-bind SQLite-backed
+    session correctly selects the ``json_extract`` branch.
+    """
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.ci_merge_helpers import _pr_number_match
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        # The footgun condition: .bind is None, but get_bind() resolves SQLite.
+        session = MagicMock()
+        session.bind = None
+        session.get_bind.return_value = engine
+        assert session.get_bind().dialect.name == "sqlite"
+
+        expr = _pr_number_match(session, 7099)
+        compiled = str(expr).lower()
+        assert "json_extract" in compiled, (
+            "None-bind SQLite session must select the json_extract branch — "
+            "the old idiom defaulted to the Postgres JSON-path branch. "
+            f"Got: {compiled}"
+        )
+        assert "as_string" not in compiled and "->" not in compiled
+    finally:
+        engine.sync_engine.dispose()
+
+
+def test_landed_signal_predicate_picks_sqlite_branch_on_none_bind_session():
+    """Regression for the None-bind dialect footgun in ``landed_signal``.
+
+    ``landed_signal_predicate`` builds a dialect-conditional predicate (SQLite
+    ``json_extract`` vs Postgres ``@>``). It now resolves the dialect through the
+    centralised ``resolve_dialect_name`` resolver rather than hand-rolling the
+    ``.bind`` → ``get_bind()`` → ``"postgresql"`` logic inline. This asserts a
+    None-bind session whose ``get_bind()`` resolves SQLite still selects the
+    ``json_extract`` branch (not the Postgres ``@>`` form).
+    """
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.landed_signal import landed_signal_predicate
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    try:
+        # The footgun condition: .bind is None, but get_bind() resolves SQLite.
+        session = MagicMock()
+        session.bind = None
+        session.get_bind.return_value = engine
+        assert session.get_bind().dialect.name == "sqlite"
+
+        expr = landed_signal_predicate(session)
+        compiled = str(expr).lower()
+        assert "json_extract" in compiled, (
+            "None-bind SQLite session must select the json_extract branch — "
+            "the old idiom defaulted to the Postgres @> JSONB branch. "
+            f"Got: {compiled}"
+        )
+        assert "@>" not in compiled
+    finally:
+        engine.sync_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pr_number_match_matches_seeded_pr_number_end_to_end(db_session):
+    """Functional companion: against the real test engine, ``_pr_number_match``
+    selects exactly the task whose ``payloads[0].pr_number`` equals the target
+    and excludes others — proving the chosen branch actually executes and
+    matches (on SQLite standalone and on ``--postgres`` alike)."""
+    from app.ci_merge_helpers import _pr_number_match
+
+    project = await _make_db_project(db_session)
+    target = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "pr_number": 7099}],
+    )
+    other = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "pr_number": 12345}],
+    )
+    await _persist(db_session, target, other)
+
+    rows = (
+        (await db_session.execute(select(Task).where(_pr_number_match(db_session, 7099))))
+        .scalars()
+        .all()
+    )
+    matched_ids = {t.id for t in rows}
+    assert target.id in matched_ids
+    assert other.id not in matched_ids

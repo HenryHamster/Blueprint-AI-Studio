@@ -14,14 +14,18 @@ from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Task, TaskStatus, _utcnow
+from app.models import (
+    Task,
+    TaskStatus,
+    _utcnow,
+    get_task_current_attempt_vm_cost_usd,
+)
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.task_locking import lock_project_or_429, with_design_doc_locked
@@ -33,7 +37,6 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_task_branch_namespace,
 )
-from app.vm_cost_rates import VM_COST_RATES
 
 logger = logging.getLogger(__name__)
 
@@ -50,47 +53,59 @@ async def cost_summary(
     days: int = Query(7, ge=1, le=365),
     current_user: dict = Depends(require_admin),
 ):
-    # VM cost rates are sourced from vm_cost_rates.py for e2-standard-2
-    ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # per second
-    SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600
-
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
-    duration_seconds = func.extract(
-        "epoch", Task.vm_stopped_at - Task.vm_provisioned_at
-    )
-    rate_expr = case((Task.vm_spot, SPOT_RATE), else_=ON_DEMAND_RATE)
-
-    rows = (
-        await session.execute(
-            select(
-                Task.provider,
-                Task.vm_spot,
-                func.count().label("count"),
-                func.sum(duration_seconds).label("total_seconds"),
-                func.sum(duration_seconds * rate_expr).label("estimated_cost"),
-            )
-            .where(
-                Task.created_at >= cutoff,
-                Task.vm_provisioned_at.is_not(None),
-                Task.vm_stopped_at.is_not(None),
-            )
-            .group_by(Task.provider, Task.vm_spot)
-        )
-    ).all()
-
     by_type: Dict[str, Any] = {}
     total_cost = 0.0
-    for row in rows:
-        key = f"{row.provider or 'unknown'}:{'spot' if row.vm_spot else 'on-demand'}"
-        estimated_cost = float(row.estimated_cost or 0.0)
-        by_type[key] = {
-            "count": row.count,
-            "total_seconds": float(row.total_seconds or 0.0),
-            "estimated_cost": estimated_cost,
-            "provider": row.provider,
-            "spot": row.vm_spot,
-        }
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.provider,
+                        Task.vm_spot,
+                        Task.vm_machine_type,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.created_at,
+                    )
+                )
+                .where(
+                    Task.created_at >= cutoff,
+                    Task.vm_provisioned_at.is_not(None),
+                    Task.vm_stopped_at.is_not(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for task in tasks:
+        key = f"{task.provider or 'unknown'}:{'spot' if task.vm_spot else 'on-demand'}"
+        duration_seconds = float(
+            (task.vm_stopped_at - task.vm_provisioned_at).total_seconds()
+        )
+        estimated_cost = get_task_current_attempt_vm_cost_usd(task)
+        row = by_type.setdefault(
+            key,
+            {
+                "count": 0,
+                "total_seconds": 0.0,
+                "estimated_cost": 0.0,
+                "provider": task.provider,
+                "spot": task.vm_spot,
+            },
+        )
+        row["count"] += 1
+        row["total_seconds"] += duration_seconds
+        row["estimated_cost"] += estimated_cost
         total_cost += estimated_cost
+
+    for row in by_type.values():
+        row["estimated_cost"] = float(row["estimated_cost"])
+        row["total_seconds"] = float(row["total_seconds"])
 
     return {
         "period_days": days,
@@ -558,6 +573,21 @@ async def update_integration_branch_config(
                 status_code=422,
                 detail="'integration_branch' contains invalid characters",
             )
+        # Reject integration == promotion BEFORE persisting. Landing integration
+        # work directly on the promotion/release target is unsafe, and the
+        # resolver fails safe rather than raising, so an invalid value would
+        # otherwise persist silently. Validate up front and return a clean 422
+        # without writing the column (or making a remote round-trip).
+        promotion_target = get_project_promotion_target(precheck_project)
+        if branch == promotion_target:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "'integration_branch' must differ from the promotion target "
+                    f"'{promotion_target}'; landing integration work directly on "
+                    "the promotion target is not allowed."
+                ),
+            )
         await _validate_branch_exists_on_remote(precheck_project, branch)
 
     project = await lock_project_or_429(session, project_id)
@@ -635,6 +665,108 @@ async def update_promotion_target_config(
         "promotion_target": get_project_promotion_target(project),
         "is_default": project.promotion_target is None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Approval-gate config endpoints
+# ---------------------------------------------------------------------------
+
+_APPROVAL_GATE_KEYS = ("infra_files", "critical_files")
+
+# A plausible repo-relative path: forward-slash separated, no leading slash,
+# no parent-directory traversal, no shell metacharacters.
+_VALID_REPO_PATH_RE = re.compile(r"^[A-Za-z0-9._\-/]+$")
+
+
+def _validate_approval_gate_paths(field: str, value) -> list[str]:
+    """Validate and normalise one approval-gate file list, returning trimmed paths."""
+    if not isinstance(value, list):
+        raise HTTPException(
+            status_code=422,
+            detail=f"'{field}' must be a list of repo-relative path strings",
+        )
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{field}' entries must be non-empty strings",
+            )
+        path = item.strip()
+        if (
+            path.startswith("/")
+            or ".." in path.split("/")
+            or not _VALID_REPO_PATH_RE.match(path)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{field}' entry {item!r} is not a valid repo-relative path",
+            )
+        cleaned.append(path)
+    return cleaned
+
+
+def _approval_gate_response(project_id: uuid.UUID, config: dict) -> Dict[str, Any]:
+    return {
+        "project_id": str(project_id),
+        "approval_gate_config": {
+            "infra_files": list(config.get("infra_files", [])),
+            "critical_files": list(config.get("critical_files", [])),
+        },
+        "is_default": not config,
+    }
+
+
+@router.get("/projects/{project_id}/approval-gate-config")
+async def get_approval_gate_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project approval-gate file lists (infra_files / critical_files)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return _approval_gate_response(project_id, dict(project.approval_gate_config or {}))
+
+
+@router.patch("/projects/{project_id}/approval-gate-config")
+async def update_approval_gate_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project approval-gate file lists (partial update, owner-only).
+
+    Takes effect for agents immediately via the existing claim-response seam.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    unknown = set(body.keys()) - set(_APPROVAL_GATE_KEYS)
+    if unknown:
+        raise HTTPException(
+            status_code=422, detail=f"Unknown config fields: {sorted(unknown)}"
+        )
+
+    cleaned = {
+        key: _validate_approval_gate_paths(key, body[key])
+        for key in _APPROVAL_GATE_KEYS
+        if key in body
+    }
+
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
+    config = dict(project.approval_gate_config or {})
+    config.update(cleaned)
+    project.approval_gate_config = config
+    flag_modified(project, "approval_gate_config")
+    session.add(project)
+    await session.commit()
+
+    return _approval_gate_response(project_id, config)
 
 
 # ---------------------------------------------------------------------------

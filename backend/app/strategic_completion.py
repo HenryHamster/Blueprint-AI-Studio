@@ -2107,11 +2107,27 @@ async def _handle_strategic_completion(
 
             from app.problem_model import apply_agent_update
 
+            # Resolve the cycle's baseline problem model (snapshot at spawn) for
+            # the 3-way operator-wins merge, mirroring the vision baseline
+            # resolution above. Degrade to None (blank-preservation only) when
+            # no cycle/baseline is resolvable (legacy task).
+            pm_baseline: dict | None = None
+            pm_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+                "strategic_cycle_id"
+            )
+            if pm_cycle_id:
+                pm_cycle_row = await strategic_cycle.get(session, pm_cycle_id)
+                if pm_cycle_row is not None:
+                    snap = strategic_cycle.baseline_problem_model(pm_cycle_row)
+                    if snap:
+                        pm_baseline = snap
+
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
                     proposed_raw=new_problem_model,
                     now_iso=_utcnow().isoformat(),
+                    baseline_raw=pm_baseline,
                 )
             except _PmValidationError as pm_err:
                 logger.warning(

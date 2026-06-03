@@ -79,6 +79,16 @@ runtime_config: Dict = {
     # negatives in prod.
     "ci_resolution_strict_mode": os.getenv("CI_RESOLUTION_STRICT_MODE", "true").lower()
     not in ("0", "false", "no"),
+    # No-CI test-suite merge gate kill-switch. When True (default), a PR on an
+    # EXTERNAL no-CI project (build_config.requires_ci_checks=False) targeting a
+    # non-staging base is gated on a verify_tests verdict — the repo's detected
+    # suite is run on the PR head and must pass before the merge proceeds.
+    # Set False to fall back to the legacy immediate-pass (merge unverified on a
+    # definitive no_checks) without a deploy if the gate misbehaves. Repos with
+    # genuinely no detectable test command, and internal staging rollups, keep
+    # the immediate-pass regardless of this flag.
+    "no_ci_test_gate_enabled": os.getenv("NO_CI_TEST_GATE_ENABLED", "true").lower()
+    not in ("0", "false", "no"),
     # Hard cap on ``ci_wait_started`` clock resets when GitHub responds with
     # "checks in progress" / "status check pending" to a merge attempt.  Each
     # reset bumps the CI-wait deadline by another full backstop window; without
@@ -408,6 +418,82 @@ runtime_config: Dict = {
     # is_warm_backlog_reuse_suppressed() circuit breaker which auto-disables
     # reuse when the backlog-origin failure rate is elevated.
     "warm_backlog_reuse_enabled": True,
+    # Warm-VM POOL (efficiency direction d-5fd69fe1): master switch for the
+    # pre-provisioned, credentialed, idle-VM pool. When True the orchestrator
+    # may cold-boot taskless pool VMs (compute.provision_pool_vm), register them
+    # in the PoolVm table, and lease an IDLE compatible member to a newly-queued
+    # task instead of cold-provisioning. Defaults to False so ALL warm-pool code
+    # (provisioning entrypoint, VM-scoped tokens, registry leasing) is INERT in
+    # production until the full pool machinery (maintainer + dispatch hook,
+    # sibling tasks) lands and the flag is flipped. Independently switchable from
+    # warm_continuity_enabled / warm_backlog_reuse_enabled.
+    "warm_pool_enabled": False,
+    # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
+    # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
+    # where the maintainer reconciles every demand-active project once
+    # warm_pool_enabled is True. A NON-EMPTY list scopes ALL pool provisioning
+    # (the autonomous maintainer AND the demand-driven entrypoints) to exactly
+    # the listed project ids, so an operator can switch the pool on for ONE
+    # project, watch its lift and cost, then widen the scope — without flipping
+    # the whole fleet warm at once. warm_pool_enabled stays the outer
+    # kill-switch; this only narrows WHICH projects the enabled pool serves.
+    # Read by warm_pool.warm_pool_project_scope(); set via /api/admin/settings.
+    "warm_pool_project_allowlist": [],
+    # Warm-pool maintainer / idle-reaper knobs (efficiency direction d-5fd69fe1).
+    # All inert while warm_pool_enabled is False. Target size is the number of
+    # IDLE pool members the maintainer keeps warm PER PROJECT that already has
+    # pool activity; env-overridable so an operator can size the pool without a
+    # code change.
+    "warm_pool_target_size": int(os.getenv("WARM_POOL_TARGET_SIZE", "2")),
+    # Per-project warm-pool IDLE target overrides ({project_id: int}). An EMPTY
+    # map (the default) means every scoped project reconciles toward the single
+    # fleet-wide ``warm_pool_target_size``. A per-project entry overrides that
+    # for exactly one project so an operator can size each project's pool to its
+    # own demand, instead of every project being held at the same number. Values
+    # are clamped to the same 0..50 range as the global target; 0 keeps that
+    # project's pool empty while leaving the master switch on. Modeled exactly on
+    # ``warm_pool_project_allowlist`` so it persists in ``runtime_config_json``
+    # with no schema migration. Read by
+    # ``warm_pool.resolve_project_warm_pool_target``; set via
+    # /api/admin/settings and the per-project warm-pool target endpoint.
+    "warm_pool_target_size_by_project": {},
+    # Hard ceiling on concurrent live (PROVISIONING/IDLE/LEASED) pool members
+    # fleet-wide. The maintainer never provisions past this even if every
+    # project is below its target — a dedicated pool budget distinct from the
+    # dispatch max_concurrent_vms budget.
+    "warm_pool_max_vms": 20,
+    # Idle-TTL: an IDLE pool member nobody leased for this long is reaped. Sized
+    # well above a normal claim latency so a member is only retired when it is
+    # genuinely surplus, not mid-handoff. Two keys are read by distinct call
+    # sites and both must exist: the maintainer/idle-reaper reads
+    # ``warm_pool_idle_ttl_seconds`` (warm_pool_maintainer.py) while the admin
+    # settings/health surface reads ``warm_pool_idle_ttl_secs``. Keep them in
+    # sync; both default to 30 min.
+    "warm_pool_idle_ttl_seconds": int(os.getenv("WARM_POOL_IDLE_TTL_SECS", "1800")),
+    "warm_pool_idle_ttl_secs": int(os.getenv("WARM_POOL_IDLE_TTL_SECS", "1800")),
+    # Liveness window for the zombie check: a pool member that has not
+    # heartbeated within this window is treated as dead and reaped.
+    "warm_pool_heartbeat_stale_seconds": 300,
+    # Maintainer tick cadence (leader-only background service).
+    "warm_pool_maintainer_interval_seconds": 120,
+    # Demand lookback window (minutes) for bootstrap-from-zero pool formation.
+    # A project with ZERO live pool members is still reconciled (bootstrapped up
+    # to target) when it has real dispatch demand: eligible QUEUED backlog OR a
+    # cold dispatch (Task.vm_dispatched_at) within this window. Sized comfortably
+    # above the maintainer tick interval (120s) so a project that dispatched
+    # moments ago is still seen as demand-active on the next tick; a DORMANT
+    # project (no recent demand, no members) is never seeded. Read by
+    # warm_pool_maintainer._demand_active_projects.
+    "warm_pool_demand_window_minutes": 30,
+    # Circuit-breaker thresholds for POOL-served claims. When pool leases or
+    # pool-leased tasks fail (lease/finalize error, a leased VM found tearing
+    # down, or a FAILED pool task) more than the threshold within a 1h rolling
+    # window — e.g. a bad pool image silently failing a stream of tasks — the
+    # maintainer stops replenishing and the dispatch hook stops leasing (falling
+    # back to cold provisioning) until the cooldown expires. Mirrors the
+    # warm-continuity / backlog-reuse breakers.
+    "warm_pool_failure_rate_threshold": 5,
+    "warm_pool_cooldown_seconds": 1800,
     # Circuit-breaker thresholds for warm-backlog reuse. When backlog-origin
     # claims result in FAILED tasks (or claim/finalize errors) exceeding the
     # threshold within a 1h rolling window, backlog reuse is auto-suppressed
@@ -415,6 +501,21 @@ runtime_config: Dict = {
     # warm_continuity_cooldown_seconds for the chain-continuity breaker.
     "warm_backlog_reuse_failure_rate_threshold": 5,
     "warm_backlog_reuse_cooldown_seconds": 1800,
+    # Warm-VM re-targeting (parent direction: re-target reused VM provider on
+    # warm claim). When True, a warm VM may claim a same-project QUEUED task
+    # whose resolved provider/auth/model/account diverges from the VM's frozen
+    # boot manifest: the warm-claim finalizer re-resolves the task's LLM runtime
+    # (select_llm_runtime_for_task), acquires the resolved account's slot, stamps
+    # it onto task.context, and hands the agent the resolved account's secret
+    # manifest in the claim response so it can re-materialize credentials.
+    # Defaults to FALSE — the whole capability ships dark, so this leaves
+    # eligibility and the claim response byte-for-byte unchanged until enabled.
+    "warm_retarget_enabled": False,
+    # Warm-backlog claim scan / teardown window. The scan limit keeps each
+    # /next-role poll cheap; the defer window gives the agent time to claim
+    # a backlog task before the idle VM is torn down.
+    "warm_backlog_scan_limit": 10,
+    "warm_backlog_teardown_defer_secs": 20,
     # Maximum seconds the agent waits in /api/agent/next-role polling before
     # falling through to the normal exit path. Bounded by the warm-handoff
     # window and the typical role transition cadence; tunable down for
@@ -772,6 +873,54 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_backlog_reuse_enabled",
                         bool(config_json["warm_backlog_reuse_enabled"]),
                     )
+                if "warm_retarget_enabled" in config_json:
+                    _set(
+                        "warm_retarget_enabled",
+                        bool(config_json["warm_retarget_enabled"]),
+                    )
+                if "warm_pool_enabled" in config_json:
+                    _set(
+                        "warm_pool_enabled",
+                        bool(config_json["warm_pool_enabled"]),
+                    )
+                if "warm_pool_project_allowlist" in config_json:
+                    # Persisted per-project enablement scope. Normalize to a
+                    # sorted list of trimmed, non-empty string ids — mirroring
+                    # warm_pool.warm_pool_project_scope() / the admin PATCH
+                    # surface — so every instance agrees on the scoped set and a
+                    # garbage entry can't silently widen or corrupt the pool.
+                    raw_allow = config_json["warm_pool_project_allowlist"]
+                    if isinstance(raw_allow, str):
+                        raw_allow = raw_allow.split(",")
+                    if isinstance(raw_allow, (list, tuple, set)):
+                        _set(
+                            "warm_pool_project_allowlist",
+                            sorted(
+                                {str(p).strip() for p in raw_allow if str(p).strip()}
+                            ),
+                        )
+                if "warm_pool_target_size_by_project" in config_json:
+                    # Persisted per-project IDLE target overrides. Normalize to a
+                    # map of trimmed, non-empty string project-id keys to integer
+                    # values clamped to the same 0..50 range the global target
+                    # uses — mirroring warm_pool.warm_pool_project_target_map() /
+                    # the admin PATCH surface — and drop malformed entries so a
+                    # garbage value can't corrupt a project's reconcile target.
+                    raw_targets = config_json["warm_pool_target_size_by_project"]
+                    if isinstance(raw_targets, dict):
+                        normalized_targets: dict[str, int] = {}
+                        for proj_key, proj_val in raw_targets.items():
+                            sid = str(proj_key).strip()
+                            if not sid:
+                                continue
+                            try:
+                                ival = int(proj_val)
+                            except (TypeError, ValueError):
+                                continue
+                            normalized_targets[sid] = max(0, min(50, ival))
+                        _set(
+                            "warm_pool_target_size_by_project", normalized_targets
+                        )
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",
@@ -794,6 +943,17 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "warm_continuity_cooldown_seconds",
                     "warm_backlog_reuse_failure_rate_threshold",
                     "warm_backlog_reuse_cooldown_seconds",
+                    "warm_backlog_scan_limit",
+                    "warm_backlog_teardown_defer_secs",
+                    "warm_pool_target_size",
+                    "warm_pool_max_vms",
+                    "warm_pool_idle_ttl_seconds",
+                    "warm_pool_idle_ttl_secs",
+                    "warm_pool_heartbeat_stale_seconds",
+                    "warm_pool_maintainer_interval_seconds",
+                    "warm_pool_demand_window_minutes",
+                    "warm_pool_failure_rate_threshold",
+                    "warm_pool_cooldown_seconds",
                     "project_broadcast_limit",
                     "reaper_cycle_halt_threshold",
                     "reaper_cycle_halt_cooldown_seconds",

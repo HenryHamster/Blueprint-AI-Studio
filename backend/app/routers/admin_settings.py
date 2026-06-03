@@ -1,3 +1,12 @@
+"""Global deployment settings and operations endpoints (admin router).
+
+Backs the admin Settings page and operator maintenance actions: reading and
+patching deployment-wide configuration (including LLM provider/model and auth
+mode), listing available providers, browsing GitHub repos and branches,
+refreshing GitHub quota, restarting the orchestrator, and the tracemalloc
+memory-profiling controls. External URLs are validated via ``url_security``.
+"""
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -96,11 +105,60 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         # Side-effect-only key: fires a test webhook, never stored.
         "test_notification",
         "warm_backlog_reuse_enabled",
+        "warm_backlog_reuse_cooldown_seconds",
+        "warm_backlog_reuse_failure_rate_threshold",
+        "warm_backlog_scan_limit",
+        "warm_backlog_teardown_defer_secs",
         "warm_continuity_enabled",
+        "warm_continuity_cooldown_seconds",
+        "warm_pin_clear_rate_threshold",
+        "warm_pool_enabled",
+        "warm_pool_project_allowlist",
+        "warm_pool_target_size",
+        "warm_pool_target_size_by_project",
+        "warm_pool_idle_ttl_secs",
     }
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_warm_pool_allowlist(raw) -> set[str]:
+    """Coerce a warm-pool allowlist value to a set of trimmed, non-empty ids.
+
+    Mirrors ``warm_pool.warm_pool_project_scope`` so the admin surface and the
+    maintainer agree on what counts as "scoped": accepts a list or a single
+    scalar, stringifies every entry, and drops blanks.
+    """
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, (list, tuple, set)):
+        raw = [raw]
+    return {str(p).strip() for p in raw if str(p).strip()}
+
+
+def _normalize_warm_pool_target_map(raw) -> dict[str, int]:
+    """Coerce a per-project warm-pool target map to ``{project_id: int}``.
+
+    Mirrors ``warm_pool.warm_pool_project_target_map`` (and the config-sync
+    normalizer) so the admin surface and the maintainer agree on the per-project
+    targets: trimmed, non-empty string keys mapping to integer values clamped to
+    the same 0..50 range the global target uses, dropping malformed entries. A
+    non-dict input yields an empty map.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        sid = str(key).strip()
+        if not sid:
+            continue
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            continue
+        out[sid] = max(0, min(50, ival))
+    return out
 
 
 def _build_provider_catalog(runtime_config: Dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
@@ -260,6 +318,39 @@ async def get_settings(
         ),
         "warm_backlog_reuse_enabled": bool(
             _runtime_config.get("warm_backlog_reuse_enabled", False)
+        ),
+        "warm_pool_enabled": bool(_runtime_config.get("warm_pool_enabled", False)),
+        "warm_pool_project_allowlist": sorted(
+            _normalize_warm_pool_allowlist(
+                _runtime_config.get("warm_pool_project_allowlist") or []
+            )
+        ),
+        "warm_pool_target_size": int(
+            _runtime_config.get("warm_pool_target_size", 2)
+        ),
+        "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
+            _runtime_config.get("warm_pool_target_size_by_project") or {}
+        ),
+        "warm_pool_idle_ttl_secs": int(
+            _runtime_config.get("warm_pool_idle_ttl_secs", 1800)
+        ),
+        "warm_pin_clear_rate_threshold": int(
+            _runtime_config.get("warm_pin_clear_rate_threshold", 10)
+        ),
+        "warm_continuity_cooldown_seconds": int(
+            _runtime_config.get("warm_continuity_cooldown_seconds", 1800)
+        ),
+        "warm_backlog_reuse_failure_rate_threshold": int(
+            _runtime_config.get("warm_backlog_reuse_failure_rate_threshold", 5)
+        ),
+        "warm_backlog_reuse_cooldown_seconds": int(
+            _runtime_config.get("warm_backlog_reuse_cooldown_seconds", 1800)
+        ),
+        "warm_backlog_scan_limit": int(
+            _runtime_config.get("warm_backlog_scan_limit", 10)
+        ),
+        "warm_backlog_teardown_defer_secs": int(
+            _runtime_config.get("warm_backlog_teardown_defer_secs", 20)
         ),
         "next_role_poll_timeout_secs": int(
             _runtime_config.get("next_role_poll_timeout_secs", 180)
@@ -669,6 +760,203 @@ async def _apply_settings(
                 detail="warm_backlog_reuse_enabled must be a boolean",
             )
         _runtime_config["warm_backlog_reuse_enabled"] = val
+    if "warm_pool_enabled" in payload:
+        val = payload["warm_pool_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400, detail="warm_pool_enabled must be a boolean"
+            )
+        _runtime_config["warm_pool_enabled"] = val
+    if "warm_pool_project_allowlist" in payload:
+        raw = payload["warm_pool_project_allowlist"]
+        # Accept a JSON list, a comma-separated string, or a single id — the
+        # same shapes warm_pool.warm_pool_project_scope() tolerates. An empty
+        # allowlist means fleet-wide (legacy all-or-nothing); a non-empty one
+        # scopes provisioning to exactly the listed projects so the pool can be
+        # rolled out one project at a time.
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        if not isinstance(raw, list):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "warm_pool_project_allowlist must be a list of project ids "
+                    "(or a comma-separated string)"
+                ),
+            )
+        if not all(isinstance(p, (str, int)) for p in raw):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pool_project_allowlist entries must be strings or ints",
+            )
+        _runtime_config["warm_pool_project_allowlist"] = sorted(
+            _normalize_warm_pool_allowlist(raw)
+        )
+    if "warm_pool_target_size" in payload:
+        try:
+            val = int(payload["warm_pool_target_size"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="warm_pool_target_size must be a number"
+            )
+        # 0 keeps the flag-on pool empty (maintainer provisions nothing); cap at
+        # 50 so a typo can't request a runaway idle fleet.
+        if not (0 <= val <= 50):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pool_target_size must be between 0 and 50",
+            )
+        _runtime_config["warm_pool_target_size"] = val
+    if "warm_pool_target_size_by_project" in payload:
+        raw = payload["warm_pool_target_size_by_project"]
+        # Per-project IDLE target overrides: a mapping of project-id strings to
+        # integers in the same 0..50 range as the global warm_pool_target_size.
+        # An empty map means every scoped project falls back to the global target.
+        # Validated strictly (reject 400 on a non-mapping or an out-of-range /
+        # non-integer value) — consistent with the other warm-pool validators —
+        # then normalized via the shared helper before storing.
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "warm_pool_target_size_by_project must be a mapping of "
+                    "project-id strings to integers"
+                ),
+            )
+        cleaned_targets: dict[str, int] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "warm_pool_target_size_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            try:
+                ival = int(value)
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"warm_pool_target_size_by_project[{sid}] must be an integer"
+                    ),
+                )
+            if not (0 <= ival <= 50):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"warm_pool_target_size_by_project[{sid}] must be "
+                        "between 0 and 50"
+                    ),
+                )
+            cleaned_targets[sid] = ival
+        _runtime_config["warm_pool_target_size_by_project"] = cleaned_targets
+    if "warm_pool_idle_ttl_secs" in payload:
+        try:
+            val = int(payload["warm_pool_idle_ttl_secs"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400, detail="warm_pool_idle_ttl_secs must be a number"
+            )
+        if not (60 <= val <= 86400):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pool_idle_ttl_secs must be between 60 and 86400",
+            )
+        _runtime_config["warm_pool_idle_ttl_secs"] = val
+        # The idle-reaper in warm_pool_maintainer.py reads the ``_seconds``
+        # variant of this key; keep both in sync so an operator's TTL change
+        # via this surface actually reaches the maintainer (the two names
+        # coexist for back-compat — see runtime_config_state defaults).
+        _runtime_config["warm_pool_idle_ttl_seconds"] = val
+    if "warm_pin_clear_rate_threshold" in payload:
+        try:
+            val = int(payload["warm_pin_clear_rate_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pin_clear_rate_threshold must be a number",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_pin_clear_rate_threshold must be between 1 and 100",
+            )
+        _runtime_config["warm_pin_clear_rate_threshold"] = val
+    if "warm_continuity_cooldown_seconds" in payload:
+        try:
+            val = int(payload["warm_continuity_cooldown_seconds"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_continuity_cooldown_seconds must be a number",
+            )
+        if not (60 <= val <= 86400):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_continuity_cooldown_seconds must be between 60 and 86400",
+            )
+        _runtime_config["warm_continuity_cooldown_seconds"] = val
+    if "warm_backlog_reuse_failure_rate_threshold" in payload:
+        try:
+            val = int(payload["warm_backlog_reuse_failure_rate_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_reuse_failure_rate_threshold must be a number",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "warm_backlog_reuse_failure_rate_threshold must be between 1 and 100"
+                ),
+            )
+        _runtime_config["warm_backlog_reuse_failure_rate_threshold"] = val
+    if "warm_backlog_reuse_cooldown_seconds" in payload:
+        try:
+            val = int(payload["warm_backlog_reuse_cooldown_seconds"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_reuse_cooldown_seconds must be a number",
+            )
+        if not (60 <= val <= 86400):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_reuse_cooldown_seconds must be between 60 and 86400",
+            )
+        _runtime_config["warm_backlog_reuse_cooldown_seconds"] = val
+    if "warm_backlog_scan_limit" in payload:
+        try:
+            val = int(payload["warm_backlog_scan_limit"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_scan_limit must be a number",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_scan_limit must be between 1 and 100",
+            )
+        _runtime_config["warm_backlog_scan_limit"] = val
+    if "warm_backlog_teardown_defer_secs" in payload:
+        try:
+            val = int(payload["warm_backlog_teardown_defer_secs"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_teardown_defer_secs must be a number",
+            )
+        if not (5 <= val <= 120):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_teardown_defer_secs must be between 5 and 120",
+            )
+        _runtime_config["warm_backlog_teardown_defer_secs"] = val
     if "drift_over_claim_min_claims" in payload:
         try:
             val = int(payload["drift_over_claim_min_claims"])
@@ -1604,6 +1892,63 @@ async def _apply_settings(
                     ),
                     "warm_backlog_reuse_enabled": bool(
                         _runtime_config.get("warm_backlog_reuse_enabled", False)
+                    ),
+                    "warm_pool_enabled": bool(
+                        _runtime_config.get("warm_pool_enabled", False)
+                    ),
+                    # Persist the per-project enablement scope so a per-project
+                    # enable (via /warm-pool/enable or the raw PATCH) survives a
+                    # Cloud Run restart. runtime_config_state.sync_* reads this key
+                    # back on boot; without it the in-memory allowlist reverts to
+                    # the [] (fleet-wide) default and the controlled scope is lost.
+                    "warm_pool_project_allowlist": sorted(
+                        _normalize_warm_pool_allowlist(
+                            _runtime_config.get("warm_pool_project_allowlist") or []
+                        )
+                    ),
+                    "warm_pool_target_size": int(
+                        _runtime_config.get("warm_pool_target_size", 2)
+                    ),
+                    # Persist the per-project IDLE target overrides so a
+                    # per-project target (set via /warm-pool/target, /warm-pool/
+                    # enable, or the raw PATCH) survives a Cloud Run restart.
+                    # runtime_config_state.sync_* reads this key back on boot;
+                    # without it the in-memory map reverts to the {} (all-global)
+                    # default and every project's configured size is lost.
+                    "warm_pool_target_size_by_project": _normalize_warm_pool_target_map(
+                        _runtime_config.get("warm_pool_target_size_by_project") or {}
+                    ),
+                    "warm_pool_idle_ttl_secs": int(
+                        _runtime_config.get("warm_pool_idle_ttl_secs", 1800)
+                    ),
+                    # Persist the ``_seconds`` spelling too — it is the one the
+                    # maintainer/idle-reaper actually read (warm_pool_maintainer.py).
+                    # Without it, sync_runtime_config_from_state finds no key on
+                    # restart and the operator's TTL change silently reverts to the
+                    # 1800 default. The PATCH handler keeps both spellings in sync.
+                    "warm_pool_idle_ttl_seconds": int(
+                        _runtime_config.get(
+                            "warm_pool_idle_ttl_seconds",
+                            _runtime_config.get("warm_pool_idle_ttl_secs", 1800),
+                        )
+                    ),
+                    "warm_pin_clear_rate_threshold": _runtime_config.get(
+                        "warm_pin_clear_rate_threshold", 10
+                    ),
+                    "warm_continuity_cooldown_seconds": _runtime_config.get(
+                        "warm_continuity_cooldown_seconds", 1800
+                    ),
+                    "warm_backlog_reuse_failure_rate_threshold": _runtime_config.get(
+                        "warm_backlog_reuse_failure_rate_threshold", 5
+                    ),
+                    "warm_backlog_reuse_cooldown_seconds": _runtime_config.get(
+                        "warm_backlog_reuse_cooldown_seconds", 1800
+                    ),
+                    "warm_backlog_scan_limit": _runtime_config.get(
+                        "warm_backlog_scan_limit", 10
+                    ),
+                    "warm_backlog_teardown_defer_secs": _runtime_config.get(
+                        "warm_backlog_teardown_defer_secs", 20
                     ),
                     "next_role_poll_timeout_secs": int(
                         _runtime_config.get("next_role_poll_timeout_secs", 180)

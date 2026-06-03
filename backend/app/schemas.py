@@ -257,6 +257,34 @@ class BuildConfigDirectoryEntry(BaseModel):
     install_cmd: str | None = None
 
 
+class MigrationConfig(BaseModel):
+    """Per-project Alembic/migration layout override.
+
+    Mirrors the agent-side ``MigrationConfig`` (agent/src/utils/test-runners.ts):
+    the migrate handler's ``resolveMigrationLayout`` consumes these fields so a
+    repo with a non-standard Python layout (e.g. migrations under
+    ``src/db/versions`` instead of ``backend/alembic/versions``) can run migrate
+    tasks. Every field is optional; an unset field falls back to Blueprint's
+    defaults (``backend/alembic/versions`` + ``app/models`` + ``app/main.py``
+    ``EXPECTED_SCHEMA_REVISION``).
+
+    This is DISTINCT from ``BuildConfig.alembic_versions_path`` (a single string
+    feeding only the backend-side migration-file guard); this object drives the
+    agent's full layout resolution.
+
+    Note: an explicit empty-string ``schema_revision_file`` is meaningful — it
+    signals "this repo has no schema-revision gate" and is preserved through
+    validation rather than coerced to None.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+    versions_dir: str | None = None
+    models_dir: str | None = None
+    alembic_cwd: str | None = None
+    schema_revision_file: str | None = None
+    schema_revision_const: str | None = None
+
+
 class BuildConfig(BaseModel):
     """Schema for project build configuration."""
 
@@ -282,8 +310,29 @@ class BuildConfig(BaseModel):
     stale_branch_prefixes: List[str] | None = None
     protected_branches: List[str] | None = None
     enable_self_improvement: bool = False
+    # Deterministic empty/near-empty repo signal, computed at onboarding from
+    # the already-fetched root + first-level subdirectory listings during
+    # build-config detection (see ``admin_onboard._classify_repo_emptiness``).
+    # True ONLY when the repo read SUCCEEDED and was COMPLETE and the repo has
+    # at most the greenfield source-file threshold after excluding
+    # docs/config/data files, dotfiles, and common manifests. If any listing
+    # needed for that determination failed to fetch (root or first-level
+    # subdirectory), the read is incomplete and this degrades to False
+    # (treat-as-non-empty) — emptiness is never inferred from a partial read.
+    # Keep this count-based rule aligned with the agent's prompt-time detector
+    # so research/plan bootstrap guidance and the durable onboarding signal
+    # agree. Default False so pre-existing projects (and any repo with detected
+    # source) degrade gracefully.
+    repo_is_empty: bool = False
     # Per-project alembic versions directory path. None means "use the project default".
+    # NOTE: this single string feeds only the backend-side migration-file guard;
+    # it is NOT the agent's full layout resolver — see ``migration`` below.
     alembic_versions_path: str | None = None
+    # Per-project migration-layout override consumed by the agent's migrate
+    # handler (resolveMigrationLayout). None means "use Blueprint defaults".
+    # Round-tripped unchanged through detect/save/PATCH so an operator-supplied
+    # build_config.migration actually reaches the agent's claim response.
+    migration: MigrationConfig | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"
@@ -329,6 +378,16 @@ class OnboardPayload(BaseModel):
     name: str | None = None
     build_config_override: Dict[str, Any] | None = None
     promotion_target: str | None = None
+    # User's goal for this repo — a short statement of what Blueprint should
+    # achieve. Seeded at creation time into the project's strategic intent
+    # (problem_model.intent + a user conversation message) so the first
+    # strategic cycle reasons from the user's actual ask rather than a blank
+    # slate. Optional: an empty/omitted goal preserves today's behavior.
+    goal: str | None = Field(None, max_length=5000)
+    # Optional initial steering merged into the user-editable strategic-intent
+    # subset (only the ``context`` / ``constraints`` keys are applied; other
+    # keys are ignored by the seeding path). None/omitted is a no-op.
+    initial_steering: Dict[str, Any] | None = None
 
 
 # --- Pipeline Efficiency ---

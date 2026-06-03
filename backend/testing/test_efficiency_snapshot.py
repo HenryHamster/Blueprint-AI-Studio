@@ -72,15 +72,18 @@ async def test_compute_current_axes_values(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Two merged tasks, each 5min on-demand. 1 cold (12s), 1 warm (no cold sample).
-    # Warm signal lives in context['_timing']['warm_start'] (the column is only
-    # ever written False at cold-provision time); the cold task participates in
-    # the denominator via its vm_provisioned_at.
+    # Two merged tasks, one on-demand and one e2-standard-4. 1 cold (12s), 1 warm (no cold sample).
+    # Warm signal lives in context['_timing']['warm_start'], the source
+    # _compute_vm_reuse_rate keys on; the cold task participates in the
+    # denominator via its vm_provisioned_at. (vm_warm_start is False on cold
+    # dispatch and True on warm claim, but the metric intentionally reads
+    # _timing.warm_start — the agent-authoritative source.)
     db_session.add(_make_efficient_task(project.id))
     db_session.add(
         _make_efficient_task(
             project.id,
             vm_cold_start_ms=None,
+            vm_machine_type="e2-standard-4",
             api_call_summary={"llm_call_count": 80},
             context={
                 "pr_merged": True,
@@ -93,13 +96,39 @@ async def test_compute_current_axes_values(db_session):
 
     axes = await compute_current_axes(db_session, project.id)
 
-    # 2 merged * 300s * ON_DEMAND_RATE / 2 merged = 300 * ON_DEMAND_RATE
-    expected_cpm = round(300 * ON_DEMAND_RATE, 4)
+    # 300s * (e2-standard-2 + e2-standard-4) / 2 merged.
+    expected_cpm = round(300 * (ON_DEMAND_RATE + (0.134 / 3600)) / 2, 4)
     assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
     assert axes[AXIS_VM_COLD_START_P50_MS] == 12000.0
     assert axes[AXIS_VM_REUSE_RATE] == 0.5
     assert axes[AXIS_MEDIAN_API_CALLS_PER_TASK] == 60.0
     assert axes[AXIS_MEDIAN_REVIEW_ITERATIONS] == 3.0
+
+
+@pytest.mark.asyncio
+async def test_cost_per_merged_pr_excludes_non_merge_unblocks(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            context={
+                "pr_merged": True,
+                "landed_on_integration": False,
+                "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            },
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    expected_cpm = round(2 * 300 * ON_DEMAND_RATE, 4)
+    assert axes[AXIS_COST_PER_MERGED_PR] == expected_cpm
 
 
 @pytest.mark.asyncio
@@ -168,6 +197,124 @@ async def test_vm_reuse_rate_warm_without_column_or_provisioned(db_session):
 
     axes = await compute_current_axes(db_session, project.id)
     assert axes[AXIS_VM_REUSE_RATE] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_warm_start_origin_breakdown_per_origin_counts(db_session):
+    """The per-origin breakdown isolates the pool-origin share of warm starts
+    from chain-continuity and backlog-reuse, while leaving the aggregate
+    vm_reuse_rate intact. Mixes pool/backlog/chain warm starts plus a cold task.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+
+    def _warm(origin):
+        return make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=2),
+            vm_stopped_at=now,
+            context={
+                "_timing": {"warm_start": True, "warm_claim_origin": origin}
+            },
+        )
+
+    # 2 pool, 1 backlog, 1 chain (next_role_endpoint), 1 legacy-unset chain.
+    db_session.add(_warm("warm_pool"))
+    db_session.add(_warm("warm_pool"))
+    db_session.add(_warm("backlog_reuse"))
+    db_session.add(_warm("next_role_endpoint"))
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=2),
+            vm_stopped_at=now,
+            context={"_timing": {"warm_start": True}},  # legacy-unset -> chain
+        )
+    )
+    # 1 cold task: participates in vm_reuse_rate denominator but NOT the warm
+    # breakdown (warm_start is False).
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            context={"_timing": {"warm_start": False}},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    bd = axes["warm_start_origin_breakdown"]
+    assert bd is not None
+    assert bd["warm_pool"] == 2
+    assert bd["backlog_reuse"] == 1
+    assert bd["chain_continuity"] == 2
+    assert bd["warm_total"] == 5
+    assert bd["pool_origin_share"] == round(2 / 5, 4)
+    # Aggregate reuse rate is intact and counts every warm origin: 5 warm / 6.
+    assert axes[AXIS_VM_REUSE_RATE] == round(5 / 6, 4)
+
+
+@pytest.mark.asyncio
+async def test_warm_start_origin_breakdown_none_when_no_warm(db_session):
+    """With only cold tasks the breakdown is None (no warm population to split)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=5),
+            vm_stopped_at=now,
+            context={"_timing": {"warm_start": False}},
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes["warm_start_origin_breakdown"] is None
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_surfaces_warm_start_origin_breakdown(db_session):
+    """read_baseline_with_drift surfaces the latest snapshot's per-origin
+    breakdown next to the pool idle cost and cost-per-merged-PR figures."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_provisioned_at=now - timedelta(minutes=2),
+            vm_stopped_at=now,
+            context={
+                "_timing": {"warm_start": True, "warm_claim_origin": "warm_pool"}
+            },
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    drift = await read_baseline_with_drift(db_session, project.id)
+    bd = drift["warm_start_origin_breakdown"]
+    assert bd is not None
+    assert bd["warm_pool"] == 1
+    assert bd["pool_origin_share"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -1574,3 +1721,820 @@ async def test_read_baseline_with_drift_includes_reuse_funnel(db_session):
     # On a fresh instance all counters start at zero.
     assert funnel["completed_vms_with_eligible_backlog"] == 0
     assert funnel["warm_claims_succeeded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_snapshot_persists_reuse_dropout_and_surfaces_trend(db_session):
+    """write_snapshot must fold the dominant reuse drop-out into the durable
+    snapshot, and read_baseline_with_drift must surface the latest ranking plus
+    a day-over-day trend that survives the in-memory funnel reset."""
+    import app.warm_backlog_reuse as wbr
+
+    # Clear the process-global rolling funnel deques, then seed a clear leader:
+    # 5 file-conflict scan skips dominate the non-converting population.
+    for dq in (
+        wbr._scan_skipped_depends_on_events,
+        wbr._scan_skipped_pinned_vm_events,
+        wbr._scan_skipped_file_conflict_events,
+        wbr._scan_saturated_events,
+        wbr._grace_idle_release_events,
+        wbr._grace_ceiling_release_events,
+        wbr._claim_skipped_events,
+    ):
+        dq.clear()
+    for _ in range(5):
+        wbr.record_scan_skipped_file_conflict()
+    wbr.record_grace_idle_release()
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    snapshot = await write_snapshot(db_session, project.id)
+    # The drop-out ranking is persisted in the snapshot body (survives restart).
+    assert snapshot["reuse_dropout"]["dominant_dropout"]["reason"] == "scan_file_conflict"
+    assert snapshot["reuse_dropout"]["dominant_dropout"]["count"] == 5
+
+    # Simulate a deploy/restart wiping the in-memory funnel counters.
+    for dq in (
+        wbr._scan_skipped_file_conflict_events,
+        wbr._grace_idle_release_events,
+    ):
+        dq.clear()
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    # Latest persisted ranking is still surfaced despite the wiped live funnel.
+    assert result["reuse_dropout"]["dominant_dropout"]["reason"] == "scan_file_conflict"
+    trend = result["reuse_dropout_trend"]
+    assert len(trend) == 1
+    assert trend[0]["dominant_reason"] == "scan_file_conflict"
+    assert trend[0]["dominant_share"] == result["reuse_dropout"]["dominant_dropout"]["share"]
+    assert trend[0]["dropout_total"] == 6
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_persists_pool_dispatch_funnel(db_session):
+    """compute_current_axes folds the live pool dispatch funnel into the snapshot,
+    carrying lease hits, cold dispatches, the lease-miss-by-reason breakdown, and
+    the dominant-miss call-out (named per the >=2 / >=50% / strictly-outranks gate)."""
+    import app.warm_backlog_reuse as wbr
+    from app.efficiency_snapshot import compute_current_axes
+
+    # Fresh process-global pool funnel deques, then seed a clear dominant miss:
+    # 3 no_compatible_member misses dominate over 1 no_idle_member miss, plus a
+    # hit and a cold dispatch so the hit-rate aggregates are exercised too.
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    wbr.record_pool_lease_hit("acct-a")
+    wbr.record_pool_cold_dispatch("acct-a")
+    for _ in range(3):
+        wbr.record_pool_lease_miss("no_compatible_member", "acct-a")
+    wbr.record_pool_lease_miss("no_idle_member", "acct-b")
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    axes = await compute_current_axes(db_session, project.id)
+    funnel = axes["pool_dispatch_funnel"]
+    assert funnel["pool_lease_hits"] == 1
+    assert funnel["cold_dispatches"] == 1
+    assert funnel["pool_hit_rate"] == 0.5
+    assert funnel["lease_miss_by_reason"]["no_compatible_member"] == 3
+    assert funnel["lease_miss_by_reason"]["no_idle_member"] == 1
+    assert funnel["lease_miss_total"] == 4
+    # Dominant miss: 3/4 = 0.75 >= 0.5, >=2 events, strictly outranks the runner-up.
+    assert funnel["dominant_miss"]["reason"] == "no_compatible_member"
+    assert funnel["dominant_miss"]["count"] == 3
+    assert funnel["dominant_miss"]["share"] == 0.75
+    # Per-account breakdown rides along for the controlled-enable view.
+    assert funnel["by_account"]["acct-a"]["pool_lease_hits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_returns_pool_dispatch_funnel_trend(db_session):
+    """write_snapshot persists the pool dispatch funnel, and
+    read_baseline_with_drift surfaces the latest block plus a day-over-day trend
+    that survives the in-memory pool funnel reset."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    wbr.record_pool_lease_hit("acct-a")
+    for _ in range(2):
+        wbr.record_pool_lease_miss("no_idle_member", "acct-a")
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    snapshot = await write_snapshot(db_session, project.id)
+    assert snapshot["pool_dispatch_funnel"]["dominant_miss"]["reason"] == "no_idle_member"
+    assert snapshot["pool_dispatch_funnel"]["pool_lease_hits"] == 1
+
+    # Simulate a deploy/restart wiping the in-memory pool funnel counters.
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_lease_miss_events.clear()
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    # Latest persisted funnel is still surfaced despite the wiped live counters.
+    assert result["pool_dispatch_funnel"]["dominant_miss"]["reason"] == "no_idle_member"
+    trend = result["pool_dispatch_funnel_trend"]
+    assert len(trend) == 1
+    assert trend[0]["pool_lease_hits"] == 1
+    assert trend[0]["lease_miss_total"] == 2
+    assert trend[0]["dominant_miss_reason"] == "no_idle_member"
+
+
+def test_compute_dominant_pool_miss_no_leader_on_even_split():
+    """An even split between two miss reasons names no dominant leader — the same
+    strictly-outranks discipline the reuse-dropout ranking uses."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+    for _ in range(2):
+        wbr.record_pool_lease_miss("no_idle_member")
+    for _ in range(2):
+        wbr.record_pool_lease_miss("no_compatible_member")
+
+    result = wbr.compute_dominant_pool_miss()
+    assert result["lease_miss_total"] == 4
+    # 2 vs 2: neither strictly outranks the other => no dominant miss named.
+    assert result["dominant_miss"] is None
+
+
+def test_compute_pool_cost_amortization_no_hits():
+    """No warm-start hit yet => idle spend is not amortized at all."""
+    from app.efficiency_snapshot import compute_pool_cost_amortization
+
+    funnel = {
+        "window_hours": 24,
+        "pool_lease_hits": 0,
+        "pool_hit_rate": 0.0,
+        "total_dispatches": 30,
+    }
+    result = compute_pool_cost_amortization(5.0, funnel)
+    assert result["pool_idle_cost_usd"] == 5.0
+    assert result["pool_lease_hits"] == 0
+    assert result["total_dispatches"] == 30
+    # No hits => cost-per-hit is undefined (not amortized).
+    assert result["cost_per_pool_hit_usd"] is None
+
+
+def test_compute_pool_cost_amortization_with_hits():
+    """Idle spend divided by warm-start hits gives the per-hit amortized cost."""
+    from app.efficiency_snapshot import compute_pool_cost_amortization
+
+    funnel = {
+        "window_hours": 24,
+        "pool_lease_hits": 4,
+        "pool_hit_rate": 0.4,
+        "total_dispatches": 10,
+    }
+    result = compute_pool_cost_amortization(6.0, funnel)
+    assert result["cost_per_pool_hit_usd"] == 1.5
+    assert result["pool_hit_rate"] == 0.4
+    assert result["window_hours"] == 24
+
+
+def test_compute_pool_cost_amortization_handles_none_idle():
+    """A None/zero idle cost is coerced to 0.0 without raising."""
+    from app.efficiency_snapshot import compute_pool_cost_amortization
+
+    result = compute_pool_cost_amortization(None, {"pool_lease_hits": 0})
+    assert result["pool_idle_cost_usd"] == 0.0
+    assert result["cost_per_pool_hit_usd"] is None
+    assert result["total_dispatches"] == 0
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_pool_cost_amortization(db_session):
+    """read_baseline_with_drift surfaces the pool cost-amortization companion."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._pool_lease_hit_events.clear()
+    wbr._pool_cold_dispatch_events.clear()
+    wbr._pool_lease_miss_events.clear()
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    assert "pool_cost_amortization" in result
+    amort = result["pool_cost_amortization"]
+    assert "pool_idle_cost_usd" in amort
+    assert "pool_lease_hits" in amort
+    assert "cost_per_pool_hit_usd" in amort
+    # Fresh instance: no idle cost recorded and no hits => not amortized.
+    assert amort["pool_lease_hits"] == 0
+    assert amort["cost_per_pool_hit_usd"] is None
+
+
+# ---------------------------------------------------------------------------
+# Per-project warm-pool PAYOFF VERDICT
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    POOL_PAYOFF_COST_REGRESSION,
+    POOL_PAYOFF_INSUFFICIENT_DATA,
+    POOL_PAYOFF_MIN_POOL_DISPATCHES,
+    POOL_PAYOFF_NO_LIFT,
+    POOL_PAYOFF_PROVEN,
+    compute_pool_payoff_verdict,
+)
+
+
+def _cost_axis(current, baseline):
+    drift = None
+    if (
+        isinstance(current, (int, float))
+        and isinstance(baseline, (int, float))
+        and baseline != 0
+    ):
+        drift = round(((current - baseline) / baseline) * 100.0, 2)
+    return {"current": current, "baseline": baseline, "drift_pct": drift}
+
+
+def test_pool_payoff_verdict_proven():
+    """Serving warm starts above the floor AND cost within tolerance => PROVEN."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(10.0, 10.2),  # cost slightly BELOW baseline => no regression
+        {"pool_hit_rate": 0.4, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_PROVEN
+    assert verdict["supporting"]["pool_origin_share"] == 0.5
+    assert verdict["supporting"]["pool_hit_rate"] == 0.4
+    assert "widening" in verdict["recommended_action"].lower()
+
+
+def test_pool_payoff_verdict_cost_regression():
+    """Idle-inclusive cost materially above baseline => COST_REGRESSION, even
+    when the pool is serving warm starts."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(12.0, 10.0),  # +20% drift, well over the 5% tolerance
+        {"pool_hit_rate": 0.4, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_COST_REGRESSION
+    assert verdict["supporting"]["cost_drift_pct"] == 20.0
+    assert "disable" in verdict["recommended_action"].lower()
+
+
+def test_pool_payoff_verdict_no_lift():
+    """Cost not regressed but the pool is barely serving (hit rate AND
+    pool-origin share below the floor) => NO_LIFT."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 1, "pool_origin_share": 0.02},
+        _cost_axis(10.1, 10.0),  # +1% drift, within tolerance
+        {"pool_hit_rate": 0.01, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_NO_LIFT
+    assert "tune" in verdict["recommended_action"].lower()
+
+
+def test_pool_payoff_verdict_insufficient_data_no_baseline():
+    """No cost baseline to compare against => INSUFFICIENT_DATA."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(10.0, None),
+        {"pool_hit_rate": 0.4, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+
+
+def test_pool_payoff_verdict_insufficient_data_too_few_dispatches():
+    """Fewer pool dispatches than the minimum sample size => INSUFFICIENT_DATA,
+    even with a cost baseline present."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 8, "pool_origin_share": 0.5},
+        _cost_axis(10.0, 10.0),
+        {"pool_hit_rate": 0.4, "total_dispatches": POOL_PAYOFF_MIN_POOL_DISPATCHES - 1},
+    )
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+
+
+def test_pool_payoff_verdict_serving_via_origin_share_only():
+    """Hit rate below floor but pool-origin share above it still counts as
+    serving (the OR), so with cost in tolerance the verdict is PROVEN."""
+    verdict = compute_pool_payoff_verdict(
+        {"warm_pool": 6, "pool_origin_share": 0.3},
+        _cost_axis(10.0, 10.0),
+        {"pool_hit_rate": 0.05, "total_dispatches": 50},
+    )
+    assert verdict["state"] == POOL_PAYOFF_PROVEN
+
+
+def test_pool_payoff_verdict_handles_none_inputs():
+    """None breakdown/funnel/axis must not raise — classify INSUFFICIENT_DATA."""
+    verdict = compute_pool_payoff_verdict(None, None, None)
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+    assert verdict["supporting"]["pool_origin_share"] is None
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_pool_payoff_verdict(db_session):
+    """read_baseline_with_drift surfaces a pool_payoff_verdict block of the
+    expected shape; a fresh project with no baseline/dispatches => INSUFFICIENT_DATA."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    assert "pool_payoff_verdict" in result
+    verdict = result["pool_payoff_verdict"]
+    assert verdict["state"] == POOL_PAYOFF_INSUFFICIENT_DATA
+    assert "supporting" in verdict
+    assert "recommended_action" in verdict
+
+
+# ---------------------------------------------------------------------------
+# Per-project warm-pool payoff TRANSITION ALERT
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock  # noqa: E402
+
+from sqlmodel import select as _sql_select  # noqa: E402
+
+from app.efficiency_snapshot import (  # noqa: E402
+    LAST_ALERTED_PAYOFF_KEY,
+    POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
+    maybe_alert_pool_payoff_transition,
+)
+from app.models import Alert, AlertSeverity  # noqa: E402
+from app.shared_state import runtime_config as _runtime_config  # noqa: E402
+
+
+def _payoff_design_doc(
+    *,
+    incl_current,
+    cost_baseline,
+    warm_pool,
+    pool_origin_share,
+    hit_rate,
+    total_dispatches,
+):
+    """Build a design_doc whose latest snapshot drives a chosen payoff verdict.
+
+    read_baseline_with_drift reads the idle-inclusive cost drift off
+    ``cost_per_merged_pr_incl_pool_idle`` (current) vs the immutable
+    ``cost_per_merged_pr`` baseline, the lift off the persisted
+    ``warm_start_origin_breakdown`` + ``pool_dispatch_funnel``.
+    """
+    snap = {
+        "captured_at": _utcnow().isoformat(),
+        "cost_per_merged_pr_incl_pool_idle": incl_current,
+        "warm_start_origin_breakdown": {
+            "warm_pool": warm_pool,
+            "pool_origin_share": pool_origin_share,
+        },
+        "pool_dispatch_funnel": {
+            "pool_hit_rate": hit_rate,
+            "total_dispatches": total_dispatches,
+        },
+    }
+    return {
+        DESIGN_DOC_KEY: {
+            "baseline": {AXIS_COST_PER_MERGED_PR: cost_baseline},
+            "snapshots": [snap],
+        }
+    }
+
+
+async def _payoff_alerts(db_session, project_id):
+    stmt = _sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.title.contains("Warm-pool payoff"),
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_cost_regression_fires_warning(db_session, mocker):
+    """A transition to COST_REGRESSION fires one WARNING carrying the numbers."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,  # +20% idle-inclusive drift, over the 5% tolerance
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired == POOL_PAYOFF_COST_REGRESSION
+
+    alerts = await _payoff_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert "COST_REGRESSION" in alerts[0].title
+    # Supporting numbers must be embedded so the operator can act from the alert.
+    assert "20.00%" in alerts[0].message  # idle-inclusive cost drift
+    assert "0.4" in alerts[0].message  # pool hit rate
+    assert "8 warm starts" in alerts[0].message
+    bcast.assert_awaited()
+
+    # The marker advanced so a repeat tick is deduped (see next test's path).
+    await db_session.refresh(project)
+    assert (
+        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_PAYOFF_KEY]
+        == POOL_PAYOFF_COST_REGRESSION
+    )
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
+    """A second tick at the same verdict does not fire a second alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    second = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert first == POOL_PAYOFF_COST_REGRESSION
+    assert second is None  # deduped on the persisted marker
+    alerts = await _payoff_alerts(db_session, project.id)
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_proven_with_volume_fires_info(db_session, mocker):
+    """PROVEN with warm-start volume at/above the floor fires an INFO alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=10.0,
+            cost_baseline=10.0,  # no cost regression
+            warm_pool=POOL_PAYOFF_PROVEN_MIN_WARM_STARTS,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired == POOL_PAYOFF_PROVEN
+    alerts = await _payoff_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "PROVEN" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_proven_below_volume_floor_no_alert(
+    db_session, mocker
+):
+    """PROVEN but below the warm-start volume floor does NOT alert (too thin)."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=10.0,
+            cost_baseline=10.0,
+            warm_pool=POOL_PAYOFF_PROVEN_MIN_WARM_STARTS - 1,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_no_lift_no_alert(db_session, mocker):
+    """NO_LIFT (barely serving, cost in tolerance) is not alert-worthy."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=10.0,
+            cost_baseline=10.0,
+            warm_pool=1,
+            pool_origin_share=0.02,
+            hit_rate=0.01,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_insufficient_data_no_alert(db_session, mocker):
+    """INSUFFICIENT_DATA (too few pool dispatches to judge) is not alert-worthy."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=5,  # below POOL_PAYOFF_MIN_POOL_DISPATCHES
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_payoff_transition_unscoped_project_no_alert(db_session, mocker):
+    """A project NOT in the warm-pool scope is never evaluated/alerted."""
+    import uuid as _uuid
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    # Scope the pool to some OTHER project so this one is out of scope.
+    _runtime_config["warm_pool_project_allowlist"] = [str(_uuid.uuid4())]
+    project = make_project(
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        )
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-enable counterfactual warm-pool hit-rate estimate
+# ---------------------------------------------------------------------------
+
+from app.efficiency_snapshot import (  # noqa: E402
+    _estimate_pool_hit_rate,
+    estimate_pool_hit_rate,
+)
+
+
+def _disp(label, second):
+    """A (account_label, dispatched_at) tuple at ``second`` seconds past an epoch."""
+    base = datetime(2026, 6, 1, 0, 0, 0)
+    return (label, base + timedelta(seconds=second))
+
+
+def test_estimate_pool_hit_rate_empty_returns_none():
+    out = _estimate_pool_hit_rate(
+        [], target_size=3, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    assert out["total_dispatches"] == 0
+    assert out["estimated_hit_rate"] is None
+    assert out["by_account"] == {}
+
+
+def test_estimate_pool_hit_rate_target_zero_all_cold():
+    # Zero capacity -> every dispatch is a miss -> hit rate 0.0 (not None: we
+    # have dispatches, just no warm capacity).
+    disp = [_disp("acct-a", s) for s in (0, 1000, 2000)]
+    out = _estimate_pool_hit_rate(
+        disp, target_size=0, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    assert out["total_dispatches"] == 3
+    assert out["estimated_warm_hits"] == 0
+    assert out["estimated_hit_rate"] == 0.0
+
+
+def test_estimate_pool_hit_rate_large_target_serves_all_when_spread():
+    # One member per simultaneous arrival -> all warm.
+    disp = [_disp("acct-a", s) for s in (0, 1, 2, 3)]
+    out = _estimate_pool_hit_rate(
+        disp, target_size=10, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    assert out["estimated_hit_rate"] == 1.0
+
+
+def test_estimate_pool_hit_rate_cross_account_is_miss_without_retarget():
+    # Pool target 1, single demand-active account 'a' gets the slot; a dispatch
+    # on a different account 'b' has no compatible idle member -> miss.
+    disp = [_disp("acct-a", 0), _disp("acct-a", 1000), _disp("acct-b", 2000)]
+    out = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    # 'a' is busiest (2 dispatches) so it owns the single slot; both its
+    # well-spaced dispatches are warm, 'b' misses.
+    assert out["by_account"]["acct-a"]["estimated_warm_hits"] == 2
+    assert out["by_account"]["acct-b"]["estimated_warm_hits"] == 0
+    assert out["estimated_warm_hits"] == 2
+
+
+def test_estimate_pool_hit_rate_retarget_covers_other_account():
+    # Same history, but with retarget the single shared member can serve EITHER
+    # account, so the 'b' dispatch (well after 'a's are done) also lands warm.
+    disp = [_disp("acct-a", 0), _disp("acct-a", 1000), _disp("acct-b", 2000)]
+    pinned = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=120, idle_ttl_seconds=1800
+    )
+    retarget = _estimate_pool_hit_rate(
+        disp,
+        target_size=1,
+        replenish_seconds=120,
+        idle_ttl_seconds=1800,
+        account_retarget=True,
+    )
+    assert retarget["estimated_warm_hits"] >= pinned["estimated_warm_hits"]
+    assert retarget["estimated_warm_hits"] == 3
+
+
+def test_estimate_pool_hit_rate_bursty_below_steady():
+    # Bursty: 3 arrivals within one replenish window exceed a single member.
+    bursty = [_disp("acct-a", s) for s in (0, 1, 2)]
+    # Steady: same count spread far apart (and within TTL) -> all warm.
+    steady = [_disp("acct-a", s) for s in (0, 1000, 2000)]
+    burst_out = _estimate_pool_hit_rate(
+        bursty, target_size=1, replenish_seconds=500, idle_ttl_seconds=100000
+    )
+    steady_out = _estimate_pool_hit_rate(
+        steady, target_size=1, replenish_seconds=500, idle_ttl_seconds=100000
+    )
+    assert burst_out["estimated_hit_rate"] < steady_out["estimated_hit_rate"]
+    assert burst_out["estimated_warm_hits"] == 1  # only the first burst arrival
+    assert steady_out["estimated_hit_rate"] == 1.0
+
+
+def test_estimate_pool_hit_rate_increases_with_target_size():
+    # Burst of 3 near-simultaneous arrivals; more slots -> more warm hits.
+    disp = [_disp("acct-a", s) for s in (0, 1, 2)]
+    small = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=500, idle_ttl_seconds=1800
+    )
+    big = _estimate_pool_hit_rate(
+        disp, target_size=3, replenish_seconds=500, idle_ttl_seconds=1800
+    )
+    assert big["estimated_hit_rate"] > small["estimated_hit_rate"]
+
+
+def test_estimate_pool_hit_rate_increases_with_ttl():
+    # Sparse, steady arrivals with gaps far larger than a short TTL: a short TTL
+    # reaps the member between arrivals (cold re-provision gap), a long TTL keeps
+    # it warm. Longer TTL -> higher hit rate.
+    disp = [_disp("acct-a", s) for s in (0, 1000, 2000, 3000)]
+    short_ttl = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=500, idle_ttl_seconds=100
+    )
+    long_ttl = _estimate_pool_hit_rate(
+        disp, target_size=1, replenish_seconds=500, idle_ttl_seconds=5000
+    )
+    assert long_ttl["estimated_hit_rate"] > short_ttl["estimated_hit_rate"]
+    assert long_ttl["estimated_hit_rate"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_estimate_pool_hit_rate_wrapper_buckets_by_account(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Two dispatches on account a, one on account b.
+    for secs, acct in ((300, "a"), (200, "a"), (100, "b")):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                vm_dispatched_at=now - timedelta(seconds=secs),
+                context={"llm_account_id": acct},
+            )
+        )
+    await db_session.commit()
+
+    out = await estimate_pool_hit_rate(
+        db_session, project.id, target_size=2, window_days=7
+    )
+    assert out["total_dispatches"] == 3
+    assert out["target_size"] == 2
+    assert set(out["by_account"].keys()) == {"a", "b"}
+    assert "estimated_hit_rate" in out
+    assert "account_retarget_scenario" in out
+    assert "assumptions" in out
+
+
+@pytest.mark.asyncio
+async def test_pool_hit_rate_estimate_endpoint_returns_shape(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            vm_dispatched_at=now - timedelta(minutes=5),
+            context={"llm_account_id": "acct-a"},
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=2"
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["target_size"] == 2
+    assert data["total_dispatches"] == 1
+    for key in (
+        "estimated_hit_rate",
+        "estimated_warm_hits",
+        "by_account",
+        "account_retarget_scenario",
+        "assumptions",
+        "replenish_seconds",
+        "idle_ttl_seconds",
+    ):
+        assert key in data
+
+
+@pytest.mark.asyncio
+async def test_pool_hit_rate_estimate_endpoint_requires_membership(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # No membership.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=2"
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_pool_hit_rate_estimate_endpoint_validates_target_size(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    # target_size is required.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate"
+    )
+    assert resp.status_code == 422
+    # target_size above le=100 is rejected.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/pool-hit-rate-estimate?target_size=101"
+    )
+    assert resp.status_code == 422

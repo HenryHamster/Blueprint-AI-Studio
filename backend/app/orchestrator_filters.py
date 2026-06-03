@@ -15,6 +15,7 @@ import uuid
 from typing import Callable, Coroutine, Any
 
 from sqlalchemy import func
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.migration_path import is_migration_file
@@ -22,6 +23,74 @@ from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 
 logger = logging.getLogger("blueprint")
+
+# Number of consecutive dispatch cycles a candidate must stay deferred on the
+# SAME precondition blocker before we raise one operator-visible alert. Kept
+# low so a genuinely stuck task surfaces quickly, but >1 so a blocker that
+# clears within a cycle or two never spams the Alerts banner.
+_PRECONDITION_ESCALATE_THRESHOLD = 3
+
+
+async def _record_defer_and_maybe_escalate(
+    candidate: Task,
+    session,
+    *,
+    blocker_kind: str,
+    detail: str,
+    threshold: int = _PRECONDITION_ESCALATE_THRESHOLD,
+) -> None:
+    """Track repeated deferral of *candidate* on the same precondition blocker.
+
+    Persists a per-blocker defer counter in
+    ``candidate.context['_precondition_defer']`` keyed by ``blocker_kind``
+    (the blocker identity — overlapping files or the blocking rollup title).
+    Once the count reaches *threshold* and the blocker has not yet been
+    escalated, raise ONE deduplicated operator alert and stamp
+    ``_precondition_escalated_key`` so it does not re-fire on every subsequent
+    dispatch cycle. The counter (and escalation stamp) reset when the blocker
+    identity changes, so a task that moves from one blocker to a different one
+    starts a fresh persistence count.
+
+    Alerting only — the candidate stays QUEUED and is NOT dispatched; we never
+    dispatch work known to be blocked, we just make the blocker visible.
+    """
+    ctx = candidate.context or {}
+    defer = ctx.get("_precondition_defer") or {}
+    if defer.get("key") == blocker_kind:
+        count = int(defer.get("count", 0)) + 1
+    else:
+        # New (or first) blocker identity — reset the persistence count and any
+        # stale escalation stamp from a previous, now-cleared blocker.
+        count = 1
+        ctx.pop("_precondition_escalated_key", None)
+    ctx["_precondition_defer"] = {"key": blocker_kind, "count": count}
+
+    already_escalated = ctx.get("_precondition_escalated_key") == blocker_kind
+    should_escalate = count >= threshold and not already_escalated
+    if should_escalate:
+        ctx["_precondition_escalated_key"] = blocker_kind
+
+    candidate.context = ctx
+    flag_modified(candidate, "context")
+    session.add(candidate)
+
+    if should_escalate:
+        # Deferred import keeps app.alert_dispatch a leaf and lets tests patch
+        # app.orchestrator_filters._maybe_create_precondition_blocker_alert.
+        from app.alert_dispatch import (  # noqa: PLC0415
+            _maybe_create_precondition_blocker_alert,
+        )
+
+        logger.warning(
+            f"[DISPATCH] Escalating persistent precondition blocker on task "
+            f"{candidate.id} after {count} deferrals: {blocker_kind}"
+        )
+        await _maybe_create_precondition_blocker_alert(
+            candidate,
+            session,
+            blocker_kind=blocker_kind,
+            detail=detail,
+        )
 
 
 def _is_test_file(path: str) -> bool:
@@ -247,6 +316,14 @@ async def filter_file_conflicts(
                 f"[DISPATCH] Deferring task {eid} — file conflict "
                 f"({len(overlap)}/{len(candidate_files)} files, scope={scope}): {overlapping_files}"
             )
+            # Track persistence — if this candidate keeps deferring on the same
+            # overlapping files across dispatch cycles, raise one operator alert.
+            await _record_defer_and_maybe_escalate(
+                candidate,
+                session,
+                blocker_kind=f"file conflict on {overlapping_files}",
+                detail=defer_msg,
+            )
         else:
             non_conflicting.append(eid)
     return non_conflicting
@@ -359,6 +436,14 @@ async def filter_rollup_conflicts(
                     logger.debug(
                         f"Failed to broadcast rollup deferral for {eid}", exc_info=True
                     )
+            # Track persistence — if this candidate keeps deferring on the same
+            # pending rollup across dispatch cycles, raise one operator alert.
+            await _record_defer_and_maybe_escalate(
+                candidate,
+                session,
+                blocker_kind=f"pending rollup '{blocking_title[:60]}'",
+                detail=defer_msg,
+            )
         else:
             if stale_overlap:
                 blocking_title = project_rollup_files[next(iter(stale_overlap))]

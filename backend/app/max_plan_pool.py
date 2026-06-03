@@ -2101,8 +2101,10 @@ async def select_llm_runtime_for_task(
     return None
 
 
-async def release_max_plan_account(account_id: str):
-    """Decrement active tasks for an account when a task finishes."""
+async def release_max_plan_account(
+    account_id: str, *, revert_daily_task_count: bool = False
+):
+    """Decrement active tasks for an account when a task finishes or aborts."""
     async with _max_plan_pool_lock:
         account = _account_by_id.get(account_id)
         if account:
@@ -2111,6 +2113,102 @@ async def release_max_plan_account(account_id: str):
                     f"[POOL] Account {account['name']} ({account_id}) release underflow — active_tasks was {account['active_tasks']}"
                 )
             account["active_tasks"] = max(0, account["active_tasks"] - 1)
+            if revert_daily_task_count:
+                account["daily_task_count"] = max(
+                    0, int(account.get("daily_task_count") or 0) - 1
+                )
+                _pending_cap_persists.add(account_id)
+
+
+async def reserve_max_plan_account(account_id: str) -> bool:
+    """Increment active tasks for an account when a task starts.
+
+    Mirror of ``release_max_plan_account``: a warm-reuse claim runs a task on
+    the VM's boot LLM account but never goes through ``select_max_plan_account``
+    (which is the only other place that pre-increments ``active_tasks``). Without
+    this reservation the boot account's concurrency count stays too low until the
+    orchestrator's next per-cycle reconciliation re-bases it from the DB — a
+    sub-cycle window in which the account's caps can be silently overrun. The
+    reconciliation overwrites ``active_tasks`` from the DB each cycle, so this
+    in-memory bump is never double-counted; it only closes that window.
+
+    No-op (returns False) when the account is absent from the pool (e.g. local /
+    test VMs with no real boot account), so callers can reserve unconditionally.
+    Acquires ``_max_plan_pool_lock``.
+    """
+    if not account_id:
+        return False
+    async with _max_plan_pool_lock:
+        account = _account_by_id.get(str(account_id))
+        if account is None:
+            return False
+        account["active_tasks"] = int(account.get("active_tasks") or 0) + 1
+        return True
+
+
+def build_account_retarget_manifest(
+    account_id: str | None,
+    *,
+    provider: str | None = None,
+    auth_mode: str | None = None,
+    model: str | None = None,
+    task: Any = None,
+    runtime_config: Mapping[str, Any] | None = None,
+) -> dict | None:
+    """Build a credential re-target secret manifest for ``account_id``.
+
+    Shared warm-claim credential re-target machinery: given a RESOLVED LLM
+    account id (the account a warm claim will actually run on), look up that
+    account's live credentials in the in-memory pool, resolve the task's
+    provider settings bag, and produce the transient ``secret_manifest`` the
+    agent re-materializes before running the role. Used by the warm-pool claim
+    path (and reusable by the chain / backlog-reuse re-target paths) so a warm
+    VM whose frozen boot account differs from the claimed task's resolved
+    account runs on the CORRECT credentials instead of the boot ones.
+
+    ``provider`` / ``auth_mode`` / ``model`` are the resolved runtime identity
+    (from the pinned task context); each falls back to the account's own value
+    when not supplied. Provider settings are resolved from ``task`` +
+    ``runtime_config`` when both are given.
+
+    Returns None when ``account_id`` is unknown to the in-memory pool (e.g. a
+    local / test VM, or the pool has not loaded) — the caller then leaves the
+    VM on its frozen boot credentials and does NOT relax the lease.
+    """
+    if not account_id:
+        return None
+    acct = _account_by_id.get(str(account_id))
+    if acct is None:
+        return None
+    resolved_provider = provider or acct.get("provider")
+    resolved_auth_mode = auth_mode or acct.get("auth_mode")
+    settings: dict[str, Any] | None = None
+    if task is not None and runtime_config is not None and resolved_provider:
+        try:
+            settings = resolve_task_provider_settings(
+                task, runtime_config, resolved_provider
+            )
+        except Exception:  # noqa: BLE001 — settings are best-effort; a bad bag
+            # must not block the credential re-target (the agent falls back to
+            # provider defaults). Loud failure here would strand the warm claim.
+            logger.exception(
+                "[WARM-POOL] provider-settings resolve failed for re-target "
+                "account=%s provider=%s; emitting manifest without settings",
+                account_id,
+                resolved_provider,
+            )
+            settings = None
+    from app.compute_manifest import build_warm_claim_retarget_manifest
+
+    return build_warm_claim_retarget_manifest(
+        provider=resolved_provider,
+        auth_mode=resolved_auth_mode,
+        model=model,
+        oauth_token=acct.get("runtime_secret") or acct.get("oauth_token"),
+        claude_config_json=acct.get("claude_config_json"),
+        provider_metadata=acct.get("provider_metadata") or {},
+        provider_settings=settings,
+    )
 
 
 async def disable_account_model(

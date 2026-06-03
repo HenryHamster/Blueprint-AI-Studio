@@ -35,7 +35,15 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('child_process', () => ({
-  execFileSync: vi.fn().mockReturnValue(Buffer.from('')),
+  // Route `git rev-parse` (HEAD and origin/<branch>) to a single stable sha so
+  // verifyCloneDelivered sees a resolvable HEAD that matches its remote tracking
+  // ref; every other git call returns empty output, which the handlers tolerate
+  // via try/catch. Suites that need a specific tree override this per-test.
+  execFileSync: vi.fn((_file: string, args?: unknown) => {
+    const a = Array.isArray(args) ? (args as string[]) : [];
+    if (a[0] === 'rev-parse') return 'deadbeefcafe0000';
+    return Buffer.from('');
+  }),
 }));
 
 vi.mock('../workspacePrep.js', () => ({
@@ -60,6 +68,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
 
 import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner } from '../index.js';
+import { execFileSync } from 'child_process';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import {
@@ -78,6 +87,8 @@ import {
   buildMemoCitationsSection,
   resolveMemoHandles,
   buildEfficiencySnapshotSection,
+  buildEmptyRepoGuidance,
+  buildCapabilityVerificationSection,
 } from './research-plan.js';
 
 describe('calcMessageAge', () => {
@@ -828,6 +839,148 @@ describe('buildPortfolioComposition', () => {
   });
 });
 
+describe('buildEmptyRepoGuidance', () => {
+  // buildEmptyRepoGuidance now routes through the unified isGreenfieldRepo
+  // predicate, which ORs the durable repo_is_empty signal with the live
+  // detectGreenfield() clone scan. To isolate the durable-signal cases we must
+  // control what the live scan sees via the git ls-files mock.
+  const setSourceRichClone = () =>
+    vi.mocked(execFileSync).mockReturnValue(
+      // > GREENFIELD_SOURCE_FILE_THRESHOLD (8) real source files → live scan false
+      Array.from({ length: 12 }, (_, i) => `src/m${i}.ts`).join('\n') as never,
+    );
+  const setEmptyClone = () =>
+    vi.mocked(execFileSync).mockReturnValue('package.json\nREADME.md\n.gitignore' as never);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns the bootstrap paragraph when repo_is_empty is truthy', () => {
+    // Durable signal short-circuits even when the live clone has real source.
+    setSourceRichClone();
+    const out = buildEmptyRepoGuidance({ repo_is_empty: true });
+    expect(out).toContain('If the codebase is nearly empty');
+    expect(out).toContain('bootstraps the target system');
+  });
+
+  it('returns empty string when repo_is_empty is false and the live clone has source', () => {
+    setSourceRichClone();
+    expect(buildEmptyRepoGuidance({ repo_is_empty: false })).toBe('');
+  });
+
+  it('returns empty string when repo_is_empty is absent and the live clone has source', () => {
+    setSourceRichClone();
+    expect(buildEmptyRepoGuidance({})).toBe('');
+  });
+
+  it('returns empty string for non-boolean falsy values when the live clone has source', () => {
+    setSourceRichClone();
+    expect(buildEmptyRepoGuidance({ repo_is_empty: 0 })).toBe('');
+    expect(buildEmptyRepoGuidance({ repo_is_empty: '' })).toBe('');
+  });
+
+  it('returns the bootstrap paragraph when repo_is_empty is absent but the live clone is near-empty', () => {
+    // Durable signal absent → the live full-clone scan catches a
+    // lightly-scaffolded repo. Both handlers agree on this.
+    setEmptyClone();
+    const out = buildEmptyRepoGuidance({});
+    expect(out).toContain('If the codebase is nearly empty');
+  });
+
+  it('returns empty string when repo_is_empty is explicitly false but the live clone is near-empty', () => {
+    // The durable signal is authoritative: a durable "non-empty" reading paired
+    // with an empty live tree is a clone problem (handled by verifyCloneDelivered),
+    // NOT a greenfield repo. It must never silently produce bootstrap guidance.
+    setEmptyClone();
+    expect(buildEmptyRepoGuidance({ repo_is_empty: false })).toBe('');
+  });
+});
+
+describe('buildCapabilityVerificationSection', () => {
+  it('returns empty string when the verification map is absent', () => {
+    expect(buildCapabilityVerificationSection(undefined)).toBe('');
+  });
+
+  it('returns empty string for an empty verification map', () => {
+    expect(buildCapabilityVerificationSection({})).toBe('');
+  });
+
+  it('flags a working-status capability whose every backing path is absent', () => {
+    // claimed_absent is the backend verdict for a capability claimed working/partial
+    // whose declared backing paths are ALL missing on the integration branch.
+    const section = buildCapabilityVerificationSection({
+      'streaming-uploads': {
+        status: 'claimed_absent',
+        claimed_status: 'working',
+        missing: ['backend/app/streaming.py', 'agent/src/upload.ts'],
+        present: [],
+      },
+    });
+    expect(section).toContain('# CAPABILITY VERIFICATION');
+    expect(section).toContain('Claimed-but-absent');
+    expect(section).toContain('**streaming-uploads**');
+    expect(section).toContain('design-doc status: working');
+    expect(section).toContain('CLAIMED-BUT-ABSENT');
+    expect(section).toContain('backend/app/streaming.py');
+    expect(section).toContain('agent/src/upload.ts');
+  });
+
+  it('does not flag a capability that partially exists (a present backing path)', () => {
+    // A capability with at least one present backing path is conservatively
+    // classified `partial`, not claimed_absent — it must NOT appear under the
+    // "Claimed-but-absent" heading.
+    const section = buildCapabilityVerificationSection({
+      'token-refresh': {
+        status: 'partial',
+        claimed_status: 'working',
+        missing: ['backend/app/refresh.py'],
+        present: ['agent/src/auth.ts'],
+      },
+    });
+    expect(section).toContain('PARTIAL');
+    expect(section).toContain('**token-refresh**');
+    expect(section).toContain('present: agent/src/auth.ts');
+    // Present-path capabilities are left alone — never marked claimed-but-absent.
+    expect(section).not.toContain('Claimed-but-absent');
+    expect(section).not.toContain('CLAIMED-BUT-ABSENT');
+  });
+
+  it('leaves a capability with no path pointer untouched (never classified)', () => {
+    // The backend never classifies a capability that declares no backing path
+    // (absence of a path is not evidence of absent code), so it never appears in
+    // the verification map. A map containing only such a (never-emitted)
+    // capability is effectively empty here — the section renders nothing for it.
+    const section = buildCapabilityVerificationSection({
+      'verified-cap': {
+        status: 'verified',
+        claimed_status: 'working',
+        missing: [],
+        present: ['backend/app/real.py'],
+      },
+    });
+    // The pathless capability is simply not in the map; only the verified one is.
+    expect(section).toContain('Verified');
+    expect(section).toContain('**verified-cap**');
+    expect(section).not.toContain('Claimed-but-absent');
+    expect(section).not.toContain('PARTIAL');
+  });
+
+  it('groups mixed verdicts into their respective sections', () => {
+    const section = buildCapabilityVerificationSection({
+      'cap-absent': { status: 'claimed_absent', claimed_status: 'working', missing: ['a.py'], present: [] },
+      'cap-partial': { status: 'partial', claimed_status: 'partial', missing: ['b.py'], present: ['c.ts'] },
+      'cap-verified': { status: 'verified', claimed_status: 'mature', missing: [], present: ['d.py'] },
+    });
+    expect(section).toContain('Claimed-but-absent');
+    expect(section).toContain('**cap-absent**');
+    expect(section).toContain('Partial');
+    expect(section).toContain('**cap-partial**');
+    expect(section).toContain('Verified');
+    expect(section).toContain('**cap-verified**');
+  });
+});
+
 describe('buildVersionPhaseSection', () => {
   it('returns empty string when versionPhase is undefined', () => {
     expect(buildVersionPhaseSection(undefined)).toBe('');
@@ -887,6 +1040,268 @@ describe('buildVersionPhaseSection', () => {
     // candidate_sha is truncated to 12 chars
     expect(result).toContain('candidate_sha=abcdef012345');
     expect(result).toContain('blocker=test_file_deleted');
+  });
+
+  it('renders sub-scores and audit findings for the current last_qualification, including the binding dimension', () => {
+    // No hard blocker and smoketest enabled (flag absent → enabled): the binding
+    // constraint is the lowest numeric sub-score.
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        candidate_sha: 'abcdef0123456789',
+        sub_scores: {
+          audit: 0.74,
+          test_erosion: 0.42,
+          smoketest: 0.88,
+        },
+        audit_findings: [
+          { severity: 'low', summary: 'documentation drift' },
+          { severity: 'critical', summary: 'unsafe release path' },
+          { severity: 'high', summary: 'broken retry guard' },
+          { severity: 'medium', summary: 'missing null check' },
+        ],
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.74, test_erosion=0.42, smoketest=0.88 (binding=test_erosion=0.42)');
+    expect(result).toContain('Audit findings: critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
+  });
+
+  it('renders the excluded-audit-findings caveat and section when findings were excluded for lacking verification', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.93,
+        sub_scores: { audit: 0.98, test_erosion: 1.0, smoketest: 0.95 },
+        // Scored findings list is empty (all higher-severity findings excluded).
+        audit_findings: [],
+        excluded_audit_findings: [
+          { severity: 'high', summary: 'broken retry guard', unverified: 'true' },
+          { severity: 'critical', summary: 'unsafe release path', unverified: 'true' },
+          { severity: 'medium', summary: 'missing null check', unverified: 'true' },
+          { severity: 'medium', summary: 'second medium', unverified: 'true' },
+        ],
+        audit_reconciliation: {
+          model_reported_score: 0.70,
+          findings_derived_score: 0.98,
+          score_delta: 0.28,
+          excluded_findings_count: 4,
+        },
+      },
+    });
+    // Part (1): the audit-score caveat names the excluded count and the divergence.
+    expect(result).toContain('Audit score caveat: audit sub-score reflects only verified findings; 4 higher-severity findings excluded for lacking verification; model-reported audit 0.70 vs findings-derived 0.98 (Δ0.28)');
+    // Part (2): the excluded findings are rendered, clearly marked unverified, sorted most-severe first and capped at 3.
+    expect(result).toContain('Excluded audit findings (UNVERIFIED — not confirmed blockers): critical: unsafe release path; high: broken retry guard; medium: missing null check (+1 more)');
+  });
+
+  it('omits the excluded-findings caveat and section when nothing was excluded', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        sub_scores: { audit: 0.74, test_erosion: 0.42, smoketest: 0.88 },
+        excluded_audit_findings: [],
+        audit_reconciliation: {
+          model_reported_score: 0.74,
+          findings_derived_score: 0.74,
+          score_delta: 0.0,
+          excluded_findings_count: 0,
+        },
+      },
+    });
+    expect(result).not.toContain('Audit score caveat:');
+    expect(result).not.toContain('Excluded audit findings');
+  });
+
+  it('renders test-erosion detail (deleted files + negative deltas) when carried', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.4,
+        test_erosion_detail: {
+          deleted_test_files: ['testing/test_foo.py', 'testing/test_bar.py'],
+          deleted_test_files_truncated: 3,
+          test_count_delta: -4,
+          assertion_delta: -12,
+        },
+      },
+    });
+    expect(result).toContain('Test erosion: deleted testing/test_foo.py, testing/test_bar.py (+3 more); -4 tests; -12 assertions');
+  });
+
+  it('renders smoketest detail (failed suite + named failing tests) when carried', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.4,
+        smoketest_detail: {
+          startup_failed: true,
+          failed_suite: 'startup',
+          failed_tests: ['boot_check', 'health_probe'],
+          failed_tests_truncated: 2,
+          passed: 1,
+          total: 5,
+        },
+      },
+    });
+    expect(result).toContain('Smoketest: startup suite failed; failed: boot_check, health_probe (+2 more)');
+  });
+
+  it('omits test-erosion and smoketest detail lines when absent', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.61,
+        test_erosion_detail: null,
+        smoketest_detail: null,
+        sub_scores: { audit: 0.74, test_erosion: 0.42, smoketest: 0.88 },
+      },
+    });
+    expect(result).not.toContain('Test erosion:');
+    expect(result).not.toContain('Smoketest:');
+  });
+
+  it('excludes a disabled smoketest dimension from the sub-scores line and binding selection', () => {
+    // smoketest_enabled=false → the smoketest 0.0 is a placeholder, not a real
+    // low score. It must not appear in the sub-scores line, and must never be
+    // chosen as the binding constraint even though its placeholder is the min.
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'promoted',
+        confidence: 0.93,
+        smoketest_enabled: false,
+        sub_scores: {
+          audit: 0.95,
+          test_erosion: 1.0,
+          smoketest: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.95, test_erosion=1.00 (binding=audit=0.95)');
+    expect(result).not.toContain('smoketest=');
+    expect(result).not.toContain('binding=smoketest');
+  });
+
+  it('reports a hard CI blocker (smoketest disabled) as the binding constraint, not a numeric minimum', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        smoketest_enabled: false,
+        blocker: 'ci_not_green',
+        sub_scores: {
+          audit: 0.0,
+          test_erosion: 0.0,
+          smoketest: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('binding=ci_not_green');
+    // The numeric-minimum binding form must NOT appear under a hard blocker.
+    expect(result).not.toContain('binding=audit=');
+    expect(result).not.toContain('binding=test_erosion=');
+    // Disabled smoketest stays excluded from the rendered sub-scores.
+    expect(result).not.toContain('smoketest=');
+  });
+
+  it('reports a test_file_deleted blocker as the binding constraint even when smoketest is enabled', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        blocker: 'test_file_deleted',
+        sub_scores: {
+          audit: 0.81,
+          test_erosion: 0.0,
+          smoketest: 0.62,
+        },
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.81, test_erosion=0.00, smoketest=0.62 (binding=test_file_deleted)');
+    expect(result).not.toContain('binding=test_erosion=');
+  });
+
+  it('surfaces CI blocker provenance (state and detail) alongside the blocker code', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        blocker: 'ci_unresolved',
+        ci_resolution: {
+          state: 'PENDING',
+          resolved_sha: 'abc123',
+          detail: 'build not started',
+        },
+        sub_scores: {
+          audit: 0.9,
+          test_erosion: 0.9,
+          smoketest: 0.9,
+        },
+      },
+    });
+    expect(result).toContain('binding=ci_unresolved');
+    expect(result).toContain('state: PENDING');
+    expect(result).toContain('build not started');
+  });
+
+  it('surfaces audit blocker provenance (missing reason) alongside the blocker code', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0,
+        blocker: 'audit_missing',
+        audit_missing_reason: 'empty_report',
+        sub_scores: {
+          audit: null,
+          test_erosion: 0.9,
+          smoketest: 0.9,
+        },
+      },
+    });
+    expect(result).toContain('binding=audit_missing');
+    expect(result).toContain('reason: empty_report');
+  });
+
+  it('identifies a genuine low audit score as the binding constraint (smoketest disabled, no blocker)', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 6,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        confidence: 0.55,
+        smoketest_enabled: false,
+        sub_scores: {
+          audit: 0.41,
+          test_erosion: 0.92,
+          smoketest: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('sub-scores: audit=0.41, test_erosion=0.92 (binding=audit=0.41)');
+    expect(result).not.toContain('smoketest=');
   });
 
   it('renders a pending last_qualification and instructs the agent NOT to re-emit qualify_request', () => {
@@ -1089,7 +1504,16 @@ describe('buildVersionPhaseSection', () => {
       version_number: 3,
       phase: 'stabilize',
       recent_versions: [
-        { version_number: 2, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.91 } },
+        {
+          version_number: 2,
+          status: 'promoted',
+          last_qualification: {
+            status: 'promoted',
+            confidence: 0.91,
+            sub_scores: { audit: 0.86, test_erosion: 0.73, smoketest: 0.49 },
+            audit_findings: [{ severity: 'high', summary: 'flaky audit step' }],
+          },
+        },
         { version_number: 1, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.85 } },
       ],
     });
@@ -1098,7 +1522,30 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('promoted');
     expect(result).toContain('qual=promoted');
     expect(result).toContain('confidence=0.91');
+    expect(result).toContain('binding=smoketest=0.49');
+    expect(result).toContain('Audit findings: high: flaky audit step');
     expect(result).toContain('v1');
+  });
+
+  it('renders recent_versions qualification details with smoketest as the binding dimension', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      recent_versions: [
+        {
+          version_number: 3,
+          status: 'promoted',
+          last_qualification: {
+            status: 'not_promoted',
+            confidence: 0.5,
+            sub_scores: { audit: 0.71, test_erosion: 0.64, smoketest: 0.31 },
+            audit_findings: [{ severity: 'medium', summary: 'startup-suite regression' }],
+          },
+        },
+      ],
+    });
+    expect(result).toContain('binding=smoketest=0.31');
+    expect(result).toContain('Audit findings: medium: startup-suite regression');
   });
 
   it('omits recent_versions gracefully when absent', () => {
@@ -1558,6 +2005,83 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
   });
 });
 
+// ── handleResearch — SYSTEM VERIFICATION rendering ───────────────────────────
+// The backend annotates the research payload with per-system code-existence
+// verdicts (system_verification). handleResearch must surface claimed-but-absent
+// and partial systems prominently so tactical research reasons about what
+// actually exists rather than trusting a stale design-doc status.
+describe('handleResearch — system verification prompt rendering', () => {
+  const SV_TASK_ID = 'sv-task-001';
+  const SV_GH_TOKEN = 'gh-token';
+  const SV_OWNER = 'owner';
+  const SV_REPO = 'repo';
+  const SV_WS = null;
+  const SV_STATUS_REF = () => ({ value: '' });
+  const SV_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('renders a SYSTEM VERIFICATION section flagging claimed-but-absent systems', async () => {
+    const payload = {
+      base_branch: 'main',
+      prompt: 'analyze',
+      system_verification: {
+        ghost: { status: 'claimed_absent', claimed_status: 'mature', present: [], missing: ['backend/app/ghost.py'] },
+      },
+    };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('# SYSTEM VERIFICATION');
+    expect(p).toContain('CLAIMED-BUT-ABSENT');
+    expect(p).toContain('backend/app/ghost.py');
+    expect(p).toContain('ghost');
+  });
+
+  it('renders partial systems under the partial heading', async () => {
+    const payload = {
+      base_branch: 'main',
+      prompt: 'analyze',
+      system_verification: {
+        half: { status: 'partial', claimed_status: 'functional', present: ['backend/app/real.py'], missing: ['backend/app/fake.py'] },
+      },
+    };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('PARTIAL');
+    expect(p).toContain('backend/app/fake.py');
+  });
+
+  it('omits the SYSTEM VERIFICATION section when no verification is present', async () => {
+    const payload = { base_branch: 'main', prompt: 'analyze' };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('# SYSTEM VERIFICATION');
+  });
+
+  it('surfaces the current direction verdict inside the architecture-context highlight', async () => {
+    const payload = {
+      base_branch: 'main',
+      prompt: 'analyze',
+      direction_design_context: {
+        system_id: 'sys-x',
+        verification: { status: 'claimed_absent', present: [], missing: ['backend/app/x.py'] },
+      },
+    };
+    await handleResearch(SV_TASK_ID, payload, SV_TASK, SV_GH_TOKEN, SV_OWNER, SV_REPO, SV_WS, SV_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('CODE VERIFICATION');
+    expect(p).toContain('CLAIMED-BUT-ABSENT');
+    expect(p).toContain('backend/app/x.py');
+  });
+});
+
 // ── Strategic executor prompt — step 1 / step 5 consistency (R4-LOW) ──────────
 //
 // R4-LOW: the executor prompt's step 1 ("read-and-pass `$(cat ...problem_model...)`,
@@ -1701,6 +2225,70 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(script).toContain('_call "set_evidence_progress"');
     // Usage string advertises the new op.
     expect(script).toContain('set-evidence-progress <json-or-file>');
+  });
+});
+
+// ── handlePlan greenfield bootstrap-from-goal mode ───────────────────────────
+// On an empty / near-empty repo the plan prompt must gain an explicit greenfield
+// branch that decomposes "build the foundation for the goal" and overrides the
+// no-op path (absent source is NOT a valid no_op_reason). A populated repo must
+// be unaffected — no greenfield branch, standard no-op guidance intact.
+describe('handlePlan greenfield bootstrap mode', () => {
+  const GF_TASK_ID = 'gf-task-001';
+  const GF_GH_TOKEN = 'gh-token';
+  const GF_OWNER = 'owner';
+  const GF_REPO = 'repo';
+  const GF_WS = null;
+  const GF_STATUS_REF = () => ({ value: '' });
+  const GF_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const GF_PAYLOAD = { base_branch: 'main', prompt: 'build the thing' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  afterEach(() => {
+    // Restore the module-default so other suites see an empty tree but
+    // verifyCloneDelivered still resolves a HEAD (rev-parse → stable sha).
+    vi.mocked(execFileSync).mockImplementation((_file: string, args?: unknown) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (a[0] === 'rev-parse') return 'deadbeefcafe0000' as never;
+      return Buffer.from('') as never;
+    });
+  });
+
+  it('injects the greenfield foundation branch when the tree is config-only', async () => {
+    // git ls-files returns only config/scaffolding → 0 source files → greenfield.
+    vi.mocked(execFileSync).mockReturnValue(
+      'package.json\nREADME.md\ntsconfig.json\n.gitignore\npnpm-lock.yaml\n' as never,
+    );
+    await handlePlan(GF_TASK_ID, GF_PAYLOAD, GF_TASK, GF_GH_TOKEN, GF_OWNER, GF_REPO, GF_WS, GF_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('GREENFIELD MODE');
+    expect(p).toContain('build the foundation for the project goal');
+    // No-op path must be overridden: absent source is not a valid no-op here.
+    expect(p).toContain('GREENFIELD CAVEAT');
+    expect(p).toContain('is NOT a valid no_op_reason');
+    // Standard no-op guidance is still present (greenfield branch is additive).
+    expect(p).toContain('no_op_reason');
+  });
+
+  it('omits the greenfield branch and keeps standard no-op guidance on a populated repo', async () => {
+    // git ls-files returns many real source files → well above the threshold.
+    const sourceFiles = Array.from({ length: 20 }, (_, i) => `src/module${i}.ts`).join('\n');
+    vi.mocked(execFileSync).mockReturnValue(sourceFiles as never);
+    await handlePlan(GF_TASK_ID, GF_PAYLOAD, GF_TASK, GF_GH_TOKEN, GF_OWNER, GF_REPO, GF_WS, GF_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('GREENFIELD MODE');
+    expect(p).not.toContain('GREENFIELD CAVEAT');
+    // Standard no-op guidance is untouched.
+    expect(p).toContain('no_op_reason');
+    expect(p).toContain('Affirmative no-op');
   });
 });
 
