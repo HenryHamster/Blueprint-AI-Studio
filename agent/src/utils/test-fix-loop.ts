@@ -510,7 +510,11 @@ export async function testFixLoop(
       }
     }
 
-    if (failures.length === 0) {
+    const reportableFailures = anyRealTestExecuted
+      ? failures.filter(failure => classifyTestExecution(failure.message) === 'ran')
+      : failures;
+
+    if (reportableFailures.length === 0) {
       // "No failures" is only a pass if we actually ran at least one
       // runner. If every runner hit setup errors (npm ci / spawn
       // timeout), tests didn't run — we can't claim they passed, and
@@ -543,14 +547,14 @@ export async function testFixLoop(
     // When baseline is available, separate new failures from pre-existing ones.
     // A failure block is pre-existing when all parsed test IDs within it appear
     // in the baseline. Unparseable failures (size=0) are treated as new (safe default).
-    let fixableFailures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = failures;
+    let fixableFailures: Array<{ label: string; message: string; structuredIds?: Set<string> }> = reportableFailures;
     let preExistingNote = '';
 
     if (baselineFailures) {
       const newFailures: typeof failures = [];
       const preExistingFailures: typeof failures = [];
 
-      for (const failure of failures) {
+      for (const failure of reportableFailures) {
         // Structured IDs (from vitest JSON reporter) win over stdout parsing.
         // Fall back to parseFailingTests only when JSON wasn't available.
         const failureIds = failure.structuredIds ?? parseFailingTests(failure.message);

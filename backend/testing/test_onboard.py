@@ -1461,6 +1461,9 @@ class TestBuildConfigDetection:
         web_resp.json.return_value = [{"name": "package.json", "type": "file"}] + [
             {"name": f"file{i}.ts", "type": "file"} for i in range(5)
         ]
+        # package.json content fetched right after the apps/web listing so the
+        # node detector can confirm a real ``scripts.test`` before emitting it.
+        web_package = _file_content_resp('{"scripts": {"test": "vitest"}}')
 
         api_resp = MagicMock()
         api_resp.status_code = 200
@@ -1471,7 +1474,14 @@ class TestBuildConfigDetection:
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp, apps_resp, services_resp, web_resp, api_resp],
+            side_effect=[
+                root_resp,
+                apps_resp,
+                services_resp,
+                web_resp,
+                web_package,
+                api_resp,
+            ],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1498,11 +1508,12 @@ class TestBuildConfigDetection:
             {"name": "app.py", "type": "file"},
             {"name": "index.ts", "type": "file"},
         ]
+        root_package = _file_content_resp('{"scripts": {"test": "jest"}}')
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp],
+            side_effect=[root_resp, root_package],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1572,11 +1583,13 @@ class TestBuildConfigDetection:
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = root_files
+        # Node detection now fetches package.json content; no scripts.test here.
+        root_package = _file_content_resp('{"name": "x"}')
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp],
+            side_effect=[root_resp, root_package],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -2037,6 +2050,106 @@ class TestFallbackTestEntrypointDetection:
         assert config["directories"] == []
 
     @pytest.mark.asyncio
+    async def test_node_package_with_test_script_emits_npm_test(self):
+        """package.json with a real ``scripts.test`` still emits ``npm test``."""
+        root = _listing_resp([{"name": "package.json", "type": "file"}])
+        package = _file_content_resp('{"scripts": {"test": "jest", "build": "tsc"}}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node = config["directories"][0]
+        assert node["type"] == "node"
+        assert node["install_cmd"] == "npm ci"
+        assert node["build_cmd"] == "npm run build"
+        assert node["test_cmd"] == "npm test"
+
+    @pytest.mark.asyncio
+    async def test_node_package_without_test_script_emits_no_test_cmd(self):
+        """package.json with no ``scripts.test`` keeps the build entry but emits
+        no ``test_cmd`` — so has_detectable_tests / the verdict read 'unverified'.
+        """
+        from app.ci_resolution import (
+            compute_merge_verification_verdict,
+            has_detectable_tests,
+        )
+
+        root = _listing_resp([{"name": "package.json", "type": "file"}])
+        package = _file_content_resp('{"scripts": {"lint": "eslint ."}}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node = config["directories"][0]
+        assert node["type"] == "node"
+        assert node["install_cmd"] == "npm ci"
+        assert node["build_cmd"] == "npm run build"
+        assert "test_cmd" not in node
+
+        project = MagicMock()
+        # No-CI repo: requires_ci_checks=False routes the verdict through the
+        # tests-gated/unverified branch, which now reflects the missing test_cmd.
+        config["requires_ci_checks"] = False
+        project.build_config = config
+        assert has_detectable_tests(project) is False
+        assert compute_merge_verification_verdict(project)["state"] == "unverified"
+
+    @pytest.mark.asyncio
+    async def test_node_package_no_scripts_key_emits_no_test_cmd(self):
+        """package.json with no ``scripts`` object at all emits no ``test_cmd``."""
+        root = _listing_resp([{"name": "package.json", "type": "file"}])
+        package = _file_content_resp('{"name": "pkg", "version": "1.0.0"}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node = config["directories"][0]
+        assert node["type"] == "node"
+        assert "test_cmd" not in node
+
+    @pytest.mark.asyncio
+    async def test_node_package_fetch_failure_emits_no_test_cmd(self):
+        """A failed package.json content fetch is treated as 'cannot confirm' —
+        the build entry is still emitted but without ``test_cmd``."""
+        root = _listing_resp([{"name": "package.json", "type": "file"}])
+        package = _file_content_resp("", status_code=404)
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node = config["directories"][0]
+        assert node["type"] == "node"
+        assert "test_cmd" not in node
+
+    @pytest.mark.asyncio
+    async def test_node_package_malformed_json_emits_no_test_cmd(self):
+        """An unparseable package.json body emits no ``test_cmd``."""
+        root = _listing_resp([{"name": "package.json", "type": "file"}])
+        package = _file_content_resp("{not valid json")
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node = config["directories"][0]
+        assert node["type"] == "node"
+        assert "test_cmd" not in node
+
+    @pytest.mark.asyncio
     async def test_core_python_manifest_takes_precedence_over_makefile(self):
         """A pyproject.toml + Makefile dir keeps pytest and never adds make test.
 
@@ -2127,9 +2240,14 @@ class TestSharedTestRunnerLayouts:
 
         root_resp = _listing_resp(_layout_root_listing(layout))
 
+        # The detector fetches the CONTENT of certain manifests before emitting
+        # a command: package.json (node ``scripts.test`` guard), composer.json
+        # (composer ``scripts.test`` guard) and Makefile (real ``test:`` target).
+        # Mirror those content fetches so the mock side-effect list stays in sync.
+        _CONTENT_FETCHED = {"package.json", "composer.json", "Makefile"}
         responses = [root_resp]
         for item in layout["files"]:
-            if item["path"] == "Makefile":
+            if item["path"] in _CONTENT_FETCHED:
                 responses.append(_file_content_resp(item.get("content", "")))
 
         with patch(

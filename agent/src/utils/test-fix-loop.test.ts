@@ -47,6 +47,8 @@ import { testFixLoop } from './test-fix-loop.js';
 import type { TestRunner } from './test-runners.js';
 
 const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
+const PLACEHOLDER_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/packages/a', label: 'npm test (packages/a)' };
+const REAL_RUNNER: TestRunner = { cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: '/tmp/workspace/packages/b', label: 'pytest (packages/b)' };
 const statusRef = { value: '' };
 
 describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () => {
@@ -111,5 +113,55 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
 
     expect(result.passed).toBe(true);
     expect(result.noTestsExecuted).toBe(false);
+  });
+
+  it('mixed real-pass + placeholder runner → placeholder is ignored and verdict stays green', async () => {
+    execFileAsync
+      .mockRejectedValueOnce(Object.assign(new Error('Command failed: npm test\nError: no test specified\nnpm ERR! Test failed.'), {}))
+      .mockResolvedValueOnce('Tests  3 passed (3)\nTest Files  1 passed (1)');
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [PLACEHOLDER_RUNNER, REAL_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.noTestsExecuted).toBe(false);
+  });
+
+  it('mixed real-fail + placeholder runner → real failure still blocks and placeholder is ignored', async () => {
+    execFileAsync
+      .mockRejectedValueOnce(new Error('Command failed: python3 -m pytest -x -q\nAssertionError: expected 1 to equal 2'))
+      .mockRejectedValueOnce(Object.assign(new Error('Command failed: npm test\nError: no test specified\nnpm ERR! Test failed.'), {}));
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER, PLACEHOLDER_RUNNER] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.noTestsExecuted).toBe(false);
+    expect(result.failureSummary).toContain('AssertionError');
+    expect(result.failureSummary).not.toContain('no test specified');
+  });
+
+  it('all-placeholder multi-runner → noTestsExecuted=true so the backend can fall back', async () => {
+    execFileAsync
+      .mockRejectedValueOnce(Object.assign(new Error('Command failed: npm test\nError: no test specified\nnpm ERR! Test failed.'), {}))
+      .mockRejectedValueOnce(Object.assign(new Error('Command failed: npm test\nError: no test specified\nnpm ERR! Test failed.'), {}));
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [PLACEHOLDER_RUNNER, { ...PLACEHOLDER_RUNNER, cwd: '/tmp/workspace/packages/c', label: 'npm test (packages/c)' }] },
+    );
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.noTestsExecuted).toBe(true);
   });
 });

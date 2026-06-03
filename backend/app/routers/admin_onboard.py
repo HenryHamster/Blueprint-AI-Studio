@@ -108,13 +108,17 @@ _MAKEFILE_TEST_TARGET_RE = re.compile(r"^test\s*:", re.MULTILINE)
 _CONVENTIONAL_TEST_SCRIPTS = ("test.sh", "run-tests.sh", "run_tests.sh")
 
 
-def _composer_defines_test_script(text: str | None) -> bool:
-    """True iff a ``composer.json`` body declares a non-empty ``scripts.test``.
+def _json_defines_test_script(text: str | None) -> bool:
+    """True iff a JSON manifest body declares a non-empty ``scripts.test``.
 
-    A bare ``composer.json`` is not enough to justify ``composer test`` — the
-    script must actually be defined, otherwise the command errors with
-    "Script test is not defined". The detector fetches the file CONTENT and
-    confirms the script exists before emitting the command.
+    Shared content-guard for the manifests whose test command is only runnable
+    when the script is actually declared: a bare ``composer.json`` does not
+    justify ``composer test`` ("Script test is not defined"), and a bare
+    ``package.json`` does not justify ``npm test`` (npm's default "no test
+    specified" placeholder runs no tests). The detector fetches the file
+    CONTENT and confirms ``scripts.test`` is present and non-empty before
+    emitting the command, mirroring the agent-side detector in
+    ``agent/src/utils/test-runners.ts``.
     """
     if not text:
         return False
@@ -242,6 +246,7 @@ async def _detect_build_config(
         languages: list[str],
         path: str,
         project_type: str,
+        node_has_test_script: bool = False,
     ) -> None:
         normalized_path = _normalized_directory_path(path)
         if any(
@@ -268,8 +273,14 @@ async def _detect_build_config(
                 "type": "node",
                 "install_cmd": "npm ci",
                 "build_cmd": "npm run build",
-                "test_cmd": "npm test",
             }
+            # Only gate the merge as "tests gated" when package.json actually
+            # declares a non-empty ``scripts.test`` — a bare package.json runs
+            # npm's "no test specified" placeholder, which executes no tests.
+            # Mirrors the composer.json / Makefile content-guards and the
+            # agent-side detector in agent/src/utils/test-runners.ts.
+            if node_has_test_script:
+                entry["test_cmd"] = "npm test"
             if path:
                 entry["lint_cmd"] = "npx eslint ."
             directories.append(entry)
@@ -298,7 +309,7 @@ async def _detect_build_config(
             )
             _record_language(languages, "rust")
 
-    def _detect_projects_in_listing(
+    async def _detect_projects_in_listing(
         path: str,
         listing: list[Dict[str, Any]],
         directories: list[Dict[str, Any]],
@@ -313,7 +324,20 @@ async def _detect_build_config(
         if {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini"} & names:
             _add_detected_directory(directories, languages, path, "python")
         if "package.json" in names:
-            _add_detected_directory(directories, languages, path, "node")
+            # Fetch + inspect package.json so ``npm test`` is only emitted when a
+            # real ``scripts.test`` exists (otherwise has_detectable_tests would
+            # claim "tests gated" for a package with no runnable suite).
+            package_path = f"{path}/package.json" if path else "package.json"
+            node_has_test_script = _json_defines_test_script(
+                await _fetch_file_text(package_path)
+            )
+            _add_detected_directory(
+                directories,
+                languages,
+                path,
+                "node",
+                node_has_test_script=node_has_test_script,
+            )
         if "go.mod" in names:
             _add_detected_directory(directories, languages, path, "go")
         if "Cargo.toml" in names:
@@ -423,7 +447,7 @@ async def _detect_build_config(
             return
         if "composer.json" in names:
             composer_path = f"{path}/composer.json" if path else "composer.json"
-            if _composer_defines_test_script(await _fetch_file_text(composer_path)):
+            if _json_defines_test_script(await _fetch_file_text(composer_path)):
                 _add_fallback_directory(path, "composer test")
                 return
 
@@ -474,7 +498,7 @@ async def _detect_build_config(
     # ``.github/workflows`` is reached at depth 2, within the scan bounds, so a
     # normal walk reads it for free alongside build-config detection.
     ci_workflow_found = False
-    _detect_projects_in_listing("", root_listing, directories, languages)
+    await _detect_projects_in_listing("", root_listing, directories, languages)
     await _detect_fallback_in_listing("", root_listing)
 
     pending_dirs = deque(
@@ -526,7 +550,7 @@ async def _detect_build_config(
             for item in sub_listing
         ):
             ci_workflow_found = True
-        _detect_projects_in_listing(subdir, sub_listing, directories, languages)
+        await _detect_projects_in_listing(subdir, sub_listing, directories, languages)
         await _detect_fallback_in_listing(subdir, sub_listing)
 
         child_dirs = sorted(
