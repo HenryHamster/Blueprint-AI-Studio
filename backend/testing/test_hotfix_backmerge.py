@@ -1555,6 +1555,219 @@ async def test_backmerge_autoreconcile_missing_schema_literal_falls_back(
 
 
 # ===========================================================================
+# Embedded renumber plan in the spawned dual-head resolver
+# ===========================================================================
+
+
+async def test_backmerge_single_collision_embeds_renumber_plan(db_session, mocker):
+    """A single-collision dual-head block hands the spawned resolver the CONCRETE,
+    already-validated renumber plan — both embedded in the prompt text (new
+    revision id, file being renamed, resulting EXPECTED_SCHEMA_REVISION) AND
+    stored as structured data under ``context['backmerge_renumber_plan']``. The
+    merge API is never called and exactly one resolver is spawned."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 600, "html_url": "http://pr/600"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # main carries the hotfix at 0002; automain carries its own feature at 0002 —
+    # the unambiguous single-collision case the planner mechanically reconciles.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+
+    # The structured plan is stored in context and matches the planner output.
+    expected_plan = await _plan_backmerge_migration_reconciliation(
+        "gh-token", "acme", "widget", 600, "automain", "main"
+    )
+    assert expected_plan is not None
+    plan = resolver.context["backmerge_renumber_plan"]
+    assert plan is not None
+    assert plan["new_revision"] == "0003"
+    assert plan["expected_schema_revision"] == "0003"
+    assert plan["old_path"] == "backend/alembic/versions/0002_feature.py"
+    assert plan["new_path"] == expected_plan["new_path"]
+    assert plan["new_down_revision"] == expected_plan["new_down_revision"]
+
+    # The concrete plan is embedded in the resolver prompt itself.
+    prompt = resolver.first_payload["prompt"]
+    assert "Known-good renumber plan" in prompt
+    assert "0003" in prompt  # the new revision id
+    assert "0002_feature.py" in prompt  # the file being renamed
+    assert "EXPECTED_SCHEMA_REVISION" in prompt
+    # Presented as a verify-then-apply candidate, not a blind apply.
+    assert "verify" in prompt.lower()
+
+
+async def test_backmerge_nonmechanical_block_falls_back_to_prose(db_session, mocker):
+    """A non-mechanical block (fan-out tail) yields a None plan, so the resolver
+    falls back to the existing prose guidance with NO embedded plan: no
+    "Known-good renumber plan" section in the prompt and
+    ``context['backmerge_renumber_plan']`` is None. The merge is still blocked
+    and exactly one resolver is spawned."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 601, "html_url": "http://pr/601"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # automain's colliding 0002_feature fans out into two children — no single
+    # linear tail, so the planner refuses (returns None).
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py", "0003_a.py", "0004_b.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        if path.endswith("0003_a.py"):
+            return _migration_source("0003", "0002")
+        if path.endswith("0004_b.py"):
+            return _migration_source("0004", "0002")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+
+    # No mechanical plan: context key present but None, prose prompt unchanged.
+    assert resolver.context["backmerge_renumber_plan"] is None
+    prompt = resolver.first_payload["prompt"]
+    assert "Known-good renumber plan" not in prompt
+    # The prose guidance is still present.
+    assert "alembic upgrade head" in prompt
+    assert "EXPECTED_SCHEMA_REVISION" in prompt
+
+
+async def test_backmerge_planner_exception_still_spawns_resolver(db_session, mocker):
+    """Fail-safe: a planner that RAISES must never crash the block path or prevent
+    the resolver spawn. The block still alerts and spawns exactly one prose-only
+    resolver (plan None in context), and the merge is never attempted."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 602, "html_url": "http://pr/602"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+    # The planner blows up — the block path must degrade to the prose resolver.
+    mocker.patch.object(
+        hb,
+        "_plan_backmerge_migration_reconciliation",
+        new=AsyncMock(side_effect=RuntimeError("planner exploded")),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+
+    # Exactly one Alert and one resolver, despite the planner failure.
+    assert len(await _alerts_for(db_session, project.id)) == 1
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+    assert resolver.context["backmerge_renumber_plan"] is None
+    assert "Known-good renumber plan" not in resolver.first_payload["prompt"]
+
+
+# ===========================================================================
 # _plan_backmerge_migration_reconciliation — unit (helper orchestration)
 # ===========================================================================
 
