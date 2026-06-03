@@ -189,6 +189,45 @@ def classify_merge_test_verdict(
     return ("fail", output or "Detected test suite failed (no output captured).")
 
 
+def build_no_ci_gate_ci_result(
+    outcome: MergeTestOutcome, detail: str = ""
+) -> dict[str, Any]:
+    """Map a no-CI merge-gate ``outcome`` to the ``ci_result`` dict the
+    orchestrator hands to ``handle_ci_completion``.
+
+    This is the load-bearing transition the orchestrator's inline no-CI gate
+    performs once it has a ``verify_tests`` verdict (a sibling to
+    ``classify_merge_test_verdict``, which produces that ``outcome``):
+
+      - ``"fail"``                  → ``conclusion="failure"`` so the existing
+                                      ``handle_ci_completion`` block-and-fix path
+                                      fires carrying ``detail`` as ``failed_logs``.
+                                      A blank ``detail`` falls back to a generic
+                                      message so the fix task is never spawned
+                                      with empty output.
+      - ``"pass"`` / ``"undetected"`` → ``conclusion="success"`` so the merge may
+                                      proceed (``"undetected"`` merges UNVERIFIED:
+                                      an absent-tests repo must still progress).
+
+    Extracted so a regression in this mapping — e.g. flipping ``fail`` back to a
+    merge-allowing ``success`` — fails a test rather than silently shipping
+    merge-without-checks.
+    """
+    if outcome == "fail":
+        return {
+            "status": "completed",
+            "conclusion": "failure",
+            "details": [],
+            "failed_logs": detail or "Detected test suite failed.",
+        }
+    return {
+        "status": "completed",
+        "conclusion": "success",
+        "details": [],
+        "failed_logs": "",
+    }
+
+
 ResolutionSource = Literal["branch_head", "merge_sha", "unresolved"]
 
 

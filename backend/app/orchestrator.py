@@ -5015,24 +5015,15 @@ async def orchestrator_worker():
                             if _v_recorded in ("pass", "undetected"):
                                 # Verdict already obtained on a prior poll —
                                 # proceed (idempotent until the merge lands).
-                                ci_result = {
-                                    "status": "completed",
-                                    "conclusion": "success",
-                                    "details": [],
-                                    "failed_logs": "",
-                                }
+                                ci_result = ci_resolution.build_no_ci_gate_ci_result(
+                                    _v_recorded
+                                )
                             elif _v_recorded == "fail":
                                 # Already classified failed — belt-and-suspenders
                                 # if we re-enter before ci_fix_spawned is set.
-                                ci_result = {
-                                    "status": "completed",
-                                    "conclusion": "failure",
-                                    "details": [],
-                                    "failed_logs": ci_loop.get(
-                                        "verify_tests_output",
-                                        "Detected test suite failed.",
-                                    ),
-                                }
+                                ci_result = ci_resolution.build_no_ci_gate_ci_result(
+                                    "fail", ci_loop.get("verify_tests_output", "")
+                                )
                             elif not _v_task_id:
                                 # First encounter: spawn verify_tests on PR head.
                                 _v_branch = _resolve_ci_fix_branch(
@@ -5186,12 +5177,6 @@ async def orchestrator_worker():
                                         f"detected test suite PASSED — proceeding to "
                                         f"merge (subject to review gate)"
                                     )
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "success",
-                                        "details": [],
-                                        "failed_logs": "",
-                                    }
                                 elif _outcome == "fail":
                                     logger.warning(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "
@@ -5199,12 +5184,6 @@ async def orchestrator_worker():
                                         f"merge, spawning fix with failing output"
                                     )
                                     ci_loop["verify_tests_output"] = _detail[:4000]
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "failure",
-                                        "details": [],
-                                        "failed_logs": _detail,
-                                    }
                                 else:
                                     # detected=false or no usable verdict (verify
                                     # task crashed / produced no artifact): fall
@@ -5217,12 +5196,9 @@ async def orchestrator_worker():
                                         f"{_verify_task.status}) — merge proceeding "
                                         f"UNVERIFIED"
                                     )
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "success",
-                                        "details": [],
-                                        "failed_logs": "",
-                                    }
+                                ci_result = ci_resolution.build_no_ci_gate_ci_result(
+                                    _outcome, _detail
+                                )
                                 # Persist the recorded verdict before
                                 # handle_ci_completion re-reads task.context.
                                 ci_task.context = {

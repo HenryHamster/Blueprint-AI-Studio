@@ -206,6 +206,40 @@ def test_classify_verdict_none_is_undetected():
     )
 
 
+# ---------------------------------------------------------------------------
+# build_no_ci_gate_ci_result — outcome → ci_result the orchestrator hands to
+# handle_ci_completion. This is the live transition the orchestrator's inline
+# no-CI gate performs; pinning it here means a regression that flips a blocking
+# `fail` into a merge-allowing `success` fails a test.
+# ---------------------------------------------------------------------------
+def test_build_ci_result_fail_blocks_merge_with_detail():
+    result = ci_resolution.build_no_ci_gate_ci_result("fail", "FAILED test_add")
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "failure"
+    assert result["failed_logs"] == "FAILED test_add"
+
+
+def test_build_ci_result_fail_blank_detail_gets_fallback_message():
+    # A failing verdict must never spawn a fix with empty output.
+    result = ci_resolution.build_no_ci_gate_ci_result("fail", "")
+    assert result["conclusion"] == "failure"
+    assert result["failed_logs"] == "Detected test suite failed."
+
+
+def test_build_ci_result_pass_proceeds_to_merge():
+    result = ci_resolution.build_no_ci_gate_ci_result("pass")
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "success"
+    assert result["failed_logs"] == ""
+
+
+def test_build_ci_result_undetected_proceeds_unverified():
+    # detected=false / no usable verdict → proceed-without-checks (merge UNVERIFIED).
+    result = ci_resolution.build_no_ci_gate_ci_result("undetected")
+    assert result["conclusion"] == "success"
+    assert result["failed_logs"] == ""
+
+
 @pytest.mark.asyncio
 async def test_branch_head_has_checks_returns_branch_head_source(mocker):
     """Normal case: branch HEAD carries a completed green build → resolved on the

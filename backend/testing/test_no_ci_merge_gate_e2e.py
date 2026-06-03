@@ -17,9 +17,21 @@ the load-bearing contract the orchestrator's inline no-CI gate
 refactor cannot silently regress external-repo verification back to
 merge-without-checks.
 
-The orchestrator glue is mirrored verbatim: on a ``fail`` verdict it sets
-``ci_result={"status":"completed","conclusion":"failure","failed_logs":detail}``;
-on ``pass``/``undetected`` it sets a ``conclusion":"success"`` result.
+The orchestrator's verdict→``ci_result`` transition is no longer mirrored as a
+copied literal here: the orchestrator builds the ``ci_result`` via
+``ci_resolution.build_no_ci_gate_ci_result(outcome, detail)`` and these tests
+call that SAME helper, so a regression in the live mapping (e.g. flipping a
+``fail`` back to a merge-allowing ``success``) fails this flow rather than
+passing against a stale hand-copy.
+
+Beyond the terminal pass / fail / undetected outcomes, the gate's *awaiting*
+transition is exercised too: a freshly-spawned ``verify_tests`` task is
+non-terminal (QUEUED), and while it runs the orchestrator's terminal guard
+(``status in {COMPLETED, FAILED, CANCELLED}``) is unmet — so the gate must
+read no verdict and attempt no merge until the task terminalizes. That poll is
+driven through the real verify-task lifecycle (QUEUED → COMPLETED) and the real
+artifact reader so a regression that classifies a still-running verify task —
+or merges before its verdict lands — fails this flow.
 """
 
 import json
@@ -30,6 +42,7 @@ from sqlalchemy import select
 
 from app.ci_completion import handle_ci_completion
 from app.ci_resolution import (
+    build_no_ci_gate_ci_result,
     classify_merge_test_verdict,
     should_run_no_ci_test_gate,
 )
@@ -191,14 +204,11 @@ async def test_no_ci_failing_suite_blocks_merge_and_spawns_fix_with_output(
     assert outcome == "fail"
     assert "test_add" in detail
 
-    # (5) Build the ci_result the orchestrator glue hands to handle_ci_completion
-    #     on a fail verdict (orchestrator.py ~5039).
-    ci_result = {
-        "status": "completed",
-        "conclusion": "failure",
-        "details": [],
-        "failed_logs": detail,
-    }
+    # (5) Build the ci_result the orchestrator hands to handle_ci_completion via
+    #     the SAME helper the orchestrator's inline gate calls — not a hand-copy.
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+    assert ci_result["failed_logs"] == detail
 
     # Re-lock parent as EVALUATING (verify spawn committed; parent still EVALUATING).
     parent = await db_session.get(Task, parent.id)
@@ -279,19 +289,109 @@ async def test_no_ci_passing_suite_proceeds_to_merge(db_session, mocker):
     assert outcome == "pass"
     assert detail == ""
 
-    # Orchestrator pass-verdict ci_result (orchestrator.py ~5026).
-    ci_result = {
-        "status": "completed",
-        "conclusion": "success",
-        "details": [],
-        "failed_logs": "",
-    }
+    # Orchestrator pass-verdict ci_result, built via the real gate helper.
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
 
     parent = await db_session.get(Task, parent.id)
     acted = await handle_ci_completion(
         parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
     )
 
+    assert acted is True
+    merge_mock.assert_called_once()
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+
+# The orchestrator's terminal guard: a verify_tests task is classified only once
+# it reaches one of these states. While QUEUED / IN_PROGRESS the no-CI gate
+# leaves ci_result PENDING and keeps polling (orchestrator.py ~5118-5159).
+_VERIFY_TERMINAL = {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+
+
+# ---------------------------------------------------------------------------
+# 2b. Awaiting-verdict poll: while verify_tests is still running the gate keeps
+#     polling (no classify, no merge); once it terminates the verdict is read.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_ci_awaiting_verdict_while_verify_running_then_passes(
+    db_session, mocker
+):
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+    # First poll: spawn verify_tests on the PR head. It is created QUEUED —
+    # non-terminal — exactly as the orchestrator's first-encounter branch does.
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+    assert verify_task.status == TaskStatus.QUEUED
+
+    # ── Awaiting-verdict poll ───────────────────────────────────────────────
+    # While the verify task is still running the orchestrator's terminal guard
+    # is unmet, so the gate neither reads a verdict nor builds a ci_result — it
+    # keeps polling. Drive that exact guard with the real artifact reader: no
+    # MERGE_TEST_RESULT has been posted yet, so there is nothing to classify.
+    assert verify_task.status not in _VERIFY_TERMINAL
+    pending_verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    assert pending_verdict is None, (
+        "no verdict must be readable while verify_tests is still running — "
+        "the gate must keep polling, not classify a missing artifact"
+    )
+    # The merge must NOT have been attempted on the awaiting poll.
+    merge_mock.assert_not_called()
+
+    # ── Terminal poll ───────────────────────────────────────────────────────
+    # The agent finishes: plant a PASSING verdict and mark the task COMPLETED.
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "tests/test_math.py::test_add", "passed": True}],
+            "output": "1 passed in 0.10s",
+        },
+    )
+    await db_session.refresh(verify_task)
+    assert verify_task.status in _VERIFY_TERMINAL
+
+    # Now the guard is satisfied: read + classify + build the ci_result via the
+    # SAME helpers the orchestrator's terminal branch calls.
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "pass"
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
     assert acted is True
     merge_mock.assert_called_once()
     await db_session.refresh(parent)
@@ -340,13 +440,9 @@ async def test_no_ci_no_detectable_tests_falls_back_to_proceed_without_checks(
     ], "no verify_tests task should be spawned when no suite is detectable"
 
     # Fallback proceed-without-checks: the orchestrator builds a success
-    # ci_result and the merge proceeds UNVERIFIED.
-    ci_result = {
-        "status": "completed",
-        "conclusion": "success",
-        "details": [],
-        "failed_logs": "",
-    }
+    # ci_result via the real gate helper and the merge proceeds UNVERIFIED.
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
     parent = await db_session.get(Task, parent.id)
     acted = await handle_ci_completion(
         parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
