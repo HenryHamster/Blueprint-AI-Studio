@@ -393,6 +393,202 @@ async def test_requeue_limit_records_direction_result_on_non_infra_failure(tl_db
 
 
 @pytest.mark.asyncio
+async def test_requeue_limit_blocks_when_all_failed_children_blocked_precondition(
+    tl_db, mocker
+):
+    """Parent at the requeue limit whose only failed child is BLOCKED_PRECONDITION
+    transitions to the recoverable BLOCKED state — not force-FAILED with a
+    confabulated CODE_ERROR category — and raises a precondition-blocker alert.
+    Mirrors the all-children-terminal sweep treatment in the limit path.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    # FAILED child whose status message routes to BLOCKED_PRECONDITION.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: upstream PR #42 not yet merged",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert parent.status != TaskStatus.FAILED
+    # Budget-exempt precondition class retained for historical consumers.
+    assert parent.context.get("failure_category") == "BLOCKED_PRECONDITION"
+    assert parent.blocker_kind == "upstream_dependency"
+    # A precondition-blocker alert is surfaced.
+    precondition_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(precondition_alerts) == 1
+    assert precondition_alerts[0].severity == AlertSeverity.WARNING
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_blocks_when_child_in_first_class_blocked_state(
+    tl_db, mocker
+):
+    """Parent at the requeue limit with a first-class BLOCKED child (invisible to
+    the old FAILED-only query) transitions to BLOCKED, not FAILED."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_fails_when_genuine_and_blocked_children_mixed(
+    tl_db, mocker
+):
+    """Parent at the requeue limit with a genuine CODE_ERROR child alongside a
+    blocked sibling still FAILS — with the worst GENUINE category, not the
+    CODE_ERROR fallback derived from blocked/empty input."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    # Genuine failure with a known category.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={"failure_category": "CODE_ERROR"},
+        latest_status_message="tests failed",
+    )
+    # Blocked-on-precondition sibling — must not force the parent to BLOCKED.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert parent.context.get("failure_category") == "CODE_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_fails_when_genuine_cancelled_child_present(tl_db, mocker):
+    """Parent at the requeue limit with a genuine (non-superseded) CANCELLED child
+    still FAILS — a genuine cancellation prevents parking as BLOCKED."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.BLOCKED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: dep not landed",
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"failure_detail": "review_cap_exhausted"},
+        latest_status_message="Cancelled after review cap exhausted",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_records_no_direction_failure_when_blocked(tl_db, mocker):
+    """A parent that hits the requeue limit but parks as BLOCKED must NOT record a
+    direction-health failure (the blocked verdict is budget-exempt)."""
+    import app.shared_state as _ss
+    from app.routers.agent_status import _recorded_task_ids
+
+    _ss.direction_failure_streaks.clear()
+    _recorded_task_ids.clear()
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3, "direction_id": "d-blocked-7"},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        latest_status_message="BLOCKER: upstream PR not yet merged",
+    )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.BLOCKED
+    assert _ss.direction_failure_streaks.get("d-blocked-7") is None
+
+
+@pytest.mark.asyncio
 async def test_requeue_same_class_consecutive_failures_reduces_budget(tl_db):
     """Two consecutive CODE_ERROR failures reduce effective budget to 2."""
     session, _ = tl_db

@@ -49,6 +49,86 @@ def _record_parent_failure(parent: Task, failure_class: str) -> None:
         )
 
 
+async def _maybe_block_on_preconditions(
+    parent: Task,
+    children: list,
+    blocked_count: int,
+    session: AsyncSession,
+    broadcast_to_project,
+) -> bool:
+    """Shared blocked-vs-genuine-failure verdict for both parent terminal paths.
+
+    Distinguishes blocked-on-precondition (recoverable, not a failure) from a
+    genuine terminal failure. A child counts as "blocked" if it is in the
+    first-class BLOCKED state OR (legacy/compat) was a FAILED child classified as
+    BLOCKED_PRECONDITION — the caller passes that tally in ``blocked_count``.
+    Genuine FAILED children are terminal failures; CANCELLED children only count
+    as terminal failures when they are genuine cancellations (review cap
+    exhausted, fix-loop diverged, operator/manual cancel, etc.), not historical
+    "Parent requeued — replaced by retry" bookkeeping rows.
+
+    When every unsucceeded subtask is waiting on an upstream precondition and
+    none genuinely failed, move the parent into the first-class BLOCKED state (no
+    retry-budget burn, no direction-health ding), surface ONE deduplicated,
+    operator-visible precondition-blocker alert, and return True. Recovery is
+    owned by the auto-unblock sweep. Otherwise return False so the caller drives
+    the parent to FAILED.
+
+    Centralizing the verdict here keeps the requeue-limit path and the
+    all-children-terminal sweep from silently drifting apart.
+    """
+    from app.direction_outcomes import _is_non_genuine_cancelled
+
+    failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+    blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
+    genuine_cancelled_children = [
+        c
+        for c in children
+        if c.status == TaskStatus.CANCELLED and not _is_non_genuine_cancelled(c)
+    ]
+    genuine_failures = (
+        len(failed_children) - blocked_count + len(genuine_cancelled_children)
+    )
+    total_blocked = blocked_count + len(blocked_children)
+
+    if total_blocked <= 0 or genuine_failures > 0:
+        return False
+
+    from app.task_blocked import enter_blocked_state
+
+    msg = (
+        f"All {total_blocked} subtask(s) blocked on upstream "
+        f"precondition — awaiting recheck"
+    )
+    enter_blocked_state(
+        parent,
+        waiting_on="subtask precondition",
+        reason=msg,
+        source="parent",
+    )
+    parent.latest_status_message = msg
+    session.add(parent)
+    await session.commit()
+    from app.alert_dispatch import _maybe_create_precondition_blocker_alert
+
+    await _maybe_create_precondition_blocker_alert(
+        parent,
+        session,
+        blocker_kind="upstream dependency",
+        detail=parent.latest_status_message,
+    )
+    await broadcast_to_project(
+        str(parent.project_id),
+        "task_updated",
+        {"task_id": str(parent.id), "status": TaskStatus.BLOCKED},
+    )
+    logger.warning(
+        f"[REQUEUE] Parent {parent.id} BLOCKED — all {total_blocked} "
+        f"subtask(s) blocked on upstream precondition"
+    )
+    return True
+
+
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
     """Re-evaluate a parent task by retrying its failed children.
     Cancels FAILED children and clones them as new QUEUED tasks.
@@ -78,19 +158,47 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             f"[REQUEUE] Parent {parent.id} hit re-evaluation limit "
             f"({requeue_count}/{effective_max} attempts) — failing permanently"
         )
-        parent.status = TaskStatus.FAILED
-        failed_children = (
-            (
-                await session.execute(
-                    select(Task).where(
-                        Task.parent_task_id == parent.id,
-                        Task.status == TaskStatus.FAILED,
-                    )
-                )
-            )
+        # Fetch ALL children (not just FAILED) so first-class BLOCKED subtasks are
+        # visible to the blocked-vs-failed verdict — the old FAILED-only query made
+        # them invisible and force-failed parents that were merely blocked.
+        children = (
+            (await session.execute(select(Task).where(Task.parent_task_id == parent.id)))
             .scalars()
             .all()
         )
+        failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+
+        # Split genuine failures from precondition-blocked FAILED children by
+        # classifying each one — a FAILED child whose failure class is
+        # BLOCKED_PRECONDITION is waiting on an upstream precondition, not a
+        # genuine code failure. ``worst_child_failure_category`` must see only the
+        # genuine failures so a blocked-only child set doesn't fall back to a
+        # confabulated CODE_ERROR category.
+        genuine_failed_children = []
+        limit_blocked_count = 0
+        for _fc in failed_children:
+            _fc_logs = (_fc.context or {}).get("last_error", "")
+            _fc_class = classify_failure(
+                _fc,
+                logs=_fc_logs or None,
+                at_time=_fc.vm_stopped_at or _fc.last_heartbeat,
+            )
+            if _fc_class == "BLOCKED_PRECONDITION":
+                limit_blocked_count += 1
+            else:
+                genuine_failed_children.append(_fc)
+
+        # Shared verdict: if every unsucceeded subtask is blocked on an upstream
+        # precondition, the parent is recoverable-BLOCKED (no retry-budget burn,
+        # no direction-health ding) — not force-failed. Mirrors the
+        # all-children-terminal sweep below.
+        if await _maybe_block_on_preconditions(
+            parent, children, limit_blocked_count, session, broadcast_to_project
+        ):
+            return 0
+
+        # Genuine failure(s) and/or cancellation(s) present — fail permanently.
+        parent.status = TaskStatus.FAILED
 
         # Surface divergence cause in the status message when available so
         # operators on the kanban immediately see why the task was abandoned.
@@ -114,7 +222,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             persist_failure_category,
         )
 
-        worst_cat = worst_child_failure_category(failed_children)
+        worst_cat = worst_child_failure_category(genuine_failed_children)
         persist_failure_category(parent, worst_cat)
         _record_parent_failure(parent, worst_cat)
         session.add(parent)
@@ -533,76 +641,19 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             for c in children
         )
         if not has_completed and not has_active:
-            # All children terminal and none succeeded. Distinguish blocked-on-
-            # precondition (recoverable, not a failure) from genuine failure. A
-            # child counts as "blocked" if it is in the first-class BLOCKED state
-            # OR (legacy/compat) FAILED with the BLOCKED_PRECONDITION class
-            # captured in pass 1 (``blocked_count``). Genuine FAILED children are
-            # the terminal failures. CANCELLED children only count as terminal
-            # failures when they are genuine cancellations (review cap exhausted,
-            # fix-loop diverged, operator/manual cancel, etc.), not historical
-            # "Parent requeued — replaced by retry" bookkeeping rows.
+            # All children terminal and none succeeded. Defer the blocked-vs-
+            # genuine-failure verdict to the shared helper (also used by the
+            # requeue-limit path) so the two terminal paths cannot drift apart.
+            # ``blocked_count`` carries the FAILED children pass 1 classified as
+            # BLOCKED_PRECONDITION.
             from app.failure_classification import (
                 AGENT_TIMEOUT,
                 persist_failure_category,
             )
-            from app.direction_outcomes import _is_non_genuine_cancelled
 
-            failed_children = [c for c in children if c.status == TaskStatus.FAILED]
-            blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
-            genuine_cancelled_children = [
-                c
-                for c in children
-                if c.status == TaskStatus.CANCELLED
-                and not _is_non_genuine_cancelled(c)
-            ]
-            genuine_failures = (
-                len(failed_children) - blocked_count + len(genuine_cancelled_children)
-            )
-            total_blocked = blocked_count + len(blocked_children)
-
-            if total_blocked > 0 and genuine_failures <= 0:
-                # Every unsucceeded subtask is waiting on an upstream
-                # precondition — the parent is not a failure, it is BLOCKED.
-                # Move it into the first-class BLOCKED state (no retry-budget
-                # burn, no direction-health ding) and surface ONE deduplicated,
-                # operator-visible precondition-blocker alert instead of a
-                # generic terminal FAILED. Recovery is owned by the auto-unblock
-                # sweep.
-                from app.task_blocked import enter_blocked_state
-
-                msg = (
-                    f"All {total_blocked} subtask(s) blocked on upstream "
-                    f"precondition — awaiting recheck"
-                )
-                enter_blocked_state(
-                    parent,
-                    waiting_on="subtask precondition",
-                    reason=msg,
-                    source="parent",
-                )
-                parent.latest_status_message = msg
-                session.add(parent)
-                await session.commit()
-                from app.alert_dispatch import (
-                    _maybe_create_precondition_blocker_alert,
-                )
-
-                await _maybe_create_precondition_blocker_alert(
-                    parent,
-                    session,
-                    blocker_kind="upstream dependency",
-                    detail=parent.latest_status_message,
-                )
-                await broadcast_to_project(
-                    str(parent.project_id),
-                    "task_updated",
-                    {"task_id": str(parent.id), "status": TaskStatus.BLOCKED},
-                )
-                logger.warning(
-                    f"[REQUEUE] Parent {parent.id} BLOCKED — all {total_blocked} "
-                    f"subtask(s) blocked on upstream precondition"
-                )
+            if await _maybe_block_on_preconditions(
+                parent, children, blocked_count, session, broadcast_to_project
+            ):
                 return 0
 
             parent.status = TaskStatus.FAILED
