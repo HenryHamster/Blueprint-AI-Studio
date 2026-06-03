@@ -2146,12 +2146,17 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(
 
 
 @pytest.mark.asyncio
-async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker):
-    """When every child is CANCELLED (none completed, none failed), the
-    parent transitions to CANCELLED with a message noting all subtasks
-    were cancelled. No rollup PR is created."""
+async def test_all_children_genuinely_cancelled_marks_parent_failed(cleanup_db, mocker):
+    """When every child is a GENUINE cancel (none completed, none failed, no
+    non-genuine markers), the rollup finalizer now routes through the shared
+    terminal verdict and finalizes the parent FAILED — matching the
+    requeue/reaper path (test_requeue_all_cancelled_children_marks_parent_failed)
+    instead of the old quiet CANCELLED that silently disagreed across sweeps.
+    No rollup PR is created."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mock_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -2195,8 +2200,11 @@ async def test_all_children_cancelled_marks_parent_cancelled(cleanup_db, mocker)
     await _check_and_trigger_rollup(child1, cleanup_db)
 
     await cleanup_db.refresh(parent)
-    assert parent.status == TaskStatus.CANCELLED
+    assert parent.status == TaskStatus.FAILED
     assert "cancelled" in (parent.latest_status_message or "").lower()
+    # Genuine all-cancelled is a terminal failure in BOTH sweeps — alert fires.
+    assert parent.context.get("failure_category") == "AGENT_TIMEOUT"
+    mock_alert.assert_awaited()
     mock_create_pr.assert_not_called()
 
 

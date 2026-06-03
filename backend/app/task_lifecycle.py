@@ -202,6 +202,8 @@ from app.retry_prompt import (  # noqa: E402, F401, RUF100
 from app.task_lifecycle_requeue import (  # noqa: E402, F401, RUF100
     _record_parent_failure,
     _requeue_parent_task,
+    _resolve_terminal_parent_verdict,
+    _terminate_all_non_genuine_cancelled,
 )
 
 
