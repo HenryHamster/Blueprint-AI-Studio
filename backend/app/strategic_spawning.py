@@ -38,7 +38,6 @@ from app.shared_state import (
     get_project_promotion_target,
     runtime_config as _runtime_config,
 )
-from app.strategic_constants import MIN_HEALTHY_ACTIVE_DIRECTIONS
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -47,38 +46,43 @@ logger = logging.getLogger(__name__)
 def _build_parallelism_hint(
     active_count: int, max_concurrent_vms: int, max_active_directions: int
 ) -> str:
-    """Advisory prompt hint surfaced to the strategic agent when its active-
-    direction count caps fleet parallelism well below capacity.
+    """Advisory prompt hint nudging the strategist to keep enough INDEPENDENT
+    direction lanes open to use the fleet.
 
     Each active direction is one parallel work-lane (research/plan dispatch fans
     out per-direction), so the active-direction count — not the VM cap — is the
-    real ceiling on how much of the fleet works at once. Returns "" when the lane
-    count is healthy, or when fleet capacity itself is the limit (so we never nag
-    about <floor directions on a 1-2 VM fleet). Quality-framed: it nudges toward
-    opening lanes for *worthwhile* parallel work, not hitting a number.
+    real ceiling on how much of the fleet works at once. The target is derived
+    from existing config, never hardcoded: aim for the operator's own
+    ``max_active_directions`` ceiling, clamped by ``max_concurrent_vms`` so a
+    small fleet is never told to open lanes it cannot run. Returns "" once the
+    lane count reaches that target. Quality-framed: it asks the agent to
+    decompose the version goal into independent, non-overlapping workstreams —
+    so the added lanes are *more parallelism, not more conflict* — rather than to
+    hit a number.
     """
-    floor = MIN_HEALTHY_ACTIVE_DIRECTIONS
+    target = max_active_directions
     if max_concurrent_vms:
-        floor = min(floor, max_concurrent_vms)
-    if active_count >= floor:
+        target = min(target, max_concurrent_vms)
+    if active_count >= target:
         return ""
     cap_clause = (
-        f" the fleet can run up to ~{max_concurrent_vms} VMs at once, so"
+        f" the fleet can run ~{max_concurrent_vms} VMs at once and"
         if max_concurrent_vms
         else ""
     )
     return (
-        f"PARALLELISM: You currently have {active_count} active direction(s). "
-        f"Research/plan work fans out PER ACTIVE DIRECTION, so your active-"
-        f"direction count — not the VM cap — is the effective ceiling on how much "
-        f"of the fleet works at once;{cap_clause} most of that capacity is idle "
-        f"right now. If there is worthwhile parallel work (e.g. hardening or "
-        f"auditing systems you've already built this version), opening additional "
-        f"directions converts idle capacity into progress. Do not stay narrow "
-        f"solely because one direction is load-bearing — only keep the count low "
-        f"if there is genuinely no other valuable work to run in parallel "
-        f"(aim for at least {MIN_HEALTHY_ACTIVE_DIRECTIONS} active directions; "
-        f"ceiling is {max_active_directions})."
+        f"PARALLELISM: You have {active_count} active direction(s);{cap_clause} "
+        f"each active direction is an independent work-lane, so most of that "
+        f"capacity is idle right now. Decompose the version goal into as many "
+        f"INDEPENDENT, non-overlapping workstreams as genuinely exist — each "
+        f"touching different subsystems/files so their work lands without "
+        f"colliding — and open a direction for each. Lean toward opening more "
+        f"lanes than fewer. Keep them disjoint: if two directions would touch the "
+        f"same code, mark them conflicts_with (to sequence) or merge them; retire "
+        f"stale ones. Only stay narrow if there is genuinely no further "
+        f"independent valuable work, or the rest depends on a load-bearing "
+        f"direction landing first (room for up to {max_active_directions} active "
+        f"directions)."
     )
 
 
