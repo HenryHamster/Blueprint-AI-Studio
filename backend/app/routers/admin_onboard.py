@@ -723,6 +723,7 @@ async def onboard_project(
 
     # Auto-detect build config from the same branch Blueprint stores as trunk.
     build_config: Dict[str, Any] = {}
+    detection_completed = False
     try:
         build_config = await _detect_build_config(
             token,
@@ -730,6 +731,10 @@ async def onboard_project(
             payload.github_repo,
             ref=default_branch,
         )
+        # A successful detection always returns a non-empty dict (it carries
+        # detected_at/repo_is_empty/has_ci); an empty/falsy result means the
+        # repo-contents listing came back non-200 (transient GitHub failure).
+        detection_completed = bool(build_config)
     except Exception as e:
         logger.error(
             "[ONBOARD] Build config detection failed for %s/%s on ref %s: %s",
@@ -739,6 +744,16 @@ async def onboard_project(
             e,
             exc_info=True,
         )
+
+    # When detection did not complete (transient GitHub 5xx/rate-limit/network
+    # blip or a non-200 listing), persist a durable marker so the idempotent
+    # landing-time auto-refresh re-detects this repo once GitHub is reachable
+    # again — instead of leaving a no-CI repo permanently un-gated. A detection
+    # that completed and genuinely found no tests is NOT flagged (it set
+    # repo_is_empty/has_ci), so a legitimately test-less repo is never re-scanned
+    # on every landing.
+    if not detection_completed:
+        build_config["detection_incomplete"] = True
 
     # Seed per-project task-branch namespace. Operator overrides can still
     # replace it, but later project PATCH/re-detect flows intentionally preserve

@@ -22,6 +22,7 @@ vi.mock('fs', () => ({
   default: {
     existsSync: vi.fn(() => false),
     readFileSync: vi.fn(() => ''),
+    readdirSync: vi.fn(() => []),
   },
 }));
 
@@ -31,6 +32,7 @@ vi.mock('fs', () => ({
 const mockFs = fs as unknown as {
   existsSync: ReturnType<typeof vi.fn>;
   readFileSync: ReturnType<typeof vi.fn>;
+  readdirSync: ReturnType<typeof vi.fn>;
 };
 
 // child_process.execSync is used only by isDockerAvailable — always return normally
@@ -344,6 +346,212 @@ describe('detectTestRunners — generic external-repo fallbacks (make/tox/nox/sc
     const runners = detectTestRunners(undefined);
 
     // The Blueprint-specific backend runner wins; the make fallback never fires.
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('bash');
+    expect(runners[0].args[0]).toBe('scripts/test-backend.sh');
+  });
+});
+
+describe('detectTestRunners — nested monorepo / external layouts', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+    mockFs.readdirSync.mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('services/api/pyproject.toml (pytest) → python3 -m pytest at services/api', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/services' || p.endsWith('/services/api/pyproject.toml'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['api'] : [],
+    );
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('pyproject.toml') ? '[tool.pytest.ini_options]\n' : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/services/api');
+  });
+
+  it('apps/web/package.json with scripts.test → npm test at apps/web', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/apps' || p.endsWith('/apps/web/package.json'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/apps') ? ['web'] : [],
+    );
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('package.json') ? JSON.stringify({ scripts: { test: 'vitest run' } }) : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('npm');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/apps/web');
+  });
+
+  it('apps/web/package.json WITHOUT scripts.test → no runner (conservative fall-through)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/apps' || p.endsWith('/apps/web/package.json'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/apps') ? ['web'] : [],
+    );
+    fs.readFileSync.mockImplementation((p: string) =>
+      p.endsWith('package.json') ? JSON.stringify({ scripts: { build: 'tsc' } }) : '',
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('packages/core/Cargo.toml → cargo test; packages/svc/go.mod → go test ./...', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/packages' ||
+      p.endsWith('/packages/core/Cargo.toml') ||
+      p.endsWith('/packages/svc/go.mod'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/packages') ? ['core', 'svc'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(2);
+    const byCwd = Object.fromEntries(runners.map(r => [r.cwd, r]));
+    expect(byCwd['/tmp/workspace/packages/core'].cmd).toBe('cargo');
+    expect(byCwd['/tmp/workspace/packages/core'].args).toEqual(['test']);
+    expect(byCwd['/tmp/workspace/packages/svc'].cmd).toBe('go');
+    expect(byCwd['/tmp/workspace/packages/svc'].args).toEqual(['test', './...']);
+  });
+
+  it('src/ as a single package directory (pytest.ini at src/) → python3 -m pytest at src', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/src' || p === '/tmp/workspace/src/pytest.ini',
+    );
+    // readdirSync of src/ returns no child dirs → only the src-itself package fires.
+    fs.readdirSync.mockReturnValue([]);
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/src');
+  });
+
+  it('multiple sibling packages each emit a runner', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/services' ||
+      p.endsWith('/services/a/setup.cfg') ||
+      p.endsWith('/services/b/Cargo.toml'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['a', 'b'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(2);
+    const cwds = runners.map(r => r.cwd).sort();
+    expect(cwds).toEqual(['/tmp/workspace/services/a', '/tmp/workspace/services/b']);
+  });
+
+  it('nested package with no manifest → no runner (graceful)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p === '/tmp/workspace/services');
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['empty-pkg'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('unreadable container directory → no runner (readdirSync throws, caught)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p === '/tmp/workspace/services');
+    fs.readdirSync.mockImplementation(() => { throw new Error('EACCES'); });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('never emits a bare `pytest` cmd from the nested scan', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/services' || p.endsWith('/services/api/pytest.ini'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['api'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].cmd).not.toBe('pytest');
+  });
+
+  it('stored build_config test_cmd suppresses the nested scan (precedence)', () => {
+    const fs = mockFs;
+    // A full nested monorepo is present on disk...
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/services' || p.endsWith('/services/api/pytest.ini'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['api'] : [],
+    );
+
+    const buildConfig: BuildConfig = {
+      directories: [{ path: '', type: 'python', test_cmd: 'python3 -m pytest' }],
+    };
+    const runners = detectTestRunners(buildConfig);
+
+    // ...but the stored test_cmd wins; the nested scan never fires.
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+    expect(runners[0].cmd).toBe('python3');
+  });
+
+  it('Blueprint backend layout still wins over a nested services/ layout (self-repo unchanged)', () => {
+    const fs = mockFs;
+    // Both the Blueprint backend layout AND a nested services/ package exist.
+    fs.existsSync.mockImplementation((p: string) =>
+      p.endsWith('/backend/pytest.ini') ||
+      p.endsWith('/scripts/test-backend.sh') ||
+      p === '/tmp/workspace/services' ||
+      p.endsWith('/services/api/pytest.ini'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['api'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    // The Blueprint backend runner is found first → noRunners() is false →
+    // the nested scan never fires. Byte-for-byte identical to pre-change.
     expect(runners).toHaveLength(1);
     expect(runners[0].cmd).toBe('bash');
     expect(runners[0].args[0]).toBe('scripts/test-backend.sh');

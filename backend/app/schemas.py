@@ -333,6 +333,18 @@ class BuildConfig(BaseModel):
     # agree. Default False so pre-existing projects (and any repo with detected
     # source) degrade gracefully.
     repo_is_empty: bool = False
+    # Marker that build-config detection did NOT complete at onboarding time —
+    # set True only when ``_detect_build_config`` returned an empty/falsy result
+    # or raised (a transient GitHub failure: 5xx, rate-limit, network blip, or a
+    # non-200 repo-contents listing). A detection that COMPLETED and genuinely
+    # found no tests sets ``repo_is_empty``/``has_ci`` instead and leaves this
+    # False, so a legitimately test-less repo is distinguishable from one whose
+    # detection never ran. The landing-time ``maybe_refresh_empty_build_config``
+    # treats True as a second re-detect trigger (alongside ``repo_is_empty``);
+    # a successful re-detect drops the marker (it is NOT in the fresh detected
+    # dict and ``apply_operator_build_config_overrides`` does not carry it
+    # forward), so the auto-refresh becomes a no-op once GitHub is reachable.
+    detection_incomplete: bool = False
     # Tri-state CI-presence signal computed at onboarding/re-detect from the
     # already-fetched ``.github/workflows`` listing during build-config detection
     # (see ``admin_onboard._detect_build_config``). True = a GitHub Actions

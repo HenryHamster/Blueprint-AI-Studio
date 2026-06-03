@@ -212,6 +212,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "DIRECTION_MILESTONE",
                 "RESIDUAL_FIX_ESCALATED",
                 "DIRECTION_BURN_PAUSE",
+                "MERGE_UNVERIFIED",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -413,6 +414,7 @@ async def get_settings(
                         "DIRECTION_MILESTONE",
                         "RESIDUAL_FIX_ESCALATED",
                         "DIRECTION_BURN_PAUSE",
+                        "MERGE_UNVERIFIED",
                     ],
                     "throttle_seconds": 30,
                 },
@@ -1708,6 +1710,10 @@ async def _apply_settings(
                 # tasks beyond the rolling-window threshold). BLOCKER severity /
                 # manual-intervention-required, so it joins the default-on list.
                 "DIRECTION_BURN_PAUSE",
+                # No-CI repo merged a PR without test verification (UNVERIFIED-merge
+                # fallback). The operator who turned off required CI checks needs to
+                # know when a merge proceeds without tests, so it is default-on.
+                "MERGE_UNVERIFIED",
             ]
         )
         enabled_events = val.get(
@@ -1720,6 +1726,7 @@ async def _apply_settings(
                 "DIRECTION_MILESTONE",
                 "RESIDUAL_FIX_ESCALATED",
                 "DIRECTION_BURN_PAUSE",
+                "MERGE_UNVERIFIED",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -2017,6 +2024,7 @@ async def _apply_settings(
                                 "REMEDIATION_ESCALATED",
                                 "RESIDUAL_FIX_ESCALATED",
                                 "DIRECTION_BURN_PAUSE",
+                                "MERGE_UNVERIFIED",
                             ],
                             "throttle_seconds": 30,
                         },

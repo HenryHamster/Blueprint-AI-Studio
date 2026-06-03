@@ -19,6 +19,7 @@ const ALL_EVENTS = [
   'RESIDUAL_FIX_ESCALATED',
   'RESIDUAL_FIX_UNSUSPENDED',
   'account_model_regression_quarantined',
+  'MERGE_UNVERIFIED',
 ];
 
 describe('SettingsNotificationsSection — viewport regression', () => {

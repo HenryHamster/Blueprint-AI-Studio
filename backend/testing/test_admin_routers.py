@@ -4230,6 +4230,25 @@ class TestNotificationConfigSettings:
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
+    async def test_patch_notification_config_merge_unverified_is_valid(
+        self, client: AsyncClient
+    ):
+        """MERGE_UNVERIFIED is accepted as a valid notification event so an
+        operator can be notified through their webhook when a no-CI repo
+        merges a PR without test verification."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "notification_config": {
+                    "webhook_url": "https://hooks.example.com/x",
+                    "enabled_events": ["TASK_FAILED", "MERGE_UNVERIFIED"],
+                    "throttle_seconds": 30,
+                }
+            },
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
     async def test_get_settings_non_admin_returns_403(self, override_get_session):
         """Non-admin caller is blocked with 403 from GET /api/admin/settings."""
         from app.main import app as _app

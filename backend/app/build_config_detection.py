@@ -104,10 +104,21 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
     """
     try:
         existing = project.build_config or {}
-        # Only refresh while the durable onboarding signal still says the repo
-        # is empty/near-empty. Once a refresh flips repo_is_empty=False, the
-        # helper becomes a no-op on later landing paths.
-        if not existing.get("repo_is_empty"):
+        # Refresh while EITHER durable onboarding signal still says this repo
+        # warrants re-detection:
+        #   - ``repo_is_empty``: a greenfield repo whose structure may have
+        #     landed since onboarding, or
+        #   - ``detection_incomplete``: onboarding-time detection never completed
+        #     (a transient GitHub failure), so the stored config has no real test
+        #     command and the no-CI gate would merge UNVERIFIED forever.
+        # A repo whose detection COMPLETED and genuinely found no tests sets
+        # neither flag, so it is never re-scanned here. Once a successful
+        # re-detect persists a config (flipping repo_is_empty=False and dropping
+        # the detection_incomplete marker), the helper becomes a no-op on later
+        # landing paths.
+        if not existing.get("repo_is_empty") and not existing.get(
+            "detection_incomplete"
+        ):
             return False
         if not getattr(project, "github_owner", None) or not getattr(
             project, "github_repo", None

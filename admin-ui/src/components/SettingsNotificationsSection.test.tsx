@@ -59,4 +59,21 @@ describe('SettingsNotificationsSection', () => {
     fireEvent.click(getToggleButton('Account/Model Regression Quarantined'));
     expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED', 'account_model_regression_quarantined']);
   });
+
+  it('shows merged-without-test-verification and toggles it in enabled_events', () => {
+    const onUpdateEnabledEvents = vi.fn();
+    const { rerender } = render(
+      <SettingsNotificationsSection {...baseProps} enabledEvents={['TASK_FAILED', 'MERGE_UNVERIFIED']} onUpdateEnabledEvents={onUpdateEnabledEvents} />
+    );
+
+    expect(screen.getByText('Merged Without Test Verification')).toBeInTheDocument();
+    fireEvent.click(getToggleButton('Merged Without Test Verification'));
+    expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED']);
+
+    rerender(
+      <SettingsNotificationsSection {...baseProps} enabledEvents={['TASK_FAILED']} onUpdateEnabledEvents={onUpdateEnabledEvents} />
+    );
+    fireEvent.click(getToggleButton('Merged Without Test Verification'));
+    expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED', 'MERGE_UNVERIFIED']);
+  });
 });

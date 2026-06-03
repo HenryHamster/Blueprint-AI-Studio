@@ -94,7 +94,7 @@ function isDockerAvailable(): boolean {
 }
 
 export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
-  const { existsSync, readFileSync } = fs;
+  const { existsSync, readFileSync, readdirSync } = fs;
   const runners: TestRunner[] = [];
 
   // --- BuildConfig-based detection (takes precedence over auto-detection) ---
@@ -183,6 +183,98 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
           }
         } catch { /* malformed package.json — skip */ }
       }
+    }
+
+    // --- Nested monorepo / external-layout detection (only if no root-level or
+    //     Blueprint-specific runner was found above). Brings the agent runtime
+    //     fallback to parity with the backend onboarding detector
+    //     (admin_onboard.py::_detect_build_config), which walks nested subdirs
+    //     and emits per-directory test commands. This lets an external no-CI
+    //     repo whose suites live under services/*, apps/*, packages/*, or a
+    //     src/ package directory run its REAL suite instead of falling through
+    //     to an UNVERIFIED merge. Inspects ONLY the already-cloned local
+    //     workspace, so there is zero GitHub-API cost. CONSERVATIVE: a runner is
+    //     emitted only when a real manifest/test entrypoint is actually present.
+    //     Multiple sibling packages each emit their own runner.
+    //
+    //     NOTE: the Blueprint self-repo (root/backend/agent) always produces a
+    //     runner above, so noRunners() is false here and this scan never fires
+    //     for the self-repo — its detection result is byte-for-byte unchanged.
+    if (noRunners()) {
+      // Emit a runner for a single package directory (relative to WORKSPACE) if
+      // it carries a recognized manifest. Mirrors the backend manifest→command
+      // mapping: python→`python3 -m pytest`, node→`npm test`, go→`go test ./...`,
+      // rust→`cargo test`. First match wins; no bare `pytest` is ever emitted
+      // (honoring the C19 bare-pytest guard). Defensive against fs errors.
+      const pushRunnerForPackageDir = (relPath: string): void => {
+        const abs = `${WORKSPACE}/${relPath}`;
+        try {
+          // Python: pytest.ini / setup.py / setup.cfg (manifest present) or a
+          // pyproject.toml that actually mentions pytest (content-guarded, to
+          // avoid emitting pytest for a packaging-only python directory).
+          if (
+            existsSync(`${abs}/pytest.ini`) ||
+            existsSync(`${abs}/setup.py`) ||
+            existsSync(`${abs}/setup.cfg`)
+          ) {
+            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: abs, label: `pytest (${relPath})` });
+            return;
+          }
+          if (existsSync(`${abs}/pyproject.toml`)) {
+            let hasPytest = false;
+            try { hasPytest = readFileSync(`${abs}/pyproject.toml`, 'utf-8').includes('pytest'); } catch { /* unreadable — skip */ }
+            if (hasPytest) {
+              runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: abs, label: `pytest (${relPath} pyproject)` });
+              return;
+            }
+          }
+          // Node: package.json declaring a real `scripts.test` (conservative —
+          // an absent test script must fall back, not block, per the no-CI gate).
+          if (existsSync(`${abs}/package.json`)) {
+            try {
+              const pkg = JSON.parse(readFileSync(`${abs}/package.json`, 'utf-8')) as { scripts?: { test?: string } };
+              if (pkg.scripts?.test) {
+                runners.push({ cmd: 'npm', args: ['test'], cwd: abs, label: `npm test (${relPath})` });
+                return;
+              }
+            } catch { /* malformed package.json — skip */ }
+          }
+          // Go: go.mod → `go test ./...`.
+          if (existsSync(`${abs}/go.mod`)) {
+            runners.push({ cmd: 'go', args: ['test', './...'], cwd: abs, label: `go test (${relPath})` });
+            return;
+          }
+          // Rust: Cargo.toml → `cargo test`.
+          if (existsSync(`${abs}/Cargo.toml`)) {
+            runners.push({ cmd: 'cargo', args: ['test'], cwd: abs, label: `cargo test (${relPath})` });
+            return;
+          }
+        } catch { /* defensive: any fs error — skip this package */ }
+      };
+
+      // Scan a container's immediate child directories, emitting a runner per
+      // child package. Skips silently when the container is absent or unreadable.
+      const scanContainer = (container: string): void => {
+        const containerAbs = `${WORKSPACE}/${container}`;
+        if (!existsSync(containerAbs)) return;
+        let children: string[];
+        try {
+          children = readdirSync(containerAbs) as unknown as string[];
+        } catch { return; /* unreadable container — skip */ }
+        if (!Array.isArray(children)) return;
+        for (const child of children) {
+          if (typeof child !== 'string') continue;
+          pushRunnerForPackageDir(`${container}/${child}`);
+        }
+      };
+
+      for (const container of ['services', 'apps', 'packages']) {
+        scanContainer(container);
+      }
+      // `src/` is treated as a single package directory (manifest at src/ itself)
+      // AND scanned for child packages, matching the backend's depth-bounded walk.
+      pushRunnerForPackageDir('src');
+      scanContainer('src');
     }
 
     // --- Generic external-repo fallbacks (only if no Blueprint-specific or

@@ -2216,6 +2216,199 @@ class TestMaybeRefreshEmptyBuildConfig:
         await db_session.refresh(project)
         assert (project.build_config or {}).get("repo_is_empty") is False
 
+    @pytest.mark.asyncio
+    async def test_refreshes_when_detection_incomplete_even_if_not_empty(
+        self, db_session
+    ):
+        """A repo flagged detection_incomplete (transient onboarding failure) is
+        re-detected on landing even though repo_is_empty is absent/False, and a
+        successful re-detect CLEARS the marker so it becomes a no-op next time."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Transient Failure",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="transient-failure-repo",
+            integration_branch="develop",
+            # No repo_is_empty, but detection never completed at onboarding.
+            build_config={"detection_incomplete": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "backend", "type": "python"}],
+                    "repo_is_empty": False,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is True
+        mock_detect.assert_awaited_once()
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+        # Real test suite now detected, and the transient-failure marker is
+        # cleared so the next landing is a no-op.
+        assert (bc.get("directories") or [{}])[0].get("path") == "backend"
+        assert bc.get("detection_incomplete") is False
+
+    @pytest.mark.asyncio
+    async def test_noop_when_detection_completed_with_no_tests(self, db_session):
+        """A genuinely test-less repo (detection COMPLETED, repo_is_empty=False,
+        no detection_incomplete marker) is NOT re-scanned on landing — proving
+        the change is not a per-landing re-scan loop."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Legitimately Test-less",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="testless-repo",
+            integration_branch="develop",
+            build_config={
+                "language": "python",
+                "directories": [{"path": ".", "type": "python"}],
+                "repo_is_empty": False,
+                "detection_incomplete": False,
+            },
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+            ) as mock_token,
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is False
+        mock_detect.assert_not_awaited()
+        mock_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_redetect_failing_again_keeps_marker_set(self, db_session):
+        """If re-detection still fails (returns {}), the detection_incomplete
+        marker is preserved so the repo stays eligible for a later retry."""
+        from app.build_config_detection import maybe_refresh_empty_build_config
+
+        project = Project(
+            name="Still Failing",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="still-failing-repo",
+            integration_branch="develop",
+            build_config={"detection_incomplete": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            refreshed = await maybe_refresh_empty_build_config(project, db_session)
+
+        assert refreshed is False
+        mock_detect.assert_awaited_once()
+        await db_session.refresh(project)
+        # Marker preserved — repo remains eligible on the next landing.
+        assert (project.build_config or {}).get("detection_incomplete") is True
+
+
+class TestOnboardDetectionIncompleteMarker:
+    """Onboarding sets detection_incomplete only when detection did not complete."""
+
+    async def _onboard(self, client, repo, *, detect_return=None, detect_exc=None):
+        kwargs = {"new_callable": AsyncMock}
+        if detect_exc is not None:
+            kwargs["side_effect"] = detect_exc
+        else:
+            kwargs["return_value"] = detect_return
+        with (
+            patch("app.routers.admin_onboard._detect_build_config", **kwargs),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": repo},
+            )
+        assert resp.status_code == 200
+        return resp.json()["project_id"]
+
+    @pytest.mark.asyncio
+    async def test_detection_exception_marks_incomplete(
+        self, client: AsyncClient, db_session
+    ):
+        """A transient GitHub failure (exception) during detection => marker True."""
+        project_id = await self._onboard(
+            client, "boom-onboard", detect_exc=RuntimeError("github 503")
+        )
+        project = await db_session.get(Project, project_id)
+        assert (project.build_config or {}).get("detection_incomplete") is True
+
+    @pytest.mark.asyncio
+    async def test_detection_empty_result_marks_incomplete(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-200 listing (detector returns {}) => marker True."""
+        project_id = await self._onboard(
+            client, "empty-onboard", detect_return={}
+        )
+        project = await db_session.get(Project, project_id)
+        assert (project.build_config or {}).get("detection_incomplete") is True
+
+    @pytest.mark.asyncio
+    async def test_successful_detection_leaves_marker_false(
+        self, client: AsyncClient, db_session
+    ):
+        """A completed detection => marker False (not flagged for re-scan)."""
+        project_id = await self._onboard(
+            client,
+            "good-onboard",
+            detect_return={
+                "language": "python",
+                "directories": [{"path": "backend", "type": "python"}],
+                "repo_is_empty": False,
+            },
+        )
+        project = await db_session.get(Project, project_id)
+        assert (project.build_config or {}).get("detection_incomplete") is False
+
 
 class TestClassifyRepoEmptiness:
     """Unit tests for the pure _classify_repo_emptiness helper."""
