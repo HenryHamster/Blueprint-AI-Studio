@@ -2,6 +2,7 @@ import { describe, test, expect } from 'vitest';
 import {
   armingHintCopy,
   armingToastCopy,
+  composerHintCopy,
   predictArming,
   parseArmingOutcome,
 } from './messageArming';
@@ -43,6 +44,32 @@ describe('armingHintCopy — composer hint per outcome', () => {
     const copy = armingHintCopy('not_armed');
     expect(copy).toContain('Couldn’t wake the strategist');
     expect(copy).toContain('resending');
+  });
+});
+
+describe('composerHintCopy — busy-aware pre-send hint, server outcome wins post-send', () => {
+  test('busy + non-NOTE pre-send: steer is queued for the next cycle', () => {
+    const copy = composerHintCopy('FEEDBACK', null, true);
+    expect(copy).toContain('queues for the next cycle');
+    expect(copy).toContain('Strategist is working');
+    // Must NOT make the immediate-reach promise while a cycle is running.
+    expect(copy).not.toContain('reaches the strategist soon');
+  });
+  test('idle + non-NOTE pre-send: existing reaches-soon copy stands', () => {
+    expect(composerHintCopy('FEEDBACK', null, false)).toContain('reaches the strategist soon');
+    // Undefined busy (default idle) behaves the same.
+    expect(composerHintCopy('FEEDBACK', null, undefined)).toContain('reaches the strategist soon');
+  });
+  test('NOTE + busy: still won’t-wake — busy state does not change passive copy', () => {
+    const copy = composerHintCopy('NOTE', null, true);
+    expect(copy).toContain('won’t wake the strategist');
+    expect(copy).not.toContain('queues for the next cycle');
+  });
+  test('post-send: server outcome wins even while busy (override suppressed)', () => {
+    // lastArming present → the real server outcome is reflected verbatim.
+    expect(composerHintCopy('FEEDBACK', 'steering', true)).toBe(armingHintCopy('steering'));
+    expect(composerHintCopy('FEEDBACK', 'routine_event', true)).toBe(armingHintCopy('routine_event'));
+    expect(composerHintCopy('FEEDBACK', 'not_armed', true)).toBe(armingHintCopy('not_armed'));
   });
 });
 

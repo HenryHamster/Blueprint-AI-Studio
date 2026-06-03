@@ -8,6 +8,7 @@ async function renderComposer(
   root: Root,
   newType: string,
   lastArming: 'steering' | 'passive_note' | 'routine_event' | null = null,
+  strategistBusy = false,
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -19,6 +20,7 @@ async function renderComposer(
         submitting={false}
         replyTo={null}
         lastArming={lastArming}
+        strategistBusy={strategistBusy}
         onChangeType={() => {}}
         onChangeContent={() => {}}
         onCancelReply={() => {}}
@@ -68,6 +70,22 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       await renderComposer(r, 'FEEDBACK');
     });
     expect(host!.textContent).toContain('reaches the strategist soon');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('busy-strategist steering hint (queued) fits 375px without overflow, truncation, or small targets', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      // FEEDBACK while a cycle is running → pre-send hint says the steer queues.
+      await renderComposer(r, 'FEEDBACK', null, true);
+    });
+    expect(host!.textContent).toContain('queues for the next cycle');
+    expect(host!.textContent).not.toContain('reaches the strategist soon');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

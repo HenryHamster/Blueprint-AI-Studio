@@ -1,7 +1,7 @@
 import { type RefObject } from 'react';
 import { X, Send, Reply } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
-import { type ArmingOutcome, armingHintCopy, predictArming } from './messageArming';
+import { type ArmingOutcome, composerHintCopy } from './messageArming';
 
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -11,6 +11,8 @@ export interface MessagesComposerProps {
   replyTo: { id: string; content: string; from: string } | null;
   /** Outcome the server reported for the last send, or null before any send. */
   lastArming?: ArmingOutcome | null;
+  /** Whether a strategic cycle is currently running (live WS-driven signal). */
+  strategistBusy?: boolean;
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -32,6 +34,7 @@ export function MessagesComposer({
   submitting,
   replyTo,
   lastArming,
+  strategistBusy,
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -47,8 +50,10 @@ export function MessagesComposer({
 
   // Hint reflects the server's real decision for the last send when available
   // (the only source that accounts for routine/system event exclusions),
-  // falling back to the type-based prediction before any message has been sent.
-  const hintOutcome: ArmingOutcome = lastArming ?? predictArming(newType);
+  // falling back to the type-based prediction before any message has been sent —
+  // and, when the strategist is mid-cycle, flagging that a steer is queued rather
+  // than acting immediately.
+  const hintText = composerHintCopy(newType, lastArming, strategistBusy);
 
   return (
     <div className="px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50">
@@ -90,7 +95,7 @@ export function MessagesComposer({
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
       <p className="text-[11px] leading-snug text-neutral-500 mt-1.5 px-0.5">
-        {armingHintCopy(hintOutcome)}
+        {hintText}
       </p>
     </div>
   );

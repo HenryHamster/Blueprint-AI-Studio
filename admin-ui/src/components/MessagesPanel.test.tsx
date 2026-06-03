@@ -3329,7 +3329,10 @@ describe('MessagesPanel send arming receipt', () => {
     });
   }
 
-  async function renderPanel(addToast: (msg: string, level: string) => void) {
+  async function renderPanel(
+    addToast: (msg: string, level: string) => void,
+    strategistActive = false,
+  ) {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -3342,6 +3345,7 @@ describe('MessagesPanel send arming receipt', () => {
           onClose={() => {}}
           addToast={addToast as never}
           onMessageCountChange={() => {}}
+          strategistActive={strategistActive}
         />,
       );
     });
@@ -3478,6 +3482,26 @@ describe('MessagesPanel send arming receipt', () => {
 
     expect(hintText(el)).toBe(armingHintCopy('passive_note'));
     expect(hintText(el)).not.toBe(armingHintCopy('not_armed'));
+  });
+
+  test('live strategist-busy state queues the pre-send steering hint and shows the working affordance', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    // Strategist mid-cycle: default FEEDBACK type predicts steering, but the
+    // live busy signal must flip the pre-send hint to the queued copy and show
+    // the at-a-glance "Strategist working…" affordance.
+    const el = await renderPanel(addToast, true);
+
+    // The four-outcome hintText() helper deliberately won't match the queued
+    // copy — assert on the composer paragraph text directly.
+    expect(el.textContent).toContain('queues for the next cycle');
+    expect(el.textContent).not.toContain('reaches the strategist soon');
+    expect(el.textContent).toContain('Strategist working');
+
+    // Post-send the server's real outcome still wins, overriding the busy hint.
+    await typeAndSend(el, 'please reprioritize while a cycle is running');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(hintText(el)).toBe(armingHintCopy('steering'));
   });
 
   test('response missing the arming field falls back to the generic confirmation without error', async () => {

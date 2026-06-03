@@ -21,6 +21,11 @@ const ARMING_HINT: Record<ArmingOutcome, string> = {
   not_armed: 'Couldn’t wake the strategist — try resending in a moment.',
 };
 
+// Pre-send hint shown when a strategic cycle is already running: a steering
+// message can't act immediately — it's coalesced into the pending refresh
+// marker and queued behind the active cycle, then picked up on the next cycle.
+const QUEUED_STEERING_HINT = 'Strategist is working — your steer queues for the next cycle.';
+
 // Outcome → post-send toast copy.
 const ARMING_TOAST: Record<ArmingOutcome, string> = {
   steering: 'Message sent — steering the strategist',
@@ -46,6 +51,25 @@ export function armingToastCopy(outcome: ArmingOutcome | null | undefined): stri
  */
 export function predictArming(newType: string): ArmingOutcome {
   return newType === 'NOTE' ? 'passive_note' : 'steering';
+}
+
+/**
+ * Composer hint copy at compose time, accounting for whether the strategist is
+ * currently working. The server's real outcome (`lastArming`) always wins once a
+ * message has been sent. Before any send, the type-based prediction stands —
+ * except a steering-type message composed while a cycle is already running is
+ * queued for the next cycle rather than acting immediately, so its pre-send hint
+ * says so. NOTE / passive / routine paths are untouched by the busy state.
+ */
+export function composerHintCopy(
+  newType: string,
+  lastArming: ArmingOutcome | null | undefined,
+  strategistBusy?: boolean,
+): string {
+  if (lastArming) return armingHintCopy(lastArming);
+  const predicted = predictArming(newType);
+  if (predicted === 'steering' && strategistBusy) return QUEUED_STEERING_HINT;
+  return armingHintCopy(predicted);
 }
 
 /** Narrow an unknown response field to a valid ArmingOutcome, else null. */

@@ -867,6 +867,7 @@ export default function App() {
           onMessageCountChange={handleMessageCountChange}
           onOpenTask={handleViewTask}
           notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+          strategistActive={s.strategistActive}
         />
       ) : s.showArchive ? (
         <ArchiveView
