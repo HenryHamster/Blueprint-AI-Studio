@@ -1168,25 +1168,33 @@ async def _check_and_trigger_rollup(
 
     # Edge case: all rollup children CANCELLED — nothing to roll up. Route the
     # terminal verdict through the SAME shared helper the requeue/reaper path
-    # uses (``_resolve_terminal_parent_verdict``) so the two finalizers cannot
+    # uses (``_resolve_terminal_parent_verdict`` /
+    # ``_terminate_all_non_genuine_cancelled``) so the two finalizers cannot
     # land the same child set in two different terminal states. The
     # EVALUATING-timeout recovery sweep
     # (recovery_sweeps._check_evaluating_timeouts) reaches this finalizer with
     # NO age gate and usually wins the race against the reaper's ~15-min requeue
     # rescue — so it MUST agree with the requeue verdict instead of diverging
-    # (the cross-sweep drift the shared helper exists to prevent).
+    # (the cross-sweep drift the shared helper exists to prevent). This branch
+    # historically hard-coded CANCELLED, which diverged from the requeue path's
+    # verdict for an identical child set: FAILED + SCOPE_EMPTY when every child
+    # is a non-genuine cancel (superseded / replaced-by-retry / cascade /
+    # reassigned / scope-empty), or FAILED + AGENT_TIMEOUT when a genuine
+    # cancellation is present. That divergence is exactly what
+    # test_parent_terminal_parity locks.
     #
     # ``children`` is the rollup set (review/fix pipeline children already
     # filtered out above) — the same set the shared helper classifies. Every
     # child is CANCELLED in this branch, so no FAILED child can be
     # BLOCKED_PRECONDITION: ``blocked_count`` is 0.
     if children and cancelled_count == len(children):
-        from app.task_lifecycle import (
+        from app.task_lifecycle_requeue import (
+            _record_parent_failure,
             _resolve_terminal_parent_verdict,
             _terminate_all_non_genuine_cancelled,
         )
 
-        _verdict, _reason = await _resolve_terminal_parent_verdict(
+        _, verdict_reason = await _resolve_terminal_parent_verdict(
             parent, children, 0
         )
 
@@ -1197,11 +1205,13 @@ async def _check_and_trigger_rollup(
         # such state), so the rollup path owns both around the helper here.
         parent.context = _clear_rollup_transient_state(parent.context)
 
-        if _reason == "all_non_genuine_cancelled":
+        if verdict_reason == "all_non_genuine_cancelled":
             # Every cancel is non-genuine (superseded / replaced-by-retry /
             # reassigned / scope-empty): the work may have landed elsewhere, so
             # this is FAILED + SCOPE_EMPTY with NO direction-health penalty and
-            # NO failure alert — byte-for-byte the requeue/reaper finalize.
+            # NO failure alert — byte-for-byte the requeue/reaper finalize. The
+            # shared helper persists the category, commits, and broadcasts; we
+            # clean up the staging branches after.
             await _terminate_all_non_genuine_cancelled(
                 parent, children, session, broadcast_to_project
             )
@@ -1218,30 +1228,25 @@ async def _check_and_trigger_rollup(
         # CANCELLED. The shared verdict counts a genuine cancel as a terminal
         # failure, and the requeue/reaper path (locked by
         # test_requeue_all_cancelled_children_marks_parent_failed) already
-        # finalizes this exact child set to FAILED with a failure alert + a
-        # direction-health signal. Because the recovery sweep wins the race to
-        # this finalizer most of the time, it must produce the SAME terminal
-        # state and the SAME side effects rather than the quieter CANCELLED that
-        # silently disagreed with the reaper. (An all-operator-cancel parent has
-        # always surfaced as a failure via the reaper; the parent's work
-        # genuinely did not land, so the alert is correct, not noise.)
+        # finalizes this exact child set to FAILED + AGENT_TIMEOUT with a
+        # failure alert + a direction-health signal via ``_record_parent_failure``.
+        # Because the recovery sweep wins the race to this finalizer most of the
+        # time, it must produce the SAME terminal state and the SAME side effects
+        # (including the SAME ``_record_parent_failure`` ding the reaper path
+        # uses — this is what test_parent_terminal_parity asserts) rather than the
+        # quieter CANCELLED that silently disagreed with the reaper.
         from app.failure_classification import (
             AGENT_TIMEOUT,
             persist_failure_category,
         )
 
         parent.status = TaskStatus.FAILED
-        parent.latest_status_message = (
-            f"All {len(children)} subtask(s) cancelled, none succeeded — "
-            f"nothing to roll up"
-        )
+        parent.latest_status_message = f"All {len(children)} subtasks were cancelled"
         persist_failure_category(parent, AGENT_TIMEOUT)
-        _record_rollup_failure_signals(parent, AGENT_TIMEOUT)
+        _record_parent_failure(parent, AGENT_TIMEOUT)
         session.add(parent)
         await _maybe_create_failure_alert(
-            parent,
-            session,
-            f"All {len(children)} subtask(s) cancelled, none succeeded",
+            parent, session, parent.latest_status_message
         )
         await session.commit()
         await _cleanup_branches(parent, session)
@@ -1252,7 +1257,7 @@ async def _check_and_trigger_rollup(
         )
         logger.info(
             f"[ROLLUP] Parent {parent.id} FAILED — all {len(children)} children "
-            f"cancelled with at least one genuine cancel"
+            f"cancelled, genuine cancellation present (shared verdict)"
         )
         return
 

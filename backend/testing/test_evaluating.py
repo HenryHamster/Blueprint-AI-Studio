@@ -2659,6 +2659,13 @@ async def test_eval_sweep_all_genuine_cancelled_finalizes_failed_with_alert(
     mock_alert = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
+    # The genuine-cancel branch now routes through the SAME shared
+    # ``_record_parent_failure`` ding the requeue/reaper path uses (parity locked
+    # by test_parent_terminal_parity) rather than the rollup-only
+    # ``_record_rollup_failure_signals``.
+    mock_parent_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
     mock_signals = mocker.patch("app.rollup_management._record_rollup_failure_signals")
 
     project = Project(name="Eval Genuine Cancel", user_id="user1")
@@ -2692,8 +2699,11 @@ async def test_eval_sweep_all_genuine_cancelled_finalizes_failed_with_alert(
     await eval_db.refresh(parent)
     assert parent.status == TaskStatus.FAILED
     assert parent.context.get("failure_category") == "AGENT_TIMEOUT"
-    # Genuine cancel is a terminal failure in BOTH sweeps — alert + signal fire.
+    # Genuine cancel is a terminal failure in BOTH sweeps — alert + the shared
+    # parent-failure ding fire. The rollup-only signal helper is NOT used; the
+    # finalizer mirrors the requeue/reaper path's ``_record_parent_failure``.
     mock_alert.assert_awaited()
-    mock_signals.assert_called_once()
+    mock_parent_failure.assert_called_once()
+    mock_signals.assert_not_called()
     mock_cleanup.assert_awaited()
     assert "_rollup_retries" not in (parent.context or {})

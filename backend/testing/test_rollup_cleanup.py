@@ -2147,16 +2147,18 @@ async def test_staging_branch_missing_all_children_completed_marks_completed(
 
 @pytest.mark.asyncio
 async def test_all_children_genuinely_cancelled_marks_parent_failed(cleanup_db, mocker):
-    """When every child is a GENUINE cancel (none completed, none failed, no
-    non-genuine markers), the rollup finalizer now routes through the shared
-    terminal verdict and finalizes the parent FAILED — matching the
-    requeue/reaper path (test_requeue_all_cancelled_children_marks_parent_failed)
-    instead of the old quiet CANCELLED that silently disagreed across sweeps.
-    No rollup PR is created."""
+    """When every child is a GENUINE cancel (bare CANCELLED, none completed,
+    none failed, no non-genuine markers), the rollup finalizer now routes
+    through the shared terminal verdict and finalizes the parent FAILED +
+    AGENT_TIMEOUT — matching the requeue/reaper path
+    (test_requeue_all_cancelled_children_marks_parent_failed) instead of the old
+    quiet CANCELLED that silently disagreed across sweeps. The verdict is now
+    centralized — see test_parent_terminal_parity. No rollup PR is created."""
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
     mock_alert = mocker.patch(
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
+    mocker.patch("app.task_lifecycle_requeue._record_parent_failure")
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
