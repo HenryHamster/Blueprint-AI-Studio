@@ -2024,6 +2024,7 @@ async def _spawn_strategic_review(
                 current_open_version,
                 ensure_initial_release_version,
                 recent_closed_versions,
+                summarize_qualification_state,
                 to_phase_block,
             )
 
@@ -2103,6 +2104,9 @@ async def _spawn_strategic_review(
                             "status": v.status,
                             "phase": v.phase,
                             "last_qualification": v.last_qualification,
+                            "qualification_state": summarize_qualification_state(
+                                v.last_qualification
+                            ),
                         }
                         for v in _closed
                     ]
@@ -2376,6 +2380,33 @@ async def _spawn_strategic_review(
             if prompt_suffix
             else _post_promote_hint
         )
+    # Qualification sub-state directive — last_qualification.status is overloaded
+    # ("pending" = audit-scoring OR promotion-PR-open-and-auto-merging), which
+    # made the agent conflate "wait for the audit" with "the promotion is
+    # failing" and burn whole cycles waiting (incident 2026-06-02). Surface the
+    # disambiguated sub-state as an explicit directive for the two states the
+    # agent misreads as "still auditing, wait". Local import keeps this resilient
+    # to integration-branch refactors of release_version on back-merge.
+    if _open_version is not None:
+        from app.release_version import (
+            summarize_qualification_state as _summarize_qual_state,
+        )
+
+        _qual_state = _summarize_qual_state(_open_version.last_qualification)
+        if _qual_state and _qual_state.get("state") in {
+            "promotion_in_flight",
+            "promotion_failed",
+        }:
+            _qual_hint = (
+                f"Qualification sub-state: {_qual_state['state'].upper()} — "
+                f"{_qual_state['summary']} Do NOT read "
+                "version_phase.last_qualification.status='pending' as 'the audit "
+                "is still running'; version_phase.qualification_state is the "
+                "disambiguated source of truth."
+            )
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_qual_hint}" if prompt_suffix else _qual_hint
+            )
     # Stabilize phase directive — when the open version is in stabilize, bias the
     # strategic agent's work-mix toward audit/cleanup/hardening so the version
     # converges toward qualification rather than accumulating net-new feature work.

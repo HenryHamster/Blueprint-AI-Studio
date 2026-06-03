@@ -266,6 +266,103 @@ async def recent_closed_versions(
     return list((await session.execute(stmt)).scalars().all())
 
 
+def summarize_qualification_state(
+    last_qualification: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Disambiguate the overloaded ``last_qualification.status`` for the agent.
+
+    ``status == "pending"`` collapses two very different situations:
+
+    * the qualification **audit is still scoring** the candidate (wait), and
+    * the audit **PASSED and a promotion PR is open** with auto-merge armed —
+      ``promote()`` records a ``promotion_pending`` sub-key for this case. It is
+      NOT "still auditing": the promotion PR can fail its own CI and bounce the
+      version back to stabilize.
+
+    The strategic agent reads ``last_qualification`` as the source of truth for
+    "what is happening with qualification", so a bare ``status="pending"`` made
+    it conflate "audit in flight, wait" with "audit passed, promotion failing"
+    and burn whole cycles waiting (incident 2026-06-02). This derives a single
+    explicit sub-state from the raw verdict — pure data, no I/O.
+
+    Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
+    ``promotion_in_flight`` | ``promotion_failed`` | ``not_promoted`` |
+    ``dry_run`` | ``promoted``), or ``None`` when unqualified (no verdict yet).
+    """
+    lq = last_qualification or {}
+    status = lq.get("status")
+    if not lq or status is None:
+        return None
+    if status == "pending":
+        promo = lq.get("promotion_pending")
+        if isinstance(promo, dict):
+            armed = promo.get("auto_merge_enabled")
+            return {
+                "state": "promotion_in_flight",
+                "summary": (
+                    "Audit PASSED; a promotion PR is open and auto-merge is "
+                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
+                    "auditing' — the audit already cleared. Watch the promotion "
+                    "PR's CI: if it goes red the version bounces back to "
+                    "stabilize and needs a fresh qualify on a synced candidate."
+                ),
+                "promotion_pr_number": promo.get("pr_number"),
+                "promotion_pr_url": promo.get("pr_url"),
+            }
+        return {
+            "state": "qualifying",
+            "summary": (
+                "Qualification audit is in flight (scoring the candidate). Wait "
+                "for the verdict — re-requesting while one is pending is ignored."
+            ),
+        }
+    if status == "promotion_failed":
+        reason = lq.get("error")
+        return {
+            "state": "promotion_failed",
+            "summary": (
+                "The last promotion FAILED after a PASSING audit"
+                + (f" ({reason})" if reason else "")
+                + ". The version is back in stabilize. This is not a pending "
+                "audit — it needs a FRESH qualify on a candidate synced with the "
+                "promotion target; waiting for a verdict will not unblock it."
+            ),
+            "error": reason,
+            "detail": lq.get("detail"),
+        }
+    if status == "not_promoted":
+        conf = lq.get("confidence")
+        thr = lq.get("threshold")
+        return {
+            "state": "not_promoted",
+            "summary": (
+                "Candidate scored BELOW the promotion threshold"
+                + (
+                    f" (confidence {conf}, threshold {thr})"
+                    if conf is not None
+                    else ""
+                )
+                + ". Resolve the binding blocker, then re-qualify."
+            ),
+            "blocker": lq.get("blocker"),
+        }
+    if status == "dry_run":
+        return {
+            "state": "dry_run",
+            "summary": (
+                "Candidate PASSED qualification in dry-run (promotion disabled). "
+                "It is promotion-ready — no further audit work is needed to clear "
+                "the bar; enabling promotion is the remaining step."
+            ),
+        }
+    if status == "promoted":
+        return {
+            "state": "promoted",
+            "summary": "Candidate was promoted — the version was cut.",
+        }
+    return {"state": status, "summary": f"Qualification status: {status}."}
+
+
 def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
     """Return a compact dict for embedding in the strategic agent's payload.
 
@@ -281,6 +378,9 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
         else None,
         "phase_reasoning": version.phase_reasoning,
         "last_qualification": version.last_qualification,
+        "qualification_state": summarize_qualification_state(
+            version.last_qualification
+        ),
     }
 
 

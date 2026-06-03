@@ -4504,6 +4504,163 @@ async def test_stabilize_hint_excludes_disabled_smoketest_from_binding(
 
 
 @pytest.mark.asyncio
+async def test_qualification_substate_hint_promotion_in_flight(
+    db_session, mocker, _lts_split_active
+):
+    """status='pending' WITH promotion_pending (audit passed, promotion PR open)
+    must be surfaced as PROMOTION_IN_FLIGHT — not read as 'audit still running'.
+    Regression for incident 2026-06-02 where the agent waited on a promotion it
+    should have been watching."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "pending",
+            "promotion_pending": {
+                "pr_number": 7357,
+                "pr_url": "https://github.com/x/y/pull/7357",
+                "auto_merge_enabled": True,
+            },
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_IN_FLIGHT" in suffix, f"Expected sub-state hint; got: {suffix}"
+    assert "already cleared" in suffix
+    assert "still running" in suffix  # the explicit "do NOT read as ..." clause
+
+    vp = payload.get("version_phase") or {}
+    assert vp.get("qualification_state", {}).get("state") == "promotion_in_flight"
+
+
+@pytest.mark.asyncio
+async def test_qualification_substate_hint_promotion_failed(
+    db_session, mocker, _lts_split_active
+):
+    """status='promotion_failed' (passed audit, merge failed) must be surfaced as
+    PROMOTION_FAILED with the failure reason and a 'fresh qualify' directive —
+    not left to read as a still-pending audit."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "promotion_failed",
+            "error": "pr_ci_red",
+            "detail": "PR #7357 CI conclusively failed",
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_FAILED" in suffix, f"Expected sub-state hint; got: {suffix}"
+    assert "pr_ci_red" in suffix
+    assert "fresh qualify" in suffix.lower()
+
+    vp = payload.get("version_phase") or {}
+    assert vp.get("qualification_state", {}).get("state") == "promotion_failed"
+
+
+@pytest.mark.asyncio
+async def test_qualification_substate_hint_absent_while_auditing(
+    db_session, mocker, _lts_split_active
+):
+    """Bare status='pending' (audit genuinely scoring) must NOT emit the
+    promotion sub-state hint — the agent SHOULD wait in that case."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "pending"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    payload = tasks[0].payloads[0]
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_IN_FLIGHT" not in suffix
+    assert "PROMOTION_FAILED" not in suffix
+    vp = payload.get("version_phase") or {}
+    assert vp.get("qualification_state", {}).get("state") == "qualifying"
+
+
+@pytest.mark.asyncio
 async def test_stabilize_findings_hint_softens_when_remediation_direction_exists(
     db_session, mocker, _lts_split_active
 ):
