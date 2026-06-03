@@ -950,6 +950,7 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
     vm_reuse_rate: 'VM reuse rate',
     median_api_calls_per_task: 'Median API calls/task',
     median_review_iterations: 'Median review iterations',
+    fleet_utilization: 'Fleet slot utilization',
   };
 
   if (!efficiencySnapshot || typeof efficiencySnapshot !== 'object') {
@@ -990,6 +991,12 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
     const base = fmt(data.baseline);
     const drift = fmtDrift(data.drift_pct);
     lines.push(`${label} | ${cur} | ${base} | ${drift}`);
+  }
+  if ('fleet_utilization' in axes) {
+    lines.push('');
+    lines.push(
+      '_Fleet slot utilization is the share of max-plan account slots in use (now + short trailing average) across the whole fleet. Chronically low utilization WITH verified non-clashing backlog means throughput is being left on the table — parallelize existing work or open more non-clashing directions. But distinguish idle headroom from cooled accounts (shown only when present): cooldowns are a rate-limit problem, not a reason to manufacture work. Near capacity is healthy, not a deficit._',
+    );
   }
   return lines.join('\n') + '\n';
 }

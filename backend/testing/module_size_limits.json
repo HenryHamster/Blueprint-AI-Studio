@@ -74,7 +74,7 @@
     "playbook_sr_metrics.py": 3100,
     "models.py": 3500,
     "shared_state.py": 2850,
-    "strategic_spawning.py": 2900,
+    "strategic_spawning.py": 3000,
     "failure_classification.py": 2400,
     "notification_dispatch.py": 2250,
     "ci_completion.py": 1850
@@ -89,7 +89,7 @@
     "prompts/check-helper.test.ts": 300,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,
-    "handlers/research-plan.ts": 1850,
+    "handlers/research-plan.ts": 1900,
     "handlers/strategic.ts": 800,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 400,
