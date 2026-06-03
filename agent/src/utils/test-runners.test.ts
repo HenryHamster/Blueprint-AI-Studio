@@ -1335,6 +1335,41 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     )).toBe('no_tests');
   });
 
+  it('bash "command not found" → no_tests', () => {
+    expect(classifyTestExecution(
+      'bash: pytest: command not found',
+    )).toBe('no_tests');
+  });
+
+  it('zsh "command not found: pytest" → no_tests', () => {
+    expect(classifyTestExecution(
+      'zsh: command not found: pytest',
+    )).toBe('no_tests');
+  });
+
+  // Regression: a genuinely failing suite whose output merely CONTAINS the
+  // words "command" and "not found" non-adjacently must classify as a real
+  // run so its failure blocks the no-CI merge gate. The pre-fix classifier
+  // (two independent whole-output substring checks) misread all three of
+  // these as "no_tests", failing the gate open.
+  it('failing suite — signal words on different lines → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_command_parser\nE   KeyError: 'x' not found",
+    )).toBe('ran');
+  });
+
+  it('failing suite — "element not found" assertion far from test id → ran', () => {
+    expect(classifyTestExecution(
+      "FAILED test_command_handler - assert 'element not found' in body",
+    )).toBe('ran');
+  });
+
+  it('failing suite — "404 Not Found" assertion → ran', () => {
+    expect(classifyTestExecution(
+      'FAILED test_command_router - 404 Not Found',
+    )).toBe('ran');
+  });
+
   it('make missing target ("No rule to make target") → no_tests', () => {
     expect(classifyTestExecution(
       'make: *** No rule to make target `test\'. Stop.',

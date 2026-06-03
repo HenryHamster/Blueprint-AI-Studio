@@ -7334,6 +7334,33 @@ def _extract_nested_package_region(source: str) -> str:
     return source[start:end]
 
 
+def _extract_classifier_region(source: str) -> str:
+    """Extract the classifyTestExecution function from test-runners.ts.
+
+    Raises ValueError with a clear message if the function anchor cannot be found.
+    """
+    start = source.find("export function classifyTestExecution")
+    if start == -1:
+        raise ValueError(
+            "Could not find `export function classifyTestExecution` anchor in "
+            "agent/src/utils/test-runners.ts — the classifier function was "
+            "renamed or removed. Update _extract_classifier_region in "
+            "backend/testing/test_invariants.py to match."
+        )
+
+    # Find the end by searching for the final return statement of the function
+    end = source.find("\n  return 'ran';", start)
+    if end == -1:
+        raise ValueError(
+            "Could not find the terminating `return 'ran';` of "
+            "classifyTestExecution in agent/src/utils/test-runners.ts — the "
+            "function's structure changed. Update _extract_classifier_region."
+        )
+    # Include the return statement and closing brace
+    end = source.find("\n}", end) + 1
+    return source[start:end]
+
+
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
@@ -7725,6 +7752,50 @@ class TestAgentTestRunnerSourceParity:
             "backend/testing/test_invariants.py (and the shared fixture)."
         )
 
+    def test_classifier_missing_command_requires_adjacency(self):
+        """The no-CI gate's classifier (classifyTestExecution) must not use loose
+        substring matching for the missing-command signal. A too-loose check that
+        scans the whole output for 'command' AND 'not found' independently would
+        false-positive on failures whose test ids contain 'command' (e.g.
+        test_command_parser) plus unrelated errors ('404 Not Found', 'element not
+        found'). This would cause the gate to incorrectly merge unverified PRs.
+
+        The classifier must require the two signal words to be adjacent (at most one
+        quoted/bare token between them) on the SAME line, with a word boundary on
+        `command` so test_command_parser doesn't match.
+        """
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        # Reject the loose pattern that would false-positive
+        loose_pattern = "lower.includes('command') && lower.includes('not found')"
+        assert loose_pattern not in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution uses loose "
+            "substring matching for 'command' and 'not found' independently, which "
+            "false-positives on genuine failures. The pattern must require adjacency "
+            f"on the same line. Found: {loose_pattern!r}. "
+            "Use a regex pattern like /\\bcommand\\b(?:\\s+(?:\"[^\"]*\"|'[^']*'|\\S+))?\\s+not\\s+found\\b/i"
+        )
+
+        # Verify the correct line-scoped pattern is present
+        assert "missingCommand" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must define a "
+            "missingCommand regex variable to handle missing-command detection."
+        )
+        assert ".some(line => missingCommand.test(line))" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must test "
+            "missingCommand on individual lines, not on the whole output."
+        )
+        # Verify the regex has the word-boundary and adjacency constraints
+        assert r"\bcommand\b" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution regex must "
+            "use \\bcommand\\b for word-boundary matching to avoid test_command_parser false-positives."
+        )
+        assert r"not\s+found" in region or "not found" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution regex must "
+            "match 'not found' with optional whitespace between the words."
+        )
+
 
 class TestAgentTestRunnerParseHelpers:
     """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic
@@ -7784,3 +7855,27 @@ class TestAgentTestRunnerParseHelpers:
             AGENT_TEST_RUNNER_COMMANDS.values()
         )
         assert orphans == {"sbt test"}
+
+    def test_extract_classifier_region_raises_on_missing_anchor(self):
+        with pytest.raises(ValueError, match="classifyTestExecution"):
+            _extract_classifier_region("export function detectTestRunners() {}")
+
+    def test_extract_classifier_region_raises_on_missing_return(self):
+        with pytest.raises(ValueError, match="return 'ran'"):
+            _extract_classifier_region(
+                "export function classifyTestExecution(output: string) { "
+                "return 'no_tests'; }"
+            )
+
+    def test_classifier_region_contains_missing_command_check(self):
+        """A synthetic classifier region with the correct pattern passes."""
+        synthetic = (
+            "export function classifyTestExecution(output: string) {\n"
+            "  const missingCommand = /\\bcommand\\b(?:\\s+(?:\"[^\"]*\"|'[^']*'|\\S+))?\\s+not\\s+found\\b/i;\n"
+            "  if (lines.some(line => missingCommand.test(line))) return 'no_tests';\n"
+            "  return 'ran';\n}"
+        )
+        region = _extract_classifier_region(synthetic)
+        assert "missingCommand" in region
+        assert ".some(line => missingCommand.test(line))" in region
+        assert r"\bcommand\b" in region

@@ -590,7 +590,24 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // yarn: "error Command "test" not found."
   // pnpm: "ERR!  No matching version found for test"
   if (lower.includes('missing script')) return 'no_tests';
-  if (lower.includes('command') && lower.includes('not found')) return 'no_tests';
+  // Shell / package-manager missing-runner messages put the literal phrase
+  // "command not found" together on a single line:
+  //   bash:  "bash: pytest: command not found"
+  //   zsh:   "zsh: command not found: pytest"
+  //   pnpm:  "error: command not found: test"
+  //   yarn:  'error Command "test" not found.'  (one token between the words)
+  // A whole-output substring test for "command" AND "not found" independently
+  // FALSE-POSITIVES on a genuinely failing suite: a failing test id such as
+  // `test_command_parser` plus an unrelated assertion ("404 Not Found",
+  // "KeyError: 'x' not found", "element not found") trips both checks even
+  // though no runner was missing — misreading the failure as "no tests ran"
+  // and letting the no-CI gate merge UNVERIFIED. Require the two signal words
+  // to be adjacent (at most one quoted/bare token between them) on the SAME
+  // line, with a word boundary on `command` so `test_command_parser` does not
+  // match. Genuine failures whose signal words are far apart or on different
+  // lines fall through to 'ran'.
+  const missingCommand = /\bcommand\b(?:\s+(?:"[^"]*"|'[^']*'|\S+))?\s+not\s+found\b/i;
+  if (lines.some(line => missingCommand.test(line))) return 'no_tests';
   // make: "No rule to make target 'test'" or "No rule to make target `test'"
   if (lower.includes('no rule to make target')) return 'no_tests';
   // pytest: "no tests ran in 0.01s" / "collected 0 items".
