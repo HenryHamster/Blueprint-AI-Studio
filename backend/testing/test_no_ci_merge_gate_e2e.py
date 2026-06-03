@@ -48,7 +48,9 @@ from app.ci_completion import handle_ci_completion
 from app.ci_resolution import (
     build_no_ci_gate_ci_result,
     classify_merge_test_verdict,
+    has_detectable_tests,
     merge_gate_runtime_block,
+    proceed_on_no_checks,
     record_no_ci_gate_runtime,
     should_run_no_ci_test_gate,
 )
@@ -1582,3 +1584,407 @@ async def test_persist_recovered_appends_other_type_stays_in_schema(db_session):
     # The persisted config must be schema-valid (validated round-trip, NOT the
     # raw-store fallback) so a subsequent operator PATCH /build_config succeeds.
     BuildConfigSchema(**project.build_config)
+
+
+# ---------------------------------------------------------------------------
+# 8. ci_loop verdict-state threading + bypass-path composed flows
+#
+# The composed flows above (sections 1-7) build the ci_result from a freshly
+# read MERGE_TEST_RESULT artifact, then HAND-MIRROR what the orchestrator's
+# inline gate writes onto review_loop via ``_set_unverified_reason``. That
+# leaves two gaps the orchestrator's own state machine owns and these tests
+# close:
+#
+#   (a) ci_loop verdict-state threading. On a re-entry poll the orchestrator
+#       does NOT re-read the artifact — it rebuilds the ci_result from the
+#       verdict state THREADED ON ci_loop on a prior poll
+#       (``verify_tests_verdict`` and, for a fail, ``verify_tests_output``;
+#       orchestrator.py ~5125-5136). ``_ci_result_from_recorded_loop`` mirrors
+#       that fast-path exactly, and ``test_orchestrator_no_ci_gate_*_wiring``
+#       statically pins the live orchestrator writes so a regression that drops
+#       / renames the ci_loop threading fails CI even though the artifact-read
+#       flows above would still pass against the stale mirror.
+#
+#   (b) the two BYPASS paths (staging base → ``internal_staging_base``,
+#       kill-switch off → ``kill_switch_off``). Until now these were only
+#       unit-tested at the ``should_run_no_ci_test_gate`` decision; here each is
+#       driven through the full gate-decision → unverified-reason →
+#       handle_ci_completion → alert chain, asserting the previously-untested
+#       reason→label mapping shapes a single operator alert.
+# ---------------------------------------------------------------------------
+
+
+def _ci_result_from_recorded_loop(ci_loop: dict) -> dict | None:
+    """Mirror the orchestrator's recorded-verdict fast-path (orchestrator.py
+    ~5125-5136).
+
+    On a re-entry poll where verify_tests already produced a verdict on a PRIOR
+    poll, the gate rebuilds the ci_result from the verdict state THREADED ON
+    ``ci_loop`` (``verify_tests_verdict`` / ``verify_tests_output``) via the SAME
+    ``build_no_ci_gate_ci_result`` helper — it does not re-read the artifact.
+    Returns ``None`` when no verdict has been recorded yet (the gate would still
+    be spawning / awaiting). ``test_orchestrator_no_ci_gate_verdict_state_wiring``
+    pins that the live orchestrator still performs exactly these ci_loop reads,
+    so this mirror cannot silently drift from production.
+    """
+    recorded = ci_loop.get("verify_tests_verdict")
+    if recorded in ("pass", "undetected"):
+        return build_no_ci_gate_ci_result(recorded)
+    if recorded == "fail":
+        return build_no_ci_gate_ci_result(
+            "fail", ci_loop.get("verify_tests_output", "")
+        )
+    return None
+
+
+async def _set_review_loop_keys(db_session, parent, **keys):
+    """Thread arbitrary review_loop state onto the parent exactly as the
+    orchestrator's gate does (dict-copy + flag_modified + add)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    parent = await db_session.get(Task, parent.id)
+    loop = dict((parent.context or {}).get("review_loop", {}))
+    loop.update(keys)
+    parent.context = {**(parent.context or {}), "review_loop": loop}
+    flag_modified(parent, "context")
+    db_session.add(parent)
+    await db_session.commit()
+    return parent
+
+
+@pytest.mark.asyncio
+async def test_no_ci_recorded_pass_verdict_fastpath_merges(db_session, mocker):
+    """Re-entry poll: ``verify_tests_verdict='pass'`` recorded on a prior poll
+    rebuilds a merge-allowing ci_result from ci_loop (no artifact re-read) and
+    proceeds to merge with no UNVERIFIED alert."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # A prior poll recorded a PASS verdict on the loop and stamped the verify
+    # task id — the gate's fast-path reads that state instead of the artifact.
+    parent = await _set_review_loop_keys(
+        db_session,
+        parent,
+        verify_tests_verdict="pass",
+        verify_tests_task_id=str(uuid.uuid4()),
+    )
+    ci_loop = (parent.context or {})["review_loop"]
+    ci_result = _ci_result_from_recorded_loop(ci_loop)
+    assert ci_result is not None
+    assert ci_result["conclusion"] == "success"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert await _unverified_merge_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_no_ci_recorded_fail_verdict_fastpath_blocks_carrying_loop_output(
+    db_session, mocker
+):
+    """Re-entry poll: ``verify_tests_verdict='fail'`` rebuilds a blocking
+    ci_result whose ``failed_logs`` come from ``verify_tests_output`` threaded on
+    ci_loop — proving the failing output survives on the loop across polls and
+    reaches the spawned fix task."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    failing_output = "FAILED tests/test_math.py::test_recorded - assert 3 == 4\n1 failed"
+    parent = await _set_review_loop_keys(
+        db_session,
+        parent,
+        verify_tests_verdict="fail",
+        verify_tests_output=failing_output,
+        verify_tests_task_id=str(uuid.uuid4()),
+    )
+    ci_loop = (parent.context or {})["review_loop"]
+    ci_result = _ci_result_from_recorded_loop(ci_loop)
+    assert ci_result is not None
+    assert ci_result["conclusion"] == "failure"
+    # The failing output threaded on ci_loop is what becomes failed_logs.
+    assert "test_recorded" in ci_result["failed_logs"]
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_not_called()  # the recorded FAIL verdict blocked the merge
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
+    assert len(fix_tasks) == 1
+    # The loop-carried output reaches the fix task, not just the ci_result.
+    assert "test_recorded" in fix_tasks[0].context["ci_failure_logs"]
+
+
+@pytest.mark.asyncio
+async def test_no_ci_recorded_undetected_verdict_fastpath_merges_unverified(
+    db_session, mocker
+):
+    """Re-entry poll: ``verify_tests_verdict='undetected'`` plus the
+    ``unverified_merge_reason`` threaded on ci_loop merges UNVERIFIED and raises
+    exactly one reason-labelled alert — the verdict and reason both ride the
+    same loop across polls."""
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    parent = await _set_review_loop_keys(
+        db_session,
+        parent,
+        verify_tests_verdict="undetected",
+        verify_tests_retries=_VERIFY_TESTS_MAX_RETRIES,
+        unverified_merge_reason="undetected_runtime",
+    )
+    ci_loop = (parent.context or {})["review_loop"]
+    ci_result = _ci_result_from_recorded_loop(ci_loop)
+    assert ci_result is not None
+    assert ci_result["conclusion"] == "success"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    assert f"PR #{PR_NUMBER}" in alerts[0].title
+    assert "no usable verdict" in alerts[0].message  # undetected_runtime label
+
+
+# A staging base the project classifies as an internal rollup target (default
+# ``research/`` prefix) — the gate bypasses verify_tests here by design.
+_STAGING_BASE = "research/rollup-7"
+
+
+def _make_parent_task_on_base(db_session, project, base: str) -> Task:
+    """Like ``_make_parent_task`` but targets an arbitrary base branch so the
+    bypass-path flows can drive a staging-base merge."""
+    loop = {
+        "pr_number": PR_NUMBER,
+        "branch": BRANCH,
+        "base_branch": base,
+        "iteration": 1,
+        "review_approved": True,
+        "ci_waiting": True,
+    }
+    task = Task(
+        project_id=project.id,
+        title="No-CI merge gate parent (bypass)",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": PR_NUMBER,
+                "branch": BRANCH,
+                "base_branch": base,
+            }
+        ],
+        context={"review_loop": loop},
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_no_ci_staging_base_bypass_merges_unverified_with_staging_reason(
+    db_session, mocker
+):
+    """Composed bypass flow: a PR onto an internal STAGING base bypasses the
+    verify_tests gate (CI is path-filtered there by design) and merges
+    UNVERIFIED with the ``internal_staging_base`` reason — EVEN THOUGH the repo
+    has a detectable suite. Pins the full gate-decision → reason → merge → alert
+    chain for the staging bypass, not just the decision predicate.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    # A repo WITH a detectable suite — proving the staging bypass beats the gate.
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    assert has_detectable_tests(project) is True
+
+    # Decision: the staging base bypasses the verify gate despite the suite, and
+    # falls to the immediate-pass (proceed-without-checks) branch.
+    assert project.is_staging_branch(_STAGING_BASE) is True
+    assert (
+        should_run_no_ci_test_gate(project, _STAGING_BASE, gate_enabled=True) is False
+    ), "a staging base must bypass the verify_tests gate even with a suite present"
+    assert proceed_on_no_checks(project, _STAGING_BASE) is True
+
+    parent = _make_parent_task_on_base(db_session, project, _STAGING_BASE)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Immediate-pass builds a merge-allowing ci_result and threads the staging
+    # reason — exactly the orchestrator's :5008-5043 bypass block.
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    assert ci_result["conclusion"] == "success"
+    parent = await _set_unverified_reason(db_session, parent, "internal_staging_base")
+
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1, "the staging-base bypass merge must raise one alert"
+    assert f"PR #{PR_NUMBER}" in alerts[0].title
+    assert "UNVERIFIED" in alerts[0].message
+    assert "internal staging branch" in alerts[0].message  # internal_staging_base label
+
+
+@pytest.mark.asyncio
+async def test_no_ci_kill_switch_off_bypass_merges_unverified_with_kill_switch_reason(
+    db_session, mocker
+):
+    """Composed bypass flow: with the gate kill-switch OFF, an external no-CI
+    repo merges UNVERIFIED with the ``kill_switch_off`` reason — even though it
+    has a detectable suite the gate would otherwise run. Drives the full
+    decision → reason → merge → alert chain for the kill-switch bypass.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    assert has_detectable_tests(project) is True
+
+    # Decision: gate_enabled=False short-circuits the gate to the immediate-pass
+    # branch even on a real base with a detectable suite.
+    assert (
+        should_run_no_ci_test_gate(project, BASE, gate_enabled=False) is False
+    ), "the kill-switch off must bypass the verify_tests gate"
+    assert proceed_on_no_checks(project, BASE) is True
+
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    ci_result = build_no_ci_gate_ci_result("undetected", "")
+    assert ci_result["conclusion"] == "success"
+    parent = await _set_unverified_reason(db_session, parent, "kill_switch_off")
+
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1, "the kill-switch-off bypass merge must raise one alert"
+    assert f"PR #{PR_NUMBER}" in alerts[0].title
+    assert "UNVERIFIED" in alerts[0].message
+    assert "kill-switch off" in alerts[0].message  # kill_switch_off label
+
+
+# ---------------------------------------------------------------------------
+# 9. Static wiring invariants — pin the orchestrator's inline ci_loop writes so
+#    a regression in the live state machine fails CI even though the composed
+#    flows above (which mirror those writes) would still pass.
+#
+#    The gate state machine is inlined inside ``orchestrator_worker``'s polling
+#    loop (not independently callable), so the composed flows necessarily
+#    HAND-MIRROR the orchestrator's ci_loop threading via ``_set_unverified_reason``
+#    / ``_ci_result_from_recorded_loop``. If a refactor drops or renames one of
+#    those writes, the mirror keeps the flows green while production silently
+#    regresses to merge-without-checks. These source scans are the backstop: if
+#    one fails, the orchestrator's gate changed — update the orchestrator AND the
+#    mirroring helpers/labels together, do not delete the assertion.
+# ---------------------------------------------------------------------------
+
+
+def _orchestrator_source() -> str:
+    import inspect
+
+    from app import orchestrator
+
+    return inspect.getsource(orchestrator)
+
+
+def test_orchestrator_no_ci_gate_verdict_state_wiring():
+    """The orchestrator's no-CI gate must still thread the ci_loop verdict state
+    the composed flows mirror: the recorded verdict, the spawned verify task id,
+    the retry counter, and the failing-test output carry."""
+    src = _orchestrator_source()
+    required = [
+        'ci_loop["verify_tests_verdict"] = _outcome',
+        'ci_loop["verify_tests_task_id"]',
+        'ci_loop["verify_tests_retries"]',
+        'ci_loop["verify_tests_output"] = _detail[:4000]',
+        'ci_loop.get("verify_tests_verdict")',
+        'ci_loop.get("verify_tests_output"',
+    ]
+    missing = [needle for needle in required if needle not in src]
+    assert not missing, (
+        "orchestrator no-CI gate ci_loop verdict-state wiring changed — the "
+        "following writes/reads are no longer present: "
+        f"{missing}. Update orchestrator.py AND the mirroring helpers in this "
+        "file (_ci_result_from_recorded_loop / _set_review_loop_keys) together."
+    )
+
+
+def test_orchestrator_no_ci_gate_bypass_reason_wiring():
+    """The orchestrator's immediate-pass branch must still assign each bypass
+    reason key and thread it into ``ci_loop['unverified_merge_reason']`` for the
+    merge-confirmed alert — the keys the bypass composed flows assert against."""
+    import re
+
+    src = _orchestrator_source()
+    # Each bypass reason key must be ASSIGNED to _unverified_merge_reason (the
+    # immediate-pass branch), tolerant of the wrapping/whitespace black uses.
+    assigned = [
+        "internal_staging_base",
+        "kill_switch_off",
+        "no_detectable_test_command",
+    ]
+    missing = [
+        key
+        for key in assigned
+        if not re.search(
+            r"_unverified_merge_reason\s*=\s*\(?\s*[\"']" + key + r"[\"']", src
+        )
+    ]
+    # ...and the chosen reason must be threaded onto ci_loop for the merge alert.
+    if not re.search(r'ci_loop\["unverified_merge_reason"\]\s*=', src):
+        missing.append("ci_loop['unverified_merge_reason'] threading")
+    assert not missing, (
+        "orchestrator no-CI gate bypass-reason wiring changed — missing: "
+        f"{missing}. Each reason key must match an _UNVERIFIED_REASON_LABELS "
+        "entry in alert_dispatch.py; update both sides together."
+    )
