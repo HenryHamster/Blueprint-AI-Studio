@@ -21,6 +21,7 @@ from sqlmodel import select
 from app.migration_path import is_migration_file
 from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
+from app.task_capabilities import READ_ONLY_TASK_TYPES
 
 logger = logging.getLogger("blueprint")
 
@@ -257,6 +258,19 @@ async def filter_file_conflicts(
         if candidate is None:
             non_conflicting.append(eid)
             continue
+        # Read-only task types (review, plan, research, the audits, memo, ...)
+        # never push a branch or open a PR — they produce a verdict / plan /
+        # findings, not a diff — so they CANNOT cause a merge conflict. Exempt
+        # them from the write-conflict gate entirely. Gating them just serialized
+        # the pipeline against hot files (orchestrator.py / task_lifecycle.py /
+        # models.py) that nearly every change touches, and needlessly held
+        # read-only work (e.g. a code review) behind unrelated in-flight writes.
+        # Real write-write conflicts are still caught on the WRITE-type tasks
+        # (create/fix/refactor/migrate/docs/deps/qa).
+        task_type = (candidate.first_payload).get("type", "")
+        if task_type in READ_ONLY_TASK_TYPES:
+            non_conflicting.append(eid)
+            continue
         # Only check conflicts within the same project
         project_files = in_progress_files_by_project.get(candidate.project_id, set())
         if not project_files:
@@ -272,13 +286,12 @@ async def filter_file_conflicts(
         if not overlap:
             non_conflicting.append(eid)
             continue
-        # Large scope tasks defer on any overlap; refactors use standard threshold
-        # (refactors are expected to touch decomposition targets — overlap is intentional)
+        # Large scope tasks defer on any overlap; standard scope uses the 2-file
+        # / 50% threshold (refactors are expected to touch decomposition targets —
+        # overlap is intentional). NB: plan (and every other read-only type) is
+        # exempted above, so the old ``or task_type == "plan"`` clause is gone.
         scope = (candidate.context or {}).get("scope", DEFAULT_TASK_SCOPE)
-        task_type = (candidate.first_payload).get("type", "")
-        is_large = (
-            scope == "large" or task_type == "plan"
-        )  # refactors use standard threshold
+        is_large = scope == "large"
         # Otherwise: defer if at least 2 files overlap AND >= 50% of candidate's files
         should_defer = is_large or (
             len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5

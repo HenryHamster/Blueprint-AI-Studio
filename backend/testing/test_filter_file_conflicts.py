@@ -68,7 +68,27 @@ class TestFilterFileConflicts:
         assert "file conflict" in (c.latest_status_message or "")
 
     @pytest.mark.asyncio
-    async def test_plan_type_deferred_on_single_file_overlap(self):
+    async def test_review_type_never_deferred_even_on_full_overlap(self):
+        """A review is read-only — it posts a verdict, not a diff — so it can
+        never conflict and must never be held behind in-flight writes (the
+        2026-06-03 spurious-hold bug: Review PR #7411 blocked by Fix #7415 on
+        hot-file overlap)."""
+        pid = uuid.uuid4()
+        # Full overlap + large scope: a WRITE task here would be deferred.
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="review")
+        ip = _in_progress(pid, ["a.py", "b.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_plan_type_not_deferred_because_read_only(self):
+        """plan is a read-only type (it produces a plan + spawns children, no PR),
+        so it is exempt from the write-conflict gate. (Previously plan deferred on
+        any overlap — that mis-applied a write-conflict gate to a no-diff task.)"""
         pid = uuid.uuid4()
         c = _queued(pid, ["a.py", "b.py"], scope="small", ttype="plan")
         ip = _in_progress(pid, ["a.py"])
@@ -76,7 +96,32 @@ class TestFilterFileConflicts:
         broadcast_fn = AsyncMock()
 
         result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+
+    @pytest.mark.asyncio
+    async def test_research_type_not_deferred_read_only(self):
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py"], scope="large", ttype="research")
+        ip = _in_progress(pid, ["a.py", "b.py", "c.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+
+    @pytest.mark.asyncio
+    async def test_write_type_still_deferred_on_overlap(self):
+        """Regression guard: WRITE types (fix here) are still gated — the
+        exemption must not disable the conflict filter for code-producing work."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", ttype="fix")
+        ip = _in_progress(pid, ["a.py"])
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
         assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_standard_not_deferred_on_single_file_overlap(self):
