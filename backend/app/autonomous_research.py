@@ -18,7 +18,7 @@ from app.models import (
     Alert,
     AlertSeverity,
 )
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.payload_schemas import (
     validate_internal_payload,
     ALL_TASK_TYPES,
@@ -436,6 +436,16 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
 
     busy_direction_ids: set = set()
     resurrection_lookback = now - timedelta(hours=2)
+    # ``~has_key`` compiles to the Postgres-only JSONB ``?`` (key-existence)
+    # operator, which raises ``sqlite3.OperationalError`` on the SQLite smoke
+    # gate. Branch on the resolved dialect and fall back to the portable
+    # ``json_extract`` IS NULL form for the key-absence check on SQLite.
+    if resolve_dialect_name(session) == "postgresql":
+        _no_resurrection_count = ~Task.context.has_key("_resurrection_count")
+    else:
+        _no_resurrection_count = func.json_extract(
+            Task.context, "$._resurrection_count"
+        ).is_(None)
     active_research = (
         (
             await session.execute(
@@ -456,7 +466,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                             Task.context["failure_category"]
                             .as_string()
                             .in_(list(INFRA_CLASSES)),
-                            ~Task.context.has_key("_resurrection_count"),
+                            _no_resurrection_count,
                         ),
                     ),
                 )

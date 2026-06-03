@@ -7,7 +7,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -764,19 +764,24 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
 
     # Audit R3-W2 (M8): push the warm_target_vm_id existence filter into SQL
     # so we don't pull 1000-row pages of QUEUED tasks just to Python-filter
-    # to a handful of warm-pinned ones. ``context['warm_target_vm_id']``
-    # compiles to ``context -> 'warm_target_vm_id'`` (Postgres JSONB) /
-    # ``json_extract(context, '$.warm_target_vm_id')`` (SQLite); both
-    # return NULL when the key is absent, so the IS NOT NULL predicate is
-    # dialect-agnostic. SQLite has no GIN — the index_safe variant matters
-    # only on Postgres but the predicate evaluates correctly either way.
+    # to a handful of warm-pinned ones.
     # R4-W2 (M3): use ``has_key`` (compiles to JSONB ``?`` operator) so the
     # ``ix_task_context_gin`` GIN index can satisfy the predicate. The prior
     # ``as_string().is_not(None)`` form casts to text and never matches the
-    # GIN index, forcing a SeqScan.
+    # GIN index, forcing a SeqScan. The ``?`` operator is Postgres-only and is
+    # NOT dialect-agnostic — it raises ``sqlite3.OperationalError`` on the
+    # SQLite smoke gate — so branch on the resolved dialect and fall back to
+    # the portable ``json_extract`` IS NOT NULL form on SQLite (which returns
+    # NULL when the key is absent).
+    if resolve_dialect_name(session) == "postgresql":
+        _warm_target_present = Task.context.has_key("warm_target_vm_id")
+    else:
+        _warm_target_present = func.json_extract(
+            Task.context, "$.warm_target_vm_id"
+        ).isnot(None)
     pinned_where = [
         Task.status == TaskStatus.QUEUED,
-        Task.context.has_key("warm_target_vm_id"),
+        _warm_target_present,
     ]
     pinned_stmt = (
         select(Task)

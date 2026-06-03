@@ -3039,21 +3039,27 @@ class TestNoUnguardedPostgresJsonOp:
     nothing static flagged it.
 
     This invariant flags any module under ``backend/app`` that emits a
-    Postgres-only JSON operator via the raw ``.op(...)`` surface — the JSONB
-    containment operator ``@>`` and the key-existence operator family
-    ``?`` / ``?|`` / ``?&`` — unless the module also routes dialect resolution
-    through ``app.database.resolve_dialect_name``. A module that branches on the
+    Postgres-only JSON operator via either surface:
+
+    * the raw ``.op(...)`` surface — the JSONB containment operator ``@>`` and
+      the key-existence operator family ``?`` / ``?|`` / ``?&``; or
+    * the ``.has_key(...)`` *method* form — SQLAlchemy's JSONB key-existence
+      check, which compiles to the Postgres-only ``?`` operator and raises
+      ``sqlite3.OperationalError`` on the SQLite smoke gate exactly like
+      ``.op("?")`` does.
+
+    unless the module also routes dialect resolution through
+    ``app.database.resolve_dialect_name``. A module that branches on the
     resolved dialect is presumed to guard the Postgres-only path behind it; if a
     genuine exception is ever needed, add the file to ``allow_list`` (the same
     escape hatch the ``.bind.dialect`` invariants use for ``database.py``).
 
-    Known scope gap (intentional, documented as latent-risk follow-up): this
-    only scans the raw ``.op(...)`` operator surface. The ``.has_key()`` *method*
-    form (a Postgres-only key-existence check) has pre-existing **unguarded**
-    sites in backend/app (digest_remediation, rollup_management,
-    autonomous_research, residual_case_endpoints) that are out of scope to fix
-    here; including ``.has_key()`` would red-fail CI on those. Closing the
-    ``.has_key()`` gap is a separate follow-up.
+    The previously-documented ``.has_key()`` scope gap is now CLOSED: the four
+    pre-existing unguarded sites (digest_remediation, rollup_management,
+    autonomous_research, residual_case_endpoints) plus the mis-commented
+    admin_health site were all routed through ``resolve_dialect_name`` with a
+    portable ``func.json_extract`` SQLite fallback, so scanning ``.has_key()``
+    here no longer red-fails CI.
     """
 
     # The canonical resolver. A module that calls it is presumed to branch on
@@ -3065,19 +3071,27 @@ class TestNoUnguardedPostgresJsonOp:
     # operator family ``?`` / ``?|`` / ``?&``.
     _PG_JSON_OP_RE = re.compile(r"""\.op\(\s*['"](?:@>|\?\|?|\?&)['"]\s*\)""")
 
+    # The ``.has_key(...)`` method form — SQLAlchemy's JSONB key-existence
+    # comparator, which compiles to the Postgres-only ``?`` operator. (Python 3
+    # dicts have no ``.has_key`` method, so a ``.has_key(`` call site in this
+    # codebase is always the JSONB operator.) A bare function named e.g.
+    # ``_build_config_has_key(...)`` has no leading dot and is not matched.
+    _PG_HAS_KEY_RE = re.compile(r"\.has_key\(")
+
     @classmethod
     def _scan_module_text(cls, text: str) -> list[int]:
-        """Return the 1-based line numbers that emit a raw Postgres-only JSON
-        operator, skipping comment / ``# noqa`` lines (mirrors the sibling
-        scanners). Returns an empty list when the module is guarded — i.e. it
-        also contains ``resolve_dialect_name``."""
+        """Return the 1-based line numbers that emit a Postgres-only JSON
+        operator — via either the raw ``.op(...)`` surface or the
+        ``.has_key(...)`` method form — skipping comment / ``# noqa`` lines
+        (mirrors the sibling scanners). Returns an empty list when the module is
+        guarded — i.e. it also contains ``resolve_dialect_name``."""
         if cls._GUARD_TOKEN in text:
             return []
         hits: list[int] = []
         for lineno, line in enumerate(text.splitlines(), start=1):
             if line.lstrip().startswith("#") or "# noqa" in line:
                 continue
-            if cls._PG_JSON_OP_RE.search(line):
+            if cls._PG_JSON_OP_RE.search(line) or cls._PG_HAS_KEY_RE.search(line):
                 hits.append(lineno)
         return hits
 
@@ -3102,11 +3116,15 @@ class TestNoUnguardedPostgresJsonOp:
                     offenders.append(f"  {rel}:{lineno}: {line.strip()}")
         assert not offenders, (
             "Found a Postgres-only JSON operator (`.op('@>')` / `.op('?')` / "
-            "`.op('?|')` / `.op('?&')`) in backend/app/ with no dialect branch.\n"
+            "`.op('?|')` / `.op('?&')` or the `.has_key(...)` method form) in "
+            "backend/app/ with no dialect branch.\n"
             "Such SQL runs on Postgres (CI stays green) but fails on the local "
-            "SQLite smoke gate with `unrecognized token: \"@\"`. Route dialect "
+            "SQLite smoke gate with `unrecognized token: \"@\"` (or a `?` "
+            "parameter-placeholder error for `.has_key`). Route dialect "
             "resolution through app.database.resolve_dialect_name(session) and "
-            "branch the Postgres-only path behind it (see account-health fix).\n"
+            "branch the Postgres-only path behind it (see account-health fix), "
+            "falling back to a portable `func.json_extract(...)` predicate on "
+            "SQLite (see landed_signal / agent_warm_continuity).\n"
             "Offenders:\n" + "\n".join(offenders)
         )
 
@@ -3134,6 +3152,49 @@ class TestNoUnguardedPostgresJsonOp:
         key_exists = 'Task.context.op("?")(literal("k"))\n'
         assert self._scan_module_text(key_exists) == [1]
 
+    def test_scanner_flags_injected_unguarded_has_key(self):
+        """Self-test: the scanner must DETECT an unguarded `.has_key(...)`
+        method-form key-existence check — the surface this invariant was
+        extended to cover. Both the positive and the negated (`~...has_key`)
+        form must be flagged."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from sqlmodel import select
+
+            async def remediation_tasks(session):
+                stmt = select(Task).where(
+                    Task.context.has_key("diagnosis_task_id"),
+                )
+                return await session.execute(stmt)
+            """
+        )
+        assert self._scan_module_text(source) == [6]
+
+        # The negated key-absence form (`~Task.context.has_key(...)`) is the
+        # exact shape that regressed in residual_case_endpoints / autonomous_
+        # research; it must be detected too.
+        negated = '.where(*filters, ~Task.context.has_key("failure_category"))\n'
+        assert self._scan_module_text(negated) == [1]
+
+    def test_scanner_ignores_non_method_has_key_function(self):
+        """Self-test: a bare function named `*_has_key(...)` (no leading dot) is
+        NOT the JSONB operator and must NOT be flagged — guards against the
+        scanner over-matching helper functions like
+        ``_build_config_has_key(project, key)``."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            def _build_config_has_key(project, key):
+                return key in (project.build_config or {})
+
+            is_default = not _build_config_has_key(project, "task_branch_prefix")
+            """
+        )
+        assert self._scan_module_text(source) == []
+
     def test_scanner_passes_guarded_op(self):
         """Self-test: a module that emits `.op('@>')` AND resolves the dialect
         via resolve_dialect_name is NOT flagged."""
@@ -3148,6 +3209,30 @@ class TestNoUnguardedPostgresJsonOp:
                     pred = Task.context.op("@>")(cast({"failed": True}, JSONB))
                 else:
                     pred = Task.context["failed"].as_boolean().is_(True)
+                return pred
+            """
+        )
+        assert self._scan_module_text(source) == []
+
+    def test_scanner_passes_guarded_has_key(self):
+        """Self-test: a module that emits `.has_key(...)` AND resolves the
+        dialect via resolve_dialect_name is NOT flagged — mirrors the canonical
+        ``func.json_extract`` SQLite fallback used in landed_signal /
+        agent_warm_continuity / the sites fixed alongside this invariant."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            from sqlalchemy import func
+            from app.database import resolve_dialect_name
+
+            async def remediation_tasks(session):
+                if resolve_dialect_name(session) == "postgresql":
+                    pred = Task.context.has_key("diagnosis_task_id")
+                else:
+                    pred = func.json_extract(
+                        Task.context, "$.diagnosis_task_id"
+                    ).isnot(None)
                 return pred
             """
         )

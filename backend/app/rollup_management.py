@@ -19,7 +19,7 @@ from sqlalchemy import func as _func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.database import AsyncSessionLocal
+from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.rollup_locking import (  # noqa: F401 — re-exported for callers/tests
     _ParentMutatedDuringPRCreation,
     _capture_rollup_parent_snapshot,
@@ -3053,7 +3053,17 @@ async def _check_and_trigger_rollup(
                             # R4-W2 (M3): ``has_key`` uses the GIN ``?``
                             # operator and matches ``ix_task_context_gin``;
                             # the prior ``as_string().is_not(None)`` form
-                            # bypassed the index.
+                            # bypassed the index. ``?`` is Postgres-only, so
+                            # branch on the resolved dialect and fall back to
+                            # the portable ``json_extract`` form on SQLite.
+                            if resolve_dialect_name(session) == "postgresql":
+                                _rollup_pr_present = Task.context.has_key(
+                                    "rollup_pr_url"
+                                )
+                            else:
+                                _rollup_pr_present = _func.json_extract(
+                                    Task.context, "$.rollup_pr_url"
+                                ).isnot(None)
                             recent_rollups = (
                                 await session.execute(
                                     select(_func.count())
@@ -3063,7 +3073,7 @@ async def _check_and_trigger_rollup(
                                         Task.id != parent.id,
                                         Task.updated_at
                                         >= _utcnow() - timedelta(hours=1),
-                                        Task.context.has_key("rollup_pr_url"),
+                                        _rollup_pr_present,
                                     )
                                 )
                             ).scalar() or 0
