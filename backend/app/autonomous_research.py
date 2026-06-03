@@ -344,8 +344,36 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         .all()
     )
     evaluating_timeout_minutes = _runtime_config.get(
-        "evaluating_pipeline_timeout_minutes", 30
+        "evaluating_pipeline_timeout_minutes", 240
     )
+
+    # Parents that still have non-terminal children are actively progressing
+    # (their findings are mid-flight on their way to a rollup), not stuck. Used
+    # to suppress the EVALUATING-pipelining exception below so we don't spawn a
+    # duplicate research cycle on a direction that's still being worked.
+    active_research_ids = [t.id for t in active_research]
+    parents_with_active_children: set = set()
+    if active_research_ids:
+        child_parent_rows = (
+            (
+                await session.execute(
+                    select(Task.parent_task_id).where(
+                        Task.parent_task_id.in_(active_research_ids),
+                        Task.status.in_(
+                            [
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        parents_with_active_children = {pid for pid in child_parent_rows if pid}
 
     # Pipelining cap: when a long-EVALUATING parent triggers the staleness
     # skip below, we still want to allow at most ONE additional pipelined
@@ -403,16 +431,39 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     updated = updated.replace(tzinfo=None)
                 age_minutes = (now - updated).total_seconds() / 60
                 if age_minutes >= evaluating_timeout_minutes:
-                    # Count OTHER recent research on this direction (any
-                    # status, including CANCELLED) — exclude self.
-                    recent_others = [
-                        rid
-                        for rid in recent_research_by_direction.get(current_did, [])
-                        if rid != t.id
-                    ]
-                    if not recent_others:
-                        continue  # No prior pipelined spawn — allow one
-                    # Already pipelined within the window — treat as busy.
+                    # Only pipeline when the parent is GENUINELY stuck, not
+                    # merely waiting on in-flight work. A research parent whose
+                    # children are still running, or whose rollup PR is still
+                    # open, is progressing normally and legitimately sits in
+                    # EVALUATING for hours — the EVALUATING age alone can't tell
+                    # "stuck" from "children working". Pipelining there spawns a
+                    # duplicate rollup on the SAME direction that is guaranteed
+                    # to conflict with the first once one of them merges
+                    # (incident 2026-06-03: d2415495/#7427 vs e783a7ad/#7433 on
+                    # d-5d841cea, spawned 2h20m apart — the second fired ~4 min
+                    # after this parent crossed the timeout while its 5 children
+                    # were still working). Genuinely-stuck = all children
+                    # terminal AND no open rollup PR. (A still-EVALUATING parent
+                    # with a pr_number means the rollup PR is still in flight —
+                    # it only leaves EVALUATING on merge.)
+                    has_active_children = t.id in parents_with_active_children
+                    has_open_pr = bool(
+                        ((t.context or {}).get("review_loop") or {}).get("pr_number")
+                    )
+                    if not has_active_children and not has_open_pr:
+                        # Count OTHER recent research on this direction (any
+                        # status, including CANCELLED) — exclude self.
+                        recent_others = [
+                            rid
+                            for rid in recent_research_by_direction.get(
+                                current_did, []
+                            )
+                            if rid != t.id
+                        ]
+                        if not recent_others:
+                            continue  # No prior pipelined spawn — allow one
+                        # Already pipelined within the window — treat as busy.
+                    # else: progressing (children active or PR open) → busy
             busy_direction_ids.add(current_did)
 
     active_directions = await _process_direction_lifecycle(

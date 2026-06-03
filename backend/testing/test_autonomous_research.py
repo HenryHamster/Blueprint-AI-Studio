@@ -940,6 +940,151 @@ async def test_pipelining_allows_first_extra_when_no_prior(db_session):
 
 
 @pytest.mark.asyncio
+async def test_pipelining_blocked_while_children_active(db_session):
+    """Regression for incident 2026-06-03 (d2415495/#7427 vs e783a7ad/#7433 on
+    d-5d841cea): a research parent legitimately sits in EVALUATING for hours
+    while its child findings do their work on the way to a rollup. The
+    EVALUATING age alone can't distinguish "stuck" from "children still
+    working", so the pipelining exception fired ~2h after the parent went
+    EVALUATING and spawned a DUPLICATE research on the same direction —
+    producing a second rollup PR guaranteed to conflict with the first once
+    one merged.
+
+    Fix: suppress pipelining while the EVALUATING parent still has non-terminal
+    children (it's progressing, not stuck)."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    _runtime_config["research_pipelining_window_minutes"] = 240
+    project = Project(
+        name="Pipelining Blocked While Children Active",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipechild")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # EVALUATING-stale parent — would normally arm the pipelining exception.
+    parent = Task(
+        project_id=project.id,
+        title="Research: parent with children still working",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipechild",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    # A child finding still mid-flight — the parent is progressing, not stuck.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        title="feat: a finding spawned by the parent research",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    from sqlalchemy import update as _update
+
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(
+        _update(Task).where(Task.id == parent.id).values(updated_at=stale)
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1, (
+        f"A stale-EVALUATING parent with active children is progressing, not "
+        f"stuck — pipelining must be suppressed (expected 1 research: the parent "
+        f"only). Got {len(research)}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_pipelining_blocked_while_rollup_pr_open(db_session):
+    """Companion to the children-active guard: even after all children are
+    terminal, an EVALUATING parent with an OPEN rollup PR is still in flight —
+    spawning a fresh research would create a second rollup on the same
+    direction that conflicts with the open PR. A still-EVALUATING parent with a
+    pr_number means the PR hasn't merged (it would leave EVALUATING on merge),
+    so suppress pipelining while a PR number is recorded."""
+    from app.shared_state import runtime_config as _runtime_config
+
+    _runtime_config["evaluating_pipeline_timeout_minutes"] = 30
+    _runtime_config["research_pipelining_window_minutes"] = 240
+    project = Project(
+        name="Pipelining Blocked While PR Open",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-pipepr")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Research: parent with open rollup PR",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [],
+                "base_branch": "main",
+                "current_direction_id": "d-pipepr",
+            }
+        ],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"review_loop": {"pr_number": 9999, "branch": "research/pipepr"}},
+    )
+    db_session.add(parent)
+    await db_session.commit()
+
+    from sqlalchemy import update as _update
+
+    stale = datetime.utcnow() - timedelta(minutes=90)
+    await db_session.execute(
+        _update(Task).where(Task.id == parent.id).values(updated_at=stale)
+    )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t
+        for t in result.scalars().all()
+        if (t.payloads or [{}])[0].get("type") == "research"
+    ]
+    assert len(research) == 1, (
+        f"A stale-EVALUATING parent with an open rollup PR is in flight — "
+        f"pipelining must be suppressed (expected 1 research). Got {len(research)}."
+    )
+
+
+@pytest.mark.asyncio
 async def test_failed_resurrection_eligible_blocks_direction(db_session):
     """Regression for race 2026-05-05 (3d4bc05a + 88c7d5c8 on d-3878da01):
     reaper marks an infra-failed task FAILED at T+0; ~5s later the autonomous

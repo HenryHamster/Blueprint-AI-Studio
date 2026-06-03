@@ -520,6 +520,76 @@ async def test_delete_direction_cancels_queued_tasks(
     assert task.status == TaskStatus.CANCELLED
 
 
+@pytest.mark.asyncio
+async def test_manual_research_409_when_research_in_flight(
+    client: AsyncClient, db_session, mocker
+):
+    """The manual research endpoint must refuse to spawn a second research on a
+    direction that already has one in flight — two concurrent research cycles
+    produce two rollup PRs that conflict (incident 2026-06-03 on d-5d841cea).
+    Uses the legacy payload shape (no current_direction_id) for the in-flight
+    task to also exercise the directions-list fallback matcher."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Already researching")
+    direction_id = direction["id"]
+
+    in_flight = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: in flight",
+        # Legacy shape: directions list, no current_direction_id.
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(in_flight)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
+
+    # bypass_cooldown must NOT override the concurrency guard.
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+        "?bypass_cooldown=true"
+    )
+    assert resp.status_code == 409, resp.text
+
+    # A different direction is unaffected.
+    other = await _add_direction(client, project_id, text="Different direction")
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{other['id']}/research"
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_manual_research_stamps_current_direction_id(
+    client: AsyncClient, db_session, mocker
+):
+    """The manual research payload must carry current_direction_id so the task
+    is visible to the autonomous busy-direction dedup (otherwise the autonomous
+    loop spawns a concurrent duplicate on the same direction)."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Stamp the direction id")
+    direction_id = direction["id"]
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+
+    created = await db_session.get(Task, uuid.UUID(task_id))
+    assert created is not None
+    assert created.first_payload.get("current_direction_id") == direction_id
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Cooldown Filter (_spawn_research_task)
 # ─────────────────────────────────────────────────────────────────────────────
