@@ -438,5 +438,27 @@
     "family": "pytest",
     "agent_families": ["pytest"],
     "onboard_families": ["npm", "pytest"]
+  },
+  {
+    "name": "composer_json_without_scripts_test",
+    "files": [
+      {
+        "path": "composer.json",
+        "content": "{\"name\":\"myapp\"}"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "package_json_without_scripts_test",
+    "files": [
+      {
+        "path": "package.json",
+        "content": "{\"name\":\"myapp\"}"
+      }
+    ],
+    "detectable": false,
+    "family": null
   }
 ]
