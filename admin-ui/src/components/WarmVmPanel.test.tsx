@@ -737,6 +737,91 @@ describe('WarmVmPanel — warm-pool retarget toggles + per-account misses', () =
   });
 });
 
+describe('WarmVmPanel — warm-breaker suppression callouts', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('{}', { status: 200 }),
+    );
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('renders the pool breaker callout with reset time and failures/threshold', async () => {
+    const state: WarmVmStateResponse = {
+      ...baseState,
+      warm_pin_metrics: {
+        ...baseState.warm_pin_metrics,
+        pool_circuit_breaker_suppressed: true,
+        pool_suppressed_until: '2026-06-03T12:30:00',
+        pool_claim_failures_last_hour: 7,
+        pool_failure_rate_threshold: 5,
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(state), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const callout = await screen.findByTestId('pool-breaker-callout');
+    expect(callout.textContent).toContain('OPEN');
+    expect(callout.textContent).toContain('7/5 failures');
+    // Reset time is rendered (local-time formatting of the naive-UTC stamp).
+    expect(callout.textContent).toMatch(/until \d/);
+    // Only the pool breaker is open here — the others must not render.
+    expect(screen.queryByTestId('continuity-breaker-callout')).toBeNull();
+    expect(screen.queryByTestId('backlog-breaker-callout')).toBeNull();
+  });
+
+  test('renders continuity and backlog breaker callouts when both are suppressed', async () => {
+    const state: WarmVmStateResponse = {
+      ...baseState,
+      warm_pin_metrics: {
+        ...baseState.warm_pin_metrics,
+        clears_last_hour: 14,
+        circuit_breaker_suppressed: true,
+        suppressed_until: '2026-06-03T09:15:00',
+        clear_rate_threshold: 10,
+        backlog_reuse_circuit_breaker_suppressed: true,
+        backlog_reuse_suppressed_until: null,
+        backlog_reuse_failures_last_hour: 8,
+        backlog_reuse_failure_rate_threshold: 5,
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(state), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const continuity = await screen.findByTestId('continuity-breaker-callout');
+    expect(continuity.textContent).toContain('14/10 failures');
+    const backlog = screen.getByTestId('backlog-breaker-callout');
+    expect(backlog.textContent).toContain('8/5 failures');
+    // No until-time when the backend reports a null reset timestamp.
+    expect(backlog.textContent).not.toMatch(/until/);
+    expect(screen.queryByTestId('pool-breaker-callout')).toBeNull();
+  });
+
+  test('renders no callouts when no breaker is suppressed (backward-compat fixture)', async () => {
+    // baseState omits every breaker field — an older backend / clean state.
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(baseState), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('warm-breaker-callouts')).toBeNull();
+    expect(screen.queryByTestId('pool-breaker-callout')).toBeNull();
+    expect(screen.queryByTestId('continuity-breaker-callout')).toBeNull();
+    expect(screen.queryByTestId('backlog-breaker-callout')).toBeNull();
+  });
+});
+
 describe('WarmVmPanel — warm-start origin breakdown', () => {
   const snapshotWithBreakdown = {
     computed_at: new Date().toISOString(),
@@ -1182,5 +1267,143 @@ describe('WarmVmPanel — per-project warm-pool payoff verdict', () => {
 
     await screen.findByTestId('warm-pool-scope-row');
     expect(screen.queryByTestId('pool-payoff-verdict-row')).toBeNull();
+  });
+});
+
+describe('WarmVmPanel — account-retarget callout', () => {
+  // Extracted so tests can spread without non-null assertions.
+  const retargetFunnel = {
+    window_hours: 24,
+    pool_lease_hits: 0,
+    cold_dispatches: 8,
+    total_dispatches: 8,
+    pool_hit_rate: 0 as number | null,
+    lease_miss_by_reason: { no_compatible_member: 8 } as Record<string, number>,
+    lease_miss_total: 8,
+  };
+  const retargetPoolMetrics = {
+    enabled: true,
+    target_size: 2,
+    current_size: 2,
+    idle_count: 2,
+    funnel: retargetFunnel,
+  };
+  // Pool enabled, low hit rate, no_compatible_member misses, retarget OFF.
+  const stateRetargetNeeded: WarmVmStateResponse = {
+    ...baseState,
+    account_retarget_enabled: false,
+    pool_metrics: retargetPoolMetrics,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response('{}', { status: 200 }),
+    );
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    localStorage.setItem('blueprint-admin:warmVmPanelCollapsed', 'false');
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  test('renders callout when pool enabled, low hit rate, no_compatible_member misses, retarget off', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateRetargetNeeded), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const callout = await screen.findByTestId('account-retarget-callout');
+    expect(callout.textContent).toContain('8');
+    expect(callout.textContent).toContain('Account Retarget');
+    expect(screen.getByTestId('account-retarget-enable-btn')).toBeTruthy();
+  });
+
+  test('does not render callout when account_retarget_enabled is true', async () => {
+    const stateRetargetOn: WarmVmStateResponse = {
+      ...stateRetargetNeeded,
+      account_retarget_enabled: true,
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateRetargetOn), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('account-retarget-callout')).toBeNull();
+  });
+
+  test('does not render callout when no_compatible_member count is zero', async () => {
+    const stateNoMismatch: WarmVmStateResponse = {
+      ...stateRetargetNeeded,
+      pool_metrics: {
+        ...retargetPoolMetrics,
+        funnel: {
+          ...retargetFunnel,
+          lease_miss_by_reason: { no_idle_member: 8 },
+        },
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateNoMismatch), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('account-retarget-callout')).toBeNull();
+  });
+
+  test('does not render callout when pool is disabled', async () => {
+    const statePoolOff: WarmVmStateResponse = {
+      ...stateRetargetNeeded,
+      pool_metrics: { ...retargetPoolMetrics, enabled: false },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(statePoolOff), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('account-retarget-callout')).toBeNull();
+  });
+
+  test('does not render callout when hit rate is high (>= 0.5)', async () => {
+    const stateHighHitRate: WarmVmStateResponse = {
+      ...stateRetargetNeeded,
+      pool_metrics: {
+        ...retargetPoolMetrics,
+        funnel: { ...retargetFunnel, pool_hit_rate: 0.6 },
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateHighHitRate), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('account-retarget-callout')).toBeNull();
+  });
+
+  test('Enable Account Retarget button calls flipFlag with warm_pool_account_retarget_enabled', async () => {
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateRetargetNeeded), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const btn = await screen.findByTestId('account-retarget-enable-btn');
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith(
+        'http://localhost:8000/api/admin/settings',
+        expect.objectContaining({ method: 'PATCH' }),
+      );
+    });
+    const [, opts] = (apiFetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const body = JSON.parse(opts.body as string);
+    // Flips ONLY the retarget flag — must not touch sibling flags.
+    expect(body).toEqual({ warm_pool_account_retarget_enabled: true });
   });
 });

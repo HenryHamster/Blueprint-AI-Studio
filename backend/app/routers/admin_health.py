@@ -1002,6 +1002,10 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 "warm_pool_cross_provider_retarget_enabled", False
             )
         ),
+        # Backward-compatible alias for the account-retarget hint/callout path.
+        "account_retarget_enabled": bool(
+            _shared_state.runtime_config.get("warm_pool_account_retarget_enabled", False)
+        ),
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
         ),

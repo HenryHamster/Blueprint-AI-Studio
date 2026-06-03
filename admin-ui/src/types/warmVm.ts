@@ -218,6 +218,10 @@ export interface WarmPoolTargetSetResponse {
 
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
+  // Whether warm_pool_account_retarget_enabled is on (any idle member serves
+  // any account in the tenant). Optional for backward compatibility with older
+  // backends that predate the field; panel treats absent as false.
+  account_retarget_enabled?: boolean;
   warm_pin_metrics: {
     clears_last_hour: number;
     clears_last_24h: number;
@@ -234,6 +238,27 @@ export interface WarmVmStateResponse {
     active_pool_origin_claims?: number;
     pool_origin_share?: number | null;
     active_chain_continuity_claims: number;
+    // Warm-subsystem circuit-breaker suppression state. All optional for
+    // backward compatibility with older backends (and existing test fixtures)
+    // that predate the breaker telemetry — when absent the panel renders no
+    // callout. The backend emits these from admin_health._compute_warm_vm_state:
+    // a *_circuit_breaker_suppressed boolean, the *_suppressed_until reset
+    // timestamp (naive UTC ISO, or null), the recent-failure count in the last
+    // hour, and the failure-rate threshold that trips the breaker.
+    // Chain continuity (warm-pin clear breaker):
+    circuit_breaker_suppressed?: boolean;
+    suppressed_until?: string | null;
+    clear_rate_threshold?: number;
+    // Backlog reuse claim breaker:
+    backlog_reuse_circuit_breaker_suppressed?: boolean;
+    backlog_reuse_suppressed_until?: string | null;
+    backlog_reuse_failures_last_hour?: number;
+    backlog_reuse_failure_rate_threshold?: number;
+    // Warm-pool claim breaker:
+    pool_circuit_breaker_suppressed?: boolean;
+    pool_suppressed_until?: string | null;
+    pool_claim_failures_last_hour?: number;
+    pool_failure_rate_threshold?: number;
   };
   warm_continuity_enabled: boolean;
   warm_backlog_reuse_enabled: boolean;

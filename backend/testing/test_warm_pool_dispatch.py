@@ -846,3 +846,75 @@ async def test_no_idle_member_miss_is_attributed_to_account(db_session, warm_poo
     )
     # Not lumped into the unattributed bucket anymore.
     assert by_account.get("unattributed", {}).get("lease_miss_total", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_incompatible_member_records_no_compatible_member(
+    db_session, warm_pool_on
+):
+    """When idle members EXIST for the project but none match the task's resolved
+    account/provider/model (and retarget is off), the miss is recorded as
+    'no_compatible_member' — the distinct reason that points the operator at the
+    retarget toggle rather than at growing the pool.
+    """
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        get_pool_funnel_snapshot,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    project = await _make_project(db_session, name="Incompatible Idle")
+    # An IDLE member exists, but pinned to a DIFFERENT model than the task needs.
+    await _make_idle_member(
+        db_session, project, vm_instance_id="vm-opus", model="claude-opus-4-8"
+    )
+    task = await _make_queued_task(db_session, project, model="claude-sonnet-4-6")
+
+    leased = await _dispatch(db_session, task, model="claude-sonnet-4-6", account="acct-1")
+    assert leased is None
+
+    snap = get_pool_funnel_snapshot()
+    assert snap["lease_miss_by_reason"].get("no_compatible_member") == 1
+    # The genuinely-empty reason must NOT have fired.
+    assert snap["lease_miss_by_reason"].get("no_idle_member") is None
+    # Still attributed to the resolved account.
+    by_account = snap["by_account"]
+    assert (
+        by_account.get("acct-1", {})
+        .get("lease_miss_by_reason", {})
+        .get("no_compatible_member")
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_pool_records_no_idle_member(db_session, warm_pool_on):
+    """When the pool is genuinely empty (no idle members for the project), the miss
+    is recorded as 'no_idle_member' — the reason that points the operator at growing
+    the pool, NOT at the retarget toggle. Complements the incompatible-member case.
+    """
+    from app.warm_backlog_reuse import (
+        _pool_cold_dispatch_events,
+        _pool_lease_hit_events,
+        _pool_lease_miss_events,
+        get_pool_funnel_snapshot,
+    )
+
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    project = await _make_project(db_session, name="Empty Pool")
+    task = await _make_queued_task(db_session, project, model="claude-opus-4-8")
+
+    leased = await _dispatch(db_session, task, account="acct-1")
+    assert leased is None
+
+    snap = get_pool_funnel_snapshot()
+    assert snap["lease_miss_by_reason"].get("no_idle_member") == 1
+    assert snap["lease_miss_by_reason"].get("no_compatible_member") is None

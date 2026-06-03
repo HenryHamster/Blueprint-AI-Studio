@@ -301,6 +301,29 @@ async def count_idle_pool_vms(
     return int((await session.execute(stmt)).scalar() or 0)
 
 
+async def count_idle_state_pool_vms(
+    session, *, project_id: Optional[uuid.UUID] = None
+) -> int:
+    """Count members in the IDLE state only (NOT PROVISIONING), per project or fleet-wide.
+
+    Distinct from ``count_idle_pool_vms`` (which also counts PROVISIONING slots for
+    concurrency accounting): this answers exactly "does leasable idle inventory exist
+    for this project?" — used on the dispatch miss path to distinguish a genuinely
+    empty pool (``no_idle_member``) from one whose idle members are present but
+    identity/tenant-incompatible with the task (``no_compatible_member``). It
+    deliberately ignores account/provider/model and the blacklist so it reflects raw
+    idle inventory regardless of why the lease could not match.
+    """
+    stmt = (
+        select(func.count())
+        .select_from(PoolVm)
+        .where(PoolVm.state == PoolVmState.IDLE)
+    )
+    if project_id is not None:
+        stmt = stmt.where(PoolVm.project_id == project_id)
+    return int((await session.execute(stmt)).scalar() or 0)
+
+
 async def count_live_pool_vms(
     session, *, project_id: Optional[uuid.UUID] = None
 ) -> int:
@@ -739,7 +762,17 @@ async def try_pool_dispatch(
         return None
 
     if member is None:
-        record_pool_lease_miss("no_idle_member", account=required_account)
+        # Distinguish the two opposite-fix causes of a pool miss: a genuinely
+        # empty pool (grow it / raise the target) vs. idle members existing but
+        # none compatible with the task's resolved account/provider/model while
+        # retarget is off (flip the retarget toggle). The extra count runs ONLY
+        # on the miss path, so the hit hot path is unaffected, and it respects
+        # the same tenant/project scoping as the lease.
+        idle_present = await count_idle_state_pool_vms(
+            session, project_id=task.project_id
+        )
+        reason = "no_compatible_member" if idle_present else "no_idle_member"
+        record_pool_lease_miss(reason, account=required_account)
         return None
 
     # In-flight-delete guard: never land a lease on a VM the orchestrator already

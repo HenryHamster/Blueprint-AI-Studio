@@ -2,7 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet, enableWarmPoolForProject, disableWarmPoolForProject, fetchWarmPoolTargets, setWarmPoolTargetForProject, fetchEfficiencyAxes } from '../api';
 import type { PoolPayoffVerdict, PoolPayoffState } from '../api';
-import { parseTimestamp } from '../utils/time';
+import { parseTimestamp, formatTimeOnly } from '../utils/time';
 import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot, PoolMetrics, PoolHitRateEstimate, WarmPoolTargets } from '../types/warmVm';
 import type { Project } from '../types/project';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
@@ -175,7 +175,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
   const chainClaims = data?.warm_pin_metrics.active_chain_continuity_claims ?? 0;
   const pool = data?.pool_metrics;
   const poolOn = pool?.enabled ?? false;
-  const accountRetargetOn = data?.warm_pool_account_retarget_enabled ?? false;
+  const accountRetargetOn = data?.warm_pool_account_retarget_enabled ?? data?.account_retarget_enabled ?? false;
   const crossProviderRetargetOn = data?.warm_pool_cross_provider_retarget_enabled ?? false;
   const overThreshold = clearsHour > 5;
 
@@ -369,6 +369,16 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
                 </div>
               )}
 
+              <WarmBreakerCallouts metrics={data.warm_pin_metrics} />
+
+              <AccountRetargetCallout
+                pool={pool}
+                poolOn={poolOn}
+                accountRetargetEnabled={accountRetargetOn}
+                flipping={flipping}
+                onEnable={() => { void flipFlag('warm_pool_account_retarget_enabled', 'warm-pool account retarget', accountRetargetOn); }}
+              />
+
               {pool && <PoolMetricsRow pool={pool} />}
 
               {projects.length > 0 && (
@@ -492,6 +502,131 @@ function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// Compact red "breaker OPEN" callout for one warm subsystem. Renders the
+// subsystem name, an OPEN badge, the reset time (parsed via the shared
+// naive-UTC helper so it shows in local time, never silently shifted), and the
+// recent-failure count vs the failure-rate threshold. Reuses the same
+// AlertTriangle/Clock icons and red callout styling as the clear-rate banner.
+function BreakerCallout({ name, suppressedUntil, failures, threshold, testid }: {
+  name: string;
+  suppressedUntil: string | null | undefined;
+  failures: number | undefined;
+  threshold: number | undefined;
+  testid: string;
+}) {
+  return (
+    <div
+      data-testid={testid}
+      className="px-2 py-1.5 rounded border border-red-500/40 bg-red-500/10 text-red-400 text-[11px] flex flex-wrap items-center gap-x-2 gap-y-1"
+    >
+      <AlertTriangle className="w-3 h-3 shrink-0" />
+      <span className="font-bold uppercase tracking-wide">{name} breaker</span>
+      <span className="bg-red-500/20 border border-red-500/40 text-red-300 text-[10px] font-bold px-1.5 py-0.5 rounded leading-none">
+        OPEN
+      </span>
+      {suppressedUntil && (
+        <span className="flex items-center gap-1 text-red-300/90">
+          <Clock className="w-2.5 h-2.5 shrink-0" />
+          until {formatTimeOnly(suppressedUntil)}
+        </span>
+      )}
+      <span className="font-mono text-red-300/90">
+        {failures ?? 0}/{threshold ?? 0} failures
+      </span>
+    </div>
+  );
+}
+
+// One coherent "what is currently suppressing warm reuse" surface. Reads the
+// breaker telemetry the backend already emits in warm_pin_metrics and renders a
+// callout for each subsystem whose breaker is OPEN — pool first (the focus of
+// the 'enabled but 0 hits' story), then chain continuity and backlog reuse.
+// Renders nothing when no breaker is suppressed (no clutter) or when an older
+// backend omits the fields entirely.
+function WarmBreakerCallouts({ metrics }: { metrics: WarmVmStateResponse['warm_pin_metrics'] }) {
+  const poolOpen = metrics.pool_circuit_breaker_suppressed ?? false;
+  const continuityOpen = metrics.circuit_breaker_suppressed ?? false;
+  const backlogOpen = metrics.backlog_reuse_circuit_breaker_suppressed ?? false;
+  if (!poolOpen && !continuityOpen && !backlogOpen) return null;
+  return (
+    <div className="mb-3 space-y-1.5 pt-2 border-t border-neutral-800/60" data-testid="warm-breaker-callouts">
+      {poolOpen && (
+        <BreakerCallout
+          name="Pool claim"
+          suppressedUntil={metrics.pool_suppressed_until}
+          failures={metrics.pool_claim_failures_last_hour}
+          threshold={metrics.pool_failure_rate_threshold}
+          testid="pool-breaker-callout"
+        />
+      )}
+      {continuityOpen && (
+        <BreakerCallout
+          name="Chain continuity"
+          suppressedUntil={metrics.suppressed_until}
+          failures={metrics.clears_last_hour}
+          threshold={metrics.clear_rate_threshold}
+          testid="continuity-breaker-callout"
+        />
+      )}
+      {backlogOpen && (
+        <BreakerCallout
+          name="Backlog reuse"
+          suppressedUntil={metrics.backlog_reuse_suppressed_until}
+          failures={metrics.backlog_reuse_failures_last_hour}
+          threshold={metrics.backlog_reuse_failure_rate_threshold}
+          testid="backlog-breaker-callout"
+        />
+      )}
+    </div>
+  );
+}
+
+// Compact actionable hint shown when the pool has idle members but can't serve
+// tasks because of account/model mismatch and account-retarget is off. Renders
+// only when: pool is enabled, hit rate < 50%, no_compatible_member misses > 0,
+// and account_retarget_enabled is false. Disappears as soon as the operator
+// flips the toggle (the poller will see the new backend state within ~15s).
+function AccountRetargetCallout({ pool, poolOn, accountRetargetEnabled, flipping, onEnable }: {
+  pool: PoolMetrics | undefined;
+  poolOn: boolean;
+  accountRetargetEnabled: boolean;
+  flipping: boolean;
+  onEnable: () => void;
+}) {
+  if (!poolOn) return null;
+  if (accountRetargetEnabled) return null;
+  const hitRate = pool?.funnel?.pool_hit_rate;
+  if (hitRate !== null && hitRate !== undefined && hitRate >= 0.5) return null;
+  const noCompatMisses = pool?.funnel?.lease_miss_by_reason?.['no_compatible_member'] ?? 0;
+  if (noCompatMisses <= 0) return null;
+
+  return (
+    <div
+      data-testid="account-retarget-callout"
+      className="mb-3 px-2 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-[11px] flex flex-wrap items-center gap-x-2 gap-y-1"
+    >
+      <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400" />
+      <span>
+        Idle pool members exist but are pinned to the wrong account/model for incoming tasks
+        ({noCompatMisses} miss{noCompatMisses !== 1 ? 'es' : ''}).
+        Enable <span className="font-bold">Account Retarget</span> so any idle member can serve any account.
+      </span>
+      <button
+        onClick={onEnable}
+        disabled={flipping}
+        data-testid="account-retarget-enable-btn"
+        className={
+          'bg-violet-500/20 border border-violet-500/40 text-violet-300 hover:bg-violet-500/30 ' +
+          'text-[10px] font-bold px-1.5 py-0.5 rounded leading-none transition-colors shrink-0' +
+          (flipping ? ' opacity-50 cursor-wait' : ' cursor-pointer')
+        }
+      >
+        {flipping ? '…' : 'Enable Account Retarget'}
+      </button>
     </div>
   );
 }
