@@ -586,6 +586,62 @@ async def acknowledge_running_update(
     }
 
 
+class RunningUpdateEdit(BaseModel):
+    """Operator edit to the running_update body.
+
+    ``body`` is the new full document. ``base`` is the document text the
+    operator started editing from; when supplied it is compared against the
+    current stored document under the row lock to detect a concurrent writer
+    (agent cycle / routine digest) and reject the edit with a 409 so the
+    operator can reload and retry — the same optimistic-concurrency discipline
+    vision/design_doc use, adapted to a plain TEXT column with no embedded
+    revision counter.
+    """
+
+    body: str
+    base: str | None = None
+
+
+@router.put("/projects/{project_id}/running-update")
+@limiter.limit("30/minute")
+async def edit_running_update(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: RunningUpdateEdit,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Operator edit of the project's running_update body.
+
+    Mirrors the operator-editable treatment vision and problem_model already
+    get: the operator can correct a stale claim, add context, or flag a
+    concern in the living status narrative. The write takes the project row
+    lock and refreshes the field so a concurrent agent write is observed; when
+    a ``base`` is supplied and differs from the current document a 409 is
+    raised. A mid-cycle edit survives the next strategic cycle via the existing
+    operator-wins reconciliation in ``running_update_merge``."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["running_update"])
+    if payload.base is not None and (project.running_update or "") != payload.base:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "running_update was modified by another writer since you began "
+                "editing. Reload and retry."
+            ),
+        )
+    project.running_update = payload.body
+    session.add(project)
+    await session.commit()
+    return {
+        "status": "updated",
+        "running_update": project.running_update,
+    }
+
+
 @router.delete("/projects/{project_id}")
 @limiter.limit("10/minute")
 async def delete_project_admin(

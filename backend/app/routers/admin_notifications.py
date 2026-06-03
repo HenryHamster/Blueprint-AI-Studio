@@ -155,11 +155,14 @@ _RESERVED_PREFS_KEYS = (_TEMP_MUTES_KEY, _MUTE_WINDOW_KEY)
 
 
 def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
-    """Append a one-line digest entry for a routine event to project.running_update."""
-    now_str = _utcnow().strftime("%Y-%m-%d %H:%M")
-    line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
-    current = (project.running_update or "").rstrip()
-    project.running_update = f"{current}\n{line}" if current else line
+    """Append a one-line digest entry for a routine event to project.running_update.
+
+    Thin wrapper delegating to the canonical ``Project.append_routine_digest``
+    so the digest format lives in exactly one place. Does NOT commit — the
+    caller owns the transaction (and, on the user-facing message path, the
+    project row lock that makes the read-append-write concurrency-safe).
+    """
+    project.append_routine_digest(event_type, summary)
 
 
 from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
@@ -467,8 +470,10 @@ async def create_message(
         project_id = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
-    # Verify user has access
-    project = await _get_user_project(project_id, current_user["user_id"], session)
+    # Verify user has access. The returned instance is only used for the
+    # access check; the routine-digest branch below re-reads the project under
+    # a row lock so its read-append-write on running_update is concurrency-safe.
+    await _get_user_project(project_id, current_user["user_id"], session)
 
     valid_types = {t.value for t in MessageType}
     msg_type = payload.message_type.upper()
@@ -500,7 +505,16 @@ async def create_message(
     session.add(msg)
     event_type = ctx.get("event_type")
     if event_type and event_type in ROUTINE_EVENT_TYPES:
-        append_routine_digest(project, event_type, content)
+        # The routine-digest append is a read-modify-write on running_update,
+        # which races with concurrent message creates and with the agent's
+        # locked set_running_update reconciliation. Acquire the project row
+        # lock (matching the codebase's existing idiom) so the append reads a
+        # fresh, committed running_update and serializes against other writers;
+        # without it, a stale read could silently drop a digest line or clobber
+        # the agent's reconciled document. populate_existing on the locked read
+        # refreshes the identity-mapped project loaded by _get_user_project.
+        locked_project = await lock_project_or_429(session, project_id)
+        append_routine_digest(locked_project, event_type, content)
     await session.commit()
     await session.refresh(msg)
     return {"id": str(msg.id), "status": "created"}

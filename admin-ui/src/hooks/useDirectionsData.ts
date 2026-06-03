@@ -373,6 +373,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     problemModel,
     setProblemModel,
     runningUpdate,
+    setRunningUpdate,
     runningUpdateAckAt,
     setRunningUpdateAckAt,
     error,

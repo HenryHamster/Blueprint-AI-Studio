@@ -385,6 +385,9 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               onAcknowledged={() => {
                 data.setRunningUpdateAckAt(new Date().toISOString());
               }}
+              onEdited={(newBody) => {
+                data.setRunningUpdate(newBody);
+              }}
             />
           </div>
         )}

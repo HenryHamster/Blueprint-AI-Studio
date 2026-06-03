@@ -2686,6 +2686,138 @@ class TestMessages:
         assert "PR #123 merged into main" in project.running_update
 
     @pytest.mark.asyncio
+    async def test_create_routine_message_acquires_project_lock(
+        self, client: AsyncClient, db_session
+    ):
+        """A routine event_type append goes through the project row lock."""
+        project = await _make_project(db_session)
+
+        import app.routers.admin_notifications as notif
+
+        real_lock = notif.lock_project_or_429
+        with patch.object(
+            notif, "lock_project_or_429", AsyncMock(side_effect=real_lock)
+        ) as spy:
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "NOTE",
+                    "content": "PR #7 merged",
+                    "context": {"event_type": "pr_merged"},
+                },
+            )
+        assert resp.status_code == 200
+        spy.assert_awaited_once()
+        # The locked read is for THIS project.
+        assert spy.await_args.args[1] == project.id
+
+    @pytest.mark.asyncio
+    async def test_create_non_routine_message_skips_project_lock(
+        self, client: AsyncClient, db_session
+    ):
+        """A plain NOTE (no routine event_type) does not pay the lock/429 cost."""
+        project = await _make_project(db_session)
+
+        import app.routers.admin_notifications as notif
+
+        with patch.object(
+            notif, "lock_project_or_429", AsyncMock()
+        ) as spy:
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "NOTE",
+                    "content": "just a note",
+                },
+            )
+        assert resp.status_code == 200
+        spy.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_create_routine_message_does_not_clobber_concurrent_rewrite(
+        self, client: AsyncClient, db_session
+    ):
+        """The locked re-read picks up a concurrently-committed running_update.
+
+        Simulates the agent's locked set_running_update committing a reconciled
+        document AFTER the handler's access-check read but BEFORE the digest
+        append. Because the append now operates on the row-locked re-read (not
+        the stale access-check instance), the agent's document survives and the
+        digest line is appended onto it — no lost update.
+        """
+        project = await _make_project(db_session)
+
+        import app.routers.admin_notifications as notif
+
+        async def _stale_access_check(pid, user_id, session):
+            # The handler used to append onto whatever this returned. Hand it a
+            # stale running_update to prove that value is NOT what gets written.
+            stale = await session.get(Project, pid)
+            stale.running_update = "STALE-BASELINE-FROM-ACCESS-CHECK"
+            return stale
+
+        async def _commit_agent_doc_then_lock(session, pid):
+            # Stand in for the agent committing its reconciled document just
+            # before we take the lock.
+            agent_proj = await session.get(Project, pid)
+            agent_proj.running_update = "AGENT-RECONCILED-DOC"
+            await session.commit()
+            return await real_lock(session, pid)
+
+        real_lock = notif.lock_project_or_429
+        with patch.object(
+            notif, "_get_user_project", AsyncMock(side_effect=_stale_access_check)
+        ), patch.object(
+            notif,
+            "lock_project_or_429",
+            AsyncMock(side_effect=_commit_agent_doc_then_lock),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "NOTE",
+                    "content": "operator digest line",
+                    "context": {"event_type": "pr_merged"},
+                },
+            )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        # Agent's reconciled document survived; the stale value was discarded.
+        assert "AGENT-RECONCILED-DOC" in project.running_update
+        assert "STALE-BASELINE-FROM-ACCESS-CHECK" not in project.running_update
+        # The new digest line was appended onto the reconciled document.
+        assert "operator digest line" in project.running_update
+
+    @pytest.mark.asyncio
+    async def test_create_two_routine_messages_keeps_both_lines(
+        self, client: AsyncClient, db_session
+    ):
+        """Two sequential routine appends both survive (no lost digest line)."""
+        project = await _make_project(db_session)
+
+        for content, evt in (
+            ("first digest line", "pr_merged"),
+            ("second digest line", "auto_fix_result"),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "NOTE",
+                    "content": content,
+                    "context": {"event_type": evt},
+                },
+            )
+            assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        assert "first digest line" in project.running_update
+        assert "second digest line" in project.running_update
+
+    @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
         """An open message can be resolved."""
         project = await _make_project(db_session)
@@ -5079,6 +5211,89 @@ class TestAcknowledgeRunningUpdate:
 
         resp = await client.post(
             f"/api/admin/projects/{other.id}/running-update/acknowledge"
+        )
+        assert resp.status_code == 404
+
+
+class TestEditRunningUpdate:
+    """PUT running-update lets an operator edit the body, with base-text
+    optimistic concurrency so a concurrent agent/digest write is detected."""
+
+    @pytest.mark.asyncio
+    async def test_edit_sets_body_with_matching_base(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.running_update = "## Current state\nStale claim."
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.put(
+            f"/api/admin/projects/{project.id}/running-update",
+            json={
+                "body": "## Current state\nOperator-corrected claim.",
+                "base": "## Current state\nStale claim.",
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "updated"
+        assert data["running_update"] == "## Current state\nOperator-corrected claim."
+
+        await db_session.refresh(project)
+        assert project.running_update == "## Current state\nOperator-corrected claim."
+
+    @pytest.mark.asyncio
+    async def test_edit_blind_set_without_base(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.running_update = "## Old"
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.put(
+            f"/api/admin/projects/{project.id}/running-update",
+            json={"body": "## New body"},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        assert project.running_update == "## New body"
+
+    @pytest.mark.asyncio
+    async def test_edit_stale_base_conflicts(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.running_update = "## Current state\nAgent rewrote this."
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.put(
+            f"/api/admin/projects/{project.id}/running-update",
+            json={
+                "body": "## Operator edit",
+                "base": "## A different base the operator started from",
+            },
+        )
+        assert resp.status_code == 409
+
+        await db_session.refresh(project)
+        # Document untouched — operator must reload and retry.
+        assert project.running_update == "## Current state\nAgent rewrote this."
+
+    @pytest.mark.asyncio
+    async def test_edit_requires_project_access(
+        self, client: AsyncClient, db_session
+    ):
+        other = Project(name="Other", user_id="other-user")
+        db_session.add(other)
+        await db_session.commit()
+
+        resp = await client.put(
+            f"/api/admin/projects/{other.id}/running-update",
+            json={"body": "x"},
         )
         assert resp.status_code == 404
 
