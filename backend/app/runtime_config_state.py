@@ -428,6 +428,15 @@ runtime_config: Dict = {
     # sibling tasks) lands and the flag is flipped. Independently switchable from
     # warm_continuity_enabled / warm_backlog_reuse_enabled.
     "warm_pool_enabled": False,
+    # Account-agnostic lease: when True, a same-tenant IDLE pool member may be
+    # leased for a task whose resolved account (and model) differ from the
+    # member's frozen boot account, and the warm-claim path re-materializes the
+    # resolved account's credentials before the role runs. Lets ONE small pool
+    # serve a project's whole account mix instead of needing a member per
+    # account. Default False (strict per-account equality). Cross-PROVIDER
+    # retarget is a further opt-in below.
+    "warm_pool_account_retarget_enabled": False,
+    "warm_pool_cross_provider_retarget_enabled": False,
     # Per-project warm-pool enablement scope (allowlist). An EMPTY list (the
     # default) means the pool is fleet-wide — the legacy all-or-nothing behavior
     # where the maintainer reconciles every demand-active project once
@@ -882,6 +891,18 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "warm_pool_enabled",
                         bool(config_json["warm_pool_enabled"]),
+                    )
+                if "warm_pool_account_retarget_enabled" in config_json:
+                    _set(
+                        "warm_pool_account_retarget_enabled",
+                        bool(config_json["warm_pool_account_retarget_enabled"]),
+                    )
+                if "warm_pool_cross_provider_retarget_enabled" in config_json:
+                    _set(
+                        "warm_pool_cross_provider_retarget_enabled",
+                        bool(
+                            config_json["warm_pool_cross_provider_retarget_enabled"]
+                        ),
                     )
                 if "warm_pool_project_allowlist" in config_json:
                     # Persisted per-project enablement scope. Normalize to a
