@@ -1115,6 +1115,38 @@ async def promote(
         # and _candidate_already_on_main records idempotent success when the
         # auto-merge lands.
         msg = merge_result.get("message", "merge not completed")
+        # Migration-carrying promotion PRs must NOT be handed to GitHub native
+        # auto-merge: the promotion target can advance while checks are pending
+        # (exactly the hotfix-migration-after-qualification race the pre-merge
+        # guard comment above documents), so the eventual native merge could
+        # land against a different migration chain than the one Blueprint
+        # validated. Parity with the task-PR and rollup auto-merge sites: skip
+        # delegation and hold the version in its existing retryable state so the
+        # next strategic cycle re-qualifies and re-runs the pre-merge guard
+        # against the live promotion target before merging.
+        from app.rollup_migration_validation import pr_touches_migrations
+
+        if await pr_touches_migrations(token, owner, repo, pr_number):
+            logger.warning(
+                "[RELEASE_QUALIFIER] promote: promotion PR #%s for v%d pending "
+                "CI touches Alembic migrations — NOT delegating to GitHub "
+                "native auto-merge; holding for re-validation against %s",
+                pr_number,
+                version.version_number,
+                promotion_target,
+            )
+            await _delete_release_branch_best_effort(
+                token, owner, repo, release_branch, version
+            )
+            return await _record_promotion_failure(
+                session,
+                version,
+                base_record,
+                "migration_pending_no_automerge",
+                detail=str(msg)[:300],
+                pr_url=pr_url,
+                lock_released=True,
+            )
         try:
             am_result = await github.enable_auto_merge(
                 token,

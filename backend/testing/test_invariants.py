@@ -1039,13 +1039,22 @@ class TestPreMergeDualHeadGuardCoverage:
         ),
     }
 
-    # Specific (file, function) merge sites that can never carry a migration onto
-    # an integration/promotion branch. Each entry MUST document WHY. Empty today:
-    # every real merge site already calls one of the two guard entrypoints in its
-    # merging function (verified while authoring this test). If a future site is
-    # genuinely exempt (e.g. a staging-only branch that never reaches the
-    # integration trunk), add it here with a reason — do NOT silently widen
-    # _EXEMPT_FILES.
+    # Whole-FUNCTION merge-site exemptions, keyed by (file, function). Each entry
+    # MUST document WHY. A string value exempts EVERY merge call in that function
+    # (used for thin shared-helper functions whose guard is enforced by their
+    # upstream caller). These are coarse and used sparingly — the granular,
+    # per-call mechanism below is preferred for any function that mixes guarded
+    # and exempt merges.
+    #
+    # NOTE: do NOT key exemptions by absolute line number. An edit above a merge
+    # site shifts the numbers and breaks the invariant on unrelated PRs; worse,
+    # under code motion a genuinely-new unguarded merge can come to occupy an
+    # exempt line and silently inherit an exemption it never declared. That is the
+    # exact silent regression this invariant exists to prevent (same class as the
+    # column-offset brittleness fixed elsewhere). For functions that mix guarded
+    # and exempt merges (e.g. ``_process_post_commit``), exempt the SPECIFIC merge
+    # call with the inline ``# premerge-guard-exempt: <reason>`` marker (see
+    # _EXEMPT_MARKER below) so the exemption travels with the code.
     _EXEMPT_SITES: dict = {
         (
             "ci_completion.py",
@@ -1055,14 +1064,17 @@ class TestPreMergeDualHeadGuardCoverage:
             "task_completion.py",
             "_maybe_release_safeguard_gate",
         ): "post-gate helper for a shared merge path; the integration/promotion guard is enforced by the upstream caller",
-        (
-            "task_lifecycle.py",
-            "_process_post_commit",
-        ): {
-            "reason": "shared post-commit merge flow mixes guarded integration/promotion branches with staging-only branches; only the guarded branches are intended to be checked",
-            "lines": {1001, 1125, 2257},
-        },
     }
+
+    # Inline per-call exemption marker. A merge call is exempt iff this sentinel,
+    # FOLLOWED BY A NON-EMPTY HUMAN-READABLE REASON, appears anywhere within the
+    # call's own source span (call.lineno..call.end_lineno). Because the marker
+    # lives on the call itself, a brand-new or relocated merge cannot inherit an
+    # exemption it did not declare: removing or moving the marked call removes or
+    # moves its exemption automatically, and an unmarked sibling merge is still
+    # flagged. A bare marker with no reason is rejected (see
+    # test_premerge_exempt_marker_requires_reason).
+    _EXEMPT_MARKER = "# premerge-guard-exempt:"
 
     @staticmethod
     def _collect_offenders(
@@ -1095,6 +1107,20 @@ class TestPreMergeDualHeadGuardCoverage:
             for node in ast.walk(stmt):
                 if isinstance(node, ast.Call) and _called_name(node) in merge_names:
                     yield node
+
+        source_lines = source.splitlines()
+        marker = TestPreMergeDualHeadGuardCoverage._EXEMPT_MARKER
+
+        def _call_has_exempt_marker(call: "ast.Call") -> bool:
+            # Slice the call's own source span; the marker is bound to THIS call,
+            # not to a position in the file, so it travels with the code under
+            # any edit or code motion. A reason after the sentinel is mandatory.
+            end = getattr(call, "end_lineno", None) or call.lineno
+            for line in source_lines[call.lineno - 1 : end]:
+                idx = line.find(marker)
+                if idx != -1 and line[idx + len(marker):].strip():
+                    return True
+            return False
 
         def _scan_body(stmts, guard_seen: bool, func_name: str) -> None:
             seen = guard_seen
@@ -1130,16 +1156,15 @@ class TestPreMergeDualHeadGuardCoverage:
                     continue
 
                 for call in _stmt_merge_calls(stmt):
-                    site_exemption = TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
+                    # Coarse whole-function exemption (string-keyed) ...
+                    if TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES.get(
                         (os.path.basename(rel), func_name)
-                    )
-                    if site_exemption:
-                        if isinstance(site_exemption, dict):
-                            exempt_lines = site_exemption.get("lines")
-                            if exempt_lines is None or call.lineno in exempt_lines:
-                                continue
-                        else:
-                            continue
+                    ):
+                        continue
+                    # ... or a granular per-call inline marker that travels with
+                    # the specific merge call.
+                    if _call_has_exempt_marker(call):
+                        continue
                     if not seen:
                         offenders.append(
                             f"  {rel}:{call.lineno} in {func_name}() — PR-merge "
@@ -1240,6 +1265,216 @@ class TestPreMergeDualHeadGuardCoverage:
         assert offenders == [
             "  synthetic_merge_fixture.py:13 in demo() — PR-merge site not covered by the pre-merge dual-head guard"
         ]
+
+    def test_exempt_marker_exempts_only_the_marked_call(self):
+        """The inline marker exempts the SPECIFIC call it sits on — not its
+        siblings, and not a line number.
+
+        Two unguarded merges live in the same function. One carries the inline
+        ``# premerge-guard-exempt: <reason>`` marker; the other does not. The
+        scan must exempt exactly the marked call and flag the unmarked sibling.
+        This proves the marker — not a position in the file — drives exemption.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def _process_post_commit():
+                if staging_only:
+                    await _merge_with_retry(  # premerge-guard-exempt: staging-only branch never carries a migration onto the trunk
+                        token, owner, repo, pr_number
+                    )
+                else:
+                    await merge_pull_request(
+                        token, owner, repo, pr_number
+                    )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="task_lifecycle.py",
+            rel="task_lifecycle.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        # Only the unmarked ``merge_pull_request`` (line 8 of the dedented body)
+        # is flagged; the marked ``_merge_with_retry`` is exempt.
+        assert offenders == [
+            "  task_lifecycle.py:8 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+        ]
+
+    def test_new_unmarked_merge_in_previously_exempt_function_is_flagged(self):
+        """Regression: a brand-new, unmarked merge added to a function that
+        already has marked-exempt merges is STILL flagged.
+
+        This is the silent-regression the old absolute-line-number scheme could
+        not catch: under code motion a new unguarded merge could come to occupy
+        an exempt line number and inherit an exemption it never declared. With
+        per-call markers, the new merge declares no exemption, so it is flagged
+        even though it sits in the same (previously line-exempt) function in the
+        same file.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def _process_post_commit():
+                if staging_a:
+                    await _merge_with_retry(  # premerge-guard-exempt: staging-only A branch never reaches the integration trunk
+                        token, owner, repo, pr_number
+                    )
+                if staging_b:
+                    await _merge_with_retry(  # premerge-guard-exempt: staging-only B branch never reaches the integration trunk
+                        token, owner, repo, pr_number
+                    )
+                # A genuinely-new, unguarded, UNMARKED merge slipped in here.
+                await merge_pull_request(
+                    token, owner, repo, pr_number
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="task_lifecycle.py",
+            rel="task_lifecycle.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  task_lifecycle.py:12 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+        ], (
+            "A new unmarked merge in a function that has marked-exempt siblings "
+            "must still be flagged — it declared no exemption of its own."
+        )
+
+    def test_exempt_marker_requires_a_nonempty_reason(self):
+        """Guard-the-guard: a bare marker with no human-readable reason does NOT
+        exempt the call.
+
+        Mirrors the documented-reason requirement on the string-keyed
+        exemptions: every exemption must carry a reason a reviewer can read.
+        A reason-less marker must be treated as no marker at all.
+        """
+        from textwrap import dedent
+
+        for trailer in ("", "   "):
+            source = dedent(
+                """
+                async def _process_post_commit():
+                    await merge_pull_request(  {marker}{trailer}
+                        token, owner, repo, pr_number
+                    )
+                """
+            ).format(marker=self._EXEMPT_MARKER, trailer=trailer)
+
+            offenders = self._collect_offenders(
+                source,
+                filename="task_lifecycle.py",
+                rel="task_lifecycle.py",
+                guard_names=self._GUARD_NAMES,
+                merge_names=self._MERGE_NAMES,
+            )
+
+            assert offenders == [
+                "  task_lifecycle.py:3 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+            ], (
+                "A bare marker with no reason must NOT exempt the call "
+                f"(trailer={trailer!r})."
+            )
+
+    def test_marker_only_applies_within_the_calls_own_span(self):
+        """The marker exempts a call only when it lies within that call's own
+        source span — a marker on a *neighbouring* statement must not leak onto
+        an unmarked merge below it.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def _process_post_commit():
+                x = compute()  # premerge-guard-exempt: this marker is on the wrong statement
+                await merge_pull_request(
+                    token, owner, repo, pr_number
+                )
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="task_lifecycle.py",
+            rel="task_lifecycle.py",
+            guard_names=self._GUARD_NAMES,
+            merge_names=self._MERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  task_lifecycle.py:4 in _process_post_commit() — PR-merge site not covered by the pre-merge dual-head guard"
+        ], "A marker on an adjacent statement must not exempt the merge below it."
+
+    def test_process_post_commit_exempt_sites_carry_marker(self):
+        """The three intentionally-exempt merge sites in the real
+        ``task_lifecycle.py:_process_post_commit`` must each carry the inline
+        marker.
+
+        If a marker is removed (or a fourth, unmarked merge is added) this test
+        — together with ``test_all_pr_merge_sites_guarded`` — fails, so the
+        exemption cannot be silently dropped or silently widened.
+        """
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        fpath = os.path.join(app_dir, "task_lifecycle.py")
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        source_lines = source.splitlines()
+        tree = ast.parse(source, filename=fpath)
+
+        marked = 0
+        total_merges = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.name != "_process_post_commit":
+                continue
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr
+                    if isinstance(func, ast.Attribute)
+                    else None
+                )
+                if name not in self._MERGE_NAMES:
+                    continue
+                total_merges += 1
+                end = getattr(call, "end_lineno", None) or call.lineno
+                span = source_lines[call.lineno - 1 : end]
+                has_marker = any(
+                    (idx := line.find(self._EXEMPT_MARKER)) != -1
+                    and line[idx + len(self._EXEMPT_MARKER):].strip()
+                    for line in span
+                )
+                if has_marker:
+                    marked += 1
+
+        assert total_merges == 3, (
+            f"Expected exactly 3 merge sites in _process_post_commit, found "
+            f"{total_merges}. If the function's merge sites changed, update this "
+            "test and the inline markers accordingly."
+        )
+        assert marked == 3, (
+            f"Expected all 3 _process_post_commit merge sites to carry the "
+            f"'{self._EXEMPT_MARKER} <reason>' inline marker; only {marked} do. "
+            "Each staging-only / non-migration auto-merge must declare its "
+            "exemption inline so the coverage invariant stays green."
+        )
 
 
 # ── Merge-primitive enumeration lock (complementary to call-site coverage) ────
@@ -1407,6 +1642,295 @@ class TestMergePrimitiveLock:
             "through unguarded.\n"
             "Fix by importing and calling the appropriate primitive instead."
         )
+
+
+# ── Native-auto-merge migration-exclusion coverage (whole-package) ────────
+
+
+class TestNativeAutoMergeMigrationExclusionCoverage:
+    """Whole-package invariant: EVERY ``enable_auto_merge`` call site under
+    backend/app/ must be guarded by a ``pr_touches_migrations`` exclusion so a
+    migration-carrying PR is never delegated to GitHub native auto-merge.
+
+    WHY (distinct from TestPreMergeDualHeadGuardCoverage): the pre-merge
+    combined-chain guard runs synchronously immediately before a merge and fully
+    protects the DIRECT merge primitive. But GitHub native auto-merge
+    (``enable_auto_merge``) completes the merge ASYNCHRONOUSLY at some later time
+    once required checks pass. That reopens a time-of-check-to-time-of-use
+    window: the target branch can advance between Blueprint's guard check and the
+    eventual native merge, so the merge can land against a DIFFERENT Alembic
+    chain than the one Blueprint validated — re-introducing the dual-head wedge
+    the guard exists to prevent.
+
+    TestPreMergeDualHeadGuardCoverage deliberately scopes this async window out
+    (see its "Coverage note": it catches missing call-site guard coverage, NOT
+    the later merge-time race "where ``enable_auto_merge`` may complete after a
+    second migration PR lands. Track that TOCTOU window separately."). This test
+    IS that separate track: it locks the native-auto-merge primitive on its own,
+    asserting each call site additionally refuses to delegate a migration PR.
+
+    The three production sites — the task-PR completion fallback
+    (task_lifecycle.py), the rollup auto-merge fallback (rollup_management.py),
+    and the release-promotion pending-CI fallback (release_promotion.py) — all
+    check ``pr_touches_migrations`` and, when True, skip delegation and hold the
+    PR in a retryable/parked state so the guarded path re-validates against the
+    live target branch before merging.
+
+    The scan is branch-aware (mirroring TestPreMergeDualHeadGuardCoverage): an
+    exclusion that covers one branch does NOT cover a sibling branch. A site is
+    covered when a ``pr_touches_migrations`` reference dominates it — either as a
+    prior sibling early-return guard (the release_promotion idiom) or as the test
+    of an enclosing ``if`` (the task-PR / rollup ``else``-branch idiom).
+
+    Source-level only (AST); NEVER executes a merge path.
+    """
+
+    _EXCLUSION_NAMES = frozenset({"pr_touches_migrations"})
+    _AUTOMERGE_NAMES = frozenset({"enable_auto_merge"})
+
+    # Whole files that DEFINE/re-export the native-auto-merge primitive. They
+    # make no migration decision (the calling site does), so they are exempt —
+    # mirrors TestPreMergeDualHeadGuardCoverage._EXEMPT_FILES.
+    _EXEMPT_FILES = {
+        "github_pulls.py": (
+            "defines the enable_auto_merge primitive (GraphQL "
+            "enablePullRequestAutoMerge mutation); makes no migration decision"
+        ),
+        "github.py": (
+            "re-exports enable_auto_merge for callers; makes no migration decision"
+        ),
+    }
+
+    # Specific (file, function) auto-merge sites that can never carry a migration
+    # onto an integration/promotion branch. Each entry MUST document WHY. Empty
+    # today: all three real sites carry the pr_touches_migrations exclusion. Add
+    # a genuinely-exempt site here with a reason rather than widening
+    # _EXEMPT_FILES (which would mask a newly-added unguarded site).
+    _EXEMPT_SITES: dict = {}
+
+    @staticmethod
+    def _collect_offenders(
+        source: str,
+        *,
+        filename: str,
+        rel: str,
+        exclusion_names: frozenset,
+        automerge_names: frozenset,
+    ) -> list:
+        import ast
+
+        def _called_name(call):
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id
+            if isinstance(func, ast.Attribute):
+                return func.attr
+            return None
+
+        def _refs_exclusion(node) -> bool:
+            return any(
+                isinstance(n, ast.Name)
+                and n.id in exclusion_names
+                or isinstance(n, ast.Attribute)
+                and n.attr in exclusion_names
+                for n in ast.walk(node)
+            )
+
+        def _stmt_automerge_calls(stmt):
+            for node in ast.walk(stmt):
+                if (
+                    isinstance(node, ast.Call)
+                    and _called_name(node) in automerge_names
+                ):
+                    yield node
+
+        offenders: list = []
+
+        def _scan_body(stmts, seen: bool, func_name: str) -> None:
+            cur = seen
+            for stmt in stmts:
+                if isinstance(
+                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    continue
+
+                if isinstance(stmt, ast.If):
+                    # An `if pr_touches_migrations(...)` test dominates BOTH
+                    # branches: the True branch parks, the else delegates only
+                    # when the PR is migration-free.
+                    branch = cur or _refs_exclusion(stmt.test)
+                    _scan_body(stmt.body, branch, func_name)
+                    _scan_body(stmt.orelse, branch, func_name)
+                elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+                    _scan_body(stmt.body, cur, func_name)
+                    _scan_body(stmt.orelse, cur, func_name)
+                elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+                    _scan_body(stmt.body, cur, func_name)
+                elif isinstance(stmt, ast.Try):
+                    _scan_body(stmt.body, cur, func_name)
+                    for handler in stmt.handlers:
+                        _scan_body(handler.body, cur, func_name)
+                    _scan_body(stmt.orelse, cur, func_name)
+                    _scan_body(stmt.finalbody, cur, func_name)
+                elif hasattr(ast, "Match") and isinstance(stmt, ast.Match):
+                    for case in stmt.cases:
+                        _scan_body(case.body, cur, func_name)
+                else:
+                    for call in _stmt_automerge_calls(stmt):
+                        if (
+                            os.path.basename(rel),
+                            func_name,
+                        ) in TestNativeAutoMergeMigrationExclusionCoverage._EXEMPT_SITES:
+                            continue
+                        if not cur:
+                            offenders.append(
+                                f"  {rel}:{call.lineno} in {func_name}() — "
+                                "enable_auto_merge site not guarded by a "
+                                "pr_touches_migrations exclusion (native "
+                                "auto-merge TOCTOU window)"
+                            )
+
+                # Sibling-level early-return guard: a prior statement that
+                # references the exclusion (the release_promotion `if
+                # pr_touches: return` idiom placed BEFORE the auto-merge sibling)
+                # covers all later siblings.
+                if _refs_exclusion(stmt):
+                    cur = True
+
+        tree = ast.parse(source, filename=filename)
+        for func in [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]:
+            _scan_body(func.body, False, func.name)
+        return offenders
+
+    def test_all_native_auto_merge_sites_exclude_migrations(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                if fname in self._EXEMPT_FILES:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    source = f.read()
+                rel = os.path.relpath(fpath, app_dir)
+                offenders.extend(
+                    self._collect_offenders(
+                        source,
+                        filename=fpath,
+                        rel=rel,
+                        exclusion_names=self._EXCLUSION_NAMES,
+                        automerge_names=self._AUTOMERGE_NAMES,
+                    )
+                )
+
+        assert not offenders, (
+            "Found GitHub native-auto-merge (enable_auto_merge) call site(s) "
+            "under backend/app/ that can delegate a migration-carrying PR "
+            "WITHOUT a pr_touches_migrations exclusion.\n"
+            "Native auto-merge completes the merge asynchronously once checks "
+            "pass, so the target branch can advance between Blueprint's "
+            "pre-merge dual-head guard and the eventual merge — landing the PR "
+            "against a different Alembic chain than the one validated "
+            "(dual-head TOCTOU).\n"
+            "Fix each site by checking `await pr_touches_migrations(...)` before "
+            "delegating and, when True, holding the PR in its retryable/parked "
+            "state instead of calling enable_auto_merge — OR, if the site can "
+            "never carry a migration onto an integration/promotion branch, add "
+            "its (file, function) to "
+            "TestNativeAutoMergeMigrationExclusionCoverage._EXEMPT_SITES with a "
+            "documented reason.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_scan_flags_sibling_unexcluded_auto_merge_branch(self):
+        """A migration-excluded branch must not mask a sibling unexcluded
+        auto-merge branch — the exact hole a file-/function-wide allowlist would
+        leave open."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if cond:
+                    if await pr_touches_migrations(token, owner, repo, pr_number):
+                        return
+                    await enable_auto_merge(token, owner, repo, pr_number)
+                else:
+                    await enable_auto_merge(token, owner, repo, pr_number)
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == [
+            "  synthetic_auto_merge_fixture.py:8 in demo() — enable_auto_merge "
+            "site not guarded by a pr_touches_migrations exclusion (native "
+            "auto-merge TOCTOU window)"
+        ]
+
+    def test_scan_accepts_else_branch_exclusion_idiom(self):
+        """The task-PR / rollup idiom — `if pr_touches: park else: auto-merge` —
+        is recognized as covered."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if await pr_touches_migrations(token, owner, repo, pr_number):
+                    park()
+                else:
+                    await enable_auto_merge(token, owner, repo, pr_number)
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == []
+
+    def test_scan_accepts_early_return_exclusion_idiom(self):
+        """The release_promotion idiom — `if pr_touches: return` BEFORE a later
+        auto-merge sibling — is recognized as covered."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def demo():
+                if await pr_touches_migrations(token, owner, repo, pr_number):
+                    return record_failure()
+                try:
+                    await enable_auto_merge(token, owner, repo, pr_number)
+                except Exception:
+                    pass
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_auto_merge_fixture.py",
+            rel="synthetic_auto_merge_fixture.py",
+            exclusion_names=self._EXCLUSION_NAMES,
+            automerge_names=self._AUTOMERGE_NAMES,
+        )
+
+        assert offenders == []
 
 
 # ── Operator message arming gate coverage (whole-package) ─────────────────

@@ -8568,6 +8568,92 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
 
 
 @pytest.mark.asyncio
+async def test_promote_pending_ci_migration_pr_skips_auto_merge(db_session, mocker):
+    """A migration-carrying promotion PR that returns pending-CI (GitHub 405,
+    no conflict) must NOT be handed to GitHub native auto-merge — that would
+    reopen the dual-head TOCTOU window (the promotion target can advance while
+    checks are pending, so the eventual native merge could land against a
+    different migration chain than the one Blueprint validated). Parity with the
+    task-PR and rollup auto-merge sites: promote() holds the version in its
+    existing retryable state (open + stabilize, no promotion_pending sub-state)
+    so the next strategic cycle re-runs the pre-merge guard against the live
+    promotion target before merging."""
+    _project, version = await _make_project_and_version(db_session)
+    candidate = "m1grat10" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.get_pull_request_merge_state",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 99, "html_url": "http://pr/99"}),
+    )
+    # 405-style: not merged, no conflict flag — pending required checks.
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={"merged": False, "message": "required checks pending"}
+        ),
+    )
+    am_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
+    )
+    delete_branch_mock = mocker.patch(
+        "app.github.delete_branch", new=AsyncMock(return_value=True)
+    )
+    # The pre-merge guard passes (validates clean against the target AT check
+    # time) so execution reaches the pending-CI auto-merge fallback; the new
+    # exclusion then diverts a migration-carrying PR away from native auto-merge.
+    mocker.patch(
+        "app.rollup_migration_validation.enforce_premerge_migration_guard",
+        new=AsyncMock(return_value=(True, None)),
+    )
+    # PR touches an Alembic migration → pr_touches_migrations returns True.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0042_feature.py"}]
+        ),
+    )
+
+    result = await rq.promote(
+        db_session,
+        version,
+        candidate,
+        composite={"confidence": 0.9},
+        base_record={"candidate_sha": candidate},
+    )
+    await db_session.commit()
+
+    # Native auto-merge was NEVER delegated.
+    am_mock.assert_not_called()
+    # Retryable hold recorded instead of pending_auto_merge.
+    assert result["status"] == "promotion_failed"
+    assert result["error"] == "migration_pending_no_automerge"
+
+    await db_session.refresh(version)
+    # Version stays open + stabilize so it re-qualifies next cycle.
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "migration_pending_no_automerge"
+    # No promotion_pending sub-state was written — there is no native auto-merge
+    # in flight for the reaper to reconcile.
+    assert "promotion_pending" not in version.last_qualification
+    # The release branch was cleaned up since the merge never ran.
+    delete_branch_mock.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_promote_does_not_commit_caller_unrelated_transaction(db_session, mocker):
     """Concern 1 (behavioral): promote()'s intermediate commit (which releases
     the row lock before its GitHub I/O) must NOT commit a caller's UNRELATED

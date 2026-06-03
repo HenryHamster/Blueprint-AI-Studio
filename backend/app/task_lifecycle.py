@@ -1000,7 +1000,7 @@ async def _process_post_commit(
                                 await session.commit()
                                 return {"status": "accepted"}
 
-                        merge_result = await _merge_with_retry(
+                        merge_result = await _merge_with_retry(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
                             merge_pull_request,
                             gh_token,
                             owner,
@@ -1124,7 +1124,7 @@ async def _process_post_commit(
                                             f"parking in CI-wait for re-validation against {base_branch}"
                                         )
                                     else:
-                                        am_result = await enable_auto_merge(
+                                        am_result = await enable_auto_merge(  # premerge-guard-exempt: only the non-migration branch reaches here; migration-touching PRs are diverted to CI-wait re-validation in the if-branch above, so auto-merge never fires for a migration PR
                                             gh_token,
                                             owner,
                                             repo,
@@ -2256,7 +2256,7 @@ async def _process_post_commit(
                                 action_taken = True
                                 return {"status": "accepted"}
 
-                        merge_result = await _merge_with_retry(
+                        merge_result = await _merge_with_retry(  # premerge-guard-exempt: migration PRs are parked above in the dual-head guard branch (returns "accepted"); this merge only runs for staging-only branches that never carry a migration onto the integration trunk
                             merge_pull_request,
                             gh_token,
                             owner,
