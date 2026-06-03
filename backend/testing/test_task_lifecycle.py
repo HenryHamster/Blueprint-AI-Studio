@@ -12,6 +12,7 @@ Covers the critical functions:
 import ast
 import contextlib
 import importlib
+import json
 import os
 import uuid
 
@@ -3336,6 +3337,299 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
         )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# REQUEST_CHANGES verification-only downgrade (CI-green spurious-rejection guard)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_runs):
+    """Drive _process_post_commit through the review-verdict handling.
+
+    ``ci_check_runs`` is the value (or side_effect callable) for the
+    treat_missing_as_success=False get_check_runs_cached call used by the
+    verification-only verdict-flip gate.
+
+    A verification-only REQUEST_CHANGES on authoritatively-green CI no longer
+    halts the loop — it FLIPS the verdict to APPROVE before the verdict branch,
+    so the PR merges through the normal approve path. The APPROVE merge cluster
+    is therefore mocked here (``_merge_with_retry`` etc.) so callers can assert
+    the merge was attempted. The still-blocks scenarios never reach that path.
+
+    Returns ``(captured_spawn_kwargs, merge_mock, review_task)`` so callers can
+    assert whether a fix was spawned, whether the PR merged, and the final task
+    state.
+    """
+    captured_spawn_kwargs = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_spawn_kwargs.append(kwargs)
+        return (None, False)
+
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn
+    )
+    # APPROVE-path merge cluster (only exercised when the verdict flips to
+    # APPROVE on a verification-only + green-CI PR). Harmless for the
+    # still-blocks scenarios, which take the REQUEST_CHANGES fix-spawn branch
+    # and never call these.
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # PR is open, not merged; head sha present so the downgrade gate can query CI.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "deadbeef", "ref": "feat/x"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    # The review-posting step (submit_pr_review) + fallbacks.
+    mocker.patch(
+        "app.github.submit_pr_review", new_callable=AsyncMock, return_value={"id": 1}
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    # Empty-PR check returns a non-empty file list so the empty-PR short-circuit
+    # is NOT taken in the still-blocks scenarios.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "app/x.py"}],
+    )
+    # get_check_runs_cached is called twice in the branch with different args:
+    #   1) the downgrade gate (treat_missing_as_success=False)
+    #   2) the CI-errors-for-fix-context fetch (default treat_missing_as_success)
+    # Route by the treat_missing_as_success kwarg so we can control the gate
+    # independently while leaving the fix-context fetch benign.
+    if callable(ci_check_runs):
+        _gate_value = ci_check_runs
+    else:
+
+        async def _gate_value(*a, **kw):
+            return ci_check_runs
+
+    async def _check_runs_router(*args, **kwargs):
+        if kwargs.get("treat_missing_as_success") is False:
+            return await _gate_value(*args, **kwargs)
+        # fix-context fetch: report no failure so no extra CI errors are appended
+        return {
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        }
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_router
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": "main"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 6060,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "review_loop": {
+                "pr_number": 6060,
+                "branch": "feat/x",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            },
+        },
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/o/r/pull/6060",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json=verdict_json,
+    )
+
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    await session.refresh(review_task)
+    return captured_spawn_kwargs, merge_mock, review_task
+
+
+_VERIFICATION_ONLY_VERDICT = json.dumps(
+    {
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Could not run the verify gate in my sandbox.",
+        "issues": [
+            {
+                "description": "Could not run ./check — command not found in sandbox",
+                "severity": "major",
+            },
+            {
+                "description": "CI probe returned 401 Unauthorized; unable to verify",
+                "severity": "major",
+            },
+        ],
+    }
+)
+
+_CONCRETE_DEFECT_VERDICT = json.dumps(
+    {
+        "verdict": "REQUEST_CHANGES",
+        "feedback": "Found a real bug.",
+        "issues": [
+            {
+                "description": "Could not run ./check in sandbox",
+                "severity": "minor",
+            },
+            {
+                "description": "SQL injection: user input is interpolated into the query",
+                "severity": "critical",
+            },
+        ],
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_request_changes_verification_only_ci_green_is_approved_and_merges(
+    tl_db, mocker
+):
+    """Verification-only REQUEST_CHANGES + authoritatively-green CI → treated as
+    APPROVE and the PR merges through the normal approve path.
+
+    This is the correctness fix: a verification-only verdict on green CI with no
+    concrete defect means "the reviewer had no real objection and CI passed", so
+    the PR must land — NOT be left open-but-unmerged (loop stopped without
+    review_approved, leaving the ci_passed AND review_approved merge gate forever
+    unsatisfied). No fix is spawned; the verdict-flip marker is recorded.
+    """
+    captured, merge_mock, review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_VERIFICATION_ONLY_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured == [], "Verification-only + green CI must NOT spawn a fix"
+    # The flip routes through the APPROVE branch, which merges the PR.
+    assert merge_mock.await_count >= 1, (
+        "Verification-only + green CI must merge the PR via the approve path"
+    )
+    assert (review_task.context or {}).get("verification_only_downgrade") is True
+
+
+@pytest.mark.asyncio
+async def test_request_changes_concrete_defect_ci_green_still_blocks(tl_db, mocker):
+    """A concrete code-defect issue is respected even when CI is green → fix spawned."""
+    captured, merge_mock, _review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_CONCRETE_DEFECT_VERDICT,
+        ci_check_runs={
+            "status": "completed",
+            "conclusion": "success",
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured, "Concrete-defect REQUEST_CHANGES must still spawn a fix"
+    merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_changes_verification_only_ci_pending_still_blocks(tl_db, mocker):
+    """Verification-only issues but CI NOT green (pending) → fix still spawned."""
+    captured, merge_mock, _review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_VERIFICATION_ONLY_VERDICT,
+        ci_check_runs={
+            "status": "in_progress",
+            "conclusion": None,
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured, "CI not green (pending) must keep REQUEST_CHANGES blocking"
+    merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_changes_verification_only_no_checks_still_blocks(tl_db, mocker):
+    """treat_missing_as_success=False → 'no_checks' is NOT a pass → fix spawned."""
+    captured, merge_mock, _review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_VERIFICATION_ONLY_VERDICT,
+        ci_check_runs={
+            "status": "no_checks",
+            "conclusion": None,
+            "failed_logs": "",
+            "details": [],
+        },
+    )
+    assert captured, "Absence of CI checks must keep REQUEST_CHANGES blocking"
+    merge_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_request_changes_verification_only_check_runs_raises_still_blocks(
+    tl_db, mocker
+):
+    """get_check_runs raising → fail-safe: keep REQUEST_CHANGES blocking → fix spawned."""
+
+    async def _raise(*args, **kwargs):
+        raise RuntimeError("github 503")
+
+    captured, merge_mock, _review_task = await _run_request_changes_branch(
+        tl_db,
+        mocker,
+        verdict_json=_VERIFICATION_ONLY_VERDICT,
+        ci_check_runs=_raise,
+    )
+    assert captured, "A check-runs error must keep REQUEST_CHANGES blocking (fail-safe)"
+    merge_mock.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_process_post_commit_completed_child_triggers_rollup_check(tl_db, mocker):
     """A COMPLETED child task with a parent causes _check_and_trigger_rollup to be called."""
@@ -5677,8 +5971,8 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-from sqlalchemy import text as _sa_text  # noqa: E402
-from sqlalchemy.exc import (  # noqa: E402
+from sqlalchemy import text as _sa_text  # noqa: E402 — deliberate mid-file import for the post-commit poison-recovery test section below
+from sqlalchemy.exc import (  # noqa: E402 — see above
     IntegrityError as _IntegrityError,
     PendingRollbackError as _PendingRollbackError,
 )

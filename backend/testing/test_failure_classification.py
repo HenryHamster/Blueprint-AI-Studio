@@ -24,6 +24,7 @@ from app.failure_classification import (
     RATE_LIMIT,
     REASSIGNED,
     BLOCKED_PRECONDITION,
+    BRANCH_GONE,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
     _external_api_subtype_from_message,
@@ -1913,3 +1914,62 @@ class TestCrossLanguageClassificationContracts:
     # bootstrap scaffolding cleanup). The backend's
     # _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS is now standalone (no agent-side
     # mirror), so there is no cross-language contract to enforce.
+
+
+class TestBranchGoneClassification:
+    """A `git clone --branch <gone>` failure (branch deleted, usually because its
+    PR already merged) is an orchestration race, not a code defect — it must
+    classify as BRANCH_GONE, override the agent's generic 'fatal' CODE_ERROR,
+    stay budget-exempt, and not trigger a code-defect investigation."""
+
+    # The exact production status message (review fbd497dd of PR #7547).
+    _PROD_MSG = (
+        "[CODE_ERROR] Retries exhausted (3/3). Fatal error: Command failed: "
+        "git clone --depth 50 --branch plan/763859dc "
+        "https://x-access-token:***@github.com/HenryHamster/BlueprintAIStudio.git "
+        "/tmp/workspace\nCloning into '/tmp/workspace'...\nwarning: Could not "
+        "find remote branch plan/763859dc to clone.\nfatal: Remote branch "
+        "plan/763859dc not found"
+    )
+
+    def test_production_clone_warning_classifies_branch_gone(self):
+        assert classify_failure(_task(self._PROD_MSG)) == BRANCH_GONE
+
+    def test_overrides_agent_posted_code_error(self):
+        # The agent labels the failed clone CODE_ERROR; branch-gone must win
+        # because the check runs before the agent_category fast-path.
+        t = _task(self._PROD_MSG, ctx={"failure_category": "CODE_ERROR"})
+        assert classify_failure(t) == BRANCH_GONE
+
+    def test_overrides_persisted_code_error_verdict(self):
+        t = _task(self._PROD_MSG, ctx={"failure_class": CODE_ERROR})
+        assert classify_failure(t) == BRANCH_GONE
+
+    def test_fetch_ref_form_classifies_branch_gone(self):
+        assert (
+            classify_failure(_task("fatal: couldn't find remote ref plan/abc123"))
+            == BRANCH_GONE
+        )
+
+    def test_not_found_in_upstream_form_classifies_branch_gone(self):
+        msg = "fatal: Remote branch feature/x not found in upstream origin"
+        assert classify_failure(_task(msg)) == BRANCH_GONE
+
+    def test_generic_not_found_code_error_does_not_overmatch(self):
+        # A real code error that merely says "not found" must stay CODE_ERROR.
+        t = _task(
+            "AssertionError: expected config file not found in /tmp/workspace",
+            ctx={"failure_category": "CODE_ERROR"},
+        )
+        assert classify_failure(t) == CODE_ERROR
+
+    def test_branch_gone_is_budget_exempt_infra_class(self):
+        from app.failure_classification import INFRA_CLASSES
+
+        assert BRANCH_GONE in INFRA_CLASSES
+        assert BRANCH_GONE in ALL_FAILURE_CLASSES
+
+    def test_branch_gone_does_not_trigger_code_defect_investigation(self):
+        # No debug/remediation task should spawn for a branch-gone race.
+        t = _task(self._PROD_MSG, ctx={"failure_category": "CODE_ERROR"})
+        assert should_trigger_code_defect_investigation(t) is False

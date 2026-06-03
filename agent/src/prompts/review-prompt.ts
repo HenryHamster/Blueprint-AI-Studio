@@ -61,7 +61,7 @@ export function buildReviewIterationPreamble(
 export const REVIEW_QA_FOCUS_HINT = 'This is a test-only change. The Test Coverage section is less relevant (this IS the test). Focus on whether tests are meaningful and correctly assert behavior.\n\n';
 export const REVIEW_MIGRATE_FOCUS_HINT = 'This is a database migration. Focus on: reversibility (downgrade path), data preservation, and index impact on existing queries.\n\n';
 
-export const REVIEW_SMALL_SCOPE_PREAMBLE = 'This is a small-scope change. Focus your review on Correctness & Logic and Build & Type Safety. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n';
+export const REVIEW_SMALL_SCOPE_PREAMBLE = 'This is a small-scope change. Focus your review on Correctness & Logic. Security and performance sections are lower priority unless the change touches auth, user input handling, or database queries.\n\n';
 export const REVIEW_LARGE_SCOPE_PREAMBLE = 'This is a large-scope change with higher risk. Review ALL checklist sections thoroughly. Pay special attention to backwards compatibility, data model safety, and security implications.\n\n';
 
 export function buildReviewScopeOverflowPreamble(taskScope: string, changedFileCount: number, scopeThreshold: number): string {
@@ -101,48 +101,59 @@ export function buildReviewDiffAccessHint(baseBranch: string): string {
 }
 
 // ── Build instruction generator for review prompts ───────────────────────────
-// Build commands are emitted with `npm ci &&` (or equivalent install step)
-// prefixed for node-typed directories so the reviewer's cold-clone workspace
-// always has dependencies available — without the prefix, every reviewer on a
-// fresh VM hits "cannot resolve <package>" and flags it as a build-gate
-// failure even when the underlying PR is fine.
+// CI — a separate, authoritative gate — already runs the project's build,
+// type-check, eslint, and the full test suite; merge requires `ci_passed AND
+// review_approved` as independent inputs, so the reviewer re-running build/tests
+// would be redundant with CI and would block PRs that CI already proved green
+// whenever the reviewer's sandbox can't run them. The reviewer's retained,
+// reliably-runnable verification is scoped lint on the changed files (the one
+// check CI does not run), framed as an optional code-quality signal — never an
+// aggregate build gate. Scoped-lint one-liners are emitted via the shared
+// buildScopedLintOneliner helper so they restrict to changed files only.
 export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
-    return `**Build & Type Safety (MUST run these — do not skip):**
-- For TypeScript/JavaScript changes: find the package root for each changed file (the nearest parent directory with a package.json), then run \`npm ci && npm run build\` (or \`npx tsc --noEmit\` for TypeScript-only packages) — report any errors
-- For Python changes: run \`python -m ruff check <changed_files>\` or \`python -m py_compile <changed_files>\` to verify syntax/style — report any errors
-- For Go changes: run \`go build ./...\` — report any errors; for Rust: run \`cargo check\`
-- Only run checks for the subsystems touched by the changed files. Do not invent additional build invocations.
-- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
+    return `**Build, Tests & Lint — who verifies what:**
+- CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because a build/type/test step failed or because you could not run one — CI owns that signal.
+- The ONE quality check CI does not run is the project's lint. As an OPTIONAL code-quality signal you MAY run the lint scoped to the changed files (Python: \`python -m ruff check <changed .py files>\`; JS/TS: \`npx eslint <changed files>\`) and surface only NET-NEW style/lint violations as code-quality issues. This is a scoped quality check, not a build gate — skip it freely if your sandbox can't run it.
+- You MAY run targeted commands in your already-cloned workspace to SUBSTANTIATE a specific concern (reproduce a suspected bug, confirm a claim). Use the result to inform your judgment.
+- A command you CANNOT run — tool missing, install/build failure, API 401/403, sandbox limit — is an environment condition, never a code defect. It is NOT grounds for REQUEST_CHANGES.`;
   }
   const base = baseBranch ?? 'main';
+  // Reviewer-runnable checks = the project's LINT, scoped to the changed files
+  // only. CI already runs the build/type-check/tests as the authoritative merge
+  // gate, so we deliberately do NOT emit build_cmd invocations here — re-running
+  // the aggregate build would be redundant with CI and would block green PRs
+  // whenever the reviewer's sandbox can't run it. A directory configured with
+  // only a build_cmd (no lint_cmd) contributes no reviewer check.
   const checks = buildConfig.directories
-    .filter(d => d.build_cmd || d.lint_cmd)
+    .filter(d => d.lint_cmd)
     .map(d => {
       const installPrefix = d.type === 'node'
         ? 'npm ci && '
         : d.install_cmd ? `${d.install_cmd} && ` : '';
-      if (d.build_cmd) {
-        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${d.build_cmd}\` — report any errors`;
-      }
-      // lint_cmd only: delegate to shared helper so scoping logic stays in sync
-      // with the ./check fix path (buildScopedLintOneliner in prompt.ts).
+      // Delegate scoping to the shared helper so it stays in sync with the
+      // ./check fix path (buildScopedLintOneliner in prompt.ts).
       const lintCmd = d.lint_cmd ?? '';
       const scopedOneliner = buildScopedLintOneliner(lintCmd, d.path, base, 'git-diff');
       if (scopedOneliner) {
         const kind = detectLinterKind(lintCmd);
         const fileDesc = kind === 'eslint' ? 'JS/TS' : '.py';
-        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${scopedOneliner}\` — report any errors (scoped to changed ${fileDesc} files)`;
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${scopedOneliner}\` — report only NET-NEW issues (scoped to changed ${fileDesc} files)`;
       }
-      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${lintCmd}\` — report any errors`;
+      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${lintCmd}\` — report only NET-NEW issues`;
     });
   if (checks.length === 0) {
-    return '**Build & Type Safety:** No build commands configured — review code manually for type correctness.';
+    return `**Build, Tests & Lint — who verifies what:**
+- CI is the authoritative gate for this project's build, type-check, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.
+- No reviewer-runnable lint is configured for this project, so there is no scoped quality check to run; review the code manually for correctness.
+- A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
   }
-  return `**Build & Type Safety (MUST run these — do not skip):**
+  return `**Build, Tests & Lint — who verifies what:**
+- CI is the authoritative gate for this project's build, type-check, eslint, and the full test suite. Merge requires CI to pass independently of your review, so do NOT re-run the build, type-check, or tests yourself, and do NOT issue REQUEST_CHANGES because one failed or because you could not run one — CI owns that signal.
+- The ONE quality check CI does not run is the project's lint. As an OPTIONAL code-quality signal you MAY run the scoped lint below (already restricted to the changed files) and surface only NET-NEW style/lint violations as code-quality issues. This is a scoped quality check, not a build gate — skip it freely if your sandbox can't run it.
 ${checks.join('\n')}
-- Only run the build commands listed above. Do not invent additional build invocations against directories without configured commands.
-- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect.`;
+- You MAY also run targeted commands in your already-cloned workspace to SUBSTANTIATE a specific concern (reproduce a suspected bug, confirm a claim) — use the result to inform your judgment.
+- A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
 }
 
 export function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
@@ -167,8 +178,8 @@ export function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranc
 - Are type annotations correct (TypeScript/Python)?
 
 **Test Coverage:**
-- Are there tests for the new/changed behavior?
-- Do existing tests still pass given these changes?
+- Are there tests for the new/changed behavior? (A genuinely missing test for new behavior is a blockable defect.)
+- Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)
 
 ${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
@@ -199,7 +210,7 @@ export function buildReviewVerdictInstructions(taskId: string): string {
 **APPROVE** — the change is ready to merge as-is. Use this when the code is correct, the tests cover the behavior, and nothing blocks shipping. Optional polish notes belong in \`feedback\` as non-blocking observations; they do NOT disqualify APPROVE.
 {"verdict": "APPROVE", "feedback": "What you verified and why it's ready to merge. Include any non-blocking polish notes here."}
 
-**REQUEST_CHANGES** — something actionable must change before this merges. Use this for any bug, missing test, broken invariant, merge conflict, failing CI signal, or behavior that would surprise a reader. If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES — another round is cheap; a missed regression is expensive.
+**REQUEST_CHANGES** — block only on a concrete, substantiated CODE defect: a logic/correctness bug, a security hole, a missing test for new behavior, a broken invariant, a design flaw, or a merge conflict in the diff. Build/type-check/test pass is CI's job, not yours — do not block on it. Uncertainty rooted in something you could NOT verify in your sandbox (a command you couldn't run, a tool that was missing, an API that 401'd) is NOT grounds to block: judge the code on its merits and trust CI for build/test pass. If your concern is a real, substantiated defect, list it; if it is only a "couldn't confirm", do not REQUEST_CHANGES.
 {"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
 
 **Exhaustiveness — list every blocking change this PR needs, not just the most prominent one.** When you choose REQUEST_CHANGES, the \`issues\` array must enumerate every blocker you can identify in this pass. The fix agent will address each item; if you surface them one-per-iteration, the PR burns N review-fix cycles for what could have converged in one. Concretely:

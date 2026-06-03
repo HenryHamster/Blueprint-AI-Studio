@@ -50,6 +50,7 @@ from app.review_pipeline import (
     _is_cross_cutting_pr,
     _is_pipeline_task_stale,
     _is_test_file,
+    _is_verification_only_rejection,
     _max_review_iterations,
     _spawn_pipeline_task,
     maybe_spawn_cross_cutting_safeguard,
@@ -10350,3 +10351,123 @@ async def test_pr_number_match_matches_seeded_pr_number_end_to_end(db_session):
     matched_ids = {t.id for t in rows}
     assert target.id in matched_ids
     assert other.id not in matched_ids
+
+
+# ── _is_verification_only_rejection ────────────────────────────────────────────
+
+
+class TestIsVerificationOnlyRejection:
+    """Pure-unit coverage for the verification-only REQUEST_CHANGES classifier.
+
+    True ONLY when every blocking issue is verification-class (the reviewer
+    could not run/verify) AND no blocking issue cites a concrete code defect.
+    Conservative bias: anything ambiguous, empty, or defect-bearing → False.
+    """
+
+    def _issue(self, desc, severity="major"):
+        return {"description": desc, "severity": severity}
+
+    # ── positive: pure verification-class sets downgrade ──────────────────
+
+    def test_could_not_run_check_is_verification_only(self):
+        issues = [self._issue("Could not run ./check — command not found in sandbox")]
+        assert _is_verification_only_rejection(issues, "") is True
+
+    def test_http_401_probe_is_verification_only(self):
+        issues = [self._issue("CI probe returned 401 Unauthorized; cannot verify")]
+        assert _is_verification_only_rejection(issues, "") is True
+
+    def test_stale_workspace_install_failure_is_verification_only(self):
+        issues = [
+            self._issue("Stale workspace: could not install deps, npm ci failed")
+        ]
+        assert _is_verification_only_rejection(issues, "") is True
+
+    def test_build_failed_pass_status_is_verification_only(self):
+        issues = [self._issue("build failed locally; tsc did not pass in my env")]
+        assert _is_verification_only_rejection(issues, "") is True
+
+    def test_feedback_fallback_when_no_structured_issues(self):
+        # No issues, but the prose feedback is a pure could-not-verify note.
+        assert (
+            _is_verification_only_rejection(
+                [], "Unable to verify — pytest unavailable, the CI check was not verifiable"
+            )
+            is True
+        )
+
+    def test_multiple_verification_issues_all_pass(self):
+        issues = [
+            self._issue("could not run the test suite"),
+            self._issue("unable to verify the build, 403 forbidden on the artifact"),
+        ]
+        assert _is_verification_only_rejection(issues, "") is True
+
+    # ── negative: any concrete code defect respects the verdict ───────────
+
+    def test_concrete_logic_bug_blocks(self):
+        issues = [self._issue("Off-by-one error in the loop bound — reads past the array")]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    def test_concrete_defect_mixed_with_verification_still_blocks(self):
+        # Even if MOST issues are verification-class, a single concrete defect
+        # anywhere in the blocking set keeps the verdict.
+        issues = [
+            self._issue("could not run ./check"),
+            self._issue("SQL injection in the query builder — user input is interpolated"),
+        ]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    def test_defect_and_verify_phrase_in_same_issue_blocks(self):
+        # One issue mentions both a build worry AND a real null-deref defect.
+        issues = [
+            self._issue(
+                "build failed but also there is a null pointer deref when payload is empty"
+            )
+        ]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    def test_missing_test_blocks(self):
+        issues = [self._issue("Missing test for the error-handling branch")]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    def test_broken_invariant_blocks(self):
+        issues = [self._issue("This change breaks the invariant that ids are unique")]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    def test_race_condition_blocks(self):
+        issues = [self._issue("Race condition between the claim and the commit")]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    # ── negative: ambiguous / opaque issue is not provably verification-class
+
+    def test_opaque_issue_is_not_verification_only(self):
+        issues = [self._issue("Please clean this up")]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    def test_one_opaque_among_verification_blocks(self):
+        # All-or-nothing: a single non-verification-class issue keeps blocking.
+        issues = [
+            self._issue("could not run the verify gate"),
+            self._issue("rename this variable for clarity"),
+        ]
+        assert _is_verification_only_rejection(issues, "") is False
+
+    # ── negative: empty / whitespace blocking set ─────────────────────────
+
+    def test_empty_issues_and_empty_feedback_is_false(self):
+        assert _is_verification_only_rejection([], "") is False
+        assert _is_verification_only_rejection(None, None) is False
+
+    def test_whitespace_only_is_false(self):
+        assert _is_verification_only_rejection([self._issue("   ")], "   ") is False
+
+    def test_non_dict_issues_are_skipped(self):
+        # Defensive: malformed (non-dict) issue entries are ignored; with no
+        # usable structured issue, the prose feedback decides.
+        assert (
+            _is_verification_only_rejection(
+                ["junk", None, 42], "could not verify — ./check not found"
+            )
+            is True
+        )
