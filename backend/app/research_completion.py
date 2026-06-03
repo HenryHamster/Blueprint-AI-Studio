@@ -1443,43 +1443,52 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if _scope_cal_project
         else None
     )
-    _suppressed_decomp_dirs = {
-        str(_d.get("id"))
-        for _d in _directions_by_id.values()
-        if _cochange_decomposition_suppressed(_d)
-    }
-    if _suppressed_decomp_dirs:
-        _to_decomp: list = []
-        _skip_decomp: list = []
-        for _item in deduplicated:
-            _fid = str(_item[1].get("direction_id") or _parent_direction_id or "")
-            if _fid in _suppressed_decomp_dirs:
-                _skip_decomp.append(_item)
-            else:
-                _to_decomp.append(_item)
-        if _skip_decomp:
-            logger.info(
-                "[RESEARCH] Suppressing cochange decomposition for %d finding(s) "
-                "in %d direction(s) with poor historical sub-finding merge rate",
-                len(_skip_decomp),
-                len(_suppressed_decomp_dirs),
+    # Global kill-switch for co-change auto-decomposition. Default OFF: live data
+    # showed split sub-findings merging at ~0% while ~3x-ing task fan-out, so by
+    # default findings pass through unsplit. Flip cochange_decomposition_enabled
+    # to re-enable (the per-direction self-suppressor below still applies when
+    # on). Only the splitting is gated — the cochange_index that also feeds
+    # scope_complexity scoring + agent-prompt hints is unaffected.
+    if not _runtime_config.get("cochange_decomposition_enabled", False):
+        pass  # decomposition disabled — leave `deduplicated` unsplit
+    else:
+        _suppressed_decomp_dirs = {
+            str(_d.get("id"))
+            for _d in _directions_by_id.values()
+            if _cochange_decomposition_suppressed(_d)
+        }
+        if _suppressed_decomp_dirs:
+            _to_decomp: list = []
+            _skip_decomp: list = []
+            for _item in deduplicated:
+                _fid = str(_item[1].get("direction_id") or _parent_direction_id or "")
+                if _fid in _suppressed_decomp_dirs:
+                    _skip_decomp.append(_item)
+                else:
+                    _to_decomp.append(_item)
+            if _skip_decomp:
+                logger.info(
+                    "[RESEARCH] Suppressing cochange decomposition for %d finding(s) "
+                    "in %d direction(s) with poor historical sub-finding merge rate",
+                    len(_skip_decomp),
+                    len(_suppressed_decomp_dirs),
+                )
+            deduplicated = (
+                auto_decompose_findings_by_cochange(
+                    _to_decomp,
+                    _cochange_index_for_decomp,
+                    task.context,
+                    _finding_hash,
+                )
+                + _skip_decomp
             )
-        deduplicated = (
-            auto_decompose_findings_by_cochange(
-                _to_decomp,
+        else:
+            deduplicated = auto_decompose_findings_by_cochange(
+                deduplicated,
                 _cochange_index_for_decomp,
                 task.context,
                 _finding_hash,
             )
-            + _skip_decomp
-        )
-    else:
-        deduplicated = auto_decompose_findings_by_cochange(
-            deduplicated,
-            _cochange_index_for_decomp,
-            task.context,
-            _finding_hash,
-        )
     # Track auto-decomposition outcomes per direction so direction_outcomes
     # can correlate decomposition success with merge rates (parallels
     # plan-parent decomposition_quality tracking).

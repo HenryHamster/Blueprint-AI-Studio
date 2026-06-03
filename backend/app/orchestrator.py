@@ -635,6 +635,15 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
     Task.context,
     Task.title,
     Task.payloads,
+    # filter_file_conflicts (Step 2.5) reads ``t.parent_task_id`` on the
+    # in-progress blockers for its cross-parent looseness check
+    # (orchestrator_filters.py, added in PR #7431). Deferring the column makes
+    # that attribute access a sync lazy-load from this async context →
+    # MissingGreenlet that kills the ENTIRE dispatch cycle (10x in prod
+    # 2026-06-03 07:0x-07:48). Same gotcha class as ``status_log`` per
+    # reference_load_only_event_listeners.md — any column a downstream filter
+    # touches on active tasks MUST be loaded here.
+    Task.parent_task_id,
 )
 
 

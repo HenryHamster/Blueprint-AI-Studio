@@ -22,6 +22,7 @@ recovers.
 """
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -504,8 +505,14 @@ async def _default_pool_provision_fn(
         if booted is None:
             # _provision_gcp hit a normal failure (capacity/timeout) and already
             # cleaned up the staged secret — no PoolVm row was registered, so there
-            # is nothing to commit. Roll back and retry next tick.
-            await session.rollback()
+            # is nothing to commit. Roll back and retry next tick. Suppress the
+            # rollback: if the connection was severed mid-provision by a deploy
+            # cutover / instance drain, rollback() raises InterfaceError
+            # ("connection is closed") and escapes the maintainer loop (prod
+            # 2026-06-03). There is nothing to roll back when the conn is already
+            # dead — the pool listener has invalidated it.
+            with contextlib.suppress(Exception):
+                await session.rollback()
             logger.info(
                 "[WARM-POOL] pool VM did not boot for project %s — skip provision",
                 project_id,
@@ -520,7 +527,10 @@ async def _default_pool_provision_fn(
         )
         return True
     except Exception:
-        await session.rollback()
+        # Guard the rollback for the same reason as the booted-None branch above:
+        # a severed connection makes rollback() raise and mask the real error.
+        with contextlib.suppress(Exception):
+            await session.rollback()
         logger.warning(
             "[WARM-POOL] pool provision failed for project %s vm=%s",
             project_id,

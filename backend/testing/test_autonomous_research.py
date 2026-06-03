@@ -3080,6 +3080,10 @@ async def test_medium_scope_cross_module_related_files_auto_decomposes(
     monkeypatch.setitem(
         _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
     )
+    # Decomposition is opt-in (default off); enable it to exercise the behavior.
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "cochange_decomposition_enabled", True
+    )
     direction = _active_direction("d-xmod01", "Cross-module heuristic direction")
     project = Project(
         name="Cross-Module Heuristic Test",
@@ -3144,6 +3148,10 @@ async def test_auto_decomposed_siblings_are_chained_via_depends_on(
     actually-merged state of prior siblings."""
     monkeypatch.setitem(
         _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
+    # Decomposition is opt-in (default off); enable it to exercise the behavior.
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "cochange_decomposition_enabled", True
     )
     direction = _active_direction("d-chain01", "Sibling-chain direction")
     project = Project(
@@ -3347,6 +3355,10 @@ async def test_medium_with_independent_clusters_decomposes_to_smalls(
     """Medium finding whose related_files form 2 independent clusters splits into 2 small tasks."""
     monkeypatch.setitem(
         _shared_state.runtime_config, "pipeline_scope_baseline_rates", {}
+    )
+    # Decomposition is opt-in (default off); enable it to exercise the behavior.
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "cochange_decomposition_enabled", True
     )
     direction = _active_direction("d-decomp01", "Decomposition direction")
     cochange_index = {
