@@ -411,6 +411,77 @@ class TestSchemaRevisionSync:
             f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
         )
 
+    def test_migration_chain_is_monotonic(self):
+        """The on-disk migration chain must be monotonic: the migration with the
+        numeric-maximum revision id must be the single structural head of the
+        chain, and every migration's revision number must be greater than its
+        down_revision's number.
+
+        The combined-chain dual-head guard identifies the head by taking the
+        numeric maximum of the revision ids (it works from filenames alone).
+        This assumes the chain is monotonic — that the highest-numbered
+        migration is the true head. When a chain is non-monotonic (e.g. a
+        colliding migration's renumber produces a backward step), numeric-max
+        head detection fails and the app wedges on the next schema upgrade.
+
+        Reuses the same migration-chain parsing helpers (:func:`build_migration_chain`,
+        :func:`find_heads`) that the rollup auto-merge guard consumes, so the
+        invariant test and the runtime guard assert against identical chain
+        structure.
+        """
+        import glob as globmod
+
+        from app.migration_chain import build_migration_chain, find_heads
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
+        assert files, "No migration files found"
+
+        sources: dict[str, str] = {}
+        for path in files:
+            with open(path) as f:
+                sources[os.path.basename(path)] = f.read()
+
+        chain, _duplicates, _unparseable = build_migration_chain(sources)
+        heads = find_heads(chain)
+
+        # Exactly one head (verified by test_migration_chain_is_linear)
+        assert len(heads) == 1, f"Expected 1 head, got {len(heads)}: {heads}"
+
+        head = heads[0]
+        max_revision = max(chain, key=int)
+
+        # Every revision number must be greater than its down_revision's number
+        # (for revisions that are part of the chain).
+        violations: list[str] = []
+        for rev, down_rev in chain.items():
+            if down_rev is not None and down_rev in chain:
+                if int(rev) <= int(down_rev):
+                    violations.append(
+                        f"  {rev} (numeric {int(rev)}) → down_revision {down_rev} "
+                        f"(numeric {int(down_rev)}) — revision must be numerically "
+                        f"greater than its down_revision"
+                    )
+
+        # The numeric-maximum revision must be the structural head
+        if max_revision != head:
+            violations.append(
+                f"  numeric-maximum revision '{max_revision}' is not the "
+                f"structural head '{head}' — numeric-max head detection will fail"
+            )
+
+        assert not violations, (
+            "Migration chain is not monotonic. The combined-chain dual-head guard "
+            "relies on numeric-max head detection to identify the head, which breaks "
+            "on non-monotonic chains where the highest-numbered migration is not the "
+            "structural head or when migrations are numbered out of chain order.\n"
+            "Violations:\n" + "\n".join(violations) + "\n\n"
+            "Ensure every revision is numerically greater than its down_revision, "
+            "and the numeric-maximum revision is the true structural head."
+        )
+
     def test_model_columns_covered_by_migrations(self):
         """Every column defined on a SQLModel table must exist in the alembic
         migration chain. If an agent adds a column to models.py but forgets

@@ -664,10 +664,11 @@ def test_plan_integration_collision_no_descendants_renumbers_and_rechains():
     assert validate_combined_migration_chain(target, plan["upserts"]) is None
 
 
-def test_plan_integration_collision_linear_tail_rechains_only_immediate_child():
-    """A colliding migration with a linear descendant tail: the colliding file is
-    renumbered above the unified head, the IMMEDIATE descendant is rechained onto
-    the new revision, and the rest of the tail keeps its numbers untouched."""
+def test_plan_integration_collision_linear_tail_renumbers_full_tail_monotonic():
+    """A colliding migration with a linear descendant tail: the colliding file AND
+    every node in the tail are renumbered monotonically into a contiguous block
+    above the unified head, each rechained onto its renumbered predecessor, so the
+    NNNN order matches the chain order and the numeric-max revision is the head."""
     target = ["0136_prev.py", "0137_hotfix.py"]
     integration = {
         "backend/alembic/versions/0137_feat.py": _migration_src("0137", "0136"),  # C
@@ -680,24 +681,36 @@ def test_plan_integration_collision_linear_tail_rechains_only_immediate_child():
     assert plan["old_revision"] == "0137"
     assert plan["new_revision"] == "0140"
     assert plan["new_down_revision"] == "0137"
-    assert plan["deletes"] == ["backend/alembic/versions/0137_feat.py"]
-    # upserts: the renamed colliding file AND the rechained immediate descendant.
+    assert plan["old_path"] == "backend/alembic/versions/0137_feat.py"
+    assert plan["new_path"] == "backend/alembic/versions/0140_feat.py"
+    # deletes: ALL three old paths being renamed away (in chain order).
+    assert plan["deletes"] == [
+        "backend/alembic/versions/0137_feat.py",
+        "backend/alembic/versions/0138_b.py",
+        "backend/alembic/versions/0139_c.py",
+    ]
+    # upserts: ALL three renamed/renumbered files — the full tail moved up.
     assert set(plan["upserts"]) == {
         "backend/alembic/versions/0140_feat.py",
-        "backend/alembic/versions/0138_b.py",
+        "backend/alembic/versions/0141_b.py",
+        "backend/alembic/versions/0142_c.py",
     }
+    # C 0137 -> 0140 <- unified head 0137.
     c_rev, c_down = parse_revision_identifiers(
         plan["upserts"]["backend/alembic/versions/0140_feat.py"]
     )
     assert (c_rev, c_down) == ("0140", "0137")
-    # D keeps its revision 0138 but is rechained off the renumbered C (0140).
+    # D 0138 -> 0141 <- renumbered C (0140).
     d_rev, d_down = parse_revision_identifiers(
-        plan["upserts"]["backend/alembic/versions/0138_b.py"]
+        plan["upserts"]["backend/alembic/versions/0141_b.py"]
     )
-    assert (d_rev, d_down) == ("0138", "0140")
-    # E is the tail end — untouched (still 0139 <- 0138) and remains the head.
-    assert "backend/alembic/versions/0139_c.py" not in plan["upserts"]
-    assert plan["expected_schema_revision"] == "0139"
+    assert (d_rev, d_down) == ("0141", "0140")
+    # E 0139 -> 0142 <- renumbered D (0141); the highest revision == the head.
+    e_rev, e_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0142_c.py"]
+    )
+    assert (e_rev, e_down) == ("0142", "0141")
+    assert plan["expected_schema_revision"] == "0142"
     # The full reconciled integration set revalidates clean.
     reconciled = {
         p: s
@@ -706,6 +719,38 @@ def test_plan_integration_collision_linear_tail_rechains_only_immediate_child():
     }
     reconciled.update(plan["upserts"])
     assert validate_combined_migration_chain(target, reconciled) is None
+    # Monotonicity property: the numeric-max revision IS the structural head.
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    assert max(reconciled_chain, key=int) == find_heads(reconciled_chain)[0]
+    assert max(int(r) for r in reconciled_chain) == int(
+        plan["expected_schema_revision"]
+    )
+
+
+def test_plan_integration_tail_chain_is_monotonic():
+    """Explicit regression: for every node in the reconciled chain
+    int(revision) > int(down_revision), and the numeric-max revision equals the
+    single structural head returned by find_heads()."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        "backend/alembic/versions/0137_feat.py": _migration_src("0137", "0136"),
+        "backend/alembic/versions/0138_b.py": _migration_src("0138", "0137"),
+        "backend/alembic/versions/0139_c.py": _migration_src("0139", "0138"),
+    }
+    plan = plan_integration_side_renumber(target, integration)
+    assert plan is not None
+    reconciled = {
+        p: s for p, s in integration.items() if p not in plan["deletes"]
+    }
+    reconciled.update(plan["upserts"])
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    # Every renumbered node points strictly downward to a lower revision number.
+    for rev, down in reconciled_chain.items():
+        if down is not None and down in reconciled_chain:
+            assert int(rev) > int(down), f"{rev} <- {down} is not monotonic"
+    heads = find_heads(reconciled_chain)
+    assert len(heads) == 1
+    assert max(reconciled_chain, key=int) == heads[0]
 
 
 def test_plan_integration_no_collision_returns_none():

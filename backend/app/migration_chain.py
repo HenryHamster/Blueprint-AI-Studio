@@ -499,13 +499,20 @@ def plan_integration_side_renumber(
         {
             "upserts",                  # path -> new source: the renamed +
                                         #   renumbered colliding migration AND
-                                        #   the rechained immediate descendant
-            "deletes",                  # [old colliding path] being renamed away
-            "old_path", "new_path",     # the rename
+                                        #   every node in its linear descendant
+                                        #   tail, renumbered monotonically
+            "deletes",                  # [old colliding path, *old tail paths]
+                                        #   being renamed away
+            "old_path", "new_path",     # the rename of the colliding migration
             "old_revision", "new_revision",
             "new_down_revision",        # the unified promotion-target head
-            "expected_schema_revision", # the resulting single head
+            "expected_schema_revision", # the resulting single head == numeric max
         }
+
+    The colliding migration and its entire linear descendant tail are
+    renumbered into a contiguous, increasing block of fresh revision ids above
+    every existing revision, each rechained onto its renumbered predecessor, so
+    the reconciled chain is MONOTONIC (numeric-max revision == structural head).
 
     The reconciled result is verified against
     :func:`validate_combined_migration_chain` before being returned, so a
@@ -557,31 +564,43 @@ def plan_integration_side_renumber(
     if tail is None:
         return None
 
-    # Next free revision: strictly above every existing revision (target or
-    # integration) so it cannot collide, rechained directly onto the unified
-    # promotion-target head.
+    # Next free revisions: a contiguous, increasing block strictly above every
+    # existing revision (target or integration) so the whole renumbered tail
+    # cannot collide. The colliding migration AND its entire linear descendant
+    # tail are renumbered MONOTONICALLY — node N gets max+1+N, rechained onto
+    # its renumbered predecessor (the colliding node onto the unified
+    # promotion-target head). This keeps the NNNN order in lockstep with the
+    # chain order, so the numeric maximum revision is the true head and the
+    # combined-chain guard's numeric-max head shortcut stays correct.
     all_revisions = target_revisions | set(int_chain)
     max_revision = max(all_revisions, key=int)
-    new_revision = f"{int(max_revision) + 1:0{len(max_revision)}d}"
+    width = len(max_revision)
+    base = int(max_revision)
+
+    # Chain order: the colliding migration first, then its linear descendants.
+    chain_order = [colliding_rev, *tail]
+
+    upserts: dict[str, str] = {}
+    deletes: list[str] = []
+    # The colliding migration anchors to the unified promotion-target head; each
+    # subsequent tail node anchors to its renumbered predecessor.
+    prev_new_revision = target_head
+    new_revision = ""  # the colliding migration's new revision (chain_order[0])
+    new_path = ""
+    for offset, rev in enumerate(chain_order):
+        renumbered = f"{base + 1 + offset:0{width}d}"
+        node_old_path = rev_to_path[rev]
+        node_new_path = _renumbered_filename(node_old_path, renumbered)
+        upserts[node_new_path] = _rewrite_migration_source(
+            integration_sources[node_old_path], renumbered, prev_new_revision
+        )
+        deletes.append(node_old_path)
+        if offset == 0:
+            new_revision = renumbered
+            new_path = node_new_path
+        prev_new_revision = renumbered
 
     old_path = rev_to_path[colliding_rev]
-    new_path = _renumbered_filename(old_path, new_revision)
-    upserts: dict[str, str] = {
-        new_path: _rewrite_migration_source(
-            integration_sources[old_path], new_revision, target_head
-        )
-    }
-    deletes: list[str] = [old_path]
-
-    # Only the immediate descendant is rechained (old colliding revision -> new
-    # revision); the rest of the linear tail keeps its numbers because each of
-    # their predecessors is unchanged.
-    if tail:
-        child_rev = tail[0]
-        child_path = rev_to_path[child_rev]
-        upserts[child_path] = _rewrite_migration_source(
-            integration_sources[child_path], child_rev, new_revision
-        )
 
     # Verify the reconciled integration set against the same combined-chain
     # validator the guard uses — never return a plan that would not resolve.
@@ -594,6 +613,13 @@ def plan_integration_side_renumber(
     reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
     heads = find_heads(reconciled_chain)
     if len(heads) != 1:
+        return None
+
+    # Monotonicity guard: the numeric-max revision MUST be the structural head,
+    # otherwise the combined-chain guard's numeric-max head shortcut would
+    # mis-identify the head on the next migration. Never emit a non-monotonic
+    # plan — fall back to the guided resolver instead.
+    if max(reconciled_chain, key=int) != heads[0]:
         return None
 
     return {
