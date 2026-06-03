@@ -1718,6 +1718,7 @@ async def test_pr_merged_on_integration_triggers_build_config_refresh(
     assert resp.status_code == 200
     refresh_mock.assert_awaited_once()
     assert refresh_mock.await_args.args[0].id == project.id
+    assert refresh_mock.await_args.kwargs.get("ref") == "main"
 
 
 @pytest.mark.asyncio
@@ -2473,6 +2474,48 @@ async def test_check_run_no_matching_tasks_returns_no_match(client, db_session, 
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_check_run_success_on_integration_branch_refreshes_build_config(
+    client, db_session, mocker
+):
+    """A successful non-PR integration-branch landing still attempts the
+    empty-build_config refresh and keeps the webhook non-blocking."""
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    refresh_mock = mocker.patch(
+        "app.build_config_detection.maybe_refresh_empty_build_config",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="Integration landing refresh",
+        user_id="user1",
+        github_owner="landingorg",
+        github_repo="landingrepo",
+        integration_branch="main",
+        build_config={"repo_is_empty": True},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    payload_bytes = _make_check_run_payload(
+        "landingorg",
+        "landingrepo",
+        "successsha123",
+        conclusion="success",
+        head_branch="main",
+    )
+    resp = await _post_webhook(client, payload_bytes, "check_run")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "no_match"
+    refresh_mock.assert_awaited_once()
+    assert refresh_mock.await_args.args[0].id == project.id
+    assert refresh_mock.await_args.kwargs.get("ref") == "main"
 
 
 @pytest.mark.asyncio

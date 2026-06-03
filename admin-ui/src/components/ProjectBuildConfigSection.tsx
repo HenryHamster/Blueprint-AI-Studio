@@ -67,6 +67,9 @@ export function ProjectBuildConfigSection({
   const [enableParallelFix, setEnableParallelFix] = useState(
     buildConfig?.enable_parallel_fix ?? false
   );
+  const [requiresCiChecks, setRequiresCiChecks] = useState(
+    buildConfig?.requires_ci_checks ?? true
+  );
   const [taskBranchNamespace, setTaskBranchNamespace] = useState(
     buildConfig?.task_branch_namespace ?? ''
   );
@@ -92,6 +95,7 @@ export function ProjectBuildConfigSection({
     setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
     setEnableParallelReview(buildConfig?.enable_parallel_review ?? false);
     setEnableParallelFix(buildConfig?.enable_parallel_fix ?? false);
+    setRequiresCiChecks(buildConfig?.requires_ci_checks ?? true);
     const preserved = preservedBranchOnDetect.current;
     setTaskBranchNamespace(buildConfig?.task_branch_namespace ?? preserved?.namespace ?? '');
     setTaskBranchPrefix(buildConfig?.task_branch_prefix ?? preserved?.prefix ?? '');
@@ -134,6 +138,7 @@ export function ProjectBuildConfigSection({
         enable_fresh_reviewer: enableFreshReviewer,
         enable_parallel_review: enableParallelReview,
         enable_parallel_fix: enableParallelFix,
+        requires_ci_checks: requiresCiChecks,
         task_branch_namespace: taskBranchNamespace.trim() || undefined,
         task_branch_prefix: taskBranchPrefix.trim() || undefined,
         pr_title_prefix: prTitlePrefix.trim() || undefined,
@@ -477,6 +482,31 @@ export function ProjectBuildConfigSection({
                 On fix iterations with multi-module diffs or many reviewer issues, the fix agent fans out
                 root-cause investigation subagents (investigation only — parent applies all edits).
                 Reduces wall-clock on large rollup fixes; auto-skipped for trivial diffs.
+              </p>
+            </div>
+          </label>
+          <label className="flex items-start gap-3 cursor-pointer group">
+            <div className="mt-0.5 shrink-0">
+              <input
+                type="checkbox"
+                checked={requiresCiChecks}
+                onChange={e => setRequiresCiChecks(e.target.checked)}
+                className="sr-only peer"
+                id="requires-ci-checks-toggle"
+              />
+              <div
+                onClick={() => setRequiresCiChecks(v => !v)}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${requiresCiChecks ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${requiresCiChecks ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-200 font-medium">Repository has required CI checks</span>
+              <p className="text-[11px] text-neutral-500 mt-0.5">
+                On by default — Blueprint waits for the repository's required CI checks to pass before merging a PR.
+                Turn this off for repos with no required checks: Blueprint then merges as soon as a PR is otherwise
+                mergeable instead of polling for checks that will never arrive.
               </p>
             </div>
           </label>

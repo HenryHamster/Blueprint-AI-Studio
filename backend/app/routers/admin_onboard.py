@@ -8,8 +8,10 @@ BuildConfig schema before saving it.
 
 import logging
 import re
+from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -88,6 +90,8 @@ _NON_SOURCE_FILE_PREFIXES = (
     "changelog",
     "security",
 )
+_BUILD_CONFIG_SCAN_MAX_DEPTH = 2
+_BUILD_CONFIG_SCAN_MAX_DIRECTORIES = 40
 
 
 def _is_real_source_file(name: str) -> bool:
@@ -110,16 +114,17 @@ def _classify_repo_emptiness(
 
     Returns True ONLY when the repository was read successfully and completely
     AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across
-    the fetched root listing and the already-fetched first-level subdirectory
-    listings. Documentation/config/data files, dotfiles, and common manifests
-    are not counted as source.
+    the fetched root listing and every nested directory listing the detector
+    walked. Documentation/config/data files, dotfiles, and common manifests are
+    not counted as source.
 
     ``listing_complete`` is the positive confirmation that every listing needed
-    to make this determination was fetched. When it is False (e.g. a
-    first-level subdirectory listing failed to fetch), emptiness is
-    indeterminate and this returns False (treat-as-non-empty) — a repo whose
-    real source lives in a subdirectory we could not read must never be
-    bootstrapped as greenfield on a transient fetch error.
+    to make this determination was fetched. When it is False (e.g. a nested
+    directory listing failed to fetch or the bounded scan hit unread deeper
+    paths), emptiness is indeterminate and this returns False
+    (treat-as-non-empty) — a repo whose real source lives in a subdirectory we
+    could not read must never be bootstrapped as greenfield on a transient
+    fetch error.
 
     ``root_items`` is the raw GitHub ``contents/`` listings already fetched by
     :func:`_detect_build_config`, so it adds zero GitHub cost.
@@ -148,12 +153,12 @@ def _classify_repo_emptiness(
 async def _detect_build_config(
     token: str, owner: str, repo: str, ref: str | None = None
 ) -> Dict[str, Any]:
-    """Auto-detect build configuration by inspecting the repo's root files.
+    """Auto-detect build configuration by inspecting a bounded repo subtree.
 
-    The detector is intentionally shallow: it looks at the repository root and
-    one level of subdirectories to seed directory-specific install/lint/build
-    commands, then returns a BuildConfig-shaped dict that onboarding can merge
-    with operator overrides.
+    The detector inspects the repository root plus nested subdirectories up to
+    ``_BUILD_CONFIG_SCAN_MAX_DEPTH`` so common layouts like ``apps/web`` and
+    ``services/api`` can emit usable directory commands during onboarding and
+    owner-triggered re-detect.
 
     When ``ref`` is provided, every GitHub contents API call targets that
     branch/ref instead of the repository's default branch. When ``ref`` is
@@ -170,10 +175,107 @@ async def _detect_build_config(
     # detection issues byte-identical requests to before.
     params = {"ref": ref} if ref is not None else None
 
+    def _contents_url(path: str | None = None) -> str:
+        if not path:
+            return f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        return (
+            f"https://api.github.com/repos/{owner}/{repo}/contents/"
+            f"{quote(path, safe='/')}"
+        )
+
+    def _record_language(languages: list[str], language: str) -> None:
+        if language not in languages:
+            languages.append(language)
+
+    def _normalized_directory_path(path: str) -> str:
+        return "./" if not path else f"{path}/"
+
+    def _add_detected_directory(
+        directories: list[Dict[str, Any]],
+        languages: list[str],
+        path: str,
+        project_type: str,
+    ) -> None:
+        normalized_path = _normalized_directory_path(path)
+        if any(
+            d["path"] == normalized_path and d.get("type") == project_type
+            for d in directories
+        ):
+            return
+
+        if project_type == "python":
+            directories.append(
+                {
+                    "path": normalized_path,
+                    "type": "python",
+                    "lint_cmd": "ruff check",
+                    "test_cmd": "python3 -m pytest",
+                }
+            )
+            _record_language(languages, "python")
+            return
+
+        if project_type == "node":
+            entry: Dict[str, Any] = {
+                "path": normalized_path,
+                "type": "node",
+                "install_cmd": "npm ci",
+                "build_cmd": "npm run build",
+                "test_cmd": "npm test",
+            }
+            if path:
+                entry["lint_cmd"] = "npx eslint ."
+            directories.append(entry)
+            _record_language(languages, "typescript")
+            return
+
+        if project_type == "go":
+            directories.append(
+                {
+                    "path": normalized_path,
+                    "type": "go",
+                    "test_cmd": "go test ./...",
+                }
+            )
+            _record_language(languages, "go")
+            return
+
+        if project_type == "rust":
+            directories.append(
+                {
+                    "path": normalized_path,
+                    "type": "rust",
+                    "build_cmd": "cargo build",
+                    "test_cmd": "cargo test",
+                }
+            )
+            _record_language(languages, "rust")
+
+    def _detect_projects_in_listing(
+        path: str,
+        listing: list[Dict[str, Any]],
+        directories: list[Dict[str, Any]],
+        languages: list[str],
+    ) -> None:
+        names = {
+            item.get("name")
+            for item in listing
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+
+        if {"pyproject.toml", "setup.py", "setup.cfg"} & names:
+            _add_detected_directory(directories, languages, path, "python")
+        if "package.json" in names:
+            _add_detected_directory(directories, languages, path, "node")
+        if "go.mod" in names:
+            _add_detected_directory(directories, languages, path, "go")
+        if "Cargo.toml" in names:
+            _add_detected_directory(directories, languages, path, "rust")
+
     # Fetch root directory listing
     resp = await _github_request(
         "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/contents/",
+        _contents_url(),
         headers,
         max_retries=2,
         params=params,
@@ -185,80 +287,40 @@ async def _detect_build_config(
         return {}
 
     root_listing = [item for item in resp.json() if isinstance(item, dict)]
-    root_files = {item["name"]: item for item in root_listing}
-    root_names = set(root_files.keys())
-
     directories: list[Dict[str, Any]] = []
     languages: list[str] = []
     source_items: list[Dict[str, Any]] = list(root_listing)
     # Positive confirmation that every listing needed for the emptiness
-    # determination was fetched. Any failed first-level subdirectory fetch
-    # flips this to False so the repo is not falsely classified as greenfield.
+    # determination was fetched. Any failed nested fetch, max-depth truncation,
+    # or scan-cap truncation flips this to False so the repo is not falsely
+    # classified as greenfield from a partial walk.
     listing_complete = True
+    _detect_projects_in_listing("", root_listing, directories, languages)
 
-    # Detect Python project
-    if (
-        "pyproject.toml" in root_names
-        or "setup.py" in root_names
-        or "setup.cfg" in root_names
-    ):
-        languages.append("python")
-        directories.append(
-            {
-                "path": "./",
-                "type": "python",
-                "lint_cmd": "ruff check",
-                "test_cmd": "python3 -m pytest",
-            }
+    pending_dirs = deque(
+        sorted(
+            (item["name"], 1)
+            for item in root_listing
+            if item.get("type") == "dir" and isinstance(item.get("name"), str)
         )
+    )
+    scanned_directories = 0
 
-    # Detect Node/TypeScript project (root-level)
-    if "package.json" in root_names:
-        languages.append("typescript")
-        directories.append(
-            {
-                "path": "./",
-                "type": "node",
-                "install_cmd": "npm ci",
-                "build_cmd": "npm run build",
-                "test_cmd": "npm test",
-            }
-        )
-
-    # Detect Go project
-    if "go.mod" in root_names:
-        languages.append("go")
-        directories.append(
-            {
-                "path": "./",
-                "type": "go",
-                "test_cmd": "go test ./...",
-            }
-        )
-
-    # Detect Rust project
-    if "Cargo.toml" in root_names:
-        languages.append("rust")
-        directories.append(
-            {
-                "path": "./",
-                "type": "rust",
-                "build_cmd": "cargo build",
-                "test_cmd": "cargo test",
-            }
-        )
-
-    # Scan subdirectories for multi-project repos
-    subdirs = [
-        item["name"]
-        for item in resp.json()
-        if isinstance(item, dict) and item.get("type") == "dir"
-    ]
-
-    for subdir in subdirs:
+    while pending_dirs:
+        subdir, depth = pending_dirs.popleft()
+        if scanned_directories >= _BUILD_CONFIG_SCAN_MAX_DIRECTORIES:
+            logger.warning(
+                "[ONBOARD] Stopped build-config scan for %s/%s after %s directories; "
+                "treating repo read as incomplete",
+                owner,
+                repo,
+                _BUILD_CONFIG_SCAN_MAX_DIRECTORIES,
+            )
+            listing_complete = False
+            break
         sub_resp = await _github_request(
             "GET",
-            f"https://api.github.com/repos/{owner}/{repo}/contents/{subdir}",
+            _contents_url(subdir),
             headers,
             max_retries=1,
             params=params,
@@ -273,38 +335,24 @@ async def _detect_build_config(
             )
             listing_complete = False
             continue
+
         sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
+        scanned_directories += 1
         source_items.extend(sub_listing)
-        sub_files = {item["name"] for item in sub_listing}
+        _detect_projects_in_listing(subdir, sub_listing, directories, languages)
 
-        if "package.json" in sub_files and not any(
-            d["path"] == f"{subdir}/" for d in directories
-        ):
-            directories.append(
-                {
-                    "path": f"{subdir}/",
-                    "type": "node",
-                    "install_cmd": "npm ci",
-                    "lint_cmd": "npx eslint .",
-                    "build_cmd": "npm run build",
-                }
-            )
-            if "typescript" not in languages:
-                languages.append("typescript")
-
-        if ("pyproject.toml" in sub_files or "setup.py" in sub_files) and not any(
-            d["path"] == f"{subdir}/" for d in directories
-        ):
-            directories.append(
-                {
-                    "path": f"{subdir}/",
-                    "type": "python",
-                    "lint_cmd": "ruff check",
-                    "test_cmd": "python3 -m pytest",
-                }
-            )
-            if "python" not in languages:
-                languages.append("python")
+        child_dirs = sorted(
+            item["name"]
+            for item in sub_listing
+            if item.get("type") == "dir" and isinstance(item.get("name"), str)
+        )
+        if not child_dirs:
+            continue
+        if depth >= _BUILD_CONFIG_SCAN_MAX_DEPTH:
+            listing_complete = False
+            continue
+        for child in child_dirs:
+            pending_dirs.append((f"{subdir}/{child}", depth + 1))
 
     # Determine primary language
     if len(languages) == 0:
@@ -319,9 +367,9 @@ async def _detect_build_config(
         "directories": directories,
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
-        # Deterministic empty/near-empty signal from the already-fetched root
-        # + first-level subdirectory listings (zero extra GitHub cost). Must
-        # stay aligned with agent/src/prompts/discovery.ts and the threshold in
+        # Deterministic empty/near-empty signal from the already-fetched bounded
+        # contents walk (zero extra GitHub cost beyond detection). Must stay
+        # aligned with agent/src/prompts/discovery.ts and the threshold in
         # agent/src/constants.ts.
         "repo_is_empty": _classify_repo_emptiness(
             source_items, listing_complete=listing_complete
@@ -439,26 +487,57 @@ async def onboard_project(
     )
     session.add(member)
 
-    # Auto-detect build config from GitHub repo
-    build_config: Dict[str, Any] = {}
     token = None
-    try:
-        from app.github import get_repo_installation_token
+    from app.github import get_repo_default_branch, get_repo_installation_token
 
-        token = await get_repo_installation_token(
-            payload.github_owner, payload.github_repo
+    token = await get_repo_installation_token(payload.github_owner, payload.github_repo)
+    if not token:
+        logger.warning(
+            "[ONBOARD] No GitHub token available for %s/%s",
+            payload.github_owner,
+            payload.github_repo,
         )
-        if token:
-            build_config = await _detect_build_config(
-                token, payload.github_owner, payload.github_repo
-            )
-        else:
-            logger.warning(
-                f"[ONBOARD] No GitHub token available for {payload.github_owner}/{payload.github_repo}"
-            )
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No installation token available — cannot detect default branch.",
+        )
+
+    try:
+        default_branch = await get_repo_default_branch(
+            token, payload.github_owner, payload.github_repo
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Default branch detection failed: {e}",
+        ) from e
+
+    if default_branch:
+        project.integration_branch = default_branch
+        project.promotion_target = default_branch
+
+    if payload.promotion_target:
+        project.promotion_target = payload.promotion_target
+
+    # Auto-detect build config from the same branch Blueprint stores as trunk.
+    build_config: Dict[str, Any] = {}
+    try:
+        build_config = await _detect_build_config(
+            token,
+            payload.github_owner,
+            payload.github_repo,
+            ref=default_branch,
+        )
     except Exception as e:
         logger.error(
-            f"[ONBOARD] Build config detection failed for {payload.github_owner}/{payload.github_repo}: {e}",
+            "[ONBOARD] Build config detection failed for %s/%s on ref %s: %s",
+            payload.github_owner,
+            payload.github_repo,
+            default_branch,
+            e,
             exc_info=True,
         )
 
@@ -485,38 +564,12 @@ async def onboard_project(
         project.build_config = validated.model_dump(exclude_none=True)
     except Exception as exc:  # noqa: BLE001
         # Detection + override produced invalid shape — store raw but log warning
-        logger.warning("[ONBOARD] build_config failed schema validation, storing raw: %s", exc)
+        logger.warning(
+            "[ONBOARD] build_config failed schema validation, storing raw: %s", exc
+        )
         project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)
-
-    # Detect default branch and initialize auto_remediation config
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No installation token available — cannot detect default branch.",
-        )
-    from app.github import get_repo_default_branch
-
-    try:
-        default_branch = await get_repo_default_branch(
-            token, payload.github_owner, payload.github_repo
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Default branch detection failed: {e}",
-        ) from e
-
-    if default_branch:
-        project.integration_branch = default_branch
-        project.promotion_target = default_branch
-
-    if payload.promotion_target:
-        project.promotion_target = payload.promotion_target
 
     branch_whitelist: list[str] = []
     if default_branch:

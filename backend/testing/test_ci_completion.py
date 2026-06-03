@@ -2076,6 +2076,47 @@ async def test_merge_success_without_orig_id(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_success_without_orig_id_triggers_build_config_refresh(
+    db_session, mocker
+):
+    """A CI-driven merge onto the integration branch refreshes empty
+    build_config even when no original_task_id linkage exists."""
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.github.merge_pull_request", return_value={"merged": True})
+    refresh_mock = mocker.patch(
+        "app.ci_completion._refresh_empty_build_config_after_integration_landing",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    project = Project(
+        name="No orig id refresh",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="direct-merge",
+        integration_branch="main",
+        build_config={"repo_is_empty": True},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    refresh_mock.assert_awaited_once_with(project.id, "main")
+
+
+@pytest.mark.asyncio
 async def test_orig_pr_merged_write_failure_does_not_poison_caller_session(
     db_session, mocker
 ):

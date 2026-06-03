@@ -29,9 +29,10 @@ def apply_operator_build_config_overrides(
     - ``git_user_email`` / ``git_user_name`` — preserved only when truthy.
     - ``env_vars``, reviewer/parallelism toggles, branch namespace/prefixes,
       ``pr_title_prefix``, staging/stale branch prefix lists,
-      ``protected_branches`` and ``enable_self_improvement`` — preserved
-      whenever the key is present in ``existing`` (including empty-list/falsey
-      values), so deliberate operator customization survives re-detection.
+      ``protected_branches``, ``enable_self_improvement`` and
+      ``requires_ci_checks`` — preserved whenever the key is present in
+      ``existing`` (including empty-list/falsey values), so deliberate operator
+      customization survives re-detection.
     """
     existing = existing or {}
 
@@ -64,6 +65,11 @@ def apply_operator_build_config_overrides(
         detected["protected_branches"] = existing["protected_branches"]
     if "enable_self_improvement" in existing:
         detected["enable_self_improvement"] = existing["enable_self_improvement"]
+    # The no-CI merge policy is operator-owned and never emitted by repo
+    # detection; carry an explicit choice (including False) forward so manual
+    # re-detect and empty-config auto-refresh do not silently re-gate the repo.
+    if "requires_ci_checks" in existing:
+        detected["requires_ci_checks"] = existing["requires_ci_checks"]
 
     return detected
 

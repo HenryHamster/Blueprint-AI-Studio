@@ -48,6 +48,35 @@ from app.models import Task, TaskStatus, _utcnow
 logger = logging.getLogger(__name__)
 
 
+async def _refresh_empty_build_config_after_integration_landing(
+    project_id, landed_ref: str
+) -> bool:
+    """Run best-effort build-config refresh in an isolated session."""
+    try:
+        from app.build_config_detection import maybe_refresh_empty_build_config
+        from app.database import AsyncSessionLocal
+        from app.models import Project
+
+        async with AsyncSessionLocal() as refresh_session:
+            project = await refresh_session.get(Project, project_id)
+            if project is None:
+                return False
+            return await maybe_refresh_empty_build_config(
+                project,
+                refresh_session,
+                ref=landed_ref,
+            )
+    except Exception as e:
+        logger.warning(
+            "[CI] Failed isolated build_config refresh after integration landing "
+            "for project %s on %s: %s",
+            project_id,
+            landed_ref,
+            e,
+            exc_info=True,
+        )
+        return False
+
 
 async def _attempt_merge_with_retry_and_escalation(
     task: Task,
@@ -444,28 +473,22 @@ async def _attempt_merge_with_retry_and_escalation(
                                 )
                         _orig_session.add(orig)
                         await _orig_session.commit()
-                        # Once a bootstrapped repo gains a project structure on
-                        # its integration branch, refresh an empty build_config
-                        # so verification commands exist without a manual step.
-                        # Best-effort + idempotent (cheap in-memory guard).
-                        if (
-                            record_pr_merged
-                            and orig_project is not None
-                            and ci_base == _integration_branch
-                        ):
-                            from app.build_config_detection import (
-                                maybe_refresh_empty_build_config,
-                            )
-
-                            await maybe_refresh_empty_build_config(
-                                orig_project,
-                                _orig_session,
-                                ref=_integration_branch,
-                            )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
                 )
+        # Once a bootstrapped repo gains a project structure on its landed
+        # integration branch, refresh an empty build_config so verification
+        # commands exist without a manual step. Keep this isolated from the
+        # merge-task session because the helper swallows failures via rollback.
+        if (
+            _merge_project is not None
+            and ci_base == get_project_integration_branch(_merge_project)
+        ):
+            await _refresh_empty_build_config_after_integration_landing(
+                _merge_project.id,
+                ci_base,
+            )
         logger.info(f"[CI] PR #{ci_pr_number} merged ({source})")
         return True
 

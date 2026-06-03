@@ -663,3 +663,57 @@ async def test_explicit_pr_number_filters_associated_prs(mocker):
     assert result["ci_passed"] is True
     assert result["state"] == "green"
     assert result["head_sha_resolved"] == target_sha
+
+
+# requires_ci_checks PERSISTENCE — the field must survive the validated write
+# path (BuildConfig(**...).model_dump(exclude_none=True)) and the operator-
+# override carry-forward used by manual re-detect / empty-config auto-refresh.
+# These exercise the actual persistence layer, not a hand-built reader dict.
+
+
+def test_build_config_schema_persists_requires_ci_checks_false():
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    persisted = BuildConfigSchema(
+        **{"requires_ci_checks": False}
+    ).model_dump(exclude_none=True)
+    # exclude_none must NOT strip an explicit False (False is not None).
+    assert persisted["requires_ci_checks"] is False
+
+
+def test_build_config_schema_defaults_requires_ci_checks_true():
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    persisted = BuildConfigSchema().model_dump(exclude_none=True)
+    # Default True preserves CI-gated behavior for existing projects.
+    assert persisted["requires_ci_checks"] is True
+
+
+def test_override_merge_preserves_existing_requires_ci_checks_false():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    # Repo detection never emits requires_ci_checks; a stored False must carry
+    # forward onto freshly-detected config so re-detect does not re-gate the repo.
+    detected = {"language": "python", "directories": []}
+    merged = apply_operator_build_config_overrides(
+        detected, {"requires_ci_checks": False}
+    )
+    assert merged["requires_ci_checks"] is False
+
+
+def test_override_merge_absent_requires_ci_checks_leaves_detected_unchanged():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    detected = {"language": "python"}
+    merged = apply_operator_build_config_overrides(detected, {"other": 1})
+    assert "requires_ci_checks" not in merged
+
+
+def test_override_merge_preserves_existing_requires_ci_checks_true():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    detected = {"language": "python"}
+    merged = apply_operator_build_config_overrides(
+        detected, {"requires_ci_checks": True}
+    )
+    assert merged["requires_ci_checks"] is True

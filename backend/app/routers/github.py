@@ -692,6 +692,33 @@ async def github_webhook(
             # No EVALUATING tasks match — check if this is a protected-branch CI failure
             conclusion = check_run.get("conclusion")
             head_branch = (check_run.get("check_suite") or {}).get("head_branch")
+            if (
+                conclusion == "success"
+                and head_branch
+                and head_branch == get_project_integration_branch(project)
+            ):
+                # Direct pushes / non-PR landings on the integration branch can
+                # still turn an initially empty repo into a real app. Refresh
+                # the empty build_config best-effort and keep the webhook
+                # response non-blocking even if refresh/logging fails.
+                from app.payload_schemas import _validate_branch_name  # noqa: PLC0415
+
+                try:
+                    _validate_branch_name(head_branch)
+                except Exception:
+                    logger.warning(
+                        f"[WEBHOOK] Rejecting invalid head_branch for refresh: {head_branch!r}"
+                    )
+                else:
+                    from app.build_config_detection import (
+                        maybe_refresh_empty_build_config,
+                    )
+
+                    await maybe_refresh_empty_build_config(
+                        project,
+                        session,
+                        ref=head_branch,
+                    )
             if conclusion == "failure" and head_branch:
                 # Validate branch name from webhook before passing downstream
                 from app.payload_schemas import _validate_branch_name  # noqa: PLC0415

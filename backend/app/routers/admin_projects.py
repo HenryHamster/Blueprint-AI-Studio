@@ -384,6 +384,7 @@ async def update_project(
                 "stale_branch_prefixes",
                 "protected_branches",
                 "enable_self_improvement",
+                "requires_ci_checks",
             ):
                 if _field not in incoming and _field in existing_bc:
                     incoming[_field] = existing_bc[_field]
@@ -519,7 +520,6 @@ async def detect_project_build_config(
     from app.github import get_repo_installation_token
     from app.routers.admin_onboard import _detect_build_config
     from app.schemas import BuildConfig as BuildConfigSchema
-
     token = await get_repo_installation_token(project.github_owner, project.github_repo)
     if not token:
         raise HTTPException(
@@ -528,7 +528,13 @@ async def detect_project_build_config(
         )
 
     detected = await _detect_build_config(
-        token, project.github_owner, project.github_repo
+        token,
+        project.github_owner,
+        project.github_repo,
+        # Preserve the legacy default-branch behavior for projects that still
+        # have a NULL integration_branch column: omitting ref lets GitHub read
+        # the repo's actual default branch instead of forcing synthetic "main".
+        ref=project.integration_branch,
     )
 
     detected = apply_operator_build_config_overrides(

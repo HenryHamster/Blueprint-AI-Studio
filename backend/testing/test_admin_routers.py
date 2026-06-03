@@ -1083,6 +1083,7 @@ class TestUpdateProjectOwnerOnlyFields:
             "task_branch_namespace": "agents",
             "task_branch_prefix": "bot/",
             "pr_title_prefix": "[bot] ",
+            "requires_ci_checks": False,
         }
         db_session.add(project)
         await db_session.commit()
@@ -1113,8 +1114,11 @@ class TestUpdateProjectOwnerOnlyFields:
         assert build_config.get("task_branch_namespace") == "agents"
         assert build_config.get("task_branch_prefix") == "bot/"
         assert build_config.get("pr_title_prefix") == "[bot] "
+        # Operator's no-CI choice must survive re-detect (validated persistence).
+        assert build_config.get("requires_ci_checks") is False
 
         await db_session.refresh(project)
+        assert (project.build_config or {}).get("requires_ci_checks") is False
         assert (project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
             "secret"
         )
@@ -1124,6 +1128,70 @@ class TestUpdateProjectOwnerOnlyFields:
         assert (project.build_config or {}).get("task_branch_namespace") == "agents"
         assert (project.build_config or {}).get("task_branch_prefix") == "bot/"
         assert (project.build_config or {}).get("pr_title_prefix") == "[bot] "
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_uses_project_integration_branch(
+        self, client: AsyncClient, db_session
+    ):
+        """Owner re-detect reads GitHub contents from the project's trunk branch."""
+        project = await _make_project(db_session, name="Detect Branch Aware")
+        project.github_owner = "acme"
+        project.github_repo = "branch-aware-repo"
+        project.integration_branch = "develop"
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/detect-build-config"
+            )
+
+        assert resp.status_code == 200
+        mock_detect.assert_awaited_once()
+        assert mock_detect.await_args.kwargs.get("ref") == "develop"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_omits_ref_when_integration_branch_unset(
+        self, client: AsyncClient, db_session
+    ):
+        """Legacy NULL-branch projects should still detect from the repo default branch."""
+        project = await _make_project(db_session, name="Detect Default Branch Aware")
+        project.github_owner = "acme"
+        project.github_repo = "default-branch-repo"
+        project.integration_branch = None
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/detect-build-config"
+            )
+
+        assert resp.status_code == 200
+        mock_detect.assert_awaited_once()
+        assert mock_detect.await_args.kwargs.get("ref") is None
 
     @pytest.mark.asyncio
     async def test_detect_build_config_refreshes_repo_is_empty(
@@ -1188,6 +1256,7 @@ class TestApplyOperatorBuildConfigOverrides:
             "stale_branch_prefixes": ["old/"],
             "protected_branches": ["main"],
             "enable_self_improvement": True,
+            "requires_ci_checks": False,
         }
 
         merged = apply_operator_build_config_overrides(detected, existing)
@@ -1208,6 +1277,30 @@ class TestApplyOperatorBuildConfigOverrides:
         assert merged["stale_branch_prefixes"] == ["old/"]
         assert merged["protected_branches"] == ["main"]
         assert merged["enable_self_improvement"] is True
+        assert merged["requires_ci_checks"] is False
+
+    def test_preserves_requires_ci_checks_present_key_only(self):
+        """requires_ci_checks is key-present-preserved (an explicit False
+        survives), and is left absent when the operator never set it — repo
+        detection never emits this field."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        # Explicit False carried forward even though detection omits it.
+        assert (
+            apply_operator_build_config_overrides(
+                {"language": "python"}, {"requires_ci_checks": False}
+            )["requires_ci_checks"]
+            is False
+        )
+        # Absent in existing → stays absent (defaults to True at read time).
+        assert (
+            "requires_ci_checks"
+            not in apply_operator_build_config_overrides(
+                {"language": "python"}, {"other": 1}
+            )
+        )
 
     def test_preserves_empty_list_branch_overrides(self):
         """Empty-list branch overrides are present-keyed, so they survive."""
@@ -1371,6 +1464,69 @@ class TestBuildConfigLintWarnings:
         assert isinstance(warnings, list)
         assert len(warnings) == 1
         assert "./a" in warnings[0]
+
+
+class TestPatchBuildConfigRequiresCiChecks:
+    """PATCH /projects/{id} must persist the no-CI choice and preserve it on
+    subsequent partial patches that omit the field."""
+
+    @pytest.mark.asyncio
+    async def test_patch_persists_requires_ci_checks_false(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-no-ci")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"requires_ci_checks": False}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["build_config"].get("requires_ci_checks") is False
+
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("requires_ci_checks") is False
+
+    @pytest.mark.asyncio
+    async def test_patch_omitting_requires_ci_checks_preserves_stored_false(
+        self, client: AsyncClient, db_session
+    ):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="patch-no-ci-preserve")
+        project.build_config = {"requires_ci_checks": False}
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        # A later PATCH that does not mention requires_ci_checks must not re-gate.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"language": "python"}},
+        )
+        assert resp.status_code == 200, resp.text
+        body_bc = resp.json()["build_config"]
+        assert body_bc.get("language") == "python"
+        assert body_bc.get("requires_ci_checks") is False
+
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("requires_ci_checks") is False
+
+    @pytest.mark.asyncio
+    async def test_patch_explicit_false_overrides_stored_true(
+        self, client: AsyncClient, db_session
+    ):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="patch-no-ci-override")
+        project.build_config = {"requires_ci_checks": True}
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"requires_ci_checks": False}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["build_config"].get("requires_ci_checks") is False
 
 
 class TestDeleteProject:

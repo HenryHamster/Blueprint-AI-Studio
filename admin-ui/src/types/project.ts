@@ -42,6 +42,10 @@ export interface BuildConfig {
   task_branch_prefix?: string;
   pr_title_prefix?: string;
   staging_branch_prefixes?: string[] | null;
+  /** Whether the repository has required CI checks. Default/undefined means CI-gated
+   *  (the merge gate waits for required checks). False means the repo has no required
+   *  CI checks and a definitive absence of checks is treated as "CI not applicable". */
+  requires_ci_checks?: boolean;
 }
 
 export interface StagingBranchPrefixesConfig {

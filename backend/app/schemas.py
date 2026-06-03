@@ -310,6 +310,15 @@ class BuildConfig(BaseModel):
     stale_branch_prefixes: List[str] | None = None
     protected_branches: List[str] | None = None
     enable_self_improvement: bool = False
+    # Whether this project's PRs must wait for required CI status checks before
+    # merging. Default True preserves CI-gated behavior (like Blueprint's own
+    # repo) for every existing project. An operator can declare
+    # ``requires_ci_checks = False`` for a greenfield/no-CI repository so a
+    # *definitive* absence of checks is treated as 'CI not applicable' instead
+    # of being polled until the merge backstop FAILs the task. This must survive
+    # validation on every write path (onboard, PATCH, re-detect, auto-refresh)
+    # — the merge gate reads it via ``ci_resolution.requires_ci_checks``.
+    requires_ci_checks: bool = True
     # Deterministic empty/near-empty repo signal, computed at onboarding from
     # the already-fetched root + first-level subdirectory listings during
     # build-config detection (see ``admin_onboard._classify_repo_emptiness``).

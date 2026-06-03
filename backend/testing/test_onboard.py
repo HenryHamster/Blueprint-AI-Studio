@@ -158,6 +158,37 @@ class TestOnboardAutoRemediation:
         assert get_project_promotion_target(project) == "master"
 
     @pytest.mark.asyncio
+    async def test_onboard_detects_build_config_from_default_branch(
+        self, client: AsyncClient
+    ):
+        """Build-config detection is pinned to the resolved default branch."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="trunk",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "branch-aware"},
+            )
+
+        assert resp.status_code == 200
+        mock_detect.assert_awaited_once()
+        assert mock_detect.await_args.kwargs.get("ref") == "trunk"
+
+    @pytest.mark.asyncio
     async def test_onboard_main_default_branch_sets_integration_branch(
         self, client: AsyncClient, db_session
     ):
@@ -455,6 +486,47 @@ class TestOnboardBranchConfig:
             "schema_revision_file": "",
             "schema_revision_const": "SCHEMA_REV",
         }
+
+    @pytest.mark.asyncio
+    async def test_onboard_build_config_override_requires_ci_checks_false_persists(
+        self, client: AsyncClient, db_session
+    ):
+        """An operator declaring a no-CI repo at onboarding persists requires_ci_checks=False.
+
+        This exercises the validated persistence path (model_dump(exclude_none=True));
+        an explicit False must NOT be stripped the way an undeclared field would be.
+        """
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "no-ci-repo",
+                    "build_config_override": {"requires_ci_checks": False},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        bc = project.build_config or {}
+        assert bc.get("requires_ci_checks") is False
 
 
 class TestBuildConfigMigrationSchema:
@@ -1194,6 +1266,112 @@ class TestBuildConfigDetection:
 
         assert mock_req.call_count == 1
         assert mock_req.call_args.kwargs.get("params") is None
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_scans_second_level_python_and_node_dirs(self):
+        """Second-level monorepo layouts like apps/web and services/api are detected."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [
+            {"name": "apps", "type": "dir"},
+            {"name": "services", "type": "dir"},
+        ]
+
+        apps_resp = MagicMock()
+        apps_resp.status_code = 200
+        apps_resp.json.return_value = [{"name": "web", "type": "dir"}]
+
+        services_resp = MagicMock()
+        services_resp.status_code = 200
+        services_resp.json.return_value = [{"name": "api", "type": "dir"}]
+
+        web_resp = MagicMock()
+        web_resp.status_code = 200
+        web_resp.json.return_value = [{"name": "package.json", "type": "file"}] + [
+            {"name": f"file{i}.ts", "type": "file"} for i in range(5)
+        ]
+
+        api_resp = MagicMock()
+        api_resp.status_code = 200
+        api_resp.json.return_value = [{"name": "pyproject.toml", "type": "file"}] + [
+            {"name": f"file{i}.py", "type": "file"} for i in range(4)
+        ]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, apps_resp, services_resp, web_resp, api_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "mixed"
+        assert config["repo_is_empty"] is False
+        directories = {item["path"]: item for item in config["directories"]}
+        assert directories["apps/web/"]["type"] == "node"
+        assert directories["apps/web/"]["install_cmd"] == "npm ci"
+        assert directories["apps/web/"]["build_cmd"] == "npm run build"
+        assert directories["apps/web/"]["test_cmd"] == "npm test"
+        assert directories["apps/web/"]["lint_cmd"] == "npx eslint ."
+        assert directories["services/api/"]["type"] == "python"
+        assert directories["services/api/"]["lint_cmd"] == "ruff check"
+        assert directories["services/api/"]["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_keeps_mixed_root_manifests_at_same_path(self):
+        """A root directory with both Python and Node manifests keeps both entries."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [
+            {"name": "pyproject.toml", "type": "file"},
+            {"name": "package.json", "type": "file"},
+            {"name": "app.py", "type": "file"},
+            {"name": "index.ts", "type": "file"},
+        ]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "mixed"
+        directories = [
+            item for item in config["directories"] if item["path"] == "./"
+        ]
+        assert len(directories) == 2
+        directories_by_type = {item["type"]: item for item in directories}
+        assert directories_by_type["python"]["lint_cmd"] == "ruff check"
+        assert directories_by_type["python"]["test_cmd"] == "python3 -m pytest"
+        assert directories_by_type["node"]["install_cmd"] == "npm ci"
+        assert directories_by_type["node"]["build_cmd"] == "npm run build"
+        assert directories_by_type["node"]["test_cmd"] == "npm test"
+        assert "lint_cmd" not in directories_by_type["node"]
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_not_empty_when_nested_fetch_fails(self):
+        """A failed second-level fetch must not yield repo_is_empty=True."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [{"name": "apps", "type": "dir"}]
+
+        apps_resp = MagicMock()
+        apps_resp.status_code = 200
+        apps_resp.json.return_value = [{"name": "web", "type": "dir"}]
+
+        web_resp = MagicMock()
+        web_resp.status_code = 502
+        web_resp.json.return_value = {}
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, apps_resp, web_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+        assert config["repo_is_empty"] is False
 
     @pytest.mark.asyncio
     async def test_detect_build_config_sets_repo_is_empty_for_readme_only(self):
