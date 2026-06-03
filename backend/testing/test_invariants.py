@@ -999,6 +999,173 @@ class TestPreMergeDualHeadGuardCoverage:
         )
 
 
+# ── Merge-primitive enumeration lock (complementary to call-site coverage) ────
+
+
+class TestMergePrimitiveLock:
+    """Complementary invariant: lock the set of merge primitives themselves.
+
+    The TestPreMergeDualHeadGuardCoverage test locks every CALL SITE so a
+    missing guard cannot slip through unnoticed. But that test's scan depends
+    on a hand-maintained set of merge function names (_MERGE_NAMES). If the
+    set itself drifts — e.g. a new merge helper is added but not registered,
+    or the raw GitHub merge endpoint is called directly from somewhere else —
+    the coverage scan treats those sites as non-merge and misses them completely.
+
+    This test closes the complementary hole by enforcing:
+      1. Every function in github_pulls.py that actually issues a GitHub merge
+         (REST PUT /pulls/{n}/merge or GraphQL enablePullRequestAutoMerge) must
+         be in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES.
+      2. The raw GitHub merge endpoint / GraphQL auto-merge mutation may be
+         issued ONLY from inside github_pulls.py (the helper layer).
+         No other backend/app file may call these endpoints directly.
+
+    Today both conditions already hold: github_pulls.py defines exactly
+    merge_pull_request and enable_auto_merge, both already registered, and
+    nothing else calls the endpoints. This invariant purely ratchets that
+    clean state and prevents future regressions.
+    """
+
+    # Patterns that identify a call to the GitHub merge REST endpoint. These
+    # match the concrete merge-endpoint URL path (.../pulls/{n}/merge) ONLY —
+    # deliberately NOT loose prose like "merge endpoint", which appears in
+    # docstrings of non-merging helpers (e.g. get_pull_request_merge_state
+    # documents the merge endpoint's 405 behaviour but only issues a GET).
+    _MERGE_REST_PATTERNS = [
+        re.compile(r"/pulls/[^\"']*/merge"),
+    ]
+
+    # Patterns that identify a call to the GraphQL auto-merge mutation. Match
+    # the concrete mutation name only, not prose mentioning "GraphQL" + "merge".
+    _MERGE_GRAPHQL_PATTERNS = [
+        re.compile(r"enablePullRequestAutoMerge"),
+    ]
+
+    def test_all_merge_issuing_functions_are_registered(self):
+        """Every function in github_pulls.py that calls the GitHub merge endpoint
+        or GraphQL mutation must be in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES.
+
+        If this fails, a new merge primitive was added to github_pulls.py but not
+        registered in the coverage scan's _MERGE_NAMES set. Register it so that
+        all call sites to the new primitive receive guard-coverage checking.
+        """
+        import ast
+
+        gh_pulls_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "app", "github_pulls.py")
+        )
+        with open(gh_pulls_path, encoding="utf-8") as f:
+            source = f.read()
+        tree = ast.parse(source, filename=gh_pulls_path)
+
+        # Find all function definitions in the module.
+        funcs = {
+            n.name: n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        # Get the canonical set of registered merge functions from the
+        # guard-coverage test.
+        registered_merge_names = TestPreMergeDualHeadGuardCoverage._MERGE_NAMES
+
+        # Identify which functions actually call the GitHub merge endpoint or
+        # GraphQL mutation by scanning their source text.
+        unregistered_merge_issuers = []
+        for func_name, func_node in funcs.items():
+            # Extract the source text of this function. ast.get_source_segment
+            # uses line/column spans to slice the exact function body; a naive
+            # source[col_offset:end_col_offset] would mix column offsets (which
+            # are per-line, not whole-file byte indices) and slice garbage.
+            func_source = ast.get_source_segment(source, func_node) or ""
+
+            # Check if it issues a merge: a PUT to the REST merge endpoint or an
+            # invocation of the GraphQL auto-merge mutation. Both pattern sets
+            # match concrete code signals only, so docstring prose mentioning
+            # "merge" does not produce false positives.
+            is_merge_issuer = any(
+                pattern.search(func_source)
+                for pattern in (*self._MERGE_REST_PATTERNS, *self._MERGE_GRAPHQL_PATTERNS)
+            )
+
+            if is_merge_issuer and func_name not in registered_merge_names:
+                unregistered_merge_issuers.append(func_name)
+
+        assert not unregistered_merge_issuers, (
+            f"Functions in github_pulls.py that issue GitHub merges but are NOT "
+            f"registered in TestPreMergeDualHeadGuardCoverage._MERGE_NAMES: "
+            f"{', '.join(sorted(unregistered_merge_issuers))}.\n"
+            f"Add each function name to _MERGE_NAMES so that all its call sites "
+            f"receive guard-coverage checking. Without registration, call sites "
+            f"escape the coverage scan and can slip through unguarded."
+        )
+
+    def test_no_raw_merge_endpoint_calls_outside_helper_layer(self):
+        """The raw GitHub merge endpoint and GraphQL mutation may be issued ONLY
+        from inside the github_pulls.py helper layer. No other backend/app file
+        may call /pulls/.../merge or enablePullRequestAutoMerge directly.
+
+        If this fails, a file outside the helper layer is calling the merge
+        endpoint directly instead of going through the registered primitives
+        (merge_pull_request / enable_auto_merge). This bypasses both the
+        guard-coverage scan and the dual-head guard checks themselves.
+
+        Fix by calling the appropriate primitive from github_pulls.py instead of
+        issuing the endpoint directly.
+        """
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+
+        # Only github_pulls.py may issue the raw merge endpoint.
+        # github.py re-exports merge_pull_request (the primitive), not the raw endpoint.
+        # task_lifecycle_github_helpers.py defines _merge_with_retry wrapper (also OK).
+        exempt_files = {
+            "github_pulls.py",
+        }
+
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                if fname in exempt_files:
+                    continue
+
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                rel = os.path.relpath(fpath, app_dir)
+
+                # Check for direct calls to the GitHub merge REST endpoint.
+                # Look for patterns like: "PUT .../pulls/{...}/merge"
+                for lineno, line in enumerate(lines, start=1):
+                    if line.lstrip().startswith("#") or "# noqa" in line:
+                        continue
+                    # Signature: PUT /repos/{owner}/{repo}/pulls/{pr_number}/merge
+                    # Look for string literals and f-strings containing the endpoint.
+                    if re.search(r'["\'].*pulls.*merge["\']|f["\'].*pulls.*merge', line) and "api.github.com" in line:
+                        offenders.append(
+                            f"  {rel}:{lineno}: raw /pulls/.../merge endpoint call: {line.rstrip()}"
+                        )
+                    # Check for the enablePullRequestAutoMerge GraphQL mutation call.
+                    # This appears as a string literal containing the mutation name.
+                    if "enablePullRequestAutoMerge" in line and ("mutation" in line or "graphql" in line.lower()):
+                        offenders.append(
+                            f"  {rel}:{lineno}: raw GraphQL enablePullRequestAutoMerge call: {line.rstrip()}"
+                        )
+
+        assert not offenders, (
+            "Found backend/app file(s) that call the raw GitHub merge endpoint or "
+            "GraphQL mutation directly (bypassing the helper layer and guard coverage):\n"
+            + "\n".join(offenders)
+            + "\n\nAll PR merges must go through the registered primitives "
+            "(merge_pull_request / enable_auto_merge from github_pulls.py). "
+            "Calling the endpoint directly bypasses guard coverage and can slip "
+            "through unguarded.\n"
+            "Fix by importing and calling the appropriate primitive instead."
+        )
+
+
 # ── Operator message arming gate coverage (whole-package) ─────────────────
 
 
