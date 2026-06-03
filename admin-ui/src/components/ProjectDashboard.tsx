@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, FolderKanban, GitBranch, Compass, UserPlus, Plus, Settings, MoreVertical, Trash2, AlertTriangle, RotateCcw, Pause, Play, Archive, ArchiveRestore } from 'lucide-react';
 import type { Task } from './TaskCard';
-import { parseTimestamp } from '../utils/time';
+import { formatAbsolute, parseTimestamp } from '../utils/time';
 import { projectStatusBadge } from '../utils/projectStatus';
 import { ProjectApprovalGateSection } from './ProjectApprovalGateSection';
 import { fetchApprovalGateConfig, updateApprovalGateConfig, deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects, type ApprovalGateConfigResponse } from '../api';
@@ -59,9 +59,18 @@ function getTaskCounts(tasks: Task[], projectId: string) {
   };
 }
 
+function humanizeMergeGateReason(reason: string): string {
+  return reason.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 function getMergeGateBadge(project: Project) {
   const verdict = project.merge_verification_verdict ?? { state: 'ci_checks' as const, test_commands: [] };
   const buildConfig = project.build_config ?? null;
+  const runtime = project.merge_gate_runtime ?? null;
+  const lastVerifiedAt = runtime?.executed_real_tests && runtime.last_run_at ? parseTimestamp(runtime.last_run_at) : null;
+  const lastUnverifiedAt = runtime?.last_unverified_at ? parseTimestamp(runtime.last_unverified_at) : null;
+  const lastUnverifiedReason = runtime?.last_unverified_reason ? humanizeMergeGateReason(runtime.last_unverified_reason) : null;
+  const runtimeMismatch = verdict.state === 'tests_gated' && Boolean(lastUnverifiedAt && (!lastVerifiedAt || lastUnverifiedAt.getTime() > lastVerifiedAt.getTime()));
 
   if (
     verdict.state === 'ci_checks' &&
@@ -76,10 +85,20 @@ function getMergeGateBadge(project: Project) {
   }
 
   if (verdict.state === 'tests_gated') {
+    if (runtimeMismatch) {
+      return {
+        label: 'Tests gated?',
+        classes: 'bg-amber-500/15 text-amber-300 border-amber-500/30',
+        title: `Config says tests-gated, but the last live merge fell back to UNVERIFIED${lastUnverifiedAt ? ` at ${formatAbsolute(lastUnverifiedAt.getTime())}` : ''}${lastUnverifiedReason ? ` because ${lastUnverifiedReason}.` : '.'}${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+        runtimeState: 'unverified-fallback',
+      };
+    }
+
     return {
       label: 'Tests gated',
       classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/20',
-      title: "Blueprint will run the project's detected test command(s) before merging PRs.",
+      title: `Blueprint will run the project's detected test command(s) before merging PRs.${lastVerifiedAt ? ` Last verified real-test run: ${formatAbsolute(lastVerifiedAt.getTime())}.` : ''}`,
+      runtimeState: lastVerifiedAt ? 'verified' : (runtime ? 'unknown' : 'absent'),
     };
   }
 
@@ -87,7 +106,8 @@ function getMergeGateBadge(project: Project) {
     return {
       label: 'UNVERIFIED',
       classes: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30',
-      title: 'No test command was detected. PRs merge without verification.',
+      title: `No test command was detected. PRs merge without verification.${lastUnverifiedAt ? ` Last live merge fell back to UNVERIFIED at ${formatAbsolute(lastUnverifiedAt.getTime())}.${lastUnverifiedReason ? ` Reason: ${lastUnverifiedReason}.` : ''}` : ''}`,
+      runtimeState: lastUnverifiedAt ? 'unverified' : (runtime ? 'unknown' : 'absent'),
     };
   }
 
@@ -95,6 +115,7 @@ function getMergeGateBadge(project: Project) {
     label: 'CI gated',
     classes: 'bg-blue-500/15 text-blue-300 border-blue-500/20',
     title: "Blueprint will wait for the repository's GitHub CI checks before merging PRs.",
+    runtimeState: runtime ? 'unknown' : 'absent',
   };
 }
 
@@ -415,9 +436,10 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                     {(() => {
                       const badge = getMergeGateBadge(project);
                       return (
-                        <span
+                          <span
                           className={`flex items-center gap-0.5 text-[9px] font-bold rounded px-1 py-0.5 border ${badge.classes}`}
                           title={badge.title}
+                          data-runtime-state={badge.runtimeState}
                         >
                           {badge.label}
                         </span>

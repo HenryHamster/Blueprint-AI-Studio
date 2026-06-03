@@ -410,6 +410,120 @@ class TestOnboardIssueImplementation:
 
 class TestOnboardBranchConfig:
     @pytest.mark.asyncio
+    async def test_onboard_preview_only_returns_detected_config_without_persisting(
+        self, client: AsyncClient, db_session
+    ):
+        """preview_only=true returns onboarding detection data but creates no project row."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [
+                        {
+                            "path": "backend/",
+                            "type": "python",
+                            "test_cmd": "pytest",
+                        }
+                    ],
+                },
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "preview-only-repo",
+                    "preview_only": True,
+                    "build_config_override": {"requires_ci_checks": False},
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["default_branch"] == "main"
+        assert data["build_config"]["requires_ci_checks"] is False
+        assert data["merge_verification_verdict"]["state"] == "tests_gated"
+        from sqlalchemy import select
+        from app.models import Project as ProjectModel
+
+        result = await db_session.execute(
+            select(ProjectModel).where(
+                ProjectModel.github_owner == "acme",
+                ProjectModel.github_repo == "preview-only-repo",
+            )
+        )
+        assert result.scalars().first() is None
+
+    @pytest.mark.asyncio
+    async def test_onboard_persists_edited_merge_gate_settings(
+        self, client: AsyncClient, db_session
+    ):
+        """Final onboarding stores the edited no-CI merge-gate settings on the project."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [
+                        {
+                            "path": "backend/",
+                            "type": "python",
+                            "test_cmd": "",
+                        }
+                    ],
+                },
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "edited-merge-gate-repo",
+                    "build_config_override": {
+                        "requires_ci_checks": False,
+                        "directories": [
+                            {
+                                "path": "backend/",
+                                "type": "python",
+                                "test_cmd": "python3 -m pytest",
+                            }
+                        ],
+                    },
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        bc = project.build_config or {}
+        assert bc.get("requires_ci_checks") is False
+        assert bc["directories"][0]["test_cmd"] == "python3 -m pytest"
+        assert data["merge_verification_verdict"]["state"] == "tests_gated"
+
+    @pytest.mark.asyncio
     async def test_onboard_build_config_override_branch_keys_survive_validation(
         self, client: AsyncClient, db_session
     ):

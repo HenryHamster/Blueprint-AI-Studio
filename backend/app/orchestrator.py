@@ -5505,6 +5505,35 @@ async def orchestrator_worker():
                             flag_modified(ci_task, "context")
                             session.add(ci_task)
 
+                        # Persist a Project-level record of what the no-CI merge
+                        # gate ACTUALLY did this poll so an operator can tell a
+                        # config that claims tests are gated from one whose live
+                        # path fell open to an UNVERIFIED merge. Only the no-CI
+                        # gate outcomes record here (verify gate ran, or an
+                        # immediate-pass set an unverified reason); normal
+                        # green/red CI leaves both flags falsy and is skipped.
+                        # executed_real_tests is True only when verify_tests
+                        # produced a real pass/fail verdict. Best-effort: the
+                        # helper never raises, so it cannot break the merge path.
+                        if _no_ci_verify_gate or _unverified_merge_reason:
+                            from app import ci_resolution
+
+                            _rt_proj = (
+                                await session.get(Project, ci_task.project_id)
+                                if ci_task.project_id
+                                else None
+                            )
+                            ci_resolution.record_no_ci_gate_runtime(
+                                session,
+                                _rt_proj,
+                                executed_real_tests=(
+                                    ci_loop.get("verify_tests_verdict")
+                                    in ("pass", "fail")
+                                ),
+                                unverified_reason=_unverified_merge_reason,
+                                when=_utcnow(),
+                            )
+
                         logger.info(
                             f"[CI] Poll fallback: CI completed for PR #{ci_pr_number}, processing"
                         )

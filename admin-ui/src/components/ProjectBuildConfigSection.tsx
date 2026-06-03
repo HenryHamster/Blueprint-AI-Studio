@@ -6,7 +6,7 @@ function isRecognizedLintCmd(cmd: string): boolean {
   const base = cmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
   return /^(ruff|eslint|mypy|flake8|pyright)\b/.test(base);
 }
-import type { BuildConfig, BuildConfigDirectory, MergeVerificationVerdict } from '../types/project';
+import type { BuildConfig, BuildConfigDirectory, MergeGateRuntime, MergeVerificationVerdict } from '../types/project';
 import { apiFetch } from '../api';
 import { SR_CANONICAL_CATEGORIES } from './SrRetrospectiveShared';
 import { MergeVerificationBanner } from './MergeVerificationBanner';
@@ -27,6 +27,8 @@ interface ProjectBuildConfigSectionProps {
    * needs no extra app-state wiring. Pass `null` to explicitly suppress.
    */
   mergeVerificationVerdict?: MergeVerificationVerdict | null;
+  /** Optional live no-CI gate runtime evidence. When omitted, the component derives it from the project list. */
+  mergeGateRuntime?: MergeGateRuntime | null;
 }
 
 const EMPTY_DIR: BuildConfigDirectory = {
@@ -51,6 +53,7 @@ export function ProjectBuildConfigSection({
   detectAvailable,
   projectId,
   mergeVerificationVerdict,
+  mergeGateRuntime,
 }: ProjectBuildConfigSectionProps) {
   const hasConfig = buildConfig && (
     (buildConfig.directories?.length ?? 0) > 0 ||
@@ -97,7 +100,9 @@ export function ProjectBuildConfigSection({
   // Verdict derived from the project list when the parent doesn't pass one
   // explicitly. The prop, when supplied (incl. null), takes precedence.
   const [fetchedVerdict, setFetchedVerdict] = useState<MergeVerificationVerdict | null>(null);
+  const [fetchedRuntime, setFetchedRuntime] = useState<MergeGateRuntime | null>(null);
   const effectiveVerdict = mergeVerificationVerdict !== undefined ? mergeVerificationVerdict : fetchedVerdict;
+  const effectiveRuntime = mergeGateRuntime !== undefined ? mergeGateRuntime : fetchedRuntime;
   const preservedBranchOnDetect = useRef<{ namespace: string; prefix: string; prTitlePrefix: string } | null>(null);
 
   // Sync state when buildConfig prop changes (e.g. after detect or project switch)
@@ -145,15 +150,17 @@ export function ProjectBuildConfigSection({
   // buildConfig changes (after detect/save) so the banner reflects persisted state.
   // apiFetch dedups this concurrent GET with the SR-targets fetch above.
   useEffect(() => {
-    if (mergeVerificationVerdict !== undefined) return; // controlled by prop
-    if (!projectId) { setFetchedVerdict(null); return; }
+    if (!projectId) { setFetchedVerdict(null); setFetchedRuntime(null); return; }
     let cancelled = false;
     apiFetch('/api/admin/projects')
       .then(r => r.json())
-      .then((resp: { items?: { id: string; merge_verification_verdict?: MergeVerificationVerdict }[] }) => {
+      .then((resp: { items?: { id: string; merge_verification_verdict?: MergeVerificationVerdict; merge_gate_runtime?: MergeGateRuntime }[] }) => {
         if (cancelled) return;
         const p = (resp.items ?? []).find(p => p.id === projectId);
-        setFetchedVerdict(p?.merge_verification_verdict ?? null);
+        setFetchedRuntime(p?.merge_gate_runtime ?? null);
+        if (mergeVerificationVerdict === undefined) {
+          setFetchedVerdict(p?.merge_verification_verdict ?? null);
+        }
       })
       .catch(() => {});
     return () => { cancelled = true; };
@@ -543,7 +550,7 @@ export function ProjectBuildConfigSection({
             </div>
           </label>
           {/* Backend-computed verdict for what the merge gate will actually do. */}
-          <MergeVerificationBanner verdict={effectiveVerdict} />
+          <MergeVerificationBanner verdict={effectiveVerdict} runtime={effectiveRuntime} />
 
           {/* CI-presence pre-flight: detection + guidance only (never auto-flips the toggle). */}
           {buildConfig?.has_ci === true && (

@@ -37,6 +37,7 @@ or merges before its verdict lands — fails this flow.
 import base64
 import json
 import uuid
+from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -46,6 +47,8 @@ from app.ci_completion import handle_ci_completion
 from app.ci_resolution import (
     build_no_ci_gate_ci_result,
     classify_merge_test_verdict,
+    merge_gate_runtime_block,
+    record_no_ci_gate_runtime,
     should_run_no_ci_test_gate,
 )
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
@@ -183,6 +186,31 @@ def _patch_github(mocker):
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
 
 
+# Fixed timestamp so the persisted runtime record is deterministic — the
+# orchestrator passes ``when=_utcnow()`` here.
+_RUNTIME_WHEN = datetime(2026, 6, 3, 12, 0, 0)
+
+
+async def _record_gate_runtime(
+    db_session, project, *, outcome: str, unverified_reason: str | None
+):
+    """Mirror the orchestrator's terminal-outcome recording call.
+
+    ``executed_real_tests`` is True only when verify_tests produced a real
+    pass/fail verdict — exactly the orchestrator's
+    ``ci_loop['verify_tests_verdict'] in ('pass', 'fail')`` condition.
+    """
+    record_no_ci_gate_runtime(
+        db_session,
+        project,
+        executed_real_tests=outcome in ("pass", "fail"),
+        unverified_reason=unverified_reason,
+        when=_RUNTIME_WHEN,
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+
 async def _unverified_merge_alerts(db_session, project_id):
     return (
         (
@@ -295,6 +323,18 @@ async def test_no_ci_failing_suite_blocks_merge_and_spawns_fix_with_output(
     assert parent.status == TaskStatus.COMPLETED
     assert parent.context["review_loop"]["ci_fix_spawned"] == str(fix.id)
 
+    # Runtime readiness: a real suite ran to a FAIL verdict, so the gate records
+    # executed_real_tests=True and does NOT stamp the UNVERIFIED fields.
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=None
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["executed_real_tests"] is True
+    assert runtime["last_run_at"] == _RUNTIME_WHEN.isoformat()
+    assert "last_unverified_at" not in runtime
+    assert "last_unverified_reason" not in runtime
+
 
 # ---------------------------------------------------------------------------
 # 2. Passing suite proceeds to merge
@@ -365,6 +405,18 @@ async def test_no_ci_passing_suite_proceeds_to_merge(db_session, mocker):
     assert (
         await _unverified_merge_alerts(db_session, project.id) == []
     ), "a verified (passing) merge must not raise an UNVERIFIED-merge alert"
+
+    # Runtime readiness: a real suite ran to a PASS verdict → executed_real_tests
+    # True and the UNVERIFIED fields are NOT stamped.
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason=None
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["executed_real_tests"] is True
+    assert runtime["last_run_at"] == _RUNTIME_WHEN.isoformat()
+    assert "last_unverified_at" not in runtime
+    assert "last_unverified_reason" not in runtime
 
 
 # The orchestrator's terminal guard: a verify_tests task is classified only once
@@ -569,6 +621,17 @@ async def test_no_ci_failed_verify_task_without_artifact_merges_unverified_and_a
     assert f"PR #{PR_NUMBER}" in alerts[0].title
     assert "UNVERIFIED" in alerts[0].message
 
+    # Runtime readiness: the crash-fallback merged UNVERIFIED, so the gate did
+    # NOT run a real suite and stamps the runtime reason.
+    await _record_gate_runtime(
+        db_session, project, outcome=outcome, unverified_reason="undetected_runtime"
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_at"] == _RUNTIME_WHEN.isoformat()
+    assert runtime["last_unverified_reason"] == "undetected_runtime"
+
 
 @pytest.mark.asyncio
 async def test_no_ci_detected_undetected_verdict_does_not_retry(db_session, mocker):
@@ -642,6 +705,21 @@ async def test_no_ci_no_detectable_tests_falls_back_to_proceed_without_checks(
     merge_mock.assert_called_once()
     await db_session.refresh(parent)
     assert parent.status == TaskStatus.COMPLETED
+
+    # Runtime readiness: the immediate-pass merged UNVERIFIED with no detectable
+    # test command, so executed_real_tests stays False and the runtime reason is
+    # stamped using the SAME label the unverified-merge signal uses.
+    await _record_gate_runtime(
+        db_session,
+        project,
+        outcome=outcome,
+        unverified_reason="no_detectable_test_command",
+    )
+    runtime = merge_gate_runtime_block(project)
+    assert runtime is not None
+    assert runtime["executed_real_tests"] is False
+    assert runtime["last_unverified_at"] == _RUNTIME_WHEN.isoformat()
+    assert runtime["last_unverified_reason"] == "no_detectable_test_command"
 
 
 # ---------------------------------------------------------------------------
@@ -1054,3 +1132,74 @@ async def test_failing_verdict_raises_no_unverified_alert(db_session, mocker):
     assert (
         await _unverified_merge_alerts(db_session, project.id) == []
     ), "a blocked (failing) merge must not raise an UNVERIFIED-merge alert"
+
+
+# ---------------------------------------------------------------------------
+# 6. Runtime readiness record persistence + field-preservation semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_runtime_absent_until_first_gate_run(db_session):
+    """A freshly-onboarded project has no runtime record until the gate runs."""
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    assert project.merge_gate_runtime is None
+    assert merge_gate_runtime_block(project) is None
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_runtime_verified_run_preserves_prior_unverified(db_session):
+    """A later verified (real-suite) run updates last_run_at/executed_real_tests
+    but PRESERVES the most recent UNVERIFIED fall-open fields.
+
+    The orchestrator records at every terminal gate outcome. An UNVERIFIED merge
+    stamps last_unverified_*; a subsequent run where a real suite passed must
+    flip executed_real_tests to True WITHOUT clearing the historical
+    last_unverified_* — they remain true of the most recent fall-open.
+    """
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+
+    # First: an UNVERIFIED fall-open stamps the unverified fields.
+    await _record_gate_runtime(
+        db_session,
+        project,
+        outcome="undetected",
+        unverified_reason="no_detectable_test_command",
+    )
+    first = merge_gate_runtime_block(project)
+    assert first["executed_real_tests"] is False
+    assert first["last_unverified_reason"] == "no_detectable_test_command"
+
+    # Then: a real suite runs and passes — executed_real_tests flips True, but
+    # the prior last_unverified_* are preserved (not cleared).
+    later_when = datetime(2026, 6, 4, 9, 30, 0)
+    record_no_ci_gate_runtime(
+        db_session,
+        project,
+        executed_real_tests=True,
+        unverified_reason=None,
+        when=later_when,
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    second = merge_gate_runtime_block(project)
+    assert second["executed_real_tests"] is True
+    assert second["last_run_at"] == later_when.isoformat()
+    # Preserved from the earlier UNVERIFIED run — NOT cleared by the verified run.
+    assert second["last_unverified_at"] == _RUNTIME_WHEN.isoformat()
+    assert second["last_unverified_reason"] == "no_detectable_test_command"
+
+
+@pytest.mark.asyncio
+async def test_record_no_ci_gate_runtime_is_best_effort_on_none_project(db_session):
+    """The recorder never raises on a None project — the merge path is protected
+    even if the project lookup somehow returned nothing."""
+    # Must not raise.
+    record_no_ci_gate_runtime(
+        db_session,
+        None,
+        executed_real_tests=True,
+        unverified_reason=None,
+        when=_RUNTIME_WHEN,
+    )

@@ -202,6 +202,59 @@ describe('ProjectDashboard', () => {
     expect(screen.getByText('Stall risk')).toBeInTheDocument();
   });
 
+  it('keeps the tests-gated badge green when no runtime block is present', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          id: 'proj-tests',
+          name: 'Tests Project',
+          merge_verification_verdict: {
+            state: 'tests_gated',
+            test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByText('Tests gated');
+    expect(badge).toHaveAttribute('data-runtime-state', 'absent');
+    expect(badge).toHaveAttribute('title', expect.stringContaining("Blueprint will run the project's detected test command(s) before merging PRs."));
+  });
+
+  it('shows a warning badge when the live gate last fell back to UNVERIFIED', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({
+          id: 'proj-tests',
+          name: 'Tests Project',
+          merge_verification_verdict: {
+            state: 'tests_gated',
+            test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+          },
+          merge_gate_runtime: {
+            last_run_at: '2026-04-24T11:00:00Z',
+            executed_real_tests: true,
+            last_unverified_at: '2026-04-24T11:30:00Z',
+            last_unverified_reason: 'no_test_command_detected',
+          },
+        })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByText('Tests gated?');
+    expect(badge).toHaveAttribute('data-runtime-state', 'unverified-fallback');
+    expect(badge).toHaveAttribute('title', expect.stringContaining('UNVERIFIED'));
+    expect(badge).toHaveAttribute('title', expect.stringContaining('no test command detected'));
+  });
+
   it('counts paused projects from the paused flag in the summary strip', () => {
     localStorage.setItem('projectDashboardCollapsed', 'false');
     render(

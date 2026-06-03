@@ -12,6 +12,7 @@ import logging
 import re
 from collections import deque
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Dict, Any
 from urllib.parse import quote
 
@@ -690,26 +691,6 @@ async def onboard_project(
        possible, or the raw detected dict if validation fails.
     """
 
-    # Create project record
-    project_name = payload.name or f"{payload.github_owner}/{payload.github_repo}"
-    project = Project(
-        name=project_name,
-        user_id=current_user["user_id"],
-        status=ProjectStatus.DEPLOYING,
-        github_owner=payload.github_owner,
-        github_repo=payload.github_repo,
-    )
-    session.add(project)
-    await session.flush()  # Get project.id before membership insert
-
-    # Create owner membership
-    member = ProjectMember(
-        project_id=project.id,
-        user_id=current_user["user_id"],
-        role="owner",
-    )
-    session.add(member)
-
     token = None
     from app.github import get_repo_default_branch, get_repo_installation_token
 
@@ -737,13 +718,6 @@ async def onboard_project(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Default branch detection failed: {e}",
         ) from e
-
-    if default_branch:
-        project.integration_branch = default_branch
-        project.promotion_target = default_branch
-
-    if payload.promotion_target:
-        project.promotion_target = payload.promotion_target
 
     # Auto-detect build config from the same branch Blueprint stores as trunk.
     build_config: Dict[str, Any] = {}
@@ -799,13 +773,51 @@ async def onboard_project(
         validated = (
             BuildConfigSchema(**build_config) if build_config else BuildConfigSchema()
         )
-        project.build_config = validated.model_dump(exclude_none=True)
+        build_config = validated.model_dump(exclude_none=True)
     except Exception as exc:  # noqa: BLE001
         # Detection + override produced invalid shape — store raw but log warning
         logger.warning(
             "[ONBOARD] build_config failed schema validation, storing raw: %s", exc
         )
-        project.build_config = build_config
+
+    response = {
+        "build_config": build_config,
+        "default_branch": default_branch,
+        "merge_verification_verdict": compute_merge_verification_verdict(
+            SimpleNamespace(build_config=build_config)
+        ),
+    }
+    if payload.preview_only:
+        return response
+
+    # Create project record only after the preview path has succeeded, so a
+    # preview-only request never touches the database.
+    project_name = payload.name or f"{payload.github_owner}/{payload.github_repo}"
+    project = Project(
+        name=project_name,
+        user_id=current_user["user_id"],
+        status=ProjectStatus.DEPLOYING,
+        github_owner=payload.github_owner,
+        github_repo=payload.github_repo,
+    )
+    session.add(project)
+    await session.flush()  # Get project.id before membership insert
+
+    # Create owner membership
+    member = ProjectMember(
+        project_id=project.id,
+        user_id=current_user["user_id"],
+        role="owner",
+    )
+    session.add(member)
+
+    project.integration_branch = default_branch
+    project.promotion_target = default_branch
+
+    if payload.promotion_target:
+        project.promotion_target = payload.promotion_target
+
+    project.build_config = build_config
     flag_modified(project, "build_config")
     session.add(project)
 
@@ -869,9 +881,7 @@ async def onboard_project(
     await session.commit()
     await session.refresh(project)
 
-    return {
-        "project_id": str(project.id),
-        "build_config": project.build_config or {},
-        "default_branch": default_branch,
-        "merge_verification_verdict": compute_merge_verification_verdict(project),
-    }
+    response["project_id"] = str(project.id)
+    response["build_config"] = project.build_config or build_config or {}
+    response["merge_verification_verdict"] = compute_merge_verification_verdict(project)
+    return response

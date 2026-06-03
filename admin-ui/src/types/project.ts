@@ -84,6 +84,13 @@ export interface MergeVerificationVerdict {
   test_commands: MergeVerificationTestCommand[];
 }
 
+export interface MergeGateRuntime {
+  last_run_at?: string | null;
+  executed_real_tests?: boolean;
+  last_unverified_at?: string | null;
+  last_unverified_reason?: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -108,6 +115,9 @@ export interface Project {
   /** Backend-computed merge-gate verdict (sibling of `build_config`). Present on
    *  the list and detail endpoints; optional/additive so older responses omit it. */
   merge_verification_verdict?: MergeVerificationVerdict;
+  /** Optional runtime evidence for the live no-CI merge gate. Omitted on older responses
+   *  and on brand-new projects that have never exercised the gate. */
+  merge_gate_runtime?: MergeGateRuntime;
   is_self_repo?: boolean;
   sr_catch_rate_targets?: Record<string, number>;
 }

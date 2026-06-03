@@ -162,6 +162,45 @@ describe('ProjectBuildConfigSection — viewport regression', () => {
     expect(banner?.textContent).toContain('backend/');
   });
 
+  test('tests_gated merge-verdict banner shows runtime fallback details without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectBuildConfigSection
+            githubOwner="myorg"
+            githubRepo="myrepo"
+            buildConfig={buildConfig}
+            onSave={vi.fn(async () => {})}
+            onDetect={vi.fn(async () => {})}
+            detectAvailable={true}
+            projectId="test-project"
+            mergeVerificationVerdict={{
+              state: 'tests_gated',
+              test_commands: [{ path: 'backend/', test_cmd: 'pytest' }],
+            }}
+            mergeGateRuntime={{
+              last_run_at: '2026-04-24T11:30:00Z',
+              executed_real_tests: true,
+              last_unverified_at: '2026-04-24T11:50:00Z',
+              last_unverified_reason: 'no_test_command_detected',
+            }}
+          />,
+        );
+      });
+    });
+
+    const banner = host!.querySelector('[data-testid="merge-verification-banner"]');
+    expect(banner?.getAttribute('data-verdict-state')).toBe('tests_gated');
+    expect(banner?.getAttribute('data-runtime-state')).toBe('unverified-fallback');
+    expect(banner?.textContent).toContain('Last live merge fell back to UNVERIFIED');
+    expect(banner?.textContent).toContain('Last verified real-test run');
+  });
+
   async function renderWith(config: BuildConfig): Promise<string | null> {
     const el = document.createElement('div');
     host = el;

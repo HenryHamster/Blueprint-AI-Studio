@@ -183,6 +183,91 @@ def compute_merge_verification_verdict(project) -> dict[str, Any]:
     return {"state": "unverified", "test_commands": []}
 
 
+def record_no_ci_gate_runtime(
+    db_session,
+    project,
+    *,
+    executed_real_tests: bool,
+    unverified_reason: str | None,
+    when,
+) -> None:
+    """Best-effort persist of the no-CI merge gate's LAST runtime outcome onto
+    ``project.merge_gate_runtime``.
+
+    Where :func:`compute_merge_verification_verdict` is a read-only advisory
+    derived purely from stored ``build_config``, this captures what the gate
+    ACTUALLY did the last time it ran a PR through to a terminal outcome — so an
+    operator can distinguish a config that *claims* tests are gated from one
+    whose live no-CI path fell open to an UNVERIFIED merge.
+
+    Always records ``last_run_at`` (ISO) and ``executed_real_tests``
+    (True ONLY when verify-tests produced a real pass/fail verdict — i.e. a
+    suite actually ran to a verdict). When the gate fell open to UNVERIFIED
+    (``unverified_reason`` is set), additionally stamps ``last_unverified_at``
+    and ``last_unverified_reason``. A verified run does NOT clear those
+    ``last_unverified_*`` fields — they preserve the most recent fall-open,
+    which remains historically true.
+
+    Best-effort by contract: it mutates the in-memory ``project`` and stages it
+    on ``db_session`` (the caller's commit persists it) but NEVER raises — a
+    failure here must not block or break the merge hot path.
+    """
+    try:
+        if project is None:
+            return
+        when_iso = when.isoformat() if hasattr(when, "isoformat") else str(when)
+        runtime: dict[str, Any] = dict(
+            getattr(project, "merge_gate_runtime", None) or {}
+        )
+        runtime["last_run_at"] = when_iso
+        runtime["executed_real_tests"] = bool(executed_real_tests)
+        if unverified_reason:
+            runtime["last_unverified_at"] = when_iso
+            runtime["last_unverified_reason"] = str(unverified_reason)
+        project.merge_gate_runtime = runtime
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(project, "merge_gate_runtime")
+        except Exception:  # noqa: BLE001
+            # flag_modified is a no-op safety net for the JSONB nested-dict
+            # write; a detached/plain object (e.g. a unit-test stub) simply
+            # skips it. Never let this break the merge path.
+            pass
+        if db_session is not None:
+            db_session.add(project)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[CI_RESOLUTION] failed to record no-CI gate runtime readiness",
+            exc_info=True,
+        )
+
+
+def merge_gate_runtime_block(project) -> dict[str, Any] | None:
+    """Normalize ``project.merge_gate_runtime`` into the stable API block, or
+    ``None`` when the gate has never run for this project.
+
+    Returns a JSON-serializable dict with the four operator-facing keys
+    (``last_run_at``, ``executed_real_tests``, ``last_unverified_at``,
+    ``last_unverified_reason``).  ``last_unverified_*`` are omitted when the gate
+    has never fallen open to an UNVERIFIED merge.  Defensive against a missing /
+    malformed column so it can be attached to every project API response without
+    raising.
+    """
+    raw = getattr(project, "merge_gate_runtime", None)
+    if not isinstance(raw, dict) or not raw:
+        return None
+    block: dict[str, Any] = {
+        "last_run_at": raw.get("last_run_at"),
+        "executed_real_tests": bool(raw.get("executed_real_tests", False)),
+    }
+    if raw.get("last_unverified_at") is not None:
+        block["last_unverified_at"] = raw.get("last_unverified_at")
+    if raw.get("last_unverified_reason") is not None:
+        block["last_unverified_reason"] = raw.get("last_unverified_reason")
+    return block
+
+
 def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: bool) -> bool:
     """Whether a definitive ``no_checks`` PR should be gated on a ``verify_tests``
     verdict (run the repo's detected suite on the PR head) instead of taking the

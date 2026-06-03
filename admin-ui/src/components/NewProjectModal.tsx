@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag, AlertTriangle } from 'lucide-react';
-import { onboardProject, authGet, apiFetch, API_BASE_URL } from '../api';
-import type { BuildConfig, AutoRemediationConfig, MergeVerificationVerdict } from '../types/project';
+import { onboardProject, previewOnboardProject, authGet, apiFetch, API_BASE_URL } from '../api';
+import type { BuildConfig, BuildConfigDirectory, AutoRemediationConfig, MergeVerificationVerdict } from '../types/project';
 import type { ProblemModelPatch } from '../types';
 import { MergeVerificationBanner } from './MergeVerificationBanner';
 
@@ -74,6 +74,42 @@ function buildInitialSteeringPayload(
   return Object.keys(payload).length > 0 ? payload : undefined;
 }
 
+function cloneBuildConfig(config: BuildConfig | null): BuildConfig | null {
+  if (!config) return null;
+  return {
+    ...config,
+    directories: (config.directories ?? []).map((directory) => ({ ...directory })),
+    env_vars: config.env_vars ? { ...config.env_vars } : {},
+  };
+}
+
+function newBuildConfigDirectory(): BuildConfigDirectory {
+  return {
+    path: '',
+    type: 'other',
+    lint_cmd: '',
+    build_cmd: '',
+    test_cmd: '',
+    install_cmd: '',
+  };
+}
+
+function deriveMergeVerificationVerdict(config: BuildConfig | null): MergeVerificationVerdict | null {
+  if (!config) return null;
+  if (config.requires_ci_checks !== false) {
+    return { state: 'ci_checks', test_commands: [] };
+  }
+  const testCommands = (config.directories ?? [])
+    .map((directory) => {
+      const testCmd = directory.test_cmd?.trim() ?? '';
+      return testCmd ? { path: directory.path ?? '', test_cmd: testCmd } : null;
+    })
+    .filter((entry): entry is { path: string; test_cmd: string } => entry !== null);
+  return testCommands.length > 0
+    ? { state: 'tests_gated', test_commands: testCommands }
+    : { state: 'unverified', test_commands: [] };
+}
+
 const STEP_LABELS: Record<string, string> = { repo: 'Repository', config: 'Confirm', success: 'Created' };
 
 export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProjectModalProps) {
@@ -92,6 +128,9 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const [createdProjectId, setCreatedProjectId] = useState(setupProject?.id ?? '');
   const [detectedConfig, setDetectedConfig] = useState<BuildConfig | null>(null);
   const [detectedVerdict, setDetectedVerdict] = useState<MergeVerificationVerdict | null>(null);
+  const [buildConfigDraft, setBuildConfigDraft] = useState<BuildConfig | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState('');
 
   // Repo picker state
   const [detectedDefaultBranch, setDetectedDefaultBranch] = useState('');
@@ -166,17 +205,56 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
   const parsed = parseRepoInput(repoInput);
 
-  const handleRepoNext = () => {
+  const previewVerdict = deriveMergeVerificationVerdict(buildConfigDraft);
+  const effectiveVerdict = previewVerdict ?? detectedVerdict;
+  const effectiveDefaultBranch = detectedDefaultBranch || previewDefaultBranch;
+
+  const handleRepoNext = async () => {
     if (!parsed) {
       setRepoError('Enter a valid GitHub repo as "owner/repo" or a full GitHub URL.');
       return;
     }
     setRepoError('');
+    setPreviewError('');
+    setBuildConfigDraft(null);
+    setDetectedConfig(null);
+    setDetectedVerdict(null);
+    setPreviewLoading(true);
     setStep('config');
+    try {
+      const initialSteering = buildInitialSteeringPayload({
+        projectType,
+        users,
+        team,
+        deployCadence,
+        notes,
+        constraints,
+      });
+      const data = await previewOnboardProject(
+        parsed.owner,
+        parsed.repo,
+        projectName.trim() || undefined,
+        undefined,
+        promotionTargetInput.trim() || undefined,
+        goal.trim() || undefined,
+        initialSteering,
+      );
+      setBuildConfigDraft(cloneBuildConfig(data.build_config));
+      setDetectedConfig(cloneBuildConfig(data.build_config));
+      setDetectedVerdict(data.merge_verification_verdict ?? null);
+      setDetectedDefaultBranch(data.default_branch ?? previewDefaultBranch);
+      setPreviewDefaultBranch(data.default_branch ?? previewDefaultBranch);
+    } catch (e) {
+      setBuildConfigDraft(null);
+      setDetectedVerdict(null);
+      setPreviewError(e instanceof Error ? e.message : 'Unable to preview build config');
+    } finally {
+      setPreviewLoading(false);
+    }
   };
 
   const handleCreate = async () => {
-    if (!parsed) return;
+    if (!parsed || !buildConfigDraft) return;
     setStep('submitting');
     setSubmitError('');
     try {
@@ -194,7 +272,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
         parsed.owner,
         parsed.repo,
         projectName.trim() || undefined,
-        undefined,
+        buildConfigDraft,
         effectivePromotionTarget,
         trimmedGoal || undefined,
         initialSteering,
@@ -286,6 +364,33 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   };
   const removeConstraint = (idx: number) => {
     setConstraints((prev) => (prev.length <= 1 ? [''] : prev.filter((_, i) => i !== idx)));
+  };
+  const updateBuildConfigDraft = (updater: (current: BuildConfig) => BuildConfig) => {
+    setBuildConfigDraft((current) => (current ? updater(current) : current));
+  };
+  const updateDraftDirectory = (
+    index: number,
+    field: keyof BuildConfigDirectory,
+    value: string,
+  ) => {
+    updateBuildConfigDraft((current) => ({
+      ...current,
+      directories: (current.directories ?? []).map((directory, dirIndex) => (
+        dirIndex === index ? { ...directory, [field]: value } : directory
+      )),
+    }));
+  };
+  const addDraftDirectory = () => {
+    updateBuildConfigDraft((current) => ({
+      ...current,
+      directories: [...(current.directories ?? []).map((directory) => ({ ...directory })), newBuildConfigDirectory()],
+    }));
+  };
+  const removeDraftDirectory = (index: number) => {
+    updateBuildConfigDraft((current) => ({
+      ...current,
+      directories: (current.directories ?? []).filter((_, dirIndex) => dirIndex !== index),
+    }));
   };
 
   return (
@@ -404,7 +509,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                       autoFocus
                       value={repoInput}
                       onChange={e => { setRepoInput(e.target.value); setRepoError(''); }}
-                      onKeyDown={e => e.key === 'Enter' && handleRepoNext()}
+                      onKeyDown={e => e.key === 'Enter' && void handleRepoNext()}
                       placeholder="owner/repo or https://github.com/owner/repo"
                       className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${
                         repoError ? 'border-red-500' : 'border-neutral-800'
@@ -573,7 +678,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 </button>
                 <button
                   type="button"
-                  onClick={handleRepoNext}
+                  onClick={() => { void handleRepoNext(); }}
                   disabled={!repoInput.trim()}
                   className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 >
@@ -598,7 +703,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 )}
               </div>
 
-              {previewDefaultBranch && (
+              {effectiveDefaultBranch && (
                 <div className="mb-4">
                   <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
                     Branch Configuration
@@ -606,7 +711,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   <div className="space-y-2">
                     <div className="flex items-center gap-2 text-[10px]">
                       <span className="text-neutral-500 w-28 shrink-0">Integration</span>
-                      <span className="font-mono text-neutral-300">{previewDefaultBranch}</span>
+                      <span className="font-mono text-neutral-300">{effectiveDefaultBranch}</span>
                       <span className="text-neutral-600">(auto-detected)</span>
                     </div>
                     <div className="flex items-start gap-2">
@@ -616,7 +721,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                           type="text"
                           value={promotionTargetInput}
                           onChange={e => setPromotionTargetInput(e.target.value)}
-                          placeholder={`${previewDefaultBranch} (same as integration)`}
+                          placeholder={`${effectiveDefaultBranch} (same as integration)`}
                           className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[10px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
                         />
                         <p className="text-[9px] text-neutral-600 mt-1">
@@ -628,11 +733,152 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                 </div>
               )}
 
-              <p className="text-xs text-neutral-400 mb-4 leading-relaxed">
-                Build configuration will be auto-detected from the repository's root files
-                (package.json, pyproject.toml, go.mod, Cargo.toml, etc.). You can adjust it
-                after creation in project settings.
-              </p>
+              {previewLoading ? (
+                <div className="mb-4 flex items-center gap-2 py-3 text-neutral-500 text-xs">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Detecting build config…
+                </div>
+              ) : previewError ? (
+                <div className="mb-4 p-3 bg-amber-950/40 border border-amber-900/50 rounded-lg text-xs text-amber-300">
+                  {previewError}
+                </div>
+              ) : null}
+
+              {buildConfigDraft && (
+                <div className="mb-4 p-3 bg-neutral-950 rounded-lg border border-neutral-800">
+                  <div className="flex items-center justify-between gap-2 mb-3">
+                    <div>
+                      <div className="text-[11px] font-semibold text-neutral-300 uppercase tracking-wider">
+                        Merge-gate draft
+                      </div>
+                      <div className="text-[10px] text-neutral-500 mt-1">
+                        Edit the detected config before creating the project.
+                      </div>
+                    </div>
+                    <label className="inline-flex items-center gap-2 text-[10px] text-neutral-400">
+                      <input
+                        type="checkbox"
+                        checked={buildConfigDraft.requires_ci_checks !== false}
+                        onChange={e => updateBuildConfigDraft((current) => ({
+                          ...current,
+                          requires_ci_checks: e.target.checked,
+                        }))}
+                        className="h-4 w-4 rounded border-neutral-700 bg-neutral-900 text-white"
+                      />
+                      Require CI checks
+                    </label>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div className="text-[10px] text-neutral-500">
+                      {buildConfigDraft.has_ci === false ? 'No CI detected. Turn off required CI checks or add a real test command.' : 'Detected build config can be adjusted here before creation.'}
+                    </div>
+
+                    {(buildConfigDraft.directories ?? []).length > 0 ? (
+                      <div className="space-y-3">
+                        {(buildConfigDraft.directories ?? []).map((directory, index) => (
+                          <div key={index} className="rounded border border-neutral-800 bg-neutral-900/70 p-3">
+                            <div className="mb-2 flex items-center justify-between gap-2">
+                              <div className="text-[10px] font-mono text-neutral-400">
+                                Directory {index + 1}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => removeDraftDirectory(index)}
+                                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center rounded border border-neutral-800 px-2 text-[10px] text-neutral-500 hover:text-rose-400 hover:bg-neutral-800/60 transition-colors"
+                                aria-label={`Remove directory ${index + 1}`}
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                              <label className="block">
+                                <span className="block text-[10px] text-neutral-500 mb-1">Path</span>
+                                <input
+                                  type="text"
+                                  value={directory.path ?? ''}
+                                  onChange={e => updateDraftDirectory(index, 'path', e.target.value)}
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                />
+                              </label>
+                              <label className="block">
+                                <span className="block text-[10px] text-neutral-500 mb-1">Type</span>
+                                <select
+                                  value={directory.type ?? 'other'}
+                                  onChange={e => updateDraftDirectory(index, 'type', e.target.value)}
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                >
+                                  <option value="python">python</option>
+                                  <option value="node">node</option>
+                                  <option value="go">go</option>
+                                  <option value="rust">rust</option>
+                                  <option value="other">other</option>
+                                </select>
+                              </label>
+                              <label className="block sm:col-span-2">
+                                <span className="block text-[10px] text-neutral-500 mb-1">Test command</span>
+                                <input
+                                  type="text"
+                                  value={directory.test_cmd ?? ''}
+                                  onChange={e => updateDraftDirectory(index, 'test_cmd', e.target.value)}
+                                  placeholder="Leave blank to keep the merge gate unverified"
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                />
+                              </label>
+                              <label className="block">
+                                <span className="block text-[10px] text-neutral-500 mb-1">Lint command</span>
+                                <input
+                                  type="text"
+                                  value={directory.lint_cmd ?? ''}
+                                  onChange={e => updateDraftDirectory(index, 'lint_cmd', e.target.value)}
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                />
+                              </label>
+                              <label className="block">
+                                <span className="block text-[10px] text-neutral-500 mb-1">Build command</span>
+                                <input
+                                  type="text"
+                                  value={directory.build_cmd ?? ''}
+                                  onChange={e => updateDraftDirectory(index, 'build_cmd', e.target.value)}
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                />
+                              </label>
+                              <label className="block sm:col-span-2">
+                                <span className="block text-[10px] text-neutral-500 mb-1">Install command</span>
+                                <input
+                                  type="text"
+                                  value={directory.install_cmd ?? ''}
+                                  onChange={e => updateDraftDirectory(index, 'install_cmd', e.target.value)}
+                                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                                />
+                              </label>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-[10px] text-neutral-500">
+                        No directories detected yet. Add one below if you want the no-CI gate to run tests.
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={addDraftDirectory}
+                      className="min-h-[44px] inline-flex items-center gap-1 px-2 py-1 text-xs text-neutral-400 hover:text-neutral-100 transition-colors"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add directory
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {effectiveVerdict && (
+                <div className="mb-4">
+                  <MergeVerificationBanner verdict={effectiveVerdict} />
+                </div>
+              )}
 
               {submitError && (
                 <div className="mb-4 p-3 bg-red-950/50 border border-red-900/50 rounded-lg text-xs text-red-400">
@@ -661,7 +907,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   <button
                     type="button"
                     onClick={handleCreate}
-                    disabled={step === 'submitting'}
+                    disabled={step === 'submitting' || previewLoading || !buildConfigDraft}
                     className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
                   >
                     {step === 'submitting' && (

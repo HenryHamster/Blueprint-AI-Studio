@@ -55,6 +55,25 @@ vi.mock('../api', () => ({
       { status: 200 },
     );
   }),
+  previewOnboardProject: vi.fn(async () => ({
+    build_config: {
+      language: 'typescript',
+      has_ci: false,
+      requires_ci_checks: true,
+      directories: [
+        {
+          path: '.',
+          type: 'node',
+          install_cmd: 'npm install',
+          build_cmd: 'npm run build',
+          test_cmd: '',
+          lint_cmd: 'npm run lint',
+        },
+      ],
+    },
+    default_branch: 'main',
+    merge_verification_verdict: { state: 'ci_checks', test_commands: [] },
+  })),
   onboardProject: vi.fn(async () => ({
     project_id: 'project-12345',
     build_config: {
@@ -90,6 +109,7 @@ async function driveToSuccess(host: HTMLElement): Promise<void> {
   await act(async () => { if (repoBtn) await user.click(repoBtn); });
   const continueBtn = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.trim() === 'Continue');
   await act(async () => { if (continueBtn) await user.click(continueBtn); });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 120)); });
   const createBtn = Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes('Create Project'));
   // handleCreate awaits onboardProject + feature-config fetches before settling.
   await act(async () => {

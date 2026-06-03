@@ -34,7 +34,10 @@ from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app.build_config_lint import build_config_lint_warnings
-from app.ci_resolution import compute_merge_verification_verdict
+from app.ci_resolution import (
+    compute_merge_verification_verdict,
+    merge_gate_runtime_block,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -90,6 +93,7 @@ async def get_all_projects(
             Project.paused,
             Project.archived,
             Project.build_config,
+            Project.merge_gate_runtime,
             Project.sr_catch_rate_targets,
             Project.running_update_acknowledged_at,
             func.coalesce(func.jsonb_array_length(Project.directions), 0).label(
@@ -128,6 +132,7 @@ async def get_all_projects(
                 ),
                 "build_config_warnings": build_config_lint_warnings(row.build_config),
                 "merge_verification_verdict": compute_merge_verification_verdict(row),
+                "merge_gate_runtime": merge_gate_runtime_block(row),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
                 "running_update_acknowledged_at": (
                     row.running_update_acknowledged_at.isoformat()
@@ -186,6 +191,7 @@ async def get_project(
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
         "merge_verification_verdict": compute_merge_verification_verdict(project),
+        "merge_gate_runtime": merge_gate_runtime_block(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
         "is_self_repo": project.is_self_repo,
@@ -493,6 +499,7 @@ async def update_project(
     response = project.model_dump()
     response["build_config_warnings"] = build_config_lint_warnings(project.build_config)
     response["merge_verification_verdict"] = compute_merge_verification_verdict(project)
+    response["merge_gate_runtime"] = merge_gate_runtime_block(project)
     return response
 
 
@@ -559,6 +566,7 @@ async def detect_project_build_config(
         "build_config": project.build_config or {},
         "build_config_warnings": build_config_lint_warnings(project.build_config),
         "merge_verification_verdict": compute_merge_verification_verdict(project),
+        "merge_gate_runtime": merge_gate_runtime_block(project),
     }
 
 

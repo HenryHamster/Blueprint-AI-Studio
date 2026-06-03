@@ -358,6 +358,21 @@ class Project(SQLModel, table=True):
     remediation_tracking: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Runtime-backed readiness of the no-CI merge gate. Unlike the read-only
+    # ``compute_merge_verification_verdict`` advisory (derived purely from stored
+    # ``build_config``), this records what the gate ACTUALLY did the last time it
+    # ran on a PR — so an operator can tell a config that *claims* tests are gated
+    # from one where the live no-CI path fell open to an UNVERIFIED merge.
+    # Written best-effort by ``ci_resolution.record_no_ci_gate_runtime`` at every
+    # terminal gate outcome. Shape:
+    #   {"last_run_at": iso, "executed_real_tests": bool,
+    #    "last_unverified_at": iso | absent,
+    #    "last_unverified_reason": str | absent}
+    # Nullable/additive: existing rows and create_all test DBs read it as None,
+    # and a fresh migration (separate task) adds the column to live DBs.
+    merge_gate_runtime: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Regression-class trip markers used to persist first-tripped timestamps
     # across dispatcher ticks when a signal has no durable historical record.
     regression_signal_state: Dict[str, Any] = Field(

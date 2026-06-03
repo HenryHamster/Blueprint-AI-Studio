@@ -2,7 +2,7 @@ import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
-import type { MergeVerificationVerdict } from './types/project';
+import type { BuildConfig, MergeGateRuntime, MergeVerificationVerdict } from './types/project';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -725,16 +725,18 @@ export async function onboardProject(
   owner: string,
   repo: string,
   name?: string,
-  buildConfigOverride?: Record<string, unknown>,
+  buildConfigOverride?: Record<string, unknown> | BuildConfig,
   promotionTarget?: string,
   goal?: string,
   initialSteering?: Pick<ProblemModelPatch, 'context' | 'constraints'>,
 ): Promise<{
   project_id: string;
-  build_config: Record<string, unknown>;
+  build_config: BuildConfig;
   default_branch?: string;
   /** Backend-computed merge-gate verdict for the freshly-onboarded repo (sibling of build_config). */
   merge_verification_verdict?: MergeVerificationVerdict;
+  /** Optional live no-CI gate runtime evidence, present when onboarding response already carries it. */
+  merge_gate_runtime?: MergeGateRuntime;
 }> {
   const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
   if (name) body.name = name;
@@ -753,6 +755,20 @@ export async function onboardProject(
 
     if (Object.keys(steering).length > 0) body.initial_steering = steering;
   }
+  return submitOnboardProject(body);
+}
+
+export interface OnboardPreviewResponse {
+  build_config: BuildConfig;
+  default_branch?: string;
+  merge_verification_verdict?: MergeVerificationVerdict;
+}
+
+export interface OnboardCreateResponse extends OnboardPreviewResponse {
+  project_id: string;
+}
+
+async function submitOnboardProject(body: Record<string, unknown>): Promise<OnboardCreateResponse> {
   const res = await apiFetch('/api/admin/projects/onboard', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -760,6 +776,35 @@ export async function onboardProject(
     throw new Error(msg);
   }
   return res.json();
+}
+
+export async function previewOnboardProject(
+  owner: string,
+  repo: string,
+  name?: string,
+  buildConfigOverride?: Record<string, unknown> | BuildConfig,
+  promotionTarget?: string,
+  goal?: string,
+  initialSteering?: Pick<ProblemModelPatch, 'context' | 'constraints'>,
+): Promise<OnboardPreviewResponse> {
+  const body: Record<string, unknown> = { github_owner: owner, github_repo: repo, preview_only: true };
+  if (name) body.name = name;
+  if (buildConfigOverride) body.build_config_override = buildConfigOverride;
+  if (promotionTarget) body.promotion_target = promotionTarget;
+  if (goal) body.goal = goal;
+  if (initialSteering) {
+    const steering: Record<string, unknown> = {};
+    const contextEntries = Object.entries(initialSteering.context ?? {})
+      .map(([key, value]) => [key, typeof value === 'string' ? value.trim() : ''] as const)
+      .filter(([, value]) => value.length > 0);
+    if (contextEntries.length > 0) steering.context = Object.fromEntries(contextEntries);
+
+    const constraints = initialSteering.constraints?.map((constraint) => constraint.trim()).filter((constraint) => constraint.length > 0);
+    if (constraints && constraints.length > 0) steering.constraints = constraints;
+
+    if (Object.keys(steering).length > 0) body.initial_steering = steering;
+  }
+  return submitOnboardProject(body);
 }
 
 export interface EfficiencyHistoryPoint {
