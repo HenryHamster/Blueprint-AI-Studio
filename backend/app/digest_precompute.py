@@ -48,10 +48,12 @@ agent fleet).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Dict, Hashable, List, Tuple
 
 logger = logging.getLogger(__name__)
@@ -173,13 +175,155 @@ class DigestPrecomputeCache:
         self._entries.clear()
 
 
-# Module-level singleton — the live precompute store for this instance.
+# Module-level singletons — the live precompute stores for THIS instance.
+# Separate stores per payload kind keep their (window, project_id) key spaces
+# from colliding: digest is keyed by ``hours``, health by ``lookback_hours``.
 _PRECOMPUTE_CACHE = DigestPrecomputeCache()
+_HEALTH_PRECOMPUTE_CACHE = DigestPrecomputeCache()
 
 
 def get_precompute_cache() -> DigestPrecomputeCache:
-    """Accessor for the module-level precompute cache (tests can clear it)."""
+    """Accessor for the module-level digest precompute cache (tests can clear it)."""
     return _PRECOMPUTE_CACHE
+
+
+def get_health_precompute_cache() -> DigestPrecomputeCache:
+    """Accessor for the module-level health-overview precompute cache."""
+    return _HEALTH_PRECOMPUTE_CACHE
+
+
+# ---------------------------------------------------------------------------
+# L2: cross-instance shared cache (Postgres ``digestcache`` table)
+# ---------------------------------------------------------------------------
+# The L1 caches above are per-instance and only the LEADER's background tick
+# fills them, so non-leader instances (and any instance right after a deploy,
+# when L1 is cold) would otherwise fall straight through to the heavy on-demand
+# compute. The shared table lets the leader's precomputed payload be read by
+# every instance with one primary-key SELECT. ALL L2 access is best-effort /
+# fail-open: a cache-table error degrades to the existing on-demand path and
+# never breaks the endpoint or the precompute tick.
+
+DIGEST_KIND = "digest"
+HEALTH_KIND = "health"
+
+
+def shared_cache_key(kind: str, window: int, project_id: uuid.UUID | None) -> str:
+    """Stable string key for an L2 row: ``"{kind}:{window}:{project|global}"``."""
+    return f"{kind}:{window}:{project_id if project_id else 'global'}"
+
+
+@dataclass
+class SharedEntry:
+    """A payload read back from the shared (L2) cache table."""
+
+    payload: Dict[str, Any]
+    computed_at: datetime
+
+
+async def read_shared(
+    cache_key: str,
+    *,
+    max_age_seconds: float,
+    session,
+) -> SharedEntry | None:
+    """Return the shared (L2) entry for ``cache_key`` if present and fresh.
+
+    Freshness is judged on the stored wall-clock ``computed_at`` — monotonic
+    clocks are not comparable across instances/processes, and Cloud Run instance
+    clocks are NTP-synced so skew is negligible against the multi-minute
+    ``max_age_seconds`` window. Only ``SOURCE_WORKER`` rows are served — the same
+    invariant the L1 read enforces via ``get_fresh(worker_only=True)``: only the
+    leader's continuously-refreshed worker writes are trustworthy for the long
+    window. Today every L2 row is worker-written, so this is structural
+    future-proofing against any non-worker writer. Returns ``None`` on miss,
+    staleness, non-worker source, or ANY error (fail-open: the caller then uses
+    its on-demand fallback).
+    """
+    try:
+        from app.models import DigestCacheEntry
+        from app.time_utils import _utcnow
+
+        row = await session.get(DigestCacheEntry, cache_key)
+        if row is None or row.computed_at is None:
+            return None
+        if row.source != SOURCE_WORKER:
+            return None
+        if (_utcnow() - row.computed_at).total_seconds() > max_age_seconds:
+            return None
+        return SharedEntry(payload=row.payload, computed_at=row.computed_at)
+    except Exception as exc:
+        logger.debug(
+            "[DIGEST_PRECOMPUTE] shared-cache read failed for %s: %s", cache_key, exc
+        )
+        # A failed SELECT aborts the current transaction; roll it back so the
+        # caller's on-demand fallback compute runs on a clean session instead of
+        # raising PendingRollbackError. The read path is invoked before any
+        # endpoint writes, so this discards nothing.
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return None
+
+
+async def write_shared(
+    cache_key: str,
+    payload: Dict[str, Any],
+    *,
+    computed_at: datetime,
+    session,
+) -> bool:
+    """UPSERT a precomputed payload into the shared (L2) table. Fail-open.
+
+    Uses ``session.merge`` (SELECT-then-INSERT/UPDATE by primary key) so it is
+    dialect-agnostic (Postgres in prod, SQLite in the test fixture). Commits on
+    success. Returns True on success; on any error the in-memory L1 write has
+    already succeeded, so a failed L2 write only costs cross-instance sharing for
+    one tick.
+    """
+    try:
+        from app.models import DigestCacheEntry
+
+        await session.merge(
+            DigestCacheEntry(
+                cache_key=cache_key,
+                payload=payload,
+                computed_at=computed_at,
+                source=SOURCE_WORKER,
+            )
+        )
+        await session.commit()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "[DIGEST_PRECOMPUTE] shared-cache write failed for %s: %s", cache_key, exc
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return False
+
+
+async def cleanup_stale_shared(session, *, older_than_seconds: float) -> int:
+    """Delete L2 rows whose ``computed_at`` is older than the cutoff. Fail-open.
+
+    Keys for no-longer-hot views (e.g. a project that went terminal) stop being
+    refreshed and would otherwise linger. The table is tiny, so this is a cheap
+    occasional sweep. Returns the number of rows deleted (0 on any error).
+    """
+    try:
+        from sqlalchemy import delete
+        from app.models import DigestCacheEntry
+        from app.time_utils import _utcnow
+
+        cutoff = _utcnow() - timedelta(seconds=older_than_seconds)
+        result = await session.execute(
+            delete(DigestCacheEntry).where(DigestCacheEntry.computed_at < cutoff)
+        )
+        await session.commit()
+        return result.rowcount or 0
+    except Exception as exc:
+        logger.debug("[DIGEST_PRECOMPUTE] shared-cache cleanup failed: %s", exc)
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        return 0
 
 
 def annotate_precompute_metadata(
@@ -266,6 +410,7 @@ async def _precompute_one(
     router only when a tick actually runs).
     """
     from app.routers.admin_digest import _compute_digest
+    from app.time_utils import _utcnow
 
     result = await _compute_digest(hours=hours, project_id=project_id, session=session)
     _PRECOMPUTE_CACHE.put(
@@ -275,6 +420,48 @@ async def _precompute_one(
         computed_wall_iso=result.get("generated_at") or "",
         source=SOURCE_WORKER,
     )
+    # L2: publish to the shared table so non-leader / cold-cache instances can
+    # serve this payload without re-running the heavy scan. Best-effort.
+    await write_shared(
+        shared_cache_key(DIGEST_KIND, hours, project_id),
+        result,
+        computed_at=_utcnow(),
+        session=session,
+    )
+
+
+async def _precompute_health_one(
+    session,
+    *,
+    lookback_hours: int,
+    project_id: uuid.UUID | None,
+) -> None:
+    """Compute one hot-key health-overview payload and store it in L1 + L2.
+
+    Health-overview previously had NO precompute (every request live-computed
+    the multi-thousand-row scan), which made it the single largest source of the
+    2026-06-03 ``statement_timeout`` 500 burst. Lazily imports the router to
+    avoid an import cycle (mirrors ``_precompute_one``).
+    """
+    from app.routers.admin_health import _compute_health_overview
+    from app.time_utils import _utcnow
+
+    result = await _compute_health_overview(
+        project_id=project_id, lookback_hours=lookback_hours, session=session
+    )
+    _HEALTH_PRECOMPUTE_CACHE.put(
+        lookback_hours,
+        project_id,
+        result,
+        computed_wall_iso=result.get("generated_at") or "",
+        source=SOURCE_WORKER,
+    )
+    await write_shared(
+        shared_cache_key(HEALTH_KIND, lookback_hours, project_id),
+        result,
+        computed_at=_utcnow(),
+        session=session,
+    )
 
 
 async def run_precompute_tick(session_factory) -> int:
@@ -282,23 +469,32 @@ async def run_precompute_tick(session_factory) -> int:
 
     Returns the number of keys successfully refreshed. Each key computes on a
     fresh session so one slow/failing key cannot poison the others' session.
-    Pure orchestration over ``_precompute_one`` — directly unit-testable with
-    a session-factory stub.
+    Pure orchestration over ``_precompute_one`` / ``_precompute_health_one`` —
+    directly unit-testable with a session-factory stub.
+
+    Priming order is budget-aware (the tick is wrapped in
+    ``PRECOMPUTE_TICK_BUDGET_SECONDS`` by the caller, and doubling the work to
+    cover health-overview risks exhausting it under load): the two GLOBAL views
+    (both kinds) go first because the no-project dashboard polls are the most-hit
+    keys, then per-project digest, then per-project health. Whatever the budget
+    truncates degrades to the bounded on-demand path (the prior behavior), never
+    an error. Each successfully-primed key also publishes to the shared L2 table
+    (best-effort) so non-leader / cold-cache instances can serve it without
+    re-running the heavy scan.
     """
     refreshed = 0
 
-    # Global (no project) view — always primed.
-    try:
-        async with session_factory() as session:
-            await _precompute_one(
-                session, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=None
-            )
-        refreshed += 1
-    except Exception as exc:
-        # One key's failure must not stop the rest of the tick.
-        logger.warning("[DIGEST_PRECOMPUTE] global digest tick failed: %s", exc)
+    async def _prime(label: str, coro_factory) -> None:
+        nonlocal refreshed
+        try:
+            async with session_factory() as session:
+                await coro_factory(session)
+            refreshed += 1
+        except Exception as exc:
+            # One key's failure must not stop the rest of the tick.
+            logger.warning("[DIGEST_PRECOMPUTE] %s tick failed: %s", label, exc)
 
-    # Per-project views for the active project set.
+    # Active project set — enumerated once and shared by both payload kinds.
     try:
         async with session_factory() as session:
             project_ids = await _active_project_ids(session)
@@ -306,19 +502,55 @@ async def run_precompute_tick(session_factory) -> int:
         logger.warning("[DIGEST_PRECOMPUTE] active-project enumeration failed: %s", exc)
         project_ids = []
 
+    # --- GLOBAL views first (both kinds). The no-project DashboardHome /
+    #     CatchUpPanel polls are the most-hit keys and the dominant source of the
+    #     health-overview timeouts, so they are primed before any per-project work
+    #     that the tick budget might truncate under load. ---
+    await _prime(
+        "global digest",
+        lambda s: _precompute_one(s, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=None),
+    )
+    await _prime(
+        "global health",
+        lambda s: _precompute_health_one(
+            s, lookback_hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=None
+        ),
+    )
+
+    # --- Per-project views: digest first (the established hot path), then
+    #     health. If the tick hits PRECOMPUTE_TICK_BUDGET_SECONDS the remaining
+    #     per-project health priming is abandoned and the next tick retries;
+    #     un-primed keys degrade to the bounded on-demand path (the old
+    #     behavior), never an error. ---
     for project_id in project_ids:
-        try:
-            async with session_factory() as session:
-                await _precompute_one(
-                    session, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=project_id
-                )
-            refreshed += 1
-        except Exception as exc:
-            logger.warning(
-                "[DIGEST_PRECOMPUTE] project=%s digest tick failed: %s",
-                project_id,
-                exc,
+        await _prime(
+            f"project={project_id} digest",
+            lambda s, pid=project_id: _precompute_one(
+                s, hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=pid
+            ),
+        )
+    for project_id in project_ids:
+        await _prime(
+            f"project={project_id} health",
+            lambda s, pid=project_id: _precompute_health_one(
+                s, lookback_hours=_DEFAULT_PRECOMPUTE_HOURS, project_id=pid
+            ),
+        )
+
+    # --- Prune L2 rows for keys that are no longer hot (cheap bounded DELETE).
+    #     Cutoff = 2x the freshness window so a briefly-restarting worker never
+    #     prunes rows a reader might still legitimately serve. ---
+    try:
+        async with session_factory() as session:
+            deleted = await cleanup_stale_shared(
+                session, older_than_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS * 2
             )
+        if deleted:
+            logger.debug(
+                "[DIGEST_PRECOMPUTE] pruned %d stale shared-cache row(s)", deleted
+            )
+    except Exception as exc:
+        logger.debug("[DIGEST_PRECOMPUTE] shared-cache prune failed: %s", exc)
 
     return refreshed
 

@@ -28,6 +28,12 @@ _HISTORY_AGG_DEFAULTS = {
     "total_tasks_failed": 0,
     "total_tasks_failed_infra": 0,
     "total_tasks_completed": 0,
+    # Correct no-op completions ("deliverable already present", no PR opened) —
+    # rolled up so _compute_lifetime_burn_metrics can subtract them from lifetime
+    # non-merge burn even after the originating cycles are evicted from
+    # research_history. Without this, a long-lived already-built direction would
+    # trip the lifetime-burn backstop once its no-op cycles aged out.
+    "total_tasks_completed_no_pr": 0,
     "total_tasks_cancelled": 0,
     "first_cycle_at": None,
     "total_autonomous_prs_merged": 0,
@@ -63,6 +69,7 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
         agg["total_tasks_failed_infra"] += ev.get("tasks_failed_infra", 0)
         agg["total_tasks_completed"] += ev.get("tasks_completed", 0)
+        agg["total_tasks_completed_no_pr"] += ev.get("tasks_completed_no_pr", 0)
         agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
         # Legacy fallback: pre-attribution entries have no autonomous_prs_merged;
         # treat all merges as autonomous so CPM is conservative for old data.

@@ -218,6 +218,21 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                                 }
                                 write_session.add(db_task)
                                 await write_session.commit()
+                                # Heal the direction's research-history merge counts
+                                # now that the landed signal is committed. This
+                                # verification path discovers a child's PR landing
+                                # asynchronously, well after the child went terminal,
+                                # so no status transition re-fires the recompute and
+                                # prs_merged would otherwise stay stale-low. Reuse the
+                                # write_session (post-commit) so the recompute sees
+                                # the merge. No-op without direction lineage.
+                                from app.direction_outcomes import (
+                                    refresh_direction_outcomes_after_merge,
+                                )
+
+                                await refresh_direction_outcomes_after_merge(
+                                    db_task, write_session
+                                )
                     except Exception as write_err:
                         logger.warning(
                             f"[PR_VERIFY] Failed to persist pr_merged for task {task.id}: {write_err}"
@@ -277,6 +292,19 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                                     db_task.status = TaskStatus.COMPLETED
                                 write_session.add(db_task)
                                 await write_session.commit()
+                                # A deliberate success-close that records an
+                                # integration landing must heal the direction's
+                                # merge counts too (same async-late-landing gap as
+                                # the merged branch above). Reuse the post-commit
+                                # write_session. No-op without direction lineage.
+                                if record_pr_merged:
+                                    from app.direction_outcomes import (
+                                        refresh_direction_outcomes_after_merge,
+                                    )
+
+                                    await refresh_direction_outcomes_after_merge(
+                                        db_task, write_session
+                                    )
                     except Exception as _sc_err:
                         logger.warning(
                             f"[PR_VERIFY] Failed to persist success-close for task "

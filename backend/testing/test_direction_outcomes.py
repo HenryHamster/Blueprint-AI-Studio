@@ -25,7 +25,7 @@ from app.direction_outcomes import (
     _update_direction_research_outcomes,
     refresh_direction_outcomes_after_merge,
 )
-from app.models import Project, Task, TaskStatus
+from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.shared_state import runtime_config
 
 
@@ -3668,3 +3668,181 @@ async def test_refresh_after_merge_noop_without_direction_context(
     await db_session.flush()
     # Must not raise and must not touch any direction state.
     await refresh_direction_outcomes_after_merge(task, db_session)
+
+
+@pytest.mark.asyncio
+async def test_refresh_after_out_of_band_merge_path_heals_prs_merged(
+    db_session: AsyncSession,
+):
+    """A child whose PR lands via a newly-wired out-of-band path heals prs_merged.
+
+    Models the gap fixed in Task 1: a child reported terminal (here FAILED, as in
+    the agent_status / reaper out-of-band recovery) while its PR merged later. The
+    recovery path stamps the landed signal and COMPLETED, then calls
+    ``refresh_direction_outcomes_after_merge``. Before the refresh the cycle's
+    prs_merged is the stale 0 that trips the zero-merge/churn guard; after it the
+    landed child is counted (alongside a sibling that landed in the same window),
+    proving the whole-cycle recompute the wired paths rely on.
+    """
+    direction_id = "d-oob-merge"
+    project = await _create_project(db_session)
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=2)]
+    db_session.add(project)
+    await db_session.flush()
+
+    child_ctx = {"direction_id": direction_id, "research_task_id": rtid}
+    # The trigger child reported FAILED with an open PR (agent died after merge);
+    # the sibling already COMPLETED. Neither yet carries the landed signal.
+    trigger = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context=dict(child_ctx),
+        title="out-of-band create",
+    )
+    sibling = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context=dict(child_ctx),
+        title="sibling create",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 0  # stale: PRs not yet recorded as landed
+
+    # The out-of-band recovery path lands BOTH PRs on the integration branch and
+    # flips the trigger COMPLETED, then fires the refresh on the trigger child.
+    trigger.status = TaskStatus.COMPLETED
+    trigger.context = {
+        **trigger.context,
+        "pr_merged": True,
+        "landed_on_integration": True,
+    }
+    sibling.context = {
+        **sibling.context,
+        "pr_merged": True,
+        "landed_on_integration": True,
+    }
+    db_session.add(trigger)
+    db_session.add(sibling)
+    await db_session.flush()
+
+    await refresh_direction_outcomes_after_merge(trigger, db_session)
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Both the trigger AND the sibling are counted — the recompute re-counts every
+    # child of the cycle, not just the one that fired the refresh.
+    assert entry["prs_merged"] == 2
+
+
+@pytest.mark.asyncio
+async def test_tasks_completed_no_pr_counts_only_genuine_no_pr(
+    db_session: AsyncSession,
+):
+    """tasks_completed_no_pr counts a COMPLETED-no-PR child, excluding others.
+
+    "No changes needed — work already exists" completions are a healthy outcome,
+    not churn. The count must include a COMPLETED child that opened no PR and
+    exclude: a merged completion, a pr_rejected completion, a COMPLETED child that
+    DID open a PR (PULL_REQUEST artifact / pr_number signal), and any in-flight /
+    failed child.
+    """
+    direction_id = "d-no-pr"
+    project = await _create_project(db_session)
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=6)]
+    db_session.add(project)
+    await db_session.flush()
+
+    # (1) COMPLETED, never opened a PR — the genuine no-PR completion to count.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        title="no-changes-needed",
+    )
+    # (2) Merged completion — excluded (it landed a PR).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="merged",
+    )
+    # (3) pr_rejected completion — excluded.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_rejected": True},
+        title="rejected",
+    )
+    # (4) COMPLETED but DID open a PR (artifact present, no landed/rejected
+    #     signal) — excluded: it produced a PR, so it is not a no-PR completion.
+    opened_pr = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_number": 99},
+        title="opened-pr-not-yet-landed",
+    )
+    db_session.add(
+        Artifact(
+            task_id=opened_pr.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/99",
+        )
+    )
+    # (5) In-flight (IN_PROGRESS) — excluded (not COMPLETED).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+        title="in-flight",
+    )
+    # (6) FAILED — excluded (not COMPLETED).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={},
+        title="failed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Only child (1) qualifies.
+    assert entry["tasks_completed_no_pr"] == 1
+    # Sanity: the other completed children are still reflected in their buckets.
+    assert entry["prs_merged"] == 1
+    assert entry["prs_rejected"] == 1
+    assert entry["tasks_completed"] == 4

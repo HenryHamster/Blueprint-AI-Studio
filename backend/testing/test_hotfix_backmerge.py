@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -32,11 +33,14 @@ from app.rollup_migration_validation import (
 from app.models import (
     Alert,
     AlertSeverity,
+    Artifact,
+    ArtifactType,
     Project,
     Task,
     TaskHistory,
     TaskStatus,
 )
+from app.time_utils import _utcnow
 
 pytestmark = pytest.mark.asyncio
 
@@ -2667,3 +2671,301 @@ async def test_backmerge_migration_stale_anchor_non_shared_refuses_falls_back(
         "gh-token", "acme", "widget", 503, "automain", "main"
     )
     assert plan is None, "stale-anchor collision must not be auto-reconciled"
+
+
+# ===========================================================================
+# Cross-cycle dedup — a TERMINAL resolver whose resolution PR is STILL OPEN
+# counts as in-flight (regression for the competing-resolver incident
+# #7476 CI-red-orphaned vs #7478 clean-merged).
+#
+# A resolver ``create`` task goes COMPLETED the instant it OPENS its resolution
+# PR, NOT when that PR merges into the integration trunk. The back-merge is not
+# actually resolved until the PR lands (CI + review tail, or never if CI stays
+# red). The "non-terminal only" guard returned False during that window, so the
+# next reconciler cycle re-saw the still-DIRTY back-merge PR and spawned a
+# DUPLICATE resolver. _resolution_task_already_open now also treats a recently-
+# terminal resolver with an OPEN resolution PR as in-flight.
+# ===========================================================================
+
+
+async def _make_resolver_task(
+    db_session,
+    project_id,
+    *,
+    status: TaskStatus,
+    created_at=None,
+    backmerge_conflict: bool = True,
+) -> Task:
+    """Create a back-merge resolver task (``context['backmerge_conflict']=True``)."""
+    task = Task(
+        project_id=project_id,
+        title="Resolve back-merge conflict: main -> automain",
+        payloads=[{"type": "create", "prompt": "resolve", "base_branch": "automain"}],
+        context={"backmerge_conflict": backmerge_conflict, "backmerge_pr_number": 100},
+        status=status,
+        created_by="ORCHESTRATOR",
+    )
+    if created_at is not None:
+        task.created_at = created_at
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _add_pr_artifact(db_session, task_id, pr_url: str) -> Artifact:
+    """Attach a PULL_REQUEST artifact (the resolver's resolution PR) to a task."""
+    artifact = Artifact(
+        task_id=task_id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url=pr_url,
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    return artifact
+
+
+async def test_resolution_already_open_terminal_with_open_pr_blocks(
+    db_session, mocker
+):
+    """A COMPLETED resolver whose resolution PR is STILL OPEN on GitHub counts
+    as in-flight — no duplicate respawn. This is the #7476/#7478 regression: the
+    resolver completes the moment it opens its PR, long before that PR merges."""
+    project = await _make_project(db_session)
+    task = await _make_resolver_task(db_session, project.id, status=TaskStatus.COMPLETED)
+    await _add_pr_artifact(
+        db_session, task.id, "https://github.com/acme/widget/pull/7478"
+    )
+
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"number": 7478, "state": "open", "merged": False}),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is True
+    # The GH call was made against the resolution PR parsed from the artifact.
+    assert get_pr.call_args.args[3] == 7478
+
+
+async def test_resolution_already_open_terminal_with_merged_pr_allows_respawn(
+    db_session, mocker
+):
+    """A COMPLETED resolver whose resolution PR has MERGED does NOT block — the
+    resolver succeeded; nothing is in flight."""
+    project = await _make_project(db_session)
+    task = await _make_resolver_task(db_session, project.id, status=TaskStatus.COMPLETED)
+    await _add_pr_artifact(
+        db_session, task.id, "https://github.com/acme/widget/pull/7478"
+    )
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"number": 7478, "state": "closed", "merged": True}
+        ),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is False
+
+
+async def test_resolution_already_open_terminal_with_closed_unmerged_pr_allows_respawn(
+    db_session, mocker
+):
+    """A FAILED resolver whose resolution PR was CLOSED-unmerged does NOT block —
+    the first resolver genuinely failed, so a fresh respawn is legitimate."""
+    project = await _make_project(db_session)
+    task = await _make_resolver_task(db_session, project.id, status=TaskStatus.FAILED)
+    await _add_pr_artifact(
+        db_session, task.id, "https://github.com/acme/widget/pull/7476"
+    )
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"number": 7476, "state": "closed", "merged": False}
+        ),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is False
+
+
+async def test_resolution_already_open_terminal_without_pr_artifact_allows_respawn(
+    db_session, mocker
+):
+    """A terminal resolver that never opened a PR (no PULL_REQUEST artifact)
+    does NOT block — it genuinely failed before publishing; respawn is allowed.
+    No GitHub call is made (there is no PR number to query)."""
+    project = await _make_project(db_session)
+    await _make_resolver_task(db_session, project.id, status=TaskStatus.CANCELLED)
+
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is False
+    get_pr.assert_not_called()
+
+
+async def test_resolution_already_open_gh_lookup_raises_is_failsafe(
+    db_session, mocker
+):
+    """If the GitHub lookup raises, the resolver is treated as STILL OPEN
+    (fail-safe) so a transient hiccup never lets a duplicate resolver through."""
+    project = await _make_project(db_session)
+    task = await _make_resolver_task(db_session, project.id, status=TaskStatus.COMPLETED)
+    await _add_pr_artifact(
+        db_session, task.id, "https://github.com/acme/widget/pull/7478"
+    )
+
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is True
+
+
+async def test_resolution_already_open_terminal_older_than_lookback_is_ignored(
+    db_session, mocker
+):
+    """A terminal resolver OLDER than the lookback window is ignored entirely —
+    no GitHub call, respawn allowed. An ancient never-landed resolver must not
+    block a fresh attempt forever, and a stale row never triggers a network hit."""
+    project = await _make_project(db_session)
+    stale_created = _utcnow() - hb._RESOLVER_PR_LOOKBACK - timedelta(hours=1)
+    task = await _make_resolver_task(
+        db_session,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        created_at=stale_created,
+    )
+    # Even though its PR is technically still open, the row is too old to query.
+    await _add_pr_artifact(
+        db_session, task.id, "https://github.com/acme/widget/pull/7000"
+    )
+
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"number": 7000, "state": "open", "merged": False}),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is False
+    get_pr.assert_not_called()
+
+
+async def test_resolution_already_open_nonterminal_blocks_without_gh_call(
+    db_session, mocker
+):
+    """The fast path is unchanged: a NON-terminal resolver blocks immediately
+    and makes ZERO GitHub calls even when creds are supplied."""
+    project = await _make_project(db_session)
+    await _make_resolver_task(db_session, project.id, status=TaskStatus.QUEUED)
+
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open", "merged": False}),
+    )
+
+    blocked = await hb._resolution_task_already_open(
+        db_session, project.id, token="gh-token", owner="acme", repo="widget"
+    )
+
+    assert blocked is True
+    get_pr.assert_not_called()
+
+
+async def test_resolution_already_open_no_creds_skips_gh_leg(db_session, mocker):
+    """Without token/owner/repo only the GH-free fast path runs: a terminal
+    resolver with an open PR is NOT detected (the caller supplied no creds), and
+    no GitHub call is attempted. This keeps unit callers that omit creds working
+    and guarantees the common no-conflict path makes zero GitHub calls."""
+    project = await _make_project(db_session)
+    task = await _make_resolver_task(db_session, project.id, status=TaskStatus.COMPLETED)
+    await _add_pr_artifact(
+        db_session, task.id, "https://github.com/acme/widget/pull/7478"
+    )
+
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"number": 7478, "state": "open", "merged": False}),
+    )
+
+    blocked = await hb._resolution_task_already_open(db_session, project.id)
+
+    assert blocked is False
+    get_pr.assert_not_called()
+
+
+async def test_open_backmerge_pr_no_duplicate_when_prior_resolver_pr_still_open(
+    db_session, mocker
+):
+    """Full-path regression for #7476/#7478: a periodic reconciler cycle that
+    re-sees a still-DIRTY back-merge while the prior resolver's PR is COMPLETED
+    (PR opened) but its resolution PR is STILL OPEN must NOT spawn a duplicate
+    resolver."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 7476, "html_url": "http://pr/7476"},
+        merge_return={"merged": False, "conflict": True, "message": "conflict"},
+    )
+
+    # Cycle 1: conflict → one resolver spawned.
+    r1 = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+    assert r1["status"] == "conflict"
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [t for t in tasks if (t.context or {}).get("backmerge_conflict")]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+
+    # The resolver opens its resolution PR and goes COMPLETED — but that PR has
+    # NOT merged into automain yet (CI + review tail).
+    resolver.status = TaskStatus.COMPLETED
+    db_session.add(resolver)
+    await db_session.commit()
+    await _add_pr_artifact(
+        db_session, resolver.id, "https://github.com/acme/widget/pull/7478"
+    )
+    # The resolution PR is still open on GitHub.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"number": 7478, "state": "open", "merged": False}),
+    )
+
+    # Cycle 2 (600s later): the back-merge PR is still dirty → conflict again.
+    r2 = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+    assert r2["status"] == "conflict"
+
+    # No DUPLICATE resolver — the still-open resolution PR counts as in-flight.
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [t for t in tasks if (t.context or {}).get("backmerge_conflict")]
+    assert len(resolvers) == 1, (
+        f"a still-open resolution PR must dedupe the next cycle — got {len(resolvers)}"
+    )
