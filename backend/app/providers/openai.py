@@ -33,6 +33,15 @@ _API_KEY_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "exceeded the rate limit, please slow down",
     "please try again after",
     "rate_limit_exceeded",
+    # Agent-invented wording: runners.ts raises
+    # `RateLimitError("<displayName> API usage exhausted — <snippet>")` when the
+    # Codex/OpenAI runner reports its usage window is spent. Without this the
+    # backend never recorded a confirmed rate-limit, so the account was not
+    # cooled and balanced selection kept routing work to the exhausted account
+    # (incident 2026-06-03: reviews looping on a spent Codex account while idle
+    # Anthropic accounts were available). Transient (window resets) → rate_limit,
+    # NOT quota_exhausted (no 24h billing-wall cooldown).
+    "api usage exhausted",
 )
 
 _OAUTH_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
@@ -50,6 +59,8 @@ _OAUTH_RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "add credits or upgrade to pro",
     "you've hit your usage limit. visit",
     "manage or purchase credits",
+    # Agent-invented wording from runners.ts RateLimitError (see _API_KEY list).
+    "api usage exhausted",
 )
 
 # Subset of the patterns above that mean "billing/quota wall, not a transient

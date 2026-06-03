@@ -86,6 +86,23 @@ OPENAI_CASES = [
         "rate_limit",
         None,
     ),
+    # Agent-invented RateLimitError wording (runners.ts) — observed verbatim in
+    # status_log when a Codex usage window is spent. Must classify as rate_limit
+    # so the backend cools the account + reroutes (incident 2026-06-03).
+    (
+        LLMProviderName.OPENAI,
+        LLMAuthMode.OAUTH,
+        "Fatal error: OpenAI Codex API usage exhausted — Reading prompt from stdin",
+        "rate_limit",
+        None,
+    ),
+    (
+        LLMProviderName.OPENAI,
+        LLMAuthMode.API_KEY,
+        "OpenAI API usage exhausted — last status: 429",
+        "rate_limit",
+        None,
+    ),
 ]
 
 GEMINI_CASES = [
