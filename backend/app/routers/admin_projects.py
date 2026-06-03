@@ -664,10 +664,33 @@ async def delete_project_admin(
         await session.commit()
         notify_tasks_terminated(all_cancelled_ids)
 
-    # Delete dependent records that lack ON DELETE CASCADE
-    from app.models import Alert
+    # Delete dependent rows whose project FK lacks ON DELETE CASCADE, or the
+    # project delete FK-violates mid-cascade. Migration 0058 cascaded the
+    # pre-0058 project children, but every table added AFTER it kept the plain
+    # SQLModel `foreign_key="project.id"` (no ondelete) — alert is now cascaded
+    # (deleted here defensively / for the SQLite test path), but messageslastseen
+    # (0099), messagesnoiseprefs (0103), messagessavedviews (0105) and
+    # anomalyfingerprintstate (0080) are not, and blocked delete in production
+    # (asyncpg ForeignKeyViolationError on messageslastseen_project_id_fkey).
+    # All are leaf tables (no children of their own) — safe to bulk-delete.
+    from app.models import (
+        Alert,
+        AnomalyFingerprintState,
+        MessagesLastSeen,
+        MessagesNoisePrefs,
+        MessagesSavedViews,
+    )
 
-    await session.execute(delete(Alert).where(Alert.project_id == project_id))
+    for _child_model in (
+        Alert,
+        MessagesLastSeen,
+        MessagesNoisePrefs,
+        MessagesSavedViews,
+        AnomalyFingerprintState,
+    ):
+        await session.execute(
+            delete(_child_model).where(_child_model.project_id == project_id)
+        )
     await session.delete(project)
     await session.commit()
 

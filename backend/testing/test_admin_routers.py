@@ -1387,6 +1387,59 @@ class TestDeleteProject:
         assert "deleted" in resp.json()["message"]
 
     @pytest.mark.asyncio
+    async def test_delete_project_removes_cascade_less_children(
+        self, client: AsyncClient, db_session
+    ):
+        """Regression: project delete must remove child rows whose project FK
+        lacks ON DELETE CASCADE. messageslastseen (0099), messagesnoiseprefs
+        (0103), messagessavedviews (0105) and anomalyfingerprintstate (0080)
+        were all added after migration 0058's cascade retrofit, so the final
+        commit FK-violated on them in production (asyncpg
+        ForeignKeyViolationError on messageslastseen_project_id_fkey)."""
+        from sqlmodel import select as _select
+
+        from app.models import (
+            AnomalyFingerprintState,
+            MessagesLastSeen,
+            MessagesNoisePrefs,
+            MessagesSavedViews,
+        )
+
+        project = await _make_project(db_session)
+        db_session.add_all(
+            [
+                MessagesLastSeen(user_id=TEST_USER_ID, project_id=project.id),
+                MessagesNoisePrefs(user_id=TEST_USER_ID, project_id=project.id),
+                MessagesSavedViews(user_id=TEST_USER_ID, project_id=project.id),
+                AnomalyFingerprintState(
+                    project_id=project.id, fingerprint_key="anomaly-1"
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        resp = await client.delete(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200, resp.text
+
+        db_session.expire_all()
+        for _model in (
+            MessagesLastSeen,
+            MessagesNoisePrefs,
+            MessagesSavedViews,
+            AnomalyFingerprintState,
+        ):
+            rows = (
+                (
+                    await db_session.execute(
+                        _select(_model).where(_model.project_id == project.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert rows == [], f"{_model.__name__} rows survived project delete"
+
+    @pytest.mark.asyncio
     async def test_delete_project_with_active_tasks_no_force_returns_409(
         self, client: AsyncClient, db_session
     ):
