@@ -623,6 +623,17 @@ describe('FAILURE_CLASS_CONFIG', () => {
   });
 });
 
+describe('TaskCard verify_tests task type', () => {
+  it('renders the Verify Tests badge (not the generic Hash fallback) for a verify_tests task', () => {
+    const task = makeTask({ task_type: 'verify_tests' });
+    render(<TaskCard task={task} {...baseProps} />);
+    // The TaskTypeBadge sets title to the styled label; the generic fallback
+    // would title it with the raw task_type string instead.
+    expect(screen.getByTitle('Verify Tests')).toBeInTheDocument();
+    expect(screen.queryByTitle('verify_tests')).toBeNull();
+  });
+});
+
 describe('TaskCard BLOCKED status', () => {
   beforeEach(() => {
     vi.clearAllMocks();

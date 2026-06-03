@@ -194,11 +194,38 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       .catch(() => {});
   }, [task.project_id, provenanceDirectionId]);
 
-  const { prArtifacts, commitArtifacts, investigationArtifacts } = useMemo(() => ({
-    prArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url)),
-    commitArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT'),
-    investigationArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
-  }), [task.artifacts]);
+  const { prArtifacts, commitArtifacts, investigationArtifacts, mergeTestVerdict } = useMemo(() => {
+    const artifacts = task.artifacts ?? [];
+    // Surface the no-CI merge gate's verdict. The verify_tests handler posts a
+    // MERGE_TEST_RESULT artifact whose `logs` carry the JSON verdict
+    // ({detected, passed, tests, output}); the orchestrator consults it to
+    // decide the merge. Parse the latest such artifact (highest iteration) and
+    // map it to the same pass/fail/undetected outcome the backend gate uses
+    // (classify_merge_test_verdict in ci_resolution.py): detected=false →
+    // undetected; passed truthy → pass; otherwise → fail.
+    const mergeTestArtifacts = artifacts.filter(a => a.artifact_type === 'MERGE_TEST_RESULT' && a.logs);
+    let mergeTestVerdict: { outcome: 'pass' | 'fail' | 'undetected'; output: string } | null = null;
+    if (mergeTestArtifacts.length > 0) {
+      const latest = mergeTestArtifacts.reduce((a, b) => ((b.iteration ?? 1) >= (a.iteration ?? 1) ? b : a));
+      try {
+        const parsed = JSON.parse(latest.logs as string) as { detected?: boolean; passed?: boolean; output?: string };
+        const outcome: 'pass' | 'fail' | 'undetected' = parsed.detected === false
+          ? 'undetected'
+          : parsed.passed
+            ? 'pass'
+            : 'fail';
+        mergeTestVerdict = { outcome, output: typeof parsed.output === 'string' ? parsed.output : '' };
+      } catch {
+        mergeTestVerdict = null;
+      }
+    }
+    return {
+      prArtifacts: artifacts.filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url)),
+      commitArtifacts: artifacts.filter(a => a.artifact_type === 'GIT_COMMIT'),
+      investigationArtifacts: artifacts.filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
+      mergeTestVerdict,
+    };
+  }, [task.artifacts]);
   // Group PR and commit artifacts by iteration for display
   const artifactIterations: { iteration: number; prs: typeof prArtifacts; commits: typeof commitArtifacts }[] = [];
   if (task.artifacts && task.artifacts.length > 0) {
@@ -637,6 +664,47 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </>
         );
       })() : null}
+
+      {mergeTestVerdict && (() => {
+        const config: Record<'pass' | 'fail' | 'undetected', { label: string; badge: string; note: string }> = {
+          pass: {
+            label: 'Passed',
+            badge: 'text-emerald-400 bg-emerald-950/30 border-emerald-800/40',
+            note: "The repository's own test suite ran on the PR head and passed — it served as the merge gate.",
+          },
+          fail: {
+            label: 'Failed',
+            badge: 'text-red-400 bg-red-950/30 border-red-800/40',
+            note: "The repository's own test suite ran on the PR head and failed — the merge gate blocked the merge.",
+          },
+          undetected: {
+            label: 'No suite detected',
+            badge: 'text-neutral-400 bg-neutral-800/40 border-neutral-700/40',
+            note: 'No runnable test suite was detected on the PR head — the gate fell back to proceeding unverified.',
+          },
+        };
+        const v = config[mergeTestVerdict.outcome];
+        return (
+          <>
+            <SectionHeader>Merge Test Gate</SectionHeader>
+            <div className="space-y-3 bg-emerald-950/10 rounded-lg p-3 border border-emerald-900/30">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-500 w-28 shrink-0">Verdict</span>
+                <span className={`text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded border ${v.badge}`}>
+                  {v.label}
+                </span>
+              </div>
+              <p className="text-xs text-neutral-400 break-words">{v.note}</p>
+              {mergeTestVerdict.output && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Test Output</span>
+                  <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-48 overflow-y-auto custom-scrollbar border border-neutral-800 font-mono min-w-0 flex-1">{mergeTestVerdict.output}</pre>
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })()}
 
       <TaskDiagnosticsPanel task={task} />
 

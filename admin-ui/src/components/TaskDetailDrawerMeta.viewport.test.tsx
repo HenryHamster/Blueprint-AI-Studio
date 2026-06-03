@@ -118,6 +118,29 @@ const llmTask: Task = {
   },
 };
 
+const mergeTestTask: Task = {
+  id: 'task-verify-550e8400e29b41d4a716446655440099',
+  title: 'Verify tests on PR head',
+  description: 'Run the repo detected suite as the no-CI merge gate',
+  status: 'COMPLETED',
+  task_type: 'verify_tests',
+  created_at: '2024-01-01T00:00:00Z',
+  created_by: 'ORCHESTRATOR',
+  requires_approval: false,
+  artifacts: [
+    {
+      artifact_type: 'MERGE_TEST_RESULT',
+      logs: JSON.stringify({
+        detected: true,
+        passed: false,
+        tests: [{ name: 'jest', status: 'fail', message: 'test failures detected' }],
+        output: 'FAIL src/components/SomeDeeplyNestedComponentWithAVeryLongName.test.tsx — expected 2 received 3 at assertion line 187',
+      }),
+      iteration: 1,
+    },
+  ],
+};
+
 describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -236,6 +259,26 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<DetailsTab task={memoTask} />); });
+    });
+  });
+
+  test('renders the merge-test-gate verdict and output at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={mergeTestTask} />); });
+    });
+  });
+
+  test('merge-test-gate output does not silently clip at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={mergeTestTask} />); });
     });
   });
 

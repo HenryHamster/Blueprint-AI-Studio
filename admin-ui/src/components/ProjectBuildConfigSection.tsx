@@ -505,8 +505,8 @@ export function ProjectBuildConfigSection({
               <span className="text-xs text-neutral-200 font-medium">Repository has required CI checks</span>
               <p className="text-[11px] text-neutral-500 mt-0.5">
                 On by default — Blueprint waits for the repository's required CI checks to pass before merging a PR.
-                Turn this off for repos with no required checks: Blueprint then merges as soon as a PR is otherwise
-                mergeable instead of polling for checks that will never arrive.
+                Turn this off for repos without required checks: Blueprint then runs the repository's detected test suite
+                as the merge gate—passing tests merge, failing tests block. If no test command is detected, Blueprint proceeds unverified.
               </p>
             </div>
           </label>

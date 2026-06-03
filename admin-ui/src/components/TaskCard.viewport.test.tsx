@@ -158,6 +158,28 @@ describe('TaskCard — viewport regression', () => {
     }, { selector: 'button[title]' });
   });
 
+  test('verify_tests task renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskCard
+            task={makeTask({
+              status: 'COMPLETED',
+              task_type: 'verify_tests',
+              title: 'Verify tests on PR head before the no-CI merge gate decides whether to merge',
+            })}
+            {...defaultProps}
+          />
+        );
+      });
+    });
+  });
+
   test('FAILED task with SR badge and direction button meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');
