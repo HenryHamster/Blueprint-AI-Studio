@@ -110,6 +110,116 @@ REVIEW_FIX_GOAL_PREAMBLE = (
 )
 
 
+# ── Verification-only REQUEST_CHANGES downgrade ───────────────────────────────
+#
+# A reviewer can emit REQUEST_CHANGES purely because it could not RUN/VERIFY in
+# its sandbox (a verify tool was missing, a CI probe 401'd, the workspace was
+# stale, an install failed) — NOT because it found a concrete code defect. The
+# pipeline's merge gate is `ci_passed AND review_approved` where `ci_passed`
+# comes from the orchestrator's own authoritative check-run polling. So a
+# "I couldn't verify" REQUEST_CHANGES on a CI-green PR with no concrete defect
+# is spurious and must not block forever.
+#
+# These two patterns classify a blocking issue. The downgrade is gated on
+# BOTH: every blocking issue is verification-class (matches _VERIFICATION_*),
+# AND no blocking issue cites a concrete code defect (matches _CONCRETE_*).
+# Anything matching _CONCRETE_DEFECT_RE is ALWAYS respected, even if it also
+# mentions a build/verify phrase — the conservative bias is to keep blocking.
+_VERIFICATION_CLASS_RE = re.compile(
+    r"could ?n'?t run|could not run|unable to run|cannot run|can'?t run|"
+    r"failed to run|command not found|no such file|not found in (?:path|sandbox)|"
+    r"\./check|check-runs?\b|"
+    r"unverifiable|could ?n'?t verify|could not verify|cannot verify|"
+    r"can'?t verify|unable to verify|not verifiable|no way to verify|"
+    r"\b401\b|\b403\b|unauthorized|forbidden|"
+    r"stale workspace|stale checkout|cannot resolve [\w.@/-]+|"
+    r"could ?n'?t install|could not install|failed to install|install(?:ation)? failed|"
+    r"npm ci|tsc\b|pytest\b|\bci\b|"
+    r"build fail(?:ed|ure)?|build broke|build (?:is )?red|"
+    r"did ?n'?t pass|did not pass|pass(?:ed|ing)? status|"
+    r"verification gate|verify gate|sandbox",
+    re.IGNORECASE,
+)
+
+# Concrete code-defect cues. If ANY blocking issue matches this, the verdict is
+# respected (never downgraded) — the reviewer found a real problem, not just a
+# tooling gap. Kept broad and conservative: when in doubt, this wins.
+_CONCRETE_DEFECT_RE = re.compile(
+    r"\b(?:bug|defect|incorrect|wrong|logic error|off[- ]by[- ]one|"
+    r"race condition|deadlock|data ?race|"
+    r"null (?:pointer|deref|reference|check)|none ?type|nullpointer|npe\b|"
+    r"undefined behavior|uninitialized|use[- ]after[- ]free|memory leak|"
+    r"sql injection|injection|xss|csrf|ssrf|path traversal|"
+    r"vulnerab(?:le|ility)|insecure|security (?:hole|flaw|issue|risk)|"
+    r"hard[- ]?coded (?:secret|credential|password|token|key)|"
+    r"leak(?:s|ed|ing)? (?:secret|credential|token|key|pii)|"
+    r"missing (?:test|validation|null check|bounds check|error handling)|"
+    r"no test(?:s)? (?:for|covering)|untested|"
+    r"breaks? (?:the )?invariant|invariant violation|violates? (?:the )?invariant|"
+    r"breaking change|backward[- ]?incompat|api contract|"
+    r"crash(?:es|ed|ing)?|throws? (?:an )?(?:unhandled|uncaught)|unhandled exception|"
+    r"divide by zero|index out of (?:range|bounds)|overflow|underflow|"
+    r"regress(?:es|ion)|correctness|"
+    r"missing return|wrong return|returns? (?:the )?wrong|"
+    r"dead ?lock|infinite loop|unbounded (?:loop|recursion)|"
+    r"resource leak|file (?:handle|descriptor) leak|connection leak|"
+    r"missing await|unawaited|not awaited)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_verification_only_rejection(
+    issues: "list | None",
+    feedback: "str | None",
+) -> bool:
+    """Classify whether a REQUEST_CHANGES verdict is PURELY verification-class.
+
+    Returns ``True`` only when EVERY blocking issue is verification-class
+    (the reviewer's inability to run/verify — missing tool, 401/403 probe,
+    stale workspace, failed install, "build failed"/CI pass-status concern,
+    ``./check`` not found, "could not verify", etc.) AND no blocking issue
+    cites a concrete code defect (logic / security / correctness / missing
+    test / broken invariant / null-handling / race / injection / crash …).
+
+    This is the conservative pre-condition for downgrading a spurious
+    "I couldn't verify" REQUEST_CHANGES against authoritative green CI. The
+    bias is to return ``False`` (keep blocking): an empty/whitespace blocking
+    set, ANY issue that is not verification-class, or ANY concrete-defect cue
+    anywhere all force ``False``. Pure / side-effect-free — unit-testable.
+    """
+    # Build the set of per-issue blocking texts. Fall back to the feedback
+    # string only when there are no structured issues, so a single prose
+    # "could not verify" verdict can still be classified.
+    blocking_texts: list[str] = []
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        desc = (issue.get("description") or "").strip()
+        if desc:
+            blocking_texts.append(desc)
+    if not blocking_texts:
+        fb = (feedback or "").strip()
+        if fb:
+            blocking_texts.append(fb)
+
+    # No blocking content at all → cannot positively classify as
+    # verification-only; keep blocking (fail-safe).
+    if not blocking_texts:
+        return False
+
+    # ANY concrete-defect cue anywhere → respect the verdict. Check the union
+    # first so a defect buried in one issue can't be masked by verify phrases
+    # in another.
+    combined = "\n".join(blocking_texts)
+    if _CONCRETE_DEFECT_RE.search(combined):
+        return False
+
+    # Every blocking issue must INDEPENDENTLY be verification-class. A single
+    # issue that matches nothing (an opaque "please fix this") is not provably
+    # verification-class, so it keeps the verdict blocking.
+    return all(_VERIFICATION_CLASS_RE.search(text) for text in blocking_texts)
+
+
 def build_ci_failure_fix_prompt(
     *,
     pr_number: int,

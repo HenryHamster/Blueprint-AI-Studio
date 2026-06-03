@@ -241,27 +241,55 @@ async def _cap_exhausted_after_approve(
     return False
 
 
+def _is_backmerge_resolver(orig: Task) -> bool:
+    """True if ``orig`` is a back-merge conflict-resolver task.
+
+    Back-merge resolvers carry ``context['backmerge_conflict'] == True`` and
+    open a PR (base=automain) that re-applies main→automain sync work after a
+    conflict. They are ``create`` tasks, NOT rollups, but — like a rollup — the
+    PR aggregates already-completed work (the sync) that is expensive to redo;
+    auto-closing it on review-loop non-convergence destroys that work and stalls
+    main→automain sync. So a mergeable, conflict-free back-merge resolver PR is
+    preservable on cap exhaustion exactly like a rollup.
+    """
+    return (orig.context or {}).get("backmerge_conflict") is True
+
+
 async def _pr_is_preservable_on_cap(
     orig: Task,
     pr_number: int,
     session: AsyncSession,
 ) -> bool:
-    """FIX #3b: decide whether a capped rollup PR is worth PRESERVING (left open
-    for hand-merge) rather than destroyed (closed + FAILED + CODE_ERROR).
+    """FIX #3b: decide whether a capped PR is worth PRESERVING (left open for
+    hand-merge) rather than destroyed (closed + FAILED + CODE_ERROR).
 
-    A PR is preservable only when it carries real, mergeable work:
-      • it is a rollup PR (rollup chains aggregate already-completed subtask work
-        — discarding the whole PR over review-loop non-convergence throws away
-        merged-elsewhere siblings), AND
+    A PR is preservable when it carries real, mergeable work that is expensive
+    to redo and safe to hand-merge:
+      • it is EITHER a rollup PR (rollup chains aggregate already-completed
+        subtask work — discarding the whole PR over review-loop non-convergence
+        throws away merged-elsewhere siblings) OR a back-merge conflict-resolver
+        PR (``context['backmerge_conflict'] is True`` — re-applied main→automain
+        sync work; auto-closing it stalls promotion sync), AND
       • it is NON-EMPTY (``changed_files > 0`` — a branch rebased flat has
         nothing to hand-merge), AND
-      • it is NOT a genuine merge conflict (``mergeable_state != 'dirty'`` — a
-        conflicted PR cannot be hand-merged without rework, so closing it is
-        correct).
+      • it is not a genuine merge conflict (``mergeable_state != 'dirty'``).
 
-    GUARDRAIL: a genuinely broken/empty/conflicted PR returns False so the
-    caller keeps today's close+FAIL path. On any GitHub lookup failure we also
-    return False — when in doubt, fall back to the safe (destructive) path.
+    GUARDRAIL — rollups (UNCHANGED): a broken/empty/conflicted rollup PR returns
+    False so the caller keeps today's close+FAIL path; ``'dirty'`` (conflict),
+    ``''``/``'unknown'`` (not-yet-computed) and any GitHub lookup failure all
+    return False — when in doubt, fall back to the safe destructive path. Every
+    other state (``clean`` / ``unstable`` / ``blocked`` / ``behind``) is treated
+    as hand-mergeable exactly as before.
+
+    Back-merge resolvers are stricter on CI but more conservative on ambiguity:
+      • CI-RED: ``mergeable_state == 'unstable'`` (mergeable but a status check
+        is failing) is NOT preservable — the task requires the resolver PR be
+        CI-green, and a red back-merge shouldn't be hand-merged blind.
+      • AMBIGUOUS: closing a back-merge resolver is the worse outcome (it can
+        always be hand-merged and otherwise stalls sync), so when its live PR
+        state is UNKNOWN or the GitHub lookup FAILS we PRESERVE.
+      • The only hard non-preserve for a back-merge resolver is a confirmed
+        empty PR or a confirmed ``dirty`` / ``unstable`` state.
     """
     is_rollup = (orig.context or {}).get("_is_rollup_review") is True or (
         orig.context or {}
@@ -270,7 +298,8 @@ async def _pr_is_preservable_on_cap(
         rollup_pr = (orig.context or {}).get("rollup_pr_number")
         if rollup_pr and rollup_pr == pr_number:
             is_rollup = True
-    if not is_rollup:
+    is_backmerge = _is_backmerge_resolver(orig)
+    if not is_rollup and not is_backmerge:
         return False
     try:
         from app.github import get_pull_request
@@ -281,20 +310,32 @@ async def _pr_is_preservable_on_cap(
             gh_token, owner, repo, pr_number, project_id=str(orig.project_id)
         )
     except Exception as e:  # noqa: BLE001
+        # On lookup failure: rollups fall back to the safe destructive path;
+        # back-merge resolvers prefer preserve-over-destroy (closing a resolver
+        # is the worse outcome — it can always be hand-merged).
         logger.warning(
             f"[PIPELINE] Cap-exhaustion: preservability lookup failed for PR "
-            f"#{pr_number}: {e} — falling back to close+FAIL"
+            f"#{pr_number}: {e} — "
+            f"{'PRESERVING (back-merge resolver)' if is_backmerge else 'falling back to close+FAIL'}"
         )
-        return False
+        return is_backmerge
     if (pr.get("state") or "").lower() != "open":
         return False
     if (pr.get("changed_files") or 0) <= 0:
+        # A confirmed-empty PR has nothing to hand-merge — never preservable,
+        # not even for a back-merge resolver.
         return False
-    # 'dirty' = genuine merge conflict per GitHub. Any other state (clean,
-    # unstable, blocked, behind) is hand-mergeable. 'unknown'/None means GitHub
-    # hasn't computed it yet — treat conservatively as NOT preservable so we
-    # don't leave a possibly-conflicted PR dangling open.
     mergeable_state = (pr.get("mergeable_state") or "").lower()
+    if is_backmerge:
+        # Back-merge resolver: require CI-green ('unstable' = a status check is
+        # failing → NOT preservable) and conflict-free ('dirty'). Any other
+        # state — INCLUDING the unknown/not-yet-computed case — is preservable;
+        # prefer preserve-over-destroy for sync-critical resolver work.
+        return mergeable_state not in ("dirty", "unstable")
+    # Rollup (UNCHANGED): 'dirty' = genuine merge conflict per GitHub. Any other
+    # state (clean, unstable, blocked, behind) is hand-mergeable. 'unknown'/None
+    # means GitHub hasn't computed it yet — treat conservatively as NOT
+    # preservable so we don't leave a possibly-conflicted PR dangling open.
     return mergeable_state not in ("dirty", "", "unknown")
 
 
@@ -452,24 +493,34 @@ async def _handle_cap_exhaustion(
         return
 
     # FIX #3b: PRESERVE WORK ON CAP. When the cap is hit on REQUEST_CHANGES for a
-    # NON-EMPTY, conflict-free ROLLUP PR, the prior behaviour (close PR + FAIL +
-    # CODE_ERROR) destroyed salvageable aggregated work over review-loop
-    # non-convergence. Instead, leave the PR OPEN and flag the orig
-    # requires_approval so an operator can hand-merge it. The orig still lands
-    # terminal (FAILED routes through the partial-rollup path and stops the
-    # stale-unmerged respawn loop, per the docstring above) but with a distinct
-    # failure_detail, NO CODE_ERROR, NO pr_rejected, and NO PR close.
+    # NON-EMPTY, conflict-free PR that aggregates expensive-to-redo work — a
+    # ROLLUP PR (merged-elsewhere siblings) or a BACK-MERGE conflict-resolver PR
+    # (re-applied main→automain sync) — the prior behaviour (close PR + FAIL +
+    # CODE_ERROR) destroyed salvageable work over review-loop non-convergence,
+    # and for a back-merge resolver additionally stalled main→automain sync.
+    # Instead, leave the PR OPEN and flag the orig requires_approval so an
+    # operator can hand-merge it. The orig still lands terminal (FAILED routes
+    # through the partial-rollup path and stops the stale-unmerged respawn loop,
+    # per the docstring above) but with a distinct failure_detail, NO CODE_ERROR,
+    # NO pr_rejected, and NO PR close.
     # GUARDRAIL: _pr_is_preservable_on_cap returns False for empty / conflicted /
-    # non-rollup PRs (and on any GitHub lookup failure) → those keep today's
-    # close+FAIL+CODE_ERROR path below.
+    # CI-red PRs and for non-rollup non-backmerge tasks → those keep today's
+    # close+FAIL+CODE_ERROR path below. (Rollups also fall back to close on an
+    # unknown mergeable state or GitHub lookup failure; back-merge resolvers
+    # prefer preserve in those ambiguous cases since closing them is worse.)
     if await _pr_is_preservable_on_cap(orig, pr_number, session):
         from sqlalchemy.orm.attributes import flag_modified
 
+        _preserve_kind = (
+            "back-merge resolver"
+            if _is_backmerge_resolver(orig)
+            else "rollup"
+        )
         logger.info(
             f"[PIPELINE] Cap reached for PR #{pr_number} on a non-empty, "
-            f"conflict-free rollup — PRESERVING work: leaving PR open + flagging "
-            f"orig {resolved_original_id[:8]} requires_approval for hand-merge "
-            f"(no CODE_ERROR, no PR close)"
+            f"conflict-free {_preserve_kind} — PRESERVING work: leaving PR open "
+            f"+ flagging orig {resolved_original_id[:8]} requires_approval for "
+            f"hand-merge (no CODE_ERROR, no PR close)"
         )
         orig.status = TaskStatus.FAILED
         # Always flag requires_approval here regardless of the global gate — the

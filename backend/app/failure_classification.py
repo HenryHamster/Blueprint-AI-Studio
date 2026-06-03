@@ -162,6 +162,21 @@ MIGRATION_ERROR = "MIGRATION_ERROR"
 # 79a4a5ec each consumed a retry slot on a missing-on-main dispatcher file
 # that was waiting on an upstream rollup PR (#3768) to land.
 BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
+# Clone-time branch-gone: the branch the task targets no longer exists on the
+# remote — almost always because its PR already merged (or closed) and the
+# branch was auto-deleted before the agent could clone it. The agent reports a
+# generic "fatal" CODE_ERROR from the failed `git clone --branch <gone>`, but
+# this is an orchestration race, not a code defect: retrying is futile (the
+# branch will not reappear) and the work usually already landed. Distinct,
+# VISIBLE class (in ALL_FAILURE_CLASSES + INFRA_CLASSES) so operators can SEE
+# how often branch-deletion-suppression falls through, while it stays
+# budget-exempt — no retry slot, no CODE_ERROR auto-remediation/debug spawn,
+# no direction-health penalty. Production case 2026-06-03: review fbd497dd of
+# PR #7547 cloned plan/763859dc 0.25h after the PR merged + branch was deleted;
+# burned 3 retries + a debug task before the respawned review skip-detected the
+# merge. The respawn already skips merged PRs gracefully (review_pipeline); this
+# only stops the FIRST attempt from being mislabeled a code defect.
+BRANCH_GONE = "BRANCH_GONE"
 # Cluster sibling pre-emption — the agent's declared related_files were already
 # covered by a sibling cluster's merged PR before this task ran. The agent did
 # the right thing by detecting the overlap and exiting cleanly; this is NOT a
@@ -321,6 +336,29 @@ def _provider_model_config_rejection(combined: str) -> bool:
     return any(kw in combined for kw in _PROVIDER_MODEL_CONFIG_PATTERNS)
 
 
+# Git signatures emitted when the target branch was deleted before clone/fetch.
+# `git clone --branch <gone>` prints the "could not find remote branch" warning
+# then fails; a fetch/checkout of a deleted ref prints "couldn't find remote
+# ref". Kept narrow so ordinary "not found" code errors don't over-match.
+_BRANCH_GONE_PATTERNS: tuple[str, ...] = (
+    "could not find remote branch",
+    "couldn't find remote ref",
+    "couldnt find remote ref",
+)
+
+
+def _is_branch_gone(combined: str) -> bool:
+    """True when the failure text shows the target branch/ref no longer exists.
+
+    Matches the clone-warning / fetch-ref forms directly, plus the
+    "fatal: Remote branch <name> not found in upstream origin" form (whose branch
+    name varies) — anchored on the git-specific "not found in upstream" tail so a
+    generic "... not found" code error does not over-match."""
+    if any(kw in combined for kw in _BRANCH_GONE_PATTERNS):
+        return True
+    return "remote branch" in combined and "not found in upstream" in combined
+
+
 # Failure classes that don't penalize direction health / research productivity —
 # the task never really ran because the infra (VMs, rate limits, upstream APIs,
 # agent lifecycle) got in the way, or the scope was structurally mismatched
@@ -334,6 +372,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         EXTERNAL_API,
         SCOPE_OVERFLOW,
         BLOCKED_PRECONDITION,
+        BRANCH_GONE,
         AGENT_STALLED,
         SCOPE_EMPTY,
         REASSIGNED,
@@ -353,6 +392,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     AGENT_STALLED,
     SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
+    BRANCH_GONE,
     SCOPE_EMPTY,
     REASSIGNED,
     NO_PROGRESS_TIMEOUT,
@@ -1483,6 +1523,16 @@ def _classify_failure_class(
     )
     if '"type":"rate_limit_event"' in _classify_combined_lower:
         return RATE_LIMIT
+
+    # Clone-time branch-gone — the target branch was deleted (usually its PR
+    # already merged) before the agent could clone it. High-signal git output, so
+    # like the rate_limit_event check it runs BEFORE the persisted-verdict
+    # short-circuit and the agent_category fast-path: the agent labels the failed
+    # clone a generic "fatal" CODE_ERROR, and we must override that to a
+    # budget-exempt, visible class so no debug/remediation spawns and no retry
+    # slot is burned on a branch that will not reappear.
+    if _is_branch_gone(_classify_combined_lower):
+        return BRANCH_GONE
 
     # Belt-and-suspenders for the Codex `exitCode=0` mid-turn silent-death
     # failure mode (cause C, 2026-05-26). The Codex CLI (gpt-5.4-mini) emits
