@@ -435,6 +435,179 @@ def plan_migration_reconciliation(
     }
 
 
+def _linear_descendant_tail(
+    start_revision: str, children: dict[str, list[str]]
+) -> list[str] | None:
+    """Ordered descendants of *start_revision* when they form a simple linear tail.
+
+    ``children`` maps a revision to the list of revisions that declare it as
+    their ``down_revision``. Walks downstream from *start_revision* requiring
+    every node to have at most one child; returns the descendants in chain order
+    (nearest first, excluding *start_revision* itself). Returns ``None`` on any
+    fan-out (a node with more than one child) or cycle — i.e. anything that is
+    not a single linear tail and therefore not mechanically rechainable.
+    """
+    tail: list[str] = []
+    seen = {start_revision}
+    current = start_revision
+    while True:
+        kids = children.get(current, [])
+        if not kids:
+            return tail
+        if len(kids) > 1:
+            return None  # fan-out — the tail branches
+        nxt = kids[0]
+        if nxt in seen:
+            return None  # cycle — not a linear tail
+        seen.add(nxt)
+        tail.append(nxt)
+        current = nxt
+
+
+def plan_integration_side_renumber(
+    promotion_target_filenames: list[str], integration_sources: dict[str, str]
+) -> dict | None:
+    """Plan a mechanical renumber of the integration branch's colliding migration.
+
+    The BACK-MERGE mirror of :func:`plan_migration_reconciliation`. When the
+    promotion target (e.g. ``main``) is back-merged into the integration branch
+    (e.g. ``automain``), the promotion-target migration is ALREADY APPLIED IN
+    PRODUCTION and is therefore immutable — it must never be renumbered. The
+    migration that must move is the one on the INTEGRATION branch whose revision
+    id independently reused the same ``NNNN`` slot, together with any
+    integration-branch migrations that linearly chain off it.
+
+    ``promotion_target_filenames`` are the immutable migration filenames on the
+    promotion target (the ``NNNN`` prefix is the revision id, kept in lockstep
+    with the in-file revision by the migration-chain invariant); they supply the
+    colliding revision id and the unified head. ``integration_sources`` maps
+    path -> source for the integration branch's post-divergence migrations (the
+    colliding migration and its descendant tail — NOT the migrations shared with
+    the promotion target).
+
+    Returns ``None`` unless the block is unambiguously mechanically reconcilable:
+    EXACTLY ONE integration migration's revision id collides with a
+    promotion-target revision id, that colliding migration is anchored to the
+    shared promotion-target ancestor, and its descendants form a single linear
+    tail. Anything else — zero or multiple collisions, a parse failure, a
+    duplicate revision, a filename/revision desync, a fan-out tail, or a result
+    that would not resolve to one clean head — returns ``None`` so the caller
+    falls back to the guided resolver rather than guessing.
+
+    When reconcilable, returns a plan dict::
+
+        {
+            "upserts",                  # path -> new source: the renamed +
+                                        #   renumbered colliding migration AND
+                                        #   the rechained immediate descendant
+            "deletes",                  # [old colliding path] being renamed away
+            "old_path", "new_path",     # the rename
+            "old_revision", "new_revision",
+            "new_down_revision",        # the unified promotion-target head
+            "expected_schema_revision", # the resulting single head
+        }
+
+    The reconciled result is verified against
+    :func:`validate_combined_migration_chain` before being returned, so a
+    renumber that would not resolve to exactly one clean head yields ``None``
+    rather than an unsafe push. Reuses the existing chain helpers throughout —
+    it does not introduce a second migration-safety rule set.
+    """
+    target_revisions = {
+        rev
+        for fn in promotion_target_filenames
+        if (rev := _filename_revision_prefix(fn)) is not None
+    }
+    if not target_revisions:
+        return None
+    target_head = max(target_revisions, key=int)
+
+    if not integration_sources:
+        return None
+    int_chain, duplicates, unparseable = build_migration_chain(integration_sources)
+    if duplicates or unparseable:
+        return None
+    if find_filename_revision_mismatches(integration_sources):
+        return None
+
+    # Exactly one integration revision id may collide with a target revision id.
+    collisions = set(int_chain) & target_revisions
+    if len(collisions) != 1:
+        return None
+    colliding_rev = next(iter(collisions))
+
+    # The colliding migration must anchor to the shared promotion-target
+    # ancestor (a genuine divergence-point collision), not to another
+    # integration migration (a non-mechanical fork we must not auto-renumber).
+    if int_chain[colliding_rev] not in target_revisions:
+        return None
+
+    # revision -> path for the integration set (unique: no duplicates above).
+    rev_to_path = {
+        parse_revision_identifiers(src)[0]: path
+        for path, src in integration_sources.items()
+    }
+
+    # The colliding migration's descendants must form a single linear tail.
+    children: dict[str, list[str]] = {}
+    for rev, down in int_chain.items():
+        if down is not None:
+            children.setdefault(down, []).append(rev)
+    tail = _linear_descendant_tail(colliding_rev, children)
+    if tail is None:
+        return None
+
+    # Next free revision: strictly above every existing revision (target or
+    # integration) so it cannot collide, rechained directly onto the unified
+    # promotion-target head.
+    all_revisions = target_revisions | set(int_chain)
+    max_revision = max(all_revisions, key=int)
+    new_revision = f"{int(max_revision) + 1:0{len(max_revision)}d}"
+
+    old_path = rev_to_path[colliding_rev]
+    new_path = _renumbered_filename(old_path, new_revision)
+    upserts: dict[str, str] = {
+        new_path: _rewrite_migration_source(
+            integration_sources[old_path], new_revision, target_head
+        )
+    }
+    deletes: list[str] = [old_path]
+
+    # Only the immediate descendant is rechained (old colliding revision -> new
+    # revision); the rest of the linear tail keeps its numbers because each of
+    # their predecessors is unchanged.
+    if tail:
+        child_rev = tail[0]
+        child_path = rev_to_path[child_rev]
+        upserts[child_path] = _rewrite_migration_source(
+            integration_sources[child_path], child_rev, new_revision
+        )
+
+    # Verify the reconciled integration set against the same combined-chain
+    # validator the guard uses — never return a plan that would not resolve.
+    reconciled = {
+        path: src for path, src in integration_sources.items() if path not in deletes
+    }
+    reconciled.update(upserts)
+    if validate_combined_migration_chain(promotion_target_filenames, reconciled):
+        return None
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    heads = find_heads(reconciled_chain)
+    if len(heads) != 1:
+        return None
+
+    return {
+        "upserts": upserts,
+        "deletes": deletes,
+        "old_path": old_path,
+        "new_path": new_path,
+        "old_revision": colliding_rev,
+        "new_revision": new_revision,
+        "new_down_revision": target_head,
+        "expected_schema_revision": heads[0],
+    }
+
+
 if __name__ == "__main__":
     _dir = sys.argv[1] if len(sys.argv) > 1 else None
     sys.exit(main(_dir))

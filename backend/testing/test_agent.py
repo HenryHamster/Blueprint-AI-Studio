@@ -14268,6 +14268,12 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True}),
     )
+    # The combined-Alembic-chain back-merge guard (step 3b) lists the PR's files
+    # before merging. This back-merge touches no migrations, so the guard returns
+    # "ok" and the merge proceeds; with no files the guard short-circuits before
+    # any diff/ref fetch. Unmocked it would hit the network, defer the merge, and
+    # the status would be "deferred" instead of "merged".
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
     mocker.patch("app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock)
 
     result = await hotfix_backmerge.open_backmerge_pr(

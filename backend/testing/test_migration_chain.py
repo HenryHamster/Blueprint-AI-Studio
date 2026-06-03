@@ -10,6 +10,7 @@ from app.migration_chain import (
     find_roots,
     main,
     parse_revision_identifiers,
+    plan_integration_side_renumber,
     plan_migration_reconciliation,
     rewrite_expected_schema_revision,
     validate_added_migrations,
@@ -570,6 +571,158 @@ def test_plan_reconciliation_stale_anchor_to_none_rechains():
     assert plan is not None
     rev, down = parse_revision_identifiers(plan["new_source"])
     assert (rev, down) == ("0138", "0137")
+
+
+# ── plan_integration_side_renumber (back-merge mirror planner) ──────────────
+
+
+def test_plan_integration_collision_no_descendants_renumbers_and_rechains():
+    """The integration migration whose revision collides with the immutable
+    promotion-target head is renumbered onto the unified head; with no
+    descendants it becomes the new head itself."""
+    # main (immutable): ... 0136 <- 0137(hotfix). automain independently reused
+    # 0137 for a feature migration anchored to the shared 0136 ancestor.
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        "backend/alembic/versions/0137_feature.py": _migration_src("0137", "0136"),
+    }
+    plan = plan_integration_side_renumber(target, integration)
+    assert plan is not None
+    assert plan["old_revision"] == "0137"
+    assert plan["new_revision"] == "0138"
+    assert plan["new_down_revision"] == "0137"
+    assert plan["old_path"] == "backend/alembic/versions/0137_feature.py"
+    assert plan["new_path"] == "backend/alembic/versions/0138_feature.py"
+    assert plan["expected_schema_revision"] == "0138"
+    assert plan["deletes"] == ["backend/alembic/versions/0137_feature.py"]
+    assert set(plan["upserts"]) == {"backend/alembic/versions/0138_feature.py"}
+    rev, down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0138_feature.py"]
+    )
+    assert (rev, down) == ("0138", "0137")
+    # The reconciled integration set revalidates clean against the immutable target.
+    assert validate_combined_migration_chain(target, plan["upserts"]) is None
+
+
+def test_plan_integration_collision_linear_tail_rechains_only_immediate_child():
+    """A colliding migration with a linear descendant tail: the colliding file is
+    renumbered above the unified head, the IMMEDIATE descendant is rechained onto
+    the new revision, and the rest of the tail keeps its numbers untouched."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        "backend/alembic/versions/0137_feat.py": _migration_src("0137", "0136"),  # C
+        "backend/alembic/versions/0138_b.py": _migration_src("0138", "0137"),  # D
+        "backend/alembic/versions/0139_c.py": _migration_src("0139", "0138"),  # E
+    }
+    plan = plan_integration_side_renumber(target, integration)
+    assert plan is not None
+    # C renumbered to max(all)+1 == 0140, anchored to the unified head 0137.
+    assert plan["old_revision"] == "0137"
+    assert plan["new_revision"] == "0140"
+    assert plan["new_down_revision"] == "0137"
+    assert plan["deletes"] == ["backend/alembic/versions/0137_feat.py"]
+    # upserts: the renamed colliding file AND the rechained immediate descendant.
+    assert set(plan["upserts"]) == {
+        "backend/alembic/versions/0140_feat.py",
+        "backend/alembic/versions/0138_b.py",
+    }
+    c_rev, c_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0140_feat.py"]
+    )
+    assert (c_rev, c_down) == ("0140", "0137")
+    # D keeps its revision 0138 but is rechained off the renumbered C (0140).
+    d_rev, d_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0138_b.py"]
+    )
+    assert (d_rev, d_down) == ("0138", "0140")
+    # E is the tail end — untouched (still 0139 <- 0138) and remains the head.
+    assert "backend/alembic/versions/0139_c.py" not in plan["upserts"]
+    assert plan["expected_schema_revision"] == "0139"
+    # The full reconciled integration set revalidates clean.
+    reconciled = {
+        p: s
+        for p, s in integration.items()
+        if p not in plan["deletes"]
+    }
+    reconciled.update(plan["upserts"])
+    assert validate_combined_migration_chain(target, reconciled) is None
+
+
+def test_plan_integration_no_collision_returns_none():
+    """An integration migration that already chains cleanly above the head (no
+    revision-id collision) needs no plan."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        "backend/alembic/versions/0138_new.py": _migration_src("0138", "0137"),
+    }
+    assert plan_integration_side_renumber(target, integration) is None
+
+
+def test_plan_integration_multiple_collisions_returns_none():
+    """More than one colliding integration migration is never auto-reconciled."""
+    target = ["0136_a.py", "0137_b.py"]
+    integration = {
+        "backend/alembic/versions/0136_x.py": _migration_src("0136", "0135"),
+        "backend/alembic/versions/0137_y.py": _migration_src("0137", "0136"),
+    }
+    assert plan_integration_side_renumber(target, integration) is None
+
+
+def test_plan_integration_fanout_tail_returns_none():
+    """A colliding migration with more than one child (a fan-out, not a linear
+    tail) is not mechanically reconcilable."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),  # C
+        "backend/alembic/versions/0138_d.py": _migration_src("0138", "0137"),  # child
+        "backend/alembic/versions/0139_e.py": _migration_src("0139", "0137"),  # child
+    }
+    assert plan_integration_side_renumber(target, integration) is None
+
+
+def test_plan_integration_parse_failure_returns_none():
+    """An unparseable integration migration file yields no plan."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),
+        "backend/alembic/versions/0138_d.py": "def upgrade():\n    pass\n",
+    }
+    assert plan_integration_side_renumber(target, integration) is None
+
+
+def test_plan_integration_not_anchored_to_shared_ancestor_returns_none():
+    """A colliding migration anchored to another integration migration (not the
+    shared promotion-target ancestor) is a non-mechanical fork — return None."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        # 0137 collides, but it anchors to 0150 which is NOT on the target chain.
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0150"),
+        "backend/alembic/versions/0150_b.py": _migration_src("0150", "0136"),
+    }
+    assert plan_integration_side_renumber(target, integration) is None
+
+
+def test_plan_integration_not_single_head_returns_none():
+    """A renumber that would not resolve to exactly one clean head (the
+    integration set carries a second, disconnected head) returns None — caught
+    by the combined-chain re-validation before returning."""
+    target = ["0136_prev.py", "0137_hotfix.py"]
+    integration = {
+        # 0137 collides and is anchored to the shared 0136 ancestor (mechanical),
+        # but 0150 is a disconnected second head that cannot be reconciled away.
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),
+        "backend/alembic/versions/0150_x.py": _migration_src("0150", "0149"),
+    }
+    assert plan_integration_side_renumber(target, integration) is None
+
+
+def test_plan_integration_empty_inputs_return_none():
+    """No promotion-target chain, or no integration migrations, yields no plan."""
+    integration = {
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),
+    }
+    assert plan_integration_side_renumber([], integration) is None
+    assert plan_integration_side_renumber(["0136_p.py", "0137_h.py"], {}) is None
 
 
 # ── rewrite_expected_schema_revision ────────────────────────────────────────

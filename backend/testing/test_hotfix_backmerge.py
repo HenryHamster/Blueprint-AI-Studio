@@ -132,6 +132,17 @@ def _patch_github(
             return_value={"status": "pending", "conclusion": None, "details": []}
         ),
     )
+    # Combined-Alembic-chain guard (step 3b). Default: the back-merge PR touches
+    # no migration files, so _validate_rollup_migration_chain returns ("ok", None)
+    # without fetching the diff or the target branch listing. Tests exercising the
+    # dual-head block / defer paths override these.
+    mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
+    mocker.patch(
+        "app.github.get_pull_request_diff", new=AsyncMock(return_value="")
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref", new=AsyncMock(return_value=[])
+    )
     return create_mock, merge_mock
 
 
@@ -790,6 +801,610 @@ async def test_open_backmerge_pr_skipped_when_single_branch(db_session, mocker):
     # And no Alert / task is raised for the inert skip.
     assert await _alerts_for(db_session, project.id) == []
     assert await _tasks_for(db_session, project.id) == []
+
+
+# ===========================================================================
+# Combined-Alembic-chain guard (step 3b) — block / defer before merge
+# ===========================================================================
+
+
+def _migration_diff(path: str, revision: str, down_revision: str) -> str:
+    """Build a minimal unified diff that ADDS one Alembic migration file.
+
+    Shaped so _extract_rollup_migration_sources reconstructs the added file's
+    revision / down_revision from the diff's ``+`` lines.
+    """
+    return (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        "@@ -0,0 +1,5 @@\n"
+        '+"""hotfix migration"""\n'
+        f"+revision = '{revision}'\n"
+        f"+down_revision = '{down_revision}'\n"
+        "+def upgrade():\n"
+        "+    pass\n"
+    )
+
+
+async def test_backmerge_blocked_on_same_revision_dual_head(db_session, mocker):
+    """A back-merge whose promotion-target diff adds a migration whose revision id
+    already exists on the integration branch is BLOCKED before merge: the merge
+    API is never called, an Alert is raised, and a dual-head-aware resolver is
+    spawned (carrying the merge-method=merge marker)."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 200, "html_url": "http://pr/200"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    # The back-merge PR touches a migration file.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    # main adds 0002_hotfix while automain already has its own 0002_feature.
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session, project.id, hotfix_task_id=uuid.uuid4()
+    )
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    assert result["pr_url"] == "http://pr/200"
+    # The merge API was NEVER called — the dual head was caught before merge.
+    merge_mock.assert_not_called()
+
+    # An operator-facing Alert was raised.
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert "blocked by Alembic chain" in alerts[0].title
+
+    # Exactly one migration-aware resolver was spawned.
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+    # Inherits the merge-method=merge gate + unified dedup marker.
+    assert resolver.context["backmerge_conflict"] is True
+    assert resolver.first_payload["base_branch"] == "automain"
+    assert resolver.first_payload["type"] == "create"
+    assert resolver.priority == hb._RESOLUTION_PRIORITY
+    # The prompt is Alembic-dual-head-aware, not the generic semantic-merge text.
+    prompt = resolver.first_payload["prompt"]
+    assert "EXPECTED_SCHEMA_REVISION" in prompt
+    assert "alembic upgrade head" in prompt
+    assert "immutable" in prompt.lower()
+    # A SPAWNED history row was written.
+    history = (
+        (
+            await db_session.execute(
+                select(TaskHistory).where(TaskHistory.task_id == resolver.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any(h.action == "SPAWNED" for h in history)
+
+
+async def test_backmerge_blocked_on_stale_anchor_dual_head(db_session, mocker):
+    """The stale-anchor variant: the added migration anchors to a revision that
+    is no longer the integration branch's head, which would create a second
+    Alembic head. The back-merge is BLOCKED (no merge) and a resolver spawned."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 201, "html_url": "http://pr/201"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py"}]
+        ),
+    )
+    # 0003 anchors to 0001, but automain's head is 0002 — a stale anchor.
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0003_hotfix.py", "0003", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+
+
+async def test_backmerge_clean_migration_still_merges(db_session, mocker):
+    """A back-merge whose added migration cleanly chains onto the integration
+    head (no collision, no stale anchor) passes the guard and merges normally —
+    the guard does not block valid migration back-merges."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 202, "html_url": "http://pr/202"},
+        merge_return={"merged": True, "message": "Merged"},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0003_hotfix.py"}]
+        ),
+    )
+    # 0003 chains cleanly onto the current head 0002 — valid.
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0003_hotfix.py", "0003", "0002"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    merge_mock.assert_called_once()
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_backmerge_defers_when_diff_fetch_fails(db_session, mocker):
+    """Fail-safe: when the back-merge PR touches migrations but the diff (or the
+    target-branch listing) cannot be fetched, the guard DEFERS — it must never
+    merge an unvalidated migration back-merge. The periodic reconciler retries."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 203, "html_url": "http://pr/203"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    # The diff fetch fails (transient GitHub error) — uncertainty -> defer.
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    assert result["status"] == "deferred"
+    assert result["error"] == "alembic_unverified"
+    # Never merged, never alerted, never spawned a task — just retry next cycle.
+    merge_mock.assert_not_called()
+    assert await _alerts_for(db_session, project.id) == []
+    assert await _tasks_for(db_session, project.id) == []
+
+
+async def test_backmerge_migration_block_dedupes_resolver(db_session, mocker):
+    """A periodic back-merge that keeps hitting the same dual head spawns exactly
+    ONE resolver across cycles — the project-wide dedup (shared with the conflict
+    / CI-fix paths) prevents a duplicate."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 204, "html_url": "http://pr/204"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+
+    for _ in range(3):
+        result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+        await db_session.commit()
+        assert result["status"] == "migration_conflict"
+
+    # One Alert, one resolver — deduped across all cycles.
+    assert len(await _alerts_for(db_session, project.id)) == 1
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+
+
+# ===========================================================================
+# Auto-reconcile a single-collision dual head (no resolver spawned)
+# ===========================================================================
+
+
+def _migration_source(revision: str, down_revision: str) -> str:
+    """A minimal, parseable Alembic migration source (revision + down_revision)."""
+    return (
+        '"""migration"""\n'
+        f"revision = '{revision}'\n"
+        f"down_revision = '{down_revision}'\n"
+        "def upgrade():\n    pass\n"
+        "def downgrade():\n    pass\n"
+    )
+
+
+def _branch_aware_versions(main_list: list[str], automain_list: list[str]) -> AsyncMock:
+    """Branch-keyed ``list_versions_at_ref``: promotion target vs integration.
+
+    ``ref`` is the 4th positional arg of ``list_versions_at_ref``.
+    """
+
+    async def _side(token, owner, repo, ref, project_id=None):
+        return list(main_list) if ref == "main" else list(automain_list)
+
+    return AsyncMock(side_effect=_side)
+
+
+async def test_backmerge_autoreconciles_single_collision_dual_head(db_session, mocker):
+    """A single integration-side migration colliding with the immutable
+    promotion-target hotfix migration is mechanically renumbered + rechained
+    INLINE: the renumber is pushed to the integration branch (automain) via
+    commit_file_changes (bumping EXPECTED_SCHEMA_REVISION), NO resolver task is
+    spawned, and the back-merge then re-attempts the merge and lands."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 300, "html_url": "http://pr/300"},
+        merge_return={"merged": True, "message": "Merged"},
+    )
+    # The back-merge PR adds main's 0002_hotfix (rev 0002, down 0001).
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # main carries the hotfix at 0002; automain carries its own feature at 0002.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        if path == "backend/app/main.py":
+            return 'EXPECTED_SCHEMA_REVISION = "0002"\n'
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+    commit_mock = mocker.patch(
+        "app.github.commit_file_changes", new=AsyncMock(return_value={"commit": "sha"})
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    # The renumber landed on the integration branch and the back-merge merged.
+    assert result["status"] == "merged"
+    merge_mock.assert_called_once()
+    commit_mock.assert_called_once()
+    call = commit_mock.call_args
+    # Pushed to the integration branch (automain) — NOT the PR head (main).
+    assert call.args[3] == "automain"
+    upserts = call.kwargs["upserts"]
+    # Renumbered integration migration + bumped main.py.
+    assert "backend/alembic/versions/0003_feature.py" in upserts
+    assert "0003" in upserts["backend/app/main.py"]
+    assert call.kwargs["deletes"] == ["backend/alembic/versions/0002_feature.py"]
+
+    # No resolver task was spawned — the dual head was reconciled mechanically.
+    assert await _tasks_for(db_session, project.id) == []
+    assert await _alerts_for(db_session, project.id) == []
+
+
+async def test_backmerge_ambiguous_dual_head_falls_back_to_resolver(db_session, mocker):
+    """When the block is NOT a single unambiguous collision (the integration
+    branch's post-divergence set is empty / the planner returns None), the
+    auto-reconcile pushes nothing and the guided dual-head resolver is spawned."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 301, "html_url": "http://pr/301"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # Both refs report the same listing — no post-divergence integration file to
+    # renumber, so the planner returns None (ambiguous / nothing mechanical).
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+    commit_mock = mocker.patch(
+        "app.github.commit_file_changes", new=AsyncMock(return_value={"commit": "sha"})
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+    commit_mock.assert_not_called()
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+
+
+async def test_backmerge_autoreconcile_push_error_falls_back(db_session, mocker):
+    """Fail-safe: if the reconcile commit push raises, NOTHING partial is relied
+    on — the merge is never attempted and the guided resolver is spawned."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 302, "html_url": "http://pr/302"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        if path == "backend/app/main.py":
+            return 'EXPECTED_SCHEMA_REVISION = "0002"\n'
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+    mocker.patch(
+        "app.github.commit_file_changes",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 500")),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+
+
+async def test_backmerge_autoreconcile_missing_schema_literal_falls_back(
+    db_session, mocker
+):
+    """If main.py has no EXPECTED_SCHEMA_REVISION literal, the auto-reconcile must
+    NOT guess: it pushes nothing and falls back to the guided resolver."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 303, "html_url": "http://pr/303"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        if path == "backend/app/main.py":
+            return "# no schema literal here\n"
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+    commit_mock = mocker.patch(
+        "app.github.commit_file_changes", new=AsyncMock(return_value={"commit": "sha"})
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "migration_conflict"
+    merge_mock.assert_not_called()
+    commit_mock.assert_not_called()
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+
+
+# ===========================================================================
+# _plan_backmerge_migration_reconciliation — unit (helper orchestration)
+# ===========================================================================
+
+
+async def test_plan_backmerge_reconciliation_single_collision(mocker):
+    """The helper filters to post-divergence integration migrations and returns a
+    plan for the single-collision case."""
+    from app import rollup_migration_validation as rmv
+
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        assert ref == "automain"  # integration sources read at the integration ref
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+
+    plan = await rmv._plan_backmerge_migration_reconciliation(
+        "tok", "acme", "widget", 400, "automain", "main"
+    )
+    assert plan is not None
+    assert plan["new_revision"] == "0003"
+    assert plan["expected_schema_revision"] == "0003"
+    assert plan["deletes"] == ["backend/alembic/versions/0002_feature.py"]
+
+
+async def test_plan_backmerge_reconciliation_empty_diff_returns_none(mocker):
+    """No added migration in the back-merge diff → nothing to reconcile → None."""
+    from app import rollup_migration_validation as rmv
+
+    mocker.patch(
+        "app.github.get_pull_request_diff", new=AsyncMock(return_value="")
+    )
+    plan = await rmv._plan_backmerge_migration_reconciliation(
+        "tok", "acme", "widget", 401, "automain", "main"
+    )
+    assert plan is None
+
+
+async def test_plan_backmerge_reconciliation_fetch_error_returns_none(mocker):
+    """A failure listing the promotion target's migrations is fail-safe → None."""
+    from app import rollup_migration_validation as rmv
+
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
+    )
+    plan = await rmv._plan_backmerge_migration_reconciliation(
+        "tok", "acme", "widget", 402, "automain", "main"
+    )
+    assert plan is None
 
 
 # ===========================================================================

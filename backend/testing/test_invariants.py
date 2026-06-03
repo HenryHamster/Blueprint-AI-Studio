@@ -253,6 +253,36 @@ class TestSchemaRevisionSync:
             "migration collisions (two branches each adding the same revision id)."
         )
 
+    def test_backmerge_guard_uses_combined_chain_check(self):
+        """The hotfix back-merge path must pass integration_branch to _validate_rollup_migration_chain.
+
+        Regression guard mirroring test_rollup_guard_uses_combined_chain_check: the
+        main->automain back-merge merges a hotfix migration on the promotion target
+        into the integration branch, which can collide with a feature migration added
+        on the integration branch since the last promotion (same-revision dual head /
+        duplicate revision id). The back-merge must reuse the same combined-chain
+        validator as the rollup guard, with the integration branch passed as the
+        target_branch — dropping it reverts to the in-isolation check that is blind to
+        exactly this cross-branch collision, letting an unvalidated merge wedge the
+        integration branch's `alembic upgrade head`.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "hotfix_backmerge.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        assert re.search(
+            r"_validate_rollup_migration_chain\s*\([^)]*\bintegration_branch\b",
+            content,
+            re.DOTALL,
+        ), (
+            "_validate_rollup_migration_chain must be called with integration_branch in "
+            "hotfix_backmerge.py. Without it the back-merge guard is blind to a hotfix "
+            "migration on the promotion target colliding with a feature migration on the "
+            "integration branch (same-revision dual head), and the immediate merge wedges "
+            "the integration branch's `alembic upgrade head`."
+        )
+
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
         no gaps, no branches, no dangling down_revision references, and no

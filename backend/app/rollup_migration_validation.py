@@ -2,11 +2,17 @@
 
 import app.github as github
 from app.migration_chain import (
+    plan_integration_side_renumber,
     plan_migration_reconciliation,
     validate_added_migrations,
     validate_combined_migration_chain,
 )
 from app.migration_path import is_migration_file
+
+# Alembic versions directory, used to resolve a bare migration basename (as
+# returned by ``github.list_versions_at_ref``) back to its full repo path for a
+# per-file text fetch.
+_ALEMBIC_VERSIONS_DIR = "backend/alembic/versions"
 
 
 def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
@@ -143,3 +149,94 @@ async def _plan_rollup_migration_reconciliation(
     except Exception:
         return None
     return plan_migration_reconciliation(existing_filenames, added_sources)
+
+
+async def _plan_backmerge_migration_reconciliation(
+    gh_token: str,
+    owner: str,
+    repo: str,
+    pr_number: int,
+    integration_branch: str,
+    promotion_target: str,
+) -> dict | None:
+    """Plan an integration-side renumber for a back-merge blocked by a dual head.
+
+    The BACK-MERGE mirror of :func:`_plan_rollup_migration_reconciliation`, with
+    the asymmetry the back-merge case demands: when ``promotion_target`` (e.g.
+    ``main``) is back-merged into ``integration_branch`` (e.g. ``automain``), the
+    promotion-target hotfix migration is ALREADY APPLIED IN PRODUCTION and is
+    therefore immutable — it must never be renumbered. The migration that must
+    move is the one on the INTEGRATION branch whose revision id independently
+    reused the same ``NNNN`` slot.
+
+    Steps (every one fail-safe to ``None`` — a failed fetch / empty result must
+    never produce an unsafe auto-rewrite; the caller falls back to the guided
+    resolver):
+
+      1. Fetch the back-merge PR diff and reconstruct its added (promotion-target)
+         migration sources. An empty result means the back-merge adds no migration
+         — nothing to reconcile — so return ``None``.
+      2. List the promotion target's current migration filenames; they supply the
+         immutable colliding revision id and the unified head.
+      3. List the integration branch's migration filenames, keep only the
+         POST-DIVERGENCE ones (basename not shared with the promotion target — so
+         the pre-divergence migrations common to both branches are dropped and
+         only the colliding integration migration + its descendant tail remain),
+         and read each one's full source at the integration ref.
+      4. Delegate to the pure :func:`plan_integration_side_renumber` planner,
+         which returns a plan only for the unambiguous single-collision case and
+         ``None`` for everything else.
+    """
+    try:
+        diff = await github.get_pull_request_diff(gh_token, owner, repo, pr_number)
+    except Exception:
+        return None
+    if not diff:
+        return None
+    added_sources = _extract_rollup_migration_sources(diff)
+    if not added_sources:
+        return None
+    try:
+        promotion_target_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, promotion_target
+        )
+    except Exception:
+        return None
+    if not promotion_target_filenames:
+        return None
+    try:
+        integration_filenames = await github.list_versions_at_ref(
+            gh_token, owner, repo, integration_branch
+        )
+    except Exception:
+        return None
+
+    # Drop the migrations shared with the promotion target (pre-divergence
+    # history) so only the colliding integration migration and its tail remain.
+    promotion_target_basenames = set(promotion_target_filenames)
+    post_divergence = [
+        fn for fn in integration_filenames if fn not in promotion_target_basenames
+    ]
+    if not post_divergence:
+        return None
+
+    integration_sources: dict[str, str] = {}
+    for basename in post_divergence:
+        path = f"{_ALEMBIC_VERSIONS_DIR}/{basename}"
+        try:
+            text = await github.get_file_text_at_ref(
+                path,
+                token=gh_token,
+                owner=owner,
+                repo=repo,
+                ref=integration_branch,
+            )
+        except Exception:
+            return None
+        if not text:
+            return None
+        integration_sources[path] = text
+
+    return plan_integration_side_renumber(
+        promotion_target_filenames, integration_sources
+    )
