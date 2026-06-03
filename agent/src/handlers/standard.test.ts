@@ -130,6 +130,7 @@ import { setupWorkspace, runClaudeCode } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-123';
@@ -274,7 +275,7 @@ describe('handleCreate configuration', () => {
   it('uses branchPrefix "task"', async () => {
     const task = { title: 'Task', description: '' };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+    expectCalledWith(setupWorkspace,
       OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), 'blueprint', undefined,
     );
   });
@@ -338,7 +339,7 @@ describe('handleRefactor configuration', () => {
   it('uses branchPrefix "refactor"', async () => {
     const task = { title: 'Refactor task', description: '' };
     await handleRefactor(TASK_ID, { prompt: 'Improve it' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+    expectCalledWith(setupWorkspace,
       OWNER, REPO, GH_TOKEN, 'main', 'refactor', TASK_ID, WS, expect.any(Object), 'blueprint', undefined,
     );
   });
@@ -560,7 +561,7 @@ describe('handleDocs configuration', () => {
   it('uses branchPrefix "docs"', async () => {
     const task = { title: 'Docs task', description: '' };
     await handleDocs(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+    expectCalledWith(setupWorkspace,
       OWNER, REPO, GH_TOKEN, 'main', 'docs', TASK_ID, WS, expect.any(Object), 'blueprint', undefined,
     );
   });
@@ -580,7 +581,7 @@ describe('handleQA configuration', () => {
   it('uses branchPrefix "task"', async () => {
     const task = { title: 'QA task', description: '' };
     await handleQA(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+    expectCalledWith(setupWorkspace,
       OWNER, REPO, GH_TOKEN, 'main', 'task', TASK_ID, WS, expect.any(Object), 'blueprint', undefined,
     );
   });
@@ -600,7 +601,7 @@ describe('handleDeps configuration', () => {
   it('uses branchPrefix "deps"', async () => {
     const task = { title: 'Deps task', description: '' };
     await handleDeps(TASK_ID, {}, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+    expectCalledWith(setupWorkspace,
       OWNER, REPO, GH_TOKEN, 'main', 'deps', TASK_ID, WS, expect.any(Object), 'blueprint', undefined,
     );
   });
@@ -698,7 +699,7 @@ describe('test baseline capture', () => {
     const relatedFiles = ['agent/src/index.ts', 'agent/src/handlers/standard.ts'];
     const task = { title: 'Task', description: '', context: { scope: 'medium' }, project_context: {} };
     await handleCreate(TASK_ID, { prompt: 'Do something', related_files: relatedFiles }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
-    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(
+    expectCalledWith(captureTestBaseline,
       WS, expect.any(Object), undefined, relatedFiles,
     );
   });

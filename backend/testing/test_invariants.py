@@ -4077,3 +4077,262 @@ class TestPrMergedLandedWriterAllowlist:
         # And it must NOT match the centralised-constant form the guarded setter
         # uses, so ``app/landed_signal.py`` is correctly left undetected.
         assert not self._DICT_PATTERN.search("        LANDED_SIGNAL_KEY: True,")
+
+
+# ── Typed mock-call helper convention ─────────────────────────────────────────
+#
+# Once a project-internal function's mock-call assertions adopt the type-safe
+# wrapper ``expectCalledWith`` (agent/src/utils/typed-mock-call.ts), signature
+# drift becomes a ``tsc`` error caught by the agent CI lane. Nothing, however,
+# stops a future edit from dropping back to the raw, untyped
+# ``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher for one of those
+# functions — silently re-opening the drift blind spot the wrapper closed.
+#
+# The agent Vitest suite is NOT run in CI and ``.github/workflows`` is
+# off-limits, so the durable lock must live in a BACKEND pytest test (which DOES
+# run in CI). This mirrors the precedent of ``test_agent_branch_invariants.py``,
+# which statically scans the agent TypeScript source.
+#
+# The allowlist is intentionally a precise, name-based set of the high-risk
+# project-internal helpers the typed-helper work locked. Node standard-library
+# spies (``fs.writeFileSync``, ``process.kill``) and other internal helpers
+# whose call-arg assertions remain legitimately raw are NOT in the set, so the
+# guard has zero false positives.
+
+# The protected project-internal functions: any call-argument assertion on one
+# of these in an agent ``*.test.ts`` file must go through ``expectCalledWith`` /
+# ``expectLastCalledWith`` / ``expectNotCalledWith`` rather than a raw matcher.
+_PROTECTED_INTERNAL_FNS = frozenset({"setupWorkspace", "captureTestBaseline"})
+
+# Resolve agent/src across local + Docker test environments. Mirrors
+# ``_resolve_agent_src_root`` in test_agent_branch_invariants.py:
+#   1. AGENT_SRC_ROOT env override.
+#   2. /agent/src (Docker volume-mount target used by scripts/test-backend.sh).
+#   3. Host filesystem at ../../agent/src from this test file.
+
+
+def _resolve_agent_src_for_typed_mock() -> "Path | None":
+    candidates: list[Path] = []
+    env_override = os.getenv("AGENT_SRC_ROOT")
+    if env_override:
+        candidates.append(Path(env_override))
+    candidates.append(Path("/agent/src"))
+    candidates.append(Path(__file__).resolve().parents[2] / "agent" / "src")
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+_TYPED_MOCK_AGENT_SRC = _resolve_agent_src_for_typed_mock()
+
+
+# Matches a RAW mock-call-argument assertion on a protected function:
+#   expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+#   expect(vi.mocked(idx.setupWorkspace)).not.toHaveBeenCalledWith(
+#   expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(
+# An optional ``<module>.`` qualifier (e.g. ``idx.setupWorkspace``) is allowed
+# on the receiver, and an optional ``.not`` may precede the matcher. Only the
+# argument-bearing matchers (``toHaveBeenCalledWith`` /
+# ``toHaveBeenLastCalledWith``) are flagged — the no-arg ``toHaveBeenCalled``
+# and ``.mockResolvedValue`` forms are correctly ignored because they carry no
+# argument list and so cannot drift on signature.
+_RAW_TYPED_MOCK_RE = re.compile(
+    r"vi\.mocked\(\s*(?:\w+\.)?(?P<fn>"
+    + "|".join(sorted(_PROTECTED_INTERNAL_FNS))
+    + r")\s*\)\s*\)\s*(?:\.not)?\."
+    r"(?P<matcher>toHaveBeenCalledWith|toHaveBeenLastCalledWith)"
+)
+
+
+def _strip_ts_comments(src: str) -> "list[tuple[int, str]]":
+    """Return ``(lineno, text)`` pairs with comment lines/regions removed.
+
+    Compact self-contained stripper so a commented-out example
+    (``// expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(...)``) does
+    not trip the guard. Handles ``//`` line comments, trailing ``//``, and
+    ``/* ... */`` block comments (single- and multi-line). String-literal
+    awareness is intentionally simple (matching the precedent stripper in
+    test_agent_branch_invariants.py) — adequate for the agent test sources.
+    """
+    result: list[tuple[int, str]] = []
+    in_block = False
+    for i, line in enumerate(src.splitlines(), start=1):
+        stripped = line
+        if in_block:
+            end = stripped.find("*/")
+            if end == -1:
+                continue
+            stripped = stripped[end + 2 :]
+            in_block = False
+        while True:
+            start = stripped.find("/*")
+            if start == -1:
+                break
+            end = stripped.find("*/", start + 2)
+            if end == -1:
+                stripped = stripped[:start]
+                in_block = True
+                break
+            stripped = stripped[:start] + stripped[end + 2 :]
+        slash_idx = stripped.find("//")
+        if slash_idx != -1:
+            stripped = stripped[:slash_idx]
+        lstripped = stripped.lstrip()
+        if not lstripped or lstripped.startswith("*"):
+            continue
+        result.append((i, stripped))
+    return result
+
+
+def _scan_for_raw_typed_mock(path: Path) -> "list[str]":
+    """Return ``file:lineno: <line>`` offenders in a single agent test file."""
+    src = path.read_text(encoding="utf-8")
+    offenders: list[str] = []
+    for lineno, line in _strip_ts_comments(src):
+        if _RAW_TYPED_MOCK_RE.search(line):
+            offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    return offenders
+
+
+def _iter_agent_test_files() -> "list[Path]":
+    """Glob every ``*.test.ts`` under the resolved agent/src tree."""
+    if _TYPED_MOCK_AGENT_SRC is None:
+        return []
+    return sorted(_TYPED_MOCK_AGENT_SRC.rglob("*.test.ts"))
+
+
+class TestTypedMockAssertConvention:
+    """Static guard: call-argument assertions on the high-risk project-internal
+    functions locked by the typed-helper work must use the type-safe wrapper
+    ``expectCalledWith`` (agent/src/utils/typed-mock-call.ts), never the raw
+    ``expect(vi.mocked(fn)).toHaveBeenCalledWith(...)`` matcher.
+
+    The raw matcher accepts ``any[]`` arguments, so a signature change to the
+    protected function silently leaves stale assertions green. The wrapper
+    constrains the asserted arguments to ``Parameters<F>``, turning drift into a
+    ``tsc`` error. Because the agent Vitest suite is not run in CI, this backend
+    guard is the only place the convention is CI-enforced.
+
+    Skips (does not fail) when ``agent/src`` is absent — the CI backend Docker
+    image builds from ``./backend`` only, so the agent source is not present
+    there; local runs and ``scripts/test-backend.sh`` mount ``agent/src`` and
+    enforce the guard.
+    """
+
+    _SKIP_REASON = (
+        "agent/src not available in this test environment "
+        "(CI docker context is ./backend; run locally or via "
+        "scripts/test-backend.sh from a checkout for enforcement)"
+    )
+
+    def test_protected_fn_allowlist_nonempty_and_resolved(self):
+        """The protected-function allowlist must not be accidentally emptied,
+        and at least one agent test file must be discoverable so the scan is
+        not silently vacuous. Mirrors ``test_target_files_exist`` in
+        test_agent_branch_invariants.py.
+        """
+        assert _PROTECTED_INTERNAL_FNS, (
+            "_PROTECTED_INTERNAL_FNS is empty — the typed-mock convention guard "
+            "would pass vacuously. Restore the protected function names "
+            "(setupWorkspace, captureTestBaseline, ...)."
+        )
+        if _TYPED_MOCK_AGENT_SRC is None:
+            pytest.skip(self._SKIP_REASON)
+        test_files = _iter_agent_test_files()
+        assert test_files, (
+            "No agent *.test.ts files found under "
+            f"{_TYPED_MOCK_AGENT_SRC} — the typed-mock scan would be vacuous. "
+            "Has the agent test layout moved?"
+        )
+
+    def test_protected_fns_use_typed_helper(self):
+        """No agent ``*.test.ts`` file may assert call arguments on a protected
+        project-internal function via the raw untyped matcher.
+
+        Correct form (agent/src/utils/typed-mock-call.ts)::
+
+            import { expectCalledWith } from '../utils/typed-mock-call.js';
+            expectCalledWith(setupWorkspace, workspace, { scope: 'medium' });
+
+        Forbidden form (re-opens the signature-drift blind spot)::
+
+            expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
+                workspace, { scope: 'medium' });
+
+        The ``.not`` and ``toHaveBeenLastCalledWith`` variants, and an optional
+        ``<module>.`` receiver qualifier (``idx.setupWorkspace``), are all
+        covered. No-argument forms (``toHaveBeenCalled()``,
+        ``.mockResolvedValue(...)``) are intentionally NOT flagged — they carry
+        no argument list to drift.
+        """
+        if _TYPED_MOCK_AGENT_SRC is None:
+            pytest.skip(self._SKIP_REASON)
+        all_offenders: list[str] = []
+        for path in _iter_agent_test_files():
+            all_offenders.extend(_scan_for_raw_typed_mock(path))
+
+        assert not all_offenders, (
+            "Raw untyped mock-call assertion found on a protected internal "
+            "function. The raw ``expect(vi.mocked(fn)).toHaveBeenCalledWith"
+            "(...)`` matcher accepts ``any[]`` args, so a signature change to "
+            f"one of {sorted(_PROTECTED_INTERNAL_FNS)} would leave the "
+            "assertion silently green. Use the type-safe wrapper "
+            "``expectCalledWith`` / ``expectLastCalledWith`` / "
+            "``expectNotCalledWith`` from "
+            "``agent/src/utils/typed-mock-call.ts`` instead:\n"
+            + "\n".join(all_offenders)
+        )
+
+    def test_typed_mock_scanner_detects_injected_regression(self):
+        """Sanity-check the scanner against synthetic snippets so a future tweak
+        to the regex (over-anchoring, over-stripping) does not silently weaken
+        the guard.
+
+        ``bad`` snippets — raw matchers on a protected function — must be
+        flagged. ``good`` snippets — the typed wrapper, no-arg matchers, raw
+        matchers on intentionally-unprotected Node stdlib spies and other
+        helpers, and commented-out examples — must NOT be flagged.
+        """
+        bad_snippets = [
+            "    expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(",
+            "    expect(vi.mocked(idx.setupWorkspace)).not.toHaveBeenCalledWith(",
+            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenLastCalledWith(",
+            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalledWith(WS, []);",
+        ]
+        good_snippets = [
+            # Typed wrapper — the convention we are enforcing.
+            "    expectCalledWith(setupWorkspace, workspace, { scope: 'm' });",
+            "    expectNotCalledWith(captureTestBaseline, WS);",
+            # No-argument matcher carries no signature to drift.
+            "    expect(vi.mocked(captureTestBaseline)).toHaveBeenCalled();",
+            "    expect(vi.mocked(setupWorkspace)).not.toHaveBeenCalled();",
+            # Setup, not an assertion.
+            "    vi.mocked(idx.setupWorkspace).mockResolvedValue({});",
+            # Intentionally-raw Node stdlib spies — NOT in the allowlist.
+            "    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(p, d);",
+            "    expect(vi.mocked(process.kill)).toHaveBeenCalledWith(-pid);",
+            # Other internal helpers left raw by design — NOT in the allowlist.
+            "    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(",
+            "    expect(vi.mocked(extractModuleInterfaces)).toHaveBeenCalledWith(",
+            # Commented-out example must be stripped before scanning.
+            "    // expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(x);",
+        ]
+
+        for snippet in bad_snippets:
+            lines = _strip_ts_comments(snippet)
+            assert lines, f"Bad snippet stripped as a comment: {snippet!r}"
+            _, line = lines[0]
+            assert _RAW_TYPED_MOCK_RE.search(line), (
+                f"Scanner failed to flag known-bad snippet: {snippet!r}"
+            )
+
+        for snippet in good_snippets:
+            lines = _strip_ts_comments(snippet)
+            if not lines:
+                # Comment-only line — correctly stripped, nothing to check.
+                continue
+            _, line = lines[0]
+            assert not _RAW_TYPED_MOCK_RE.search(line), (
+                f"Scanner false-positive on known-good snippet: {snippet!r}"
+            )
