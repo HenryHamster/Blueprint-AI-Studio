@@ -49,30 +49,27 @@ def _record_parent_failure(parent: Task, failure_class: str) -> None:
         )
 
 
-async def _maybe_block_on_preconditions(
+async def _resolve_terminal_parent_verdict(
     parent: Task,
     children: list,
     blocked_count: int,
-    session: AsyncSession,
-    broadcast_to_project,
-) -> bool:
-    """Shared blocked-vs-genuine-failure verdict for both parent terminal paths.
+) -> TaskStatus:
+    """Shared terminal-state verdict for both parent terminal paths.
 
-    Distinguishes blocked-on-precondition (recoverable, not a failure) from a
-    genuine terminal failure. A child counts as "blocked" if it is in the
-    first-class BLOCKED state OR (legacy/compat) was a FAILED child classified as
-    BLOCKED_PRECONDITION — the caller passes that tally in ``blocked_count``.
-    Genuine FAILED children are terminal failures; CANCELLED children only count
-    as terminal failures when they are genuine cancellations (review cap
-    exhausted, fix-loop diverged, operator/manual cancel, etc.), not historical
-    "Parent requeued — replaced by retry" bookkeeping rows.
+    Distinguishes blocked-on-precondition (recoverable, not a failure), genuine
+    terminal failures, and rollup-re-evaluation cases that should stay EVALUATING.
+    A child counts as "blocked" if it is in the first-class BLOCKED state OR
+    (legacy/compat) was a FAILED child classified as BLOCKED_PRECONDITION — the
+    caller passes that tally in ``blocked_count``. Genuine FAILED children are
+    terminal failures; CANCELLED children only count as terminal failures when
+    they are genuine cancellations (review cap exhausted, fix-loop diverged,
+    operator/manual cancel, etc.), not historical bookkeeping rows.
 
-    When every unsucceeded subtask is waiting on an upstream precondition and
-    none genuinely failed, move the parent into the first-class BLOCKED state (no
-    retry-budget burn, no direction-health ding), surface ONE deduplicated,
-    operator-visible precondition-blocker alert, and return True. Recovery is
-    owned by the auto-unblock sweep. Otherwise return False so the caller drives
-    the parent to FAILED.
+    When every unsucceeded subtask is waiting on an upstream precondition and no
+    cancellation or completed work is present, the parent should park BLOCKED.
+    When the unsucceeded set is mixed with non-genuine cancellations, or when any
+    completed child exists to roll up, the parent should stay EVALUATING so the
+    genuine outcome can be recomputed without burning retry budget.
 
     Centralizing the verdict here keeps the requeue-limit path and the
     all-children-terminal sweep from silently drifting apart.
@@ -81,52 +78,31 @@ async def _maybe_block_on_preconditions(
 
     failed_children = [c for c in children if c.status == TaskStatus.FAILED]
     blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
+    cancelled_children = [c for c in children if c.status == TaskStatus.CANCELLED]
     genuine_cancelled_children = [
         c
-        for c in children
-        if c.status == TaskStatus.CANCELLED and not _is_non_genuine_cancelled(c)
+        for c in cancelled_children
+        if not _is_non_genuine_cancelled(c)
+    ]
+    non_genuine_cancelled_children = [
+        c for c in cancelled_children if _is_non_genuine_cancelled(c)
     ]
     genuine_failures = (
         len(failed_children) - blocked_count + len(genuine_cancelled_children)
     )
     total_blocked = blocked_count + len(blocked_children)
+    has_completed_children = any(c.status == TaskStatus.COMPLETED for c in children)
 
-    if total_blocked <= 0 or genuine_failures > 0:
-        return False
+    if genuine_failures > 0:
+        return TaskStatus.FAILED
 
-    from app.task_blocked import enter_blocked_state
+    if has_completed_children or non_genuine_cancelled_children:
+        return TaskStatus.EVALUATING
 
-    msg = (
-        f"All {total_blocked} subtask(s) blocked on upstream "
-        f"precondition — awaiting recheck"
-    )
-    enter_blocked_state(
-        parent,
-        waiting_on="subtask precondition",
-        reason=msg,
-        source="parent",
-    )
-    parent.latest_status_message = msg
-    session.add(parent)
-    await session.commit()
-    from app.alert_dispatch import _maybe_create_precondition_blocker_alert
+    if total_blocked > 0:
+        return TaskStatus.BLOCKED
 
-    await _maybe_create_precondition_blocker_alert(
-        parent,
-        session,
-        blocker_kind="upstream dependency",
-        detail=parent.latest_status_message,
-    )
-    await broadcast_to_project(
-        str(parent.project_id),
-        "task_updated",
-        {"task_id": str(parent.id), "status": TaskStatus.BLOCKED},
-    )
-    logger.warning(
-        f"[REQUEUE] Parent {parent.id} BLOCKED — all {total_blocked} "
-        f"subtask(s) blocked on upstream precondition"
-    )
-    return True
+    return TaskStatus.FAILED
 
 
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
@@ -188,13 +164,66 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             else:
                 genuine_failed_children.append(_fc)
 
+        limit_total_blocked = limit_blocked_count + len(
+            [c for c in children if c.status == TaskStatus.BLOCKED]
+        )
+
         # Shared verdict: if every unsucceeded subtask is blocked on an upstream
         # precondition, the parent is recoverable-BLOCKED (no retry-budget burn,
         # no direction-health ding) — not force-failed. Mirrors the
         # all-children-terminal sweep below.
-        if await _maybe_block_on_preconditions(
-            parent, children, limit_blocked_count, session, broadcast_to_project
-        ):
+        limit_verdict = await _resolve_terminal_parent_verdict(
+            parent, children, limit_blocked_count
+        )
+        if limit_verdict == TaskStatus.BLOCKED:
+            from app.task_blocked import enter_blocked_state
+
+            msg = (
+                f"All {limit_total_blocked} "
+                f"subtask(s) blocked on upstream precondition — awaiting recheck"
+            )
+            enter_blocked_state(
+                parent,
+                waiting_on="subtask precondition",
+                reason=msg,
+                source="parent",
+            )
+            parent.latest_status_message = msg
+            session.add(parent)
+            await session.commit()
+            from app.alert_dispatch import _maybe_create_precondition_blocker_alert
+
+            await _maybe_create_precondition_blocker_alert(
+                parent,
+                session,
+                blocker_kind="upstream dependency",
+                detail=parent.latest_status_message,
+            )
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.BLOCKED},
+            )
+            logger.warning(
+                f"[REQUEUE] Parent {parent.id} BLOCKED — all {limit_total_blocked} "
+                f"subtask(s) blocked on upstream precondition"
+            )
+            return 0
+        if limit_verdict == TaskStatus.EVALUATING:
+            parent.status = TaskStatus.EVALUATING
+            parent.latest_status_message = (
+                "No failed subtasks to retry — awaiting rollup re-evaluation"
+            )
+            session.add(parent)
+            await session.commit()
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.EVALUATING},
+            )
+            logger.info(
+                f"[REQUEUE] Parent {parent.id} kept at EVALUATING — rollup re-evaluation needed"
+            )
             return 0
 
         # Genuine failure(s) and/or cancellation(s) present — fail permanently.
@@ -651,55 +680,51 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 persist_failure_category,
             )
 
-            # Re-apply PR #7487 on top of automain's shared-helper refactor.
-            # Classify the terminal child set BEFORE the pure-blocked verdict so a
-            # mix of genuinely-BLOCKED + non-genuine-cancelled children (with no
-            # genuine failure) is routed to rollup re-evaluation rather than being
-            # coerced to fully-BLOCKED — "all subtasks blocked" is factually wrong
-            # for a mixed set. ``_maybe_block_on_preconditions`` (below) recomputes
-            # the same tallies for the pure-blocked / genuine-failure verdict and
-            # is the single source of truth shared with the requeue-limit path.
-            from app.direction_outcomes import _is_non_genuine_cancelled
-
-            failed_children = [c for c in children if c.status == TaskStatus.FAILED]
-            blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
-            genuine_cancelled_children = [
-                c
-                for c in children
-                if c.status == TaskStatus.CANCELLED
-                and not _is_non_genuine_cancelled(c)
-            ]
-            non_genuine_cancelled = [
-                c
-                for c in children
-                if c.status == TaskStatus.CANCELLED
-                and _is_non_genuine_cancelled(c)
-            ]
-            genuine_failures = (
-                len(failed_children) - blocked_count + len(genuine_cancelled_children)
+            total_blocked = blocked_count + len(
+                [c for c in children if c.status == TaskStatus.BLOCKED]
             )
-            total_blocked = blocked_count + len(blocked_children)
 
-            if (
-                total_blocked > 0
-                and genuine_failures <= 0
-                and len(non_genuine_cancelled) > 0
-            ):
-                # Mixed set: some children are genuinely blocked, but others were
-                # superseded / handed-off / approved-then-capped (non-genuine
-                # cancellations) — there is no genuine failure. Parking the whole
-                # parent BLOCKED on a precondition would be factually wrong ("all
-                # subtasks blocked" is false) and could mask that a replacement
-                # clone or landed work is advancing the parent's real outcome.
-                # Route to rollup re-evaluation so that outcome — not a coerced
-                # precondition block — drives the parent. Don't burn the requeue
-                # budget; nothing was actually retried. Checked before the shared
-                # helper because that helper would otherwise BLOCK this set.
+            verdict = await _resolve_terminal_parent_verdict(
+                parent, children, blocked_count
+            )
+            if verdict == TaskStatus.BLOCKED:
+                from app.task_blocked import enter_blocked_state
+
+                msg = (
+                    f"All {total_blocked} "
+                    f"subtask(s) blocked on upstream precondition — awaiting recheck"
+                )
+                enter_blocked_state(
+                    parent,
+                    waiting_on="subtask precondition",
+                    reason=msg,
+                    source="parent",
+                )
+                parent.latest_status_message = msg
+                session.add(parent)
+                await session.commit()
+                from app.alert_dispatch import _maybe_create_precondition_blocker_alert
+
+                await _maybe_create_precondition_blocker_alert(
+                    parent,
+                    session,
+                    blocker_kind="upstream dependency",
+                    detail=parent.latest_status_message,
+                )
+                await broadcast_to_project(
+                    str(parent.project_id),
+                    "task_updated",
+                    {"task_id": str(parent.id), "status": TaskStatus.BLOCKED},
+                )
+                logger.warning(
+                    f"[REQUEUE] Parent {parent.id} BLOCKED — all {total_blocked} "
+                    f"subtask(s) blocked on upstream precondition"
+                )
+                return 0
+            if verdict == TaskStatus.EVALUATING:
                 parent.status = TaskStatus.EVALUATING
                 parent.latest_status_message = (
-                    f"{total_blocked} subtask(s) blocked alongside "
-                    f"{len(non_genuine_cancelled)} superseded/handed-off "
-                    f"subtask(s) — awaiting rollup re-evaluation"
+                    "No failed subtasks to retry — awaiting rollup re-evaluation"
                 )
                 session.add(parent)
                 await session.commit()
@@ -709,20 +734,8 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     {"task_id": str(parent.id), "status": TaskStatus.EVALUATING},
                 )
                 logger.info(
-                    f"[REQUEUE] Parent {parent.id} — mixed blocked "
-                    f"({total_blocked}) + non-genuine-cancelled "
-                    f"({len(non_genuine_cancelled)}) children, no genuine "
-                    f"failure; kept at EVALUATING for rollup re-evaluation"
+                    f"[REQUEUE] Parent {parent.id} kept at EVALUATING — rollup re-evaluation needed"
                 )
-                return 0
-
-            # Not a mixed set — defer the pure-blocked-vs-genuine-failure verdict
-            # to the shared helper (also used by the requeue-limit path) so the two
-            # terminal paths cannot drift apart. Its "all blocked" message is
-            # accurate here because the mixed case was already handled above.
-            if await _maybe_block_on_preconditions(
-                parent, children, blocked_count, session, broadcast_to_project
-            ):
                 return 0
 
             parent.status = TaskStatus.FAILED

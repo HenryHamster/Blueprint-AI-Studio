@@ -1132,22 +1132,20 @@ async def test_requeue_parent_failed_when_blocked_and_genuine_cancelled_child_mi
 
 
 @pytest.mark.asyncio
-async def test_requeue_parent_mixed_blocked_and_superseded_cancelled_not_parked(
-    tl_db, mocker
-):
-    """A mix of genuinely-BLOCKED + non-genuine-cancelled children (no genuine
-    failure) must NOT be coerced to fully-BLOCKED. Some children were superseded
-    by a replacement clone, so "all subtasks blocked" is factually wrong — the
-    parent is routed to EVALUATING for rollup re-evaluation instead, with no
-    precondition-blocker alert and no requeue-budget burn."""
-    alert = mocker.patch(
+async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, mocker):
+    """A blocked + superseded-cancelled mix re-evaluates for rollup instead of BLOCKED."""
+    precondition_alert = mocker.patch(
         "app.alert_dispatch._maybe_create_precondition_blocker_alert",
         new_callable=AsyncMock,
     )
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     session, _ = tl_db
     project = await _make_project(session)
-    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
     await _make_task(
         session,
         project.id,
@@ -1167,42 +1165,137 @@ async def test_requeue_parent_mixed_blocked_and_superseded_cancelled_not_parked(
     await _requeue_parent_task(parent, session)
 
     await session.refresh(parent)
-    # Not coerced to fully-BLOCKED — re-evaluated by rollup instead.
     assert parent.status == TaskStatus.EVALUATING
-    assert parent.status != TaskStatus.BLOCKED
+    assert parent.context.get("_requeue_count") == 0
     assert "awaiting rollup re-evaluation" in (parent.latest_status_message or "")
-    # Message must NOT claim all subtasks are blocked.
-    assert "All 1 subtask" not in (parent.latest_status_message or "")
-    # No precondition-blocker alert for a mixed set, and budget untouched.
-    alert.assert_not_called()
-    assert (parent.context or {}).get("_requeue_count", 0) == 0
+    assert "blocked on upstream precondition" not in (parent.latest_status_message or "")
+    assert precondition_alert.await_count == 0
+    precondition_alert.assert_not_awaited()
+    alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.task_id == parent.id,
+                    Alert.title.contains("Precondition blocker"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
 
 
 @pytest.mark.asyncio
-async def test_requeue_parent_blocked_only_when_purely_blocked(tl_db, mocker):
-    """When EVERY unsucceeded child is genuinely BLOCKED (no cancellations), the
-    parent still parks BLOCKED with an accurate count message."""
+@pytest.mark.parametrize(
+    ("child_specs", "expected_status", "expected_alert_calls", "expected_message"),
+    [
+        (
+            [
+                (
+                    TaskStatus.BLOCKED,
+                    None,
+                    "BLOCKER: dep not landed",
+                )
+            ],
+            TaskStatus.BLOCKED,
+            1,
+            "blocked on upstream precondition",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (
+                    TaskStatus.CANCELLED,
+                    {"_replaced_by_task_id": str(uuid.uuid4())},
+                    "Parent requeued — replaced by retry",
+                ),
+            ],
+            TaskStatus.EVALUATING,
+            0,
+            "awaiting rollup re-evaluation",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (
+                    TaskStatus.CANCELLED,
+                    {"failure_detail": "review_cap_exhausted"},
+                    "Cancelled after review cap exhausted",
+                ),
+            ],
+            TaskStatus.FAILED,
+            0,
+            "Re-evaluation limit reached",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (
+                    TaskStatus.FAILED,
+                    {"failure_category": "CODE_ERROR"},
+                    "tests failed",
+                ),
+            ],
+            TaskStatus.FAILED,
+            0,
+            "Re-evaluation limit reached",
+        ),
+        (
+            [
+                (TaskStatus.BLOCKED, None, "BLOCKER: dep not landed"),
+                (TaskStatus.COMPLETED, {"pr_merged": True}, None),
+            ],
+            TaskStatus.EVALUATING,
+            0,
+            "awaiting rollup re-evaluation",
+        ),
+    ],
+)
+async def test_requeue_limit_respects_mixed_terminal_child_sets(
+    tl_db,
+    mocker,
+    child_specs,
+    expected_status,
+    expected_alert_calls,
+    expected_message,
+):
+    """The limit path should distinguish pure blocked, mixed, and rollup cases."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    precondition_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+        new_callable=AsyncMock,
+    )
     session, _ = tl_db
     project = await _make_project(session)
-    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
-    for _ in range(2):
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+
+    for status, context, latest_status_message in child_specs:
         await _make_task(
             session,
             project.id,
-            status=TaskStatus.BLOCKED,
+            status=status,
             parent_task_id=parent.id,
-            latest_status_message="BLOCKER: dep not landed",
+            context=context,
+            latest_status_message=latest_status_message,
         )
 
     await _requeue_parent_task(parent, session)
 
     await session.refresh(parent)
-    assert parent.status == TaskStatus.BLOCKED
-    assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
-    # Count message is factually accurate: 2 blocked subtasks.
-    assert "All 2 subtask(s) blocked" in (parent.latest_status_message or "")
-    assert (parent.context or {}).get("_requeue_count", 0) == 0
+    assert parent.status == expected_status
+    assert expected_message in (parent.latest_status_message or "")
+    assert precondition_alert.await_count == expected_alert_calls
+    if expected_status == TaskStatus.BLOCKED:
+        assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+    else:
+        assert (parent.context or {}).get("blocker") is None
+        assert (parent.context or {}).get("_requeue_count") == 3
 
 
 @pytest.mark.asyncio
