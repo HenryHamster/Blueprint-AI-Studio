@@ -1642,6 +1642,160 @@ async def test_backmerge_single_collision_embeds_renumber_plan(db_session, mocke
     assert "verify" in prompt.lower()
 
 
+async def test_backmerge_collision_with_linear_descendant_embeds_full_plan(
+    db_session, mocker
+):
+    """A single-collision dual-head block whose colliding integration migration
+    has a LINEAR DESCENDANT tail hands the spawned resolver the FULL structured
+    renumber plan — the mechanically richer two-file shape: the colliding
+    migration is renamed+renumbered AND its immediate descendant is rechained
+    onto the new revision. Both rewritten bodies are stored under
+    ``context['backmerge_renumber_plan']['upserts']`` and embedded verbatim in
+    the resolver prompt. This is the production/embedding-level coverage for the
+    descendant-tail shape that ``test_migration_chain.py`` only exercises at the
+    pure-planner unit level.
+
+    Promotion target (main): ``0001_init`` + ``0002_hotfix``.
+    Integration branch (automain): ``0001_init`` + ``0002_feature`` +
+    ``0003_more`` (a linear descendant chaining onto 0002). The back-merge PR
+    adds main's ``0002_hotfix`` (rev 0002, down 0001), colliding with automain's
+    own ``0002_feature``. The planner renumbers ``0002_feature`` to ``0004``
+    (next free above every existing revision), rechained onto the promotion-
+    target head ``0002``; the descendant ``0003_more`` keeps its ``0003`` prefix
+    but its ``down_revision`` moves from ``0002`` to ``0004``; the reconciled
+    single head is ``0003``.
+    """
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 610, "html_url": "http://pr/610"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    # The back-merge PR adds main's 0002_hotfix (rev 0002, down 0001).
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # main carries the hotfix at 0002; automain carries its own feature at 0002
+    # PLUS a linear descendant 0003_more chaining onto 0002.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py", "0003_more.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        # Integration sources read at the integration ref.
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        if path.endswith("0003_more.py"):
+            return _migration_source("0003", "0002")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+    commit_mock = mocker.patch(
+        "app.github.commit_file_changes", new=AsyncMock(return_value={"commit": "sha"})
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    # (a) Blocked before merge — the merge API and the inline integration-branch
+    # push must both stay untouched (the block-path-pushes-nothing guarantee).
+    assert result["status"] == "migration_conflict"
+    assert result["pr_url"] == "http://pr/610"
+    merge_mock.assert_not_called()
+    commit_mock.assert_not_called()
+    for call in commit_mock.call_args_list:  # belt-and-braces
+        assert "automain" not in call.args
+
+    # (b) Exactly one migration-aware resolver spawned.
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+    resolver = resolvers[0]
+
+    # Derive the exact expected plan from the same mocked GitHub state, exactly
+    # as test_backmerge_single_collision_embeds_renumber_plan does.
+    expected_plan = await _plan_backmerge_migration_reconciliation(
+        "gh-token", "acme", "widget", 610, "automain", "main"
+    )
+    assert expected_plan is not None
+
+    # (c) The stored structured plan is the FULL two-file shape.
+    plan = resolver.context["backmerge_renumber_plan"]
+    assert plan is not None
+    # The colliding 0002_feature renumbers to the next free revision (0004),
+    # rechained onto the promotion-target head 0002.
+    assert plan["new_revision"] == "0004"
+    assert plan["new_down_revision"] == "0002"
+    assert plan["old_revision"] == "0002"
+    assert plan["old_path"] == "backend/alembic/versions/0002_feature.py"
+    assert plan["new_path"] == "backend/alembic/versions/0004_feature.py"
+    # The reconciled single head is 0003 (the descendant keeps its prefix).
+    assert plan["expected_schema_revision"] == "0003"
+    # ``deletes`` names the old colliding integration path being renamed away.
+    assert plan["deletes"] == ["backend/alembic/versions/0002_feature.py"]
+    # ``upserts`` contains BOTH rewritten files: the renamed+renumbered colliding
+    # migration AND the rechained immediate descendant.
+    assert set(plan["upserts"].keys()) == {
+        "backend/alembic/versions/0004_feature.py",
+        "backend/alembic/versions/0003_more.py",
+    }
+    # The stored plan matches the independently-derived planner output exactly.
+    assert plan == expected_plan
+
+    # The renamed+renumbered colliding migration carries the new revision id and
+    # is rechained onto the unified promotion-target head.
+    renamed_source = plan["upserts"]["backend/alembic/versions/0004_feature.py"]
+    assert "revision = '0004'" in renamed_source
+    assert "down_revision = '0002'" in renamed_source
+    # The immediate descendant keeps revision 0003 but rechains onto 0004.
+    descendant_source = plan["upserts"]["backend/alembic/versions/0003_more.py"]
+    assert "revision = '0003'" in descendant_source
+    assert "down_revision = '0004'" in descendant_source
+
+    # The reconciled integration set resolves to exactly one head (0003).
+    reconciled = {
+        "backend/alembic/versions/0004_feature.py": renamed_source,
+        "backend/alembic/versions/0003_more.py": descendant_source,
+    }
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    assert find_heads(reconciled_chain) == ["0003"]
+
+    # (d) The full plan is embedded in the resolver prompt.
+    prompt = resolver.first_payload["prompt"]
+    assert "Known-good renumber plan" in prompt
+    # The correct new revision and down_revision are rendered.
+    assert "0004" in prompt  # the new revision id
+    assert "0002_feature.py" in prompt  # the file being renamed
+    assert "0003_more.py" in prompt  # the rechained descendant
+    assert "EXPECTED_SCHEMA_REVISION" in prompt
+    # BOTH rewritten migration bodies are embedded verbatim — every rewritten
+    # source in expected_plan['upserts'] appears in the prompt.
+    for rewritten_source in expected_plan["upserts"].values():
+        assert rewritten_source in prompt
+    # Verify-then-apply framing, not a blind apply.
+    assert "verify" in prompt.lower()
+    assert "do NOT apply blindly" in prompt
+
+
 async def test_backmerge_nonmechanical_block_falls_back_to_prose(db_session, mocker):
     """A non-mechanical block (fan-out tail) yields a None plan, so the resolver
     falls back to the existing prose guidance with NO embedded plan: no
