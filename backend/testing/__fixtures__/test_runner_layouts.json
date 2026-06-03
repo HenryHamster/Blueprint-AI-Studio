@@ -1,0 +1,92 @@
+[
+  {
+    "name": "pytest_ini_root",
+    "files": [
+      {
+        "path": "pytest.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "pyproject_toml_with_pytest",
+    "files": [
+      {
+        "path": "pyproject.toml",
+        "content": "[tool.pytest.ini_options]\n"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "package_json_with_scripts_test",
+    "files": [
+      {
+        "path": "package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "makefile_with_test_target",
+    "files": [
+      {
+        "path": "Makefile",
+        "content": "build:\n\tgo build ./...\n\ntest:\n\tgo test ./...\n"
+      }
+    ],
+    "detectable": true,
+    "family": "make"
+  },
+  {
+    "name": "makefile_without_test_target",
+    "files": [
+      {
+        "path": "Makefile",
+        "content": "build:\n\tgo build ./...\n\nlint:\n\tgolangci-lint run\n"
+      }
+    ],
+    "detectable": false,
+    "family": null
+  },
+  {
+    "name": "cargo_toml_root",
+    "files": [
+      {
+        "path": "Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
+  },
+  {
+    "name": "tox_ini_root",
+    "files": [
+      {
+        "path": "tox.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "tox"
+  },
+  {
+    "name": "noxfile_root",
+    "files": [
+      {
+        "path": "noxfile.py"
+      }
+    ],
+    "detectable": true,
+    "family": "nox"
+  },
+  {
+    "name": "empty_repo",
+    "files": [],
+    "detectable": false,
+    "family": null
+  }
+]

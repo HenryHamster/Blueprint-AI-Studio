@@ -310,7 +310,7 @@ async def _detect_build_config(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         }
 
-        if {"pyproject.toml", "setup.py", "setup.cfg"} & names:
+        if {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini"} & names:
             _add_detected_directory(directories, languages, path, "python")
         if "package.json" in names:
             _add_detected_directory(directories, languages, path, "node")

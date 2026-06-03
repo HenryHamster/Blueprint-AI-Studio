@@ -9,8 +9,9 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
+import { readFile } from 'node:fs/promises';
 import { detectTestRunners, classifyTestExecution } from './test-runners.js';
-import type { BuildConfig } from './test-runners.js';
+import type { BuildConfig, TestRunner } from './test-runners.js';
 
 // We test detectTestRunners in isolation.  fs.existsSync and fs.readFileSync
 // are mocked per-test so the real filesystem is never consulted.
@@ -34,6 +35,51 @@ const mockFs = fs as unknown as {
   readFileSync: ReturnType<typeof vi.fn>;
   readdirSync: ReturnType<typeof vi.fn>;
 };
+const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+
+type LayoutFixture = {
+  name: string;
+  files: Array<{
+    path: string;
+    content?: string;
+  }>;
+  detectable: boolean;
+  family: 'pytest' | 'npm' | 'cargo' | 'make' | 'tox' | 'nox' | null;
+};
+
+const sharedLayouts = JSON.parse(
+  await readFile(
+    new URL('../../../backend/testing/__fixtures__/test_runner_layouts.json', import.meta.url),
+    'utf-8',
+  ),
+) as LayoutFixture[];
+
+function toWorkspaceRelativePath(p: string): string {
+  const prefix = `${WORKSPACE}/`;
+  return p.startsWith(prefix) ? p.slice(prefix.length) : p;
+}
+
+function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
+  if (runner.cmd === 'python3' && runner.args[0] === '-m' && runner.args[1] === 'pytest') {
+    return 'pytest';
+  }
+  if (runner.cmd === 'npm' && runner.args[0] === 'test') {
+    return 'npm';
+  }
+  if (runner.cmd === 'cargo' && runner.args[0] === 'test') {
+    return 'cargo';
+  }
+  if (runner.cmd === 'make' && runner.args[0] === 'test') {
+    return 'make';
+  }
+  if (runner.cmd === 'tox') {
+    return 'tox';
+  }
+  if (runner.cmd === 'nox') {
+    return 'nox';
+  }
+  return null;
+}
 
 // child_process.execSync is used only by isDockerAvailable — always return normally
 // (Docker "available") to keep tests deterministic.
@@ -350,6 +396,51 @@ describe('detectTestRunners — generic external-repo fallbacks (make/tox/nox/sc
     expect(runners[0].cmd).toBe('bash');
     expect(runners[0].args[0]).toBe('scripts/test-backend.sh');
   });
+});
+
+describe('detectTestRunners — shared layout parity fixtures', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+    mockFs.readdirSync.mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  for (const layout of sharedLayouts) {
+    it(layout.name, () => {
+      const filesByPath = new Map(layout.files.map((item) => [item.path, item]));
+      const fsMock = mockFs;
+
+      fsMock.existsSync.mockImplementation((p: string) => {
+        const rel = toWorkspaceRelativePath(p);
+        return filesByPath.has(rel);
+      });
+      fsMock.readFileSync.mockImplementation((p: string) => {
+        const rel = toWorkspaceRelativePath(p);
+        const file = filesByPath.get(rel);
+        if (!file) {
+          throw new Error(`unexpected readFileSync for ${rel}`);
+        }
+        return file.content ?? '';
+      });
+
+      const runners = detectTestRunners(undefined);
+
+      expect(runners.length > 0).toBe(layout.detectable);
+
+      if (!layout.detectable) {
+        expect(runners).toHaveLength(0);
+        return;
+      }
+
+      expect(runners).toHaveLength(1);
+      expect(familyFromRunner(runners[0])).toBe(layout.family);
+    });
+  }
 });
 
 describe('detectTestRunners — nested monorepo / external layouts', () => {

@@ -850,6 +850,190 @@ async def test_no_ci_makefile_detected_repo_blocks_merge_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_no_ci_pytest_ini_detected_repo_blocks_merge_on_failure(
+    db_session, mocker
+):
+    """An external no-CI repo whose only test marker is a BARE ``pytest.ini``
+    (no pyproject/setup) is auto-detected at onboarding as a Python project and
+    the gate runs ``python3 -m pytest`` as the merge verdict — a failing run
+    blocks the merge with no UNVERIFIED fall-open.
+
+    This composes the onboarding detector (which now recognizes a bare
+    pytest.ini, mirroring the agent's runtime detector) with the no-CI gate so a
+    pytest.ini-only repo is no longer silently merged UNVERIFIED.
+    """
+    from app.routers.admin_onboard import _detect_build_config
+
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    # --- Detection: a pytest.ini-only repo (no core Python manifest). ---
+    root_resp = MagicMock()
+    root_resp.status_code = 200
+    root_resp.json.return_value = [{"name": "pytest.ini", "type": "file"}]
+    with patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[root_resp],
+    ):
+        detected = await _detect_build_config("ghs_test", "acme", "widget")
+
+    assert any(
+        d.get("test_cmd") == "python3 -m pytest" for d in detected["directories"]
+    ), "bare pytest.ini repo must detect a `python3 -m pytest` command"
+
+    # --- Build a no-CI project from the DETECTED config. ---
+    project = Project(
+        name="pytest.ini no-CI repo",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch=BASE,
+        build_config={"requires_ci_checks": False, **detected},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # The gate runs because the pytest.ini-detected dir produced a test_cmd.
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    # The agent ran `python3 -m pytest` and it failed.
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": False,
+            "tests": [{"name": "tests/test_widget.py::test_x", "passed": False}],
+            "output": "FAILED tests/test_widget.py::test_x - assert 1 == 2\n1 failed",
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+    assert "test_x" in detail
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+
+    assert acted is True
+    merge_mock.assert_not_called()  # the failing pytest suite blocked the merge
+    assert await _unverified_merge_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_no_ci_pytest_ini_detected_repo_merges_on_pass(db_session, mocker):
+    """The passing-verdict half of the pytest.ini gate: a bare-pytest.ini repo
+    whose detected suite passes merges, and raises no UNVERIFIED alert."""
+    from app.routers.admin_onboard import _detect_build_config
+
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    root_resp = MagicMock()
+    root_resp.status_code = 200
+    root_resp.json.return_value = [{"name": "pytest.ini", "type": "file"}]
+    with patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[root_resp],
+    ):
+        detected = await _detect_build_config("ghs_test", "acme", "widget")
+
+    assert any(
+        d.get("test_cmd") == "python3 -m pytest" for d in detected["directories"]
+    )
+
+    project = Project(
+        name="pytest.ini no-CI repo (pass)",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch=BASE,
+        build_config={"requires_ci_checks": False, **detected},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "tests/test_widget.py::test_x", "passed": True}],
+            "output": "1 passed in 0.10s",
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "pass"
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+
+    assert acted is True
+    merge_mock.assert_called_once()
+    assert (
+        await _unverified_merge_alerts(db_session, project.id) == []
+    ), "a verified (passing) pytest.ini merge must not raise an UNVERIFIED alert"
+
+
+@pytest.mark.asyncio
 async def test_failing_verdict_raises_no_unverified_alert(db_session, mocker):
     _patch_github(mocker)
     merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)

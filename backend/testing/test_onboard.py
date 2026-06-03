@@ -1,5 +1,8 @@
 """Tests for onboarding endpoint — build config detection and auto_remediation defaults."""
 
+import json
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient
@@ -15,6 +18,17 @@ from app.routers.admin_onboard import (
 )
 
 TEST_USER_ID = "test-user-123"
+TEST_RUNNER_FIXTURE_PATH = (
+    Path(__file__).resolve().parent / "__fixtures__" / "test_runner_layouts.json"
+)
+
+
+def _load_test_runner_layouts():
+    with TEST_RUNNER_FIXTURE_PATH.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+TEST_RUNNER_LAYOUTS = _load_test_runner_layouts()
 
 
 def _listing_resp(items, status_code=200):
@@ -41,6 +55,29 @@ def _file_content_resp(text, status_code=200):
         "encoding": "base64",
     }
     return resp
+
+
+def _layout_root_listing(layout):
+    return [{"name": item["path"], "type": "file"} for item in layout["files"]]
+
+
+def _backend_family_for_directory(directory):
+    directory_type = directory.get("type")
+    if directory_type == "python":
+        return "pytest"
+    if directory_type == "node":
+        return "npm"
+    if directory_type == "rust":
+        return "cargo"
+
+    test_cmd = str(directory.get("test_cmd") or "").strip()
+    if test_cmd == "make test":
+        return "make"
+    if test_cmd == "tox":
+        return "tox"
+    if test_cmd == "nox":
+        return "nox"
+    return None
 
 
 @pytest.fixture(autouse=True)
@@ -1242,6 +1279,114 @@ class TestBuildConfigDetection:
                 )
 
     @pytest.mark.asyncio
+    async def test_detect_build_config_emits_pytest_for_bare_pytest_ini(self):
+        """A bare pytest.ini (no pyproject/setup) is recognized as a Python
+        project and emits the canonical 'python3 -m pytest' test_cmd, mirroring
+        the agent-side detector so the no-CI merge gate runs the real suite."""
+        root_files = [
+            {"name": "pytest.ini", "type": "file"},
+        ]
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[_listing_resp(root_files)],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["path"] == "./"
+        assert dir_config["type"] == "python"
+        assert dir_config["lint_cmd"] == "ruff check"
+        assert dir_config["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_emits_pytest_for_subdir_pytest_ini(self):
+        """A bare pytest.ini in a nested subdirectory is recognized the same way
+        a core Python manifest would be, emitting a runnable pytest test_cmd."""
+        root_files = [
+            {"name": "service", "type": "dir"},
+        ]
+        subdir_files = [
+            {"name": "pytest.ini", "type": "file"},
+        ]
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[
+                _listing_resp(root_files),
+                _listing_resp(subdir_files),
+            ],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["path"] == "service/"
+        assert dir_config["type"] == "python"
+        assert dir_config["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_pytest_ini_with_pyproject_no_duplicate(self):
+        """pytest.ini alongside a core Python manifest yields exactly one Python
+        directory — the (path, type) dedupe prevents a duplicate emission."""
+        root_files = [
+            {"name": "pytest.ini", "type": "file"},
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[_listing_resp(root_files)],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        python_dirs = [
+            d for d in config["directories"] if d.get("type") == "python"
+        ]
+        assert len(python_dirs) == 1
+        assert python_dirs[0]["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_pytest_ini_project_gates_no_ci_test_run(self):
+        """A pytest.ini-only build_config makes has_detectable_tests() and
+        should_run_no_ci_test_gate() both return True, so the no-CI merge gate
+        spawns verify_tests instead of falling open to UNVERIFIED."""
+        from app.ci_resolution import (
+            has_detectable_tests,
+            should_run_no_ci_test_gate,
+        )
+
+        root_files = [
+            {"name": "pytest.ini", "type": "file"},
+        ]
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[_listing_resp(root_files)],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        # An EXTERNAL no-CI project carrying the detected config: the gate must
+        # see a runnable suite and decide to run it (not fall open to UNVERIFIED).
+        project = Project(
+            name="pytest.ini no-CI repo",
+            user_id=TEST_USER_ID,
+            github_owner="owner",
+            github_repo="repo",
+            integration_branch="main",
+            build_config={"requires_ci_checks": False, **config},
+        )
+
+        assert has_detectable_tests(project) is True
+        assert (
+            should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
+        )
+
+    @pytest.mark.asyncio
     async def test_detect_build_config_forwards_ref_to_every_request(self):
         """When ``ref`` is provided it is forwarded as params={'ref': ...} to
         every GitHub contents call (root listing + each subdir)."""
@@ -1967,6 +2112,55 @@ class TestFallbackTestEntrypointDetection:
         assert (
             should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
         )
+
+
+class TestSharedTestRunnerLayouts:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "layout",
+        TEST_RUNNER_LAYOUTS,
+        ids=[layout["name"] for layout in TEST_RUNNER_LAYOUTS],
+    )
+    async def test_shared_layout_parity(self, layout):
+        """The onboarding detector agrees with the shared runner-family fixture."""
+        from app.ci_resolution import has_detectable_tests
+
+        root_resp = _listing_resp(_layout_root_listing(layout))
+
+        responses = [root_resp]
+        for item in layout["files"]:
+            if item["path"] == "Makefile":
+                responses.append(_file_content_resp(item.get("content", "")))
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=responses,
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        directories = config.get("directories") or []
+        assert bool(directories) is layout["detectable"]
+
+        project = Project(
+            name=f"shared-layout-{layout['name']}",
+            user_id=TEST_USER_ID,
+            github_owner="owner",
+            github_repo="repo",
+            integration_branch="main",
+            build_config=config,
+        )
+        assert has_detectable_tests(project) is layout["detectable"]
+
+        if not layout["detectable"]:
+            assert directories == []
+            assert not any(
+                str(item.get("test_cmd") or "").strip() for item in directories
+            )
+            return
+
+        assert len(directories) == 1
+        assert _backend_family_for_directory(directories[0]) == layout["family"]
 
 
 class TestMaybeRefreshEmptyBuildConfig:
