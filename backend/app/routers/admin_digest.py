@@ -15,9 +15,12 @@ from sqlmodel import select
 from app.database import get_session, resolve_dialect_name
 from app.digest_cache import DigestCache, get_digest_cache
 from app.digest_precompute import (
+    DIGEST_KIND,
     PRECOMPUTE_STALE_FALLBACK_SECONDS,
     annotate_precompute_metadata,
     get_precompute_cache,
+    read_shared,
+    shared_cache_key,
 )
 from app.time_utils import _to_naive_utc, _coerce_naive_utc
 from app.models import (
@@ -206,6 +209,28 @@ async def get_digest(
             precomputed=True,
             precomputed_at=entry.computed_wall_iso or None,
             precompute_age_seconds=time.monotonic() - entry.computed_monotonic,
+        )
+
+    # L2: cross-instance shared cache. On a NON-leader instance (or any instance
+    # right after a deploy) L1 is never worker-filled, so without this every
+    # dashboard poll would fall through to the heavy on-demand compute below —
+    # the dominant source of the 2026-06-03 statement_timeout 500s. A row here
+    # was written by the leader's worker tick, so it carries the SAME freshness
+    # guarantee as a local worker L1 entry. Fail-open: read_shared returns None
+    # on any error, falling through to the on-demand path unchanged.
+    shared = await read_shared(
+        shared_cache_key(DIGEST_KIND, hours, project_id),
+        max_age_seconds=PRECOMPUTE_STALE_FALLBACK_SECONDS,
+        session=session,
+    )
+    if shared is not None:
+        return annotate_precompute_metadata(
+            shared.payload,
+            precomputed=True,
+            precomputed_at=shared.computed_at.isoformat(),
+            precompute_age_seconds=max(
+                0.0, (_utcnow() - shared.computed_at).total_seconds()
+            ),
         )
 
     cache_key = ("digest", hours, str(project_id) if project_id else None)

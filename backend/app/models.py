@@ -1900,6 +1900,45 @@ class OrchestratorErrorAck(SQLModel, table=True):
     acknowledged_by: str = Field(default="")
 
 
+class DigestCacheEntry(SQLModel, table=True):
+    """Cross-instance shared L2 cache for precomputed digest / health payloads.
+
+    Written by the leader-only digest precompute worker (one row per hot key) and
+    read by every Cloud Run instance with a single primary-key SELECT when its
+    in-process L1 (``DigestPrecomputeCache``) misses — i.e. on non-leader
+    instances and on post-deploy cold starts. This replaces the per-request
+    5000-row ``_compute_digest`` / ``_compute_health_overview`` scan on those
+    instances (prod 2026-06-03 statement_timeout 500s) with a cheap keyed read,
+    at no new infra cost (lives on the existing Cloud SQL instance). See
+    ``app.digest_precompute`` for the read/write helpers and the freshness model.
+
+    ``cache_key`` is ``"{kind}:{window}:{project_id|global}"`` (kind ∈
+    {digest, health}). ``payload`` is the byte-identical compute output; readers
+    serve it only while ``computed_at`` is within
+    ``PRECOMPUTE_STALE_FALLBACK_SECONDS`` and otherwise fall back to the existing
+    on-demand path. The table is created on Postgres by alembic 0138 and on the
+    SQLite test fixture by ``SQLModel.metadata.create_all``.
+    """
+
+    # Explicit name: SQLModel would otherwise default to the lowercased class
+    # name (``digestcacheentry``), which would NOT match the alembic-created
+    # ``digestcache`` table.
+    __tablename__ = "digestcache"
+
+    cache_key: str = Field(sa_column=Column(String, primary_key=True))
+    payload: dict = Field(
+        default_factory=dict, sa_column=Column(JSONB, nullable=False)
+    )
+    computed_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    source: str = Field(
+        default="worker",
+        sa_column=Column(String, nullable=False, server_default="worker"),
+    )
+
+
 class MessageType(str, Enum):
     QUESTION = "QUESTION"
     FEEDBACK = "FEEDBACK"

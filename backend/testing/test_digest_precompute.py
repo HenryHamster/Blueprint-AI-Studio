@@ -21,10 +21,12 @@ from httpx import AsyncClient
 from app.digest_precompute import (
     DigestPrecomputeCache,
     annotate_precompute_metadata,
+    get_health_precompute_cache,
     get_precompute_cache,
     run_precompute_tick,
 )
 from app.routers import admin_digest as _admin_digest
+from app.routers import admin_health as _admin_health
 from testing.factories import make_project, make_task
 from app.models import TaskStatus
 
@@ -129,12 +131,14 @@ async def test_run_precompute_tick_primes_global_and_projects(monkeypatch):
     import app.digest_precompute as dp
 
     get_precompute_cache().clear()
+    get_health_precompute_cache().clear()
 
     proj_a = uuid.uuid4()
     proj_b = uuid.uuid4()
 
-    # Stub the heavy compute so the test is DB-free and fast; the digest body
-    # is exercised by the integration tests below.
+    # Stub the heavy computes so the test is DB-free and fast; the digest /
+    # health bodies are exercised by the integration tests below. The tick
+    # primes BOTH kinds (digest first, then health) over the same hot key set.
     async def _fake_compute(*, hours, project_id, session):
         return {
             "generated_at": "2026-05-31T00:00:00",
@@ -142,20 +146,32 @@ async def test_run_precompute_tick_primes_global_and_projects(monkeypatch):
             "_pid": str(project_id) if project_id else None,
         }
 
+    async def _fake_health(*, project_id, lookback_hours, session):
+        return {
+            "generated_at": "2026-05-31T00:00:00",
+            "_pid": str(project_id) if project_id else None,
+        }
+
     monkeypatch.setattr(_admin_digest, "_compute_digest", _fake_compute)
+    monkeypatch.setattr(_admin_health, "_compute_health_overview", _fake_health)
     monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=[proj_a, proj_b]))
 
     @asynccontextmanager
     async def _session_factory():
-        yield object()  # _compute_digest is stubbed; session is unused
+        yield object()  # computes are stubbed; L2 writes fail-open on the stub
 
     refreshed = await run_precompute_tick(_session_factory)
 
-    assert refreshed == 3  # global + 2 projects
+    # global + 2 projects, for EACH of digest and health = 6.
+    assert refreshed == 6
     cache = get_precompute_cache()
     assert cache.get_fresh(24, None, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, proj_a, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, proj_b, max_age_seconds=300.0) is not None
+    hcache = get_health_precompute_cache()
+    assert hcache.get_fresh(24, None, max_age_seconds=300.0) is not None
+    assert hcache.get_fresh(24, proj_a, max_age_seconds=300.0) is not None
+    assert hcache.get_fresh(24, proj_b, max_age_seconds=300.0) is not None
 
 
 @pytest.mark.asyncio
@@ -166,6 +182,7 @@ async def test_run_precompute_tick_survives_per_key_failure(monkeypatch):
     import app.digest_precompute as dp
 
     get_precompute_cache().clear()
+    get_health_precompute_cache().clear()
 
     bad = uuid.uuid4()
     good = uuid.uuid4()
@@ -175,7 +192,13 @@ async def test_run_precompute_tick_survives_per_key_failure(monkeypatch):
             raise RuntimeError("boom")
         return {"generated_at": "t", "completed_count": 0}
 
+    async def _flaky_health(*, project_id, lookback_hours, session):
+        if project_id == bad:
+            raise RuntimeError("boom")
+        return {"generated_at": "t"}
+
     monkeypatch.setattr(_admin_digest, "_compute_digest", _flaky_compute)
+    monkeypatch.setattr(_admin_health, "_compute_health_overview", _flaky_health)
     monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=[bad, good]))
 
     @asynccontextmanager
@@ -185,11 +208,15 @@ async def test_run_precompute_tick_survives_per_key_failure(monkeypatch):
     refreshed = await run_precompute_tick(_session_factory)
 
     cache = get_precompute_cache()
-    # global + good succeeded; bad failed.
-    assert refreshed == 2
+    hcache = get_health_precompute_cache()
+    # For each kind: global + good succeeded; bad failed. 2 kinds x 2 = 4.
+    assert refreshed == 4
     assert cache.get_fresh(24, None, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, good, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, bad, max_age_seconds=300.0) is None
+    assert hcache.get_fresh(24, None, max_age_seconds=300.0) is not None
+    assert hcache.get_fresh(24, good, max_age_seconds=300.0) is not None
+    assert hcache.get_fresh(24, bad, max_age_seconds=300.0) is None
 
 
 @pytest.mark.asyncio
