@@ -442,6 +442,9 @@ async def test_no_ci_awaiting_verdict_while_verify_running_then_passes(
     merge_mock = mocker.patch(
         "app.github.merge_pull_request", return_value={"merged": True}
     )
+    stall_alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", return_value=None
+    )
 
     project = await _make_no_ci_project(db_session, with_test_cmd=True)
     parent = _make_parent_task(db_session, project)
@@ -480,6 +483,7 @@ async def test_no_ci_awaiting_verdict_while_verify_running_then_passes(
     )
     # The merge must NOT have been attempted on the awaiting poll.
     merge_mock.assert_not_called()
+    stall_alert_mock.assert_not_called()
 
     # ── Terminal poll ───────────────────────────────────────────────────────
     # The agent finishes: plant a PASSING verdict and mark the task COMPLETED.
@@ -1947,6 +1951,7 @@ def test_orchestrator_no_ci_gate_verdict_state_wiring():
         'ci_loop["verify_tests_task_id"]',
         'ci_loop["verify_tests_retries"]',
         'ci_loop["verify_tests_output"] = _detail[:4000]',
+        'ci_loop["ci_checks_seen"] = True',
         'ci_loop.get("verify_tests_verdict")',
         'ci_loop.get("verify_tests_output"',
     ]
