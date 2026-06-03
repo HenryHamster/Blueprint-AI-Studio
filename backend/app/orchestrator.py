@@ -2697,7 +2697,13 @@ async def orchestrator_worker():
                                 # site in this loop.
                                 continue
                             else:
-                                record_pool_lease_hit()
+                                record_pool_lease_hit(
+                                    account=(
+                                        runtime_selection.account.get("id")
+                                        if runtime_selection.account
+                                        else None
+                                    )
+                                )
                                 logger.info(
                                     f"[ORCHESTRATOR] Warm-pool dispatch: task {task.id} "
                                     f"leased pool VM {_leased_member.vm_instance_id} "

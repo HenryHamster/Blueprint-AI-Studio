@@ -425,6 +425,18 @@ function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {
           <span><span className="text-neutral-500">hits</span>: <span className="font-mono text-emerald-400">{funnel.pool_lease_hits}</span></span>
           <span><span className="text-neutral-500">cold</span>: <span className="font-mono text-neutral-300">{funnel.cold_dispatches}</span></span>
           <span><span className="text-neutral-500">hit rate</span>: <span className="font-mono text-neutral-300">{hitRate === null || hitRate === undefined ? '—' : `${Math.round(hitRate * 100)}%`}</span></span>
+          {(funnel.lease_miss_total ?? 0) > 0 && (
+            <span data-testid="pool-lease-misses">
+              <span className="text-neutral-500">misses</span>:{' '}
+              <span className="font-mono text-rose-400">{funnel.lease_miss_total}</span>
+              <span className="text-neutral-600">
+                {' '}({Object.entries(funnel.lease_miss_by_reason ?? {})
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([reason, n]) => `${reason} ${n}`)
+                  .join(', ')})
+              </span>
+            </span>
+          )}
         </>
       )}
     </div>
