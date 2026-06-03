@@ -11,7 +11,10 @@ Two modes:
   print each breach (path, current lines, cap). Exits non-zero if any file exceeds
   its cap, zero when clean.
 * ``--fix`` mode: for every breached file, rewrite *only* that file's cap in the
-  tracked JSON to the canonical ``bump_size_limit`` policy value, preserving key
+  tracked JSON to the canonical ``bump_size_limit`` policy value; AND for every
+  uncapped source file over ``_COVERAGE_THRESHOLD`` lines (the complementary
+  coverage guardrail the ``test_*_no_uncapped_large_file`` meta-tests enforce),
+  ADD a new cap entry sized at the same policy headroom. Both paths preserve key
   order and the leading ``_doc`` field so the diff stays minimal. After ``--fix``
   re-running check mode passes. The bump stays policy-consistent so the guardrail
   still catches genuine runaway growth.
@@ -62,6 +65,41 @@ _DEFAULT_JSON_PATH = os.path.join(os.path.dirname(__file__), "module_size_limits
 # Section order is significant: matches the JSON's section order so output and
 # --sections=all iteration are deterministic.
 SECTIONS = ("backend", "agent", "frontend")
+
+# Coverage threshold for the complementary guardrail: a source file larger than
+# this with NO cap entry at all is invisible to the per-file caps and can grow
+# without limit. Mirrors ``test_invariants._COVERAGE_THRESHOLD`` (and the agent /
+# frontend coverage meta-tests). Kept in sync by a guard test in
+# test_size_limits_checker.py. NEVER mirror this by importing test_invariants —
+# that module pulls in pytest/app machinery and would break the stdlib-only,
+# dependency-free contract this checker guarantees.
+_COVERAGE_THRESHOLD = 1500
+
+
+def _is_frontend_excluded(rel_path: str) -> bool:
+    """Mirror test_invariants._is_frontend_excluded: skip frontend test/type files."""
+    return rel_path.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel_path.startswith(
+        "test/"
+    )
+
+
+def _is_agent_excluded(rel_path: str) -> bool:
+    """Mirror test_invariants._is_agent_excluded: skip agent test/type files."""
+    return rel_path.endswith((".test.ts", ".d.ts"))
+
+
+def _no_exclusion(_rel_path: str) -> bool:
+    return False
+
+
+# Per-section scan rules for the uncapped-file coverage guardrail. Mirrors the
+# suffix tuples and exclusion predicates the coverage meta-tests in
+# test_invariants.py use, so --fix adds the exact caps those tests demand.
+_SECTION_SCAN = {
+    "backend": ((".py",), _no_exclusion),
+    "agent": ((".ts",), _is_agent_excluded),
+    "frontend": ((".ts", ".tsx"), _is_frontend_excluded),
+}
 
 
 def resolve_section_root(section: str, repo_root: str) -> str | None:
@@ -124,6 +162,34 @@ def scan_section(caps: dict, root: str) -> list[dict]:
             }
         )
     return records
+
+
+def scan_uncapped_section(
+    root: str, caps: dict, suffixes: tuple, is_excluded
+) -> list[dict]:
+    """Walk ``root`` for source files over ``_COVERAGE_THRESHOLD`` lines that have
+    NO cap entry in ``caps``.
+
+    Mirrors ``test_invariants._scan_uncapped``: collects every file whose name
+    ends in one of ``suffixes``, is not skipped by ``is_excluded``, exceeds the
+    coverage threshold, and is absent from ``caps``. Returns one record per file
+    (``{rel, path, count}``) sorted largest-first. Tree-relative paths use forward
+    slashes to match the JSON key convention.
+    """
+    offenders = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if not name.endswith(suffixes):
+                continue
+            abs_path = os.path.join(dirpath, name)
+            rel = os.path.relpath(abs_path, root).replace(os.sep, "/")
+            if is_excluded(rel) or rel in caps:
+                continue
+            count = count_lines(abs_path)
+            if count > _COVERAGE_THRESHOLD:
+                offenders.append({"rel": rel, "path": abs_path, "count": count})
+    offenders.sort(key=lambda rec: rec["count"], reverse=True)
+    return offenders
 
 
 def load_limits(json_path: str) -> dict:
@@ -219,8 +285,23 @@ def main(argv: list[str] | None = None) -> int:
         if rec["breach"]
     ]
 
+    # Complementary guardrail: uncapped source files over the coverage threshold.
+    # A capped-but-breached file is handled by ``breaches`` above; a file with no
+    # cap at all is invisible to that scan, so walk each scoped section's tree.
+    uncapped: list[tuple[str, dict]] = []
+    for section in args.sections:
+        if section in skipped:
+            continue
+        root = resolve_section_root(section, args.repo_root)
+        if root is None:
+            continue
+        suffixes, is_excluded = _SECTION_SCAN[section]
+        caps = data.get(section) or {}
+        for rec in scan_uncapped_section(root, caps, suffixes, is_excluded):
+            uncapped.append((section, rec))
+
     if args.fix:
-        if not breaches:
+        if not breaches and not uncapped:
             print("No breaches to fix — all scoped files within cap.")
             return 0
         for section, rec in breaches:
@@ -230,10 +311,23 @@ def main(argv: list[str] | None = None) -> int:
                 f"[fix]  {section}/{rec['rel']}: {rec['count']} lines — "
                 f"cap {rec['cap']} -> {new_cap}"
             )
+        for section, rec in uncapped:
+            new_cap = _bump_size_limit(rec["count"])
+            data.setdefault(section, {})[rec["rel"]] = new_cap
+            print(
+                f"[add]  {section}/{rec['rel']}: {rec['count']} lines — "
+                f"added cap {new_cap}"
+            )
         write_limits(args.json_path, data)
-        print(f"Bumped {len(breaches)} cap(s) in {args.json_path}.")
+        actions = []
+        if breaches:
+            actions.append(f"Bumped {len(breaches)} cap(s)")
+        if uncapped:
+            actions.append(f"Added {len(uncapped)} cap(s)")
+        print(f"{'; '.join(actions)} in {args.json_path}.")
         return 0
 
+    exit_code = 0
     if breaches:
         for section, rec in breaches:
             print(
@@ -244,10 +338,24 @@ def main(argv: list[str] | None = None) -> int:
             f"\n{len(breaches)} size breach(es). Run with --fix to bump the "
             f"breached caps to the canonical policy value."
         )
-        return 1
+        exit_code = 1
 
-    print("All scoped files within their size caps.")
-    return 0
+    if uncapped:
+        for section, rec in uncapped:
+            print(
+                f"[uncapped] {section}/{rec['rel']}: {rec['count']} lines "
+                f"(threshold: {_COVERAGE_THRESHOLD}) — NO cap entry"
+            )
+        print(
+            f"\n{len(uncapped)} uncapped file(s) over {_COVERAGE_THRESHOLD} lines "
+            f"violate the size guardrail (no cap entry). Run with --fix to add a "
+            f"cap entry (current size + policy headroom)."
+        )
+        exit_code = 1
+
+    if exit_code == 0:
+        print("All scoped files within their size caps.")
+    return exit_code
 
 
 if __name__ == "__main__":

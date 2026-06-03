@@ -220,6 +220,23 @@ describe('matchesSizeBreachSignature', () => {
     expect(matchesSizeBreachSignature(checkerOutput)).toBe(true);
   });
 
+  it('matches the missing-cap coverage failure (threshold + NO cap entry)', () => {
+    // test_*_no_uncapped_large_file emits this shape; its remediation is to ADD
+    // a cap, which check_size_limits.py --fix now does deterministically.
+    const coverageFailure =
+      '1 source file(s) exceed 1500 lines with NO cap entry under \'agent\' in\n' +
+      'backend/testing/module_size_limits.json:\n\n' +
+      '  - prompts/huge.ts has 1700 lines (threshold: 1500)\n';
+    expect(matchesSizeBreachSignature(coverageFailure)).toBe(true);
+  });
+
+  it('matches the local checker [uncapped] line form', () => {
+    const checkerOutput =
+      '[uncapped] agent/prompts/huge.ts: 1700 lines (threshold: 1500) — NO cap entry\n\n' +
+      '1 uncapped file(s) over 1500 lines violate the size guardrail (no cap entry).';
+    expect(matchesSizeBreachSignature(checkerOutput)).toBe(true);
+  });
+
   it('does NOT match an ordinary assertion failure', () => {
     expect(
       matchesSizeBreachSignature('AssertionError: expected 1 to equal 2'),
@@ -231,6 +248,14 @@ describe('matchesSizeBreachSignature', () => {
     // anchor) must not trigger a cap bump.
     expect(
       matchesSizeBreachSignature('file has 12 lines (limit: 5) of diff context'),
+    ).toBe(false);
+  });
+
+  it('does NOT match a "threshold" mention without a size anchor', () => {
+    // A bare "(threshold: N)" with no module_size_limits.json / guardrail anchor
+    // must not be mistaken for a missing-cap coverage failure.
+    expect(
+      matchesSizeBreachSignature('retry budget has 3 lines (threshold: 5) remaining'),
     ).toBe(false);
   });
 });
@@ -267,6 +292,39 @@ describe('testFixLoop — deterministic size-breach remediation', () => {
     expect(bumpCall).toBeDefined();
     expect(bumpCall?.[1]).toEqual(['backend/testing/check_size_limits.py', '--fix']);
     // The breach was resolved deterministically — no refactor/LLM path taken.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('auto-adds a missing cap for an uncapped large file — no LLM call', async () => {
+    const COVERAGE_FAILURE =
+      'Command failed: npm test\n' +
+      '1 source file(s) exceed 1500 lines with NO cap entry under \'agent\' in\n' +
+      'backend/testing/module_size_limits.json:\n\n' +
+      '  - prompts/huge.ts has 1700 lines (threshold: 1500)\n';
+    let testRunCalls = 0;
+    execFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'python3' && args.includes('--fix')) {
+        return Promise.resolve(
+          '[add]  agent/prompts/huge.ts: 1700 lines — added cap 1900\nAdded 1 cap(s).',
+        );
+      }
+      testRunCalls += 1;
+      if (testRunCalls === 1) return Promise.reject(new Error(COVERAGE_FAILURE));
+      return Promise.resolve('Tests  3 passed (3)');
+    });
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    const bumpCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
+    );
+    expect(bumpCall?.[1]).toEqual(['backend/testing/check_size_limits.py', '--fix']);
+    // Remediated deterministically — the refactor-biased LLM path never ran.
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 

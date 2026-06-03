@@ -1975,6 +1975,36 @@ export function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();
 }
 
+/**
+ * Register the `sizecap` custom merge driver in the workspace's LOCAL git config.
+ *
+ * `.gitattributes` maps `backend/testing/module_size_limits.json` to
+ * `merge=sizecap`, but git ignores that mapping unless the driver command is
+ * registered in the repo's `.git/config` — and a clone does NOT carry git config.
+ * So every workspace-prep site (cold clone, warm reuse, setupWorkspace) must call
+ * this so a rebase/merge of competing size-cap bumps auto-resolves with no markers
+ * (max-cap union; see backend/testing/merge_size_limits.py). Idempotent — git
+ * config overwrites the keys on repeat calls. The driver runs from the worktree
+ * root, so the script path is repo-relative. Best-effort: a failure here only
+ * means the JSON falls back to the normal conflict path, so we log and continue.
+ */
+export function registerSizeCapMergeDriver(workspace = WORKSPACE): void {
+  try {
+    execFileSync(
+      'git',
+      ['-C', workspace, 'config', 'merge.sizecap.name', 'max-cap union merge for module_size_limits.json'],
+      { encoding: 'utf-8', timeout: 30_000 },
+    );
+    execFileSync(
+      'git',
+      ['-C', workspace, 'config', 'merge.sizecap.driver', 'python3 backend/testing/merge_size_limits.py %O %A %B'],
+      { encoding: 'utf-8', timeout: 30_000 },
+    );
+  } catch (e) {
+    log(`registerSizeCapMergeDriver: failed to register sizecap merge driver: ${String(e)}`);
+  }
+}
+
 /** Non-blocking exec that mirrors execFileSync's error shape.
  *  Use this for long-running commands (test runners, build tools) so the
  *  event loop stays free and the setInterval heartbeat keeps firing.
@@ -2188,6 +2218,9 @@ export async function setupWorkspace(
   sendHeartbeatSync(taskId, `Clone complete, configuring workspace...`);
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
+  // Activate the max-cap union merge driver for module_size_limits.json so a
+  // pre-push rebase of competing cap bumps auto-resolves (see .gitattributes).
+  registerSizeCapMergeDriver(WORKSPACE);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
   // Namespace is resolved by the caller (from the raw task) and threaded in, so
   // it survives an empty build_config.directories (resolveBuildConfig → undefined).

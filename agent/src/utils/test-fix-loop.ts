@@ -97,17 +97,24 @@ function buildFixLoopGuidanceSuffix(): string {
  * which has historically prescribed a code-extraction refactor against the
  * explicit instruction (losing a full strategic cycle on a documented run).
  *
- * Two structured numeric forms are recognized:
- *  - the test_invariants assertion: "<path> has <N> lines (limit: <M>)."
+ * Three structured forms are recognized — two cap-breach forms and the
+ * complementary missing-cap (coverage meta-test) form:
+ *  - the test_invariants breach assertion: "<path> has <N> lines (limit: <M>)."
  *  - the fast local checker breach line: "[breach] <section>/<rel>: <N> lines (cap: <M>)"
- * Either form must be anchored by a size-guardrail token so an unrelated
- * assertion that merely mentions "lines (limit: N)" cannot trigger a cap bump.
+ *  - the missing-cap coverage failure: "<path> has <N> lines (threshold: <M>)" /
+ *    "NO cap entry" (test_*_no_uncapped_large_file and the checker's [uncapped]
+ *    line). Its single remediation is to ADD a cap entry — `check_size_limits.py
+ *    --fix` now does this deterministically, same as a breach bump.
+ * Any form must be anchored by a size-guardrail token so an unrelated assertion
+ * that merely mentions "lines (limit: N)" cannot trigger a cap bump.
  */
 export function matchesSizeBreachSignature(text: string): boolean {
   if (!text) return false;
   const assertionForm = /\bhas\s+\d+\s+lines\s+\(limit:\s*\d+\)/i.test(text);
   const checkerForm = /\blines\s+\(cap:\s*\d+\)/i.test(text);
-  if (!assertionForm && !checkerForm) return false;
+  const thresholdForm = /\blines\s+\(threshold:\s*\d+\)/i.test(text);
+  const missingCapForm = /\bNO cap entry\b/i.test(text);
+  if (!assertionForm && !checkerForm && !thresholdForm && !missingCapForm) return false;
   return (
     /module_size_limits\.json/i.test(text) ||
     /size guardrail/i.test(text) ||

@@ -21,7 +21,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT } from './index.js';
+import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerSizeCapMergeDriver } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
 
 /**
@@ -166,6 +166,10 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
         ],
         { encoding: 'utf-8', timeout: 60_000 },
       );
+      // Re-register the size-cap merge driver: git config lives in .git/config,
+      // which the warm reuse keeps, but registering is idempotent and cheap so we
+      // always assert it (a prior role on a different repo could have left it unset).
+      registerSizeCapMergeDriver(workspace);
       log(`prepareWorkspaceForRole: warm-handoff reuse OK (branch=${branch})`);
       return;
     } catch (e) {
@@ -191,4 +195,7 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
   }
   cloneArgs.push(repoUrl, workspace);
   await cloneWithRetry(cloneArgs);
+  // A fresh clone does NOT carry .git/config, so the .gitattributes sizecap
+  // mapping is inert until the driver command is registered here.
+  registerSizeCapMergeDriver(workspace);
 }

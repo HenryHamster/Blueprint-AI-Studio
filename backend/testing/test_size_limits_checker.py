@@ -160,3 +160,114 @@ def test_default_sections_check_all(tmp_path):
     )
     # No --sections flag => all sections; the agent breach must surface.
     assert _run(jp, repo) == 1
+
+
+# ── Uncapped-file (coverage meta-test) remediation ──────────────────────────
+
+
+def test_check_flags_uncapped_over_threshold_nonzero(tmp_path):
+    # An oversized backend file with NO cap entry must fail check mode.
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
+    _write_lines(str(tmp_path / "repo" / "backend" / "app" / "huge.py"), 1600)
+    rc = _run(jp, repo, "--sections", "backend")
+    assert rc == 1
+
+
+def test_check_ignores_uncapped_under_threshold(tmp_path):
+    # A file with no cap but under the coverage threshold is fine.
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
+    _write_lines(str(tmp_path / "repo" / "backend" / "app" / "small.py"), 1499)
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_fix_adds_cap_for_uncapped_file_at_policy_value(tmp_path):
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
+    _write_lines(str(tmp_path / "repo" / "backend" / "app" / "huge.py"), 1600)
+
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+
+    data = json.loads(_read(jp))
+    # New cap added, sized at exactly the canonical policy headroom.
+    assert data["backend"]["huge.py"] == bump_size_limit(1600)
+    # The pre-existing entry is untouched.
+    assert data["backend"]["ok.py"] == 100
+    # And re-running check now passes.
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_fix_bumps_and_adds_in_one_pass(tmp_path):
+    # One section with both a breached existing cap and an uncapped large file.
+    repo, jp = _build_repo(tmp_path, backend={"big.py": (1720, 1600)})
+    _write_lines(str(tmp_path / "repo" / "backend" / "app" / "huge.py"), 1600)
+
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+
+    data = json.loads(_read(jp))
+    assert data["backend"]["big.py"] == bump_size_limit(1720)
+    assert data["backend"]["huge.py"] == bump_size_limit(1600)
+    assert _run(jp, repo, "--sections", "backend") == 0
+
+
+def test_fix_no_op_message_when_nothing_to_do(tmp_path, capsys):
+    # No breach + no uncapped file => the no-op message the agent's loop keys on.
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+    out = capsys.readouterr().out
+    assert "No breaches to fix" in out
+
+
+def test_fix_add_prints_added_not_no_op(tmp_path, capsys):
+    # When only an add happens, the output must NOT say "No breaches to fix"
+    # (the agent's deterministic loop treats that string as a no-op).
+    repo, jp = _build_repo(tmp_path, backend={"ok.py": (50, 100)})
+    _write_lines(str(tmp_path / "repo" / "backend" / "app" / "huge.py"), 1600)
+    assert _run(jp, repo, "--fix", "--sections", "backend") == 0
+    out = capsys.readouterr().out
+    assert "No breaches to fix" not in out
+    assert "Added 1 cap(s)" in out
+
+
+def test_agent_test_and_dts_files_excluded_from_uncapped_scan(tmp_path):
+    # .test.ts and .d.ts agent files mirror test_invariants._is_agent_excluded —
+    # even when oversized they must not be flagged as uncapped. Call the scanner
+    # directly so the assertion is independent of which source trees happen to be
+    # mounted in the test environment (agent/src, /admin-ui/src).
+    root = tmp_path / "src"
+    _write_lines(str(root / "huge.test.ts"), 1600)
+    _write_lines(str(root / "types.d.ts"), 1600)
+    _write_lines(str(root / "real.ts"), 1600)  # the one genuine offender
+    offenders = csl.scan_uncapped_section(
+        str(root), {}, (".ts",), csl._is_agent_excluded
+    )
+    assert [rec["rel"] for rec in offenders] == ["real.ts"]
+
+
+def test_frontend_test_files_excluded_from_uncapped_scan(tmp_path):
+    # Frontend test/type files mirror test_invariants._is_frontend_excluded.
+    root = tmp_path / "src"
+    _write_lines(str(root / "Big.test.tsx"), 1600)
+    _write_lines(str(root / "Big.test.ts"), 1600)
+    _write_lines(str(root / "vite-env.d.ts"), 1600)
+    _write_lines(str(root / "Real.tsx"), 1600)  # the one genuine offender
+    offenders = csl.scan_uncapped_section(
+        str(root), {}, (".ts", ".tsx"), csl._is_frontend_excluded
+    )
+    assert [rec["rel"] for rec in offenders] == ["Real.tsx"]
+
+
+def test_uncapped_scan_skips_already_capped_files(tmp_path):
+    # A file already present in caps is not an "uncapped" offender even if large.
+    root = tmp_path / "src"
+    _write_lines(str(root / "capped.py"), 1600)
+    _write_lines(str(root / "uncapped.py"), 1600)
+    offenders = csl.scan_uncapped_section(
+        str(root), {"capped.py": 1700}, (".py",), csl._no_exclusion
+    )
+    assert [rec["rel"] for rec in offenders] == ["uncapped.py"]
+
+
+def test_coverage_threshold_in_sync_with_test_invariants():
+    # The checker mirrors (not imports) the meta-test threshold; guard the drift.
+    from testing import test_invariants
+
+    assert csl._COVERAGE_THRESHOLD == test_invariants._COVERAGE_THRESHOLD

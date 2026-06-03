@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -1888,6 +1888,50 @@ describe('setupWorkspace reference-cache reuse', () => {
 
     const cloneArgs = findCloneArgs();
     expect(cloneArgs).not.toContain('--reference-if-able');
+  });
+
+  it('registers the sizecap merge driver after configuring user.* git config', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
+
+    const gitConfigCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('config'),
+    );
+    // The driver command is registered…
+    const driverCall = gitConfigCalls.find(
+      c => (c[1] as string[]).includes('merge.sizecap.driver'),
+    );
+    expect(driverCall).toBeDefined();
+    expect(driverCall?.[1]).toContain('python3 backend/testing/merge_size_limits.py %O %A %B');
+    // …after the user.email/user.name config (so warm/cold ordering is stable).
+    const idx = (key: string) => gitConfigCalls.findIndex(c => (c[1] as string[]).includes(key));
+    expect(idx('merge.sizecap.driver')).toBeGreaterThan(idx('user.email'));
+  });
+});
+
+// ── registerSizeCapMergeDriver ───────────────────────────────────────────────
+describe('registerSizeCapMergeDriver', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+  });
+
+  it('configures both merge.sizecap.name and merge.sizecap.driver in the given workspace', () => {
+    registerSizeCapMergeDriver('/custom/ws');
+
+    const calls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'git');
+    const argLists = calls.map(c => (c[1] as string[]).join(' '));
+    expect(argLists.some(a => a === '-C /custom/ws config merge.sizecap.name max-cap union merge for module_size_limits.json')).toBe(true);
+    expect(argLists.some(a => a === '-C /custom/ws config merge.sizecap.driver python3 backend/testing/merge_size_limits.py %O %A %B')).toBe(true);
+  });
+
+  it('swallows git config failures (best-effort registration)', () => {
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('git config boom'); });
+    // Must not throw — a failed registration only means the JSON falls back to
+    // the normal conflict path.
+    expect(() => { registerSizeCapMergeDriver('/ws'); }).not.toThrow();
   });
 });
 
