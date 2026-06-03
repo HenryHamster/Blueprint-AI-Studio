@@ -43,7 +43,8 @@ vi.mock('fs', () => ({
   },
 }));
 
-import { testFixLoop } from './test-fix-loop.js';
+import { testFixLoop, matchesSizeBreachSignature } from './test-fix-loop.js';
+import { runClaudeCode } from '../providers/runners.js';
 import type { TestRunner } from './test-runners.js';
 
 const NPM_RUNNER: TestRunner = { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace', label: 'npm test (root)' };
@@ -163,5 +164,96 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.passed).toBe(false);
     expect(result.testFailuresDetected).toBe(true);
     expect(result.noTestsExecuted).toBe(true);
+  });
+});
+
+// The structured assertion test_invariants._size_breach_message emits, verbatim
+// in shape (path + line count + limit + the module_size_limits.json pointer).
+const SIZE_BREACH_FAILURE =
+  'Command failed: npm test\n' +
+  'AssertionError: prompt.ts has 1700 lines (limit: 1650).\n\n' +
+  'If your change legitimately needed to grow this file:\n' +
+  '  2. Apply the new_limit returned in the response to\n' +
+  "     backend/testing/module_size_limits.json under 'agent'.";
+
+describe('matchesSizeBreachSignature', () => {
+  it('matches the test_invariants size-breach assertion', () => {
+    expect(matchesSizeBreachSignature(SIZE_BREACH_FAILURE)).toBe(true);
+  });
+
+  it('matches the fast local checker breach line (cap: N) form', () => {
+    const checkerOutput =
+      '[breach] agent/prompt.ts: 1700 lines (cap: 1650)\n\n' +
+      '1 size breach(es). Run with --fix to bump the breached caps.';
+    expect(matchesSizeBreachSignature(checkerOutput)).toBe(true);
+  });
+
+  it('does NOT match an ordinary assertion failure', () => {
+    expect(
+      matchesSizeBreachSignature('AssertionError: expected 1 to equal 2'),
+    ).toBe(false);
+  });
+
+  it('does NOT match a numeric "lines (limit: N)" mention without a size anchor', () => {
+    // The numeric form alone (no module_size_limits.json / guardrail / breach
+    // anchor) must not trigger a cap bump.
+    expect(
+      matchesSizeBreachSignature('file has 12 lines (limit: 5) of diff context'),
+    ).toBe(false);
+  });
+});
+
+describe('testFixLoop — deterministic size-breach remediation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('auto-bumps the cap via check_size_limits.py --fix and re-verifies — no LLM call', async () => {
+    let testRunCalls = 0;
+    execFileAsync.mockImplementation((cmd: string, args: string[]) => {
+      if (cmd === 'python3' && args.includes('--fix')) {
+        return Promise.resolve('[fix]  agent/prompt.ts: 1700 lines — cap 1650 -> 1900\nBumped 1 cap(s).');
+      }
+      // Test runner: first run reports the size breach, the re-run (after the
+      // cap bump) is clean.
+      testRunCalls += 1;
+      if (testRunCalls === 1) return Promise.reject(new Error(SIZE_BREACH_FAILURE));
+      return Promise.resolve('Tests  3 passed (3)');
+    });
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [NPM_RUNNER] },
+    );
+
+    expect(result.passed).toBe(true);
+    // The canonical checker was invoked with the --fix contract.
+    const bumpCall = execFileAsync.mock.calls.find(
+      ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && args.includes('--fix'),
+    );
+    expect(bumpCall).toBeDefined();
+    expect(bumpCall?.[1]).toEqual(['backend/testing/check_size_limits.py', '--fix']);
+    // The breach was resolved deterministically — no refactor/LLM path taken.
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
+  it('a non-size failure still routes to the Claude fix path (no cap bump)', async () => {
+    execFileAsync.mockRejectedValue(
+      new Error('Command failed: npm test\nAssertionError: expected 1 to equal 2'),
+    );
+
+    await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 1, runnersOverride: [NPM_RUNNER] },
+    );
+
+    // The LLM fix path runs; the deterministic checker is never invoked.
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
+    const bumpCall = execFileAsync.mock.calls.find(
+      ([cmd]) => cmd === 'python3',
+    );
+    expect(bumpCall).toBeUndefined();
   });
 });

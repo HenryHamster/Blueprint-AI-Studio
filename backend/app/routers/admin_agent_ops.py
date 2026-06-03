@@ -49,6 +49,7 @@ from app.shared_state import (
     limiter,
     runtime_config as _runtime_config,
 )
+from app.size_limit_policy import bump_size_limit as _bump_size_limit_policy
 from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
@@ -436,13 +437,12 @@ _ANNOTATION_TYPE_MAP = {
 def _bump_size_limit(current_size: int) -> int:
     """Server-side policy for how much to bump a size limit on breach.
 
-    Picks the larger of "current_size + 200" and "current + 15%" so a
-    small overrun gets a reasonable floor and a big overrun doesn't
-    leave tiny headroom. Rounded to the nearest 50 lines for stability."""
-    floor = current_size + 200
-    proportional = int(current_size * 1.15)
-    raw = max(floor, proportional)
-    return ((raw + 49) // 50) * 50
+    Delegates to the shared, dependency-free policy in
+    ``app.size_limit_policy`` so the server endpoint and the standalone
+    ``check_size_limits.py`` checker produce identical bumps. Kept as a thin
+    wrapper here (and re-exported from ``app.main``) so existing call sites
+    and test patches (test_agent_annotate.py) keep working unchanged."""
+    return _bump_size_limit_policy(current_size)
 
 
 @router.post("/api/agent/annotate")

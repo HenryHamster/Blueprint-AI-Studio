@@ -57,6 +57,14 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
     expect(script).toContain('PASS — all checks green');
+    // Size guardrail is wired into the self-repo gate: invoked by reference
+    // as the committed checker script, scoped from the touched stacks.
+    expect(script).toContain('python3 backend/testing/check_size_limits.py --sections $SIZE_SECTIONS');
+    expect(script).toContain('if touches backend/;          then SIZE_SECTIONS="$SIZE_SECTIONS,backend"; fi');
+    expect(script).toContain('if touches agent/;            then SIZE_SECTIONS="$SIZE_SECTIONS,agent"; fi');
+    expect(script).toContain('if admin_ui_runtime_touched;  then SIZE_SECTIONS="$SIZE_SECTIONS,frontend"; fi');
+    // Routed through the `run` helper so a breach lands in FAILED.
+    expect(script).toContain('run "size guardrail ($SIZE_SECTIONS)" bash -c');
   });
 
   it('emits a generic no-op fallback (no Blueprint blocks) for a foreign repo with no buildConfig', async () => {
@@ -78,6 +86,8 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
     expect(script).not.toContain('run "agent tsc"');
     expect(script).not.toContain('admin-ui playwright chromium');
+    // The Blueprint-specific size guardrail does not run against a foreign repo.
+    expect(script).not.toContain('check_size_limits.py');
     // Still a valid check that reports PASS when nothing failed.
     expect(script).toContain('PASS — all checks green');
   });
@@ -144,6 +154,8 @@ describe('writeCheckHelper — direct invocation', () => {
     // shared header — what we check for is that it's not invoked here.)
     expect(script).not.toContain('if admin_ui_runtime_touched; then');
     expect(script).not.toContain('run "agent tsc"');
+    // Size guardrail is a Blueprint self-repo concern, not config-driven.
+    expect(script).not.toContain('check_size_limits.py');
   });
 
   it('validateCfgShellSafety rejects unsafe taskId when called via writeCheckHelper', async () => {

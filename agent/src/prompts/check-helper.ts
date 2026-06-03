@@ -336,6 +336,24 @@ if touches backend/; then
     run "backend migration chain" bash -c 'python3 backend/app/migration_chain.py 2>&1'
   fi
 fi
+
+# Fast module size-guardrail check: no DB/Docker/network, sub-second. Mirrors
+# the line-count caps that backend/testing/test_invariants.py enforces, so a
+# size breach surfaces HERE (before ./pr open) instead of only after a PR is
+# open and a full CI/Docker round-trip is burned. Scope to whichever stacks
+# the diff touched, mapping admin-ui -> frontend (the JSON's section name).
+# Invoked BY REFERENCE as a committed script (exactly like the migration-chain
+# guard above) — no embedded Python heredoc (see CLAUDE.md). A breach makes
+# the checker exit non-zero, which \`run\` records in FAILED so ./check fails.
+# Remediate with: python3 backend/testing/check_size_limits.py --fix
+SIZE_SECTIONS=""
+if touches backend/;          then SIZE_SECTIONS="$SIZE_SECTIONS,backend"; fi
+if touches agent/;            then SIZE_SECTIONS="$SIZE_SECTIONS,agent"; fi
+if admin_ui_runtime_touched;  then SIZE_SECTIONS="$SIZE_SECTIONS,frontend"; fi
+SIZE_SECTIONS="\${SIZE_SECTIONS#,}"
+if [ -n "$SIZE_SECTIONS" ]; then
+  run "size guardrail ($SIZE_SECTIONS)" bash -c "python3 backend/testing/check_size_limits.py --sections $SIZE_SECTIONS 2>&1"
+fi
 `;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
