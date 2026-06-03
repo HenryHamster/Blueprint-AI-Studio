@@ -1,14 +1,16 @@
 import { useState } from 'react';
-import { Check, Clock, FileText, Pencil, X } from 'lucide-react';
+import { Check, Clock, FileText, Pencil, ShieldCheck, X } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
+import type { RunningUpdateReconciliation } from '../types';
 
 interface RunningUpdatePanelProps {
   projectId: string;
   document: string | null;
   acknowledgedAt: string | null;
   userLastActiveAt?: string | null;
+  reconciliation?: RunningUpdateReconciliation | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onAcknowledged: () => void;
   onEdited?: (newBody: string) => void;
@@ -19,6 +21,7 @@ export default function RunningUpdatePanel({
   document,
   acknowledgedAt,
   userLastActiveAt,
+  reconciliation,
   addToast,
   onAcknowledged,
   onEdited,
@@ -29,6 +32,8 @@ export default function RunningUpdatePanel({
   const [saving, setSaving] = useState(false);
 
   const hasContent = !!(document && document.trim());
+  const operatorWins = reconciliation?.operator_wins_count ?? 0;
+  const showReconciledBadge = operatorWins > 0;
 
   function startEditing() {
     setDraft(document ?? '');
@@ -125,6 +130,21 @@ export default function RunningUpdatePanel({
               </span>
             )}
           </div>
+          {showReconciledBadge && (
+            <div
+              className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-emerald-600/40 bg-emerald-600/10 px-2 py-1 text-xs text-emerald-300"
+              title="A mid-cycle edit you made was kept when the strategic cycle completed; the agent's competing rewrite was recorded as superseded."
+            >
+              <ShieldCheck size={12} />
+              <span>
+                Your edit preserved — {operatorWins} agent{' '}
+                {operatorWins === 1 ? 'proposal' : 'proposals'} superseded
+                {reconciliation?.last_operator_win_at
+                  ? ` ${timeAgo(reconciliation.last_operator_win_at)}`
+                  : ''}
+              </span>
+            </div>
+          )}
         </div>
         <div className="shrink-0 flex items-center gap-2">
           {!editing && (

@@ -27,6 +27,7 @@ from app.models import (
     SystemMaturity,
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
 from app.source_ref_validation import (
     classify_existing_paths,
     ground_design_doc,
@@ -39,6 +40,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
+from app.vision_merge import REJECTED_EDITS_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +646,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "anomaly_summary": {"priority": "low"},
     "playbook_summary": {"priority": "low"},
     "rejected_proposals": {"priority": "low"},
+    "running_update_superseded": {"priority": "low"},
     "prediction_calibration_factor": {"priority": "low"},
     "prediction_calibration_note": {"priority": "low"},
     # Mode-aware additions: only present when non-empty
@@ -1932,6 +1935,32 @@ async def _spawn_strategic_review(
     rejected_proposals.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
     rejected_proposals = rejected_proposals[:10]
 
+    # running_update operator-override signal (last 30 days). When the
+    # operator-wins reconciliation preserved an operator mid-cycle edit over the
+    # agent's running_update rewrite, ``apply_reconciled_running_update`` records a
+    # ``running_update_superseded`` entry in the vision rejected-edits ledger.
+    # Surface a small derived signal so next cycle's thinker treats the document
+    # as operator-authoritative rather than a blank slate to rewrite. Derived
+    # server-side (count + most-recent ``at``) so it survives even if the full
+    # vision blob is summarized away under the payload byte budget.
+    _superseded_entries = [
+        e
+        for e in ((project.vision or {}).get(REJECTED_EDITS_KEY) or [])
+        if isinstance(e, dict)
+        and e.get("kind") == RUNNING_UPDATE_REJECTED_KIND
+        and (e.get("at") or "") >= cutoff_iso
+    ]
+    running_update_superseded = (
+        {
+            "count": len(_superseded_entries),
+            "most_recent_at": max(
+                (e.get("at") or "") for e in _superseded_entries
+            ),
+        }
+        if _superseded_entries
+        else None
+    )
+
     # Fetch unified conversation thread — recent messages chronologically,
     # regardless of status.  Gives the strategic agent a coherent back-and-forth
     # instead of flat, separated open/resolved lists. Capped at 15 because the
@@ -2786,6 +2815,11 @@ async def _spawn_strategic_review(
             "conversation_thread": conversation_thread,
             **(
                 {"rejected_proposals": rejected_proposals} if rejected_proposals else {}
+            ),
+            **(
+                {"running_update_superseded": running_update_superseded}
+                if running_update_superseded
+                else {}
             ),
             **({"prompt_suffix": prompt_suffix} if prompt_suffix else {}),
             # Mode-aware: include only when non-empty so cold-start projects

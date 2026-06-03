@@ -91,6 +91,9 @@ async def get_directions(
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
     )  # noqa: PLC0415
+    from app.running_update_merge import (
+        summarize_running_update_reconciliation,
+    )  # noqa: PLC0415
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
@@ -159,6 +162,9 @@ async def get_directions(
             project.running_update_acknowledged_at.isoformat()
             if project.running_update_acknowledged_at
             else None
+        ),
+        "running_update_reconciliation": summarize_running_update_reconciliation(
+            project.vision
         ),
         "self_reflection_log": project.self_reflection_log or [],
         "is_self_repo": bool(project.is_self_repo),

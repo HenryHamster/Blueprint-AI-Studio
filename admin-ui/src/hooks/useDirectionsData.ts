@@ -3,7 +3,7 @@ import { apiFetch } from '../api';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
 import type { Direction } from '../components/DirectionsPanel';
-import type { ProblemModel } from '../types';
+import type { ProblemModel, RunningUpdateReconciliation } from '../types';
 
 interface UseDirectionsDataDeps {
   selectedProjectId: string | null;
@@ -31,6 +31,8 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   const [problemModel, setProblemModel] = useState<ProblemModel>({});
   const [runningUpdate, setRunningUpdate] = useState<string | null>(null);
   const [runningUpdateAckAt, setRunningUpdateAckAt] = useState<string | null>(null);
+  const [runningUpdateReconciliation, setRunningUpdateReconciliation] =
+    useState<RunningUpdateReconciliation | null>(null);
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +93,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       setProblemModel(data.problem_model ?? {});
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
+      setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
@@ -376,6 +379,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     setRunningUpdate,
     runningUpdateAckAt,
     setRunningUpdateAckAt,
+    runningUpdateReconciliation,
     error,
     setError,
     researchingIds,

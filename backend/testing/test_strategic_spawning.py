@@ -6645,3 +6645,126 @@ async def test_arch_cycle_emits_cycle_started_phase1(db_session):
     ]
     assert len(started) == 1, "expected one strategic_cycle_started for the arch spawn"
     assert started[0][2]["phase"] == 1
+
+
+@pytest.mark.asyncio
+async def test_running_update_superseded_signal_present_when_recent_ledger_entry(
+    db_session,
+):
+    """A recent running_update_superseded ledger entry surfaces a derived signal
+    in the strategic payload so next cycle's thinker treats the document as
+    operator-authoritative."""
+    from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    recent_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-rus01",
+                "status": "active",
+                "text": "Some direction",
+                "priority": "medium",
+            }
+        ],
+        vision={
+            "purpose": "test purpose",
+            REJECTED_EDITS_KEY: [
+                {
+                    "at": recent_at,
+                    "field": "running_update",
+                    "kind": RUNNING_UPDATE_REJECTED_KIND,
+                    "agent_value": "superseded agent doc",
+                },
+                # An unrelated vision field conflict sharing the ledger — must be ignored.
+                {
+                    "at": recent_at,
+                    "field": "purpose",
+                    "kind": "field_conflict",
+                    "agent_value": "x",
+                },
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "running_update_superseded" in payload
+    signal = payload["running_update_superseded"]
+    assert signal["count"] == 1
+    assert signal["most_recent_at"] == recent_at
+
+
+@pytest.mark.asyncio
+async def test_running_update_superseded_signal_absent_without_ledger_entry(db_session):
+    """No running_update_superseded ledger entry → field omitted from the payload."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-rus02",
+                "status": "active",
+                "text": "Some direction",
+                "priority": "medium",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "running_update_superseded" not in payload
+
+
+@pytest.mark.asyncio
+async def test_running_update_superseded_signal_excludes_stale_entries(db_session):
+    """A ledger entry older than the 30-day window is not surfaced."""
+    from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    stale_at = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-rus03",
+                "status": "active",
+                "text": "Some direction",
+                "priority": "medium",
+            }
+        ],
+        vision={
+            "purpose": "test purpose",
+            REJECTED_EDITS_KEY: [
+                {
+                    "at": stale_at,
+                    "field": "running_update",
+                    "kind": RUNNING_UPDATE_REJECTED_KIND,
+                    "agent_value": "old superseded doc",
+                }
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    assert "running_update_superseded" not in payload

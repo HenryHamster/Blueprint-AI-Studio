@@ -102,12 +102,21 @@ _SECTION_SCAN = {
 }
 
 
-def resolve_section_root(section: str, repo_root: str) -> str | None:
+def resolve_section_root(
+    section: str, repo_root: str, *, use_env_overrides: bool = True
+) -> str | None:
     """Resolve a section's source tree root, mirroring test_invariants.py.
 
     Returns the directory path if it exists, else None (caller skips the
     section). frontend honors the ``ADMIN_UI_SRC`` override and the Docker
     ``/admin-ui/src`` mount before falling back to ``<repo>/admin-ui/src``.
+
+    ``use_env_overrides`` gates the environment-specific frontend escape
+    hatches (the ``ADMIN_UI_SRC`` env var and the global ``/admin-ui/src``
+    Docker mount). They make sense only for the *real* run rooted at the
+    default repo root; when an explicit ``--repo-root`` is supplied (e.g. a
+    hermetic test fixture) resolution must stay strictly under that root so a
+    stray global mount does not leak the host environment into the result.
     """
     if section == "backend":
         root = os.path.join(repo_root, "backend", "app")
@@ -117,10 +126,11 @@ def resolve_section_root(section: str, repo_root: str) -> str | None:
         return root if os.path.isdir(root) else None
     if section == "frontend":
         candidates = []
-        env_override = os.getenv("ADMIN_UI_SRC")
-        if env_override:
-            candidates.append(env_override)
-        candidates.append("/admin-ui/src")
+        if use_env_overrides:
+            env_override = os.getenv("ADMIN_UI_SRC")
+            if env_override:
+                candidates.append(env_override)
+            candidates.append("/admin-ui/src")
         candidates.append(os.path.join(repo_root, "admin-ui", "src"))
         for candidate in candidates:
             if os.path.isdir(candidate):
@@ -210,19 +220,22 @@ def write_limits(json_path: str, data: dict) -> None:
 
 
 def evaluate(
-    data: dict, sections: list[str], repo_root: str
+    data: dict, sections: list[str], repo_root: str, *, use_env_overrides: bool = True
 ) -> tuple[dict[str, list[dict]], list[str]]:
     """Evaluate the scoped sections.
 
     Returns ``(checked, skipped)`` where ``checked`` maps section -> list of
     file records (from scan_section) and ``skipped`` is the list of section
-    names whose source tree was absent.
+    names whose source tree was absent. ``use_env_overrides`` is forwarded to
+    ``resolve_section_root`` (see its docstring).
     """
     checked: dict[str, list[dict]] = {}
     skipped: list[str] = []
     for section in sections:
         caps = data.get(section) or {}
-        root = resolve_section_root(section, repo_root)
+        root = resolve_section_root(
+            section, repo_root, use_env_overrides=use_env_overrides
+        )
         if root is None:
             skipped.append(section)
             continue
@@ -273,7 +286,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     data = load_limits(args.json_path)
-    checked, skipped = evaluate(data, args.sections, args.repo_root)
+    # The environment-specific frontend escape hatches (ADMIN_UI_SRC /
+    # /admin-ui/src) apply only to the real run rooted at the default repo
+    # root. An explicit --repo-root means hermetic resolution under that root.
+    use_env_overrides = os.path.normpath(args.repo_root) == _DEFAULT_REPO_ROOT
+    checked, skipped = evaluate(
+        data, args.sections, args.repo_root, use_env_overrides=use_env_overrides
+    )
 
     for section in skipped:
         print(f"[skip] {section}: source tree not present in this environment")

@@ -123,6 +123,16 @@ export interface ProblemModel {
 // each cycle as the project's current-state snapshot. Acknowledge stamps a
 // read-marker; the document itself persists and is refined next cycle.
 
+// Summary of operator-wins running_update reconciliations: how many times an
+// operator's mid-cycle edit superseded the agent's refreshed document, and
+// when the most recent one happened. Null on the payload when no such
+// reconciliation has occurred. Mirrors
+// running_update_merge.summarize_running_update_reconciliation.
+export interface RunningUpdateReconciliation {
+  operator_wins_count: number;
+  last_operator_win_at: string | null;
+}
+
 // Self-reflection log — one entry per cycle on self-repo projects.
 export interface SelfReflectionEntry {
   ts: string;
@@ -149,6 +159,7 @@ export interface DirectionsEndpointResponse {
   problem_model: ProblemModel;
   running_update: string | null;
   running_update_acknowledged_at: string | null;
+  running_update_reconciliation: RunningUpdateReconciliation | null;
   self_reflection_log: SelfReflectionEntry[];
   is_self_repo: boolean;
 }

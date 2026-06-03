@@ -41,7 +41,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Project
 from app.time_utils import _utcnow
-from app.vision_merge import append_rejected_edits
+from app.vision_merge import REJECTED_EDITS_KEY, append_rejected_edits
 
 
 # A routine-event digest line has the exact one-line shape produced by
@@ -180,3 +180,43 @@ def apply_reconciled_running_update(
         append_rejected_edits(project.vision, [rejected])
         flag_modified(project, "vision")
     return rejected
+
+
+def summarize_running_update_reconciliation(vision: dict | None) -> dict | None:
+    """Summarize operator-wins running_update reconciliations from the ledger.
+
+    Scans ``vision[REJECTED_EDITS_KEY]`` for entries written by
+    ``reconcile_running_update`` (``kind == RUNNING_UPDATE_REJECTED_KIND``) —
+    each one records a cycle where the operator's mid-cycle running_update edit
+    superseded the agent's refreshed document. Returns a compact summary
+    ``{"operator_wins_count": int, "last_operator_win_at": <isoformat str|None>}``
+    suitable for surfacing on the directions payload, or ``None`` when no such
+    entry exists (so the UI can omit the badge entirely).
+
+    Read-only: never mutates ``vision``. Ignores ledger entries from the
+    vision/problem-model field conflicts that share the ledger.
+    """
+    if not isinstance(vision, dict):
+        return None
+    entries = vision.get(REJECTED_EDITS_KEY) or []
+    if not isinstance(entries, list):
+        return None
+    ats: list[str] = []
+    count = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("kind") != RUNNING_UPDATE_REJECTED_KIND:
+            continue
+        count += 1
+        at = entry.get("at")
+        if isinstance(at, str) and at:
+            ats.append(at)
+    if count == 0:
+        return None
+    # ISO-8601 timestamps from ``_utcnow().isoformat()`` sort lexicographically
+    # in chronological order, so ``max`` yields the most recent win.
+    return {
+        "operator_wins_count": count,
+        "last_operator_win_at": max(ats) if ats else None,
+    }

@@ -80,6 +80,7 @@ import {
   buildScopeCalibrationSignal,
   buildFilteredFindingsSection,
   buildRejectedProposalsSection,
+  buildRunningUpdateSupersededSection,
   buildUserPausedSection,
   readProgressArtifact,
   buildPortfolioComposition,
@@ -761,6 +762,35 @@ describe('buildRejectedProposalsSection', () => {
     const out = buildRejectedProposalsSection(many);
     expect(out).toContain('proposal 9');
     expect(out).not.toContain('proposal 10');
+  });
+});
+
+describe('buildRunningUpdateSupersededSection', () => {
+  it('returns empty string for null/undefined signal', () => {
+    expect(buildRunningUpdateSupersededSection(null)).toBe('');
+    expect(buildRunningUpdateSupersededSection(undefined)).toBe('');
+  });
+
+  it('returns empty string when count is zero or missing', () => {
+    expect(buildRunningUpdateSupersededSection({ count: 0 })).toBe('');
+    expect(buildRunningUpdateSupersededSection({})).toBe('');
+  });
+
+  it('renders an operator-authoritative note with the most-recent date', () => {
+    const out = buildRunningUpdateSupersededSection({
+      count: 2,
+      most_recent_at: '2026-05-20T09:30:00Z',
+    });
+    expect(out).toContain('operator preserved their own running_update');
+    expect(out).toContain('operator-authoritative');
+    expect(out).toContain('do NOT rewrite it from a blank slate');
+    expect(out).toContain('most recent: 2026-05-20');
+  });
+
+  it('renders the note without a date tail when most_recent_at is absent', () => {
+    const out = buildRunningUpdateSupersededSection({ count: 1 });
+    expect(out).toContain('operator preserved their own running_update');
+    expect(out).not.toContain('most recent:');
   });
 });
 

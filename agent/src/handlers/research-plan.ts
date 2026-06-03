@@ -431,6 +431,17 @@ export function buildRejectedProposalsSection(
   return `\n## Recently Rejected Proposals (last 30 days)\nThe user explicitly rejected these direction proposals. Do NOT re-propose similar work — find a different angle or move on.\n${lines.join('\n')}\n`;
 }
 
+export function buildRunningUpdateSupersededSection(
+  signal: Record<string, unknown> | null | undefined
+): string {
+  if (!signal || typeof signal !== 'object') return '';
+  const count = Number(signal.count) || 0;
+  if (count <= 0) return '';
+  const when = strVal(signal.most_recent_at).slice(0, 10);
+  const whenTail = when ? ` (most recent: ${when})` : '';
+  return `\n_Last cycle the operator preserved their own running_update over your proposed rewrite${whenTail}. The operator is actively editing this document — treat it as operator-authoritative. Refine it; do NOT rewrite it from a blank slate or re-impose your superseded version._\n`;
+}
+
 export function buildUserPausedSection(
   directionsSummary: Array<Record<string, unknown>>
 ): string {

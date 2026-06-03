@@ -85,6 +85,9 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
   if (runner.cmd === 'cargo' && runner.args[0] === 'test') {
     return 'cargo';
   }
+  if (runner.cmd === 'go' && runner.args[0] === 'test') {
+    return 'go';
+  }
   if (runner.cmd === 'make' && runner.args[0] === 'test') {
     return 'make';
   }
@@ -475,9 +478,50 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
       const filesByPath = new Map(layout.files.map((item) => [item.path, item]));
       const fsMock = mockFs;
 
+      // Synthesize a directory tree from the flat fixture paths so the nested
+      // monorepo scan (readdirSync of services/apps/packages/src containers)
+      // sees the same layout the backend BFS walks. `dirChildren` maps a
+      // directory rel-path to its immediate child names; `allDirs` is every
+      // intermediate directory so existsSync(container) is true.
+      const dirChildren = new Map<string, Set<string>>();
+      const allDirs = new Set<string>();
+      const addChild = (dir: string, child: string): void => {
+        let children = dirChildren.get(dir);
+        if (!children) {
+          children = new Set();
+          dirChildren.set(dir, children);
+        }
+        children.add(child);
+      };
+      for (const item of layout.files) {
+        const parts = item.path.split('/');
+        for (let i = 0; i < parts.length - 1; i++) {
+          addChild(parts.slice(0, i).join('/'), parts[i]);
+          allDirs.add(parts.slice(0, i + 1).join('/'));
+        }
+        addChild(parts.slice(0, -1).join('/'), parts[parts.length - 1]);
+      }
+
       fsMock.existsSync.mockImplementation((p: string) => {
         const rel = toWorkspaceRelativePath(p);
-        return filesByPath.has(rel);
+        return filesByPath.has(rel) || allDirs.has(rel);
+      });
+      // A single readdirSync mock must serve BOTH callers, since
+      // mockImplementation replaces (it does not stack):
+      //  - the .NET detector globs the WORKSPACE-root listing for a
+      //    *.sln/*.csproj (existsSync alone cannot match an arbitrary
+      //    project-file name), so the root must expose its top-level files;
+      //  - the nested monorepo scan reads each services/apps/packages/src
+      //    container's immediate children, served from `dirChildren`.
+      fsMock.readdirSync.mockImplementation((p: string) => {
+        const rel = toWorkspaceRelativePath(p);
+        if (rel === WORKSPACE || rel === '') {
+          return layout.files
+            .map((item) => item.path)
+            .filter((path) => !path.includes('/'));
+        }
+        const children = dirChildren.get(rel);
+        return children ? Array.from(children) : [];
       });
       fsMock.readFileSync.mockImplementation((p: string) => {
         const rel = toWorkspaceRelativePath(p);
@@ -486,18 +530,6 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
           throw new Error(`unexpected readFileSync for ${rel}`);
         }
         return file.content ?? '';
-      });
-      // The .NET detector globs the directory listing for a *.sln/*.csproj, so
-      // the parity loop must expose the fixture's root-level files to readdirSync
-      // (existsSync alone cannot match an arbitrary project-file name).
-      fsMock.readdirSync.mockImplementation((p: string) => {
-        const rel = toWorkspaceRelativePath(p);
-        if (rel === WORKSPACE || rel === '') {
-          return layout.files
-            .map((item) => item.path)
-            .filter((path) => !path.includes('/'));
-        }
-        return [];
       });
 
       const runners = detectTestRunners(undefined);

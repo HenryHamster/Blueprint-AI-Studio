@@ -8066,3 +8066,90 @@ async def test_strategic_completion_running_update_agent_wins_untouched(
 
     await db_session.refresh(project)
     assert project.running_update == "AGENT REFRESHED DOC"
+
+
+def test_reconcile_running_update_invalid_event_type_in_middle_is_operator_edit():
+    """When appended lines include a mix of valid digest events and an
+    unrecognized event type in the middle (e.g., baseline + valid_digest_line +
+    invalid_custom_line + valid_digest_line), the _detect_digest_append logic
+    should classify this as an operator edit (operator wins), not a pure digest
+    append, since the operator edited the body."""
+    from app.running_update_merge import reconcile_running_update
+
+    valid_line_1 = "- [2026-06-03 12:00] **pr_merged**: Merged PR #103"
+    invalid_line = "- [2026-06-03 12:30] **custom_operator_note**: operator's hand-written note"
+    valid_line_2 = "- [2026-06-03 13:00] **cycle_summary**: Cycle complete"
+
+    current = f"BASELINE\n{valid_line_1}\n{invalid_line}\n{valid_line_2}"
+    doc, rejected = reconcile_running_update(
+        baseline="BASELINE", agent="AGENT NEW DOC", current=current
+    )
+    # Operator wins because the middle line is not a recognized routine event type
+    assert doc == current
+    assert rejected is not None
+    assert rejected["field"] == "running_update"
+    assert rejected["agent_value"] == "AGENT NEW DOC"
+
+
+def test_apply_reconciled_running_update_caps_rejected_edits_ledger():
+    """When vision._rejected_agent_edits is already at capacity
+    (REJECTED_EDITS_MAX entries), adding a new running_update_superseded entry
+    should not exceed the cap and should discard the oldest entry."""
+    from app.running_update_merge import (
+        apply_reconciled_running_update,
+        RUNNING_UPDATE_REJECTED_KIND,
+    )
+    from app.vision_merge import REJECTED_EDITS_KEY, REJECTED_EDITS_MAX
+
+    project = Project(
+        name="RU-ledger-cap",
+        user_id="u1",
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            REJECTED_EDITS_KEY: [
+                {
+                    "at": "2026-06-03T12:00:00",
+                    "field": "vision",
+                    "kind": "unrelated",
+                    "value": f"entry_{i}",
+                }
+                for i in range(REJECTED_EDITS_MAX)
+            ],
+        },
+        directions=[],
+        # Operator edited the body mid-cycle: the live running_update diverges
+        # from the cycle baseline (a full-body edit, not a digest append), so
+        # reconciliation must take the operator's doc and reject the agent's.
+        running_update="OPERATOR EDITED BODY",
+    )
+
+    # The operator body edit above supersedes the agent doc, so a new
+    # running_update_superseded entry is appended to the (already-full) ledger.
+    rejected = apply_reconciled_running_update(
+        project,
+        baseline="BASELINE",
+        agent="AGENT DOCUMENT THAT WILL BE REJECTED",
+    )
+
+    # Verify the rejected entry was created
+    assert rejected is not None
+    assert rejected["kind"] == RUNNING_UPDATE_REJECTED_KIND
+    assert rejected["field"] == "running_update"
+    assert rejected["agent_value"] == "AGENT DOCUMENT THAT WILL BE REJECTED"
+
+    # Verify the ledger is still capped at REJECTED_EDITS_MAX
+    ledger = project.vision.get(REJECTED_EDITS_KEY) or []
+    assert len(ledger) == REJECTED_EDITS_MAX, (
+        f"Ledger exceeded cap: expected {REJECTED_EDITS_MAX}, got {len(ledger)}"
+    )
+
+    # Verify the new entry is present (at the end)
+    assert ledger[-1] == rejected
+
+    # Verify the oldest entry (entry_0) was discarded when the new entry was added
+    # by checking that the remaining old entries are 1 through REJECTED_EDITS_MAX-2
+    old_entries = [e for e in ledger if e.get("kind") == "unrelated"]
+    assert len(old_entries) == REJECTED_EDITS_MAX - 1
+    # The first old entry should be entry_1 (entry_0 was dropped)
+    assert old_entries[0]["value"] == "entry_1"

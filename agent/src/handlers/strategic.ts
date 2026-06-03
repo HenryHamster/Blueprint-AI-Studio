@@ -29,6 +29,7 @@ import {
   buildStrategicCompletionLogs,
   readProgressArtifact,
   buildRejectedProposalsSection,
+  buildRunningUpdateSupersededSection,
   buildUserPausedSection,
   buildVersionPhaseSection,
   buildMemoCitationsSection,
@@ -389,6 +390,11 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       reflectionSection,
       selfImprovementBlock,
       runningUpdateSection,
+      runningUpdateSupersededSection: buildRunningUpdateSupersededSection(
+        payload.running_update_superseded && typeof payload.running_update_superseded === 'object'
+          ? payload.running_update_superseded as Record<string, unknown>
+          : null
+      ),
       designDocJson,
       visionJson,
       outcomeSection,

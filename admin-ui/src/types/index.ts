@@ -9,6 +9,7 @@ export type {
   FrictionStatus, PendingConfirmationType, CapabilityStatus,
   SelfReflectionEntry, ProblemModelPatch,
   DirectionsEndpointResponse, GapHistoryEvent, RevisionLogEntry,
+  RunningUpdateReconciliation,
 } from './problemModel';
 
 /** Budget utilization fields shared between DirectionCard and DirectionProgressSection. */

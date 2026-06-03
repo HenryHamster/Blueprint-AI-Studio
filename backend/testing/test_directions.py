@@ -190,6 +190,61 @@ async def test_get_directions_includes_null_hold_timing_when_not_held(
 
 
 @pytest.mark.asyncio
+async def test_get_directions_running_update_reconciliation_null_by_default(
+    client: AsyncClient, mocker
+):
+    """GET exposes running_update_reconciliation, None when no operator edit has
+    superseded an agent's running_update write."""
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "running_update_reconciliation" in data
+    assert data["running_update_reconciliation"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_directions_running_update_reconciliation_summarizes_ledger(
+    client: AsyncClient, db_session, mocker
+):
+    """When the rejected-edits ledger holds running_update_superseded entries,
+    GET summarizes them as operator_wins_count + the latest timestamp."""
+    from app.running_update_merge import RUNNING_UPDATE_REJECTED_KIND
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project_id = await _deploy_project(client, mocker)
+    project = await db_session.get(Project, uuid.UUID(project_id))
+    project.vision = {
+        REJECTED_EDITS_KEY: [
+            {
+                "at": "2026-06-01T10:00:00",
+                "field": "running_update",
+                "kind": RUNNING_UPDATE_REJECTED_KIND,
+                "agent_value": "old superseded doc",
+            },
+            {
+                "at": "2026-06-03T12:30:00",
+                "field": "running_update",
+                "kind": RUNNING_UPDATE_REJECTED_KIND,
+                "agent_value": "newer superseded doc",
+            },
+            # A non-running-update ledger entry must NOT be counted.
+            {"at": "2026-06-04T00:00:00", "field": "purpose", "kind": "vision_field"},
+        ]
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    recon = resp.json()["running_update_reconciliation"]
+    assert recon == {
+        "operator_wins_count": 2,
+        "last_operator_win_at": "2026-06-03T12:30:00",
+    }
+
+
+@pytest.mark.asyncio
 async def test_unhold_direction_clears_hold(client: AsyncClient, mocker):
     """POST /unhold clears an existing direction hold and reports was_held=True."""
     import app.shared_state as _ss

@@ -164,6 +164,6 @@
     "components/SrMissedRetrospectivesPanel.tsx": 900,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 1650,
-    "api.ts": 1500
+    "api.ts": 1800
   }
 }

@@ -69,6 +69,7 @@ export interface ThinkerPromptParams {
   reflectionSection: string;
   selfImprovementBlock: string;
   runningUpdateSection: string;
+  runningUpdateSupersededSection?: string;
   designDocJson: string;
   visionJson: string;
   outcomeSection: string;
@@ -140,7 +141,7 @@ ${p.verificationFailuresSection ? `\n${p.verificationFailuresSection}\n` : ''}
 ${p.reflectionSection}
 
 ${p.runningUpdateSection}
-
+${p.runningUpdateSupersededSection || ''}
 ## Architecture (design document — current state)
 ${p.designDocJson || 'No design document yet.'}
 

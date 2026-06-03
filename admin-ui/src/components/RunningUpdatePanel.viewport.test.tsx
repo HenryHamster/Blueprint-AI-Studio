@@ -200,6 +200,58 @@ describe('RunningUpdatePanel — viewport regression', () => {
     expect(addToast).toHaveBeenCalledWith(expect.any(String), 'error');
   });
 
+  test('reconciliation badge renders when an operator edit was preserved', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Reconciled body"
+          reconciliation={{
+            operator_wins_count: 2,
+            last_operator_win_at: new Date(Date.now() - 3_600_000).toISOString(),
+          }}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain('Your edit preserved');
+    // Pluralized count surfaces the number of superseded agent proposals.
+    expect(host.textContent).toContain('2 agent proposals superseded');
+  });
+
+  test('reconciliation badge is hidden when no operator edit was preserved', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Plain body"
+          reconciliation={null}
+        />,
+      );
+    });
+    expect(host.textContent).not.toContain('Your edit preserved');
+
+    // Also hidden when the count is explicitly zero.
+    await act(async () => {
+      r.render(
+        <RunningUpdatePanel
+          {...BASE_PROPS}
+          document="Plain body"
+          reconciliation={{ operator_wins_count: 0, last_operator_win_at: null }}
+        />,
+      );
+    });
+    expect(host.textContent).not.toContain('Your edit preserved');
+  });
+
   test('Acknowledge button meets 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');

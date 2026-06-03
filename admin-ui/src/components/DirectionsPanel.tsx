@@ -381,6 +381,7 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
               projectId={selectedProjectId}
               document={data.runningUpdate}
               acknowledgedAt={data.runningUpdateAckAt}
+              reconciliation={data.runningUpdateReconciliation}
               addToast={addToast}
               onAcknowledged={() => {
                 data.setRunningUpdateAckAt(new Date().toISOString());

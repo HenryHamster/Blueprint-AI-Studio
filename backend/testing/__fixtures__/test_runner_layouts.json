@@ -161,5 +161,46 @@
     "files": [],
     "detectable": false,
     "family": null
+  },
+  {
+    "name": "services_python_pytest_nested",
+    "files": [
+      {
+        "path": "services/api/pytest.ini"
+      }
+    ],
+    "detectable": true,
+    "family": "pytest"
+  },
+  {
+    "name": "apps_node_with_scripts_test_nested",
+    "files": [
+      {
+        "path": "apps/web/package.json",
+        "content": "{\"scripts\":{\"test\":\"vitest run\"}}"
+      }
+    ],
+    "detectable": true,
+    "family": "npm"
+  },
+  {
+    "name": "packages_go_mod_nested",
+    "files": [
+      {
+        "path": "packages/svc/go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "src_pkg_cargo_nested",
+    "files": [
+      {
+        "path": "src/engine/Cargo.toml"
+      }
+    ],
+    "detectable": true,
+    "family": "cargo"
   }
 ]

@@ -74,6 +74,8 @@ vi.mock('./research-plan.js', () => ({
   buildStrategicCompletionLogs: () => ({ logs: '', warning: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
+  buildRunningUpdateSupersededSection: (signal: Record<string, unknown> | null | undefined) =>
+    signal && Number(signal.count) > 0 ? '\n_operator preserved running_update_\n' : '',
   buildUserPausedSection: () => '',
   buildVersionPhaseSection: () => '',
   buildMemoCitationsSection: () => '',
@@ -187,6 +189,33 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('```json');
     expect(section).not.toContain('this is the first cycle');
     expect(section).not.toContain('EXISTS but was not shipped in full');
+  });
+});
+
+describe('handleStrategic running_update_superseded wiring', () => {
+  beforeEach(() => {
+    capturedThinkerParams = undefined;
+  });
+
+  it('wires a running_update_superseded section when the payload signal is present', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      running_update_superseded: { count: 2, most_recent_at: '2026-05-20T09:30:00Z' },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-rus', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(String(capturedThinkerParams?.runningUpdateSupersededSection)).toContain(
+      'operator preserved running_update'
+    );
+  });
+
+  it('passes an empty section when no superseded signal is present', async () => {
+    const payload: Record<string, unknown> = { project_name: 'Blueprint' };
+    const statusRef = { value: '' };
+    await handleStrategic('task-rus-empty', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    expect(capturedThinkerParams?.runningUpdateSupersededSection).toBe('');
   });
 });
 

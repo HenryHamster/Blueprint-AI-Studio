@@ -57,8 +57,58 @@ def _file_content_resp(text, status_code=200):
     return resp
 
 
-def _layout_root_listing(layout):
-    return [{"name": item["path"], "type": "file"} for item in layout["files"]]
+def _build_layout_tree(layout):
+    """Synthesize a directory tree + file-content map from a layout's flat file
+    list, so a single URL-routing GitHub mock can serve the detector's BFS walk
+    (root listing → nested container/package listings → inline manifest content
+    fetches) regardless of request order.
+
+    Returns ``(dir_listings, file_contents)`` where ``dir_listings`` maps a
+    directory path (``""`` for the repo root, ``"services/api"`` for nested
+    dirs) to a Contents-API-style listing of its IMMEDIATE children, and
+    ``file_contents`` maps a file path to its declared text body.
+    """
+    dir_children: dict[str, dict[str, str]] = {"": {}}
+    file_contents: dict[str, str] = {}
+    for item in layout["files"]:
+        path = item["path"]
+        file_contents[path] = item.get("content", "")
+        parts = path.split("/")
+        for i in range(len(parts) - 1):
+            parent = "/".join(parts[:i])  # "" at the root
+            dir_children.setdefault(parent, {})[parts[i]] = "dir"
+            dir_children.setdefault("/".join(parts[: i + 1]), {})
+        parent = "/".join(parts[:-1])
+        dir_children.setdefault(parent, {})[parts[-1]] = "file"
+    dir_listings = {
+        directory: [{"name": name, "type": typ} for name, typ in children.items()]
+        for directory, children in dir_children.items()
+    }
+    return dir_listings, file_contents
+
+
+def _make_layout_github_side_effect(layout):
+    """Build a ``_github_request`` side-effect callable that routes by URL.
+
+    The detector interleaves directory listings and single-file content fetches
+    across a depth-bounded BFS, so an order-sensitive response list is brittle
+    for nested layouts. Routing on the requested contents path instead tolerates
+    any traversal order: a path that names a file returns that file's body, a
+    path that names a directory returns its child listing, and an unknown path
+    returns an empty listing.
+    """
+    dir_listings, file_contents = _build_layout_tree(layout)
+    prefix = "https://api.github.com/repos/owner/repo/contents/"
+
+    def _route(method, url, headers, *args, **kwargs):
+        path = url[len(prefix):] if url.startswith(prefix) else url
+        if path in file_contents:
+            return _file_content_resp(file_contents[path])
+        if path in dir_listings:
+            return _listing_resp(dir_listings[path])
+        return _listing_resp([])
+
+    return _route
 
 
 def _backend_family_for_directory(directory):
@@ -67,6 +117,8 @@ def _backend_family_for_directory(directory):
         return "pytest"
     if directory_type == "node":
         return "npm"
+    if directory_type == "go":
+        return "go"
     if directory_type == "rust":
         return "cargo"
     if directory_type == "go":
@@ -2553,22 +2605,17 @@ class TestSharedTestRunnerLayouts:
         """The onboarding detector agrees with the shared runner-family fixture."""
         from app.ci_resolution import has_detectable_tests
 
-        root_resp = _listing_resp(_layout_root_listing(layout))
-
-        # The detector fetches the CONTENT of certain manifests before emitting
+        # The detector walks a depth-bounded subtree (root → nested containers /
+        # packages) and fetches the CONTENT of certain manifests before emitting
         # a command: package.json (node ``scripts.test`` guard), composer.json
         # (composer ``scripts.test`` guard), Makefile (real ``test:`` target),
         # and pyproject.toml when pytest must be confirmed from its body.
-        # Mirror those content fetches so the mock side-effect list stays in sync.
-        responses = [root_resp]
-        for item in layout["files"]:
-            if "content" in item:
-                responses.append(_file_content_resp(item.get("content", "")))
-
+        # A URL-routing side effect serves listings and file bodies in whatever
+        # order the BFS issues them, so nested layouts work without sequencing.
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=responses,
+            side_effect=_make_layout_github_side_effect(layout),
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 

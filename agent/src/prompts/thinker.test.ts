@@ -206,6 +206,18 @@ describe('buildThinkerPrompt', () => {
     expect(without).not.toContain('## Drift Signals');
   });
 
+  it('running_update superseded note rendered only when runningUpdateSupersededSection is non-empty', () => {
+    const note = '\n_Last cycle the operator preserved their own running_update over your proposed rewrite._\n';
+    const with_ = buildThinkerPrompt({ ...base, runningUpdateSupersededSection: note });
+    expect(with_).toContain('operator preserved their own running_update');
+
+    const without = buildThinkerPrompt({ ...base, runningUpdateSupersededSection: '' });
+    expect(without).not.toContain('operator preserved their own running_update');
+
+    const absent = buildThinkerPrompt(base);
+    expect(absent).not.toContain('operator preserved their own running_update');
+  });
+
   it('efficiency snapshot section rendered when efficiencySnapshotSection is non-empty', () => {
     const section = '\n## Pipeline Efficiency Axes\nsome data\n';
     const prompt = buildThinkerPrompt({ ...base, efficiencySnapshotSection: section });
