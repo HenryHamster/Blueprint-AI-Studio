@@ -232,6 +232,66 @@ jobs:
           done
           echo "Frontend legs OK (build=$B unit=$U viewport=$V)"
 
+  # Backend test image: a deps-only layer (apt + pip), cached in GHCR keyed by a
+  # hash of requirements.txt + Dockerfile. Built once when those change; the 8
+  # shards below then pull it and mount the checked-out source over /app at run
+  # time — instead of each shard rebuilding the full image from scratch every
+  # run (~34s × 8 of redundant `pip install`). GHCR images aren't branch-scoped,
+  # so this cache is shared across all PRs (unlike the GH Actions cache).
+  # Best-effort: if login/build/push can't happen (e.g. a fork PR's read-only
+  # token), the shards fall back to building the deps stage locally — never worse
+  # than before. This job never fails the run (exits 0); a genuine deps build
+  # error surfaces in the shards instead.
+  backend-deps:
+    name: CI / Backend deps image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: detect
+    if: needs.detect.outputs.backend == 'true'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      reqhash: ${{ steps.hash.outputs.reqhash }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute deps hash
+        id: hash
+        run: |
+          REQHASH=$(cat backend/requirements.txt backend/Dockerfile | sha256sum | cut -c1-16)
+          echo "reqhash=$REQHASH" >> "$GITHUB_OUTPUT"
+          echo "deps tag: $REQHASH"
+
+      - name: Build + push deps image if missing
+        env:
+          REQHASH: ${{ steps.hash.outputs.reqhash }}
+        run: |
+          IMG="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/backend-test-deps"
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin 2>/dev/null \
+            || { echo "::warning::ghcr login failed — shards will build the deps stage locally"; exit 0; }
+          if docker manifest inspect "$IMG:$REQHASH" >/dev/null 2>&1; then
+            echo "deps image $IMG:$REQHASH already cached — nothing to build"
+            exit 0
+          fi
+          echo "deps image missing — building --target deps and pushing $IMG:$REQHASH"
+          # python:3.11-slim base pull can hit a Docker Hub blip; retry it (mirrors
+          # the postgres/playwright retries elsewhere).
+          for i in 1 2 3; do
+            docker pull python:3.11-slim && break
+            echo "::warning::python:3.11-slim pull failed (attempt $i/3) — retrying"
+            sleep $((i * 10))
+          done
+          docker build --target deps -t "$IMG:$REQHASH" ./backend \
+            || { echo "::warning::deps build failed — shards will build locally and surface the error"; exit 0; }
+          for i in 1 2 3; do
+            docker push "$IMG:$REQHASH" && exit 0
+            echo "::warning::ghcr push failed (attempt $i/3) — retrying"
+            sleep $((i * 5))
+          done
+          echo "::warning::deps image push failed after retries — shards will build locally"
+          exit 0
+
   backend:
     name: CI / Backend (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -241,7 +301,7 @@ jobs:
     # Actions' default job timeout is 360 min, so without this a single hang
     # stalls the runner for 6h and wedges the rollup. This is the catch-all.
     timeout-minutes: 10
-    needs: detect
+    needs: [detect, backend-deps]
     if: needs.detect.outputs.backend == 'true'
     # Sharded: the suite (~7k tests, ~11.5 min serial) is split into 8 parallel
     # legs via pytest-split (--splits 8 --group N). Each leg is an ordinary
@@ -259,6 +319,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      packages: read
     # PostgreSQL is started manually (in the first step) instead of as a
     # `services:` container so we can retry the Docker Hub image pull. A
     # service-container pull only auto-retries 3x over ~45s; a Docker Hub blip
@@ -297,32 +358,44 @@ jobs:
             exit 1
           fi
 
-      - name: Build backend image
+      - name: Resolve backend deps image (pull cached, else build)
+        id: deps
+        env:
+          REQHASH: ${{ needs.backend-deps.outputs.reqhash }}
         run: |
+          # CLAUDE.md is mounted into /app for the steps below (some tests read
+          # it); the deps image deliberately has no source baked in.
           cp CLAUDE.md backend/CLAUDE.md
-          # python:3.11-slim is pulled from Docker Hub — pre-pull it with retry so
-          # the same registry blip that hits postgres can't fail the build either.
-          for i in 1 2 3; do
-            docker pull python:3.11-slim && break
-            echo "::warning::python:3.11-slim pull failed (attempt $i/3) — retrying"
-            sleep $((i * 10))
-          done
-          docker build -t blueprint-backend-test ./backend
+          IMG="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/backend-test-deps"
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin 2>/dev/null || true
+          if [ -n "$REQHASH" ] && docker pull "$IMG:$REQHASH" 2>/dev/null; then
+            echo "using cached deps image $IMG:$REQHASH"
+            echo "image=$IMG:$REQHASH" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::deps image unavailable — building --target deps locally"
+            for i in 1 2 3; do
+              docker pull python:3.11-slim && break
+              echo "::warning::python:3.11-slim pull failed (attempt $i/3) — retrying"
+              sleep $((i * 10))
+            done
+            docker build --target deps -t "backend-test-deps:${REQHASH:-local}" ./backend
+            echo "image=backend-test-deps:${REQHASH:-local}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify app imports
         run: |
-          docker run --rm \
+          docker run --rm -v "$PWD/backend:/app" \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e AGENT_JWT_SECRET=ci-test-secret \
             -e WS_TICKET_SECRET=ci-test-secret \
-            blueprint-backend-test \
+            ${{ steps.deps.outputs.image }} \
             python -c "from app.main import app; print(f'OK: {len(app.routes)} routes')"
 
       - name: Run migrations on test DB
         run: |
-          docker run --rm --network host \
+          docker run --rm --network host -v "$PWD/backend:/app" \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
-            blueprint-backend-test \
+            ${{ steps.deps.outputs.image }} \
             alembic upgrade head
 
       - name: Run tests (shard ${{ matrix.shard }}/8)
@@ -338,12 +411,12 @@ jobs:
           # Disable -e so pytest's non-zero exit doesn't short-circuit the
           # failure-extraction below; we propagate the code via $pytest_status.
           set +e
-          docker run --rm --network host \
+          docker run --rm --network host -v "$PWD/backend:/app" \
             -e DATABASE_URL=${{ env.TEST_DB_URL }} \
             -e USE_TEST_POSTGRES=true \
             -e AGENT_JWT_SECRET=ci-test-secret \
             -e WS_TICKET_SECRET=ci-test-secret \
-            blueprint-backend-test \
+            ${{ steps.deps.outputs.image }} \
             python -m pytest testing/ --splits 8 --group ${{ matrix.shard }} \
               -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
           pytest_status=${PIPESTATUS[0]}
