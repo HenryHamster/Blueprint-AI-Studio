@@ -956,6 +956,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "ci_backstop_timeout_minutes",
                     "evaluating_fail_hours",
                     "max_total_research_per_project",
+                    "productive_direction_cooldown_minutes",
                     "next_role_poll_timeout_secs",
                     "direction_churn_window_cycles",
                     "direction_churn_non_merge_threshold",

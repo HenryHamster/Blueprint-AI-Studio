@@ -1911,6 +1911,9 @@ async def _apply_settings(
                     "max_total_research_per_project": _runtime_config.get(
                         "max_total_research_per_project", 5
                     ),
+                    "productive_direction_cooldown_minutes": _runtime_config.get(
+                        "productive_direction_cooldown_minutes", 45
+                    ),
                     "warm_continuity_enabled": bool(
                         _runtime_config.get("warm_continuity_enabled", False)
                     ),

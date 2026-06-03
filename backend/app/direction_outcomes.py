@@ -1096,6 +1096,50 @@ async def _update_direction_research_outcomes(
     _refresh_pipeline_scope_merge_rates(project)
 
 
+async def refresh_direction_outcomes_after_merge(
+    task: Task, session: AsyncSession
+) -> None:
+    """Re-run the research-history outcome recompute after a task's PR merges.
+
+    The terminal-status path (``task_lifecycle``) computes a research cycle's
+    ``prs_merged`` when each child task reaches COMPLETED — at which point its
+    PR has only just *opened*, not merged. The PR lands asynchronously later via
+    the rollup, by which point the child is already terminal, so no status
+    transition re-fires the recompute and ``prs_merged`` stays stale-low. Call
+    this from merge chokepoints (where the landed signal is stamped) so the
+    cycle's merge counts reflect reality — the churn guardrail, lifetime-burn
+    backstop, and productivity scoring all read ``prs_merged``/``merge_rate``.
+
+    The recompute re-counts *every* child of the cycle via
+    :func:`is_merged_completion`, so a single child's merge heals the whole
+    cycle entry (picking up sibling PRs that landed since the last recompute).
+
+    No-op unless *task* carries both ``direction_id`` and ``research_task_id``.
+    Best-effort: a failure here must never break merge finalization, so errors
+    are logged and the session is rolled back to keep the caller's scope clean.
+    """
+    import contextlib
+    import logging
+
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    research_task_id = ctx.get("research_task_id")
+    if not (direction_id and research_task_id) or task.project_id is None:
+        return
+    try:
+        await _update_direction_research_outcomes(
+            task.project_id, str(direction_id), str(research_task_id), session
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
+        logging.getLogger(__name__).warning(
+            "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
+            getattr(task, "id", None),
+            exc,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+
+
 def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
     """Publish project-wide scope merge rates to runtime_config.
 
