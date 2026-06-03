@@ -1,3 +1,16 @@
+"""SQLModel ORM models and shared enums for the Blueprint orchestrator.
+
+This module is the single source of truth for the persisted schema: the
+SQLModel tables (``Project``, ``Task``, ``Artifact``, ``Direction``, and
+related entities), the status/type enums used across the backend
+(``ProjectStatus``, ``TaskStatus``, ``ArtifactType``, ``LLMProviderName``,
+``LLMAuthMode``, ...), and the ``NaiveUTCDateTime`` column type used uniformly
+for naive-UTC timestamps. Table definitions here must stay in lock-step with
+the Alembic migrations under ``backend/alembic/versions/`` and with
+``EXPECTED_SCHEMA_REVISION`` in ``app.main`` — see ``docs/DATA_MODELS.md`` for a
+field-level reference.
+"""
+
 from enum import Enum
 from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
@@ -104,6 +117,10 @@ class ArtifactType(str, Enum):
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
     MEMO = "MEMO"
+    # Verdict from the verify_tests agent handler: the repo's detected test
+    # suite run on a PR head, consulted by the no-CI merge gate. ArtifactType is
+    # a plain String column (sa_column=Column(String)) so no migration is needed.
+    MERGE_TEST_RESULT = "MERGE_TEST_RESULT"
 
 
 class LLMProviderName(str, Enum):
@@ -116,6 +133,22 @@ class LLMAuthMode(str, Enum):
     OAUTH = "oauth"
     API_KEY = "api_key"
     SERVICE_ACCOUNT = "service_account"
+
+
+class PoolVmState(str, Enum):
+    """Lease state of a pre-provisioned warm-pool agent VM.
+
+    PROVISIONING — the VM is booting (taskless) and has not yet reported ready.
+    IDLE         — booted, credentialed, and available to be leased.
+    LEASED       — currently claimed by a task (``leased_task_id`` set until
+                   ``lease_expires_at``).
+    RETIRING     — scheduled for teardown; never lease in this state.
+    """
+
+    PROVISIONING = "PROVISIONING"
+    IDLE = "IDLE"
+    LEASED = "LEASED"
+    RETIRING = "RETIRING"
 
 
 # --- Auto-pause diagnosis workflow constants ---
@@ -201,6 +234,14 @@ class UserIntegration(SQLModel, table=True):
 
 
 class Project(SQLModel, table=True):
+    """Repository-scoped container for tasks, strategic state, and build config.
+
+    The onboarding flow seeds ``build_config`` with detected defaults and a
+    per-repo task-branch namespace. Subsequent admin PATCHes and re-detects are
+    expected to preserve operator-owned overrides such as branch naming,
+    cleanup prefixes, PR-title prefixes, and self-improvement flags.
+    """
+
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     name: str
     # Firebase UID of the project owner. Intentionally NOT a FK to
@@ -275,10 +316,22 @@ class Project(SQLModel, table=True):
     )
     # Toggle autonomous research/task generation
     autonomous_enabled: bool = Field(default=True)
+    # Operator pause switch. Distinct from ``autonomous_enabled`` (which only
+    # gates NEW autonomous spawning) and from terminal ``status`` (DRAFT →
+    # COMPLETED/FAILED/CANCELLED): while ``paused`` is True the orchestrator
+    # must not select or provision this project's QUEUED work on any dispatch
+    # path, and all autonomous spawn entry points skip it. In-flight
+    # PROVISIONING/IN_PROGRESS tasks are allowed to drain. Resuming
+    # (paused=False) restores normal dispatch with no re-configuration.
+    paused: bool = Field(default=False)
     # Self-repo flag: enables rollback monitoring, extended windows, infra soft gates
     # Set True when github_owner/github_repo matches Blueprint's own repo
     is_self_repo: bool = Field(default=False)
-    # Build configuration: directories, commands, git identity for the agent
+    # Archived flag: durable, reversible "set aside" state so a project can be
+    # hidden without deletion. Server default false backfills existing rows.
+    archived: bool = Field(default=False)
+    # Build configuration: onboarding seeds repo-derived defaults here, and
+    # admin PATCH / re-detect preserves operator-owned branch/cleanup overrides.
     build_config: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
@@ -304,7 +357,7 @@ class Project(SQLModel, table=True):
     )
     # Approval gate configuration for PR file-path flagging.
     # Shape: {"infra_files": [...], "critical_files": [...]}.
-    # When unset, defaults to Blueprint's hardcoded sensitive paths.
+    # When unset/empty, the file-based gate is disabled and reads as {}.
     approval_gate_config: Dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
@@ -312,14 +365,15 @@ class Project(SQLModel, table=True):
     # Per-project trunk branch for autonomous task spawning.
     # NULL means "fall back to 'main'".
     # Blueprint's own repo uses 'automain'; most other projects use 'main'.
-    # See shared_state.get_project_integration_branch.
+    # Admin onboarding does not seed this column; it is set separately and
+    # preserved across project config edits.
     integration_branch: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
     )
     # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
     # identical semantics to integration_branch.
-    # See shared_state.get_project_promotion_target.
+    # Like integration_branch, this is operator-managed and preserved once set.
     promotion_target: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
@@ -327,6 +381,7 @@ class Project(SQLModel, table=True):
 
     @property
     def enable_self_improvement(self) -> bool:
+        """True when build_config explicitly enables self-improvement mode."""
         return bool((self.build_config or {}).get("enable_self_improvement", False))
 
     @property
@@ -334,8 +389,10 @@ class Project(SQLModel, table=True):
         """Namespace prefix for agent task branches (``{namespace}/{prefix}-{8hex}``).
 
         Reads from ``build_config.task_branch_namespace`` if set; otherwise
-        returns Blueprint's default (``"blueprint"``). A non-Blueprint install
-        can ship its own namespace (e.g. ``"autoproj"``) by setting this in
+        returns Blueprint's default (``"blueprint"``). Onboarding seeds this
+        value from the repo name, and later PATCH/re-detect flows preserve it
+        unless an operator explicitly changes it. A non-Blueprint install can
+        ship its own namespace (e.g. ``"autoproj"``) by setting this in
         build_config, and the canonical resolver lives in
         ``shared_state.get_project_task_branch_namespace``.
         """
@@ -350,6 +407,7 @@ class Project(SQLModel, table=True):
 
         Reads from ``build_config.staging_branch_prefixes`` if set; otherwise
         returns Blueprint's conventional pair (``research/``, ``plan/``).
+        Admin re-detect preserves this list when already configured.
         """
         configured = (self.build_config or {}).get("staging_branch_prefixes")
         if configured is not None:
@@ -392,7 +450,8 @@ class Project(SQLModel, table=True):
         Reads from build_config.stale_branch_prefixes if set; otherwise returns
         the project's task-branch namespace alongside the project's staging
         branch prefixes. An empty list in build_config disables cleanup for this
-        project.
+        project, and admin PATCH/re-detect preserve the explicit empty-list
+        opt-out.
         """
         configured = (self.build_config or {}).get("stale_branch_prefixes")
         if configured is not None:
@@ -406,7 +465,8 @@ class Project(SQLModel, table=True):
         Reads from build_config.protected_branches if set; otherwise returns
         the default set (main, master, develop, dev). Always includes the
         project's integration_branch and promotion_target so misconfiguration
-        cannot delete trunk branches.
+        cannot delete trunk branches. Admin re-detect preserves any operator
+        override already stored in build_config.
         """
         from app.services import _DEFAULT_PROTECTED_BRANCHES
         from app.shared_state import (
@@ -431,7 +491,9 @@ class Project(SQLModel, table=True):
         By default this tracks ``task_branch_namespace`` so a project that
         overrides only the namespace (e.g. ``'autoproj'``) gets the matching
         prefix (``'autoproj/'``) automatically — keeping cleanup loops in
-        sync with the project's actual branch naming.
+        sync with the project's actual branch naming. Onboarding seeds the
+        namespace; later config saves preserve it unless the operator changes
+        the value explicitly.
 
         Precedence: an explicit ``build_config.task_branch_prefix`` wins
         (legacy escape hatch so any project pinned to the older key keeps
@@ -467,6 +529,19 @@ class Project(SQLModel, table=True):
         line = f"- [{now_str}] **{event_type}**: {summary[:200]}"
         current = (self.running_update or "").rstrip()
         self.running_update = f"{current}\n{line}" if current else line
+
+    @classmethod
+    def not_archived(cls):
+        """Canonical "project is not archived" filter expression.
+
+        Archiving halts ALL of a project's work, so every project-selection
+        query that drives or surfaces work (orchestrator candidate dispatch,
+        autonomous schedulers, strategic-starvation and pipeline alert scans)
+        filters on this. Centralized here so the exclusion clause cannot drift
+        independently across call sites — production code and tests reference
+        the same predicate. Usage: ``select(...).where(Project.not_archived())``.
+        """
+        return cls.archived.is_(False)
 
     tasks: List["Task"] = Relationship(
         back_populates="project",
@@ -754,6 +829,9 @@ class Task(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
     vm_spot: bool = Field(default=False)
+    vm_machine_type: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
 
     # Efficiency-direction (d-91d8dede) foundational instrumentation.
     # vm_cold_start_ms = (first agent heartbeat - vm_provisioned_at) in ms.
@@ -764,10 +842,12 @@ class Task(SQLModel, table=True):
         default=None,
         sa_column=Column(Integer, nullable=True),
     )
-    # vm_warm_start is True when the VM was reused from a warm pool / cached
-    # image rather than freshly provisioned. There is no warm pool today, so
-    # all provisions write False — the column is foundational scaffolding so
-    # that vm_reuse_rate has a real signal once warm pooling lands.
+    # vm_warm_start is True when the VM was reused via a warm claim / backlog
+    # reuse path rather than freshly provisioned. Cold dispatch writes False
+    # (orchestrator.py); the warm-claim path writes True
+    # (routers/agent_warm_continuity._finalize_warm_claim). The efficiency
+    # vm_reuse_rate metric reads context['_timing']['warm_start'] as its source,
+    # which now agrees with this column on warm tasks.
     vm_warm_start: bool | None = Field(
         default=False,
         sa_column=Column(Boolean, nullable=True, server_default=text("false")),
@@ -1167,7 +1247,11 @@ def get_task_current_attempt_vm_cost_usd(
     )
     if runtime_seconds <= 0:
         return 0.0
-    return runtime_seconds * get_vm_rate_per_second(spot=task.vm_spot)
+
+    machine_type = task.__dict__.get("vm_machine_type")
+    return runtime_seconds * get_vm_rate_per_second(
+        machine_type=machine_type, spot=task.vm_spot
+    )
 
 
 def get_task_total_vm_cost_usd(
@@ -1285,6 +1369,7 @@ def bank_task_current_attempt(
         else None,
         "vm_stopped_at": effective_stop.isoformat() if effective_stop else None,
         "vm_spot": bool(task.vm_spot),
+        "vm_machine_type": task.vm_machine_type,
         "vm_runtime_cost_usd": round(vm_cost, 6),
         "llm_input_tokens": input_tokens,
         "llm_output_tokens": output_tokens,
@@ -1304,6 +1389,131 @@ def bank_task_current_attempt(
         task.api_call_summary = None
 
     return snapshot
+
+
+class PoolVm(SQLModel, table=True):
+    """Durable fleet-wide registry of pre-provisioned, credentialed, idle agent VMs.
+
+    One row per warm-pool member. A pool VM is cold-booted *without* a task,
+    pinned to a specific LLM account/provider/auth_mode/model baked into its
+    boot secret manifest (see ``compute_manifest.build_taskless_agent_secret_manifest``),
+    and registered here so the dispatch layer can later lease an IDLE member to
+    a newly-queued task instead of cold-provisioning.
+
+    Leasing uses ``SELECT ... FOR UPDATE SKIP LOCKED`` over real rows (NOT a JSON
+    blob) so concurrent dispatchers can't double-claim a member — mirroring the
+    backlog-reuse selection in ``warm_backlog_reuse``. The lease helper only
+    returns a row whose pinned identity is compatible with the candidate task's
+    required account/provider/model AND whose ``project_id`` matches (a hard
+    tenant-isolation gate). This table is INFRASTRUCTURE — nothing leases or
+    dispatches to it until the dispatch hook / maintainer land (sibling tasks);
+    it is inert behind the ``warm_pool_enabled`` runtime flag (default False).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Unique GCP instance name; the natural key the dispatch/heartbeat paths use.
+    vm_instance_id: str = Field(
+        sa_column=Column(String, nullable=False, unique=True, index=True)
+    )
+    # Hard tenant-isolation boundary: a member only ever serves tasks from this
+    # project. Indexed (with state) for the lease hot path.
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+
+    # Pinned LLM identity frozen into the VM's boot secret manifest. The lease
+    # gate requires these to be compatible with the candidate task's resolved
+    # account/provider/model — a reused VM runs on its boot credentials.
+    account_id: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+    provider: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    auth_mode: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    model: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    # Identifies the agent image the VM booted on, so a stale-image member can be
+    # retired rather than leased after a rebake.
+    agent_image_fingerprint: str | None = Field(
+        default=None, sa_column=Column(String, nullable=True)
+    )
+
+    state: PoolVmState = Field(
+        default=PoolVmState.PROVISIONING,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=PoolVmState.PROVISIONING.value,
+        ),
+    )
+    # When the member last entered IDLE; the idle reaper / maintainer (sibling
+    # task) uses this to age out members that nobody leased.
+    idle_since: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    # The task currently holding the lease (cleared on release). Plain GUID, no
+    # FK — a leased task may be archived/deleted independently of the registry.
+    leased_task_id: uuid.UUID | None = Field(
+        default=None, sa_column=Column(GUID(), nullable=True)
+    )
+    lease_expires_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    # Idle-VM cost accumulator. Idle pool members still bill GCE wall-clock; this
+    # banks that cost onto the row so cost accounting (sibling task) can attribute
+    # it later WITHOUT a second model change.
+    idle_cost_banked: float | None = Field(
+        default=None, sa_column=Column(Float, nullable=True)
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        # Lease hot path: WHERE project_id = ? AND state = 'IDLE' AND <identity>.
+        Index("ix_poolvm_project_state", "project_id", "state"),
+    )
+
+
+class PoolIdleCostLedger(SQLModel, table=True):
+    """Durable carry-forward of a retired pool member's banked idle cost.
+
+    A ``PoolVm`` row carries its accrued idle spend in ``idle_cost_banked`` while
+    it lives, but the idle reaper HARD-DELETES the row on teardown (after the
+    1800s idle-TTL). Efficiency snapshots run once per UTC day, so the vast
+    majority of members are provisioned, accrue idle cost, and are deleted
+    entirely between two snapshots — their spend would vanish, making
+    ``cost_per_merged_pr_incl_pool_idle`` systematically undercount.
+
+    To honor the documented invariant "teardown never erases measured idle
+    spend" (``efficiency_snapshot.compute_pool_idle_cost``), the reaper writes
+    one append-only ledger row carrying the member's banked cost in the SAME
+    transaction that deletes the registry row, and ``compute_pool_idle_cost``
+    sums these rows into ``settled_idle_cost_usd``. Append-only INSERT is
+    concurrency-safe (no row lock / accumulator contention).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Tenant the retired member served — lets the snapshot scope the carry-forward
+    # to a project (mirroring compute_pool_idle_cost's optional project filter).
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # The retired VM's natural key (audit / dedup trail; not unique — defensive).
+    vm_instance_id: str = Field(sa_column=Column(String, nullable=False))
+    # Banked idle USD carried forward from the deleted PoolVm row.
+    idle_cost_usd: float = Field(sa_column=Column(Float, nullable=False))
+    # Teardown reason (pool_idle_ttl / pool_zombie_no_heartbeat / ...), for audit.
+    reason: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    retired_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
 
 
 class TaskHistory(SQLModel, table=True):

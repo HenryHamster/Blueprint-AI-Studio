@@ -113,6 +113,26 @@ async def _reconcile_if_promotion_failed_landed(
             if project is None:
                 return False
 
+            # Single-branch repo guard (LTS model inactive) — mirrors the
+            # promote() guard.  When the integration branch IS the promotion
+            # target there is no separate release trunk: fleet work (including
+            # this candidate) already merges directly to that branch, so
+            # promote() records an inert success and never opens a release PR.
+            # _candidate_already_on_main would therefore ALWAYS be True on the
+            # single branch — reconciling here would spuriously record a
+            # promotion against a branch work already lands on.  Bail out inert,
+            # mirroring the back-merge guard's "lts_inactive" skip semantics.
+            integration_branch, promotion_target = _lts_branch_names(project)
+            if integration_branch == promotion_target:
+                logger.debug(
+                    "[RELEASE_QUALIFIER] reconcile: v%d integration branch (%s) "
+                    "is the promotion target — single-branch repo, LTS inactive; "
+                    "nothing to reconcile",
+                    version.version_number,
+                    promotion_target,
+                )
+                return False
+
             # Release the row lock before any GitHub I/O (mirrors promote()).
             try:
                 await session.commit()
@@ -248,6 +268,24 @@ async def _reconcile_if_pending_auto_merge_landed(
 
             project = await session.get(Project, version.project_id)
             if project is None:
+                return False
+
+            # Single-branch repo guard (LTS model inactive) — mirrors the
+            # promote() guard.  When the integration branch IS the promotion
+            # target promote() never opens a release PR (it records an inert
+            # success), so there is no pending promotion PR to reconcile and
+            # _candidate_already_on_main would always be True on the single
+            # branch.  Bail out inert, mirroring the back-merge guard's
+            # "lts_inactive" skip semantics.
+            integration_branch, promotion_target = _lts_branch_names(project)
+            if integration_branch == promotion_target:
+                logger.debug(
+                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: v%d "
+                    "integration branch (%s) is the promotion target — "
+                    "single-branch repo, LTS inactive; nothing to reconcile",
+                    version.version_number,
+                    promotion_target,
+                )
                 return False
 
             try:

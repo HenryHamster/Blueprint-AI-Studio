@@ -733,6 +733,102 @@ class TestSecurityIntegrity:
         )
 
 
+# ── Dialect-resolution footgun guard ───────────────────────────────────────
+
+
+class TestNoRawBindDialectIdiom:
+    """Guard against the None-bind dialect footgun (triggering incident PR #7099).
+
+    The idiom ``<session>.bind.dialect.name if <session>.bind else "postgresql"``
+    (and the ``.bind.dialect.name == "postgresql"`` guard variant) reads ``.bind``
+    directly off a session. An ``AsyncSession`` created from an
+    ``async_sessionmaker`` exposes a **None** ``.bind`` even though it resolves a
+    real engine lazily at execute-time, so the idiom silently defaults to
+    Postgres and emits Postgres-only SQL on a SQLite-bound session. All dialect
+    resolution must go through ``app.database.resolve_dialect_name`` instead.
+    """
+
+    def test_no_raw_session_bind_dialect_in_app_code(self):
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # database.py *defines* resolve_dialect_name and documents the bad idiom
+        # in its docstring; it is the one legitimate site that names ``.bind.dialect``.
+        allow_list = {"database.py"}
+        pattern = re.compile(r"\.bind\.dialect")
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py") or fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if pattern.search(line):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found raw `.bind.dialect` access in backend/app/.\n"
+            "Resolve the dialect via app.database.resolve_dialect_name(session) "
+            "instead — a None-bind async session silently defaults to Postgres "
+            "and emits Postgres-only SQL on SQLite (incident PR #7099).\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_no_two_line_bind_dialect_split(self):
+        """Catch the two-line split form the single-line regex misses.
+
+        The footgun can evade ``test_no_raw_session_bind_dialect_in_app_code``
+        by spreading the access across two lines: assign a session's ``.bind``
+        (or ``get_bind()``) to a local, then read ``.dialect`` off that local on
+        a later line. This whole-file scan flags any local assigned from
+        ``<x>.bind`` / ``<x>.get_bind()`` whose ``.dialect`` is read anywhere in
+        the same file. Legitimate non-dialect uses of ``.bind`` (e.g. handing the
+        engine to a sub-session factory) never read ``.dialect`` off the local,
+        so they are not flagged.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # database.py *defines* resolve_dialect_name (the one legitimate site).
+        allow_list = {"database.py"}
+        # A local assigned from a session's bind: ``<var> = <expr>.bind`` or
+        # ``<var> = <expr>.get_bind(...)``.
+        assign_re = re.compile(
+            r"^\s*(\w+)\s*=\s*[\w.]+\.(?:bind\b|get_bind\s*\()", re.MULTILINE
+        )
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py") or fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    text = f.read()
+                for m in assign_re.finditer(text):
+                    var = m.group(1)
+                    line = text[m.start() : text.find("\n", m.start())]
+                    if line.lstrip().startswith("#") or "# noqa" in line:
+                        continue
+                    # Flag only when ``.dialect`` is read off this same local —
+                    # that is what distinguishes the footgun from a benign
+                    # ``.bind`` use that just forwards the engine.
+                    if re.search(rf"\b{re.escape(var)}\.dialect\b", text):
+                        lineno = text.count("\n", 0, m.start()) + 1
+                        rel = os.path.relpath(fpath, app_dir)
+                        offenders.append(f"  {rel}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "Found a two-line `.bind` → `.dialect` split in backend/app/.\n"
+            "A local assigned from a session's `.bind`/`get_bind()` whose "
+            "`.dialect` is read later is the same None-bind footgun in disguise "
+            "(incident PR #7099). Resolve the dialect via "
+            "app.database.resolve_dialect_name(session) instead.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Base-branch fallback hardening ─────────────────────────────────────────
 
 
@@ -819,6 +915,39 @@ class TestBaseBranchFallback:
             "instead of embedding literal 'main...' or 'main -> automain'.\n"
             "Offenders:\n" + "\n".join(offenders)
         )
+
+
+# ── Self-repo branch resolution guard ──────────────────────────────────────
+
+
+class TestSelfRepoBranchResolution:
+    """Ensure self-repo projects resolve to correct integration branches."""
+
+    def test_self_repo_null_integration_branch_resolves_to_automain(self):
+        """A self-repo with NULL integration_branch must resolve to 'automain', not 'main'.
+
+        Blueprint's integration trunk is 'automain' (qualification branch).
+        The promotion/release target is 'main'. When integration_branch is unset,
+        the resolver must fall back to 'automain' for self-repos, not 'main'.
+        """
+        from app.branch_resolution import get_project_integration_branch
+
+        class _FakeSelfRepo:
+            integration_branch = None
+            is_self_repo = True
+
+        assert get_project_integration_branch(_FakeSelfRepo()) == "automain"
+
+    def test_non_self_repo_null_integration_branch_resolves_to_main(self):
+        """A non-self-repo with NULL integration_branch must resolve to 'main'."""
+        from app.branch_resolution import get_project_integration_branch
+
+        class _FakeProject:
+            integration_branch = None
+            is_self_repo = False
+            github_repo = "other-repo"
+
+        assert get_project_integration_branch(_FakeProject()) == "main"
 
 
 # ── Staging-branch prefix classification guard ────────────────────────────
@@ -3338,3 +3467,145 @@ class TestVmCostRateConsolidation:
             f"Unknown machine type '{unknown_type}' spot rate should fall back to "
             f"e2-standard-2 spot rate ({expected_spot}), got {unknown_spot}"
         )
+
+
+# ── pr_merged "landed on integration" writer allowlist ─────────────────────
+
+
+class TestPrMergedLandedWriterAllowlist:
+    """Tripwire: NO backend/app/ site may SET the ``pr_merged`` "landed on
+    integration" signal via a bare literal ``True`` — every writer must funnel
+    through the guarded setter in ``app/landed_signal.py``. The reviewed
+    allowlist of permitted inline writers is now EMPTY.
+
+    Motivation
+    ----------
+    ``pr_merged`` is the canonical "this task's PR actually merged into the
+    project integration branch" signal — setting it unblocks dependent work
+    and feeds the release/landed query helpers. It must ONLY be set when a PR
+    truly landed on the integration branch.
+
+    Setter-consolidation (direction "refactor: separate landed signal from
+    pr_merged") is COMPLETE: every writer now funnels through
+    ``app/landed_signal.py`` — ``mark_landed_on_integration`` /
+    ``apply_merged_landed_signal`` — which stamps the signal through the
+    ``LANDED_SIGNAL_KEY`` constant, not a bare ``"pr_merged": True`` literal.
+    This ratchet now enumerates any remaining inline literal writer and asserts
+    the set is empty so that:
+
+      * a NEW inline writer fails CI with a message directing the author to
+        route through the guarded setter rather than stamping the signal
+        inline (``found - _ALLOWLIST`` — the allowlist being empty, ANY inline
+        writer trips it).
+
+    How it works
+    ------------
+    The test walks every ``.py`` file under ``backend/app/`` line-by-line
+    (the same source-walking style as ``TestBaseBranchFallback`` /
+    ``TestStagingBranchClassification``), skipping comment lines
+    (``#``-prefixed) and ``# noqa`` lines, and matches writer lines with two
+    regexes — a dict-literal/spread form (``"pr_merged": True``) and a
+    subscript-assignment form (``ctx["pr_merged"] = True``). It collects the
+    SET of relative file paths containing at least one match (file-level keys,
+    so no line numbers are hardcoded and consolidation that removes the last
+    literal in a file drops it from the set) and asserts set equality against
+    ``_ALLOWLIST``.
+
+    Excluded files
+    --------------
+    ``release_version.py`` is the landed-signal reader/query-helper: it
+    contains a ``cast({"pr_merged": True}, JSONB)`` ``@>`` containment query
+    plus docstrings describing the signal — it does not WRITE the signal onto
+    a task. It is listed in ``_SKIP_FILES`` so the docstring/query text does
+    not register as a writer (mirrors how the behind-recovery tripwire skips
+    ``github.py``).
+    """
+
+    # Dict-literal / spread form: ``"pr_merged": True`` (also matches the
+    # conditional-spread idiom ``**({"pr_merged": True} if _landed else {})``).
+    _DICT_PATTERN = re.compile(r"""["']pr_merged["']\s*:\s*True\b""")
+    # Subscript-assignment form: ``ctx["pr_merged"] = True``.
+    _SUBSCRIPT_PATTERN = re.compile(r"""["']pr_merged["']\s*\]\s*=\s*True\b""")
+
+    # Reader / query-helper files that mention ``pr_merged: True`` in a query
+    # cast or docstring but never stamp the signal onto a task.
+    _SKIP_FILES = frozenset({"release_version.py"})
+
+    # Reviewed set of files that may set the landed signal to True inline.
+    # Setter-consolidation is now COMPLETE: every writer funnels through the
+    # guarded setter in ``app/landed_signal.py`` (``mark_landed_on_integration``
+    # / ``apply_merged_landed_signal``), which stamps ``LANDED_SIGNAL_KEY: True``
+    # via the centralised constant rather than a bare ``"pr_merged": True``
+    # literal — so the regexes below (which require the quoted ``pr_merged``
+    # key) do not match it. The allowlist is therefore EMPTY: no backend/app/
+    # file may stamp the literal signal inline. A NEW inline writer fails CI
+    # and must route through ``landed_signal`` instead. Keys are paths relative
+    # to backend/app/.
+    _ALLOWLIST: frozenset[str] = frozenset()
+
+    @classmethod
+    def _discover_writers(cls):
+        """Return the set of backend/app-relative paths that set pr_merged=True."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        found: set[str] = set()
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, app_dir).replace(os.sep, "/")
+                if rel in cls._SKIP_FILES:
+                    continue
+                with open(fpath, encoding="utf-8") as f:
+                    for line in f:
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if cls._DICT_PATTERN.search(line) or cls._SUBSCRIPT_PATTERN.search(line):
+                            found.add(rel)
+                            break
+        return found
+
+    def test_landed_writer_set_matches_allowlist(self):
+        """The set of pr_merged=True writer files must equal the reviewed allowlist."""
+        found = self._discover_writers()
+        new_writers = sorted(found - self._ALLOWLIST)
+        stale_entries = sorted(self._ALLOWLIST - found)
+        assert found == self._ALLOWLIST, (
+            "The set of backend/app/ files that set the pr_merged 'landed on "
+            "integration' signal to True drifted from the reviewed allowlist.\n"
+            + (
+                "\nNEW writer(s) detected — the landed signal must only be set "
+                "for a real integration-branch merge. Route the write through the "
+                "shared guarded setter instead of stamping \"pr_merged\": True "
+                "inline; do NOT just add the file to _ALLOWLIST:\n"
+                + "\n".join(f"  + {p}" for p in new_writers)
+                if new_writers
+                else ""
+            )
+            + (
+                "\nSTALE allowlist entry — this file no longer sets pr_merged=True "
+                "(consolidation removed it). Remove it from _ALLOWLIST in "
+                "TestPrMergedLandedWriterAllowlist:\n"
+                + "\n".join(f"  - {p}" for p in stale_entries)
+                if stale_entries
+                else ""
+            )
+        )
+
+    def test_writer_regexes_still_match_sample_literals(self):
+        """Positive sanity: the writer regexes must still match a known literal.
+
+        Now that consolidation is complete the live scan finds ZERO inline
+        writers, so a file-based "must detect something" check would be
+        unsatisfiable. Instead we assert the detection regexes still match the
+        canonical inline forms directly — if they silently stop matching, the
+        empty-allowlist set-equality tripwire would pass vacuously even after a
+        real inline writer reappears. This guards against that regression
+        without requiring any inline writer to exist.
+        """
+        assert self._DICT_PATTERN.search('        "pr_merged": True,')
+        assert self._DICT_PATTERN.search("ctx = {**base, 'pr_merged': True}")
+        assert self._SUBSCRIPT_PATTERN.search('    ctx["pr_merged"] = True')
+        # And it must NOT match the centralised-constant form the guarded setter
+        # uses, so ``app/landed_signal.py`` is correctly left undetected.
+        assert not self._DICT_PATTERN.search("        LANDED_SIGNAL_KEY: True,")

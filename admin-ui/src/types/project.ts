@@ -56,6 +56,13 @@ export interface Project {
   github_owner: string;
   github_repo: string;
   autonomous_enabled: boolean;
+  /** Owner-toggled pause switch. When true, the orchestrator dispatches no new
+   *  QUEUED work for the project. Optional/additive: absent on older responses,
+   *  which are treated as not-paused. Distinct from lifecycle `status` and from
+   *  the `autonomous_enabled` toggle. */
+  paused?: boolean;
+  /** True when the project has been archived (hidden from the active list). Present on list endpoint. */
+  archived?: boolean;
   /** Full directions array — present on detail endpoint; absent on list endpoint. */
   directions?: Direction[];
   /** Count of active directions — present on list endpoint. */

@@ -494,6 +494,408 @@ async def get_fix_loop_convergence_trend(
 
 
 # ---------------------------------------------------------------------------
+# Outer review<->fix loop convergence (PR-level cycle, not inner lint/test/check)
+# ---------------------------------------------------------------------------
+
+_OUTER_LOOP_ESCALATION_PREFIX = "Review-fix escalation: "
+
+# Query caps for the outer-loop endpoints. When a window can exceed these the
+# aggregate silently under-counts, so each call site logs on overflow (project
+# playbook: "no silent caps").
+_OUTER_LOOP_TASK_CAP = 5000
+_OUTER_LOOP_TREND_TASK_CAP = 10_000
+_OUTER_LOOP_ALERT_CAP = 5000
+
+
+async def _load_escalation_alerts(
+    session: AsyncSession,
+    *,
+    cutoff: datetime,
+    project_id: uuid.UUID | None,
+) -> List[Alert]:
+    """Load review-fix early-escalation Alerts created since ``cutoff``."""
+    alert_stmt = (
+        select(Alert)
+        .where(
+            Alert.created_at >= cutoff,
+            Alert.title.like(f"{_OUTER_LOOP_ESCALATION_PREFIX}%"),
+        )
+        .options(load_only(Alert.id, Alert.title, Alert.task_id, Alert.created_at))
+        .limit(5000)
+    )
+    if project_id is not None:
+        alert_stmt = alert_stmt.where(Alert.project_id == project_id)
+    rows = list((await session.execute(alert_stmt)).scalars().all())
+    if len(rows) >= _OUTER_LOOP_ALERT_CAP:
+        logger.warning(
+            "[OUTER-LOOP] escalation-alert query hit the %d-row cap (project=%s, "
+            "cutoff=%s); convergence aggregate may under-count escalations",
+            _OUTER_LOOP_ALERT_CAP,
+            project_id,
+            cutoff.isoformat(),
+        )
+    return rows
+
+
+async def _load_outer_loop_original_tasks(
+    session: AsyncSession,
+    tasks: List[Task],
+    *,
+    project_id: uuid.UUID | None,
+) -> Dict[str, Task]:
+    """Load chain-original tasks referenced by in-window review loops.
+
+    The aggregation window is based on the review-loop task timestamp, but the
+    chain-original task can predate that window. We hydrate those originals so
+    terminal outcomes stamped there remain visible to the reducer.
+    """
+    original_ids: set[str] = set()
+    for task in tasks:
+        rl = (task.context or {}).get("review_loop")
+        if isinstance(rl, dict):
+            oid = rl.get("original_task_id")
+            if isinstance(oid, str) and oid:
+                original_ids.add(oid)
+    if not original_ids:
+        return {}
+
+    stmt = (
+        select(Task)
+        .where(Task.id.in_([uuid.UUID(oid) for oid in original_ids]))
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    originals = list((await session.execute(stmt)).scalars().all())
+    return {str(task.id): task for task in originals}
+
+
+@router.get("/outer-loop-convergence")
+async def get_outer_loop_convergence(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Aggregate OUTER review<->fix PR-cycle convergence health for a window.
+
+    Sources the per-PR ``review_loop`` state and the early-escalation operator
+    Alerts (does NOT change the convergence control logic). Returns the
+    cycles-to-merge distribution, churn/drift totals, terminal-outcome counts,
+    escalation-reason histogram, and the overall convergence rate. Suitable for
+    the outer-loop convergence dashboard widget.
+    """
+    from app.digest_metrics import compute_outer_loop_convergence  # noqa: PLC0415
+
+    cutoff = _utcnow() - timedelta(hours=hours)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+        .order_by(Task.created_at.desc())
+        .limit(_OUTER_LOOP_TASK_CAP)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    tasks = list((await session.execute(stmt)).scalars().all())
+    if len(tasks) >= _OUTER_LOOP_TASK_CAP:
+        logger.warning(
+            "[OUTER-LOOP] task query hit the %d-row cap (hours=%d, project=%s); "
+            "convergence aggregate may under-count PR-chains in this window",
+            _OUTER_LOOP_TASK_CAP,
+            hours,
+            project_id,
+        )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+
+    summary = compute_outer_loop_convergence(
+        all_tasks=[
+            *tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in tasks}
+            ],
+        ],
+        escalation_alerts=alerts,
+        window_start=cutoff,
+    )
+    return {"window_hours": hours, **summary}
+
+
+@router.get("/outer-loop-convergence-trend")
+async def get_outer_loop_convergence_trend(
+    days: int = Query(7, ge=1, le=30),
+    project_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Per-day buckets of outer review<->fix loop convergence over ``days``.
+
+    Each bucket carries the per-day convergence rate, escalation total, and
+    churn total so the widget can trend whether issue-churn is becoming rare and
+    work is converging (merging) rather than oscillating.
+    """
+    from app.digest_metrics import (  # noqa: PLC0415
+        compute_churn_direction,
+        compute_outer_loop_convergence,
+    )
+
+    cutoff = _utcnow() - timedelta(days=days)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+        .limit(_OUTER_LOOP_TREND_TASK_CAP)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    tasks = list((await session.execute(stmt)).scalars().all())
+    if len(tasks) >= _OUTER_LOOP_TREND_TASK_CAP:
+        logger.warning(
+            "[OUTER-LOOP] trend task query hit the %d-row cap (days=%d, project=%s); "
+            "per-day convergence buckets may under-count PR-chains",
+            _OUTER_LOOP_TREND_TASK_CAP,
+            days,
+            project_id,
+        )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+
+    # Bucket tasks and alerts by their creation day, then aggregate each day
+    # through the same pure helper the point-in-time endpoint uses.
+    tasks_by_day: Dict[str, List[Task]] = defaultdict(list)
+    for t in tasks:
+        if t.created_at is not None:
+            tasks_by_day[t.created_at.strftime("%Y-%m-%d")].append(t)
+    alerts_by_day: Dict[str, List[Alert]] = defaultdict(list)
+    for a in alerts:
+        if a.created_at is not None:
+            alerts_by_day[a.created_at.strftime("%Y-%m-%d")].append(a)
+
+    buckets = []
+    for i in range(days - 1, -1, -1):
+        day_dt = _utcnow() - timedelta(days=i)
+        day = day_dt.strftime("%Y-%m-%d")
+        day_start = day_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_tasks = list(tasks_by_day.get(day, []))
+        day_task_ids = {str(task.id) for task in day_tasks}
+        day_original_ids = set()
+        for task in day_tasks:
+            rl = (task.context or {}).get("review_loop")
+            if isinstance(rl, dict):
+                oid = rl.get("original_task_id")
+                if isinstance(oid, str) and oid in original_tasks:
+                    day_original_ids.add(oid)
+        if day_original_ids:
+            for oid in day_original_ids:
+                original_task = original_tasks[oid]
+                if str(original_task.id) not in day_task_ids:
+                    day_tasks.append(original_task)
+        summary = compute_outer_loop_convergence(
+            all_tasks=day_tasks,
+            escalation_alerts=alerts_by_day.get(day, []),
+            window_start=day_start,
+        )
+        buckets.append(
+            {
+                "date": day,
+                "pr_count": summary["prs_with_review_loop"],
+                "convergence_rate": summary["convergence_rate"],
+                "escalation_total": summary["escalation_total"],
+                "churn_total": summary["churn_total"],
+                "terminal_outcome_histogram": summary["terminal_outcome_histogram"],
+                "incidence_counts": summary["incidence_counts"],
+                "incidence_rates": summary["incidence_rates"],
+            }
+        )
+
+    # Stamp the single canonical churn direction so the widget glyph and the
+    # narrative verdict (digest_metrics.compute_narrative_summary) read the SAME
+    # value rather than each re-deriving it client-/server-side.
+    return {
+        "days": days,
+        "buckets": buckets,
+        "churn_direction": compute_churn_direction(buckets),
+    }
+
+
+# Terminal-outcome / escalation reasons the chain drill-down can filter on. Kept
+# in lockstep with the per-chain outcomes resolved by digest_metrics
+# (_resolve_chain_outcome): the five non-merge blockers plus ``merged`` itself.
+_OUTER_LOOP_DRILLDOWN_REASONS = (
+    "rejected",
+    "cap_exhausted",
+    "stuck",
+    "standoff",
+    "repeat_fingerprint_halt",
+    "merged",
+)
+
+
+@router.get("/outer-loop-chains")
+async def get_outer_loop_chains(
+    hours: int = Query(24, ge=1, le=168),
+    project_id: uuid.UUID | None = Query(None),
+    reason: str | None = Query(
+        None,
+        description=(
+            "Filter chains by terminal outcome / escalation reason: rejected, "
+            "cap_exhausted, stuck, standoff, repeat_fingerprint_halt, or merged. "
+            "When omitted, all non-merged chains are returned."
+        ),
+    ),
+    limit: int = Query(50, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """List the specific OUTER review<->fix PR-chains behind a terminal outcome.
+
+    Outer-loop analog of ``/fix-loop-diverged-tasks``: where
+    ``/outer-loop-convergence`` reports the dominant non-merge blocker as a
+    single count, this lists the actual PR-chains so an operator can open and
+    investigate them. Read-only; reuses the SAME ``require_admin`` dependency,
+    row caps, original-task hydration, and chain grouping as the other
+    outer-loop endpoints. When ``reason`` is omitted, all non-merged chains are
+    returned (the actionable set); otherwise only chains matching that outcome.
+    """
+    from app.digest_metrics import _resolve_outer_loop_chains  # noqa: PLC0415
+
+    if reason is not None and reason not in _OUTER_LOOP_DRILLDOWN_REASONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid reason '{reason}'. Must be one of: "
+                f"{', '.join(_OUTER_LOOP_DRILLDOWN_REASONS)}."
+            ),
+        )
+
+    cutoff = _utcnow() - timedelta(hours=hours)
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.created_at >= cutoff,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+            )
+        )
+        .order_by(Task.created_at.desc())
+        .limit(_OUTER_LOOP_TASK_CAP)
+    )
+    if project_id is not None:
+        stmt = stmt.where(Task.project_id == project_id)
+
+    tasks = list((await session.execute(stmt)).scalars().all())
+    if len(tasks) >= _OUTER_LOOP_TASK_CAP:
+        logger.warning(
+            "[OUTER-LOOP] chain drill-down task query hit the %d-row cap "
+            "(hours=%d, project=%s); some PR-chains may be omitted",
+            _OUTER_LOOP_TASK_CAP,
+            hours,
+            project_id,
+        )
+    original_tasks = await _load_outer_loop_original_tasks(
+        session, tasks, project_id=project_id
+    )
+    alerts = await _load_escalation_alerts(
+        session, cutoff=cutoff, project_id=project_id
+    )
+
+    chains = _resolve_outer_loop_chains(
+        all_tasks=[
+            *tasks,
+            *[
+                task
+                for oid, task in original_tasks.items()
+                if oid not in {str(t.id) for t in tasks}
+            ],
+        ],
+        escalation_alerts=alerts,
+        window_start=cutoff,
+    )
+
+    if reason is not None:
+        selected = [c for c in chains if c["outcome"] == reason]
+    else:
+        selected = [
+            c
+            for c in chains
+            if c["outcome"] is not None and c["outcome"] != "merged"
+        ]
+
+    rows = [
+        {
+            "pr_number": c["pr_number"],
+            "task_ids": c["task_ids"],
+            "max_iteration": c["max_iteration"],
+            "churn_count": c["churn_count"],
+            "terminal_reason": c["outcome"],
+            "project_id": c["project_id"],
+        }
+        for c in selected[:limit]
+    ]
+
+    return {
+        "window_hours": hours,
+        "reason_filter": reason,
+        "total": len(rows),
+        "chains": rows,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Fix-loop diverged-task drill-down endpoint
 # ---------------------------------------------------------------------------
 
@@ -789,6 +1191,116 @@ async def get_warm_reuse_funnel(
     return get_reuse_funnel_snapshot(window_hours=window_hours)
 
 
+@router.get("/projects/{project_id}/warm-reuse-dropout")
+async def get_warm_reuse_dropout(
+    project_id: uuid.UUID,
+    window_hours: int = Query(default=24, ge=1, le=168),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Ranked warm-reuse drop-out diagnostic for the last ``window_hours``.
+
+    Surfaces :func:`app.warm_backlog_reuse.compute_dominant_reuse_dropout`:
+    a per-reason breakdown of why completed VMs with eligible backlog failed to
+    convert to a warm claim, plus the single ``dominant_dropout`` (named only
+    when one reason clearly dominates — see the gating in that helper). Mirrors
+    the dominant-blocker pattern used for outer-loop convergence. Counters are
+    in-memory and reset on instance restart; use the ``-trend`` endpoint for the
+    restart-durable day-over-day view. This is observability only.
+    """
+    from app.warm_backlog_reuse import compute_dominant_reuse_dropout  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return compute_dominant_reuse_dropout(window_hours=window_hours)
+
+
+@router.get("/projects/{project_id}/warm-reuse-dropout-trend")
+async def get_warm_reuse_dropout_trend(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Day-over-day warm-reuse drop-out trend from persisted daily snapshots.
+
+    Reads the ``reuse_dropout`` block persisted into each daily
+    efficiency-snapshot (see :mod:`app.efficiency_snapshot`) so the dominant
+    drop-out survives instance restarts and an operator can confirm whether a
+    widening change reduced the leader. Returns an empty ``buckets`` list until
+    at least one daily snapshot has captured the drop-out block.
+    """
+    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    project = await session.get(Project, project_id)
+    container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
+    buckets: List[Dict[str, Any]] = []
+    for snap in container.get("snapshots") or []:
+        block = snap.get("reuse_dropout")
+        if not isinstance(block, dict):
+            continue
+        dominant = block.get("dominant_dropout") or {}
+        buckets.append(
+            {
+                "captured_at": snap.get("captured_at"),
+                "dropout_total": block.get("dropout_total"),
+                "dominant_reason": dominant.get("reason"),
+                "dominant_share": dominant.get("share"),
+            }
+        )
+    return {"buckets": buckets}
+
+
+@router.get("/projects/{project_id}/pool-dispatch-funnel-trend")
+async def get_pool_dispatch_funnel_trend(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Day-over-day warm-POOL dispatch funnel trend from persisted snapshots.
+
+    Reads the ``pool_dispatch_funnel`` block persisted into each daily
+    efficiency-snapshot (see :mod:`app.efficiency_snapshot`) so the pool
+    dispatch funnel — lease hits, cold dispatches, hit rate, the lease-miss
+    breakdown, and the single dominant lease-miss reason — survives the
+    instance restarts that reset the in-memory funnel counters. This is the
+    restart-durable view of WHY the pool missed across the multi-day windows an
+    operator watches during a controlled enable; a miss funnel dominated by
+    ``no_compatible_member`` says enable account-retarget, one dominated by
+    ``no_idle_member`` says grow the pool. A DIFFERENT funnel from
+    ``warm-reuse-dropout-trend``. Returns an empty ``buckets`` list until at
+    least one daily snapshot has captured the block. Observability only.
+    """
+    from app.efficiency_snapshot import DESIGN_DOC_KEY  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    project = await session.get(Project, project_id)
+    container = (getattr(project, "design_doc", None) or {}).get(DESIGN_DOC_KEY) or {}
+    buckets: List[Dict[str, Any]] = []
+    for snap in container.get("snapshots") or []:
+        block = snap.get("pool_dispatch_funnel")
+        if not isinstance(block, dict):
+            continue
+        dominant = block.get("dominant_miss") or {}
+        buckets.append(
+            {
+                "captured_at": snap.get("captured_at"),
+                "pool_lease_hits": block.get("pool_lease_hits"),
+                "cold_dispatches": block.get("cold_dispatches"),
+                "pool_hit_rate": block.get("pool_hit_rate"),
+                "lease_miss_total": block.get("lease_miss_total"),
+                "dominant_miss_reason": dominant.get("reason"),
+                "dominant_miss_share": dominant.get("share"),
+            }
+        )
+    return {"buckets": buckets}
+
+
 @router.get("/pipeline-efficiency")
 async def get_pipeline_efficiency(
     project_id: Optional[uuid.UUID] = Query(default=None),
@@ -827,6 +1339,15 @@ async def get_pipeline_efficiency(
         s = sorted(values)
         return s[min(int(len(s) * p / 100), len(s) - 1)]
 
+    # Per-origin warm-start breakdown reuses the same helper that powers the
+    # project-scoped efficiency-axes view, so the pool-vs-chain-vs-backlog split
+    # shown next to ``warm_reuse_rate`` is computed identically (and over the
+    # same per-window task bucket). Imported locally to avoid widening this
+    # router's module-load import surface.
+    from app.efficiency_snapshot import (  # noqa: PLC0415
+        _compute_warm_start_origin_breakdown,
+    )
+
     def _metrics(bucket: list) -> Dict[str, Any]:
         timing_list = [(t.context or {}).get("_timing") or {} for t in bucket]
         cold = [
@@ -848,6 +1369,13 @@ async def get_pipeline_efficiency(
             "setup_sample_n": len(cold),
             "warm_reuse_rate": round(warm_n / timed_n, 3) if timed_n else None,
             "warm_reuse_sample_n": timed_n,
+            # Pool-vs-chain-vs-backlog split of the warm-start population over
+            # this window, plus the pool-origin share. None when no warm starts
+            # in the window (nothing to attribute). Lets an operator see whether
+            # the pool — not chain-continuity/backlog-reuse — earned its idle cost.
+            "warm_start_origin_breakdown": _compute_warm_start_origin_breakdown(
+                bucket
+            ),
             "review_iter_median": _pct(iters, 50),
             "review_iter_p95": _pct(iters, 95),
             "review_iter_sample_n": len(iters),

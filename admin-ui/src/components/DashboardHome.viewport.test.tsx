@@ -223,6 +223,32 @@ vi.mock('../api', () => ({
     evicted_findings: [],
   })),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
+  fetchEfficiencyAxes: vi.fn(async () => ({
+    axes: {
+      vm_reuse_rate: {
+        current: 42,
+        baseline: 18,
+        drift_pct: 133.3,
+        history: [
+          { captured_at: '2026-05-01T00:00:00', value: 20 },
+          { captured_at: '2026-05-02T00:00:00', value: 30 },
+          { captured_at: '2026-05-03T00:00:00', value: 42 },
+        ],
+      },
+      cost_per_merged_pr: {
+        current: 3.1,
+        baseline: 3.0,
+        drift_pct: 3.3,
+        history: [
+          { captured_at: '2026-05-01T00:00:00', value: 3.2 },
+          { captured_at: '2026-05-02T00:00:00', value: 3.0 },
+          { captured_at: '2026-05-03T00:00:00', value: 3.1 },
+        ],
+      },
+    },
+    baseline_captured_at: '2026-04-24T00:00:00',
+    last_snapshot_at: '2026-05-03T00:00:00',
+  })),
   onboardProject: vi.fn(async () => ({})),
   setVersionPhase: vi.fn(async () => ({
     version_number: 42,
@@ -253,6 +279,45 @@ vi.mock('../api', () => ({
       unpriced_coverage_fraction: null,
     },
     unpriced_combos: [],
+  })),
+  // DashboardHome renders OuterReviewLoopConvergenceWidget, which imports these
+  // from '../api'. The complete mock must provide them or the browser-mode test
+  // file fails to load with "does not provide an export named ...".
+  fetchOuterLoopConvergence: vi.fn(async () => ({
+    window_hours: 24,
+    prs_with_review_loop: 12,
+    iteration_median: 2,
+    iteration_p95: 6,
+    iteration_distribution: { '1': 4, '2': 4, '3': 2, '4+': 2 },
+    churn_total: 5,
+    churn_pr_count: 3,
+    drift_pr_count: 2,
+    outcomes: { merged: 7, rejected: 3, cap_exhausted: 1, repeat_fingerprint_halt: 1 },
+    terminal_outcome_histogram: {
+      merged: 7,
+      rejected: 3,
+      cap_exhausted: 1,
+      stuck: 1,
+      standoff: 1,
+      repeat_fingerprint_halt: 1,
+    },
+    incidence_counts: { churn: 3, stuck: 1, standoff: 1, repeat_fingerprint: 1, overall_escalations: 4 },
+    incidence_rates: { churn: 0.25, stuck: 0.083, standoff: 0.083, repeat_fingerprint: 0.083, overall_escalations: 0.333 },
+    escalation_total: 4,
+    escalation_by_reason: { stuck: 2, standoff: 1, 'repeat-fingerprint': 1 },
+    convergence_rate: 0.58,
+    non_converged_total: 6,
+    dominant_blocker: { cause: 'churn', count: 3, total: 6, share: 0.5 },
+  })),
+  fetchOuterLoopConvergenceTrend: vi.fn(async () => ({
+    days: 7,
+    buckets: [],
+  })),
+  fetchOuterLoopChains: vi.fn(async () => ({
+    window_hours: 24,
+    reason_filter: null,
+    total: 0,
+    chains: [],
   })),
 }));
 

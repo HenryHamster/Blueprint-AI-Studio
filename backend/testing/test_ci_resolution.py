@@ -62,6 +62,150 @@ def test_proceed_on_no_checks_none_project():
     assert ci_resolution.proceed_on_no_checks(None, "main") is False
 
 
+# has_detectable_tests — does the stored build_config carry a runnable suite?
+
+
+def test_has_detectable_tests_true_when_any_test_cmd_present():
+    p = _proj(
+        {
+            "directories": [
+                {"path": "backend/", "test_cmd": "python3 -m pytest"},
+                {"path": "ui/", "test_cmd": ""},
+            ]
+        }
+    )
+    assert ci_resolution.has_detectable_tests(p) is True
+
+
+def test_has_detectable_tests_false_when_no_directories():
+    # Greenfield / empty repo: onboarding found no manifests → no test_cmd.
+    assert ci_resolution.has_detectable_tests(_proj()) is False
+    assert ci_resolution.has_detectable_tests(_proj({"directories": []})) is False
+
+
+def test_has_detectable_tests_false_when_all_test_cmds_blank():
+    p = _proj({"directories": [{"path": "x/", "test_cmd": "   "}, {"path": "y/"}]})
+    assert ci_resolution.has_detectable_tests(p) is False
+
+
+def test_has_detectable_tests_none_project():
+    assert ci_resolution.has_detectable_tests(None) is False
+
+
+# should_run_no_ci_test_gate — the orchestrator's gating decision
+
+
+def _no_ci_repo():
+    return _proj(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}],
+        }
+    )
+
+
+def test_gate_runs_for_external_no_ci_repo_with_tests_on_real_base():
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(
+            _no_ci_repo(), "main", gate_enabled=True
+        )
+        is True
+    )
+
+
+def test_gate_skipped_when_kill_switch_off():
+    # Kill-switch off → fall back to legacy immediate-pass.
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(
+            _no_ci_repo(), "main", gate_enabled=False
+        )
+        is False
+    )
+
+
+def test_gate_skipped_on_internal_staging_base():
+    # Staging rollups (research/plan) keep the immediate-pass — never run repo
+    # tests on internal rollups, even for a no-CI project with detectable tests.
+    p = _no_ci_repo()
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(p, "research/cycle-1", gate_enabled=True)
+        is False
+    )
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(p, "plan/cycle-1", gate_enabled=True)
+        is False
+    )
+
+
+def test_gate_skipped_for_ci_gated_repo():
+    # CI-gated repo (requires_ci_checks default True): the no_checks branch keeps
+    # polling; the gate must never engage.
+    p = _proj({"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}]})
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(p, "main", gate_enabled=True) is False
+    )
+
+
+def test_gate_skipped_when_no_detectable_tests():
+    # No-CI repo but no runnable suite → fall back to proceed-without-checks
+    # (absent-tests repos must still progress).
+    p = _proj({"requires_ci_checks": False, "directories": []})
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(p, "main", gate_enabled=True) is False
+    )
+
+
+def test_gate_none_project():
+    assert (
+        ci_resolution.should_run_no_ci_test_gate(None, "main", gate_enabled=True)
+        is False
+    )
+
+
+# classify_merge_test_verdict — MERGE_TEST_RESULT artifact → merge-gate outcome
+
+
+def test_classify_verdict_pass():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": True, "tests": [], "output": ""}
+    )
+    assert outcome == "pass"
+    assert detail == ""
+
+
+def test_classify_verdict_fail_carries_output():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": False, "tests": [], "output": "2 failed"}
+    )
+    assert outcome == "fail"
+    assert detail == "2 failed"
+
+
+def test_classify_verdict_fail_default_detail_when_output_blank():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": True, "passed": False, "output": ""}
+    )
+    assert outcome == "fail"
+    assert detail  # non-empty fallback message
+
+
+def test_classify_verdict_detected_false_is_undetected():
+    outcome, detail = ci_resolution.classify_merge_test_verdict(
+        {"detected": False, "passed": False, "tests": [], "output": "no runner"}
+    )
+    assert outcome == "undetected"
+    assert detail == ""
+
+
+def test_classify_verdict_none_is_undetected():
+    # Verify task crashed / produced no artifact → fall back, don't block.
+    assert ci_resolution.classify_merge_test_verdict(None) == ("undetected", "")
+    assert ci_resolution.classify_merge_test_verdict("not a dict") == (
+        "undetected",
+        "",
+    )
+
+
 @pytest.mark.asyncio
 async def test_branch_head_has_checks_returns_branch_head_source(mocker):
     """Normal case: branch HEAD carries a completed green build → resolved on the

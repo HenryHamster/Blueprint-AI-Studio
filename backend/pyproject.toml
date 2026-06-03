@@ -27,7 +27,10 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 # shared_state.py uses datetime.utcnow() at module level (can't import _utcnow due to circular dep)
-"app/shared_state.py" = ["DTZ"]
+# E402: it is a thin facade that re-exports symbols from the extracted domain modules via
+# deferred mid-module imports (circular-dependency / load-order) — the same intentional
+# pattern already exempted for main.py / orchestrator.py above.
+"app/shared_state.py" = ["DTZ", "E402"]
 # Test files use convenience patterns (broad except, datetime.utcnow, etc.)
 "testing/*" = ["DTZ", "BLE", "B"]
 # main.py has many intentional except Exception blocks for background-task error handling
@@ -42,11 +45,20 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "app/vm_lifecycle.py" = ["BLE001"]
 "app/alert_dispatch.py" = ["BLE001"]
 "app/notification.py" = ["BLE001"]
+"app/deploy_health_alerts.py" = ["BLE001"]
 # services.py is entirely background workers (cleanup, persist, timeout sweep, orphan
 # recovery). Every except Exception is the intentional "log and continue — never crash
 # the background loop" pattern; narrowing risks missing an exception type and killing
 # the worker, which is strictly worse than logging an unexpected error.
-"app/services.py" = ["BLE001"]
+# E402: re-exports stale_branch_cleanup helpers from app.branch_cleanup via a
+# deferred mid-module import (load-order) — same intentional pattern as main.py.
+"app/services.py" = ["BLE001", "E402"]
+# recovery_sweeps.py was extracted from services.py and holds the three
+# leader-cycle recovery sweeps (EVALUATING-timeout, post-commit-pending, orphan
+# recovery). It inherits services.py's intentional "log and continue — never
+# crash the background loop" broad-except pattern, so it carries the same
+# BLE001 ignore.
+"app/recovery_sweeps.py" = ["BLE001"]
 # lifecycle.py is the FastAPI lifespan that hosts every background service plus the
 # crash-monitor and leader-election loops. BLE001 (broad except) and PERF203
 # (try/except inside a loop) are both the intentional resilient-loop pattern — a
@@ -57,6 +69,9 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # same "log and keep retrying" pattern (DB lookup races, GitHub API blips, merge retries).
 # Crashing here would leave a PR in limbo with no progress.
 "app/ci_completion.py" = ["BLE001"]
+# ci_merge_helpers.py was extracted from ci_completion.py; _post_merge_summary
+# carries the same best-effort "log and continue" broad-except pattern.
+"app/ci_merge_helpers.py" = ["BLE001"]
 # task_lifecycle.py is the agent status-event dispatcher and rollup gate. Same
 # log-and-continue policy: each branch handles a distinct PR / pipeline stage and
 # must not crash the dispatcher on transient lookup / GitHub failures.
@@ -68,17 +83,36 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # rollup_management.py runs rollup PR creation/merge under sibling-completion races,
 # branch-cleanup edge cases, and concurrent worker calls. Same intentional pattern.
 "app/rollup_management.py" = ["BLE001"]
+# rollup_pr_verification.py and rollup_branch_cleanup.py were extracted from
+# rollup_management.py; they carry the same background-worker log-and-continue
+# broad-except pattern.
+"app/rollup_pr_verification.py" = ["BLE001"]
+"app/rollup_branch_cleanup.py" = ["BLE001"]
 # orchestrator.py is the background provisioning + monitoring loop. Same
 # log-and-continue policy: crash here halts all task dispatch and health monitoring.
 # E402: re-exports symbols extracted to app.orchestrator_health via deferred mid-module
 # imports (circular-dependency / load-order) — the same intentional pattern as main.py.
 "app/orchestrator.py" = ["BLE001", "E402"]
+# routers/agent.py re-exports the GitHub-token cache helpers extracted to
+# app.github_token_resolver via a deferred mid-module import (keeps the 15+
+# `from app.routers.agent import get_github_token_for_task` call sites working).
+# Same intentional re-export-via-deferred-import pattern as main.py/orchestrator.py.
+"app/routers/agent.py" = ["E402"]
+# reaper.py imports app.reaper_sweeps mid-module (after the sweep-helper
+# definitions it complements) — a deferred load-order import, the same
+# intentional E402 pattern as main.py / orchestrator.py above.
+"app/reaper.py" = ["E402"]
 # admin_analytics.py is read-only analytics/reporting endpoints. except blocks are
 # defensive fallbacks (Cloud Logging, zone health) to show partial data instead of 500.
 "app/routers/admin_analytics.py" = ["BLE001"]
 # admin.py and github.py raise HTTPException inside except blocks to convert errors to HTTP responses
 "app/admin.py" = ["B904"]
-"app/github.py" = ["B904"]
+# E402: github.py is a thin facade that re-exports symbols from the extracted
+# github_* domain modules (github_auth/checks/issues/refs/pulls/merge_summary)
+# via deferred end-of-file imports placed after the core helpers to avoid
+# circular-import order issues — the same intentional pattern as main.py /
+# orchestrator.py above.
+"app/github.py" = ["B904", "E402"]
 # max_plan_pool.py hosts the account-pool background loops (recheck_disabled_accounts,
 # rate-limit/usage-cap persist-retry drains). Same log-and-continue policy: a transient
 # DB persist failure must be logged and retried, not crash the pool maintenance loop.
@@ -88,12 +122,22 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # debug log" guards — raising here would crash the caller's failure handling, which is
 # strictly worse than a conservative misclassification.
 "app/failure_classification.py" = ["BLE001"]
+# failure_residual.py is the residual-remediation seam extracted from
+# failure_classification.py; it retains the same intentional "log-and-degrade"
+# broad-except guard around the fire-and-forget DB upsert.
+"app/failure_residual.py" = ["BLE001"]
 # digest_precompute.py is a leader-only periodic worker that primes the digest
 # cache. BLE001 (broad except) and PERF203 (try/except inside a loop) are the
 # same intentional resilient-loop pattern as lifecycle.py/services.py: one hot
 # key's transient compute failure must be logged and skipped, not crash the
 # whole precompute tick or kill the background loop.
 "app/digest_precompute.py" = ["BLE001", "PERF203"]
+# warm_pool_maintainer.py is the leader-only warm-pool reconcile worker + the
+# idle-reaper sweep. Its broad-except guards are the same intentional
+# log-and-continue resilient-loop pattern as services.py / lifecycle.py — a
+# single project's reconcile / a single member's teardown must be logged and
+# skipped, never crash the maintainer tick or the reaper cycle.
+"app/warm_pool_maintainer.py" = ["BLE001"]
 
 [tool.mypy]
 python_version = "3.11"

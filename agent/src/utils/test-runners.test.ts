@@ -9,7 +9,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
-import { detectTestRunners } from './test-runners.js';
+import { detectTestRunners, classifyTestExecution } from './test-runners.js';
 import type { BuildConfig } from './test-runners.js';
 
 // We test detectTestRunners in isolation.  fs.existsSync and fs.readFileSync
@@ -198,5 +198,44 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
       vi.clearAllMocks();
       fs.existsSync.mockReturnValue(false);
     }
+  });
+});
+
+describe('classifyTestExecution — placeholder/empty suite detection', () => {
+  it('npm "no test specified" placeholder → no_tests', () => {
+    expect(classifyTestExecution(
+      'Error: no test specified\nnpm ERR! Test failed.',
+    )).toBe('no_tests');
+  });
+
+  it('pytest "collected 0 items" → no_tests', () => {
+    expect(classifyTestExecution(
+      'collected 0 items\n\nno tests ran in 0.01s',
+    )).toBe('no_tests');
+  });
+
+  it('pytest "no tests ran" → no_tests', () => {
+    expect(classifyTestExecution('no tests ran in 0.02s')).toBe('no_tests');
+  });
+
+  it('vitest "No test files found" → no_tests', () => {
+    expect(classifyTestExecution(
+      'No test files found, exiting with code 1',
+    )).toBe('no_tests');
+  });
+
+  it('a real failing test ("1 failed") → ran (never misread as no_tests)', () => {
+    expect(classifyTestExecution(
+      'Test Files  1 failed (1)\n     Tests  1 failed | 2 passed (3)',
+    )).toBe('ran');
+  });
+
+  it('a real passing run ("2 passed") → ran', () => {
+    expect(classifyTestExecution('2 passed in 0.50s')).toBe('ran');
+  });
+
+  it('empty / ambiguous output → ran (conservative default)', () => {
+    expect(classifyTestExecution('')).toBe('ran');
+    expect(classifyTestExecution('some unrelated output')).toBe('ran');
   });
 });

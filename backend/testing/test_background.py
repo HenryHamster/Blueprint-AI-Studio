@@ -3874,6 +3874,87 @@ async def test_reaper_queued_age_alert_retry_after_cause(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_reaper_queued_age_alert_precondition_defer_cause(reaper_db, mocker):
+    """
+    Reaper Step 6: a QUEUED task whose latest_status_message is a dispatcher
+    precondition defer ('Waiting: ...') is escalated with that precondition as
+    the likely cause, taking precedence over the generic infrastructure
+    heuristics (VM-slot / pool-blockage / type-failure gate).
+    """
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop("Stop"))
+    mocker.patch(
+        "app.reaper._runtime_config",
+        {
+            "max_concurrent_vms": 8,
+            "max_retries": 3,
+            "max_provision_retries": 3,
+            "queued_age_alert_hours": 2,
+        },
+    )
+
+    project = Project(name="Precondition Defer Cause Test", user_id="user1")
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    # Case 1: deferred behind a pending rollup.
+    rollup_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "deferred"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        latest_status_message="Waiting: overlaps pending rollup 'big-rollup'",
+    )
+    # Case 2: deferred behind a file conflict with a running task.
+    conflict_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "deferred"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=False,
+        created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        latest_status_message="Waiting: file conflict on app/models.py",
+    )
+    reaper_db.add(rollup_task)
+    reaper_db.add(conflict_task)
+    await reaper_db.commit()
+    await reaper_db.refresh(rollup_task)
+    await reaper_db.refresh(conflict_task)
+
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+    from sqlmodel import select as _select
+
+    rollup_alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == rollup_task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rollup_alerts) == 1
+    assert "overlaps pending rollup 'big-rollup'" in rollup_alerts[0].message
+    # The generic infrastructure guesses must NOT appear in their place.
+    assert "VM slot limit" not in rollup_alerts[0].message
+
+    conflict_alerts = (
+        (
+            await reaper_db.execute(
+                _select(Alert).where(Alert.task_id == conflict_task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(conflict_alerts) == 1
+    assert "file conflict on app/models.py" in conflict_alerts[0].message
+    assert "VM slot limit" not in conflict_alerts[0].message
+
+
+@pytest.mark.asyncio
 async def test_reaper_queued_age_alert_escalates(reaper_db, mocker):
     """
     Reaper Step 6: a task already at tier 1 (INFO) that ages past the tier 2

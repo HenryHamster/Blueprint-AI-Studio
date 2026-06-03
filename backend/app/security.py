@@ -1,3 +1,15 @@
+"""Prompt-injection scanning for PR content before agent review.
+
+Defines the catalogue of injection patterns (instruction overrides, data
+exfiltration, role hijacking, etc.), compiled once at module load, and the
+pure scanning functions that apply them to diffs, commit messages, and PR
+metadata — including fuzzy/Levenshtein matching and base64-hidden-text
+detection. ``evaluate_findings`` collapses matches into a high/medium verdict
+(high severity blocks automated review and requires a human), and the async
+``scan_pr_for_injection`` is the orchestration entry point that fetches PR
+content via ``app.github`` and runs the full scan.
+"""
+
 import re
 import base64
 import logging

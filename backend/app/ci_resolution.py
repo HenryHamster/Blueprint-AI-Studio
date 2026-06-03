@@ -102,6 +102,93 @@ def proceed_on_no_checks(project, branch: str | None) -> bool:
     return not requires_ci_checks(project)
 
 
+def has_detectable_tests(project) -> bool:
+    """Whether the project's stored ``build_config`` carries a runnable test
+    command — i.e. the no-CI merge gate has a suite the ``verify_tests`` agent
+    can run on a PR head.
+
+    Onboarding (and the auto re-detect path) populate
+    ``build_config.directories[].test_cmd`` for each detected manifest
+    directory.  This only answers 'is ANY non-empty ``test_cmd`` present'; the
+    agent's ``detectTestRunners`` does the authoritative resolution at run time
+    and reports ``detected=false`` if nothing is actually runnable, at which
+    point the gate falls back to proceed-without-checks.  A near-empty /
+    greenfield repo with no manifests has no directories (or empty
+    ``test_cmd``) and returns False here, so it keeps today's immediate-pass
+    behavior.
+    """
+    if project is None:
+        return False
+    build_config = getattr(project, "build_config", None) or {}
+    directories = build_config.get("directories") or []
+    for d in directories:
+        if isinstance(d, dict) and str(d.get("test_cmd") or "").strip():
+            return True
+    return False
+
+
+def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: bool) -> bool:
+    """Whether a definitive ``no_checks`` PR should be gated on a ``verify_tests``
+    verdict (run the repo's detected suite on the PR head) instead of taking the
+    legacy immediate-pass.
+
+    True only when ALL hold:
+      - the kill-switch ``gate_enabled`` is on;
+      - the base is NOT an internal staging branch (research/plan rollups keep
+        the immediate-pass — CI is path-filtered out there by design, and we do
+        not run repo tests on internal rollups);
+      - ``proceed_on_no_checks`` is True, i.e. the merge would otherwise
+        immediate-pass — combined with the not-staging check above this means
+        the project is an EXTERNAL no-CI repo (``requires_ci_checks`` False).
+        A CI-gated repo keeps polling and never reaches this gate;
+      - the project has a detectable test command.
+
+    Otherwise the legacy immediate-pass applies (CI-gated repos are untouched).
+    """
+    if project is None or not gate_enabled:
+        return False
+    if project.is_staging_branch(branch):
+        return False
+    if not proceed_on_no_checks(project, branch):
+        return False
+    return has_detectable_tests(project)
+
+
+# Outcome of mapping a MERGE_TEST_RESULT verdict onto the merge gate.
+MergeTestOutcome = Literal["pass", "fail", "undetected"]
+
+
+def classify_merge_test_verdict(
+    verdict: dict[str, Any] | None,
+) -> tuple[MergeTestOutcome, str]:
+    """Map a ``verify_tests`` MERGE_TEST_RESULT artifact to a merge-gate outcome.
+
+    The agent posts ``{detected, passed, tests[], output}``.  Returns
+    ``(outcome, detail)``:
+
+      - ``"pass"``       — a suite was detected, ran, and passed; the merge may
+                           proceed (subject to the unchanged review gate).
+      - ``"fail"``       — a suite was detected and ran but failed; block the
+                           merge.  ``detail`` carries the failing-test output.
+      - ``"undetected"`` — the agent found no runnable command
+                           (``detected=false``) OR the verify task produced no
+                           usable verdict (crashed / no artifact).  Fall back to
+                           the legacy proceed-without-checks behavior: an
+                           absent-tests repo must still progress, merging
+                           UNVERIFIED.
+
+    ``detail`` is the failing-test output for ``"fail"`` and ``""`` otherwise.
+    """
+    if not isinstance(verdict, dict):
+        return ("undetected", "")
+    if verdict.get("detected") is False:
+        return ("undetected", "")
+    if verdict.get("passed"):
+        return ("pass", "")
+    output = str(verdict.get("output") or "").strip()
+    return ("fail", output or "Detected test suite failed (no output captured).")
+
+
 ResolutionSource = Literal["branch_head", "merge_sha", "unresolved"]
 
 

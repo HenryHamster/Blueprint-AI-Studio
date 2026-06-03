@@ -51,6 +51,65 @@ async def test_create_inserts_row_with_baseline(db_session):
 
 
 @pytest.mark.asyncio
+async def test_create_snapshots_baseline_problem_model(db_session):
+    """The problem-model snapshot is captured alongside the vision baseline so
+    the 3-way operator-wins merge can compare the agent's write against it."""
+    project = await _make_project(db_session)
+    baseline_pm = {
+        "revision": 4,
+        "intent": {"purpose": "Ship billing", "current_focus": "invoicing"},
+        "constraints": ["No PII in logs"],
+    }
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_vision={"purpose": "x"},
+        baseline_problem_model=baseline_pm,
+    )
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.baseline_problem_model(fetched) == baseline_pm
+    # The vision baseline is unaffected by the new key.
+    assert strategic_cycle.baseline_vision(fetched) == {"purpose": "x"}
+
+
+@pytest.mark.asyncio
+async def test_baseline_problem_model_defaults_empty(db_session):
+    """A cycle created without a problem-model baseline (e.g. legacy spawn)
+    reads back an empty dict, so apply_agent_update degrades to None safely."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_vision={"purpose": "x"},
+    )
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.baseline_problem_model(fetched) == {}
+
+
+def test_to_legacy_dict_omits_baseline_problem_model():
+    """The problem-model snapshot must never leak into the agent-facing
+    cycle-history shape, exactly as baseline_vision is hidden."""
+    cycle = StrategicCycle(
+        id="sc-test1",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={
+            "baseline_vision": {"purpose": "secret"},
+            "baseline_problem_model": {"intent": {"purpose": "also secret"}},
+            "memos_cited": 2,
+        },
+    )
+    out = strategic_cycle._to_legacy_dict(cycle)
+    assert "baseline_vision" not in out
+    assert "baseline_problem_model" not in out
+    # Non-baseline metadata is still spread back in.
+    assert out["memos_cited"] == 2
+
+
+@pytest.mark.asyncio
 async def test_mark_phase1_completed_with_phase2_spawn(db_session):
     project = await _make_project(db_session)
     phase1 = Task(
@@ -269,6 +328,40 @@ async def test_cycle_row_created_on_phase1_spawn(db_session, mocker):
 
     # Verify baseline_vision snapshot
     assert strategic_cycle.baseline_vision(cycle).get("purpose") == "test purpose"
+
+
+@pytest.mark.asyncio
+async def test_cycle_row_snapshots_problem_model_on_phase1_spawn(db_session, mocker):
+    """Spawning a strategic cycle snapshots project.problem_model into
+    cycle_metadata.baseline_problem_model so the completion-time 3-way merge
+    can detect a concurrent operator edit."""
+    from app.strategic_spawning import _spawn_design_doc_update
+
+    project = await _make_project(db_session)
+    project.vision = {"purpose": "test purpose", "revision": 1}
+    project.problem_model = {
+        "revision": 3,
+        "intent": {"purpose": "Operator goal", "current_focus": "phase 1"},
+        "constraints": ["No CI changes"],
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+    assert spawned is True
+
+    cycle = (
+        (
+            await db_session.execute(
+                select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    snap = strategic_cycle.baseline_problem_model(cycle)
+    assert snap.get("intent", {}).get("purpose") == "Operator goal"
+    assert snap.get("constraints") == ["No CI changes"]
 
 
 # --- memo exit counting + citation tracking ------------------------------------

@@ -2,7 +2,8 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
 import { sendLog, WORKSPACE } from '../index.js';
-import type { BuildConfig } from '../index.js';
+import type { BuildConfig, FailureCategory } from '../index.js';
+import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
 export function buildFileTree(ws: WebSocket | null): string {
   try {
@@ -38,6 +39,164 @@ export function buildFileTree(ws: WebSocket | null): string {
   } catch (e) {
     sendLog(ws, `Warning: file tree generation failed: ${String(e)}\n`);
     return '';
+  }
+}
+
+// ── Greenfield (empty / near-empty repo) detection ──────────────────────────
+// Config/scaffolding files that do NOT count as real source. A repo containing
+// only these (plus dotfiles) is a fresh project to bootstrap, not a codebase to
+// read and improve. Extension-based so it is language-agnostic.
+const NON_SOURCE_EXT = /\.(md|markdown|json|ya?ml|toml|cfg|ini|txt|lock|lockb)$/i;
+// Common config/manifest basenames with no telling extension.
+const NON_SOURCE_BASENAMES = new Set([
+  'license', 'notice', 'authors', 'codeowners', 'dockerfile', 'makefile',
+  'procfile', '.gitignore', '.gitattributes', '.dockerignore', '.editorconfig',
+  '.npmrc', '.nvmrc', '.prettierrc', '.eslintrc',
+]);
+
+/**
+ * Counts the real source files in the cloned working tree, excluding
+ * config/scaffolding (lockfiles, *.md/*.json/*.yml/*.toml, dotfiles, common
+ * manifests). Reuses the same `git ls-files` enumeration as buildFileTree.
+ * Returns null when the scan cannot complete, so callers can fall back to the
+ * durable onboarding signal instead of misclassifying an existing repo.
+ */
+export function countSourceFiles(): number | null {
+  try {
+    const out = execFileSync('git', ['ls-files'], { cwd: WORKSPACE, encoding: 'utf-8' });
+    const files = out
+      .split('\n')
+      .filter(f => f && !f.includes('node_modules/') && !f.includes('dist/'));
+    let count = 0;
+    for (const f of files) {
+      const base = (f.split('/').pop() || f).toLowerCase();
+      // Dotfiles (e.g. .gitignore, .env) and dot-prefixed config are scaffolding.
+      if (base.startsWith('.')) continue;
+      if (NON_SOURCE_BASENAMES.has(base)) continue;
+      if (NON_SOURCE_EXT.test(base)) continue;
+      count++;
+    }
+    return count;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when the working tree has effectively no source — only config and
+ * scaffolding — so the system should bootstrap the foundation from the project
+ * goal rather than assume an existing codebase. Gated by a single threshold
+ * constant (GREENFIELD_SOURCE_FILE_THRESHOLD).
+ *
+ * Cross-language coupling: the NON_SOURCE_EXT / NON_SOURCE_BASENAMES sets and
+ * GREENFIELD_SOURCE_FILE_THRESHOLD that define "real source" here must stay
+ * aligned with the backend's durable empty-repo classifier
+ * (backend/app/build_config_detection.py). If you change what counts as source
+ * on one side, change it on the other or the durable onboarding signal and this
+ * live prompt-time signal will disagree again.
+ */
+export function detectGreenfield(): boolean {
+  const sourceFileCount = countSourceFiles();
+  if (sourceFileCount === null) return false;
+  return sourceFileCount <= GREENFIELD_SOURCE_FILE_THRESHOLD;
+}
+
+/**
+ * Single greenfield predicate that BOTH the research and plan handlers consult,
+ * so the durable onboarding gate and the prompt-time gate can never disagree.
+ *
+ * Reconciles two signals:
+ *  - the DURABLE onboarding signal `task.repo_is_empty` (persisted as
+ *    `build_config.repo_is_empty` from the shallow onboarding scan), and
+ *  - the LIVE full-clone `detectGreenfield()` scan of the working tree.
+ *
+ * The DURABLE signal is authoritative whenever it is explicitly present:
+ *  - `repo_is_empty === true`  → greenfield (short-circuit; never read the tree).
+ *  - `repo_is_empty === false` → NOT greenfield, even if the live scan currently
+ *    sees an empty tree. A durable "non-empty" reading paired with an empty live
+ *    tree means the clone failed to deliver content (partial/wrong/shallow
+ *    checkout), NOT that the repo is genuinely greenfield — `verifyCloneDelivered`
+ *    catches that disagreement and fails loudly before we get here. Treating the
+ *    empty tree as greenfield would scaffold into a repo that actually has code.
+ *
+ * Only when the durable signal is ABSENT (or a non-boolean value) do we consult
+ * the live `detectGreenfield()` scan, which catches lightly-scaffolded repos the
+ * shallow onboarding scan may have missed and projects onboarded before the
+ * durable signal existed. The two signals can therefore never silently resolve
+ * to greenfield when they disagree.
+ */
+export function isGreenfieldRepo(task: Record<string, unknown>): boolean {
+  if (task.repo_is_empty === true) return true;
+  if (task.repo_is_empty === false) return false;
+  return detectGreenfield();
+}
+
+/**
+ * Positively confirms that the clone actually delivered the expected working
+ * tree BEFORE any greenfield conclusion is allowed. A clone can exit 0 yet leave
+ * an empty or near-empty tree — a partial clone, a wrong/empty checkout, or a
+ * shallow fetch whose objects never materialized. Without this check
+ * `countSourceFiles()` returns 0 (not null) and the agent wrongly enters
+ * bootstrap mode, scaffolding into a repo that already has code.
+ *
+ * Two positive confirmations, both throwing a `clone_failed`-tagged error (which
+ * the role loop classifies as a PROVISION_FAILURE and retries / fails loudly,
+ * rather than silently proceeding as greenfield):
+ *  1. HEAD resolves to a real commit, and — when the expected branch is known —
+ *     matches `origin/<branch>` (so a wrong or partial checkout is caught).
+ *  2. When the durable signal says the repo is NOT empty (`repo_is_empty ===
+ *     false`) but the live tree is empty/near-empty, the clone did not deliver
+ *     the expected content — treat it as a clone problem, not greenfield.
+ *
+ * The check is intentionally conservative about FALSE positives: if HEAD cannot
+ * be read at all we throw (an unusable workspace), but a missing `origin/<branch>`
+ * ref or an unreadable `git ls-files` (countSourceFiles → null) is NOT treated as
+ * a clone failure on its own — only an explicit durable/live disagreement is.
+ */
+export function verifyCloneDelivered(task: Record<string, unknown>, branch?: string): void {
+  const cloneFailure = (message: string): Error & { failureCategory: FailureCategory } => {
+    const err = new Error(message) as Error & { failureCategory: FailureCategory };
+    err.failureCategory = 'clone_failed';
+    return err;
+  };
+
+  // (1a) HEAD must resolve to a real commit — a usable checkout exists.
+  let head: string | null = null;
+  try {
+    head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: WORKSPACE, encoding: 'utf-8' }).trim();
+  } catch {
+    head = null;
+  }
+  if (!head) {
+    throw cloneFailure('clone_failed: working tree has no resolvable HEAD after clone — the clone did not deliver a checkout');
+  }
+
+  // (1b) When we know the expected branch, HEAD must match its remote tracking
+  // ref. A mismatch means a wrong or partial checkout. A MISSING origin ref is
+  // not treated as a failure here (the durable check below is the real net).
+  if (branch) {
+    let originHead: string | null = null;
+    try {
+      originHead = execFileSync('git', ['rev-parse', '--verify', `origin/${branch}`],
+        { cwd: WORKSPACE, encoding: 'utf-8' }).trim();
+    } catch {
+      originHead = null;
+    }
+    if (originHead && originHead !== head) {
+      throw cloneFailure(`clone_failed: HEAD (${head.slice(0, 12)}) does not match origin/${branch} (${originHead.slice(0, 12)}) — partial or wrong checkout`);
+    }
+  }
+
+  // (2) Durable signal says the repo is NOT empty, but the live tree is
+  // empty/near-empty → the clone did not deliver content. countSourceFiles()
+  // returning null means the scan could not run; we do NOT claim a clone failure
+  // on a failed scan (only on a confirmed empty tree paired with a non-empty
+  // durable signal).
+  if (task.repo_is_empty === false) {
+    const sourceFileCount = countSourceFiles();
+    if (sourceFileCount !== null && sourceFileCount <= GREENFIELD_SOURCE_FILE_THRESHOLD) {
+      throw cloneFailure(`clone_failed: durable onboarding signal says the repo is NOT empty, but the cloned tree has only ${sourceFileCount} source file(s) — the clone did not deliver the expected content`);
+    }
   }
 }
 

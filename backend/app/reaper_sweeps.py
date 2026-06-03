@@ -19,6 +19,16 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+# Prefix written by the dispatcher's precondition-defer filters
+# (orchestrator_filters.py) onto Task.latest_status_message when a task is
+# kept QUEUED because a precondition isn't yet satisfiable — a file conflict
+# with an in-progress task, an overlap with a not-yet-merged rollup, or
+# serialization behind a pending migration.  The age-escalation sweep reads
+# this prefix to surface the real, already-recorded blocker as the alert's
+# likely cause instead of a generic infrastructure guess.
+_PRECONDITION_DEFER_PREFIX = "Waiting:"
+
+
 # Per-(provider, model) regression scan cadence.  Moved here from reaper.py.
 _REGRESSION_SCAN_INTERVAL_SECONDS = 15 * 60
 _last_regression_scan: datetime | None = None
@@ -221,6 +231,19 @@ async def sweep_queued_age_alerts(
                     f"rate-limit retry delay recently expired ({_expired_min:.1f}m ago, "
                     f"reset {_resets} times)"
                 )
+        elif (_qt.latest_status_message or "").startswith(
+            _PRECONDITION_DEFER_PREFIX
+        ):
+            # The dispatcher already recorded the authoritative, actionable
+            # blocker at defer time (e.g. waiting on a pending rollup, a file
+            # conflict with a running task, or a serializing migration). Surface
+            # it verbatim — dropping the "Waiting: " lead so it reads naturally
+            # after "Likely cause: " — in preference to the generic
+            # infrastructure heuristics below.
+            _likely_cause = (
+                _qt.latest_status_message[len(_PRECONDITION_DEFER_PREFIX) :].strip()
+                or _qt.latest_status_message
+            )
         else:
             _rate, _sample = _shared_state.get_task_type_failure_rate(
                 _qt_type, window_minutes=15

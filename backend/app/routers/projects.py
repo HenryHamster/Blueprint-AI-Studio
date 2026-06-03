@@ -227,8 +227,19 @@ async def get_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Get a specific project's details.
+    """Retrieve project metadata and configuration.
+
+    Requires project membership. Returns the full Project object including
+    name, repository details, and configuration.
+
+    Path Parameters:
+        project_id: UUID of the project to retrieve.
+
+    Returns:
+        Project: Full project details (name, github_owner, github_repo, etc.)
+
+    Raises:
+        HTTPException(404): Project not found or user lacks membership.
     """
     # Check membership
     member = (
@@ -262,8 +273,38 @@ async def get_project_tasks(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Get all tasks and their artifacts for a specific project.
+    """Retrieve paginated tasks with artifacts and computed metrics.
+
+    Lists all tasks for a project with optional filtering by status, direction,
+    and task type. Fetches associated artifacts (PRs, commits, logs, research
+    findings) and computes VM duration and cost estimates.
+
+    Path Parameters:
+        project_id: UUID of the project.
+
+    Query Parameters:
+        limit: Number of tasks to return (1-100, default 50).
+        offset: Pagination offset (default 0).
+        status: Filter by TaskStatus (QUEUED, IN_PROGRESS, COMPLETED, etc.).
+        direction_id: Filter tasks belonging to a specific research direction.
+        task_type: Filter by task type from first payload (create, refactor, etc.).
+
+    Returns:
+        {
+            "tasks": [
+                {
+                    "id": str, "title": str, "status": TaskStatus,
+                    "task_type": str, "vm_instance_id": str,
+                    "payloads": list, "created_at": datetime,
+                    "parent_task_id": str | null, "context": dict,
+                    "artifacts": list[Artifact], "research_findings": list | null,
+                    "duration_seconds": float | null, "estimated_cost_usd": float | null
+                }
+            ],
+            "pagination": {"limit": int, "offset": int, "count": int}
+        }
+
+    Rate limit: 60 requests/minute.
     """
     # Verify project membership
     member = (
@@ -367,8 +408,19 @@ async def generate_ws_ticket(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Generates a short-lived ticket for authenticating WebSocket connections.
+    """Generate a WebSocket authentication ticket.
+
+    Creates a short-lived JWT token that grants WebSocket access to a project's
+    real-time log stream. The ticket is single-use and expires after initial
+    validation.
+
+    Path Parameters:
+        project_id: UUID of the project.
+
+    Returns:
+        {"ticket": str}: Signed JWT token for WebSocket auth.
+
+    Rate limit: 30 requests/minute.
     """
     member = (
         await session.execute(
@@ -387,9 +439,32 @@ async def generate_ws_ticket(
 
 @router.websocket("/api/projects/{project_id}/ws")
 async def websocket_endpoint(websocket: WebSocket, project_id: str):
-    """
-    WebSocket endpoint for real-time updates.
-    The frontend connects to this to receive live status changes and logs.
+    """Establish a WebSocket connection for real-time project updates.
+
+    Handles two-way communication with clients for live logs, status changes,
+    and deployment state. Requires WebSocket ticket authentication.
+
+    Path Parameters:
+        project_id: UUID of the project to monitor.
+
+    Authentication:
+        First message must be JSON: {"ticket": "<ws_ticket>"}
+        The ticket is obtained via POST /api/projects/{project_id}/ws-ticket
+
+    Messages received by server:
+        {"type": "ping"}: Keep-alive (returns pong)
+        Other message types are logged but not processed.
+
+    Messages sent to clients:
+        {"event": "connected", "data": {"project_id": str}}
+        {"event": "agent_log", "data": {"task_id": str, "log": str}}
+        {"event": "deploy_state", "data": {...}}
+
+    Idle timeout: 90 seconds (detects silent drops from load balancers)
+    Message rate limit: 20 messages/second
+    Max message size: 10 KB
+
+    Closes with code 1008 on auth failure or membership loss.
     """
     await websocket.accept()
 
@@ -811,8 +886,27 @@ async def cancel_project(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """
-    Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
+    """Cancel all pending tasks and terminate associated VMs.
+
+    Halts the entire project, marking pending tasks (QUEUED, PROVISIONING,
+    IN_PROGRESS, EVALUATING) as CANCELLED, and immediately terminates all
+    running VMs in the background. Requires project owner role.
+
+    Path Parameters:
+        project_id: UUID of the project to cancel.
+
+    Returns:
+        {
+            "status": "cancelled" | "ignored",
+            "message": str
+        }
+
+    Status codes:
+        200: Project cancelled successfully or already terminal
+        401: Unauthorized
+        404: Project not found or user lacks owner role
+
+    Rate limit: 10 requests/minute.
     """
     from app.vm_lifecycle import _ensure_vm_deleted  # noqa: PLC0415
     from app.admin import _get_user_project_with_role  # noqa: PLC0415

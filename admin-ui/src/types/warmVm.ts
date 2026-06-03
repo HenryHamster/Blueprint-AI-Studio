@@ -6,9 +6,10 @@ export interface WarmVmCurrentTask {
   task_type: string;
   status: string;
   warm_start: boolean;
-  // "backlog_reuse" | "next_role_endpoint" | null (legacy/unset). Set by the
-  // server when a warm VM claims a task; distinguishes same-project backlog
-  // reuse from PR-chain continuity. See admin_health._compute_warm_vm_state.
+  // "warm_pool" | "backlog_reuse" | "next_role_endpoint" | null (legacy/unset).
+  // Set by the server when a warm VM claims a task; distinguishes pre-provisioned
+  // pool-origin claims from same-project backlog reuse and PR-chain continuity.
+  // See admin_health._compute_warm_vm_state.
   warm_claim_origin: string | null;
   prior_role_vm_id: string | null;
   setup_secs: number | null;
@@ -81,6 +82,140 @@ export interface SpawnPinFunnelSnapshot {
   skipped_total: number;
 }
 
+// Per-account slice of the pool dispatch funnel, as built by
+// warm_backlog_reuse.get_pool_funnel_snapshot -> by_account. Events recorded
+// without a resolved account fall under the _UNATTRIBUTED_ACCOUNT label.
+export interface PoolFunnelAccountBreakdown {
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  lease_miss_by_reason: Record<string, number>;
+  lease_miss_total: number;
+}
+
+export interface PoolFunnelSnapshot {
+  window_hours: number;
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  lease_miss_by_reason: Record<string, number>;
+  lease_miss_total: number;
+  // Per-account breakdown of the same funnel (omitted by older backends).
+  by_account?: Record<string, PoolFunnelAccountBreakdown>;
+}
+
+// Per-account warm-pool idle cost, as built by
+// efficiency_snapshot.compute_pool_idle_cost -> by_account. Covers LIVE members
+// only; the ledger carry-forward of already-reaped members is fleet-wide and
+// intentionally absent here (PoolIdleCostLedger carries no account_id).
+export interface PoolIdleCostAccountBreakdown {
+  settled_idle_cost_usd: number;
+  live_idle_cost_usd: number;
+  total_idle_cost_usd: number;
+  member_count: number;
+  idle_count: number;
+}
+
+// Per-account cost-amortization view, as built by
+// efficiency_snapshot.compute_pool_cost_amortization_by_account: joins the
+// per-account idle cost with the per-account dispatch funnel so an operator can
+// read warm-claim counts, hit rate, idle cost, and idle dollars per warm start
+// per account. cost_per_pool_hit_usd is null when that account has no warm hit
+// yet (its idle spend is not being amortized).
+export interface PoolAccountAmortization {
+  pool_idle_cost_usd: number;
+  pool_lease_hits: number;
+  cold_dispatches: number;
+  total_dispatches: number;
+  pool_hit_rate: number | null;
+  cost_per_pool_hit_usd: number | null;
+}
+
+// Warm-pool sizing + idle-cost + dispatch-funnel snapshot. All fields optional
+// for backward compatibility: an older backend that predates the pool metrics
+// returns no `pool_metrics` block (or {}) and the panel renders without it.
+export interface PoolMetrics {
+  enabled?: boolean;
+  target_size?: number;
+  idle_ttl_secs?: number;
+  current_size?: number;
+  idle_count?: number;
+  projected_idle_cost_usd?: number;
+  settled_idle_cost_usd?: number;
+  live_idle_cost_usd?: number;
+  funnel?: PoolFunnelSnapshot;
+  // Current per-project enablement scope (sorted project ids). An empty array
+  // means the pool is fleet-wide (legacy all-or-nothing). Omitted by older
+  // backends. The panel renders each scoped project with a disable control.
+  project_allowlist?: string[];
+  // Per-account breakdowns for a controlled enable's 'retire or pivot'
+  // decision (omitted by older backends). idle_cost_by_account answers which
+  // account's idle members drive cost; cost_amortization_by_account joins that
+  // with the per-account dispatch funnel for per-account hit rate + $/warm.
+  idle_cost_by_account?: Record<string, PoolIdleCostAccountBreakdown>;
+  cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
+}
+
+// Per-account slice of the offline pool hit-rate estimate, as built by
+// efficiency_snapshot._estimate_pool_hit_rate -> by_account.
+export interface PoolHitRateEstimateAccount {
+  total_dispatches: number;
+  estimated_warm_hits: number;
+  estimated_hit_rate: number | null;
+  allocated_slots: number;
+}
+
+// Offline, read-only counterfactual estimate of the warm-pool hit rate a
+// project would achieve at a candidate target size, returned by GET
+// /api/admin/projects/{project_id}/pool-hit-rate-estimate. Derived purely from
+// recent per-account dispatch history — it provisions nothing and does not
+// change the dispatch path. estimated_hit_rate is null when there are no
+// dispatches in the window. account_retarget_scenario is the same estimate with
+// account-retarget on (any idle member can serve any account).
+export interface PoolHitRateEstimate {
+  project_id: string;
+  target_size: number;
+  window_days: number;
+  replenish_seconds: number;
+  idle_ttl_seconds: number;
+  total_dispatches: number;
+  estimated_warm_hits: number;
+  estimated_hit_rate: number | null;
+  by_account: Record<string, PoolHitRateEstimateAccount>;
+  account_retarget_scenario: {
+    estimated_warm_hits: number;
+    estimated_hit_rate: number | null;
+  };
+  assumptions: string;
+}
+
+// Per-project warm-pool TARGET sizing, read from GET /api/admin/settings. The
+// maintainer reconciles each scoped project toward its explicit per-project
+// target in `warm_pool_target_size_by_project` (keyed by project id), falling
+// back to the global `warm_pool_target_size` when the project has no explicit
+// entry. Both fields are always present on a current backend; an older backend
+// that predates per-project targets simply omits the map (treated as {}).
+export interface WarmPoolTargets {
+  warm_pool_target_size: number;
+  warm_pool_target_size_by_project: Record<string, number>;
+}
+
+// Response from POST /api/admin/projects/{project_id}/warm-pool/target. Mirrors
+// the additive-only keys returned by admin_warm_pool.set_warm_pool_target_for_project:
+// `target_size` is the explicit per-project value now stored (null when cleared),
+// `effective_target` is the value the maintainer reconciles toward after global
+// fallback, `cleared` is whether the explicit entry was removed, and
+// `warm_pool_target_size_by_project` is the resulting map.
+export interface WarmPoolTargetSetResponse {
+  project_id: string;
+  target_size: number | null;
+  effective_target: number;
+  cleared: boolean;
+  warm_pool_target_size_by_project: Record<string, number>;
+}
+
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
   warm_pin_metrics: {
@@ -91,6 +226,13 @@ export interface WarmVmStateResponse {
     active_pinned_queued_total: number;
     active_warm_chains: number;
     active_backlog_reuse_claims: number;
+    // Pool-origin in-flight claims, isolated from chain-continuity (a
+    // pre-provisioned warm-pool member served the dispatch). Optional for
+    // backward compatibility with older backends that folded it into the
+    // chain-continuity bucket. pool_origin_share is the pool fraction of all
+    // active warm chains (null when there are no active warm chains).
+    active_pool_origin_claims?: number;
+    pool_origin_share?: number | null;
     active_chain_continuity_claims: number;
   };
   warm_continuity_enabled: boolean;
@@ -99,4 +241,6 @@ export interface WarmVmStateResponse {
   chain_continuity_funnel?: ChainContinuityFunnelSnapshot;
   spawn_pin_funnel?: SpawnPinFunnelSnapshot;
   backlog_reuse_funnel?: BacklogReuseFunnelSnapshot;
+  // Optional for backward compatibility (older backend omits it entirely).
+  pool_metrics?: PoolMetrics;
 }

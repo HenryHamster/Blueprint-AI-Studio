@@ -3,6 +3,28 @@
 Extracted from app.main to reduce module size. The worker polls for QUEUED tasks,
 checks dependencies, handles file conflicts, provisions VMs, and monitors
 EVALUATING tasks.
+
+The orchestrator loop runs every ~10 seconds and:
+
+1. **Task Polling**: Fetches QUEUED tasks in priority order (high → medium → low)
+2. **Dependency Checking**: Validates file conflicts, rollup conflicts, and migration
+   serialization before provisioning
+3. **VM Provisioning**: Creates GCP VMs for non-dependent tasks (subject to
+   MAX_CONCURRENT_VMS and MAX_PROVISION_SLOTS limits)
+4. **Autonomous Research**: Spawns new research/plan tasks from strategic directions
+5. **EVALUATING Monitoring**: Watches tasks waiting on CI/review and triggers PR rollups
+   when ready
+6. **Circuit Breaker**: Halts new provisioning if a project exceeds failure threshold
+
+Key Functions:
+- orchestrator_worker() - Main polling loop (async, called by lifecycle)
+- _check_idle_research() - Spawns autonomous research tasks if pipeline is idle
+- _provision_and_handle() - Attempts to provision a task, with retry and fallback logic
+- _monitor_evaluating_tasks() - Checks CI completion and review status for EVALUATING tasks
+
+The orchestrator is the single source of truth for when work moves from QUEUED →
+PROVISIONING. All other state transitions (PROVISIONING → IN_PROGRESS, IN_PROGRESS →
+COMPLETED/FAILED, etc.) are driven by agent reports or task lifecycle handlers.
 """
 
 import asyncio
@@ -224,6 +246,40 @@ async def _lock_task_for_mutation(
                 await session.commit()
                 return None
         return task
+
+
+async def _lock_dispatchable_task_for_mutation(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+) -> Task | None:
+    """Lock a QUEUED task only if its project is still unpaused and unarchived.
+
+    The candidate scan and queued-task refresh both prefilter paused/archived
+    projects, but an operator can pause or archive a project in the narrow
+    window before the final dispatch claim. Re-check both flags in the same
+    ``SELECT .. FOR UPDATE SKIP LOCKED`` that acquires the task row so the
+    task cannot leave QUEUED after pause/archive lands.
+    """
+    stmt = (
+        select(Task)
+        .join(Project, Task.project_id == Project.id)
+        .where(
+            Task.id == task_id,
+            Task.status == TaskStatus.QUEUED,
+            Project.paused.is_(False),
+            Project.not_archived(),
+        )
+        .with_for_update(skip_locked=True)
+        .execution_options(populate_existing=True)
+    )
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+    if task is None:
+        logger.info(
+            "[ORCHESTRATOR] dispatch for task %s deferred: row locked, status changed, or project paused",
+            task_id,
+        )
+    return task
 
 
 async def _lock_provisioning_task_for_vm(
@@ -516,6 +572,38 @@ def _resolve_ci_fix_branch(
     return branch or ""
 
 
+async def _apply_ci_merged_landed_signal(
+    ci_task: Task,
+    session: AsyncSession,
+    *,
+    base_branch: str,
+    review_loop: dict,
+) -> bool:
+    """Stage the pr_merged landed signal only when the merged PR landed on
+    the project's integration branch.
+
+    Returns True when the merged PR landed on the integration branch. When the
+    base branch resolves to a distinct promotion target, the helper withholds
+    pr_merged and stages the same branch-safety alert the rollup boundary uses.
+    """
+    from app.landed_signal import apply_merged_landed_signal
+
+    project = (
+        await session.get(Project, ci_task.project_id) if ci_task.project_id else None
+    )
+    hotfix_lane = bool(
+        (ci_task.first_payload or {}).get("hotfix")
+        or (ci_task.context or {}).get("hotfix")
+        or review_loop.get("hotfix")
+    )
+    return apply_merged_landed_signal(
+        ci_task,
+        project,
+        base_branch=base_branch,
+        hotfix_lane=hotfix_lane,
+    )
+
+
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
 # starving new provisions and creating a cascading failure where no VM can
@@ -591,10 +679,316 @@ def _sync_task_payload_runtime_fields(
     return changed
 
 
+async def _persist_deps_satisfied(task: Task) -> None:
+    """Durably stamp the sticky ``_deps_satisfied`` readiness marker on a
+    dependency-bearing task whose dependencies the orchestrator has just
+    resolved as fully satisfied.
+
+    This marker is the contract between the orchestrator's authoritative,
+    GitHub-aware dependency / PR-merge resolution (``_check_candidate_task_deps``
+    returning ``"eligible"``) and the two warm-reuse hot paths — the
+    ``/next-role`` warm-backlog scan and the dispatch first-refusal hold. Both
+    treat a task carrying this marker as warm-claimable WITHOUT re-running dep
+    resolution at high frequency. It is stamped only after deps resolve eligible
+    (a failed dep cascade-cancels the dependent instead of stamping), so the
+    marker can never outlive an unsatisfied dependency.
+
+    Persisted in its own session (mirroring the dep-remap write) so the Step 3
+    dispatch re-read and the next-role scan both observe it, and mirrored onto
+    the in-memory ``task`` so the same-cycle dispatch sees it without a re-read.
+    Idempotent: a no-op when the marker is already present.
+    """
+    if (task.context or {}).get("_deps_satisfied"):
+        return
+    async with AsyncSessionLocal() as deps_session:
+        deps_task = await deps_session.get(Task, task.id)
+        if deps_task is not None:
+            deps_task.context = {
+                **(deps_task.context or {}),
+                "_deps_satisfied": True,
+            }
+            deps_session.add(deps_task)
+            await deps_session.commit()
+    task.context = {**(task.context or {}), "_deps_satisfied": True}
+
+
 from app.orchestrator_health import (
     _check_candidate_task_deps,
     get_confirmed_down_critical_deps,
 )
+
+
+async def _cascade_cancel_dependent(task_id, project_id, broadcast_to_project) -> int:
+    """Cancel a dependent whose prerequisite genuinely failed, cascading to its
+    non-terminal children, releasing any held account slot, and tearing down its VM.
+
+    Single source of truth shared by the main dispatch dependency check and the
+    deadlock-breaker sweep so both apply identical dependency-death policy — a task
+    whose real prerequisite failed is recognized once and cancelled, never
+    dispatched as impossible work.
+
+    Returns the number of tasks cancelled (the dependent itself plus its cascaded
+    children) so callers can accumulate a single deduplicated operator alert per
+    failed prerequisite. Returns 0 if the dependent row no longer exists.
+    """
+    from app.max_plan_pool import release_max_plan_account, get_task_llm_account_id
+    from app.vm_lifecycle import _ensure_vm_deleted
+    from app.alert_dispatch import _maybe_create_failure_alert
+
+    vm_id = None
+    cancelled_count = 0
+    async with AsyncSessionLocal() as cancel_session:
+        cancel_task = await cancel_session.get(Task, task_id)
+        if cancel_task is None:
+            return 0
+        vm_id = cancel_task.vm_instance_id
+        cancel_task.status = TaskStatus.CANCELLED
+        if cancel_task.vm_provisioned_at:
+            cancel_task.vm_stopped_at = _utcnow()
+        cancel_task.latest_status_message = "Cancelled: dependency task failed"
+        # Release account slot if held
+        cancel_acct = get_task_llm_account_id(cancel_task)
+        if cancel_acct and not (cancel_task.context or {}).get("_slot_released"):
+            await release_max_plan_account(cancel_acct)
+            cancel_task.context = {
+                **(cancel_task.context or {}),
+                "_slot_released": True,
+            }
+        cancel_session.add(cancel_task)
+        # Cascade cancel to children in non-terminal states
+        children = (
+            (
+                await cancel_session.execute(
+                    select(Task).where(
+                        Task.parent_task_id == task_id,
+                        Task.status.not_in(
+                            [
+                                TaskStatus.COMPLETED,
+                                TaskStatus.FAILED,
+                                TaskStatus.CANCELLED,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for child in children:
+            child.status = TaskStatus.CANCELLED
+            if child.vm_provisioned_at:
+                child.vm_stopped_at = _utcnow()
+            child.latest_status_message = "Cancelled: parent dependency failed"
+            child_acct = get_task_llm_account_id(child)
+            if child_acct and not (child.context or {}).get("_slot_released"):
+                await release_max_plan_account(child_acct)
+                child.context = {**(child.context or {}), "_slot_released": True}
+            cancel_session.add(child)
+        await _maybe_create_failure_alert(
+            cancel_task,
+            cancel_session,
+            "Cascade cancelled: dependency task failed",
+        )
+        cancelled_count = 1 + len(children)
+        await cancel_session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "task_updated",
+        {"task_id": str(task_id), "status": TaskStatus.CANCELLED},
+    )
+    await _ensure_vm_deleted(vm_id, reason="dependency_cancelled")
+    logger.error(f"[ORCHESTRATOR] Cancelled task {task_id} — dependency failed")
+    return cancelled_count
+
+
+async def _apply_deadlock_classification(
+    classified, broadcast_to_project, eligible_ids, scan_label=""
+) -> int:
+    """Apply a :func:`_classify_stuck_tasks` result.
+
+    True cycles and satisfied-dead deps get ``depends_on`` cleared and become
+    dispatchable; a dependent whose real prerequisite genuinely failed is
+    cascade-cancelled (NOT dispatched) via the same policy the main check uses.
+    Returns the number of tasks acted on.
+    """
+    if not classified:
+        return 0
+    cancels: list[tuple] = []
+    acted = 0
+    all_ids = [tid for tid, _ in classified]
+    async with AsyncSessionLocal() as fix_session:
+        rows = await fix_session.execute(select(Task).where(Task.id.in_(all_ids)))
+        tasks_by_id = {t.id: t for t in rows.scalars().all()}
+        for task_id, reason in classified:
+            fix_task = tasks_by_id.get(task_id)
+            if reason == "cascade_cancel":
+                if fix_task:
+                    cancels.append((task_id, fix_task.project_id))
+                    acted += 1
+                continue
+            if fix_task:
+                if reason == "cycle":
+                    msg = f"Dependencies cleared: dependency cycle detected{scan_label}"
+                    tag = "cycle broken"
+                else:
+                    msg = (
+                        "Dependencies cleared: all deps satisfied/cancelled"
+                        f"{scan_label}"
+                    )
+                    tag = "dead deps cleared"
+                logger.warning(
+                    f"[ORCHESTRATOR] Breaking deadlock ({tag}{scan_label}): "
+                    f"clearing depends_on for task {task_id}"
+                )
+                fix_task.depends_on = []
+                fix_task.latest_status_message = msg
+                fix_session.add(fix_task)
+                await broadcast_to_project(
+                    str(fix_task.project_id),
+                    "task_updated",
+                    {"task_id": str(task_id), "status": "QUEUED", "message": msg},
+                )
+            eligible_ids.append(task_id)
+            acted += 1
+        await fix_session.commit()
+    # Cascade-cancel after the clear-commit so each cancel manages its own session.
+    for task_id, project_id in cancels:
+        await _cascade_cancel_dependent(task_id, project_id, broadcast_to_project)
+    return acted
+
+
+async def _mark_unblocked_dependents(completed_task: Task, verify_pr_merged) -> int:
+    """Completion-side trigger: when a task finishes and its PR has landed on the
+    integration branch, proactively stamp the sticky ``_deps_satisfied`` readiness
+    marker on any QUEUED dependent whose dependencies now authoritatively resolve
+    as satisfied.
+
+    Without this, a just-unblocked dependent stays unmarked until a later
+    capacity-and-window-bounded dispatch scan happens to reach it, so the
+    just-completed task's warm VM — polling for follow-on work inside its
+    teardown-defer grace window — skips it and tears down cold, and the
+    orchestrator then cold-provisions a fresh VM for the very dependent the
+    completion just unblocked. Marking it here makes the obvious sibling-to-sibling
+    fan-out reusable in the saturated-fleet regime where reuse matters most.
+
+    The readiness signal is NOT loosened: this reuses the same authoritative,
+    GitHub-aware ``_check_candidate_task_deps`` resolution the dispatch scan uses,
+    and stamps only the ``"eligible"`` result — a dependent with any still-unresolved
+    or failed dependency continues to carry no marker and continue to cold-dispatch
+    and cascade-cancel exactly as before. Adds no cold provisioning.
+
+    Async hot-loop safety: dependents and their dependency rows are loaded with
+    full ``select(Task)`` (every column present, no partial projection) so the
+    downstream attribute reads inside ``_check_candidate_task_deps`` cannot trip a
+    MissingGreenlet. The eligibility pass performs no commits, so the attached rows
+    are never expired mid-iteration; the marker write happens afterwards in its own
+    session.
+    """
+    completed_id_str = str(completed_task.id)
+    project_id = completed_task.project_id
+    eligible_ids: list[uuid.UUID] = []
+    # Bound the candidate scan. ``depends_on`` is a JSON column filtered in Python
+    # below, so the cap is on the raw QUEUED-dependent pool, not the matched subset.
+    # Order deterministically (oldest first) so the bounded window is stable rather
+    # than nondeterministic, and surface a warning when it is saturated so the
+    # silent-drop of surplus dependents for a >cap fan-out is observable.
+    _DEPENDENT_SCAN_CAP = 100
+    async with AsyncSessionLocal() as dep_session:
+        dependents = (
+            (
+                await dep_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status == TaskStatus.QUEUED,
+                        Task.requires_approval.is_(False),
+                        Task.project_id == project_id,
+                        Task.depends_on.isnot(None),
+                    )
+                    .order_by(Task.created_at)
+                    .limit(_DEPENDENT_SCAN_CAP)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if len(dependents) >= _DEPENDENT_SCAN_CAP:
+            logger.warning(
+                "[warm-reuse] _mark_unblocked_dependents hit the %d-dependent scan "
+                "cap for project %s after task %s; surplus QUEUED dependents are not "
+                "marked this pass and will fall back to the dispatch scan",
+                _DEPENDENT_SCAN_CAP,
+                project_id,
+                completed_id_str,
+            )
+        dependents = [
+            d
+            for d in dependents
+            if completed_id_str in (d.depends_on or [])
+            and not (d.context or {}).get("_deps_satisfied")
+        ]
+        if not dependents:
+            return 0
+        # Batch every dependency row across all dependents into one query.
+        per_dep_uuids: dict[uuid.UUID, list[uuid.UUID]] = {}
+        all_dep_uuids: set[uuid.UUID] = set()
+        for d in dependents:
+            du: list[uuid.UUID] = []
+            for raw in d.depends_on or []:
+                try:
+                    du.append(uuid.UUID(raw))
+                except (ValueError, AttributeError):
+                    continue
+            per_dep_uuids[d.id] = du
+            all_dep_uuids.update(du)
+        dep_by_id: dict[uuid.UUID, Task] = {}
+        if all_dep_uuids:
+            dep_by_id = {
+                dt.id: dt
+                for dt in (
+                    await dep_session.execute(
+                        select(Task).where(Task.id.in_(all_dep_uuids))
+                    )
+                )
+                .scalars()
+                .all()
+            }
+        for d in dependents:
+            du = per_dep_uuids[d.id]
+            dep_tasks = [dep_by_id[u] for u in du if u in dep_by_id]
+            result_str, _ = await _check_candidate_task_deps(
+                d, dep_tasks, du, dep_session, verify_pr_merged
+            )
+            if result_str == "eligible":
+                eligible_ids.append(d.id)
+    if not eligible_ids:
+        return 0
+    async with AsyncSessionLocal() as stamp_session:
+        for r in (
+            (
+                await stamp_session.execute(
+                    select(Task).where(Task.id.in_(eligible_ids))
+                )
+            )
+            .scalars()
+            .all()
+        ):
+            if not (r.context or {}).get("_deps_satisfied"):
+                r.context = {**(r.context or {}), "_deps_satisfied": True}
+                stamp_session.add(r)
+        await stamp_session.commit()
+    # Surface the completion-side trigger's lift on the reuse funnel so operators
+    # can confirm the widening change is converting just-unblocked dependents into
+    # warm-claimable work. Best-effort: telemetry must never abort the completion
+    # cycle. Recorder no-ops on a non-positive count, but the early ``return 0``
+    # paths above carry no marked dependents, so this single call at the marked-some
+    # landing is the authoritative record for all three completion callers.
+    from app.warm_backlog_reuse import record_completion_dependents_marked
+
+    try:
+        record_completion_dependents_marked(len(eligible_ids))
+    except Exception:
+        logger.exception("[warm-reuse] completion_dependents_marked telemetry failed")
+    return len(eligible_ids)
 
 
 async def orchestrator_worker():
@@ -622,8 +1016,23 @@ async def orchestrator_worker():
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
     )
+    from app.warm_pool import (
+        is_warm_pool_enabled,
+        mark_pool_vm_retiring,
+        try_pool_dispatch,
+    )
+
+    # Pool dispatch funnel: record into the warm_backlog_reuse counters that the
+    # operator panel (admin_health._get_pool_metrics → get_pool_funnel_snapshot)
+    # actually displays, so the surfaced pool_metrics.funnel reflects real
+    # dispatch activity instead of staying permanently zero.
+    from app.warm_backlog_reuse import (
+        record_pool_cold_dispatch,
+        record_pool_lease_hit,
+    )
     from app.alert_dispatch import (
         _maybe_create_failure_alert,
+        _maybe_create_cascade_cancel_alert,
         _create_orchestrator_error_alerts,
     )
     from app.routers.agent_status import record_task_result
@@ -853,7 +1262,9 @@ async def orchestrator_worker():
                             )
                             acct_id = get_task_llm_account_id(fresh_t)
                             if acct_id:
-                                await release_max_plan_account(acct_id)
+                                await release_max_plan_account(
+                                    acct_id, revert_daily_task_count=True
+                                )
                             session.add(fresh_t)
                             await _maybe_create_failure_alert(
                                 fresh_t,
@@ -871,7 +1282,9 @@ async def orchestrator_worker():
                         # Release Max Plan account slot before requeueing
                         acct_id = get_task_llm_account_id(fresh_t)
                         if acct_id:
-                            await release_max_plan_account(acct_id)
+                            await release_max_plan_account(
+                                acct_id, revert_daily_task_count=True
+                            )
                         # Cancel any lingering coroutine reference
                         zombie = _provision_coroutines.pop(str(t.id), None)
                         if zombie and not zombie.done():
@@ -934,10 +1347,31 @@ async def orchestrator_worker():
                 active_count = len(active_tasks_result)
                 # Cross-check with actual GCP VM count (cached, refreshed every 2 min)
                 actual_vm_count = await _get_actual_gcp_vm_count()
-                effective_count = max(active_count, actual_vm_count)
-                if actual_vm_count > active_count + 2:
+                # Warm-pool slot accounting: a pre-provisioned idle pool VM is a
+                # real agent-vm-* instance, so _get_actual_gcp_vm_count() and the
+                # GCP cleanup count BOTH include it. Charging it against the
+                # dispatch budget would starve real queued tasks. Exclude the
+                # non-task-bound pool members (PROVISIONING/IDLE) from the GCP
+                # cross-check — they live in a dedicated pool budget
+                # (warm_pool_max_vms, enforced by the maintainer), NOT the dispatch
+                # budget. LEASED pool members run a task and are already counted in
+                # active_count, so they must NOT be subtracted.
+                from app.warm_pool import count_idle_pool_vms, is_warm_pool_enabled
+
+                # Only subtract idle pool inventory when the pool is enabled. When
+                # disabled the maintainer/idle-sweep early-return and never clear
+                # PoolVm rows, but the generic GCP cleanup still deletes the
+                # underlying VMs — so stale IDLE rows would over-subtract here,
+                # inflating slots_available past max_concurrent_vms. Gate it off.
+                idle_pool_count = (
+                    await count_idle_pool_vms(session) if is_warm_pool_enabled() else 0
+                )
+                gcp_dispatch_vms = max(0, actual_vm_count - idle_pool_count)
+                effective_count = max(active_count, gcp_dispatch_vms)
+                if gcp_dispatch_vms > active_count + 2:
                     logger.warning(
-                        f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}) > DB active count ({active_count}) "
+                        f"[ORCHESTRATOR] GCP VM count ({actual_vm_count}, "
+                        f"{idle_pool_count} idle-pool) > DB active count ({active_count}) "
                         f"— possible orphans, using GCP count for slot calculation"
                     )
                 slots_available = max(
@@ -1201,9 +1635,24 @@ async def orchestrator_worker():
                 # if it's a deferred-loaded attribute (no async session bound).
                 candidate_stmt = (
                     select(Task)
+                    # Exclude tasks owned by an archived OR paused project — both
+                    # halt new dispatch of the project's QUEUED work. Pause is a
+                    # first-class persisted switch distinct from terminal status
+                    # and from autonomous_enabled: while paused, no new dispatch
+                    # (cold OR warm-pool) may select the project's work, though
+                    # in-flight PROVISIONING/IN_PROGRESS tasks drain. Filtering via
+                    # a project-id subquery (rather than a JOIN) keeps the
+                    # load_only/scalars() shape and the MissingGreenlet-safe
+                    # Task-only column set untouched.
                     .where(
                         Task.status == TaskStatus.QUEUED,
                         Task.requires_approval.is_(False),
+                        Task.project_id.in_(
+                            select(Project.id).where(
+                                Project.not_archived(),
+                                Project.paused.is_(False),
+                            )
+                        ),
                     )
                     .options(
                         load_only(
@@ -1320,6 +1769,15 @@ async def orchestrator_worker():
                         _dep_batch_session.expunge_all()
 
                 eligible_ids = []
+                # Accumulate cascade-cancel counts per failed prerequisite across
+                # this single dependency-resolution pass so a root failure that
+                # cascades through A→B→C raises exactly ONE operator alert per
+                # distinct failed prerequisite (flushed after the loop), rather
+                # than one alert per cancelled dependent.
+                _cascade_cancel_by_prereq: dict[uuid.UUID, dict] = {}
+                from app.failure_classification import (
+                    SCOPE_EMPTY as _SCOPE_EMPTY,
+                )
                 for task in candidate_tasks:
                     # Skip tasks held back due to retry_after hold (audit W1:
                     # ``retry_after_until`` is a column now, so a stale
@@ -1423,79 +1881,53 @@ async def orchestrator_worker():
                             )
 
                     if any_failed:
-                        # Use separate session to avoid polluting the main dispatch session
-                        async with AsyncSessionLocal() as cancel_session:
-                            cancel_task = await cancel_session.get(Task, task.id)
-                            if cancel_task:
-                                cancel_task.status = TaskStatus.CANCELLED
-                                if cancel_task.vm_provisioned_at:
-                                    cancel_task.vm_stopped_at = _utcnow()
-                                cancel_task.latest_status_message = (
-                                    "Cancelled: dependency task failed"
-                                )
-                                # Release account slot if held
-                                cancel_acct = get_task_llm_account_id(cancel_task)
-                                if cancel_acct and not (cancel_task.context or {}).get(
-                                    "_slot_released"
-                                ):
-                                    await release_max_plan_account(cancel_acct)
-                                    cancel_task.context = {
-                                        **(cancel_task.context or {}),
-                                        "_slot_released": True,
-                                    }
-                                cancel_session.add(cancel_task)
-                                # Cascade cancel to children in non-terminal states
-                                children = (
-                                    (
-                                        await cancel_session.execute(
-                                            select(Task).where(
-                                                Task.parent_task_id == task.id,
-                                                Task.status.not_in(
-                                                    [
-                                                        TaskStatus.COMPLETED,
-                                                        TaskStatus.FAILED,
-                                                        TaskStatus.CANCELLED,
-                                                    ]
-                                                ),
-                                            )
-                                        )
-                                    )
-                                    .scalars()
-                                    .all()
-                                )
-                                for child in children:
-                                    child.status = TaskStatus.CANCELLED
-                                    if child.vm_provisioned_at:
-                                        child.vm_stopped_at = _utcnow()
-                                    child.latest_status_message = (
-                                        "Cancelled: parent dependency failed"
-                                    )
-                                    child_acct = get_task_llm_account_id(child)
-                                    if child_acct and not (child.context or {}).get(
-                                        "_slot_released"
-                                    ):
-                                        await release_max_plan_account(child_acct)
-                                        child.context = {
-                                            **(child.context or {}),
-                                            "_slot_released": True,
-                                        }
-                                    cancel_session.add(child)
-                                await _maybe_create_failure_alert(
-                                    cancel_task,
-                                    cancel_session,
-                                    "Cascade cancelled: dependency task failed",
-                                )
-                                await cancel_session.commit()
-                        await broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {"task_id": str(task.id), "status": TaskStatus.CANCELLED},
+                        # Single source of truth: same cascade-cancel policy the
+                        # deadlock-breaker sweep applies (its own session, child
+                        # cascade, slot release, VM teardown). Returns the number
+                        # of tasks cancelled (dependent + cascaded children).
+                        _cancelled_count = await _cascade_cancel_dependent(
+                            task.id, task.project_id, broadcast_to_project
                         )
-                        await _ensure_vm_deleted(task, reason="dependency_cancelled")
-                        logger.error(
-                            f"[ORCHESTRATOR] Cancelled task {task.id} — dependency failed"
+                        # Accumulate the cascade against the failed prerequisite
+                        # so a single deduplicated operator alert is raised once
+                        # after this dispatch pass. Re-derive the failed
+                        # prerequisite locally (mirrors _check_candidate_task_deps'
+                        # cancel decision: first terminal-failed dep that is not a
+                        # deliberate SCOPE_EMPTY no-op exit) so the heavily-tested
+                        # helper signature is untouched.
+                        _failed_prereq = next(
+                            (
+                                dt
+                                for dt in dep_tasks
+                                if dt.status
+                                in (
+                                    TaskStatus.FAILED,
+                                    TaskStatus.CANCELLED,
+                                )
+                                and (dt.context or {}).get("failure_category")
+                                != _SCOPE_EMPTY
+                            ),
+                            None,
                         )
+                        if _failed_prereq is not None:
+                            _entry = _cascade_cancel_by_prereq.setdefault(
+                                _failed_prereq.id,
+                                {
+                                    "prereq_task": _failed_prereq,
+                                    "count": 0,
+                                },
+                            )
+                            _entry["count"] += _cancelled_count
                     elif all_met:
+                        # Durably stamp the sticky readiness marker so the cheap
+                        # /next-role warm-backlog scan and the dispatch
+                        # first-refusal hold can treat this dependency-bearing
+                        # task as warm-claimable WITHOUT re-running the
+                        # (GitHub-aware) dependency / PR-merge resolution on the
+                        # hot path. Only reached on the all_met path — a failed
+                        # dependency cascade-cancels the dependent above, so the
+                        # marker can never outlive an unsatisfied dependency.
+                        await _persist_deps_satisfied(task)
                         eligible_ids.append(task.id)
                     else:
                         # Surface dependency-wait reason to UI
@@ -1524,6 +1956,26 @@ async def orchestrator_worker():
                             except Exception:
                                 logger.exception(
                                     f"[ORCHESTRATOR] Failed to update dep wait message for task {task.id}"
+                                )
+
+                # Flush accumulated cascade-cancels: raise ONE deduplicated
+                # operator alert per distinct failed prerequisite that cancelled
+                # dependents during this dependency-resolution pass.
+                if _cascade_cancel_by_prereq:
+                    async with AsyncSessionLocal() as _cascade_alert_session:
+                        for _entry in _cascade_cancel_by_prereq.values():
+                            try:
+                                await _maybe_create_cascade_cancel_alert(
+                                    _cascade_alert_session,
+                                    _entry["prereq_task"].project_id,
+                                    _entry["prereq_task"],
+                                    _entry["count"],
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to raise cascade-cancel "
+                                    "alert for prereq %s",
+                                    _entry["prereq_task"].id,
                                 )
 
                 # Step 2.4: Deadlock detection — break circular deps among stuck QUEUED tasks
@@ -1555,59 +2007,37 @@ async def orchestrator_worker():
                             task_dep_uuids[stask.id] = dep_uuids
                             all_dep_ids.update(dep_uuids)
 
-                        dep_status: dict = {}
+                        dep_tasks_by_id: dict = {}
                         if all_dep_ids:
                             dep_rows = await session.execute(
                                 select(Task).where(Task.id.in_(all_dep_ids))
                             )
-                            for dep_task in dep_rows.scalars().all():
-                                dep_status[dep_task.id] = dep_task.status
+                            dep_tasks_by_id = {
+                                dt.id: dt for dt in dep_rows.scalars().all()
+                            }
 
-                        # True cycle detection — avoids false positives where a
-                        # stuck task waits on another that depends on an active task
-                        classified = _classify_stuck_tasks(
-                            stuck_tasks, task_dep_uuids, dep_status, stuck_ids
+                        # Cycle detection + shared dependency-death policy: a true
+                        # cycle clears depends_on and dispatches; a genuinely failed
+                        # prerequisite cascade-cancels the dependent instead of being
+                        # dispatched as impossible work (single source of truth with
+                        # the main per-candidate check via _check_candidate_task_deps).
+                        classified = await _classify_stuck_tasks(
+                            stuck_tasks,
+                            task_dep_uuids,
+                            dep_tasks_by_id,
+                            stuck_ids,
+                            session,
+                            _verify_pr_merged,
                         )
-                        if classified:
-                            async with AsyncSessionLocal() as fix_session:
-                                _classified_ids = [tid for tid, _ in classified]
-                                _classified_result = await fix_session.execute(
-                                    select(Task).where(Task.id.in_(_classified_ids))
-                                )
-                                _tasks_by_id = {
-                                    t.id: t for t in _classified_result.scalars().all()
-                                }
-                                for task_id, reason in classified:
-                                    fix_task = _tasks_by_id.get(task_id)
-                                    if fix_task:
-                                        if reason == "cycle":
-                                            msg = "Dependencies cleared: dependency cycle detected"
-                                            tag = "cycle broken"
-                                        else:
-                                            msg = "Dependencies cleared: all deps failed/cancelled"
-                                            tag = "dead deps cleared"
-                                        logger.warning(
-                                            f"[ORCHESTRATOR] Breaking deadlock ({tag}): "
-                                            f"clearing depends_on for task {task_id}"
-                                        )
-                                        fix_task.depends_on = []
-                                        fix_task.latest_status_message = msg
-                                        fix_session.add(fix_task)
-                                        await broadcast_to_project(
-                                            str(fix_task.project_id),
-                                            "task_updated",
-                                            {
-                                                "task_id": str(task_id),
-                                                "status": "QUEUED",
-                                                "message": msg,
-                                            },
-                                        )
-                                    eligible_ids.append(task_id)
-                                    narrow_broken += 1
-                                await fix_session.commit()
+                        narrow_broken += await _apply_deadlock_classification(
+                            classified, broadcast_to_project, eligible_ids
+                        )
 
                     # Broader scan: check QUEUED tasks older than 10 min with deps (not just candidate batch)
                     ten_min_ago = _utcnow() - timedelta(minutes=10)
+                    # Full rows (no load_only): the shared dependency-death policy
+                    # reads first_payload / context on both the stuck task and its
+                    # deps, so a partial projection would trip an async lazy-load.
                     broad_stmt = (
                         select(Task)
                         .where(
@@ -1615,11 +2045,6 @@ async def orchestrator_worker():
                             Task.created_at < ten_min_ago,
                             Task.requires_approval.is_(False),
                             Task.depends_on.isnot(None),
-                        )
-                        .options(
-                            load_only(
-                                Task.id, Task.depends_on, Task.status, Task.created_at
-                            )
                         )
                         .limit(100)
                     )
@@ -1649,60 +2074,29 @@ async def orchestrator_worker():
                             broad_task_dep_uuids[stask.id] = dep_uuids_b
                             all_dep_ids_broad.update(dep_uuids_b)
 
-                        broad_dep_status: dict = {}
+                        broad_dep_tasks_by_id: dict = {}
                         if all_dep_ids_broad:
                             broad_dep_rows = await session.execute(
-                                select(Task.id, Task.status).where(
-                                    Task.id.in_(all_dep_ids_broad)
-                                )
+                                select(Task).where(Task.id.in_(all_dep_ids_broad))
                             )
-                            broad_dep_status = {
-                                dep_id: dep_status
-                                for dep_id, dep_status in broad_dep_rows.all()
+                            broad_dep_tasks_by_id = {
+                                dt.id: dt for dt in broad_dep_rows.scalars().all()
                             }
 
-                        broad_classified = _classify_stuck_tasks(
+                        broad_classified = await _classify_stuck_tasks(
                             broad_stuck,
                             broad_task_dep_uuids,
-                            broad_dep_status,
+                            broad_dep_tasks_by_id,
                             broad_stuck_ids,
+                            session,
+                            _verify_pr_merged,
                         )
-                        if broad_classified:
-                            async with AsyncSessionLocal() as fix_session:
-                                _broad_ids = [tid for tid, _ in broad_classified]
-                                _broad_result = await fix_session.execute(
-                                    select(Task).where(Task.id.in_(_broad_ids))
-                                )
-                                _broad_tasks_by_id = {
-                                    t.id: t for t in _broad_result.scalars().all()
-                                }
-                                for task_id, reason in broad_classified:
-                                    fix_task = _broad_tasks_by_id.get(task_id)
-                                    if fix_task:
-                                        if reason == "cycle":
-                                            msg = "Dependencies cleared: dependency cycle detected (broad scan)"
-                                            tag = "cycle broken"
-                                        else:
-                                            msg = "Dependencies cleared: all deps failed/cancelled (broad scan)"
-                                            tag = "dead deps cleared"
-                                        logger.warning(
-                                            f"[ORCHESTRATOR] Breaking deadlock (broad scan, {tag}): "
-                                            f"clearing depends_on for task {task_id}"
-                                        )
-                                        fix_task.depends_on = []
-                                        fix_task.latest_status_message = msg
-                                        fix_session.add(fix_task)
-                                        await broadcast_to_project(
-                                            str(fix_task.project_id),
-                                            "task_updated",
-                                            {
-                                                "task_id": str(task_id),
-                                                "status": "QUEUED",
-                                                "message": msg,
-                                            },
-                                        )
-                                        broad_broken += 1
-                                await fix_session.commit()
+                        broad_broken += await _apply_deadlock_classification(
+                            broad_classified,
+                            broadcast_to_project,
+                            eligible_ids,
+                            scan_label=" (broad scan)",
+                        )
 
                     total_broken = narrow_broken + broad_broken
                     if total_broken > 0:
@@ -1832,9 +2226,12 @@ async def orchestrator_worker():
                 if eligible_ids:
                     dispatch_stmt = (
                         select(Task)
+                        .join(Project, Task.project_id == Project.id)
                         .where(
                             Task.id.in_(eligible_ids),
                             Task.status == TaskStatus.QUEUED,
+                            Project.paused.is_(False),
+                            Project.not_archived(),
                         )
                         .options(
                             load_only(
@@ -2038,12 +2435,7 @@ async def orchestrator_worker():
                         )
                         continue
 
-                    task = await _lock_task_for_mutation(
-                        session,
-                        _qt_id,
-                        allowed_statuses=(TaskStatus.QUEUED,),
-                        reason="dispatch",
-                    )
+                    task = await _lock_dispatchable_task_for_mutation(session, _qt_id)
                     if task is None:
                         continue
                     if task.requires_approval:
@@ -2061,6 +2453,10 @@ async def orchestrator_worker():
                     #       through to provision (cold path).
                     _warm_ctx = task.context or {}
                     _warm_target_vm_id = _warm_ctx.get("warm_target_vm_id")
+                    # A pool pin (warm_pool dispatch hook) reuses the warm_target_vm_id
+                    # machinery but is gated on the warm-pool flag/breaker, not
+                    # warm-continuity, and releases its leased PoolVm row on clear.
+                    _is_pool_pin = bool(_warm_ctx.get("warm_pool_pin"))
                     if _warm_target_vm_id:
                         _warm_deadline_iso = _warm_ctx.get("warm_handoff_deadline")
                         _warm_expired = False
@@ -2079,7 +2475,14 @@ async def orchestrator_worker():
                         else:
                             _warm_expired = True
 
-                        _cb_suppressed = _shared_state.is_warm_continuity_suppressed()
+                        if _is_pool_pin:
+                            _cb_suppressed = (
+                                not is_warm_pool_enabled()
+                            ) or _shared_state.is_warm_pool_suppressed()
+                        else:
+                            _cb_suppressed = (
+                                _shared_state.is_warm_continuity_suppressed()
+                            )
                         if (
                             not _warm_expired
                             and not _cb_suppressed
@@ -2105,6 +2508,7 @@ async def orchestrator_worker():
                                 "warm_target_vm_id",
                                 "warm_target_pr",
                                 "warm_handoff_deadline",
+                                "warm_pool_pin",
                             )
                         }
                         task.context = _new_ctx
@@ -2117,6 +2521,23 @@ async def orchestrator_worker():
                             _clear_reason = "deadline_expired"
                         else:
                             _clear_reason = "vm_unresponsive"
+                        # A pool pin we give up on releases its leased PoolVm row
+                        # (retired so it is never re-leased — it failed to serve
+                        # the pinned task in time / is unresponsive). Pool clears
+                        # feed the pool breaker, NOT the warm-continuity pin-clear
+                        # metric, so the two breakers stay independent.
+                        if _is_pool_pin:
+                            await mark_pool_vm_retiring(session, _warm_target_vm_id)
+                            if _clear_reason != "circuit_breaker":
+                                _shared_state.record_pool_claim_failure(_clear_reason)
+                            # _pin_task_to_pool_vm stamped this retiring member's
+                            # vm_instance_id onto the task. Reset it so the cold
+                            # fall-through below mints a FRESH agent-vm- id instead
+                            # of re-creating a GCP instance named after the VM we
+                            # just scheduled for teardown (name collision racing the
+                            # reaper's delete). Chain pins leave vm_instance_id None
+                            # so they are unaffected; only pool pins set it.
+                            task.vm_instance_id = None
                         # Phase 2e observability: track clear-out rate so we
                         # can detect warm-VM instability. Sustained >5/hour
                         # means the warm chain is failing more than expected.
@@ -2128,7 +2549,7 @@ async def orchestrator_worker():
                         # events to avoid a feedback loop that deepens suppression.
                         _pending_warm_pin_clear: tuple[str, str] | None = (
                             None
-                            if _clear_reason == "circuit_breaker"
+                            if (_clear_reason == "circuit_breaker" or _is_pool_pin)
                             else (_warm_target_vm_id, _clear_reason)
                         )
                         logger.info(
@@ -2138,42 +2559,12 @@ async def orchestrator_worker():
                     else:
                         _pending_warm_pin_clear = None
 
-                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
-                    # if an idle warm VM is actively polling /next-role for this
-                    # project, hold off cold-provisioning this eligible backlog task
-                    # for a bounded window so the warm VM can claim it first. Scoped
-                    # to no-dependency, non-chain-pinned tasks — exactly the set
-                    # /next-role's backlog branch will claim — so dependency-bearing
-                    # or chain work is never starved. The atomic SKIP-LOCKED claim in
-                    # /next-role still guarantees no double-provision if both race;
-                    # this only biases the race toward reuse. The window auto-expires,
-                    # so a VM that dies mid-poll delays this task by at most that bound.
-                    if (
-                        _runtime_config.get("warm_backlog_reuse_enabled", False)
-                        and not _warm_target_vm_id
-                        and not task.depends_on
-                        and _shared_state.is_backlog_first_refusal_active(
-                            str(task.project_id)
-                        )
-                    ):
-                        logger.info(
-                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
-                            f"cold-provision of task {task.id} (project {task.project_id}) "
-                            f"— idle warm VM has first claim"
-                        )
-                        await session.rollback()
-                        continue
-
-                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery
-                    # OR set to None for warm-pinned tasks whose pin was just cleared).
-                    if not task.vm_instance_id:
-                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
-                    logger.info(
-                        f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})"
-                    )
-
-                    # Resolve the task's LLM runtime identity and select an eligible account.
-                    # Two sources feed the effective blacklist:
+                    # Resolve the task's LLM runtime identity and select an eligible
+                    # account BEFORE consulting the warm pool, so the pool lease gate
+                    # enforces the SAME compatibility the cold path would (provider
+                    # preference, category/quality routing, account availability, and
+                    # the rate-limit blacklist). Two sources feed the effective
+                    # blacklist:
                     #  - blacklisted_accounts: pruneable (rate-limit recovers → reusable)
                     #  - provision_failed_accounts: sticky (silent pre-claim deaths stay
                     #    unavailable for this task — prune logic below would otherwise
@@ -2229,6 +2620,146 @@ async def orchestrator_worker():
                         runtime_config=_runtime_config,
                         blacklist=_effective_blacklist,
                     )
+
+                    # Warm-pool dispatch hook (efficiency direction d-5fd69fe1):
+                    # BEFORE cold-provisioning, consult the pre-provisioned idle
+                    # pool. If a compatible, same-tenant IDLE member is free, lease
+                    # it atomically (FOR UPDATE SKIP LOCKED) and pin this task to
+                    # it, then skip cold provisioning entirely — the member's agent
+                    # claims the task warm via /next-role (origin "warm_pool"),
+                    # converting a cold dispatch into a warm-start claim. Inert when
+                    # warm_pool_enabled is off. Scoped to fresh, non-pinned,
+                    # no-dependency tasks (a task already carrying a warm pin is
+                    # handled by the skip-provision branch above). The required
+                    # identity passed in is the RESOLVED selection (runtime_selection)
+                    # — honoring provider preference, category/quality routing AND the
+                    # rate-limit blacklist — NOT the task's raw context, so a member
+                    # pinned to a blacklisted account or a non-routed model is never
+                    # leased. Skipped entirely when no runtime identity resolves
+                    # (runtime_selection is None — the cold path's no-account handling
+                    # takes over). On no lease, fall through to the existing cold path
+                    # and count it as a cold dispatch.
+                    if (
+                        not _warm_target_vm_id
+                        and not task.depends_on
+                        and is_warm_pool_enabled()
+                        and runtime_selection is not None
+                    ):
+                        _leased_member = await try_pool_dispatch(
+                            session,
+                            task,
+                            required_provider=runtime_selection.provider,
+                            required_model=runtime_selection.model or task_model,
+                            required_account=(
+                                runtime_selection.account.get("id")
+                                if runtime_selection.account
+                                else None
+                            ),
+                            required_auth_mode=runtime_selection.auth_mode,
+                            excluded_account_ids=_effective_blacklist,
+                        )
+                        if _leased_member is not None:
+                            try:
+                                await session.commit()
+                            except Exception:
+                                logger.exception(
+                                    "[ORCHESTRATOR] Failed to commit warm-pool lease "
+                                    f"for task {task.id}; falling back to cold provision"
+                                )
+                                _shared_state.record_pool_claim_failure("commit_error")
+                                # Release the slot pre-reserved during runtime
+                                # selection (select_max_plan_account pre-increments
+                                # active_tasks under lock). This early-exit abandons
+                                # the dispatch without launching, so the reservation
+                                # would otherwise leak until the next per-cycle
+                                # reconciliation re-bases the counter from the DB —
+                                # mirroring the cold-provision commit-failure release.
+                                # Guarded so it is a no-op when selection resolved to
+                                # an env-credential fallback with no pooled account;
+                                # the release helper also floors at zero. Use the
+                                # account carried on the resolved selection, not the
+                                # loop-local account_id (only assigned later, below).
+                                if runtime_selection and runtime_selection.account:
+                                    await release_max_plan_account(
+                                        runtime_selection.account["id"],
+                                        revert_daily_task_count=True,
+                                    )
+                                await session.rollback()
+                                # session.rollback() expires every session-bound
+                                # instance (independent of expire_on_commit=False),
+                                # so the fall-through reads of this task below
+                                # (task.depends_on/project_id/vm_instance_id) would
+                                # trigger a sync lazy-load -> MissingGreenlet and
+                                # abort the whole cycle (the hazard documented at
+                                # the top of this loop). The lease was rolled back,
+                                # so the task is still QUEUED — retry it cleanly
+                                # next cycle, exactly like every other rollback
+                                # site in this loop.
+                                continue
+                            else:
+                                record_pool_lease_hit()
+                                logger.info(
+                                    f"[ORCHESTRATOR] Warm-pool dispatch: task {task.id} "
+                                    f"leased pool VM {_leased_member.vm_instance_id} "
+                                    "(skipping cold provision)"
+                                )
+                                continue
+
+                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
+                    # if an idle warm VM is actively polling /next-role for this
+                    # project, hold off cold-provisioning this eligible backlog task
+                    # for a bounded window so the warm VM can claim it first. Scoped
+                    # to non-chain-pinned tasks that the /next-role backlog branch
+                    # will actually claim: either no dependencies, or dependencies
+                    # the orchestrator already resolved and stamped
+                    # ``_deps_satisfied`` on above — exactly the warm-eligible set.
+                    # A task with still-unresolved deps carries no marker and is
+                    # never held (it cold-dispatches as before). The atomic
+                    # SKIP-LOCKED claim in /next-role still guarantees no
+                    # double-provision if both race; this only biases the race
+                    # toward reuse. The window auto-expires, so a VM that dies
+                    # mid-poll delays this task by at most that bound.
+                    if (
+                        _runtime_config.get("warm_backlog_reuse_enabled", False)
+                        and not _warm_target_vm_id
+                        and (
+                            not task.depends_on
+                            or (task.context or {}).get("_deps_satisfied")
+                        )
+                        and _shared_state.is_backlog_first_refusal_active(
+                            str(task.project_id)
+                        )
+                    ):
+                        logger.info(
+                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
+                            f"cold-provision of task {task.id} (project {task.project_id}) "
+                            f"— idle warm VM has first claim"
+                        )
+                        # Release the slot pre-reserved during runtime selection
+                        # (select_max_plan_account pre-increments active_tasks). This
+                        # hold abandons the dispatch so the warm VM can claim the task
+                        # via /next-role; without releasing, the reservation leaks for
+                        # the rest of the cycle and repeated holds compound the drift.
+                        # Mirrors the cold-provision commit-failure release; guarded for
+                        # the env-credential fallback (no pooled account) and floored at
+                        # zero by the helper. Targets the resolved selection's account,
+                        # not the loop-local account_id (assigned later, below).
+                        if runtime_selection and runtime_selection.account:
+                            await release_max_plan_account(
+                                runtime_selection.account["id"],
+                                revert_daily_task_count=True,
+                            )
+                        await session.rollback()
+                        continue
+
+                    # Ensure VM ID exists (cleared during stale PROVISIONING recovery
+                    # OR set to None for warm-pinned tasks whose pin was just cleared).
+                    if not task.vm_instance_id:
+                        task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+                    logger.info(
+                        f"[ORCHESTRATOR] Picking up queued task {task.id} (VM: {task.vm_instance_id})"
+                    )
+
                     runtime_secret = None
                     claude_config_json = None
                     account_id = None
@@ -2491,10 +3022,11 @@ async def orchestrator_worker():
                     if task.vm_dispatched_at is None:
                         task.vm_dispatched_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
-                    # Foundational scaffolding for vm_reuse_rate (efficiency
-                    # direction d-91d8dede). There is no warm pool today, so
-                    # every dispatch is a cold provision — TODO(warm-pool):
-                    # flip to True at the reuse path once pooling lands. See
+                    # Cold dispatch: this is a fresh provision, so vm_warm_start
+                    # is False. The warm-claim / backlog-reuse path stamps True
+                    # instead (routers/agent_warm_continuity._finalize_warm_claim),
+                    # which is also where the vm_reuse_rate signal
+                    # (context['_timing']['warm_start']) is written. See
                     # compute.provision_agent_vm for the corresponding marker.
                     task.vm_warm_start = False
                     # vm_spot must be written here — it's read by ~30 cost-rate sites
@@ -2537,6 +3069,12 @@ async def orchestrator_worker():
                                 *_pending_warm_pin_clear
                             )
                             _pending_warm_pin_clear = None
+                        # Pool-hit-vs-cold-dispatch funnel: this task was cold-
+                        # provisioned (no compatible pool member was leased above).
+                        # Recorded only when the pool feature is on so the funnel
+                        # denominator reflects the period the pool was actually live.
+                        if is_warm_pool_enabled():
+                            record_pool_cold_dispatch()
                     except Exception as e:
                         import traceback
 
@@ -2547,7 +3085,9 @@ async def orchestrator_worker():
                         traceback.print_exc()
                         # Release the pre-incremented slot on commit failure
                         if account_id:
-                            await release_max_plan_account(account_id)
+                            await release_max_plan_account(
+                                account_id, revert_daily_task_count=True
+                            )
                         task.context = clear_task_llm_runtime_context(task.context)
                         await session.rollback()
                         continue
@@ -2722,7 +3262,10 @@ async def orchestrator_worker():
                             # Always release the Max Plan account slot on failure, even if an
                             # exception escapes the try/except above (e.g. from record_task_result)
                             if not success and acct_id_for_release:
-                                await release_max_plan_account(acct_id_for_release)
+                                await release_max_plan_account(
+                                    acct_id_for_release,
+                                    revert_daily_task_count=True,
+                                )
                         if not success:
                             provision_err = get_provision_error(vm_id)
                             logger.error(
@@ -3506,14 +4049,33 @@ async def orchestrator_worker():
                                     )
                                 continue
                             if pr_data.get("merged"):
+                                _orch_ci_project = (
+                                    await session.get(Project, ci_task.project_id)
+                                    if ci_task.project_id
+                                    else None
+                                )
+                                _ci_base = (
+                                    (pr_data.get("base") or {}).get("ref", "")
+                                    or ci_loop.get("base_branch", "")
+                                    or (ci_task.first_payload or {}).get(
+                                        "base_branch", ""
+                                    )
+                                    or _shared_state.get_project_integration_branch(
+                                        _orch_ci_project
+                                    )
+                                )
+                                _landed_on_integration = (
+                                    await _apply_ci_merged_landed_signal(
+                                        ci_task,
+                                        session,
+                                        base_branch=_ci_base,
+                                        review_loop=ci_loop,
+                                    )
+                                )
                                 ci_task.status = TaskStatus.COMPLETED
                                 ci_task.latest_status_message = (
                                     f"PR #{ci_pr_number} merged"
                                 )
-                                ci_task.context = {
-                                    **(ci_task.context or {}),
-                                    "pr_merged": True,
-                                }
                                 session.add(ci_task)
                                 await session.commit()
                                 await broadcast_to_project(
@@ -3527,6 +4089,28 @@ async def orchestrator_worker():
                                 logger.info(
                                     f"[CI] PR #{ci_pr_number} merged, marking task COMPLETED"
                                 )
+                                # Completion-side warm-reuse trigger: now that this
+                                # PR has landed on integration, proactively mark any
+                                # dependents it just unblocked as warm-claimable so
+                                # this task's warm VM can claim follow-on work inside
+                                # its teardown-defer grace window instead of tearing
+                                # down cold. Best-effort: a failure here must never
+                                # abort the CI completion cycle.
+                                if _landed_on_integration:
+                                    try:
+                                        _unblocked = await _mark_unblocked_dependents(
+                                            ci_task, _verify_pr_merged
+                                        )
+                                        if _unblocked:
+                                            logger.info(
+                                                f"[CI] PR #{ci_pr_number} unblocked "
+                                                f"{_unblocked} dependent(s) — marked warm-claimable"
+                                            )
+                                    except Exception:
+                                        logger.exception(
+                                            "[CI] dependent warm-claim marking failed "
+                                            f"for task {ci_task.id}"
+                                        )
                             else:
                                 # Closed without merge (human/bot intervention, not a self-close
                                 # reset — pending_reopen case handled above). Do NOT mark
@@ -4211,6 +4795,13 @@ async def orchestrator_worker():
                             runtime_config as _rt_cfg,
                         )
 
+                        # No-CI test-suite merge gate state for this poll. Set in
+                        # the no_checks branch when an EXTERNAL no-CI repo should
+                        # run its detected suite (verify_tests) before merging;
+                        # consumed in the locked block after the re-acquire below.
+                        _no_ci_verify_gate = False
+                        _no_ci_verify_base = ""
+
                         if _rt_cfg.get("ci_resolution_strict_mode", True):
                             from app import ci_resolution
 
@@ -4272,22 +4863,74 @@ async def orchestrator_worker():
                                 if _ci_proj is not None and ci_resolution.proceed_on_no_checks(
                                     _ci_proj, _ci_base_ref
                                 ):
-                                    _ci_reason = (
-                                        f"targets internal staging branch '{_ci_base_ref}'"
-                                        if _ci_proj.is_staging_branch(_ci_base_ref)
-                                        else "the project declares no CI (requires_ci_checks=False)"
+                                    _is_staging = _ci_proj.is_staging_branch(
+                                        _ci_base_ref
                                     )
-                                    logger.info(
-                                        f"[CI] PR #{ci_pr_number} has 0 check-runs and "
-                                        f"{_ci_reason} — treating as passed so the "
-                                        f"merge can proceed"
+                                    _gate_on = _rt_cfg.get(
+                                        "no_ci_test_gate_enabled", True
                                     )
-                                    ci_result = {
-                                        "status": "completed",
-                                        "conclusion": "success",
-                                        "details": _resolved.get("details", []),
-                                        "failed_logs": "",
-                                    }
+                                    if ci_resolution.should_run_no_ci_test_gate(
+                                        _ci_proj,
+                                        _ci_base_ref,
+                                        gate_enabled=_gate_on,
+                                    ):
+                                        # EXTERNAL no-CI repo (requires_ci_checks=
+                                        # False) on a real base WITH a runnable
+                                        # suite: gate the merge on a verify_tests
+                                        # verdict instead of merging blind. Defer
+                                        # the spawn / verdict-await to the locked
+                                        # block after the re-acquire below; keep
+                                        # ci_result PENDING so the loop keeps
+                                        # polling until the verdict lands.
+                                        _no_ci_verify_gate = True
+                                        _no_ci_verify_base = _ci_base_ref
+                                        logger.info(
+                                            f"[CI] PR #{ci_pr_number} has 0 check-runs "
+                                            f"and the project declares no CI — gating "
+                                            f"the merge on the repo's detected test "
+                                            f"suite (verify_tests) before proceeding"
+                                        )
+                                        ci_result = {
+                                            "status": "pending",
+                                            "conclusion": None,
+                                            "details": _resolved.get("details", []),
+                                            "failed_logs": "",
+                                        }
+                                    else:
+                                        # Immediate-pass (unchanged legacy behavior).
+                                        # Internal staging base (CI path-filtered by
+                                        # design), kill-switch off, or NO detectable
+                                        # test command — an absent-tests repo must
+                                        # still progress, so it merges UNVERIFIED.
+                                        if _is_staging:
+                                            _ci_reason = (
+                                                f"targets internal staging branch "
+                                                f"'{_ci_base_ref}'"
+                                            )
+                                        elif not _gate_on:
+                                            _ci_reason = (
+                                                "the project declares no CI "
+                                                "(requires_ci_checks=False) and the "
+                                                "no_ci_test_gate kill-switch is off"
+                                            )
+                                        else:
+                                            _ci_reason = (
+                                                "the project declares no CI "
+                                                "(requires_ci_checks=False) and no "
+                                                "test command is detectable — merging "
+                                                "UNVERIFIED"
+                                            )
+                                        logger.info(
+                                            f"[CI] PR #{ci_pr_number} has 0 check-runs and "
+                                            f"{_ci_reason} — treating as passed so the "
+                                            f"merge can proceed"
+                                        )
+                                        ci_result = {
+                                            "status": "completed",
+                                            "conclusion": "success",
+                                            "details": _resolved.get("details", []),
+                                            "failed_logs": "",
+                                        }
                                 else:
                                     ci_result = {
                                         "status": "pending",
@@ -4335,6 +4978,262 @@ async def orchestrator_worker():
                         ci_loop = dict(
                             (ci_task.context or {}).get("review_loop", {}) or {}
                         )
+
+                        # ── No-CI test-suite merge gate (verify_tests) ──────────
+                        # Reached when the no_checks branch flagged an external
+                        # no-CI repo with a runnable suite. We hold the task lock
+                        # and a fresh ci_loop here. First poll: spawn verify_tests
+                        # on the PR head, record its id, keep polling. Subsequent
+                        # polls: once that task is terminal, read its latest
+                        # MERGE_TEST_RESULT verdict and set ci_result —
+                        #   pass          → completed/success (merge proceeds,
+                        #                   still subject to the review gate);
+                        #   fail          → completed/failure so the existing
+                        #                   handle_ci_completion fix path fires
+                        #                   carrying the failing-test output;
+                        #   detected=false / no usable verdict → completed/success
+                        #                   UNVERIFIED (absent-tests repos must
+                        #                   still progress — logged as such).
+                        # Kill-switch (no_ci_test_gate_enabled) was checked in the
+                        # no_checks branch; when off, _no_ci_verify_gate is never
+                        # set and today's immediate-pass applies.
+                        if _no_ci_verify_gate:
+                            from sqlalchemy.orm.attributes import flag_modified
+                            from app.review_pipeline import _spawn_pipeline_task
+                            from app.release_qualifier_audit import (
+                                _latest_artifact_logs,
+                            )
+                            from app.models import ArtifactType
+
+                            # Mark active so the "no CI checks appeared" stall
+                            # escalation below is bypassed while we verify.
+                            ci_loop["ci_checks_seen"] = True
+                            _v_recorded = ci_loop.get("verify_tests_verdict")
+                            _v_task_id = ci_loop.get("verify_tests_task_id")
+                            _v_poll_interval = min(ci_poll_interval * 2, 90)
+
+                            if _v_recorded in ("pass", "undetected"):
+                                # Verdict already obtained on a prior poll —
+                                # proceed (idempotent until the merge lands).
+                                ci_result = {
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                    "details": [],
+                                    "failed_logs": "",
+                                }
+                            elif _v_recorded == "fail":
+                                # Already classified failed — belt-and-suspenders
+                                # if we re-enter before ci_fix_spawned is set.
+                                ci_result = {
+                                    "status": "completed",
+                                    "conclusion": "failure",
+                                    "details": [],
+                                    "failed_logs": ci_loop.get(
+                                        "verify_tests_output",
+                                        "Detected test suite failed.",
+                                    ),
+                                }
+                            elif not _v_task_id:
+                                # First encounter: spawn verify_tests on PR head.
+                                _v_branch = _resolve_ci_fix_branch(
+                                    ci_loop, ci_task.first_payload, pr_data
+                                )
+                                if not _v_branch:
+                                    logger.error(
+                                        f"[CI] PR #{ci_pr_number}: cannot resolve "
+                                        f"head branch for verify_tests spawn — "
+                                        f"retrying next cycle"
+                                    )
+                                    ci_loop["ci_poll_interval"] = _v_poll_interval
+                                    ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    continue
+                                _v_orig = ci_loop.get(
+                                    "original_task_id", ""
+                                ) or ci_task.first_payload.get("original_task_id", "")
+                                _verify_task, _ = await _spawn_pipeline_task(
+                                    ci_task,
+                                    "verify_tests",
+                                    session,
+                                    ci_pr_number,
+                                    _v_branch,
+                                    _no_ci_verify_base,
+                                    original_task_id=_v_orig,
+                                    suppress_warm_handoff=True,
+                                )
+                                # _spawn_pipeline_task commits internally — re-lock
+                                # the parent before mutating it.
+                                ci_task = await _lock_task_for_mutation(
+                                    session,
+                                    ci_task_id,
+                                    allowed_statuses=(TaskStatus.EVALUATING,),
+                                    reason="CI polling after verify_tests spawn",
+                                )
+                                if ci_task is None:
+                                    continue
+                                ci_loop = dict(
+                                    (ci_task.context or {}).get("review_loop", {})
+                                    or {}
+                                )
+                                ci_loop["ci_checks_seen"] = True
+                                if _verify_task is not None:
+                                    ci_loop["verify_tests_task_id"] = str(
+                                        _verify_task.id
+                                    )
+                                    ci_task.latest_status_message = (
+                                        f"No CI on PR #{ci_pr_number} — running "
+                                        f"detected test suite to gate merge → "
+                                        f"{_verify_task.id}"
+                                    )
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"spawned verify_tests → {_verify_task.id}"
+                                    )
+                                else:
+                                    ci_task.latest_status_message = (
+                                        f"No CI on PR #{ci_pr_number} — verify_tests "
+                                        f"spawn deferred, will retry"
+                                    )
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"verify_tests spawn suppressed/deferred — "
+                                        f"retrying"
+                                    )
+                                ci_loop["ci_poll_interval"] = _v_poll_interval
+                                ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                ci_loop["head_sha"] = ci_head_sha
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(ci_task.project_id),
+                                    "task_updated",
+                                    {
+                                        "task_id": str(ci_task.id),
+                                        "status": ci_task.status,
+                                    },
+                                )
+                                continue
+                            else:
+                                # Await: verify task spawned on a prior poll.
+                                _verify_task = None
+                                try:
+                                    _verify_task = await session.get(
+                                        Task, uuid.UUID(_v_task_id)
+                                    )
+                                except (ValueError, TypeError):
+                                    _verify_task = None
+                                _terminal = {
+                                    TaskStatus.COMPLETED,
+                                    TaskStatus.FAILED,
+                                    TaskStatus.CANCELLED,
+                                }
+                                if (
+                                    _verify_task is None
+                                    or _verify_task.status not in _terminal
+                                ):
+                                    # Still running — keep polling.
+                                    ci_loop["ci_poll_interval"] = _v_poll_interval
+                                    ci_loop["ci_last_polled"] = _utcnow().isoformat()
+                                    ci_loop["head_sha"] = ci_head_sha
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} — awaiting detected-test "
+                                        f"verdict (verify_tests {_v_task_id[:8]})"
+                                    )
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    await broadcast_to_project(
+                                        str(ci_task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(ci_task.id),
+                                            "status": ci_task.status,
+                                        },
+                                    )
+                                    continue
+                                # Terminal — read the latest verdict artifact.
+                                _verdict = None
+                                if _verify_task.status == TaskStatus.COMPLETED:
+                                    _verdict = await _latest_artifact_logs(
+                                        session,
+                                        _verify_task.id,
+                                        ArtifactType.MERGE_TEST_RESULT,
+                                    )
+                                _outcome, _detail = (
+                                    ci_resolution.classify_merge_test_verdict(
+                                        _verdict
+                                    )
+                                )
+                                ci_loop["verify_tests_verdict"] = _outcome
+                                if _outcome == "pass":
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"detected test suite PASSED — proceeding to "
+                                        f"merge (subject to review gate)"
+                                    )
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                        "details": [],
+                                        "failed_logs": "",
+                                    }
+                                elif _outcome == "fail":
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"detected test suite FAILED — blocking "
+                                        f"merge, spawning fix with failing output"
+                                    )
+                                    ci_loop["verify_tests_output"] = _detail[:4000]
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "failure",
+                                        "details": [],
+                                        "failed_logs": _detail,
+                                    }
+                                else:
+                                    # detected=false or no usable verdict (verify
+                                    # task crashed / produced no artifact): fall
+                                    # back to proceed-without-checks. Absent-tests
+                                    # repos must still progress — merge UNVERIFIED.
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"no test command detectable (verify_tests "
+                                        f"{_v_task_id[:8]} status="
+                                        f"{_verify_task.status}) — merge proceeding "
+                                        f"UNVERIFIED"
+                                    )
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                        "details": [],
+                                        "failed_logs": "",
+                                    }
+                                # Persist the recorded verdict before
+                                # handle_ci_completion re-reads task.context.
+                                ci_task.context = {
+                                    **(ci_task.context or {}),
+                                    "review_loop": ci_loop,
+                                }
+                                flag_modified(ci_task, "context")
+                                session.add(ci_task)
+                                # Fall through: ci_result is "completed" so the
+                                # pending-skip below is bypassed and
+                                # handle_ci_completion runs.
 
                         # Track whether CI checks have ever been observed for this PR
                         ci_details = ci_result.get("details", [])
@@ -4605,6 +5504,22 @@ async def orchestrator_worker():
             if (_utcnow() - _last_post_commit_sweep).total_seconds() >= 60:
                 _last_post_commit_sweep = _utcnow()
                 await _sweep_post_commit_pending()
+            # Drain the deferred missing-branch alert queue into durable,
+            # idempotent operator Alerts. The synchronous branch resolvers
+            # record intent off the hot path (no DB I/O); the durable persist
+            # runs here in an async-safe context so the signal survives
+            # restarts without re-spamming (one undismissed alert per project
+            # column). Guarded so a flush failure never stalls monitoring.
+            try:
+                async with AsyncSessionLocal() as _branch_alert_session:
+                    if await _shared_state.flush_pending_branch_alerts(
+                        _branch_alert_session
+                    ):
+                        await _branch_alert_session.commit()
+            except Exception:
+                logger.exception(
+                    "[ORCHESTRATOR] Failed to flush pending branch alerts"
+                )
             _orchestrator_consecutive_monitoring_errors = 0
         except Exception as e:
             _orchestrator_consecutive_monitoring_errors += 1

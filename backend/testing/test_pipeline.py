@@ -30,7 +30,7 @@ from app.review_pipeline import (
     _spawn_pipeline_task,
 )
 from app.rollup_management import _check_and_trigger_rollup
-from app.models import Project, Task, TaskStatus, DeploymentStatus
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus, DeploymentStatus
 
 
 # ── Verdict Parsing ─────────────────────────────────────────────────────────
@@ -1566,9 +1566,21 @@ async def test_rollup_fails_parent_when_all_fail_and_limit_exhausted(rollup_db, 
 
 
 async def _make_rollup_parent_with_completed_child(
-    rollup_db, *, target_branch, child_risk=None
+    rollup_db,
+    *,
+    target_branch,
+    child_risk=None,
+    integration_branch="main",
+    promotion_target="main",
+    build_config=None,
 ):
-    project = Project(name="Approval Gate Test", user_id="user1")
+    project = Project(
+        name="Approval Gate Test",
+        user_id="user1",
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+        build_config=build_config,
+    )
     rollup_db.add(project)
     await rollup_db.commit()
     await rollup_db.refresh(project)
@@ -2555,6 +2567,280 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
             f"transient key {key!r} must be cleared on terminal success, "
             f"but was present with value {(parent.context or {}).get(key)!r}"
         )
+
+
+@pytest.mark.asyncio
+async def test_rollup_existing_merged_pr_on_distinct_promotion_target_alerts(
+    rollup_db, mocker
+):
+    import asyncio
+    from sqlmodel import select as _select
+
+    _patch_common_rollup_mocks(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": True},
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db,
+        target_branch="release/main",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent.context = {
+        **(parent.context or {}),
+        "rollup_pr_number": 777,
+        "rollup_pr_url": "https://example.com/pr/777",
+    }
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    await asyncio.sleep(0)
+    alerts = (
+        (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 777
+
+
+@pytest.mark.asyncio
+async def test_rollup_existing_merged_pr_on_single_branch_sets_pr_merged(
+    rollup_db, mocker
+):
+    from sqlmodel import select as _select
+
+    _patch_common_rollup_mocks(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": True},
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db,
+        target_branch="release/main",
+        integration_branch="release/main",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent.context = {
+        **(parent.context or {}),
+        "rollup_pr_number": 778,
+        "rollup_pr_url": "https://example.com/pr/778",
+    }
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    alerts = (
+        (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is True
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rollup_existing_merged_pr_on_intermediate_branch_stays_evaluating(
+    rollup_db, mocker
+):
+    _patch_common_rollup_mocks(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged": True},
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db,
+        target_branch="release/candidate-1",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+    parent.context = {
+        **(parent.context or {}),
+        "rollup_pr_number": 779,
+        "rollup_pr_url": "https://example.com/pr/779",
+    }
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (parent.latest_status_message or "")
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_rollup_auto_merge_on_distinct_promotion_target_alerts_without_pr_merged(
+    rollup_db, mocker
+):
+    import asyncio
+    from sqlmodel import select as _select
+
+    _patch_common_rollup_mocks(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "sha": "deadbeef"},
+    )
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db,
+        target_branch="release/main",
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    await asyncio.sleep(0)
+    alerts = (
+        (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is None
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert len(approval_calls) == 1
+    assert approval_calls[0].args[2]["pr_number"] == 777
+
+
+@pytest.mark.asyncio
+async def test_rollup_auto_merge_on_single_branch_sets_pr_merged(rollup_db, mocker):
+    from sqlmodel import select as _select
+
+    _patch_common_rollup_mocks(mocker)
+    dispatch_mock = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "sha": "deadbeef"},
+    )
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db,
+        target_branch="release/main",
+        integration_branch="release/main",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+    alerts = (
+        (await rollup_db.execute(_select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+
+    assert parent.status == TaskStatus.COMPLETED
+    assert (parent.context or {}).get("pr_merged") is True
+    assert alerts == []
+    approval_calls = [
+        c for c in dispatch_mock.call_args_list if c.args[1] == "APPROVAL_NEEDED"
+    ]
+    assert approval_calls == []
 
 
 def _patch_refetch_failure_mocks(mocker, *, merge_msg="merge_msg-from-failed-attempt"):

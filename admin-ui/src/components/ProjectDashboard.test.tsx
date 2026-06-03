@@ -4,6 +4,32 @@ import { ProjectDashboard } from './ProjectDashboard';
 import type { Project } from '../types/project';
 import type { Task } from './TaskCard';
 
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  const approvalGateData = {
+    project_id: 'proj-1',
+    approval_gate_config: { infra_files: [], critical_files: [] },
+    is_default: true,
+  };
+  return {
+    ...actual,
+    fetchApprovalGateConfig: vi.fn(async () => approvalGateData),
+    updateApprovalGateConfig: vi.fn(async (projectId: string, config: { infra_files: string[]; critical_files: string[] }) => ({
+      project_id: projectId,
+      approval_gate_config: config,
+      is_default: config.infra_files.length === 0 && config.critical_files.length === 0,
+    })),
+    deleteProject: vi.fn(async () => ({ message: 'deleted', active_tasks_cancelled: 0 })),
+    resetProject: vi.fn(async () => ({ message: 'reset', active_tasks_cancelled: 0, tasks_deleted: 0 })),
+    setProjectPaused: vi.fn(async (_projectId: string, paused: boolean) => ({ paused })),
+    archiveProject: vi.fn(async () => ({ message: 'archived', archived: true })),
+    unarchiveProject: vi.fn(async () => ({ message: 'unarchived', archived: false })),
+    fetchArchivedProjects: vi.fn(async () => []),
+  };
+});
+
+import { deleteProject, resetProject, setProjectPaused, archiveProject, unarchiveProject, fetchArchivedProjects } from '../api';
+
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: 'proj-1',
@@ -99,6 +125,314 @@ describe('ProjectDashboard', () => {
     expect(onOpenSetupGuide).toHaveBeenCalledWith('proj-2');
     fireEvent.click(screen.getByTitle('Add new project'));
     expect(onNewProject).toHaveBeenCalled();
+  });
+
+  it('renders a per-project status badge', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ status: 'DEPLOYING' }), makeProject({ id: 'proj-2', name: 'Bootstrap', status: 'FAILED' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    expect(screen.getByText('Deploying')).toBeInTheDocument();
+    expect(screen.getByText('Failed')).toBeInTheDocument();
+  });
+
+  it('counts paused projects from the paused flag in the summary strip', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[
+          makeProject(),
+          makeProject({ id: 'proj-2', name: 'Paused Platform', status: 'active', paused: true }),
+        ]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('1 paused')).toBeInTheDocument();
+  });
+
+  it('shows the actions menu (with Delete) only for project owners', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const { rerender } = render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'member' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTitle('Project actions')).not.toBeInTheDocument();
+
+    rerender(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    expect(screen.getByTitle('Project actions')).toBeInTheDocument();
+    fireEvent.click(screen.getByTitle('Project actions'));
+    expect(screen.getByTitle('Delete project')).toBeInTheDocument();
+  });
+
+  it('confirmation step names the project and warns active work is cancelled', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', name: 'Platform' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle('Delete project'));
+    expect(screen.getByTitle('Confirm delete')).toBeInTheDocument();
+    expect(screen.getByText(/force-cancelled/)).toBeInTheDocument();
+    // Name appears in the card header AND in the confirmation warning.
+    expect(screen.getAllByText('Platform').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('calls deleteProject(force) and onProjectDeleted on success', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const onProjectDeleted = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectDeleted={onProjectDeleted}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle('Delete project'));
+    fireEvent.click(screen.getByTitle('Confirm delete'));
+
+    await vi.waitFor(() => expect(onProjectDeleted).toHaveBeenCalledWith('proj-1'));
+    expect(deleteProject).toHaveBeenCalledWith('proj-1', true);
+  });
+
+  it('surfaces a delete error inline and does not call onProjectDeleted', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    vi.mocked(deleteProject).mockRejectedValueOnce(new Error('Permission denied'));
+    const onProjectDeleted = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectDeleted={onProjectDeleted}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle('Delete project'));
+    fireEvent.click(screen.getByTitle('Confirm delete'));
+
+    expect(await screen.findByText('Permission denied')).toBeInTheDocument();
+    expect(onProjectDeleted).not.toHaveBeenCalled();
+  });
+
+  it('reset confirmation states what is wiped vs kept, and confirming calls resetProject', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const onProjectReset = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', name: 'Platform', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectReset={onProjectReset}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle(/Reset project to a clean/));
+    // Confirmation spells out wipe vs keep.
+    expect(screen.getByText(/all task history and runtime state/)).toBeInTheDocument();
+    expect(screen.getByText(/the project and all its configuration/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Confirm reset'));
+    await vi.waitFor(() => expect(onProjectReset).toHaveBeenCalledWith('proj-1'));
+    expect(resetProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('owner can pause a project: action calls setProjectPaused(true) and onProjectPaused', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const onProjectPaused = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectPaused={onProjectPaused}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle(/Pause project/));
+
+    await vi.waitFor(() => expect(onProjectPaused).toHaveBeenCalledWith('proj-1'));
+    expect(setProjectPaused).toHaveBeenCalledWith('proj-1', true);
+  });
+
+  it('renders a Paused pill and a Resume action that calls setProjectPaused(false)', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const onProjectPaused = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', paused: true, created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectPaused={onProjectPaused}
+      />,
+    );
+    // The distinct paused pill is visible on the card.
+    expect(screen.getByText('Paused')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle(/Resume project/));
+
+    await vi.waitFor(() => expect(onProjectPaused).toHaveBeenCalledWith('proj-1'));
+    expect(setProjectPaused).toHaveBeenCalledWith('proj-1', false);
+  });
+
+  it('surfaces a pause error inline and does not call onProjectPaused', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    vi.mocked(setProjectPaused).mockRejectedValueOnce(new Error('Permission denied'));
+    const onProjectPaused = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectPaused={onProjectPaused}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle(/Pause project/));
+
+    expect(await screen.findByText('Permission denied')).toBeInTheDocument();
+    expect(onProjectPaused).not.toHaveBeenCalled();
+  });
+
+  it('non-owners see no pause control', () => {
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'member' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    expect(screen.queryByTitle('Project actions')).not.toBeInTheDocument();
+    expect(screen.queryByTitle(/Pause project/)).not.toBeInTheDocument();
+  });
+
+  it('owner menu shows Archive; confirming calls archiveProject and onProjectArchived', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    const onProjectArchived = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', name: 'Platform', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectArchived={onProjectArchived}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle(/Archive project/));
+    // Confirmation explains it's reversible and hides the project.
+    expect(screen.getByText(/hidden from the active dashboard/)).toBeInTheDocument();
+    expect(screen.getByText(/Reversible/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Confirm archive'));
+    await vi.waitFor(() => expect(onProjectArchived).toHaveBeenCalledWith('proj-1'));
+    expect(archiveProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('surfaces an archive error inline and does not call onProjectArchived', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    vi.mocked(archiveProject).mockRejectedValueOnce(new Error('Permission denied'));
+    const onProjectArchived = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner', created_at: '2020-01-01T00:00:00Z' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectArchived={onProjectArchived}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Project actions'));
+    fireEvent.click(screen.getByTitle(/Archive project/));
+    fireEvent.click(screen.getByTitle('Confirm archive'));
+
+    expect(await screen.findByText('Permission denied')).toBeInTheDocument();
+    expect(onProjectArchived).not.toHaveBeenCalled();
+  });
+
+  it('Show archived toggle fetches archived projects and renders them', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    vi.mocked(fetchArchivedProjects).mockResolvedValueOnce([
+      makeProject({ id: 'arch-1', name: 'Old Project', github_repo: 'old', archived: true, my_role: 'owner' }),
+    ]);
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Show archived projects'));
+    expect(fetchArchivedProjects).toHaveBeenCalled();
+    expect(await screen.findByText('Old Project')).toBeInTheDocument();
+    expect(screen.getByText('Archived projects')).toBeInTheDocument();
+  });
+
+  it('Restore calls unarchiveProject and onProjectUnarchived', async () => {
+    vi.useRealTimers();
+    localStorage.setItem('projectDashboardCollapsed', 'false');
+    vi.mocked(fetchArchivedProjects).mockResolvedValue([
+      makeProject({ id: 'arch-1', name: 'Old Project', github_repo: 'old', archived: true, my_role: 'owner' }),
+    ]);
+    const onProjectUnarchived = vi.fn();
+    render(
+      <ProjectDashboard
+        projects={[makeProject({ my_role: 'owner' })]}
+        tasks={[]}
+        selectedProjectId={null}
+        onSelectProject={vi.fn()}
+        onProjectUnarchived={onProjectUnarchived}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Show archived projects'));
+    const restoreBtn = await screen.findByTitle('Restore project to the active list');
+    fireEvent.click(restoreBtn);
+    await vi.waitFor(() => expect(onProjectUnarchived).toHaveBeenCalledWith('arch-1'));
+    expect(unarchiveProject).toHaveBeenCalledWith('arch-1');
   });
 
   it('hides the admin new-project control for non-admin users', () => {

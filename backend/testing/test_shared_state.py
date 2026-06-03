@@ -389,7 +389,10 @@ class TestBackfillBranchColumns:
         Simulates the admin create-task and deploy-endpoint paths that create projects
         without initialising branch columns. After backfill, both integration_branch and
         promotion_target must reflect the repo's actual default (not silently resolve to
-        'main'), and the branch resolvers must return the same non-'main' value.
+        'main'). That leaves the integration branch equal to the promotion target; the
+        hot-path resolver fails safe (returns the configured value rather than raising),
+        and the unsafe integration==promotion landing is blocked at the merge/rollup
+        boundary instead.
         """
         project = _project(integration_branch=None, promotion_target=None)
         session = _make_session([project])
@@ -413,70 +416,176 @@ class TestBackfillBranchColumns:
         assert summary["filled"] == 2
         assert summary["errored"] == 0
 
-        # Regression guard: branch resolvers must not fall back to 'main' once
-        # the columns are populated by the backfill called from the auto-create path.
+        # The hot-path resolver fails safe: it returns the configured value even
+        # when integration == promotion (so read endpoints / background loops /
+        # the protected_branches property never raise). Refusing to land work on
+        # the promotion target is enforced at the merge/rollup boundary instead.
         assert _shared_state.get_project_integration_branch(project) == "develop"
         assert _shared_state.get_project_promotion_target(project) == "develop"
 
 
+def _flush_session(existing=None):
+    """Async-session double for flush_pending_branch_alerts tests.
+
+    ``existing`` is returned by ``result.scalars().first()`` to simulate an
+    already-persisted undismissed alert (idempotency path).
+    """
+    session = AsyncMock()
+    result = MagicMock()
+    scalars = MagicMock()
+    scalars.first.return_value = existing
+    result.scalars.return_value = scalars
+    session.execute = AsyncMock(return_value=result)
+    session.add = MagicMock()
+    return session
+
+
 class TestProjectBranchResolvers:
     @pytest.fixture(autouse=True)
-    def _reset_missing_branch_alerts(self):
-        import app.shared_state as shared_state
+    def _reset_project_branch_alerts(self):
+        import app.branch_resolution as branch_resolution
 
-        shared_state._missing_project_branch_alerts.clear()
+        branch_resolution._missing_project_branch_alerts.clear()
+        branch_resolution._blocking_project_branch_alerts.clear()
+        branch_resolution._pending_durable_branch_alerts.clear()
         yield
-        shared_state._missing_project_branch_alerts.clear()
+        branch_resolution._missing_project_branch_alerts.clear()
+        branch_resolution._blocking_project_branch_alerts.clear()
+        branch_resolution._pending_durable_branch_alerts.clear()
 
     def test_populated_branches_return_values_without_alerts(self):
+        import app.branch_resolution as branch_resolution
+
         project = _project(
             integration_branch="develop",
             promotion_target="release",
         )
-        session = MagicMock()
 
-        with (
-            patch(
-                "app.branch_resolution.object_session", return_value=session
-            ) as mock_session,
-            patch("app.branch_resolution.logger.warning") as mock_warning,
-        ):
+        with patch("app.branch_resolution.logger.warning") as mock_warning:
             assert _shared_state.get_project_integration_branch(project) == "develop"
             assert _shared_state.get_project_promotion_target(project) == "release"
 
-        mock_session.assert_not_called()
         mock_warning.assert_not_called()
+        # A populated column never enqueues a deferred durable alert.
+        assert branch_resolution._pending_durable_branch_alerts == []
+
+    def test_self_repo_null_integration_resolves_to_automain_with_single_alert(self):
+        import app.branch_resolution as branch_resolution
+
+        project = _project(
+            integration_branch=None,
+            promotion_target=None,
+            is_self_repo=True,
+            github_repo="BlueprintAIStudio",
+        )
+
+        assert _shared_state.get_project_integration_branch(project) == "automain"
+        assert _shared_state.get_project_integration_branch(project) == "automain"
+        assert _shared_state.get_project_promotion_target(project) == "main"
+        assert _shared_state.get_project_promotion_target(project) == "main"
+
+        # The synchronous resolver records intent (no inline DB I/O) — one
+        # enqueue per missing column, deduped across repeated calls.
+        pending = branch_resolution._pending_durable_branch_alerts
+        assert len(pending) == 2
+        assert pending[0]["project_id"] == project.id
+        assert pending[0]["title"] == "Missing integration_branch"
+        assert pending[0]["severity"] == "ERROR"
+        assert pending[1]["title"] == "Missing promotion_target"
+        assert pending[1]["severity"] == "ERROR"
+
+    def test_null_branch_falls_back_to_main_once_per_project_when_non_self_repo(self):
+        import app.branch_resolution as branch_resolution
+
+        project = _project(integration_branch=None, promotion_target=None)
+
+        # Fails safe to "main" for a non-self repo (never raises), so callers
+        # in read endpoints / background loops never abort on a NULL column.
+        assert _shared_state.get_project_integration_branch(project) == "main"
+        assert _shared_state.get_project_integration_branch(project) == "main"
+        assert _shared_state.get_project_promotion_target(project) == "main"
+        assert _shared_state.get_project_promotion_target(project) == "main"
+
+        # One enqueue per column, deduped across repeated calls.
+        pending = branch_resolution._pending_durable_branch_alerts
+        assert len(pending) == 2
+        assert pending[0]["title"] == "Missing integration_branch"
+        assert pending[1]["title"] == "Missing promotion_target"
+
+    @pytest.mark.asyncio
+    async def test_flush_pending_branch_alerts_persists_once(self):
+        import app.branch_resolution as branch_resolution
+
+        project = _project(integration_branch=None, promotion_target=None)
+        _shared_state.get_project_integration_branch(project)
+        _shared_state.get_project_promotion_target(project)
+        assert len(branch_resolution._pending_durable_branch_alerts) == 2
+
+        session = _flush_session(existing=None)
+        with patch(
+            "app.broadcast.broadcast_to_project", new=AsyncMock()
+        ) as mock_broadcast:
+            created = await branch_resolution.flush_pending_branch_alerts(session)
+
+        assert created == 2
+        assert session.add.call_count == 2
+        # Queue drained on success.
+        assert branch_resolution._pending_durable_branch_alerts == []
+        titles = {call.args[0].title for call in session.add.call_args_list}
+        assert titles == {"Missing integration_branch", "Missing promotion_target"}
+        for call in session.add.call_args_list:
+            assert call.args[0].severity == AlertSeverity.ERROR
+        assert mock_broadcast.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_flush_is_idempotent_across_simulated_restart(self):
+        import app.branch_resolution as branch_resolution
+
+        project = _project(integration_branch=None, promotion_target=None)
+        _shared_state.get_project_integration_branch(project)
+        _shared_state.get_project_promotion_target(project)
+
+        # First flush persists both alerts.
+        with patch("app.broadcast.broadcast_to_project", new=AsyncMock()):
+            assert (
+                await branch_resolution.flush_pending_branch_alerts(
+                    _flush_session(existing=None)
+                )
+                == 2
+            )
+
+        # Simulate a restart: the in-memory dedupe set forgets, so the resolver
+        # re-enqueues on the next encounter.
+        branch_resolution._missing_project_branch_alerts.clear()
+        _shared_state.get_project_integration_branch(project)
+        _shared_state.get_project_promotion_target(project)
+        assert len(branch_resolution._pending_durable_branch_alerts) == 2
+
+        # But the durable SELECT finds the existing undismissed alert, so no
+        # second row is created — the signal stays one-per-misconfiguration.
+        existing_alert = MagicMock()
+        session = _flush_session(existing=existing_alert)
+        with patch("app.broadcast.broadcast_to_project", new=AsyncMock()):
+            created = await branch_resolution.flush_pending_branch_alerts(session)
+
+        assert created == 0
         session.add.assert_not_called()
 
-    def test_null_branch_emits_alert_once_per_project_and_column(self):
-        project = _project(integration_branch=None, promotion_target=None)
-        session = MagicMock()
+    def test_populating_column_stops_the_signal(self):
+        import app.branch_resolution as branch_resolution
 
-        with (
-            patch("app.branch_resolution.object_session", return_value=session),
-            patch("app.branch_resolution.logger.warning") as mock_warning,
-        ):
-            assert _shared_state.get_project_integration_branch(project) == "main"
-            assert _shared_state.get_project_integration_branch(project) == "main"
-            assert _shared_state.get_project_promotion_target(project) == "main"
-            assert _shared_state.get_project_promotion_target(project) == "main"
+        # A NULL column enqueues once.
+        project = _project(integration_branch=None, promotion_target="release")
+        _shared_state.get_project_integration_branch(project)
+        assert len(branch_resolution._pending_durable_branch_alerts) == 1
 
-        assert session.add.call_count == 2
-        integration_alert = session.add.call_args_list[0].args[0]
-        promotion_alert = session.add.call_args_list[1].args[0]
-        assert integration_alert.severity == AlertSeverity.ERROR
-        assert integration_alert.title == "Missing integration_branch"
-        assert promotion_alert.severity == AlertSeverity.ERROR
-        assert promotion_alert.title == "Missing promotion_target"
-        assert mock_warning.call_count == 2
-        assert mock_warning.call_args_list[0].args[1:] == (
-            str(project.id),
-            "integration_branch",
-        )
-        assert mock_warning.call_args_list[1].args[1:] == (
-            str(project.id),
-            "promotion_target",
-        )
+        # Populating the column means the resolver returns it and stops
+        # signaling — no further pending item is recorded.
+        branch_resolution._pending_durable_branch_alerts.clear()
+        branch_resolution._missing_project_branch_alerts.clear()
+        project.integration_branch = "develop"
+        assert _shared_state.get_project_integration_branch(project) == "develop"
+        assert branch_resolution._pending_durable_branch_alerts == []
 
 
 if __name__ == "__main__":

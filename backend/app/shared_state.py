@@ -75,6 +75,7 @@ from app.branch_resolution import (  # noqa: F401
     backfill_task_branch_namespace,
     derive_task_branch,
     ensure_project_pr_title_prefix,
+    flush_pending_branch_alerts,
     get_project_broadcast_limit,
     get_project_integration_branch,
     get_project_promotion_target,
@@ -94,6 +95,7 @@ from app.anomaly_state import (  # noqa: F401
     hydrate_persistent_anomalies,
     persist_anomaly_snapshot,
     persistent_anomalies,
+    reset_project_state,
     with_design_doc_locked,
 )
 
@@ -121,6 +123,7 @@ from app.warm_vm_state import (  # noqa: F401
     _empty_pr_is_not_behind_bucket,
     count_merge_error_pattern_prs,
     count_recent_backlog_reuse_failures,
+    count_recent_pool_claim_failures,
     count_recent_user_debug_spawns,
     count_recent_warm_pin_clears,
     count_recent_warm_pin_clears_by_reason,
@@ -131,6 +134,7 @@ from app.warm_vm_state import (  # noqa: F401
     pr_is_not_behind_counts,
     record_backlog_reuse_failure,
     record_merge_error_occurrence,
+    record_pool_claim_failure,
     record_pr_is_not_behind,
     record_user_debug_spawn,
     record_vm_heartbeat,
@@ -144,6 +148,7 @@ from app.warm_vm_state import (  # noqa: F401
     warm_backlog_first_refusal,
     warm_backlog_reuse_failure_events,
     warm_pin_clear_events,
+    warm_pool_claim_failure_events,
 )
 
 # --- Pipeline / deploy / dependency health (app.pipeline_health_state) ---
@@ -229,6 +234,9 @@ warm_continuity_suppressed_until: datetime | None = None
 # Auto-suppression deadline set by is_warm_backlog_reuse_suppressed() when the
 # failure rate exceeds warm_backlog_reuse_failure_rate_threshold. None = not suppressed.
 warm_backlog_reuse_suppressed_until: datetime | None = None
+# Auto-suppression deadline set by is_warm_pool_suppressed() when the pool-claim
+# failure rate exceeds warm_pool_failure_rate_threshold. None = not suppressed.
+warm_pool_suppressed_until: datetime | None = None
 
 
 def is_warm_continuity_suppressed() -> bool:
@@ -286,4 +294,32 @@ def is_warm_backlog_reuse_suppressed() -> bool:
         )
         return True
     warm_backlog_reuse_suppressed_until = None
+    return False
+
+
+def is_warm_pool_suppressed() -> bool:
+    """True iff warm-pool claims are auto-suppressed by the failure circuit breaker.
+
+    Checks the recent pool-claim failure rate against the configured threshold.
+    When the rate exceeds the threshold, sets a suppression window so the
+    maintainer stops replenishing and the orchestrator dispatch hook stops
+    leasing (falling back to cold provisioning) until the cooldown expires and
+    the rate normalises. Mirrors is_warm_backlog_reuse_suppressed.
+    """
+    global warm_pool_suppressed_until
+    now = _utcnow()
+    if warm_pool_suppressed_until is not None and now < warm_pool_suppressed_until:
+        return True
+    threshold = runtime_config.get("warm_pool_failure_rate_threshold", 5)
+    recent_failures = count_recent_pool_claim_failures(3600)
+    if recent_failures >= threshold:
+        cooldown = runtime_config.get("warm_pool_cooldown_seconds", 1800)
+        warm_pool_suppressed_until = now + timedelta(seconds=cooldown)
+        logger.warning(
+            f"[WARM_POOL] Circuit breaker tripped: {recent_failures} pool-claim "
+            f"failure events in last hour (threshold {threshold}). Suppressed until "
+            f"{warm_pool_suppressed_until.isoformat()}."
+        )
+        return True
+    warm_pool_suppressed_until = None
     return False

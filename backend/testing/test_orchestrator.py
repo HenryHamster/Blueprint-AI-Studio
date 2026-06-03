@@ -2282,6 +2282,227 @@ class TestBatchedDepRowsSurviveCommit:
             assert spy.call_count == 1
 
 
+class TestPersistDepsSatisfied:
+    """The orchestrator durably stamps ``context['_deps_satisfied']`` on a
+    dependency-bearing task once its deps resolve eligible. This sticky marker
+    is the contract the warm-backlog scan and dispatch first-refusal hold key
+    off so dependency-ready work can run warm without re-running the
+    (GitHub-aware) dep resolution on the hot path."""
+
+    @pytest.mark.asyncio
+    async def test_persist_deps_satisfied_stamps_and_persists(
+        self, db_session, mocker
+    ):
+        from app.orchestrator import _persist_deps_satisfied
+
+        project = make_project(name="Deps Satisfied", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(uuid.uuid4())],
+            context={"scope": "small"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Redirect the helper's separate-session write to the test DB.
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        await _persist_deps_satisfied(task)
+
+        # In-memory mirror set for the same-cycle dispatch first-refusal hold.
+        assert task.context.get("_deps_satisfied") is True
+        # And durably persisted so the next-role warm scan (separate session)
+        # and the Step 3 dispatch re-read observe it.
+        db_session.expire(task)
+        await db_session.refresh(task)
+        assert task.context.get("_deps_satisfied") is True
+        # Pre-existing context keys are preserved, not clobbered.
+        assert task.context.get("scope") == "small"
+
+    @pytest.mark.asyncio
+    async def test_persist_deps_satisfied_is_idempotent_noop(
+        self, db_session, mocker
+    ):
+        """A task already carrying the marker is left untouched (no redundant
+        write), so repeated eligible cycles don't thrash the row."""
+        from app.orchestrator import _persist_deps_satisfied
+
+        task = make_task(
+            payloads=[{"type": "create", "prompt": "cand"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(uuid.uuid4())],
+            context={"_deps_satisfied": True},
+        )
+        # If the helper opened a session it would hit this un-redirected factory
+        # and fail; the early-return guard means it never does.
+        sentinel = mocker.patch(
+            "app.orchestrator.AsyncSessionLocal",
+            side_effect=AssertionError("should not open a session when marker present"),
+        )
+        await _persist_deps_satisfied(task)
+        assert task.context.get("_deps_satisfied") is True
+        assert sentinel.call_count == 0
+
+
+class TestMarkUnblockedDependents:
+    """Completion-side trigger: when a task finishes and its PR lands on the
+    integration branch, the orchestrator proactively stamps ``_deps_satisfied``
+    on the QUEUED dependents it just unblocked, so the just-completed task's warm
+    VM can claim that follow-on work inside its teardown-defer grace window
+    instead of tearing down cold. The marker stays authoritative — only deps that
+    resolve ``eligible`` are stamped; a dependent with any unresolved dep is left
+    unmarked."""
+
+    @staticmethod
+    async def _verify_true(_task, _session):
+        return True
+
+    @pytest.mark.asyncio
+    async def test_marks_ready_dependent_after_completion(self, db_session, mocker):
+        from app.orchestrator import _mark_unblocked_dependents
+
+        project = make_project(name="Unblock", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(completed)
+        await db_session.commit()
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "follow-on"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(completed.id)],
+            context={"scope": "small"},
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 1
+
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        # The just-unblocked dependent is now warm-claimable...
+        assert dependent.context.get("_deps_satisfied") is True
+        # ...without clobbering pre-existing context.
+        assert dependent.context.get("scope") == "small"
+
+    @pytest.mark.asyncio
+    async def test_marking_records_completion_funnel_telemetry(
+        self, db_session, mocker
+    ):
+        """The completion-side trigger surfaces its lift on the reuse funnel: a
+        production call to ``_mark_unblocked_dependents`` that stamps N dependents
+        must record N onto ``completion_dependents_marked`` (not stay a dead 0)."""
+        from app.orchestrator import _mark_unblocked_dependents
+        from app.warm_backlog_reuse import get_reuse_funnel_snapshot
+
+        project = make_project(name="Unblock Telemetry", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(completed)
+        await db_session.commit()
+        await db_session.refresh(completed)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "follow-on"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(completed.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        before = get_reuse_funnel_snapshot()["completion_dependents_marked"]
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 1
+        after = get_reuse_funnel_snapshot()["completion_dependents_marked"]
+        assert after == before + 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_mark_dependent_with_unresolved_dep(
+        self, db_session, mocker
+    ):
+        """Signal is NOT loosened: a dependent that also waits on a still-QUEUED
+        sibling stays unmarked, so it continues to cold-dispatch exactly as before."""
+        from app.orchestrator import _mark_unblocked_dependents
+
+        project = make_project(name="Unblock Partial", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        completed = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep-a"}],
+            status=TaskStatus.COMPLETED,
+        )
+        still_pending = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "prompt": "dep-b"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([completed, still_pending])
+        await db_session.commit()
+        await db_session.refresh(completed)
+        await db_session.refresh(still_pending)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "follow-on"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(completed.id), str(still_pending.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        mocker.patch(
+            "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+
+        marked = await _mark_unblocked_dependents(completed, self._verify_true)
+        assert marked == 0
+
+        db_session.expire(dependent)
+        await db_session.refresh(dependent)
+        assert dependent.context.get("_deps_satisfied") is None
+
+
 class TestOrchestratorClosureSafety:
     """Regression: a `from app.compute import X` inside orchestrator_worker
     silently shadows the module-level X for the *entire* function, which then
@@ -2752,3 +2973,1108 @@ class TestWarmVMSkipProvision:
             "record_warm_pin_clear must not be invoked when the commit "
             "that persists the warm-field clear has not landed"
         )
+
+    @pytest.mark.asyncio
+    async def test_cascade_cancel_raises_single_dedup_alert(
+        self, orch_warm_db, mocker
+    ):
+        """A failed prerequisite that cascade-cancels multiple dependents in
+        one dispatch pass raises exactly ONE operator alert naming the root
+        failure (not one-per-dependent), and a later pass does not duplicate it
+        (title-based dedup)."""
+        from sqlmodel import select as _select
+        from app.models import Alert, AlertSeverity
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        # The cascade-cancel helper binds broadcast_to_project at module load;
+        # patch it on alert_dispatch so the real WS/notify path is not exercised.
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Cascade Dedup", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="root prerequisite",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "root"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            # Two dependents that both fail their dependency on the same root.
+            for label in ("dependent-B", "dependent-C"):
+                dep = make_task(
+                    project_id=project.id,
+                    title=label,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "create", "prompt": label}],
+                    depends_on=[str(prereq.id)],
+                )
+                session.add(dep)
+            await session.commit()
+            project_id = project.id
+            prereq_id = prereq.id
+
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify:
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1, (
+                f"Expected exactly one cascade-cancel alert, got {len(alerts)}"
+            )
+            alert = alerts[0]
+            assert alert.severity == AlertSeverity.WARNING
+            assert "root prerequisite" in alert.title
+            assert alert.task_id == prereq_id
+            # Both dependents counted in the single alert.
+            assert "2 dependent task" in alert.message
+
+        # Add a THIRD dependent and re-run: title-based dedup means the existing
+        # undismissed alert is reused — no second alert is created.
+        async with orch_warm_db() as session2:
+            dep_d = make_task(
+                project_id=project_id,
+                title="dependent-D",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent-D"}],
+                depends_on=[str(prereq_id)],
+            )
+            session2.add(dep_d)
+            await session2.commit()
+
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify2:
+            alerts2 = (
+                (
+                    await verify2.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts2) == 1, (
+                "A second dispatch pass must not create a duplicate cascade "
+                f"alert (title dedup), got {len(alerts2)}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cascade_cancel_alert_counts_children(self, orch_warm_db, mocker):
+        """The cascade-cancel count includes a dependent's non-terminal children
+        that are cascade-cancelled along with it."""
+        from sqlmodel import select as _select
+        from app.models import Alert
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Cascade Children", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            prereq = make_task(
+                project_id=project.id,
+                title="root prerequisite",
+                status=TaskStatus.FAILED,
+                payloads=[{"type": "create", "prompt": "root"}],
+            )
+            session.add(prereq)
+            await session.commit()
+            await session.refresh(prereq)
+
+            dependent = make_task(
+                project_id=project.id,
+                title="dependent-with-child",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create", "prompt": "dependent"}],
+                depends_on=[str(prereq.id)],
+            )
+            session.add(dependent)
+            await session.commit()
+            await session.refresh(dependent)
+
+            # A non-terminal child of the dependent — PROVISIONING is excluded
+            # from the candidate scan but cascade-cancelled with its parent.
+            child = make_task(
+                project_id=project.id,
+                title="child-task",
+                status=TaskStatus.PROVISIONING,
+                payloads=[{"type": "create", "prompt": "child"}],
+                parent_task_id=dependent.id,
+            )
+            session.add(child)
+            await session.commit()
+            project_id = project.id
+
+        await self._run_one_cycle(mocker)
+
+        async with orch_warm_db() as verify:
+            alerts = (
+                (
+                    await verify.execute(
+                        _select(Alert).where(Alert.project_id == project_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert len(alerts) == 1
+            # 1 dependent + 1 cascaded child = 2.
+            assert "2 dependent task" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_ci_poll_merge_on_promotion_target_withholds_pr_merged(
+        self, db_session
+    ):
+        """The direct CI poll merge path must not stamp pr_merged when GitHub
+        reports a merged PR whose base branch is the project's promotion target
+        rather than its integration branch."""
+        import app.branch_resolution as branch_resolution
+        from app.branch_resolution import flush_pending_branch_alerts
+        from app.models import Alert
+        from app.orchestrator import _apply_ci_merged_landed_signal
+        from sqlmodel import select as _select
+
+        # The synchronous resolver records the branch-misconfiguration alert
+        # intent off the hot path (no inline DB I/O); the durable persist runs
+        # later in an async-safe context (the orchestrator monitoring loop).
+        # Reset the process-local queue + dedupe set so this test sees only its
+        # own enqueue (mirrors test_shared_state isolation).
+        branch_resolution._blocking_project_branch_alerts.clear()
+        branch_resolution._pending_durable_branch_alerts.clear()
+
+        project = make_project(
+            name="CI promotion target",
+            user_id=_TEST_USER,
+            integration_branch="main",
+            promotion_target="release",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "review", "pr_number": 123, "base_branch": "release"}],
+            context={
+                "review_loop": {
+                    "pr_number": 123,
+                    "ci_waiting": True,
+                    "base_branch": "release",
+                }
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        landed = await _apply_ci_merged_landed_signal(
+            task,
+            db_session,
+            base_branch="release",
+            review_loop=(task.context or {}).get("review_loop", {}),
+        )
+        task.status = TaskStatus.COMPLETED
+        db_session.add(task)
+        await db_session.commit()
+
+        assert landed is False
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.COMPLETED
+        assert (task.context or {}).get("pr_merged") is not True
+
+        # Drain the deferred branch-alert queue into durable Alerts the way the
+        # orchestrator monitoring loop does, then assert the operator signal landed.
+        await flush_pending_branch_alerts(db_session)
+        await db_session.commit()
+
+        alert = (
+            await db_session.execute(
+                _select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Blocking branch configuration",
+                )
+            )
+        ).scalars().first()
+        assert alert is not None
+        assert "promotion target" in alert.message
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Warm-POOL dispatch + pool-pin branches (efficiency direction d-5fd69fe1).
+    # Distinct from the warm-CONTINUITY pin tests above: a pool pin uses the
+    # warm-pool flag/breaker (not the continuity breaker), releases its leased
+    # PoolVm row, suppresses the continuity pin-clear metric, and resets
+    # vm_instance_id; the pool dispatch hook leases a pre-provisioned member
+    # before cold provisioning. These exercise the orchestrator_worker wiring
+    # end-to-end (the leasing internals are unit-tested in test_warm_pool_*).
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _fake_selection(account_id="acct-pool-1"):
+        from app.max_plan_pool import LLMSelectionResult
+
+        return LLMSelectionResult(
+            provider="anthropic",
+            auth_mode="oauth",
+            model="claude-opus-4-8",
+            quality_tier=None,
+            account={
+                "id": account_id,
+                "name": "Pool Acct",
+                "runtime_secret": "tok",
+                "claude_config_json": None,
+                "provider_metadata": {},
+            },
+            settings=None,
+            execution_mode=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_pool_pin_unresponsive_clears_releases_and_resets_vm_id(
+        self, orch_warm_db, mocker
+    ):
+        """A POOL pin (warm_pool_pin in ctx) whose target VM is unresponsive must:
+        release the leased PoolVm (mark_pool_vm_retiring), feed the POOL breaker
+        (record_pool_claim_failure), NOT fire the continuity pin-clear metric,
+        and reset task.vm_instance_id so the cold fall-through mints a FRESH id
+        instead of colliding with the retiring pool VM's name."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=False,
+        )
+        retiring_spy = mocker.patch(
+            "app.warm_pool.mark_pool_vm_retiring", new_callable=AsyncMock
+        )
+        pool_fail_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_pool_claim_failure"
+        )
+        clear_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_warm_pin_clear"
+        )
+
+        # Ensure the pool breaker is NOT tripped by residue from other tests, so
+        # the unresponsive-VM clear takes the vm_unresponsive path (not circuit_breaker).
+        _shared_state.warm_pool_suppressed_until = None
+        _shared_state.warm_pool_claim_failure_events.clear()
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Pool-Pin", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                target_vm = "agent-vm-pool-target-1"
+                deadline = (
+                    datetime.utcnow() + timedelta(seconds=240)
+                ).isoformat()
+                task = make_task(
+                    project_id=project.id,
+                    # _pin_task_to_pool_vm stamps the pool VM's id onto the task;
+                    # the clear branch must reset it.
+                    vm_instance_id=target_vm,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={
+                        "warm_target_vm_id": target_vm,
+                        "warm_handoff_deadline": deadline,
+                        "warm_pool_pin": True,
+                    },
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            # No heartbeat → unresponsive → reaches the pool-pin clear branch.
+            _shared_state.vm_last_heartbeat.pop(target_vm, None)
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # The leased pool VM was released and the POOL breaker (not the
+        # continuity metric) was fed.
+        assert retiring_spy.await_count >= 1
+        assert retiring_spy.await_args.args[1] == target_vm
+        assert pool_fail_spy.called
+        assert pool_fail_spy.call_args.args[0] == "vm_unresponsive"
+        # Continuity pin-clear metric is suppressed for pool pins.
+        assert not clear_spy.called
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            ctx = row.context or {}
+            assert "warm_target_vm_id" not in ctx
+            assert "warm_pool_pin" not in ctx
+            # Load-bearing reset: a FRESH agent-vm- id, never the retiring pool
+            # VM's name (which would race the reaper's delete on a name clash).
+            assert row.vm_instance_id != target_vm
+            assert (row.vm_instance_id or "").startswith("agent-vm-")
+
+    @pytest.mark.asyncio
+    async def test_pool_dispatch_lease_hit_skips_cold_provision(
+        self, orch_warm_db, mocker
+    ):
+        """A fresh QUEUED task leases a compatible idle pool member before cold
+        provisioning: provision_agent_vm is NOT called, record_pool_lease_hit
+        fires, and try_pool_dispatch receives the RESOLVED runtime identity +
+        the effective (sticky) blacklist."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+
+        class _Member:
+            vm_instance_id = "agent-vm-pool-leased-1"
+
+        dispatch_spy = mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=_Member(),
+        )
+        lease_hit_spy = mocker.patch(
+            "app.warm_backlog_reuse.record_pool_lease_hit"
+        )
+        cold_spy = mocker.patch(
+            "app.warm_backlog_reuse.record_pool_cold_dispatch"
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Pool-Lease", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    # Sticky blacklist must flow into excluded_account_ids.
+                    context={"provision_failed_accounts": ["acct-dead"]},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # Lease hit → cold provision skipped, funnel records a hit not a cold.
+        prov_mock.assert_not_called()
+        assert lease_hit_spy.called
+        assert not cold_spy.called
+
+        # Resolved-identity plumbing: the gate passes the SELECTION's identity.
+        assert dispatch_spy.await_count == 1
+        kwargs = dispatch_spy.await_args.kwargs
+        assert kwargs["required_provider"] == "anthropic"
+        assert kwargs["required_model"] == "claude-opus-4-8"
+        assert kwargs["required_account"] == "acct-pool-1"
+        assert "acct-dead" in (kwargs["excluded_account_ids"] or [])
+
+        # Task stays QUEUED — the pooled agent claims it warm via /next-role.
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_paused_project_queued_task_not_dispatched(
+        self, orch_warm_db, mocker
+    ):
+        """A QUEUED task owned by a paused project must NOT be dispatched:
+        provision_agent_vm is never called and the task stays QUEUED.
+
+        Uses the same cold-dispatch enabling mocks as the resume test below so
+        the ONLY thing keeping the task QUEUED is the project's paused flag."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Paused-Dispatch", user_id=_TEST_USER, paused=True
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # Paused project's work is never selected → no provision, still QUEUED.
+        prov_mock.assert_not_called()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"Paused project's task must stay QUEUED, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_project_paused_after_candidate_scan_not_dispatched(
+        self, orch_warm_db, mocker
+    ):
+        """Pausing after eligibility but before the final claim keeps the task
+        QUEUED and suppresses cold provision."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        paused_mid_cycle = False
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(
+                    name="Paused-During-Dispatch", user_id=_TEST_USER, paused=False
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+                project_id = project.id
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            async def _pause_before_claim(
+                eligible_ids, candidate_tasks, runtime_config, session
+            ):
+                nonlocal paused_mid_cycle
+                async with orch_warm_db() as pause_session:
+                    paused = await pause_session.get(Project, project_id)
+                    assert paused is not None
+                    paused.paused = True
+                    pause_session.add(paused)
+                    await pause_session.commit()
+                paused_mid_cycle = True
+                return eligible_ids
+
+            mocker.patch(
+                "app.orchestrator.cap_pipeline_slots",
+                side_effect=_pause_before_claim,
+            )
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        assert paused_mid_cycle is True
+        prov_mock.assert_not_called()
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED, (
+                f"Mid-cycle pause must keep task QUEUED, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_resumed_project_queued_task_is_dispatched(
+        self, orch_warm_db, mocker
+    ):
+        """Resuming a project (paused True → False) restores dispatch: with the
+        same cold-dispatch setup, a previously-paused project's QUEUED task is
+        now selected and cold-provisioned (status → PROVISIONING)."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                # Start paused, then resume (flip to False) before dispatch.
+                project = make_project(
+                    name="Resumed-Dispatch", user_id=_TEST_USER, paused=True
+                )
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+                project.paused = False
+                session.add(project)
+                await session.commit()
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # Resume restored dispatch → the task left QUEUED for provisioning.
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING, (
+                f"Resumed project's task must be dispatched, got {row.status}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_pool_dispatch_cold_fall_through_records_funnel(
+        self, orch_warm_db, mocker
+    ):
+        """When no compatible pool member is free (try_pool_dispatch → None),
+        the task cold-provisions and the funnel records a cold dispatch (not a
+        lease hit)."""
+        from sqlmodel import select as _select
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        mocker.patch(
+            "app.warm_pool.try_pool_dispatch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        lease_hit_spy = mocker.patch(
+            "app.warm_backlog_reuse.record_pool_lease_hit"
+        )
+        cold_spy = mocker.patch(
+            "app.warm_backlog_reuse.record_pool_cold_dispatch"
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Pool-Cold", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # Cold fall-through → funnel records a cold dispatch, never a lease hit.
+        assert cold_spy.called
+        assert not lease_hit_spy.called
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
+    async def test_pool_dispatch_commit_error_falls_back_to_cold(
+        self, orch_warm_db, mocker
+    ):
+        """If the lease commit raises (the MissingGreenlet hazard path), the
+        orchestrator records a 'commit_error' pool failure, rolls back, and
+        leaves the task QUEUED for a clean retry — never a lease-hit."""
+        from sqlmodel import select as _select
+        from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+        mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+
+        # Arm a one-shot commit failure that fires on the FIRST commit after
+        # try_pool_dispatch returns — i.e. the lease commit.
+        state = {"arm": False}
+        _orig_commit = _AsyncSession.commit
+
+        async def _maybe_failing_commit(self):
+            if state["arm"]:
+                state["arm"] = False
+                raise RuntimeError("simulated lease commit failure")
+            return await _orig_commit(self)
+
+        mocker.patch.object(_AsyncSession, "commit", _maybe_failing_commit)
+
+        class _Member:
+            vm_instance_id = "agent-vm-pool-leased-2"
+
+        async def _dispatch(*_a, **_kw):
+            state["arm"] = True
+            return _Member()
+
+        # Patch with the async function directly so the lazy
+        # `from app.warm_pool import try_pool_dispatch` binds to it and awaits
+        # cleanly (arming the one-shot commit failure as a side effect).
+        mocker.patch("app.warm_pool.try_pool_dispatch", _dispatch)
+        pool_fail_spy = mocker.patch(
+            "app.orchestrator._shared_state.record_pool_claim_failure"
+        )
+        lease_hit_spy = mocker.patch(
+            "app.warm_backlog_reuse.record_pool_lease_hit"
+        )
+        # The slot pre-reserved during runtime selection must be released on
+        # this early-exit (mirroring the cold-provision commit-failure path).
+        release_spy = mocker.patch(
+            "app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock
+        )
+
+        _shared_state.runtime_config["warm_pool_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Pool-CommitFail", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_pool_enabled", None)
+
+        # commit_error recorded, no lease-hit, and the lease was rolled back so
+        # the task is still QUEUED (clean retry next cycle).
+        assert pool_fail_spy.called
+        assert pool_fail_spy.call_args.args[0] == "commit_error"
+        assert not lease_hit_spy.called
+        # The reserved account slot was released (no leak) — and against the
+        # account carried on the resolved selection, not a loop-local variable.
+        assert release_spy.await_count == 1
+        assert release_spy.await_args.args[0] == "acct-pool-1"
+        # Abandon path: the daily-usage increment pre-reserved during selection
+        # must also be reverted, not just the concurrency slot — otherwise the
+        # daily counter durably over-counts and trips the cap prematurely.
+        assert release_spy.await_args.kwargs.get("revert_daily_task_count") is True
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_backlog_first_refusal_hold_releases_reserved_slot(
+        self, orch_warm_db, mocker
+    ):
+        """When an idle warm VM gets first refusal on a backlog task, the
+        orchestrator holds off cold-provisioning (rolls back, leaves the task
+        QUEUED for the warm VM to claim) — and must release the account slot
+        pre-reserved during runtime selection so the reservation does not leak
+        for the rest of the cycle (repeated holds would otherwise compound the
+        drift)."""
+        from sqlmodel import select as _select
+
+        prov_mock = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.max_plan_pool.select_llm_runtime_for_task",
+            new_callable=AsyncMock,
+            return_value=self._fake_selection(),
+        )
+        # An idle warm VM is actively polling for this project → first refusal.
+        mocker.patch(
+            "app.orchestrator._shared_state.is_backlog_first_refusal_active",
+            return_value=True,
+        )
+        release_spy = mocker.patch(
+            "app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock
+        )
+
+        _shared_state.runtime_config["warm_backlog_reuse_enabled"] = True
+        try:
+            async with orch_warm_db() as session:
+                project = make_project(name="Backlog-FirstRefusal", user_id=_TEST_USER)
+                session.add(project)
+                await session.commit()
+                await session.refresh(project)
+
+                task = make_task(
+                    project_id=project.id,
+                    vm_instance_id=None,
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix", "prompt": "x"}],
+                    context={},
+                )
+                session.add(task)
+                await session.commit()
+                await session.refresh(task)
+                task_id = task.id
+
+            await self._run_one_cycle(mocker)
+        finally:
+            _shared_state.runtime_config.pop("warm_backlog_reuse_enabled", None)
+
+        # Held off cold provisioning so the warm VM can claim it, and released
+        # the reserved slot against the resolved selection's account.
+        assert not prov_mock.called
+        assert release_spy.await_count == 1
+        assert release_spy.await_args.args[0] == "acct-pool-1"
+        # Abandon path: revert the pre-reserved daily-usage increment too, so a
+        # held-off dispatch leaves daily_task_count exactly where it was.
+        assert release_spy.await_args.kwargs.get("revert_daily_task_count") is True
+
+        async with orch_warm_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == task_id)))
+                .scalars()
+                .first()
+            )
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED
+
+
+class TestClassifyStuckTasksSharedPolicy:
+    """The deadlock-breaker (``_classify_stuck_tasks``) shares the main path's
+    dependency-death semantics via ``_check_candidate_task_deps``:
+
+    - a genuinely FAILED prerequisite cascade-cancels the dependent (it is never
+      dispatched as impossible work);
+    - a SCOPE_EMPTY-cancelled prerequisite counts as satisfied (clear & dispatch);
+    - a requeue-cancelled prerequisite with a still-active replacement clone keeps
+      the dependent waiting (no premature dispatch, no cancel);
+    - only a TRUE cycle is cleared-and-dispatched.
+    """
+
+    async def _noop_verify(self, _task, _session):
+        return True
+
+    @pytest.mark.asyncio
+    async def test_all_failed_deps_cascade_cancel_not_dispatched(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckFail", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dep"}],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # The real prerequisite genuinely failed → cascade-cancel, NOT dead_deps
+        # (which would clear depends_on and dispatch the impossible work).
+        assert out == [(stuck.id, "cascade_cancel")]
+
+    @pytest.mark.asyncio
+    async def test_scope_empty_dep_is_satisfied(self, db_session):
+        from app.failure_classification import SCOPE_EMPTY
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckScopeEmpty", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dep"}],
+            status=TaskStatus.CANCELLED,
+            context={"failure_category": SCOPE_EMPTY},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # SCOPE_EMPTY is a deliberate "scope already covered" exit → satisfied, so
+        # the dependent is safe to clear-and-dispatch, never cascade-cancelled.
+        assert out == [(stuck.id, "dead_deps")]
+
+    @pytest.mark.asyncio
+    async def test_requeue_cancelled_dep_with_active_clone_waits(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckRequeue", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # The live replacement clone is still in flight (QUEUED).
+        clone = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "clone"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(clone)
+        await db_session.commit()
+        await db_session.refresh(clone)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "dep"}],
+            status=TaskStatus.CANCELLED,
+            context={"_replaced_by_task_id": str(clone.id)},
+        )
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        stuck = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "stuck"}],
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(stuck)
+        await db_session.commit()
+        await db_session.refresh(stuck)
+
+        out = await _classify_stuck_tasks(
+            [stuck],
+            {stuck.id: {dep.id}},
+            {dep.id: dep},
+            {stuck.id},
+            db_session,
+            self._noop_verify,
+        )
+        # Replacement clone still running → wait/remap, neither dispatched nor
+        # cancelled prematurely.
+        assert out == []
+
+    @pytest.mark.asyncio
+    async def test_true_cycle_is_cleared_and_dispatched(self, db_session):
+        from app.orchestrator_health import _classify_stuck_tasks
+
+        project = make_project(name="StuckCycle", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        a = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "a"}],
+            status=TaskStatus.QUEUED,
+        )
+        b = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "prompt": "b"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add_all([a, b])
+        await db_session.commit()
+        await db_session.refresh(a)
+        await db_session.refresh(b)
+
+        out = await _classify_stuck_tasks(
+            [a, b],
+            {a.id: {b.id}, b.id: {a.id}},
+            {a.id: a, b.id: b},
+            {a.id, b.id},
+            db_session,
+            self._noop_verify,
+        )
+        # A genuine A<->B cycle: both members cleared-and-dispatched.
+        assert sorted(reason for _, reason in out) == ["cycle", "cycle"]
+        assert {tid for tid, _ in out} == {a.id, b.id}

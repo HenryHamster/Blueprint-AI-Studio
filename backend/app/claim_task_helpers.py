@@ -229,6 +229,99 @@ def _build_vision_summary(vision_raw: dict | None) -> "dict | None":
 
 
 # ---------------------------------------------------------------------------
+# Helper: live problem-model intent for the claim response
+# ---------------------------------------------------------------------------
+
+
+def _build_problem_model_summary(pm_raw: dict | None) -> "dict | None":
+    """Return a size-bounded, agent-safe view of the LIVE ``project.problem_model``.
+
+    Surfaces the operator-editable strategic intent — ``intent.purpose``,
+    ``intent.current_focus``, the ``context`` framing
+    (project_type/users/team/deploy_cadence/notes), and ``constraints`` — so
+    worker agents see current steering immediately, without waiting for a
+    strategic cycle to mirror it into the legacy ``vision`` blob. Truncates
+    free-text the same way :func:`_build_vision_summary` bounds its fields.
+
+    Fails open: returns ``None`` on missing/malformed input or when the model is
+    empty (per :func:`app.problem_model.is_empty`) so a bad problem_model never
+    500s the claim and callers can fall back to the legacy vision summary.
+    """
+    if not pm_raw or not isinstance(pm_raw, dict):
+        return None
+    try:
+        from app.problem_model import is_empty, parse_problem_model
+
+        model = parse_problem_model(pm_raw)
+    except Exception:
+        return None
+    if is_empty(model):
+        return None
+
+    summary: dict = {}
+    purpose = model.intent.purpose
+    if isinstance(purpose, str) and purpose.strip():
+        summary["purpose"] = purpose.strip()[:600]
+    current_focus = model.intent.current_focus
+    if isinstance(current_focus, str) and current_focus.strip():
+        summary["current_focus"] = current_focus.strip()[:600]
+
+    context_summary: dict = {}
+    for field in ("project_type", "users", "team", "deploy_cadence", "notes"):
+        val = getattr(model.context, field, None)
+        if isinstance(val, str) and val.strip():
+            context_summary[field] = val.strip()[:300]
+    if context_summary:
+        summary["context"] = context_summary
+
+    if isinstance(model.constraints, list):
+        compact = [
+            str(c).strip()[:200]
+            for c in model.constraints[:8]
+            if isinstance(c, str) and c.strip()
+        ]
+        if compact:
+            summary["constraints"] = compact
+
+    if not summary:
+        return None
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Helper: current direction contract (success evidence / completion / retirement)
+# ---------------------------------------------------------------------------
+
+
+def _build_direction_contract(direction: dict) -> "dict | None":
+    """Extract the current direction's contract fields for the worker prompt.
+
+    ``completion_criteria`` lives directly on the direction dict;
+    ``success_evidence`` and ``retirement_condition`` live under
+    ``direction["context"]`` (see ``routers/directions.py``). Bounds each
+    free-text field the same way the other claim helpers do. Returns ``None``
+    when no contract field is set so callers can skip injection.
+    """
+    if not isinstance(direction, dict):
+        return None
+    contract: dict = {}
+    completion = direction.get("completion_criteria")
+    if isinstance(completion, str) and completion.strip():
+        contract["completion_criteria"] = completion.strip()[:600]
+    ctx = direction.get("context")
+    if isinstance(ctx, dict):
+        success_evidence = ctx.get("success_evidence")
+        if isinstance(success_evidence, str) and success_evidence.strip():
+            contract["success_evidence"] = success_evidence.strip()[:600]
+        retirement_condition = ctx.get("retirement_condition")
+        if isinstance(retirement_condition, str) and retirement_condition.strip():
+            contract["retirement_condition"] = retirement_condition.strip()[:600]
+    if not contract:
+        return None
+    return contract
+
+
+# ---------------------------------------------------------------------------
 # Helper: direction narrative (what we know, what's open)
 # ---------------------------------------------------------------------------
 

@@ -181,6 +181,35 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
 }
 
 /**
+ * Classify whether a test runner's output indicates that real tests actually
+ * executed, or that the command was a placeholder / collected zero tests.
+ *
+ * Used by the no-CI merge gate: a repo whose only "test" command is the default
+ * scaffolded placeholder (`npm` "no test specified"), or whose suite collects
+ * zero tests, is effectively a repo with no detectable tests — it should route
+ * to the documented proceed-without-checks fallback rather than being recorded
+ * as a hard failure (placeholder exits non-zero) or a vacuous pass (empty suite
+ * exits zero).
+ *
+ * CONSERVATIVE BY DESIGN: returns 'no_tests' ONLY on a positive signature match.
+ * Anything else — including a genuine failure like "1 failed" or "2 passed",
+ * empty output, or an unrecognized format — defaults to 'ran' so that a real
+ * verdict is never misread as "no tests".
+ */
+export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
+  const lower = output.toLowerCase();
+  // npm placeholder: the default `package.json` test script prints
+  // "Error: no test specified" and exits 1 without running anything.
+  if (lower.includes('no test specified')) return 'no_tests';
+  // pytest: "no tests ran in 0.01s" / "collected 0 items".
+  if (lower.includes('no tests ran')) return 'no_tests';
+  if (lower.includes('collected 0 items')) return 'no_tests';
+  // vitest: "No test files found, exiting with code 1".
+  if (lower.includes('no test files found')) return 'no_tests';
+  return 'ran';
+}
+
+/**
  * Parse failing test identifiers from test runner output.
  * Returns a Set of stable test IDs (e.g. "path/test_foo.py::test_bar" for pytest,
  * "test description" for vitest) for baseline comparison.

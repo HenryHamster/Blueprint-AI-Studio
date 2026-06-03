@@ -96,6 +96,47 @@ def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     return True, entry[1]
 
 
+async def _vm_is_governed_pool_member(vm_id: str) -> bool:
+    """True iff *vm_id* is a LIVE warm-pool member whose teardown is owned by the
+    warm-pool lifecycle, not the generic task-completion teardown path.
+
+    Mirrors :func:`app.warm_pool.pool_vm_cleanup_exemptions` (the orphan-sweep
+    exemption) for a single VM. When a pool-leased task reaches a terminal state
+    the agent_status handler fires ``fire_and_forget_vm_delete`` like any other
+    task — but a pool member must NOT be cold-deleted there: the pool reconciles it
+    itself, returning it to IDLE for re-lease (:func:`app.warm_pool.release_pool_vm`,
+    COMPLETED) or flipping it RETIRING for the maintainer's
+    ``retire_and_delete_pool_vm`` (FAILED/CANCELLED), which also clears the
+    pre-staged secret and the registry row. Deleting the VM here would make every
+    member single-use and strand the registry row counting against the pool budget.
+
+    Only LIVE members (``LIVE_POOL_STATES`` = PROVISIONING/IDLE/LEASED) are
+    governed; a RETIRING member is intentionally excluded so the pool's OWN retire
+    path — which itself calls ``_ensure_vm_deleted`` — still tears it down. Returns
+    False (caller proceeds with teardown) when the pool is disabled, the VM is not a
+    registered member, or the lookup fails — we never leak a live VM by assuming
+    reuse. The flag check short-circuits before any DB I/O, so the common
+    cold-provisioned teardown pays nothing while the pool is dark.
+    """
+    try:
+        from app.warm_pool import is_warm_pool_enabled  # noqa: PLC0415
+
+        if not is_warm_pool_enabled():
+            return False
+        from app.warm_pool import LIVE_POOL_STATES, get_pool_vm  # noqa: PLC0415
+
+        async with AsyncSessionLocal() as s:
+            member = await get_pool_vm(s, vm_id)
+        return member is not None and member.state in LIVE_POOL_STATES
+    except Exception:
+        logger.exception(
+            "[WARM-POOL] pool-member teardown guard failed for VM %s — "
+            "proceeding with teardown",
+            vm_id,
+        )
+        return False
+
+
 async def _ensure_vm_deleted(
     task_or_vm_id, *, reason: str = "terminal_transition"
 ) -> bool:
@@ -116,6 +157,24 @@ async def _ensure_vm_deleted(
 
     if not vm_id:
         return True  # No VM to delete
+
+    # Warm-pool guard: a live pool member that just finished a task is reconciled
+    # by the pool lifecycle (returned to IDLE for re-lease, or retired by the
+    # maintainer which also clears its secret + registry row). Tearing its VM down
+    # here would make every member single-use and strand the registry row. Skip,
+    # and drop any orchestrator-deleted marker fire_and_forget_vm_delete
+    # pre-recorded — the VM is staying alive, so a later DELETED observation must
+    # not be mis-attributed. RETIRING members are NOT governed (see helper) so the
+    # pool's own retire path still deletes them here.
+    if await _vm_is_governed_pool_member(vm_id):
+        _orchestrator_deleted_vms.pop(vm_id, None)
+        logger.info(
+            "[WARM-POOL] VM %s is a live pool member — skipping completion teardown "
+            "(task=%s); pool lifecycle governs its return-to-IDLE / retire",
+            vm_id,
+            task_id,
+        )
+        return True
 
     logger.info(f"[VM CLEANUP] Deleting VM {vm_id} (task={task_id}, reason={reason})")
     # Record the orchestrator-initiated delete BEFORE attempting the GCP
@@ -200,23 +259,14 @@ def fire_and_forget_vm_delete(
     bg.add_done_callback(_background_vm_deletes.discard)
 
 
-async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
-    """Hold a just-idle VM's teardown briefly so it can claim backlog work.
+async def _vm_claimed_backlog_work(vm_id: str) -> bool:
+    """True iff a task is currently running on *vm_id* (claimed during the hold).
 
-    Backlog reuse (efficiency direction d-91d8dede): when a COMPLETED task's
-    VM has eligible QUEUED backlog work in its project, this defers teardown
-    by runtime_config['warm_backlog_teardown_defer_secs'] (read fresh per call)
-    so the agent's /next-role poll can claim that work and run it warm. After
-    the window, the VM is deleted iff it never claimed anything.
-
-    Crucially this does NOT pre-record the orchestrator-deleted marker (unlike
-    fire_and_forget_vm_delete): that marker makes is_orchestrator_initiated_delete
-    return True, and the /next-role doomed-VM guard would then refuse the VM's
-    own warm claim. The marker is only written if/when we actually delete.
+    On query failure returns False so the caller falls through to teardown —
+    never leak a VM by assuming it was reused. A claim flips a QUEUED task to
+    PROVISIONING/IN_PROGRESS (and EVALUATING once it posts a verdict), so any of
+    those bound to this VM means the agent picked up backlog work.
     """
-    from app.warm_backlog_reuse import _teardown_defer_secs
-
-    await asyncio.sleep(_teardown_defer_secs())
     try:
         async with AsyncSessionLocal() as s:
             claimed = (
@@ -235,26 +285,125 @@ async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
                     .limit(1)
                 )
             ).first()
+        return claimed is not None
     except Exception:
-        # If the re-check query fails, fall through to teardown — never leak a
-        # VM by assuming it was reused.
         logger.exception(
             "[BACKLOG-REUSE] Deferred-teardown re-check failed for VM %s — "
-            "tearing down",
+            "treating as unclaimed",
             vm_id,
         )
-        claimed = None
-    if claimed is not None:
+        return False
+
+
+async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
+    """Hold a just-idle VM's teardown so it can claim backlog work — bounded and
+    activity-gated.
+
+    Backlog reuse (efficiency direction d-91d8dede): when a COMPLETED task's VM
+    has eligible QUEUED backlog work in its project, the agent re-enters its
+    /api/agent/next-role poll loop and keeps polling for up to
+    next_role_poll_timeout_secs (~180s). The original fixed
+    ``warm_backlog_teardown_defer_secs`` hold (~20s) tore the VM down long before
+    the agent stopped polling, so same-project work that arrived a little after
+    completion was never claimed warm. This holds the VM through a longer window
+    so those existing polls can claim it:
+
+      * an unconditional minimum hold of ``_teardown_defer_secs()`` covers the
+        first poll round-trip (before any heartbeat is recorded);
+      * after that the hold is **activity-gated** — it is extended one poll
+        interval at a time only while the VM is still heartbeating
+        (``is_vm_alive`` reads the heartbeat the /next-role poll records), and
+        released early once the agent goes quiet for ``_grace_idle_cutoff_secs``
+        (gave up / process exited / VM preempted) so an abandoned VM is not held
+        idle to the ceiling;
+      * the hold is **bounded** by ``_grace_window_secs()`` (floored at the
+        minimum hold) so a still-heartbeating-but-never-claiming VM cannot be
+        held indefinitely.
+
+    The VM is deleted iff it never claimed anything before the gate/ceiling
+    released the hold. Each loop turn re-checks for a claim first, and one final
+    re-check runs immediately before deletion, so a claim landing late in the
+    window still wins.
+
+    Crucially this does NOT pre-record the orchestrator-deleted marker (unlike
+    fire_and_forget_vm_delete): that marker makes is_orchestrator_initiated_delete
+    return True, and the /next-role doomed-VM guard would then refuse the VM's
+    own warm claim. The marker is only written if/when we actually delete (inside
+    _ensure_vm_deleted, synchronously before its first await).
+    """
+    from app.warm_backlog_reuse import (
+        _grace_idle_cutoff_secs,
+        _grace_poll_interval_secs,
+        _grace_window_secs,
+        _teardown_defer_secs,
+        record_grace_ceiling_release,
+        record_grace_idle_release,
+        record_grace_window_extension,
+    )
+    from app.warm_vm_state import is_vm_alive
+
+    min_hold = _teardown_defer_secs()
+    # Ceiling can never undercut the unconditional minimum hold.
+    ceiling = max(_grace_window_secs(), min_hold)
+    idle_cutoff = _grace_idle_cutoff_secs()
+    poll_interval = _grace_poll_interval_secs()
+
+    # Unconditional minimum hold: give the agent's first poll round-trip a chance
+    # to record a heartbeat before activity-gating begins.
+    await asyncio.sleep(min_hold)
+    elapsed = float(min_hold)
+
+    release_reason = "ceiling"
+    while True:
+        if await _vm_claimed_backlog_work(vm_id):
+            logger.info(
+                "[BACKLOG-REUSE] VM %s claimed backlog work during grace window "
+                "(after %.0fs) — skipping teardown",
+                vm_id,
+                elapsed,
+            )
+            return
+        if elapsed >= ceiling:
+            release_reason = "ceiling"
+            break
+        # Activity gate: only keep holding while the agent is still polling.
+        if not is_vm_alive(vm_id, max_age_seconds=idle_cutoff):
+            release_reason = "idle"
+            break
+        record_grace_window_extension()
+        # Don't overshoot the ceiling on the last interval.
+        step = min(float(poll_interval), ceiling - elapsed)
+        await asyncio.sleep(step)
+        elapsed += step
+
+    # Final re-check: a claim may have landed between the last loop check and
+    # here. Deletion records the orchestrator marker synchronously before its
+    # first await, so no poll can interleave between this check and the marker.
+    if await _vm_claimed_backlog_work(vm_id):
         logger.info(
-            "[BACKLOG-REUSE] VM %s claimed backlog work during defer window — "
+            "[BACKLOG-REUSE] VM %s claimed backlog work at grace-window close — "
             "skipping teardown",
             vm_id,
         )
         return
-    logger.info(
-        "[BACKLOG-REUSE] VM %s claimed nothing within defer window — tearing down",
-        vm_id,
-    )
+
+    if release_reason == "idle":
+        record_grace_idle_release()
+        logger.info(
+            "[BACKLOG-REUSE] VM %s stopped polling within grace window "
+            "(%.0fs, no heartbeat for >%ds) — tearing down",
+            vm_id,
+            elapsed,
+            idle_cutoff,
+        )
+    else:
+        record_grace_ceiling_release()
+        logger.info(
+            "[BACKLOG-REUSE] VM %s claimed nothing within grace ceiling "
+            "(%.0fs) — tearing down",
+            vm_id,
+            elapsed,
+        )
     await _ensure_vm_deleted(vm_id, reason=reason)
 
 

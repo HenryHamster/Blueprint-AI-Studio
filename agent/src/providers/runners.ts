@@ -103,9 +103,9 @@ function normalizeAuthMode(raw: string | undefined, provider: ProviderName): Aut
   return 'oauth';
 }
 
-export const PROVIDER: ProviderName = normalizeProvider(process.env.PROVIDER);
-export const AUTH_MODE: AuthMode = normalizeAuthMode(process.env.AUTH_MODE, PROVIDER);
-export const LLM_EXECUTION_MODE = process.env.LLM_EXECUTION_MODE || 'default';
+export let PROVIDER: ProviderName = normalizeProvider(process.env.PROVIDER);
+export let AUTH_MODE: AuthMode = normalizeAuthMode(process.env.AUTH_MODE, PROVIDER);
+export let LLM_EXECUTION_MODE = process.env.LLM_EXECUTION_MODE || 'default';
 
 export type LLMCliTranslation = {
   env: Record<string, string>;
@@ -131,7 +131,15 @@ export function parseLLMCliTranslation(): LLMCliTranslation | null {
   }
 }
 
-export const LLM_CLI_TRANSLATION: LLMCliTranslation | null = parseLLMCliTranslation();
+export let LLM_CLI_TRANSLATION: LLMCliTranslation | null = parseLLMCliTranslation();
+
+export function refreshRuntimeState(): void {
+  const provider = normalizeProvider(process.env.PROVIDER);
+  PROVIDER = provider;
+  AUTH_MODE = normalizeAuthMode(process.env.AUTH_MODE, provider);
+  LLM_EXECUTION_MODE = process.env.LLM_EXECUTION_MODE || 'default';
+  LLM_CLI_TRANSLATION = parseLLMCliTranslation();
+}
 
 function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): readonly string[] {
   return RATE_LIMIT_PATTERNS[provider][authMode] ?? RATE_LIMIT_PATTERNS[provider].oauth ?? [];

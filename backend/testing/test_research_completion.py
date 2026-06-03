@@ -13,10 +13,16 @@ from app.spawn_calibration import (
 )
 from app.source_ref_validation import (
     _parse_ref,
+    _symbol_defined_at_head,
     collect_stale_refs,
     extract_source_file_paths,
+    summarize_ungrounded_claims,
     summarize_broken_refs,
     validate_source_refs,
+)
+from app.research_completion import (
+    _apply_structural_actionability_downgrade,
+    _summarize_ungrounded_claims_grounded,
 )
 from app.time_utils import _utcnow
 
@@ -372,6 +378,21 @@ class TestSourceRefParsing:
 class TestSourceRefValidation:
     """Validation of research finding source file references."""
 
+    def _patch_git_show(self, monkeypatch, *, stdout=b"", stderr=b"", returncode=0):
+        from app import source_ref_validation as srv
+
+        class _Proc:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return stdout, stderr
+
+        async def _create(*args, **kwargs):
+            return _Proc()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
+
     async def test_pr_source_passes_through(self):
         """PR-type sources require no validation."""
         sources = [
@@ -487,8 +508,23 @@ class TestSourceRefValidation:
         validated = await validate_source_refs("not a list")
         assert validated == []
 
-    async def test_mixed_source_types(self):
-        """Batch with mixed source types is validated correctly."""
+    async def test_mixed_source_types(self, monkeypatch):
+        """Batch with mixed source types is validated correctly.
+
+        The existence check is mocked so the test does not depend on a local
+        /tmp/workspace checkout (absent in the backend test container). Under
+        the conservative degradation rules an unmocked missing file would be
+        indeterminate (None) and therefore NOT flagged — so the missing ref is
+        explicitly resolved to False here to exercise the invalid-marking path.
+        """
+        from app import source_ref_validation as srv
+
+        missing = "nonexistent/missing.py"
+        monkeypatch.setattr(
+            srv,
+            "_file_exists_at_head",
+            AsyncMock(side_effect=lambda path: path != missing),
+        )
         sources = [
             {
                 "type": "pr",
@@ -504,7 +540,7 @@ class TestSourceRefValidation:
             },
             {
                 "type": "file",
-                "ref": "nonexistent/missing.py",
+                "ref": missing,
             },
         ]
         validated = await validate_source_refs(sources)
@@ -530,6 +566,519 @@ class TestSourceRefValidation:
         validated = await validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0]["type"] == "custom_type"
+
+    async def test_symbol_ref_present_is_grounded(self, monkeypatch):
+        self._patch_git_show(monkeypatch, stdout=b"def present_symbol():\n    pass\n")
+        assert await _symbol_defined_at_head("backend/app/example.py", "present_symbol") is True
+
+    async def test_symbol_ref_absent_in_existing_file_is_flagged(self, monkeypatch):
+        self._patch_git_show(monkeypatch, stdout=b"def other_symbol():\n    pass\n")
+        assert await _symbol_defined_at_head("backend/app/example.py", "missing_symbol") is False
+
+    async def test_symbol_ref_missing_file_is_flagged(self, monkeypatch):
+        self._patch_git_show(
+            monkeypatch,
+            returncode=128,
+            stderr=b"fatal: path 'backend/app/missing.py' exists on disk, but not in 'HEAD'",
+        )
+        assert await _symbol_defined_at_head("backend/app/missing.py", "missing") is False
+
+    async def test_malformed_symbol_ref_is_ignored(self):
+        assert await summarize_ungrounded_claims(["backend/app/example.py:42"]) is None
+
+    async def test_git_failure_degrades_gracefully(self, monkeypatch):
+        from app import source_ref_validation as srv
+
+        async def _create(*args, **kwargs):
+            raise OSError("git unavailable")
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
+        assert await _symbol_defined_at_head("backend/app/example.py", "present_symbol") is None
+
+
+class TestSourceRefValidationBranchAware:
+    """validate_source_refs verifies against the project's REAL integration
+    branch (via the GitHub contents API) when a verification context is passed,
+    with a graceful local fallback, and NEVER marks a citation invalid on an
+    indeterminate result.
+    """
+
+    _CTX = {
+        "token": "tok",
+        "owner": "octo",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+
+    async def test_github_path_valid_file_not_flagged(self, monkeypatch):
+        """A file present on the integration branch is not flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 100))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert len(validated) == 1
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_github_path_absent_file_flagged(self, monkeypatch):
+        """A file unambiguously absent on the integration branch (404) is flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(False, None))
+        )
+        sources = [{"type": "file", "ref": "backend/app/gone.py"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") == False  # noqa: E712
+
+    async def test_github_path_line_out_of_range_flagged(self, monkeypatch):
+        """A line number beyond the branch file's length is flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 10))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:99"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") == False  # noqa: E712
+
+    async def test_github_path_line_within_range_not_flagged(self, monkeypatch):
+        """A line number within the branch file's length is not flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 200))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:42-50"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_github_path_indeterminate_existence_never_invalid(self, monkeypatch):
+        """An indeterminate existence result (None) never marks the ref invalid.
+
+        This is the core prod fix: a backend with no checkout and a GitHub
+        API error must NOT collapse every citation into file-not-found.
+        """
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(None, None))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:42"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_github_path_indeterminate_line_count_never_invalid(self, monkeypatch):
+        """File exists but its line count is indeterminate → line ref not flagged."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, None))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:9999"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_partial_context_falls_back_to_local(self, monkeypatch):
+        """An incomplete GitHub context falls back to the local HEAD checker."""
+        from app import source_ref_validation as srv
+
+        content_spy = AsyncMock(return_value=(False, None))
+        monkeypatch.setattr(srv, "_file_content_in_repo_branch", content_spy)
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=True))
+        sources = [{"type": "file", "ref": "backend/app/foo.py"}]
+        # owner/repo/branch present but token missing → not use_repo_branch.
+        validated = await validate_source_refs(
+            sources, owner="octo", repo="repo", branch="integration"
+        )
+        assert validated[0].get("valid") != False  # noqa: E712
+        content_spy.assert_not_awaited()
+
+    async def test_local_fallback_indeterminate_never_invalid(self, monkeypatch):
+        """Local-path indeterminate (no checkout → None) never marks invalid."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=None))
+        sources = [{"type": "file", "ref": "backend/app/foo.py:42"}]
+        validated = await validate_source_refs(sources)
+        assert validated[0].get("valid") != False  # noqa: E712
+
+    async def test_malformed_range_flagged_regardless_of_tree(self, monkeypatch):
+        """end < start is intrinsically malformed and flagged even on the branch path."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv, "_file_content_in_repo_branch", AsyncMock(return_value=(True, 500))
+        )
+        sources = [{"type": "file", "ref": "backend/app/foo.py:50-10"}]
+        validated = await validate_source_refs(sources, **self._CTX)
+        assert validated[0].get("valid") == False  # noqa: E712
+
+
+class TestUngroundedClaimDetection:
+    """Grounding logic: detect claims that reference absent symbols and discount them."""
+
+    def _patch_git_show(self, monkeypatch, *, stdout=b"", stderr=b"", returncode=0):
+        from app import source_ref_validation as srv
+
+        class _Proc:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return stdout, stderr
+
+        async def _create(*args, **kwargs):
+            return _Proc()
+
+        monkeypatch.setattr(srv.asyncio, "create_subprocess_exec", _create)
+
+    async def test_ungrounded_claim_with_absent_symbol_is_detected(self, monkeypatch):
+        """A claim referencing a symbol NOT defined in an existing file is flagged."""
+        self._patch_git_show(
+            monkeypatch, stdout=b"def other_func():\n    pass\n"
+        )
+        result = await summarize_ungrounded_claims([
+            "backend/app/module.py:missing_symbol is the main entry point"
+        ])
+        assert result is not None
+        assert result["ungrounded_claim_count"] == 1
+        assert "backend/app/module.py:missing_symbol" in result["ungrounded_refs"]
+
+    async def test_grounded_claim_with_present_symbol_is_not_flagged(self, monkeypatch):
+        """A claim referencing a symbol that IS defined is not flagged."""
+        self._patch_git_show(
+            monkeypatch, stdout=b"def present_func():\n    return True\n"
+        )
+        result = await summarize_ungrounded_claims([
+            "backend/app/module.py:present_func implements the main logic"
+        ])
+        assert result is None
+
+    async def test_multiple_claims_with_distinct_ungrounded_count(self, monkeypatch):
+        """Ungrounded-claim count reflects distinct claims, not total refs."""
+        from app import source_ref_validation as srv
+
+        # Mock _symbol_defined_at_head to return False for missing symbols
+        async def mock_symbol_check(path, symbol):
+            return symbol == "present_func"
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = [
+            "backend/app/x.py:present_func does something",
+            "backend/app/x.py:missing_func does something else",
+            "backend/app/x.py:missing_func is also referenced here",  # same ref, different claim
+            "backend/app/y.py:another_missing creates objects",
+        ]
+        result = await summarize_ungrounded_claims(claims)
+        assert result is not None
+        # 3 claims carry ungrounded refs (claims 2, 3, 4)
+        assert result["ungrounded_claim_count"] == 3
+        # 2 distinct ungrounded refs (missing_func and another_missing)
+        assert len(result["ungrounded_refs"]) == 2
+        assert "backend/app/x.py:missing_func" in result["ungrounded_refs"]
+        assert "backend/app/y.py:another_missing" in result["ungrounded_refs"]
+
+    async def test_mixed_grounded_and_ungrounded_claims(self, monkeypatch):
+        """Batch with both grounded and ungrounded claims filters only the bad ones."""
+        from app import source_ref_validation as srv
+
+        async def mock_symbol_check(path, symbol):
+            return symbol in ("func_a", "func_b")
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = [
+            "backend/app/module.py:func_a is solid",
+            "backend/app/module.py:missing_func is broken",
+            "backend/app/module.py:func_b is also solid",
+            "backend/app/module.py:ghost_func is gone",
+        ]
+        result = await summarize_ungrounded_claims(claims)
+        assert result is not None
+        # 2 claims carry ungrounded refs
+        assert result["ungrounded_claim_count"] == 2
+        assert len(result["ungrounded_refs"]) == 2
+
+    async def test_indeterminate_git_state_flags_nothing(self, monkeypatch):
+        """When git is unavailable, no claims are flagged (fail-open)."""
+        from app import source_ref_validation as srv
+
+        async def mock_symbol_check(path, symbol):
+            # Simulate git unavailability returning None (indeterminate)
+            return None
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = [
+            "backend/app/module.py:some_func does something",
+            "backend/app/module.py:another_func does another thing",
+        ]
+        result = await summarize_ungrounded_claims(claims)
+        # Indeterminate refs (None) are treated as grounded, so no result
+        assert result is None
+
+    async def test_claim_with_file_source_excerpt_is_checked(self, monkeypatch):
+        """File sources with quote/excerpt fields are checked the same way."""
+        from app import source_ref_validation as srv
+
+        async def mock_symbol_check(path, symbol):
+            return symbol == "present_func"
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", mock_symbol_check)
+
+        claims = []
+        sources = [
+            {
+                "type": "file",
+                "ref": "backend/app/module.py",
+                "quote": "backend/app/module.py:missing_func is defined here"
+            }
+        ]
+        result = await summarize_ungrounded_claims(claims, sources)
+        assert result is not None
+        # Source excerpts increment ungrounded_refs but NOT ungrounded_claim_count
+        assert result["ungrounded_claim_count"] == 0
+        assert "backend/app/module.py:missing_func" in result["ungrounded_refs"]
+
+
+class TestUngroundedClaimsGroundedAgainstBranch:
+    """_summarize_ungrounded_claims_grounded threads the GitHub repo/branch
+    verification context through to the symbol check so symbol grounding runs
+    against the real integration branch, with a conservative local fallback."""
+
+    _CTX = {
+        "token": "tok",
+        "owner": "octo",
+        "repo": "repo",
+        "branch": "integration",
+        "project_id": "proj-1",
+    }
+
+    async def test_github_context_absent_symbol_flagged(self, monkeypatch):
+        """With GitHub creds, an absent symbol on the branch is flagged via the
+        GitHub content fetch (the local checkout is never consulted)."""
+        from app import source_ref_validation as srv
+
+        fetch = AsyncMock(return_value=(True, "def other_func():\n    pass\n"))
+        monkeypatch.setattr(srv, "_file_content_in_repo_branch", fetch)
+        # Local git must never be touched on the GitHub-context path.
+        monkeypatch.setattr(
+            srv.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=AssertionError("local git used on GitHub path")),
+        )
+
+        result = await _summarize_ungrounded_claims_grounded(
+            ["backend/app/module.py:missing_symbol is the entry point"],
+            None,
+            self._CTX,
+        )
+        assert result is not None
+        assert result["ungrounded_claim_count"] == 1
+        assert "backend/app/module.py:missing_symbol" in result["ungrounded_refs"]
+        # Context threaded through to the content fetch.
+        assert fetch.await_count >= 1
+        _, kwargs = fetch.call_args
+        assert kwargs["branch"] == "integration"
+        assert kwargs["owner"] == "octo"
+
+    async def test_github_context_present_symbol_not_flagged(self, monkeypatch):
+        """A symbol present on the branch is grounded → None."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv,
+            "_file_content_in_repo_branch",
+            AsyncMock(return_value=(True, "def present_func():\n    return True\n")),
+        )
+        result = await _summarize_ungrounded_claims_grounded(
+            ["backend/app/module.py:present_func implements the logic"],
+            None,
+            self._CTX,
+        )
+        assert result is None
+
+    async def test_indeterminate_check_never_flags(self, monkeypatch):
+        """An indeterminate symbol check (no creds → local git unavailable)
+        never produces an ungrounded ref, even with a branch-only context."""
+        from app import source_ref_validation as srv
+
+        async def _indeterminate(path, symbol, **kwargs):
+            return None
+
+        monkeypatch.setattr(srv, "_symbol_defined_at_head", _indeterminate)
+        result = await _summarize_ungrounded_claims_grounded(
+            ["backend/app/module.py:some_func does something"],
+            None,
+            {"branch": "integration", "project_id": "proj-1"},  # no token/owner/repo
+        )
+        assert result is None
+
+    async def test_file_source_excerpt_counts_refs_not_claims(self, monkeypatch):
+        """File-source excerpts add ungrounded refs but never increment the
+        claim count (mirrors summarize_ungrounded_claims' count_claim=False)."""
+        from app import source_ref_validation as srv
+
+        monkeypatch.setattr(
+            srv,
+            "_file_content_in_repo_branch",
+            AsyncMock(return_value=(True, "def other_func():\n    pass\n")),
+        )
+        sources = [
+            {
+                "type": "file",
+                "ref": "backend/app/module.py",
+                "quote": "backend/app/module.py:missing_func is defined here",
+            }
+        ]
+        result = await _summarize_ungrounded_claims_grounded([], sources, self._CTX)
+        assert result is not None
+        assert result["ungrounded_claim_count"] == 0
+        assert "backend/app/module.py:missing_func" in result["ungrounded_refs"]
+
+
+class TestStructuralActionabilityDowngrade:
+    """The actionability gate downgrades findings whose structural support is insufficient."""
+
+    def test_high_grade_with_no_claims_downgrades_to_low(self):
+        """Finding with HIGH grade but no claims downgrades to LOW."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": [],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # _ungrounded_claim_count not set (assume 0)
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        assert findings[0]["actionability_grade"] == "LOW"
+
+    def test_high_grade_with_ungrounded_claims_downgrades(self):
+        """Finding with HIGH grade but all claims ungrounded downgrades to MEDIUM or LOW."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": ["claim1", "claim2"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                "_ungrounded_claim_count": 2,  # Both claims are ungrounded
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        # effective_claims = 2 - 2 = 0, so grade drops below HIGH
+        assert findings[0]["actionability_grade"] != "HIGH"
+
+    def test_medium_grade_with_partial_ungrounded_claims(self):
+        """Finding with 3 claims where 1 is ungrounded drops from 3 effective to 2."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "MEDIUM",
+                "description": "x" * 100,
+                "claims": ["c1", "c2", "c3"],
+                "sources": [{"type": "file", "ref": "backend/app/foo.py"}],
+                "_ungrounded_claim_count": 1,
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        # effective_claims = 3 - 1 = 2; sources = 1
+        # 2 >= 2 and 1 >= 1 and len(desc) >= 80 → stays HIGH or MEDIUM, not downgraded
+        assert findings[0]["actionability_grade"] in ("MEDIUM", "HIGH")
+
+    def test_low_grade_stays_low(self):
+        """Finding already at LOW grade is never downgraded further."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "LOW",
+                "description": "x" * 100,
+                "claims": ["c1"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                "_ungrounded_claim_count": 1,
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        assert findings[0]["actionability_grade"] == "LOW"
+
+    def test_downgrade_count_returned_correctly(self):
+        """Return value reflects number of findings actually downgraded."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": [],
+                "sources": [],
+                # No claims, sources, or sufficient description → downgrade to LOW
+            },
+            {
+                "title": "F2",
+                "actionability_grade": "MEDIUM",
+                "description": "x" * 100,
+                "claims": ["c1"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # Has structure: 1 claim, 1 source, sufficient desc → stays MEDIUM
+            },
+            {
+                "title": "F3",
+                "actionability_grade": "HIGH",
+                "claims": ["c1", "c2"],
+                "description": "x" * 100,
+                "sources": [],
+                "_ungrounded_claim_count": 2,
+                # effective_claims = 0; sources = 0 → downgrade to LOW
+            }
+        ]
+        downgrades = _apply_structural_actionability_downgrade(findings)
+        assert downgrades == 2
+        assert findings[0]["actionability_grade"] == "LOW"
+        assert findings[1]["actionability_grade"] == "MEDIUM"
+        assert findings[2]["actionability_grade"] == "LOW"
+
+    def test_grade_order_respected_on_downgrade(self):
+        """Downgrades only happen when structural grade is lower than current."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "LOW",
+                "description": "description",
+                "claims": ["c1", "c2"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # effective_claims = 2, sources = 1, desc >= 40 → structural = HIGH
+                # But current is LOW, so no downgrade (can't upgrade)
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        assert findings[0]["actionability_grade"] == "LOW"
+
+    def test_missing_ungrounded_count_treats_as_zero(self):
+        """Finding without _ungrounded_claim_count field is treated as 0."""
+        findings = [
+            {
+                "title": "F1",
+                "actionability_grade": "HIGH",
+                "description": "x" * 100,
+                "claims": ["c1"],
+                "sources": [{"type": "pr", "ref": "https://github.com/o/r/pull/1"}],
+                # _ungrounded_claim_count not present
+            }
+        ]
+        _apply_structural_actionability_downgrade(findings)
+        # effective_claims = 1 - 0 = 1; sources = 1; desc >= 80
+        # This meets HIGH threshold (1 >= 2? No, but sources >= 1 and desc >= 80 → MEDIUM)
+        # Actually: effective_claims >= 1 or valid_sources >= 1 and len(desc) >= 40 → MEDIUM
+        # So no downgrade from HIGH → but wait, let me reread the threshold...
+        # HIGH requires: effective_claims >= 2 AND valid_sources >= 1 AND len(desc) >= 80
+        # This has 1 claim, so it cannot be HIGH, will downgrade to MEDIUM at best
+        assert findings[0]["actionability_grade"] in ("MEDIUM", "LOW")
 
 
 class TestExtractSourceFilePaths:

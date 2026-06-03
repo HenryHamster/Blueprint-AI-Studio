@@ -11,6 +11,7 @@ import { RemediationFunnelSection } from './RemediationFunnelSection';
 import { FailureStageWidget } from './FailureStageWidget';
 import { TaskDurationWidget, type TaskDurationStats } from './TaskDurationWidget';
 import { FixLoopConvergenceWidget } from './FixLoopConvergenceWidget';
+import { OuterReviewLoopConvergenceWidget } from './OuterReviewLoopConvergenceWidget';
 import { ScopeConversionRatesSection } from './ScopeConversionRatesSection';
 import { ScopeTrendsSection, type ScopeBaselinesResponse } from './ScopeTrendsSection';
 import { ProviderCostPanel } from './ProviderCostPanel';
@@ -37,6 +38,7 @@ import { TAXONOMY_ORDER } from './dashboardConstants';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import { SystemStatusCard } from './SystemStatusCard';
 import { PipelineEfficiencyPanel } from './PipelineEfficiencyPanel';
+import { WarmReuseVsCostTrend } from './WarmReuseVsCostTrend';
 import { FailureClassPill } from './FailureClassPill';
 import { SystemHealthCard, type HealthOverviewResponse } from './SystemHealthCard';
 import { AnomalyThrottleBanner } from './AnomalyThrottleBanner';
@@ -524,6 +526,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
 
+      {/* Warm-reuse vs cost-per-merged-PR trend (baseline reference line) */}
+      <WarmReuseVsCostTrend projectId={selectedProjectId} />
+
       {/* System Status */}
       <SystemStatusCard digest={digest} loading={loading} />
 
@@ -590,6 +595,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                 projectId={selectedProjectId ?? undefined}
                 onViewTask={handleViewTaskById}
               />
+              <div className="mt-3">
+                <OuterReviewLoopConvergenceWidget
+                  trendDays={fixLoopTrendDays}
+                  projectId={selectedProjectId ?? undefined}
+                  windowHours={windowHours}
+                />
+              </div>
             </div>
           )}
 

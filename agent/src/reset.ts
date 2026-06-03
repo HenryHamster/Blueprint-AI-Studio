@@ -72,6 +72,80 @@ export interface ResetOptions {
   baseBranch?: string;
 }
 
+// Home-relative provider credential / CLI-state paths the boot manifest
+// materializes (build_agent_secret_manifest → materialize_manifest.py): provider
+// API/OAuth cred dirs plus the Claude Code onboarding-bypass file ~/.claude.json
+// and ~/.gemini/settings.json. These are ACCOUNT-SCOPED, not per-task, so they
+// must be wiped ONLY when the next role binds a DIFFERENT account — and on that
+// account-divergent path performWarmRetarget (index.ts) clears them via
+// clearProviderCredentials and immediately re-materializes the new account's
+// files before the role runs, so there is no leakage and no missing-config gap.
+//
+// Critically, this wipe must NOT run on the same-account fast path (chain
+// continuity / backlog reuse, both default-ON). There the boot-materialized
+// config is exactly the right config for the next role and nothing re-creates
+// it — wiping it would leave role 2+ without ~/.claude.json / ~/.gemini settings
+// (buildBaseCliEnv has no env-only equivalent for the onboarding bypass), a
+// silent credential/config regression on the live warm paths. resetForNextRole
+// therefore does NOT clear these; only the account-divergent re-target does.
+const PROVIDER_CRED_HOME_PATHS = [
+  '.anthropic',
+  '.openai',
+  '.gemini',
+  '.claude.json',
+] as const;
+
+// systemd EnvironmentFile written at boot. Root-owned 0600, so the agent user
+// usually needs sudo to remove it; clearProviderCredentials falls back to
+// `sudo rm` on EACCES/EPERM. Tests pass a writable temp path so neither sudo
+// nor the real /etc file is touched.
+const SYSTEM_ENV_FILE = '/etc/agent.env';
+
+/** Remove a path, falling back to `sudo rm -rf` when the agent user lacks
+ *  direct permission (e.g. the root-owned /etc/agent.env). All failures are
+ *  swallowed (logged) — credential clearing is best-effort and must never
+ *  abort the between-role reset. */
+async function rmBestEffort(target: string): Promise<void> {
+  try {
+    await fs.promises.rm(target, { recursive: true, force: true });
+    return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EACCES' || code === 'EPERM') {
+      try {
+        await execFileAsync('sudo', ['rm', '-rf', target], { timeout: 30_000 });
+        return;
+      } catch (sudoErr) {
+        console.error(`[reset] clearProviderCredentials sudo rm ${target}: ${String(sudoErr)}`);
+        return;
+      }
+    }
+    console.error(`[reset] clearProviderCredentials rm ${target}: ${String(err)}`);
+  }
+}
+
+/**
+ * Clear the prior account's credential material so it cannot leak into the
+ * next role. Wipes the systemd env file (provider/auth/model + secret env) and
+ * the provider CLI credential/state directories under the agent's home.
+ *
+ * Exported so the warm re-target path (index.ts performWarmRetarget) can call it
+ * explicitly before materializing a new account's manifest — guaranteeing
+ * clear-then-write ordering on the account-divergent path. It is deliberately
+ * NOT called from resetForNextRole's same-account fast path (see the
+ * PROVIDER_CRED_HOME_PATHS comment): there the boot-materialized config is still
+ * correct and nothing would re-create it.
+ */
+export async function clearProviderCredentials(
+  homeDir: string = process.env.HOME || os.homedir(),
+  envFilePath: string = SYSTEM_ENV_FILE,
+): Promise<void> {
+  await rmBestEffort(envFilePath);
+  for (const rel of PROVIDER_CRED_HOME_PATHS) {
+    await rmBestEffort(path.join(homeDir, rel));
+  }
+}
+
 /**
  * Reset all per-role state on the warm VM.
  *
@@ -136,6 +210,16 @@ export async function resetForNextRole(opts: ResetOptions): Promise<void> {
   } catch (err) {
     console.error(`[reset] step 3 (~/.claude wipe) failed: ${String(err)}`);
   }
+
+  // NOTE: provider credential material (/etc/agent.env + provider cred/state
+  // dirs) is intentionally NOT cleared here. Those files are account-scoped and
+  // identical across same-account roles (chain continuity / backlog reuse, both
+  // default-ON); wiping them on the same-account fast path would destroy
+  // boot-materialized config (~/.claude.json onboarding bypass, ~/.gemini
+  // settings) that nothing re-creates, breaking role 2+. Account-divergent warm
+  // claims instead clear-then-re-materialize via performWarmRetarget
+  // (index.ts → clearProviderCredentials) before the next role runs, so there
+  // is no cross-account leakage on the only path where a leak is possible.
 
   // Step 4 — reset the workspace to a clean HEAD while preserving
   // dependency caches. This is the only step we re-throw on; if the

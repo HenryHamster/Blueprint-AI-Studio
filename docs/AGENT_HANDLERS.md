@@ -122,7 +122,7 @@ These handlers clone the repo, run Claude Code, and optionally create a PR.
 **Workflow:**
 1. Clone repo
 2. Claude generates documentation (README, docstrings, API docs)
-3. No PR creation — docs usually checked in directly
+3. Run the normal code-change loop for docs work (checks, then PR creation with a `docs:` title prefix)
 4. Report artifact type: `RESEARCH_FINDINGS` or custom
 
 ---
@@ -247,7 +247,7 @@ These handlers clone the repo, run Claude Code, and optionally create a PR.
 
 ### `handleResearch` (research-plan.ts)
 
-**Task type:** `research` (or `strategic_review` when `research_mode="strategic"`)
+**Task type:** `research` (only when `research_mode` is *not* `"strategic"` — see note below)
 
 **Purpose:** Investigate a codebase area and produce structured findings.
 
@@ -285,7 +285,12 @@ These handlers clone the repo, run Claude Code, and optionally create a PR.
 ```
 
 **Strategic mode:**
-When `research_mode="strategic"`, findings feed into the autonomous research cycle to generate next directions.
+The `research` task type is registered to a `dispatchResearch` wrapper (see
+[Handler Registration](#handler-registration)). When `research_mode="strategic"`,
+that wrapper routes to `handleStrategic` (the same handler the `strategic_review`
+task type uses) instead of `handleResearch`; the strategic path generates the
+next autonomous-research directions. For all other `research_mode` values the
+wrapper calls `handleResearch` as described above.
 
 ---
 
@@ -499,12 +504,22 @@ Handlers use centralized logging:
 All handlers are registered in `handlers/index.ts`:
 
 ```typescript
+// research task type forwards to the strategic handler when research_mode is
+// 'strategic'; otherwise it runs the tactical research path. strategic_review
+// always goes directly to handleStrategic.
+const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
+  if (payload.research_mode === 'strategic') {
+    return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+  }
+  return handleResearch(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+};
+
 export const handlers: Record<AgentTaskType, Handler> = {
   create: handleCreate,
   review: handleReview,
   fix: handleFix,
   plan: handlePlan,
-  research: handleResearch,
+  research: dispatchResearch,
   docs: handleDocs,
   security_audit: handleSecurityAudit,
   self_audit: handleSelfAudit,
@@ -517,7 +532,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   perf: handlePerf,
   investigate: handleInvestigate,
   design_doc_update: handleDesignDocUpdate,
-  strategic_review: handleResearch,  // Reuses research handler
+  strategic_review: handleStrategic,
   release_audit: handleReleaseAudit,
   memo: handleMemo,
 };

@@ -541,11 +541,12 @@ async def test_residual_upsert_skips_on_lock_contention(mocker, caplog):
     """When the residual-case row is held by a peer, the background upsert
     must skip rather than raise. The next residual hit will retry the
     increment — losing one count is far cheaper than a 500-quarantined
-    instance. Phase A1, was site failure_classification.py:887,921.
+    instance. Phase A1, was site failure_classification.py:887,921
+    (residual subsystem since extracted to failure_residual.py).
     """
     import logging
 
-    from app.failure_classification import _upsert_residual_case_async
+    from app.failure_residual import _upsert_residual_case_async
 
     # Stub AsyncSessionLocal to return a session whose execute() emulates
     # contention: locking SELECTs return empty, but the non-locking probe
@@ -619,7 +620,7 @@ async def test_residual_upsert_skips_on_lock_contention(mocker, caplog):
 
     now_dt = datetime.now(tz=timezone.utc)
 
-    with caplog.at_level(logging.INFO, logger="app.failure_classification"):
+    with caplog.at_level(logging.INFO, logger="app.failure_residual"):
         # Must complete without raising — the helper logs and returns.
         await _upsert_residual_case_async(project_id, fingerprint, now_dt, "sample")
 

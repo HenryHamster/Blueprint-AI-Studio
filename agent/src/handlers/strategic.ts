@@ -14,6 +14,7 @@ import {
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { parseBackendTimestamp } from '../utils/time.js';
+import { reconcileDesignDocPresence } from '../utils/design-doc-presence.js';
 import {
   formatPreviousDecisionOutcomes,
   formatPastRetirementCritiques,
@@ -37,6 +38,7 @@ import {
 } from './research-plan.js';
 import {
   buildSystemMaturitySection,
+  buildCapabilityVerificationSection,
   buildDriftSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
@@ -46,6 +48,21 @@ import {
   buildDirSummaryText,
   buildDirHealthSummary,
 } from './strategic-sections.js';
+
+/**
+ * Render the backend-supplied `prompt_suffix` as an "Additional instructions"
+ * block, matching the convention every other agent task type uses (see
+ * research-plan.ts / standard.ts / audits.ts). The strategic payload packs
+ * per-cycle guidance here every cycle — deployment-model framing, stabilize
+ * audit-findings hints, build/stabilize stall nudges, mode hints — so this is
+ * reasoning input that must reach the thinker (analysis) pass. Returns '' when
+ * the suffix is absent so the prompt stays unchanged for empty payloads.
+ */
+export function renderStrategicPromptSuffix(payload: Record<string, unknown>): string {
+  return payload.prompt_suffix
+    ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}`
+    : '';
+}
 
 export async function handleStrategic(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -123,7 +140,16 @@ export async function handleStrategic(
 
     const dirSummaryText = buildDirSummaryText(directionsSummary);
 
-    const designDoc = payload.design_doc as Record<string, unknown> | undefined;
+    // Reconcile the design doc's systems/* and capabilities/* statuses against
+    // the cloned file tree BEFORE serializing into the thinker prompt: any
+    // entry marked present (mature/functional/partial / working) whose backing
+    // module files are all absent on the integration branch is downgraded to
+    // `missing` + annotated, so the strategic agent never reasons on a status
+    // the code does not back up.
+    const designDoc = reconcileDesignDocPresence(
+      payload.design_doc as Record<string, unknown> | undefined,
+      WORKSPACE,
+    );
     const designDocJson = designDoc && Object.keys(designDoc).length > 0
       ? JSON.stringify(designDoc, null, 2)
       : '';
@@ -269,6 +295,7 @@ export async function handleStrategic(
     const problemModelSection = problemModelJson
       ? `## Your current understanding (problem_model)\n\`\`\`json\n${problemModelJson}\n\`\`\``
       : `## Your current understanding (problem_model)\n_(empty — this is the first cycle. Bootstrap from the other sections below.)_`;
+    const verificationFailuresSection = buildCapabilityVerificationSection(problemModel);
 
     const runningUpdateSection = `## Running update (living document — rewrite, don't append)\n${renderRunningUpdateDoc(runningUpdateDoc)}\n\n_This is the document the user currently sees. Refine it this cycle — remove stale content, integrate what's new, keep it coherent and short. It's a current snapshot, not a log._`;
 
@@ -307,6 +334,7 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       packerMetaSection,
       strategicContext,
       problemModelSection,
+      verificationFailuresSection,
       reflectionSection,
       selfImprovementBlock,
       runningUpdateSection,
@@ -332,8 +360,14 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       efficiencySnapshotSection,
     });
 
+    // Append the backend-supplied prompt_suffix as "Additional instructions"
+    // (same convention as every other task type). This guidance is reasoning
+    // input — deployment framing, stabilize audit-findings hints, stall nudges,
+    // mode hints — so it belongs in the analysis pass that produces decisions.
+    const thinkerPromptWithSuffix = thinkerPrompt + renderStrategicPromptSuffix(payload);
+
     const thinkerGateResult = await runThinkerWithGate(
-      thinkerPrompt, taskId, ws, statusRef, model, effort, disallowedTools,
+      thinkerPromptWithSuffix, taskId, ws, statusRef, model, effort, disallowedTools,
     );
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;

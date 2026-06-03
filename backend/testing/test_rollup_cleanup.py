@@ -30,10 +30,18 @@ from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlmodel import SQLModel
+from sqlmodel import SQLModel, select
 
 from app.rollup_management import _cleanup_branches, _verify_pr_merged
-from app.models import Project, Task, TaskStatus, Artifact, ArtifactType
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Project,
+    Task,
+    TaskStatus,
+    Artifact,
+    ArtifactType,
+)
 
 
 # ── Fixture ───────────────────────────────────────────────────────────────────
@@ -76,8 +84,20 @@ async def cleanup_db():
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def _make_project(session):
-    project = Project(name="Test Project", user_id="user1")
+async def _make_project(
+    session,
+    *,
+    integration_branch: str | None = None,
+    promotion_target: str | None = None,
+    build_config: dict | None = None,
+):
+    project = Project(
+        name="Test Project",
+        user_id="user1",
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+        build_config=build_config,
+    )
     session.add(project)
     await session.commit()
     await session.refresh(project)
@@ -748,12 +768,12 @@ async def _make_artifact(session, task_id, pr_url):
 
 @pytest.mark.asyncio
 async def test_verify_pr_merged_context_cache_hit(cleanup_db, mocker):
-    """If task.context already has pr_merged=True, returns True without any API call."""
+    """The unblock bit short-circuits even when the task did not land on integration."""
     project = await _make_project(cleanup_db)
     task = await _make_task(
         cleanup_db,
         project.id,
-        context={"pr_merged": True},
+        context={"pr_merged": True, "landed_on_integration": False},
     )
 
     mock_get_pr = mocker.patch("app.github.get_pull_request", new_callable=AsyncMock)
@@ -776,12 +796,14 @@ async def test_verify_pr_merged_no_artifact(cleanup_db, mocker):
 
     assert result is True
     assert task.context.get("pr_merged") is True
+    assert task.context.get("landed_on_integration") is False
+    assert task.context.get("_non_merge_unblock_reason") == "rollup_no_pr_artifact"
     mock_get_pr.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
-    """GitHub API says merged=True → returns True, updates task.context."""
+    """A verified merged child PR is treated as an integration landing."""
     project = await _make_project(cleanup_db)
     task = await _make_task(cleanup_db, project.id, context={})
     await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/42")
@@ -797,12 +819,234 @@ async def test_verify_pr_merged_api_confirms_merged(cleanup_db, mocker):
         return_value={"merged": True, "state": "closed"},
     )
     ctx, _ = _make_write_session_mock(db_task=None)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
     assert result is True
     assert task.context.get("pr_merged") is True
+    assert task.context.get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_on_distinct_promotion_target_alerts_without_pr_merged(
+    cleanup_db, mocker
+):
+    project = await _make_project(
+        cleanup_db,
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/43")
+
+    mocker.patch(
+        "app.broadcast.broadcast_to_project",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "state": "closed", "base": {"ref": "main"}},
+    )
+    write_ctx, _write_session = _make_write_session_mock(db_task=None)
+    mocker.patch(
+        "app.rollup_pr_verification.AsyncSessionLocal",
+        return_value=write_ctx,
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+    await cleanup_db.commit()
+    alerts = (
+        (
+            await cleanup_db.execute(
+                select(Alert).where(Alert.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    assert result is True
+    assert (task.context or {}).get("pr_merged") is None
+    assert write_ctx.__aenter__.await_count == 0
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_on_single_branch_sets_pr_merged(cleanup_db, mocker):
+    project = await _make_project(
+        cleanup_db,
+        integration_branch="main",
+        promotion_target="main",
+    )
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/44")
+
+    mocker.patch(
+        "app.broadcast.broadcast_to_project",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "state": "closed", "base": {"ref": "main"}},
+    )
+    ctx, _ = _make_write_session_mock(db_task=None)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
+
+    result = await _verify_pr_merged(task, cleanup_db)
+    await cleanup_db.commit()
+    alerts = (
+        (
+            await cleanup_db.execute(
+                select(Alert).where(Alert.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    assert result is True
+    assert task.context.get("pr_merged") is True
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_success_close_on_single_branch_sets_pr_merged(
+    cleanup_db, mocker
+):
+    project = await _make_project(
+        cleanup_db,
+        integration_branch="main",
+        promotion_target="main",
+    )
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        context={"pr_closed_success": True},
+    )
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/45")
+
+    mocker.patch(
+        "app.broadcast.broadcast_to_project",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "state": "closed", "base": {"ref": "main"}},
+    )
+    db_task_mock = MagicMock()
+    db_task_mock.context = {}
+    db_task_mock.status = TaskStatus.EVALUATING
+    ctx, write_session = _make_write_session_mock(db_task=db_task_mock)
+    write_session.get = AsyncMock(return_value=db_task_mock)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is True
+    assert (task.context or {}).get("landed_on_integration") is True
+    assert (task.context or {}).get("_non_merge_unblock_reason") is None
+    assert db_task_mock.context.get("pr_merged") is True
+    assert db_task_mock.context.get("landed_on_integration") is True
+    assert db_task_mock.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_success_close_on_distinct_promotion_target_alerts_without_pr_merged(
+    cleanup_db, mocker
+):
+    project = await _make_project(
+        cleanup_db,
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    task = await _make_task(
+        cleanup_db,
+        project.id,
+        context={"pr_closed_success": True},
+    )
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/46")
+
+    mocker.patch(
+        "app.broadcast.broadcast_to_project",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "state": "closed", "base": {"ref": "main"}},
+    )
+    db_task_mock = MagicMock()
+    db_task_mock.context = {}
+    db_task_mock.status = TaskStatus.EVALUATING
+    ctx, write_session = _make_write_session_mock(db_task=db_task_mock)
+    write_session.get = AsyncMock(return_value=db_task_mock)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
+
+    result = await _verify_pr_merged(task, cleanup_db)
+    await cleanup_db.commit()
+    alerts = (
+        (
+            await cleanup_db.execute(
+                select(Alert).where(Alert.task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+    assert (task.context or {}).get("pr_merged") is None
+    assert db_task_mock.context.get("pr_merged") is None
+    assert db_task_mock.status == TaskStatus.COMPLETED
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert alerts[0].title == "Merged PR landed on promotion target before integration"
 
 
 @pytest.mark.asyncio
@@ -827,7 +1071,7 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
         ],
     )
     ctx, _ = _make_write_session_mock(db_task=None)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
@@ -905,7 +1149,7 @@ async def test_verify_pr_merged_closed_not_merged_fails_task(cleanup_db, mocker)
     db_task_mock.context = {}
     ctx, write_session = _make_write_session_mock(db_task=db_task_mock)
     write_session.get = AsyncMock(return_value=db_task_mock)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
 
     result = await _verify_pr_merged(task, cleanup_db)
 
@@ -947,7 +1191,12 @@ def _mock_verify_pr_closed_deps(mocker, *, pr_data, reviews):
     db_task_mock.context = {}
     ctx, write_session = _make_write_session_mock(db_task=db_task_mock)
     write_session.get = AsyncMock(return_value=db_task_mock)
-    mocker.patch("app.rollup_management.AsyncSessionLocal", return_value=ctx)
+    # _verify_pr_merged lives in app.rollup_pr_verification and writes via that
+    # module's AsyncSessionLocal binding — patch there, not in rollup_management
+    # (matches every other _verify_pr_merged test in this file). Patching the
+    # wrong module let the real session run, which returned db_task=None against
+    # the rollback-isolated fixture DB and silently skipped the failure alert.
+    mocker.patch("app.rollup_pr_verification.AsyncSessionLocal", return_value=ctx)
     return write_session, alert_mock
 
 
@@ -1312,6 +1561,98 @@ async def test_zero_diff_rollup_pr_closed_without_spawning_review(cleanup_db, mo
     # No review/fix task spawned
     mock_spawn.assert_not_called()
     # Rollup PR marker cleared so reaper/retry logic doesn't resume with a closed PR
+    assert "rollup_pr_number" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
+async def test_zero_diff_rollup_on_intermediate_staged_target_stays_evaluating(
+    cleanup_db, mocker
+):
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="abc123"
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch(
+        "app.github.create_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 4243,
+            "html_url": "https://github.com/owner/repo/pull/4243",
+            "empty_diff": False,
+        },
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"additions": 0, "deletions": 0, "merged": False, "state": "open"},
+    )
+    mock_close = mocker.patch(
+        "app.github.close_pull_request", new_callable=AsyncMock, return_value=True
+    )
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(
+        cleanup_db,
+        integration_branch="automain",
+        promotion_target="release/main",
+        build_config={"staging_branch_prefixes": ["release/"]},
+    )
+
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "release/zero-diff",
+            "parent_base": "release/candidate-1",
+        },
+        payloads=[{"type": "research", "prompt": "rollup parent"}],
+        plan_output="some plan",
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("pr_merged") is None
+    assert "awaiting downstream landing" in (parent.latest_status_message or "")
+    mock_close.assert_awaited_once()
+    assert any(
+        call.args[-1] == "release/zero-diff" for call in mock_delete.call_args_list
+    )
+    mock_spawn.assert_not_called()
     assert "rollup_pr_number" not in (parent.context or {})
 
 
@@ -2716,6 +3057,8 @@ async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mock
     assert (child.context or {}).get("pr_merged") is True, (
         "Malformed pr_url must force-set pr_merged=True so rollup progresses"
     )
+    assert (child.context or {}).get("landed_on_integration") is False
+    assert (child.context or {}).get("_non_merge_unblock_reason") == "malformed_pr_url"
 
 
 # ── ci_waiting seed gate for the spawn-review path ────────────────────────────

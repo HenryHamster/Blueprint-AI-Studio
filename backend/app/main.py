@@ -1,3 +1,14 @@
+"""FastAPI application entry point for the Blueprint orchestrator.
+
+Constructs the ASGI ``app``, wires middleware (CORS, rate limiting, request
+IDs) and exception handlers, and registers every API router from
+``app.routers``. Background workers (orchestrator, reaper, cleanup) are
+started and stopped through the ``lifespan`` context manager imported from
+``app.lifecycle``. On startup it validates that the live database is at
+``EXPECTED_SCHEMA_REVISION`` (kept in lockstep with the latest Alembic
+migration) and records deployment state for new-deploy / rollback detection.
+"""
+
 import hmac
 import logging
 import os
@@ -35,6 +46,7 @@ from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_debug import router as admin_debug_router
 from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
 from app.routers.admin_project_config import router as admin_project_config_router
+from app.routers.admin_warm_pool import router as admin_warm_pool_router
 from app.routers.agent import router as agent_router
 from app.routers.agent_github import router as agent_github_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
@@ -68,10 +80,9 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
-
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0131"
+EXPECTED_SCHEMA_REVISION = "0136"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -635,6 +646,9 @@ from app.alert_dispatch import (  # noqa: F401  re-exported for back-compat (cal
     _create_halted_recovery_alerts,
     _maybe_create_failure_alert,
     _maybe_create_circuit_breaker_alert,
+    _maybe_create_escalation_alert,
+    _maybe_create_precondition_blocker_alert,
+    _maybe_create_cascade_cancel_alert,
     _create_strategic_alert,
 )
 
@@ -652,6 +666,7 @@ app.include_router(admin_settings_router)
 app.include_router(admin_debug_router)
 app.include_router(admin_pool_accounts_router)
 app.include_router(admin_project_config_router)
+app.include_router(admin_warm_pool_router)
 app.include_router(agent_router)
 app.include_router(agent_github_router)
 app.include_router(agent_strategic_fetch_router)

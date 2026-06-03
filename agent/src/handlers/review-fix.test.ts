@@ -244,6 +244,81 @@ describe('review history feedback truncation — reviewer sees at least as much 
   });
 });
 
+// ── handleFix: operator steering reaches the fix prompt ─────────────────────
+describe('handleFix — operator steering (strategic_intent)', () => {
+  const histWithStructured = [{
+    iteration: 1,
+    feedback: 'address the issues',
+    issues: [{ severity: 'major', description: 'real problem', file: 'a.ts', line: 10 }],
+  }];
+
+  it('prepends ## Project Vision before ## Operator Steering when vision is present', async () => {
+    await handleFix(
+      'task-vision-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 7, prompt: 'address review' },
+      {
+        vision: {
+          purpose: 'Ship the right user outcome.',
+          success_criteria: ['The fix is validated by the review feedback.'],
+          priorities: ['Keep the change minimal.'],
+          context: 'Fixes should inherit the project-level why.',
+        },
+        context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } },
+        strategic_intent: {
+          purpose: 'Build an autonomous coding studio.',
+          current_focus: 'Thread operator steering into tactical prompts.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Project Vision');
+    expect(prompt).toContain('**Purpose:** Ship the right user outcome.');
+    expect(prompt).toContain('**Success criteria:**');
+    expect(prompt).toContain('- The fix is validated by the review feedback.');
+    expect(prompt).toContain('**Priorities:**');
+    expect(prompt).toContain('- Keep the change minimal.');
+    expect(prompt).toContain('**Context:** Fixes should inherit the project-level why.');
+    expect(prompt).toContain('## Operator Steering');
+    expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
+    expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
+  it('prepends ## Operator Steering alongside the existing review context', async () => {
+    await handleFix(
+      'task-steering-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 7, prompt: 'address review' },
+      {
+        context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } },
+        strategic_intent: {
+          purpose: 'Build an autonomous coding studio.',
+          current_focus: 'Thread operator steering into tactical prompts.',
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Operator Steering');
+    expect(prompt).toContain('**Current focus:** Thread operator steering into tactical prompts.');
+    expect(prompt).toContain('**Purpose:** Build an autonomous coding studio.');
+    // The steering section is additive — existing review context still present.
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+
+  it('omits ## Operator Steering when strategic_intent is absent', async () => {
+    await handleFix(
+      'task-no-steering-fix',
+      { branch: 'feat/s', base_branch: 'main', pr_number: 8, prompt: 'address review' },
+      { context: { scope: 'small', review_loop: { iteration: 2, review_history: histWithStructured } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('## Operator Steering');
+    expect(prompt).toContain('[MAJOR] [a.ts:10] real problem');
+  });
+});
+
 // ── handleReview: scope-overflow replaces (not augments) scope preamble ─────
 describe('handleReview — scope overflow replaces scope-narrowed preamble', () => {
   const basePayload = {
@@ -1292,6 +1367,36 @@ describe('handleFix — code-change helper guidance is in prompt', () => {
   });
 });
 
+describe('handleFix — direction implementation constraints', () => {
+  it('surfaces implementation_constraints from direction_context in the enriched prompt', async () => {
+    await handleFix(
+      'task-fix-impl-constraints',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      {
+        context: { scope: 'small' },
+        direction_context: { implementation_constraints: 'Must not modify the public API surface.' },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain('## Implementation Constraints');
+    expect(prompt).toContain('Must not modify the public API surface.');
+  });
+
+  it('omits the Implementation Constraints section when direction_context has none', async () => {
+    await handleFix(
+      'task-fix-no-impl-constraints',
+      { branch: 'feature/x', base_branch: 'main', pr_number: 7, prompt: 'address review feedback' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).not.toContain('## Implementation Constraints');
+  });
+});
+
 // ── handleFix: conflict marker + stale-premise detection ────────────────────
 describe('handleFix — conflict marker detection', () => {
   it('enriches the prompt with a CONFLICT MARKERS FOUND header when git grep finds markers', async () => {
@@ -1846,6 +1951,23 @@ describe('handleFix structural prompt invariants', () => {
     expect(p).toContain("If You're Retrying");                           // PRIOR_ATTEMPT_DIVERGENCE
     expect(p).toContain('When You Find Bigger Problems Than Your Task');  // BEYOND_SCOPE_REPORTING
     expect(p).toContain('Use Grep/Glob for code search');                // DEFAULT_TOOL_GUIDANCE
+  });
+
+  it('build_config fix task gets project-aware ./check guidance (no Blueprint stacks)', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [
+        { path: 'web', type: 'node', lint_cmd: 'eslint src', build_cmd: 'npm run build', test_cmd: 'npm test' },
+      ],
+    } as ReturnType<typeof resolveBuildConfig>);
+    await handleFix('task-fix-bc', FIX_PAYLOAD, FIX_TASK, 'token', 'owner', 'repo', null, statusRef());
+    const p = capturedFixPrompt();
+    expect(p).toContain('Task lifecycle — you own it end-to-end');
+    expect(p).toContain('./pr open');
+    expect(p).toContain('./done');
+    expect(p).not.toContain('scripts/test-backend.sh');
+    expect(p).not.toContain('backend ruff');
+    expect(p).not.toContain('agent tsc');
+    expect(p).toContain('npm run build');
   });
 });
 

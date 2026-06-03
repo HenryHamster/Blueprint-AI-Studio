@@ -65,6 +65,9 @@ import {
   formatSelfReviewCalibrationSection,
   writeDesignDocHelper,
   CODE_CHANGE_HELPER_GUIDANCE,
+  buildCodeChangeHelperGuidance,
+  codeChangeGuidanceVariant,
+  computePromptFingerprint,
   CREATE_TASK_FOCUS,
   FIX_TASK_FOCUS,
   PLAYBOOK_GUIDANCE,
@@ -385,6 +388,31 @@ describe('buildContextPrefix', () => {
     expect(result).not.toContain('Recent cycles');
   });
 
+  it('renders implementation constraints in Direction Context when present', () => {
+    const task = {
+      direction_context: {
+        title: 'Refactor internals',
+        priority: 'high',
+        implementation_constraints: 'Must not modify the public API surface.',
+        failed_approaches: [],
+        recent_outcomes: [],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('**Implementation constraints:** Must not modify the public API surface.');
+  });
+
+  it('omits implementation constraints line when the field is absent or empty', () => {
+    const present = buildContextPrefix({
+      direction_context: { title: 'X', priority: 'low', implementation_constraints: '' },
+    });
+    expect(present).not.toContain('**Implementation constraints:**');
+    const missing = buildContextPrefix({
+      direction_context: { title: 'X', priority: 'low' },
+    });
+    expect(missing).not.toContain('**Implementation constraints:**');
+  });
+
   it('does not render direction_context section when direction_context is absent', () => {
     const task = {
       project_context: {
@@ -422,6 +450,61 @@ describe('buildContextPrefix', () => {
   it('does not render ## Project Vision when task.vision is absent', () => {
     const task = { payloads: [{ type: 'create' }] };
     expect(buildContextPrefix(task)).not.toContain('## Project Vision');
+  });
+
+  it('renders ## Strategic Intent (purpose, focus, context, constraints) when task.strategic_intent is present', () => {
+    const task = {
+      payloads: [{ type: 'create' }],
+      strategic_intent: {
+        purpose: 'Ship a reliable autonomous coding studio.',
+        current_focus: 'Make operator steering reach workers immediately.',
+        context: { project_type: 'internal-tool', team: 'solo' },
+        constraints: ['Never break the main branch', 'Keep PRs small'],
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Strategic Intent');
+    expect(result).toContain('**Purpose:** Ship a reliable autonomous coding studio.');
+    expect(result).toContain('**Current focus:** Make operator steering reach workers immediately.');
+    expect(result).toContain('- Project type: internal-tool');
+    expect(result).toContain('- Team: solo');
+    expect(result).toContain('- Never break the main branch');
+    expect(result).toContain('- Keep PRs small');
+  });
+
+  it('does not render ## Strategic Intent when task.strategic_intent is absent', () => {
+    const task = { payloads: [{ type: 'create' }] };
+    expect(buildContextPrefix(task)).not.toContain('## Strategic Intent');
+  });
+
+  it('renders direction contract fields (completion/success/retirement) in Direction Context', () => {
+    const task = {
+      direction_context: {
+        title: 'Carry live intent',
+        priority: 'high',
+        contract: {
+          completion_criteria: 'Workers render live intent and contract.',
+          success_evidence: 'Claim response exposes strategic_intent.',
+          retirement_condition: 'Live intent reaches every worker type.',
+        },
+      },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).toContain('**Completion criteria:** Workers render live intent and contract.');
+    expect(result).toContain('**Success evidence:** Claim response exposes strategic_intent.');
+    expect(result).toContain('**Retirement condition:** Live intent reaches every worker type.');
+  });
+
+  it('does not render contract lines when direction_context.contract is absent', () => {
+    const task = {
+      direction_context: { title: 'No contract', priority: 'low' },
+    };
+    const result = buildContextPrefix(task);
+    expect(result).toContain('## Direction Context');
+    expect(result).not.toContain('**Completion criteria:**');
+    expect(result).not.toContain('**Success evidence:**');
+    expect(result).not.toContain('**Retirement condition:**');
   });
 
   it('renders narrative (established findings, open questions, last cycle) in Direction Context', () => {
@@ -3602,62 +3685,62 @@ describe('formatSelfReviewBlindSpots', () => {
 });
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — truncated_files_read & incomplete_review schema', () => {
-  it('documents truncated_files_read in the schema block', async () => {
+  it('documents truncated_files_read in the schema block', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('truncated_files_read');
   });
 
-  it('documents the incomplete_review categories marker', async () => {
+  it('documents the incomplete_review categories marker', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('incomplete_review');
   });
 
-  it('explains truncated_files_read as a subset of changed files (verification-only)', async () => {
+  it('explains truncated_files_read as a subset of changed files (verification-only)', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/truncated_files_read[\s\S]*subset/);
   });
 });
 
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
-  it('includes scope-drift in the canonical category list', async () => {
+  it('includes scope-drift in the canonical category list', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`scope-drift`');
   });
 
-  it('includes scope threshold table for small scope', async () => {
+  it('includes scope threshold table for small scope', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('small');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('50');
   });
 
-  it('includes scope threshold table for medium scope', async () => {
+  it('includes scope threshold table for medium scope', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('medium');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('200');
   });
 
-  it('includes scope threshold table for large scope', async () => {
+  it('includes scope threshold table for large scope', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('large');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('800');
   });
 
-  it('instructs agent to run git diff --stat', async () => {
+  it('instructs agent to run git diff --stat', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --stat');
   });
 
-  it('describes off-scope file modifications as a second trigger', async () => {
+  it('describes off-scope file modifications as a second trigger', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('related_files');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('git diff --name-only');
   });
 
-  it('shows the off-scope issue format with file list', async () => {
+  it('shows the off-scope issue format with file list', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('modified files outside declared scope');
   });
 
-  it('mentions lockfile allowlist for incidental files', async () => {
+  it('mentions lockfile allowlist for incidental files', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('package-lock.json');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('poetry.lock');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Cargo.lock');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('go.sum');
   });
 
-  it('mentions sibling test files as allowlisted', async () => {
+  it('mentions sibling test files as allowlisted', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/\.test\.|\.spec\./);
   });
 
@@ -3670,7 +3753,7 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
   });
 
-  it('per-task-type focus blocks reference the off-scope files concept', async () => {
+  it('per-task-type focus blocks reference the off-scope files concept', () => {
     expect(CREATE_TASK_FOCUS).toContain('related_files');
     expect(CREATE_TASK_FOCUS).toContain('git diff --name-only');
     expect(FIX_TASK_FOCUS).toContain('related_files');
@@ -3679,39 +3762,39 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — scope-drift category', () => {
 });
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — regression_risk category', () => {
-  it('includes regression_risk in the canonical category list', async () => {
+  it('includes regression_risk in the canonical category list', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`regression_risk`');
   });
 
-  it('references the test_baseline file path', async () => {
+  it('references the test_baseline file path', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('test_baseline_');
   });
 
-  it('instructs agent to omit check when baseline file is absent', async () => {
+  it('instructs agent to omit check when baseline file is absent', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('omit');
   });
 });
 
 describe('CODE_CHANGE_HELPER_GUIDANCE — cross-system-contract category', () => {
-  it('includes cross-system-contract in the canonical category list', async () => {
+  it('includes cross-system-contract in the canonical category list', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('`cross-system-contract`');
   });
 
-  it('fires when diff touches 2+ of {admin-ui, backend, agent}', async () => {
+  it('fires when diff touches 2+ of {admin-ui, backend, agent}', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/admin-ui.*backend.*agent|≥2|>=2/);
   });
 
-  it('instructs agent to grep the other side for matching route definitions', async () => {
+  it('instructs agent to grep the other side for matching route definitions', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('grep');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('other');
   });
 
-  it('specifies major severity for URL/route mismatch', async () => {
+  it('specifies major severity for URL/route mismatch', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('major');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('minor');
   });
 
-  it('instructs agent to record passed:true when diff is not cross-system', async () => {
+  it('instructs agent to record passed:true when diff is not cross-system', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('diff does not cross system boundaries');
   });
 });
@@ -3759,31 +3842,31 @@ describe('TASK_TYPE_HINTS dispatch parity', () => {
 // fingerprint strings to the source constants so a rename here fails immediately
 // rather than silently invalidating the downstream assertions.
 describe('cross-cutting guidance-block fingerprints — structural invariants for prompt.ts', () => {
-  it('PLAYBOOK_GUIDANCE contains fingerprint used by handler structural tests', async () => {
+  it('PLAYBOOK_GUIDANCE contains fingerprint used by handler structural tests', () => {
     expect(PLAYBOOK_GUIDANCE).toContain('./playbook set');
   });
 
-  it('DEFAULT_TOOL_GUIDANCE contains fingerprint used by handler structural tests', async () => {
+  it('DEFAULT_TOOL_GUIDANCE contains fingerprint used by handler structural tests', () => {
     expect(DEFAULT_TOOL_GUIDANCE).toContain('Use Grep/Glob for code search');
   });
 
-  it('CODE_CHANGE_HELPER_GUIDANCE contains fingerprint used by handler structural tests', async () => {
+  it('CODE_CHANGE_HELPER_GUIDANCE contains fingerprint used by handler structural tests', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Task lifecycle — you own it end-to-end');
   });
 
-  it('READ_THE_FAILURE_MESSAGE contains section header fingerprint', async () => {
+  it('READ_THE_FAILURE_MESSAGE contains section header fingerprint', () => {
     expect(READ_THE_FAILURE_MESSAGE).toContain('Read The Failure Message Literally');
   });
 
-  it('SIZE_GUARDRAIL_GUIDANCE contains section header fingerprint', async () => {
+  it('SIZE_GUARDRAIL_GUIDANCE contains section header fingerprint', () => {
     expect(SIZE_GUARDRAIL_GUIDANCE).toContain('Size Guardrails Are Advisory');
   });
 
-  it('PRIOR_ATTEMPT_DIVERGENCE contains section header fingerprint', async () => {
+  it('PRIOR_ATTEMPT_DIVERGENCE contains section header fingerprint', () => {
     expect(PRIOR_ATTEMPT_DIVERGENCE).toContain("If You're Retrying");
   });
 
-  it('BEYOND_SCOPE_REPORTING contains section header fingerprint', async () => {
+  it('BEYOND_SCOPE_REPORTING contains section header fingerprint', () => {
     expect(BEYOND_SCOPE_REPORTING).toContain('When You Find Bigger Problems Than Your Task');
   });
 });
@@ -3793,7 +3876,7 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 // create/fix/docs/deps focus blocks were added. If this test fails, bump the
 // version in prompt.ts and reset this assertion to the new value.
 describe('SELF_REVIEW_PROMPT_VERSION — regime version lock', () => {
-  it('is "6" (current pinned version)', async () => {
+  it('is "6" (current pinned version)', () => {
     expect(SELF_REVIEW_PROMPT_VERSION).toBe('6');
   });
 
@@ -3952,23 +4035,23 @@ describe('formatSelfReviewCalibrationSection', () => {
 
 // ── CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning ───────────────
 describe('CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning', () => {
-  it('includes a reasoning field in the schema example for check_results', async () => {
+  it('includes a reasoning field in the schema example for check_results', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('"reasoning"');
   });
 
-  it('requires reasoning for both pass and fail outcomes on regressing categories', async () => {
+  it('requires reasoning for both pass and fail outcomes on regressing categories', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('BOTH pass and fail');
   });
 
-  it('references the Self-Review Blind Spots section as the source of regressing categories', async () => {
+  it('references the Self-Review Blind Spots section as the source of regressing categories', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Self-Review Blind Spots');
   });
 
-  it('instructs agent to describe what was inspected in the reasoning field', async () => {
+  it('instructs agent to describe what was inspected in the reasoning field', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('what you inspected');
   });
 
-  it('mentions the ./done exit error so agent knows to update SR JSON and re-run', async () => {
+  it('mentions the ./done exit error so agent knows to update SR JSON and re-run', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('reasoning field');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('./done');
   });
@@ -3976,54 +4059,171 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — regressing-category reasoning', () => 
 
 // ── CODE_CHANGE_HELPER_GUIDANCE — evidence anchors for high-stakes PASS verdicts ──
 describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
-  it('requires evidence anchors for PASS on correctness category', async () => {
+  it('requires evidence anchors for PASS on correctness category', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('correctness');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
-  it('requires evidence anchors for PASS on error-handling category', async () => {
+  it('requires evidence anchors for PASS on error-handling category', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('error-handling');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
-  it('requires evidence anchors for PASS on security category', async () => {
+  it('requires evidence anchors for PASS on security category', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('security');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
-  it('requires evidence anchors for PASS on regression_risk category', async () => {
+  it('requires evidence anchors for PASS on regression_risk category', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('regression_risk');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
-  it('requires evidence anchors for PASS on scope-drift category', async () => {
+  it('requires evidence anchors for PASS on scope-drift category', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('scope-drift');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
-  it('specifies file:line format as a valid anchor type', async () => {
+  it('specifies file:line format as a valid anchor type', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/file:line|path\/to\/file\.ts:/);
   });
 
-  it('specifies code snippet format as a valid anchor type', async () => {
+  it('specifies code snippet format as a valid anchor type', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/code snippet|quoted|backtick/);
   });
 
-  it('specifies scope-drift anchor formats (diff stats and file list)', async () => {
+  it('specifies scope-drift anchor formats (diff stats and file list)', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/Trigger A.*diff.*stats|Trigger B.*related_files/);
   });
 
-  it('mentions that this requirement applies to high-stakes categories', async () => {
+  it('mentions that this requirement applies to high-stakes categories', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/high-stakes|five categories/);
   });
 
-  it('excludes lower-stakes categories from evidence anchor requirement', async () => {
+  it('excludes lower-stakes categories from evidence anchor requirement', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/lower-stakes|style-conventions|documentation|performance|architecture/);
   });
 
-  it('documents scope-drift-specific anchor requirements (Trigger A and B)', async () => {
+  it('documents scope-drift-specific anchor requirements (Trigger A and B)', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger A');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
+  });
+});
+
+
+// ── buildCodeChangeHelperGuidance — project-aware ./check intro ──────────────
+describe('buildCodeChangeHelperGuidance', () => {
+  const SELF = { owner: 'HenryHamster', repo: 'BlueprintAIStudio' };
+  const FOREIGN = { owner: 'acme', repo: 'webapp' };
+  // A non-Blueprint build_config (no admin-ui/agent/backend, no test-backend.sh).
+  const FOREIGN_BUILD_CONFIG = {
+    directories: [
+      { path: 'frontend', type: 'node', lint_cmd: 'eslint src', build_cmd: 'vite build', test_cmd: 'vitest run' },
+      { path: 'api', type: 'python', lint_cmd: 'ruff check', test_cmd: 'pytest -q' },
+    ],
+  };
+
+  // The repo-agnostic parts must survive every variant.
+  const sharedInvariants = (g: string) => {
+    expect(g).toContain('Task lifecycle — you own it end-to-end');
+    expect(g).toContain('./pr open');
+    expect(g).toContain('./done');
+    expect(g).toContain('./fail');
+    expect(g).toContain('./blocked');
+    // self-review schema + the three informational checks live in the remainder
+    expect(g).toContain('self_review_');
+    expect(g).toContain('scope-drift');
+    expect(g).toContain('regression_risk');
+    expect(g).toContain('cross-system-contract');
+  };
+
+  // Isolate the stack-specific ./check intro (between the preamble and the
+  // first shared bullet). Blueprint-only stack identity must not appear HERE —
+  // note the preserved cross-system-contract example in the remainder legitimately
+  // lists {admin-ui, backend, agent}, so bare-token checks must be scoped to the intro.
+  const checkIntroOf = (g: string): string => {
+    const start = g.indexOf('executable):');
+    const end = g.indexOf('./pr open --title');
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    return g.slice(start, end);
+  };
+
+  it('self-repo + no build_config returns CODE_CHANGE_HELPER_GUIDANCE byte-for-byte', () => {
+    const g = buildCodeChangeHelperGuidance({ ...SELF });
+    expect(g).toBe(CODE_CHANGE_HELPER_GUIDANCE);
+    // sanity: it does keep the Blueprint-specific paragraph
+    expect(g).toContain('scripts/test-backend.sh');
+    expect(checkIntroOf(g)).toContain('admin-ui eslint');
+    sharedInvariants(g);
+  });
+
+  it('build_config variant omits Blueprint-only stacks and references configured commands', () => {
+    const g = buildCodeChangeHelperGuidance({ buildConfig: FOREIGN_BUILD_CONFIG, ...FOREIGN });
+    // scripts/test-backend.sh / "backend ruff" / "agent tsc" / "8 GB" appear ONLY in
+    // the Blueprint intro, never the shared remainder — safe to assert on the full string.
+    expect(g).not.toContain('scripts/test-backend.sh');
+    expect(g).not.toContain('agent tsc');
+    expect(g).not.toContain('backend ruff');
+    expect(g).not.toContain('8 GB');
+    // bare "admin-ui" must be gone from the stack intro (it survives only in the
+    // preserved cross-system-contract example in the remainder).
+    expect(checkIntroOf(g)).not.toContain('admin-ui');
+    // references the project's own directories + commands
+    expect(g).toContain('frontend');
+    expect(g).toContain('vite build');
+    expect(g).toContain('vitest run');
+    expect(g).toContain('api');
+    expect(g).toContain('pytest -q');
+    sharedInvariants(g);
+  });
+
+  it('build_config variant is used even on the self-repo when directories are configured', () => {
+    const g = buildCodeChangeHelperGuidance({ buildConfig: FOREIGN_BUILD_CONFIG, ...SELF });
+    expect(g).not.toContain('scripts/test-backend.sh');
+    expect(g).toContain('vite build');
+  });
+
+  it('non-Blueprint repo + no build_config matches the no-op ./check fallback', () => {
+    const g = buildCodeChangeHelperGuidance({ ...FOREIGN });
+    expect(g).not.toContain('scripts/test-backend.sh');
+    expect(g).not.toContain('backend ruff');
+    expect(checkIntroOf(g)).not.toContain('admin-ui');
+    expect(g).toContain('no configured build_config');
+    expect(g).toContain('CI is the backstop');
+    // still mentions both check entry points
+    expect(g).toContain('./check');
+    expect(g).toContain('./check test');
+    sharedInvariants(g);
+  });
+
+  it('empty directories list is treated as no build_config (falls through to repo branch)', () => {
+    const g = buildCodeChangeHelperGuidance({ buildConfig: { directories: [] }, ...SELF });
+    expect(g).toBe(CODE_CHANGE_HELPER_GUIDANCE);
+  });
+});
+
+describe('codeChangeGuidanceVariant + fingerprint divergence', () => {
+  const SELF = { owner: 'HenryHamster', repo: 'BlueprintAIStudio' };
+  const FOREIGN = { owner: 'acme', repo: 'webapp' };
+  const BUILD_CONFIG = { directories: [{ path: 'web', type: 'node', build_cmd: 'npm run build' }] };
+
+  it('labels each branch distinctly', () => {
+    expect(codeChangeGuidanceVariant({ ...SELF })).toBe('self-repo');
+    expect(codeChangeGuidanceVariant({ ...FOREIGN })).toBe('generic');
+    expect(codeChangeGuidanceVariant({ buildConfig: BUILD_CONFIG, ...FOREIGN })).toBe('build-config');
+  });
+
+  it('fingerprint diverges when the guidance variant diverges (same task type)', () => {
+    const selfFp = computePromptFingerprint('fix', undefined, { codeChangeGuidanceVariant: 'self-repo' });
+    const genericFp = computePromptFingerprint('fix', undefined, { codeChangeGuidanceVariant: 'generic' });
+    expect(selfFp).not.toBe(genericFp);
+  });
+
+  it('omitting the variant keeps the legacy fingerprint unchanged (backward compatible)', () => {
+    const legacy = computePromptFingerprint('fix');
+    const explicit = computePromptFingerprint('fix', undefined, {});
+    expect(explicit).toBe(legacy);
   });
 });
 

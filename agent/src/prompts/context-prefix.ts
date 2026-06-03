@@ -126,6 +126,68 @@ export function synthesizeFailureHotspots(
     .map(([file, count]) => ({ file, count }));
 }
 
+export function formatProjectVision(vision: Record<string, unknown> | undefined): string {
+  if (!vision || typeof vision !== 'object') return '';
+  const lines: string[] = ['## Project Vision'];
+  const purpose = strVal(vision.purpose);
+  if (purpose) lines.push(`**Purpose:** ${purpose}`);
+  const successCriteria = vision.success_criteria;
+  if (typeof successCriteria === 'string' && successCriteria) {
+    lines.push(`**Success criteria:** ${successCriteria}`);
+  } else if (Array.isArray(successCriteria) && successCriteria.length > 0) {
+    lines.push('**Success criteria:**');
+    for (const sc of successCriteria) {
+      const s = strVal(sc);
+      if (s) lines.push(`- ${s}`);
+    }
+  }
+  const priorities = Array.isArray(vision.priorities) ? vision.priorities as unknown[] : [];
+  if (priorities.length > 0) {
+    lines.push('**Priorities:**');
+    for (const p of priorities) {
+      const s = strVal(p);
+      if (s) lines.push(`- ${s}`);
+    }
+  }
+  const systems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
+  if (systems.length > 0) {
+    lines.push('**Systems:**');
+    for (const sys of systems) {
+      const name = strVal(sys.name);
+      if (!name) continue;
+      const status = strVal(sys.status);
+      const desc = strVal(sys.description);
+      const statusSuffix = status ? ` (${status})` : '';
+      const descSuffix = desc ? ` — ${desc}` : '';
+      lines.push(`- **${name}**${statusSuffix}${descSuffix}`);
+    }
+  }
+  const context = strVal(vision.context);
+  if (context) lines.push(`**Context:** ${context}`);
+  if (lines.length === 1) return '';
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
+// Render the operator's current strategic intent (purpose + current_focus) as
+// a distinct markdown section. Retained for the fix path (review-fix.ts), which
+// assembles its prompt manually and never calls buildContextPrefix. NOT called
+// inside buildContextPrefix itself — the canonical `## Strategic Intent` block
+// below already surfaces task.strategic_intent (purpose, current focus, context,
+// constraints), so calling this here too would double-render the same payload.
+// Returns '' when the payload is absent or empty so no bare header is emitted.
+export function formatStrategicIntent(intent: Record<string, unknown> | undefined): string {
+  if (!intent || typeof intent !== 'object') return '';
+  const lines: string[] = ['## Operator Steering'];
+  const currentFocus = strVal(intent.current_focus);
+  if (currentFocus) lines.push(`**Current focus:** ${currentFocus}`);
+  const purpose = strVal(intent.purpose);
+  if (purpose) lines.push(`**Purpose:** ${purpose}`);
+  if (lines.length === 1) return '';
+  lines.push('');
+  return lines.join('\n') + '\n';
+}
+
 export function buildContextPrefix(task: Record<string, unknown>): string {
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
@@ -138,47 +200,48 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
 
   // Project Vision — strategic "why" set by the strategic research agent.
   // Surfaced first so tactical agents can align their work to it.
-  const vision = task.vision as Record<string, unknown> | undefined;
-  if (vision && typeof vision === 'object') {
-    const vLines: string[] = ['## Project Vision'];
-    const purpose = strVal(vision.purpose);
-    if (purpose) vLines.push(`**Purpose:** ${purpose}`);
-    const successCriteria = vision.success_criteria;
-    if (typeof successCriteria === 'string' && successCriteria) {
-      vLines.push(`**Success criteria:** ${successCriteria}`);
-    } else if (Array.isArray(successCriteria) && successCriteria.length > 0) {
-      vLines.push('**Success criteria:**');
-      for (const sc of successCriteria) {
-        const s = strVal(sc);
-        if (s) vLines.push(`- ${s}`);
+  prefix += formatProjectVision(task.vision as Record<string, unknown> | undefined);
+
+  // Strategic Intent — the LIVE, operator-editable problem-model steering
+  // (purpose, current focus, project context framing, active constraints).
+  // Surfaced separately from the legacy Project Vision; the backend sends at
+  // most one of the two, so they never double-render.
+  const strategicIntent = task.strategic_intent as Record<string, unknown> | undefined;
+  if (strategicIntent && typeof strategicIntent === 'object') {
+    const siLines: string[] = ['## Strategic Intent'];
+    const purpose = strVal(strategicIntent.purpose);
+    if (purpose) siLines.push(`**Purpose:** ${purpose}`);
+    const currentFocus = strVal(strategicIntent.current_focus);
+    if (currentFocus) siLines.push(`**Current focus:** ${currentFocus}`);
+    const ctx = strategicIntent.context as Record<string, unknown> | undefined;
+    if (ctx && typeof ctx === 'object') {
+      const ctxFields: Array<[string, string]> = [
+        ['project_type', 'Project type'],
+        ['users', 'Users'],
+        ['team', 'Team'],
+        ['deploy_cadence', 'Deploy cadence'],
+        ['notes', 'Notes'],
+      ];
+      const ctxParts: string[] = [];
+      for (const [key, label] of ctxFields) {
+        const v = strVal(ctx[key]);
+        if (v) ctxParts.push(`${label}: ${v}`);
+      }
+      if (ctxParts.length > 0) {
+        siLines.push('**Context:**');
+        for (const part of ctxParts) siLines.push(`- ${part}`);
       }
     }
-    const priorities = Array.isArray(vision.priorities) ? vision.priorities as unknown[] : [];
-    if (priorities.length > 0) {
-      vLines.push('**Priorities:**');
-      for (const p of priorities) {
-        const s = strVal(p);
-        if (s) vLines.push(`- ${s}`);
-      }
+    const constraints = Array.isArray(strategicIntent.constraints)
+      ? (strategicIntent.constraints as unknown[]).map(c => strVal(c)).filter(Boolean)
+      : [];
+    if (constraints.length > 0) {
+      siLines.push('**Constraints:**');
+      for (const c of constraints) siLines.push(`- ${c}`);
     }
-    const systems = Array.isArray(vision.systems) ? vision.systems as Array<Record<string, unknown>> : [];
-    if (systems.length > 0) {
-      vLines.push('**Systems:**');
-      for (const sys of systems) {
-        const name = strVal(sys.name);
-        if (!name) continue;
-        const status = strVal(sys.status);
-        const desc = strVal(sys.description);
-        const statusSuffix = status ? ` (${status})` : '';
-        const descSuffix = desc ? ` — ${desc}` : '';
-        vLines.push(`- **${name}**${statusSuffix}${descSuffix}`);
-      }
-    }
-    const context = strVal(vision.context);
-    if (context) vLines.push(`**Context:** ${context}`);
-    if (vLines.length > 1) {
-      vLines.push('');
-      prefix += vLines.join('\n') + '\n';
+    if (siLines.length > 1) {
+      siLines.push('');
+      prefix += siLines.join('\n') + '\n';
     }
   }
 
@@ -192,7 +255,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         (payload?.related_files as string[] | undefined) ||
         (taskContext?.related_files as string[] | undefined) ||
         [];
-      prefix = formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
+      prefix += formatProjectContext(projectCtx, taskType, taskScope, currentDirectionId, relatedFiles.length) + '\n\n';
       if (['create', 'fix', 'refactor', 'migrate'].includes(taskType)) {
         prefix += formatSelfReviewCalibrationSection(
           (projectCtx.self_review_catch_rate as SRCatchRateSource | undefined) ||
@@ -211,6 +274,20 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
     if (title) dcLines.push(`**Goal:** ${title}`);
     const priority = strVal(dirCtx.priority);
     if (priority) dcLines.push(`**Priority:** ${priority}`);
+    const implConstraints = strVal(dirCtx.implementation_constraints);
+    if (implConstraints) dcLines.push(`**Implementation constraints:** ${implConstraints}`);
+    // Contract — what "done" means for this direction (success evidence /
+    // completion criteria / retirement condition). Rendered defensively; only
+    // fields the backend actually sent appear.
+    const contract = dirCtx.contract as Record<string, unknown> | undefined;
+    if (contract && typeof contract === 'object') {
+      const completionCriteria = strVal(contract.completion_criteria);
+      if (completionCriteria) dcLines.push(`**Completion criteria:** ${completionCriteria}`);
+      const successEvidence = strVal(contract.success_evidence);
+      if (successEvidence) dcLines.push(`**Success evidence:** ${successEvidence}`);
+      const retirementCondition = strVal(contract.retirement_condition);
+      if (retirementCondition) dcLines.push(`**Retirement condition:** ${retirementCondition}`);
+    }
     const narrative = dirCtx.narrative as Record<string, unknown> | undefined;
     if (narrative && typeof narrative === 'object') {
       const established = Array.isArray(narrative.established_findings)

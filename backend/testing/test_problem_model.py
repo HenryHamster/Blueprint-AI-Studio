@@ -24,6 +24,7 @@ from app.problem_model import (
     append_revision_log,
     append_self_reflection,
     apply_agent_update,
+    apply_user_intent_patch,
     archive_closed_gaps,
     is_empty,
     parse_problem_model,
@@ -132,6 +133,81 @@ def test_gap_enum_validation():
 def test_capability_enum_validation():
     with pytest.raises(ValidationError):
         Capability(name="x", status="maybe")  # invalid status
+
+
+def test_capability_backing_paths_defaults_empty():
+    """Old-shape capability (no backing_paths) parses with an empty list, so
+    every stored model and older agent payload remains valid."""
+    cap = Capability(name="auth", status="working")
+    assert cap.backing_paths == []
+
+
+def test_capability_backing_paths_round_trips():
+    cap = Capability(
+        name="auth",
+        status="working",
+        backing_paths=["backend/app/auth.py", "backend/app/models.py"],
+    )
+    dumped = cap.model_dump()
+    assert dumped["backing_paths"] == [
+        "backend/app/auth.py",
+        "backend/app/models.py",
+    ]
+    restored = Capability.model_validate(dumped)
+    assert restored.backing_paths == cap.backing_paths
+
+
+def test_problem_model_round_trip_preserves_backing_paths():
+    """Full ProblemModel round-trip keeps capability backing_paths intact."""
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="auth",
+                status="working",
+                backing_paths=["backend/app/auth.py"],
+            ),
+            Capability(name="legacy", status="partial"),  # old shape, no paths
+        ]
+    )
+    raw = model.model_dump()
+    restored = parse_problem_model(raw)
+    assert restored.capabilities[0].backing_paths == ["backend/app/auth.py"]
+    assert restored.capabilities[1].backing_paths == []
+
+
+def test_old_shape_problem_model_with_capabilities_parses():
+    """A stored problem_model whose capabilities predate backing_paths still
+    validates cleanly (backward compatibility)."""
+    raw = {
+        "revision": 3,
+        "capabilities": [
+            {"name": "CapA", "status": "working", "notes": "stable"},
+            {"name": "CapB", "status": "planned"},
+        ],
+    }
+    model = parse_problem_model(raw)
+    assert all(c.backing_paths == [] for c in model.capabilities)
+
+
+def test_apply_agent_update_unaffected_by_backing_paths_only_change():
+    """A capability that only adds/changes backing_paths (status unchanged)
+    is not reported as a capability status change by _compute_diff."""
+    current = {
+        "revision": 1,
+        "capabilities": [{"name": "CapA", "status": "working"}],
+    }
+    proposed = {
+        "capabilities": [
+            {
+                "name": "CapA",
+                "status": "working",  # unchanged
+                "backing_paths": ["backend/app/foo.py"],  # newly linked
+            }
+        ],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert "capabilities_changed" not in diff
+    assert new_raw["capabilities"][0]["backing_paths"] == ["backend/app/foo.py"]
 
 
 def test_is_empty_detects_meaningful_content():
@@ -414,6 +490,382 @@ def test_apply_agent_update_no_changes_still_logs():
     assert diff == {}
     assert len(new_raw["revision_log"]) == 1
     assert new_raw["revision_log"][0]["summary"] == "no structural changes"
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — operator-seeded intent preservation
+# ---------------------------------------------------------------------------
+
+
+def _operator_seeded_current() -> dict:
+    """A problem-model as the onboarding seed leaves it: operator purpose with
+    a user_message source, operator context/constraints, last_updated_by=user."""
+    return {
+        "revision": 1,
+        "last_updated_by": "user",
+        "intent": {
+            "purpose": "Ship a reliable billing system.",
+            "current_focus": "Ship a reliable billing system.",
+            "source": {"type": "user_message", "message_id": "m-1", "excerpt": "Ship..."},
+        },
+        "context": {"project_type": "startup", "users": "SMBs"},
+        "constraints": ["No PII in logs", "GDPR compliant"],
+    }
+
+
+def test_apply_agent_update_preserves_operator_intent_when_omitted():
+    """Agent omits intent/context/constraints entirely → operator values kept."""
+    current = _operator_seeded_current()
+    proposed: dict = {"gaps": [{"id": "g1", "name": "x", "status": "active"}]}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["context"]["project_type"] == "startup"
+    assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant"]
+
+
+def test_apply_agent_update_preserves_operator_intent_when_blanked():
+    """Agent sends empty purpose / blank context / empty constraints → kept."""
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "", "current_focus": "Wire up Stripe webhooks."},
+        "context": {},
+        "constraints": [],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["context"]["project_type"] == "startup"
+    assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant"]
+    # Agent-owned current_focus advances freely.
+    assert new_raw["intent"]["current_focus"] == "Wire up Stripe webhooks."
+
+
+def test_apply_agent_update_preserved_purpose_not_reported_as_intent_changed():
+    """Honest diff: when only the purpose is preserved (current_focus
+    unchanged), the carry-forward must NOT register as intent_changed."""
+    current = _operator_seeded_current()
+    proposed = {
+        # Same current_focus the seed wrote; only purpose is blanked.
+        "intent": {"purpose": "", "current_focus": "Ship a reliable billing system."},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert "intent_changed" not in diff
+
+
+def test_apply_agent_update_allows_explicit_operator_intent_change():
+    """A genuine non-empty agent change to purpose still applies + bumps rev."""
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "Pivot to a usage-metering platform.", "current_focus": ""},
+        "context": {"project_type": "product"},
+        "constraints": ["SOC2"],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Pivot to a usage-metering platform."
+    assert new_raw["context"]["project_type"] == "product"
+    assert new_raw["constraints"] == ["SOC2"]
+    assert new_raw["revision"] == 2
+    assert diff.get("intent_changed") is True
+
+
+def test_apply_agent_update_advances_agent_owned_fields_with_intent_preserved():
+    """Agent advances current_focus / gaps while purpose is preserved."""
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "", "current_focus": "Phase 2: invoicing."},
+        "gaps": [{"id": "g-new", "name": "invoicing", "status": "active"}],
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == "Ship a reliable billing system."
+    assert new_raw["intent"]["current_focus"] == "Phase 2: invoicing."
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-new"}
+    assert diff["gaps_opened"] == ["g-new"]
+
+
+def test_apply_agent_update_does_not_preserve_agent_authored_intent():
+    """When prior purpose was agent-authored (no user source), a blank proposed
+    purpose is NOT resurrected — only operator-owned words are protected."""
+    current = {
+        "revision": 2,
+        "last_updated_by": "agent",
+        "intent": {
+            "purpose": "Agent-derived purpose.",
+            "current_focus": "focus",
+            "source": {"type": "agent_observation"},
+        },
+    }
+    proposed = {"intent": {"purpose": "", "current_focus": "next"}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == ""
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update — 3-way operator-wins merge (concurrent mid-cycle edit)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_operator_purpose_edit_mid_cycle_wins():
+    """The race this PR closes: operator edits intent.purpose to a NEW non-blank
+    value mid-cycle; the agent (computing from the baseline snapshot) proposes a
+    DIFFERENT non-blank value. With a baseline supplied, the operator's value
+    wins, the agent's value is recorded to the ledger, and agent-owned advances
+    (a new gap, advanced current_focus) still apply + bump the revision."""
+    baseline = _operator_seeded_current()  # purpose = "Ship a reliable billing system."
+    # Operator edits the purpose mid-cycle (current diverges from baseline).
+    current = _operator_seeded_current()
+    current["intent"]["purpose"] = "Ship reliable billing AND metering."
+    current["revision"] = 2
+    # Agent, working from the baseline, proposes its own different purpose plus
+    # genuine agent-owned advances.
+    proposed = {
+        "intent": {
+            "purpose": "Pivot fully to a metering platform.",
+            "current_focus": "Phase 2: invoicing.",
+        },
+        "gaps": [{"id": "g-new", "name": "invoicing", "status": "active"}],
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    # Operator's mid-cycle purpose survives; agent's is rejected.
+    assert new_raw["intent"]["purpose"] == "Ship reliable billing AND metering."
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # Agent-owned advances still land + revision bumps.
+    assert new_raw["intent"]["current_focus"] == "Phase 2: invoicing."
+    assert {g["id"] for g in new_raw["gaps"]} == {"g-new"}
+    assert new_raw["revision"] == 3
+    assert diff["gaps_opened"] == ["g-new"]
+    # The overridden agent value is recorded to the ledger for reconciliation.
+    ledger = new_raw["rejected_agent_edits"]
+    assert len(ledger) == 1
+    assert ledger[0]["field"] == "intent.purpose"
+    assert ledger[0]["operator_value"] == "Ship reliable billing AND metering."
+    assert ledger[0]["agent_value"] == "Pivot fully to a metering platform."
+
+
+def test_apply_agent_update_operator_context_and_constraints_edit_wins():
+    """A mid-cycle operator edit to context / constraints wins over a divergent
+    agent write, and each override is recorded."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    current["context"] = {"project_type": "enterprise", "users": "Fortune 500"}
+    current["constraints"] = ["SOC2", "No PII in logs"]
+    proposed = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "context": {"project_type": "startup", "users": "indie hackers"},
+        "constraints": ["Move fast"],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    assert new_raw["context"]["project_type"] == "enterprise"
+    assert new_raw["constraints"] == ["SOC2", "No PII in logs"]
+    fields = {e["field"] for e in new_raw["rejected_agent_edits"]}
+    assert fields == {"context", "constraints"}
+
+
+def test_apply_agent_update_operator_untouched_field_takes_agent_value():
+    """When the operator did NOT touch a field (current == baseline), the agent's
+    new value applies even with a baseline supplied — no ledger entry."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()  # identical to baseline → untouched
+    proposed = {
+        "intent": {
+            "purpose": "Refined: reliable billing, fast onboarding.",
+            "current_focus": "x",
+        },
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    assert new_raw["intent"]["purpose"] == "Refined: reliable billing, fast onboarding."
+    assert diff.get("intent_changed") is True
+    # No conflict → no ledger key surfaced (byte-identical to pre-merge output).
+    assert "rejected_agent_edits" not in new_raw
+
+
+def test_apply_agent_update_agent_only_change_to_operator_field_applies():
+    """Operator did not edit (current == baseline) but the agent changed an
+    operator-owned field: the agent's value applies, no rejection."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    proposed = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "context": {"project_type": "scale-up", "users": "SMBs"},
+        "constraints": ["No PII in logs", "GDPR compliant", "SOC2"],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    assert new_raw["context"]["project_type"] == "scale-up"
+    assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant", "SOC2"]
+    assert "rejected_agent_edits" not in new_raw
+
+
+def test_apply_agent_update_operator_edit_agent_kept_field_no_conflict():
+    """Operator edited a field mid-cycle but the agent did NOT change it (agent
+    value == baseline): operator wins silently with NO ledger entry."""
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    current["constraints"] = ["No PII in logs", "GDPR compliant", "PCI-DSS"]
+    # Agent echoes the baseline constraints (didn't touch them).
+    proposed = {
+        "intent": {"purpose": "Ship a reliable billing system.", "current_focus": "x"},
+        "constraints": ["No PII in logs", "GDPR compliant"],
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    # Operator's value wins.
+    assert new_raw["constraints"] == ["No PII in logs", "GDPR compliant", "PCI-DSS"]
+    # Agent didn't try to change it → no conflict recorded.
+    assert "rejected_agent_edits" not in new_raw
+
+
+def test_apply_agent_update_no_baseline_is_unchanged_from_today():
+    """Degrade safely: with baseline_raw=None the merge is skipped and the
+    output is byte-identical to the blank-preservation-only path."""
+    current = _operator_seeded_current()
+    current["intent"]["purpose"] = "Operator changed this mid-cycle."
+    proposed = {
+        "intent": {"purpose": "Agent's divergent purpose.", "current_focus": "x"},
+    }
+    without_baseline, _ = apply_agent_update(
+        current, dict(proposed), "2026-04-21T12:00:00"
+    )
+    # Without a baseline, today's behavior stands: the agent's non-blank purpose
+    # overwrites (the race is NOT caught — that's the legacy contract).
+    assert without_baseline["intent"]["purpose"] == "Agent's divergent purpose."
+    assert "rejected_agent_edits" not in without_baseline
+
+
+def test_apply_agent_update_agent_authored_purpose_not_merged():
+    """When the prior purpose was agent-authored (source != user_message), the
+    purpose is agent-owned: the agent overwrites it even if current != baseline,
+    and nothing is recorded."""
+    baseline = {
+        "revision": 1,
+        "intent": {
+            "purpose": "Agent purpose v1.",
+            "current_focus": "f",
+            "source": {"type": "agent_observation"},
+        },
+    }
+    current = {
+        "revision": 2,
+        "intent": {
+            "purpose": "Agent purpose v2.",  # differs from baseline
+            "current_focus": "f",
+            "source": {"type": "agent_observation"},
+        },
+    }
+    proposed = {
+        "intent": {"purpose": "Agent purpose v3.", "current_focus": "f"},
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    assert new_raw["intent"]["purpose"] == "Agent purpose v3."
+    assert "rejected_agent_edits" not in new_raw
+
+
+def test_apply_agent_update_ledger_carried_forward_and_capped():
+    """The ledger persists across cycles (carried from current) and is capped at
+    REJECTED_AGENT_EDITS_MAX, oldest rolled off."""
+    from app.problem_model import REJECTED_AGENT_EDITS_MAX
+
+    prior_ledger = [
+        {"at": "t", "field": "context", "kind": "value_conflict", "i": i}
+        for i in range(REJECTED_AGENT_EDITS_MAX)
+    ]
+    baseline = _operator_seeded_current()
+    current = _operator_seeded_current()
+    current["intent"]["purpose"] = "Operator edit."
+    current["rejected_agent_edits"] = prior_ledger
+    proposed = {
+        "intent": {"purpose": "Agent divergent.", "current_focus": "x"},
+    }
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-04-21T12:00:00", baseline_raw=baseline
+    )
+    ledger = new_raw["rejected_agent_edits"]
+    assert len(ledger) == REJECTED_AGENT_EDITS_MAX  # capped
+    # Newest (this cycle's purpose conflict) retained at the end; oldest dropped.
+    assert ledger[-1]["field"] == "intent.purpose"
+    assert ledger[0]["i"] == 1  # entry 0 rolled off
+
+
+# ---------------------------------------------------------------------------
+# apply_user_intent_patch — the user-facing write path (onboarding + PATCH)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_user_intent_patch_seeds_goal_into_intent():
+    """Onboarding goal capture: an empty model gains the user's intent and
+    is attributed to the user."""
+    model = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Ship a CLI", "current_focus": "Ship a CLI"}},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "Ship a CLI"
+    assert model.intent.current_focus == "Ship a CLI"
+    assert model.revision == 1
+    assert model.last_updated == "2026-06-02T12:00:00"
+    assert model.last_updated_by == "user"
+
+
+def test_apply_user_intent_patch_merges_steering_subset():
+    """Optional steering reaches the context / constraints subset."""
+    model = apply_user_intent_patch(
+        {"revision": 2, "intent": {"purpose": "x"}},
+        {
+            "context": {"project_type": "startup", "users": "early adopters"},
+            "constraints": ["No breaking changes"],
+        },
+        "2026-06-02T12:00:00",
+    )
+    assert model.context.project_type == "startup"
+    assert model.constraints == ["No breaking changes"]
+    # Existing intent is preserved when not in the patch.
+    assert model.intent.purpose == "x"
+    assert model.revision == 3
+
+
+def test_apply_user_intent_patch_empty_patch_is_valid_no_op_bump():
+    """An empty steering payload preserves content but still records a
+    user-attributed revision — today's skip-the-goal behavior."""
+    model = apply_user_intent_patch(
+        {"revision": 4, "intent": {"purpose": "kept"}},
+        {},
+        "2026-06-02T12:00:00",
+    )
+    assert model.intent.purpose == "kept"
+    assert model.revision == 5
+    assert model.last_updated_by == "user"
+
+
+def test_apply_user_intent_patch_rejects_agent_owned_fields():
+    """Users cannot overwrite gaps / capabilities / other agent-owned state."""
+    with pytest.raises(ValueError, match="agent-owned"):
+        apply_user_intent_patch(
+            None,
+            {"gaps": [{"id": "g-x", "name": "x"}]},
+            "2026-06-02T12:00:00",
+        )
+
+
+def test_apply_user_intent_patch_rejects_malformed_subset():
+    """A malformed value inside an allowed field still surfaces as a
+    ValidationError, not a silent persist."""
+    with pytest.raises(ValidationError):
+        apply_user_intent_patch(
+            None,
+            {"intent": {"purpose": 123}},  # purpose must be a str
+            "2026-06-02T12:00:00",
+        )
 
 
 # ---------------------------------------------------------------------------

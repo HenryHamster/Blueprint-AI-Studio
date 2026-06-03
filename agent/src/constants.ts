@@ -265,6 +265,13 @@ export function shouldFanOutFix(
   return matched.size >= PARALLEL_FIX_THRESHOLDS.minDistinctModules;
 }
 
+// Greenfield detection: a cloned working tree with at most this many real
+// source files (config/scaffolding excluded — lockfiles, *.md/*.json/*.yml,
+// dotfiles, manifests) is treated as an empty/near-empty repo. The plan and
+// research agents then enter "bootstrap the foundation from the goal" mode
+// instead of assuming there is an existing codebase to read and improve.
+export const GREENFIELD_SOURCE_FILE_THRESHOLD = 8;
+
 // Pre-implementation analysis plan gate. If a medium-scope analysis plan
 // proposes more files than this, the handler retries the analysis with a
 // narrowing directive once, then fails fast rather than burning the

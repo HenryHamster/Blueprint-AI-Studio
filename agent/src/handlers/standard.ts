@@ -9,7 +9,8 @@ import {
 } from '../index.js';
 import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import {
-  getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE,
+  buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   getTaskTypeFocusBlock,
   assembleFailureGuidanceBlocks,
   readClaudeMd, buildContextPrefix, buildFileTree, discoverRelatedTests, configureAgentPermissions,
@@ -25,6 +26,7 @@ import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrProm
 import {
   runFreshReviewerPass,
   loneCheckerCategoriesForTask,
+  sensitivePathsFromMetadata,
   getRegressingCategories,
   getThinningCategories,
   VIEWPORT_INFRA_SKIP_GUIDANCE,
@@ -33,6 +35,7 @@ import {
 export {
   runFreshReviewerPass,
   loneCheckerCategoriesForTask,
+  sensitivePathsFromMetadata,
   pickFreshReviewerEffort,
   extractSelfReviewJson,
   SR_SKIP_REASONS,
@@ -256,7 +259,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const prTitlePrefixNote = prTitlePrefix
     ? `\n\nWhen you open the PR with ./pr open, start the title with ${prTitlePrefix}.`
     : '';
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + buildCodeChangeHelperGuidance({ buildConfig, owner, repo }) + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, resolveTaskBranchNamespace(task), buildConfig);
   writePlaybookHelper(taskId);
@@ -491,7 +494,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   }
 
   const finalPromptWithTree = fileTree + analysisContext + finalPrompt;
-  const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig);
+  const promptFingerprint = computePromptFingerprint(taskTypeKey, buildConfig, {
+    codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig, owner, repo }),
+  });
 
   statusRef.value = `Running ${getProviderRunner().displayName}...`;
   setCurrentPromptFingerprint(promptFingerprint);
@@ -550,6 +555,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       statusRef,
       model,
       task.project_context as Record<string, unknown> | undefined,
+      undefined, undefined, undefined, undefined,
+      sensitivePathsFromMetadata(projectMeta),
     );
   }
 
@@ -565,6 +572,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     const loneCheckerCats = loneCheckerCategoriesForTask(
       task.project_context as Record<string, unknown> | undefined,
       loneCheckerRelatedFiles,
+      buildConfig,
     );
     if (loneCheckerCats.length > 0) {
       sendLog(ws, `[FreshReview] Lone-checker categories detected (${loneCheckerCats.join(', ')}) — auto-triggering fresh-reviewer pass.\n`);
@@ -572,7 +580,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
       await runFreshReviewerPass(
         taskId, taskTitle, rawPrompt, loneCheckerRelatedFiles, ws, statusRef, model,
         task.project_context as Record<string, unknown> | undefined,
-        false, true,
+        false, true, undefined, undefined,
+        sensitivePathsFromMetadata(projectMeta),
       );
     }
   }
@@ -607,13 +616,34 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
         statusRef,
         model,
         task.project_context as Record<string, unknown> | undefined,
-        true,
+        true, undefined, undefined, undefined,
+        sensitivePathsFromMetadata(projectMeta),
       );
     }
   }
 }
 
 // ── Handler: Create (default — make changes, push, open PR) ─────────────────
+/**
+ * Handle a 'create' task: implement a new feature from a prompt.
+ *
+ * Runs Claude Code with the provided prompt, captures output, runs tests
+ * if applicable, commits changes, and opens a pull request. Supports
+ * sibling-task coordination and file-overlap warnings for parallel tasks.
+ *
+ * @param taskId - Task UUID
+ * @param payload - Task payload with 'prompt', 'branch', optional 'related_files'
+ * @param task - Full task object from API
+ * @param ghToken - GitHub token for repo access
+ * @param owner - GitHub repo owner
+ * @param repo - GitHub repo name
+ * @param ws - Optional WebSocket for live log streaming
+ * @param statusRef - Status message reference (mutated by handler)
+ * @param model - Optional model override (e.g. 'claude-opus-4-8')
+ * @param effort - Optional effort level for planning ('low', 'medium', 'high')
+ *
+ * Throws on fatal errors: invalid prompt, git clone failure, etc.
+ */
 export async function handleCreate(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -691,7 +721,7 @@ export async function handleCreate(
       if (mergeBase) fs.writeFileSync(`/tmp/base_commit_${taskId}`, mergeBase);
     } catch { /* ok */ }
     const title = strVal(task.title) || 'Operator-requested fresh review';
-    await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor);
+    await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor, sensitivePathsFromMetadata(task.project_metadata as Record<string, unknown> | undefined));
     return;
   }
 
@@ -733,6 +763,25 @@ export async function handleCreate(
   });
 }
 
+/**
+ * Handle a 'refactor' task: improve code quality without changing behavior.
+ *
+ * Runs Claude Code with the refactoring prompt, runs tests to ensure no
+ * behavioral changes, commits, and opens a PR. Respects file-overlap warnings.
+ *
+ * @param taskId - Task UUID
+ * @param payload - Task payload with 'prompt', optional 'related_files'
+ * @param task - Full task object from API
+ * @param ghToken - GitHub token for repo access
+ * @param owner - GitHub repo owner
+ * @param repo - GitHub repo name
+ * @param ws - Optional WebSocket for live log streaming
+ * @param statusRef - Status message reference (mutated by handler)
+ * @param model - Optional model override
+ * @param effort - Optional effort level
+ *
+ * Throws on fatal errors: missing prompt, git failure, etc.
+ */
 // ── Handler: Refactor (improve code quality without changing behavior) ────────
 export async function handleRefactor(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
@@ -821,6 +870,8 @@ Steps:
    - Create or update API documentation where applicable
 4. Focus on accuracy — only document what actually exists in the code. Do not invent features or describe things that don't exist.
 5. Do NOT change any production code. Only modify documentation files (README, docs/, etc.) and add/update docstrings within existing source files.
+
+This task follows the standard code-change loop: make the docs changes, run the repo's checks, and open a PR with a docs-prefixed title when the work is complete.
 
 Be thorough but precise. Every statement in the documentation must reflect the actual code.`,
     commitPrefix: 'docs',

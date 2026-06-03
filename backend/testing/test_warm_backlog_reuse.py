@@ -20,7 +20,7 @@ import time
 import pytest
 from httpx import AsyncClient
 
-from app.auth import create_agent_token, verify_agent_jwt
+from app.auth import create_agent_token, create_vm_scoped_token, verify_agent_jwt
 from app.efficiency_snapshot import (
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
@@ -66,9 +66,10 @@ def _patch_broadcast(mocker):
 class _FlagGuard:
     """Snapshot/restore runtime_config flags + the first-refusal registry."""
 
-    def __init__(self, backlog=False, continuity=False):
+    def __init__(self, backlog=False, continuity=False, retarget=False):
         self.backlog = backlog
         self.continuity = continuity
+        self.retarget = retarget
 
     def __enter__(self):
         import app.shared_state as ss
@@ -78,15 +79,18 @@ class _FlagGuard:
         self._rc = rc
         self._prior_backlog = rc.get("warm_backlog_reuse_enabled")
         self._prior_continuity = rc.get("warm_continuity_enabled")
+        self._prior_retarget = rc.get("warm_retarget_enabled")
         self._prior_refusal = dict(ss.warm_backlog_first_refusal)
         rc["warm_backlog_reuse_enabled"] = self.backlog
         rc["warm_continuity_enabled"] = self.continuity
+        rc["warm_retarget_enabled"] = self.retarget
         return self
 
     def __exit__(self, *exc):
         for key, prior in (
             ("warm_backlog_reuse_enabled", self._prior_backlog),
             ("warm_continuity_enabled", self._prior_continuity),
+            ("warm_retarget_enabled", self._prior_retarget),
         ):
             if prior is None:
                 self._rc.pop(key, None)
@@ -169,6 +173,36 @@ async def test_backlog_reuse_config_gate_off_is_unchanged(
             headers={"x-agent-token": token},
         )
         assert resp.status_code == 204
+
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.QUEUED
+        assert backlog.vm_instance_id is None
+
+
+@pytest.mark.asyncio
+async def test_pool_vm_scoped_token_excluded_from_backlog_reuse(
+    client: AsyncClient, db_session, mocker
+):
+    """An IDLE pool VM (VM-scoped token, no warm_pool_pin task) must NOT claim a
+    backlog task via the credential-agnostic backlog-reuse branch — that branch
+    bypasses the pool's account/provider/model lease gate. It gets 204 and the
+    backlog task stays QUEUED; only the orchestrator's strict pool lease may hand
+    a pool VM work."""
+    _patch_broadcast(mocker)
+    with _FlagGuard(backlog=True):
+        project = await _make_project(db_session, name="Pool Token Excluded")
+        vm_id = "agent-vm-pool-token"
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        # VM-scoped (taskless) token — what a freshly-booted pool VM carries.
+        token = create_vm_scoped_token(vm_id, str(project.id))
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 204, resp.text
 
         db_session.expire(backlog)
         await db_session.refresh(backlog)
@@ -339,6 +373,131 @@ async def test_eligibility_skips_dependency_and_file_conflict(db_session):
 
 
 @pytest.mark.asyncio
+async def test_paused_project_has_no_warm_claimable_backlog(db_session):
+    """A paused project's QUEUED backlog must not be warm-claimable on the
+    idle-VM next-role reuse path; resuming restores eligibility."""
+    project = await _make_project(db_session, name="Paused Backlog")
+    vm_id = "agent-vm-paused-backlog"
+
+    clean = await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+    # Baseline: eligible while the project is running.
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+
+    # Pause: the same backlog task is now ineligible on every reuse entry point.
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is False
+    assert (
+        await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+    )
+
+    # Resume: eligibility is restored with no other change.
+    project.paused = False
+    db_session.add(project)
+    await db_session.commit()
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == clean.id
+
+
+@pytest.mark.asyncio
+async def test_final_claim_rechecks_project_pause_with_stale_eligible_ids(
+    db_session, mocker
+):
+    """The final warm-claim lock re-checks Project.paused even if eligibility
+    was computed before the project was paused."""
+    project = await _make_project(db_session, name="Paused Claim Race")
+    vm_id = "agent-vm-paused-claim-race"
+    task = await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+
+    project.paused = True
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.warm_backlog_reuse._eligible_backlog_ids",
+        new_callable=mocker.AsyncMock,
+        return_value=[task.id],
+    )
+
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_dependency_ready_task_is_eligible_with_marker(db_session):
+    """A dependency-bearing task whose deps the orchestrator already resolved
+    (``context['_deps_satisfied']`` stamped) is warm-claimable, while an
+    otherwise-identical task WITHOUT the marker stays ineligible and still
+    fires the depends_on skip funnel."""
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="Dep Ready")
+    vm_id = "agent-vm-dep-ready"
+
+    # Dependency-bearing task, deps NOT yet resolved (no marker) -> skipped.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"scope": "small"},
+    )
+    wbr._scan_skipped_depends_on_events.clear()
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is False
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+    # The unsatisfied-dep skip funnel still fires for the unmarked task.
+    assert len(wbr._scan_skipped_depends_on_events) >= 1
+
+    # Same shape but deps resolved + stamped by the orchestrator -> eligible.
+    ready = await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"scope": "small", "_deps_satisfied": True},
+    )
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    picked = await select_backlog_reuse_candidate(db_session, project.id, vm_id)
+    assert picked is not None and picked.id == ready.id
+
+
+@pytest.mark.asyncio
+async def test_dep_ready_task_still_respects_other_exclusions(db_session):
+    """The ``_deps_satisfied`` marker only lifts the dependency gate — a
+    dep-ready task pinned to a different VM or conflicting on files stays
+    ineligible exactly as a dependency-free task would."""
+    project = await _make_project(db_session, name="Dep Ready Exclusions")
+    vm_id = "agent-vm-mine"
+
+    # Dep-ready but pinned to another VM -> still excluded.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"_deps_satisfied": True, "warm_target_vm_id": "agent-vm-other"},
+    )
+    # Dep-ready but file-conflicting with an IN_PROGRESS task -> still excluded.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["src/app.py"]},
+    )
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        depends_on=["00000000-0000-0000-0000-000000000123"],
+        context={"_deps_satisfied": True, "related_files": ["src/app.py"]},
+    )
+    assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+
+
+@pytest.mark.asyncio
 async def test_eligibility_skips_other_vm_pin(db_session):
     """A task pinned to a different VM (chain pin) is not claimable as backlog
     by this VM."""
@@ -350,6 +509,395 @@ async def test_eligibility_skips_other_vm_pin(db_session):
         context={"warm_target_vm_id": "agent-vm-someone-else"},
     )
     assert await select_backlog_reuse_candidate(db_session, project.id, vm_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Provider-aware backlog reuse (a reused VM is locked to its boot manifest's
+# provider/account/model — never warm-claim a task pinned/recorded elsewhere)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_provider_mismatch_task_is_ineligible(db_session):
+    """A task recorded to a different provider than the reusing VM's boot
+    account is excluded and fires the provider-mismatch scan funnel; a task on
+    the matching provider remains claimable."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Provider Mismatch")
+        vm_id = "agent-vm-provider"
+        vm_boot = {"provider": "anthropic"}
+
+        # Recorded to gemini -> incompatible with an anthropic-booted VM.
+        await _make_backlog_task(db_session, project.id, provider="gemini")
+        # Explicitly pinned to gemini via context -> also incompatible.
+        await _make_backlog_task(
+            db_session, project.id, context={"provider_preference": ["gemini"]}
+        )
+
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is False
+        )
+        assert (
+            await select_backlog_reuse_candidate(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is None
+        )
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_provider_mismatch_skip"] >= 1
+
+        # A matching-provider candidate is claimable on the same VM.
+        match = await _make_backlog_task(db_session, project.id, provider="anthropic")
+        picked = await select_backlog_reuse_candidate(
+            db_session, project.id, vm_id, vm_boot=vm_boot
+        )
+        assert picked is not None and picked.id == match.id
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_single_provider_project_still_warm_reuses(db_session):
+    """REGRESSION: the provider guard is a no-op for single-provider projects.
+
+    Even with ``vm_boot`` supplied, a task carrying no divergent constraint
+    (no recorded provider, or one matching the boot account) stays claimable so
+    single-provider projects keep warm-reusing exactly as before."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Single Provider")
+        vm_id = "agent-vm-single"
+        vm_boot = {"provider": "anthropic", "account_id": "acct-1", "model": "opus"}
+
+        # Fresh task with no recorded/pinned provider — fungible.
+        await _make_backlog_task(db_session, project.id)
+        # Task recorded to the same provider/account/model as the boot manifest.
+        await _make_backlog_task(
+            db_session,
+            project.id,
+            provider="anthropic",
+            account_id="acct-1",
+            model="opus",
+        )
+
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is True
+        )
+        assert (
+            await select_backlog_reuse_candidate(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is not None
+        )
+        # No task was provider-skipped — the guard stayed inert.
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_provider_mismatch_skip"] == 0
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_provider_guard_noop_when_vm_boot_absent(db_session):
+    """Omitting ``vm_boot`` disables the guard entirely — a task recorded to a
+    different provider is still eligible (pre-feature behavior preserved)."""
+    project = await _make_project(db_session, name="No Boot Identity")
+    vm_id = "agent-vm-noboot"
+    await _make_backlog_task(db_session, project.id, provider="gemini")
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    assert (
+        await select_backlog_reuse_candidate(db_session, project.id, vm_id) is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_provider_match_with_divergent_account_is_ineligible(db_session):
+    """Same provider but a different recorded account is still incompatible —
+    the boot manifest freezes the account, not just the provider."""
+    project = await _make_project(db_session, name="Account Mismatch")
+    vm_id = "agent-vm-acct"
+    vm_boot = {"provider": "anthropic", "account_id": "acct-boot"}
+    await _make_backlog_task(
+        db_session, project.id, provider="anthropic", account_id="acct-other"
+    )
+    assert (
+        await select_backlog_reuse_candidate(
+            db_session, project.id, vm_id, vm_boot=vm_boot
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_retarget_disabled_keeps_boot_compat_gate(db_session):
+    """REGRESSION (flag off): with warm_retarget_enabled OFF the boot-compat gate
+    is byte-for-byte unchanged — an account/provider-divergent task stays
+    ineligible and cold-dispatches as before."""
+    with _FlagGuard(backlog=True, retarget=False):
+        project = await _make_project(db_session, name="Retarget Off")
+        vm_id = "agent-vm-retarget-off"
+        vm_boot = {"provider": "anthropic", "account_id": "acct-boot", "model": "opus"}
+        await _make_backlog_task(
+            db_session, project.id, provider="gemini", account_id="acct-other"
+        )
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is False
+        )
+        assert (
+            await select_backlog_reuse_candidate(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_retarget_enabled_relaxes_boot_compat_gate(db_session):
+    """Flag on: warm_retarget_enabled makes account/provider/model divergence
+    re-targetable, so a same-project task that diverges from the VM's boot
+    manifest becomes claimable (the finalizer re-materializes its credentials)."""
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session, name="Retarget On")
+        vm_id = "agent-vm-retarget-on"
+        vm_boot = {"provider": "anthropic", "account_id": "acct-boot", "model": "opus"}
+        divergent = await _make_backlog_task(
+            db_session,
+            project.id,
+            provider="gemini",
+            account_id="acct-other",
+            model="gemini-2.5-pro",
+        )
+        assert (
+            await has_eligible_backlog_task(
+                db_session, project.id, vm_id, vm_boot=vm_boot
+            )
+            is True
+        )
+        picked = await select_backlog_reuse_candidate(
+            db_session, project.id, vm_id, vm_boot=vm_boot
+        )
+        assert picked is not None and picked.id == divergent.id
+
+
+def _pool_account(account_id, user_id="test-user-123", provider="anthropic"):
+    """Minimal in-memory pool account dict select_max_plan_account treats as
+    healthy (runtime-ready OAuth, enabled, no disabled models, zero load)."""
+    return {
+        "id": account_id,
+        "user_id": user_id,
+        "name": f"acct-{account_id}",
+        "provider": provider,
+        "auth_mode": "oauth",
+        "oauth_token": "sk-ant-retarget-token",
+        "runtime_secret": "sk-ant-retarget-token",
+        "runtime_ready": True,
+        "claude_config_json": None,
+        "provider_metadata": {},
+        "enabled": True,
+        "active_tasks": 0,
+        "daily_task_count": 0,
+        "disabled_models": {},
+    }
+
+
+def _seed_pool(mocker, accounts, user_id="test-user-123"):
+    """Patch the in-memory account pool with ``accounts`` for ``user_id``."""
+    import app.max_plan_pool as pool
+
+    mocker.patch.object(pool, "_max_plan_pools", {user_id: list(accounts)})
+    mocker.patch.object(pool, "_account_by_id", {a["id"]: a for a in accounts})
+
+
+@pytest.mark.asyncio
+async def test_retarget_claim_emits_secret_manifest_when_account_differs(
+    client: AsyncClient, db_session, mocker
+):
+    """Flag on + resolved account != VM boot account: the claim response carries
+    secret_manifest for the resolved account, the task is stamped/acquired to
+    that account, and the bootstrap token is NOT duplicated into the manifest."""
+    _patch_broadcast(mocker)
+    retarget_acct = _pool_account("acct-retarget")
+    _seed_pool(mocker, [retarget_acct])
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-diff"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert body["task_id"] == str(backlog.id)
+        manifest = body.get("secret_manifest")
+        assert manifest is not None, "expected secret_manifest for divergent account"
+        assert manifest["metadata"]["provider"] == "anthropic"
+        assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-retarget-token"
+        # The authoritative JWT is the rotated agent_token, not the manifest.
+        assert "AGENT_SECRET_TOKEN" not in manifest["env"]
+
+        # Slot acquired against the resolved account and durably stamped.
+        assert retarget_acct["active_tasks"] == 1
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-retarget"
+
+
+@pytest.mark.asyncio
+async def test_retarget_claim_omits_manifest_when_account_matches(
+    client: AsyncClient, db_session, mocker
+):
+    """Flag on but resolved account == VM boot account: response stays
+    byte-identical (no secret_manifest), while the slot is still acquired and
+    stamped so accounting follows the account the task runs on."""
+    _patch_broadcast(mocker)
+    boot_acct = _pool_account("acct-boot")
+    _seed_pool(mocker, [boot_acct])
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-match"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        assert "secret_manifest" not in body
+        assert boot_acct["active_tasks"] == 1
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-boot"
+
+
+@pytest.mark.asyncio
+async def test_retarget_releases_slot_on_finalize_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """If finalization fails after the re-target slot was acquired, the slot is
+    released (acquire/release balanced) and the task is rolled back to QUEUED."""
+    _patch_broadcast(mocker)
+    retarget_acct = _pool_account("acct-retarget-fail")
+    _seed_pool(mocker, [retarget_acct])
+    mocker.patch(
+        "app.routers.agent_warm_continuity.create_agent_token",
+        side_effect=RuntimeError("mint boom"),
+    )
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-fail"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(db_session, project.id)
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 500
+        # Acquired slot was released — net zero.
+        assert retarget_acct["active_tasks"] == 0
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert backlog.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_retarget_scopes_pool_to_launcher_not_project_owner(
+    client: AsyncClient, db_session, mocker
+):
+    """A user-launched backlog task (launcher != project owner) must re-target
+    against the LAUNCHER's account pool, mirroring cold dispatch (the launcher
+    pays). Resolving against the project owner would mis-attribute cost and, when
+    the owner's pool has no match, strand the task on the VM's boot creds."""
+    _patch_broadcast(mocker)
+    # Pool belongs to the LAUNCHER, not the project owner ("test-user-123").
+    launcher_acct = _pool_account("acct-launcher", user_id="launcher-user-999")
+    _seed_pool(mocker, [launcher_acct], user_id="launcher-user-999")
+    with _FlagGuard(backlog=True, retarget=True):
+        project = await _make_project(db_session)
+        vm_id = "agent-vm-retarget-launcher"
+        prior = await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            vm_instance_id=vm_id,
+            account_id="acct-boot",
+            provider="anthropic",
+        )
+        backlog = await _make_backlog_task(
+            db_session, project.id, launched_by_user_id="launcher-user-999"
+        )
+
+        token = create_agent_token(
+            str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+        )
+        resp = await client.post(
+            "/api/agent/next-role",
+            json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+            headers={"x-agent-token": token},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["action"] == "claim"
+        manifest = body.get("secret_manifest")
+        assert manifest is not None, "expected manifest from launcher's pool account"
+        # Slot acquired against the launcher's account and stamped onto the task.
+        assert launcher_acct["active_tasks"] == 1
+        db_session.expire(backlog)
+        await db_session.refresh(backlog)
+        assert (backlog.context or {}).get("llm_account_id") == "acct-launcher"
 
 
 @pytest.mark.asyncio
@@ -541,7 +1089,9 @@ def _clear_funnel_events(wbr):
     wbr._scan_skipped_depends_on_events.clear()
     wbr._scan_skipped_pinned_vm_events.clear()
     wbr._scan_skipped_file_conflict_events.clear()
+    wbr._scan_skipped_provider_mismatch_events.clear()
     wbr._scan_saturated_events.clear()
+    wbr._completion_dependents_marked_events.clear()
 
 
 def test_funnel_counters_and_snapshot():
@@ -573,6 +1123,26 @@ def test_funnel_counters_and_snapshot():
         _clear_funnel_events(wbr)
 
 
+def test_funnel_completion_dependents_marked():
+    """record_completion_dependents_marked sums the dependents proactively marked
+    by completion-side triggers within the window; non-positive counts no-op."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        wbr.record_completion_dependents_marked(2)
+        wbr.record_completion_dependents_marked(1)
+        # Non-positive counts must not register an event.
+        wbr.record_completion_dependents_marked(0)
+        wbr.record_completion_dependents_marked(-3)
+
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["completion_dependents_marked"] == 3
+        assert len(wbr._completion_dependents_marked_events) == 2
+    finally:
+        _clear_funnel_events(wbr)
+
+
 def test_funnel_claim_skipped_circuit_breaker():
     """record_claim_skipped('circuit_breaker_tripped') is tracked in the snapshot."""
     import app.warm_backlog_reuse as wbr
@@ -585,6 +1155,64 @@ def test_funnel_claim_skipped_circuit_breaker():
         assert snap["claim_skipped_total"] == 1
     finally:
         _clear_funnel_events(wbr)
+
+
+def _clear_all_dropout_events(wbr):
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+
+
+def test_dominant_dropout_names_clear_leader():
+    """A reason that meets the volume/share/runner-up gate is named dominant,
+    with its share of the non-converting population; below the gate it is None."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_all_dropout_events(wbr)
+    try:
+        # 4 lost-claim-race vs 1 ceiling-release: race covers 4/5 (>=50%),
+        # >=2 events, and strictly outranks the runner-up -> dominant.
+        for _ in range(4):
+            wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_grace_ceiling_release()
+
+        result = wbr.compute_dominant_reuse_dropout()
+        assert result["dropout_total"] == 5
+        assert result["dropout_by_reason"]["claim_lost_claim_race"] == 4
+        assert result["dropout_by_reason"]["grace_ceiling_release"] == 1
+        dom = result["dominant_dropout"]
+        assert dom is not None
+        assert dom["reason"] == "claim_lost_claim_race"
+        assert dom["count"] == 4
+        assert dom["total"] == 5
+        assert dom["share"] == 0.8
+        assert "per-VM" in result["attribution_note"]
+    finally:
+        _clear_all_dropout_events(wbr)
+
+
+def test_dominant_dropout_none_on_even_split_and_empty():
+    """No leader is named on an even split (no clear dominant) or empty window."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_all_dropout_events(wbr)
+    try:
+        # Empty window -> total 0, no dominant.
+        empty = wbr.compute_dominant_reuse_dropout()
+        assert empty["dropout_total"] == 0
+        assert empty["dominant_dropout"] is None
+
+        # Even 2-vs-2 split: top does not strictly outrank runner-up -> None.
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_grace_idle_release()
+        wbr.record_grace_idle_release()
+        tied = wbr.compute_dominant_reuse_dropout()
+        assert tied["dropout_total"] == 4
+        assert tied["dominant_dropout"] is None
+    finally:
+        _clear_all_dropout_events(wbr)
 
 
 @pytest.mark.asyncio
@@ -792,3 +1420,147 @@ async def test_scan_skip_no_events_when_all_eligible(db_session):
         assert snap["scan_polls_saturated"] == 0
     finally:
         _clear_funnel_events(wbr)
+
+
+# ---------------------------------------------------------------------------
+# Bounded, activity-gated grace-window teardown (_deferred_backlog_teardown)
+# ---------------------------------------------------------------------------
+
+
+def _set_grace_config(monkeypatch, wbr, *, defer, window, idle, interval):
+    monkeypatch.setitem(wbr._runtime_config, "warm_backlog_teardown_defer_secs", defer)
+    monkeypatch.setitem(wbr._runtime_config, "warm_backlog_grace_window_secs", window)
+    monkeypatch.setitem(wbr._runtime_config, "warm_backlog_grace_idle_secs", idle)
+    monkeypatch.setitem(
+        wbr._runtime_config, "warm_backlog_grace_poll_interval_secs", interval
+    )
+
+
+@pytest.mark.asyncio
+async def test_grace_window_claim_skips_teardown(monkeypatch, mocker):
+    """A claim landing during the window returns without deleting the VM."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    _set_grace_config(monkeypatch, wbr, defer=20, window=60, idle=30, interval=5)
+    mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
+    delete_mock = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+    # Not claimed on the first check, claimed on the second.
+    mocker.patch(
+        "app.vm_lifecycle._vm_claimed_backlog_work",
+        new_callable=mocker.AsyncMock,
+        side_effect=[False, True],
+    )
+
+    await vml._deferred_backlog_teardown("agent-vm-grace-claim", "agent_completion")
+
+    delete_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_grace_window_idle_release_tears_down_early(monkeypatch, mocker):
+    """When the agent stops heartbeating before the ceiling, the activity gate
+    releases the hold early and the VM is torn down (idle release)."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+    try:
+        _set_grace_config(monkeypatch, wbr, defer=20, window=120, idle=30, interval=5)
+        mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        # Agent never claims and is not alive (stopped polling).
+        mocker.patch(
+            "app.vm_lifecycle._vm_claimed_backlog_work",
+            new_callable=mocker.AsyncMock,
+            return_value=False,
+        )
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=False)
+
+        await vml._deferred_backlog_teardown("agent-vm-grace-idle", "agent_completion")
+
+        delete_mock.assert_awaited_once()
+        assert len(wbr._grace_idle_release_events) == 1
+        assert len(wbr._grace_ceiling_release_events) == 0
+    finally:
+        wbr._grace_idle_release_events.clear()
+        wbr._grace_ceiling_release_events.clear()
+        wbr._grace_window_extension_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_grace_window_extends_until_bounded_ceiling(monkeypatch, mocker):
+    """A still-polling but never-claiming VM is extended each interval and torn
+    down at the bounded ceiling (not held indefinitely)."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    wbr._grace_idle_release_events.clear()
+    wbr._grace_ceiling_release_events.clear()
+    wbr._grace_window_extension_events.clear()
+    try:
+        _set_grace_config(monkeypatch, wbr, defer=20, window=50, idle=30, interval=5)
+        mocker.patch("app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock)
+        delete_mock = mocker.patch(
+            "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+        )
+        mocker.patch(
+            "app.vm_lifecycle._vm_claimed_backlog_work",
+            new_callable=mocker.AsyncMock,
+            return_value=False,
+        )
+        # Agent keeps polling the whole time.
+        mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+
+        await vml._deferred_backlog_teardown("agent-vm-grace-ceil", "agent_completion")
+
+        delete_mock.assert_awaited_once()
+        assert len(wbr._grace_ceiling_release_events) == 1
+        assert len(wbr._grace_idle_release_events) == 0
+        # min_hold=20, ceiling=50, interval=5 -> extensions at 20,25,...,45 = 6.
+        assert len(wbr._grace_window_extension_events) == 6
+    finally:
+        wbr._grace_idle_release_events.clear()
+        wbr._grace_ceiling_release_events.clear()
+        wbr._grace_window_extension_events.clear()
+
+
+@pytest.mark.asyncio
+async def test_grace_window_ceiling_floored_at_min_hold(monkeypatch, mocker):
+    """A grace ceiling configured below the minimum hold is floored at the
+    minimum hold, so the unconditional first-poll window is never undercut."""
+    import app.vm_lifecycle as vml
+    import app.warm_backlog_reuse as wbr
+
+    # window (5) < defer (20): ceiling must floor to 20, so the loop runs the
+    # min-hold sleep and then immediately hits the ceiling.
+    _set_grace_config(monkeypatch, wbr, defer=20, window=5, idle=30, interval=5)
+    sleep_mock = mocker.patch(
+        "app.vm_lifecycle.asyncio.sleep", new_callable=mocker.AsyncMock
+    )
+    delete_mock = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "app.vm_lifecycle._vm_claimed_backlog_work",
+        new_callable=mocker.AsyncMock,
+        return_value=False,
+    )
+    alive_mock = mocker.patch("app.warm_vm_state.is_vm_alive", return_value=True)
+
+    await vml._deferred_backlog_teardown("agent-vm-grace-floor", "agent_completion")
+
+    # The unconditional min-hold sleep used 20 (the floored value), not 5.
+    assert sleep_mock.await_args_list[0].args[0] == 20
+    delete_mock.assert_awaited_once()
+    # Ceiling hit immediately after min-hold; no activity-gate iteration ran.
+    alive_mock.assert_not_called()

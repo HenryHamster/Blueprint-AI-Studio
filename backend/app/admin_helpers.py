@@ -1,3 +1,12 @@
+"""Shared project/task access-control helpers for admin routers.
+
+Centralizes the membership and role checks reused across the admin router
+modules: resolving a project or task while asserting the current user is a
+member (raising 404/403 as appropriate) and the role-gated variants that also
+enforce a minimum ``viewer``/``member``/``owner`` level. Re-exports
+``modify_task_apply`` so router modules import task mutation from one place.
+"""
+
 import uuid
 
 from fastapi import HTTPException

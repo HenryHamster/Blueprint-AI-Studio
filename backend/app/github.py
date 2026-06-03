@@ -3,6 +3,7 @@ import contextlib
 import random
 import re as _re
 from datetime import datetime
+from urllib.parse import quote
 
 import httpx
 import logging
@@ -402,6 +403,86 @@ async def _github_request(
     return response  # unreachable but satisfies type checker
 
 
+async def get_file_content_at_ref(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> tuple[bool | None, int | None]:
+    """Fetch *path* at ``owner/repo@ref`` via the GitHub contents API.
+
+    The GitHub-layer foundation for branch-aware grounding: line-number
+    validation needs file CONTENT, but the existing existence helpers only
+    answer "is this path here?". Goes through :func:`_github_request`, so it is
+    quota-accounted and rate-limit-aware like every other GitHub call, and is
+    reused by the source-ref, symbol-grounding, and playbook-grounding paths.
+
+    Returns ``(exists, line_count)`` with a tri-state ``exists``:
+
+      * ``True``  — the path is a file on ``ref``; ``line_count`` is its
+        newline count (matching ``count("\\n")``), or ``None`` when the body
+        could not be decoded.
+      * ``False`` — ``ref`` unambiguously has no such file (HTTP 404).
+      * ``None``  — indeterminate (non-200/non-404 status, a non-file payload,
+        an undecodable body, or any error). Callers MUST NOT treat ``None`` as
+        absence — only ``False`` is a definite absence on the branch.
+
+    ``line_count`` is ``None`` whenever it cannot be determined, so an
+    indeterminate count never invalidates a line-number citation.
+    """
+    import base64
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_path = quote(path, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code == 404:
+            return False, None
+        if response.status_code != 200:
+            logger.warning(
+                "[GITHUB] contents fetch for %s on %s/%s@%s: HTTP %s",
+                path,
+                owner,
+                repo,
+                ref,
+                response.status_code,
+            )
+            return None, None
+        payload = response.json()
+        if not (isinstance(payload, dict) and payload.get("type") == "file"):
+            return None, None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return True, None
+        try:
+            text = base64.b64decode(content_b64).decode(errors="replace")
+        except Exception:  # noqa: BLE001 — malformed base64 → unknown line count
+            return True, None
+        return True, text.count("\n")
+    except Exception as e:  # noqa: BLE001 — never let a fetch error read as absence
+        logger.warning(
+            "[GITHUB] Failed contents fetch for %s on %s/%s@%s: %s",
+            path,
+            owner,
+            repo,
+            ref,
+            e,
+        )
+        return None, None
 
 
 # ---------------------------------------------------------------------------

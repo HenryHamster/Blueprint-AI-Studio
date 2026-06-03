@@ -48,8 +48,15 @@ async def db_session():
     await engine.dispose()
 
 
-async def _make_project(session, status=ProjectStatus.DEPLOYING) -> Project:
-    project = Project(name="Test Project", user_id="user1", status=status)
+async def _make_project(
+    session, status=ProjectStatus.DEPLOYING, autonomous_enabled=False
+) -> Project:
+    project = Project(
+        name="Test Project",
+        user_id="user1",
+        status=status,
+        autonomous_enabled=autonomous_enabled,
+    )
     session.add(project)
     await session.commit()
     await session.refresh(project)
@@ -95,7 +102,11 @@ def _run_aggregation(all_tasks, project):
         ]
     ]
 
-    if not (project.status != ProjectStatus.CANCELLED and executable_statuses):
+    if not (
+        not project.autonomous_enabled
+        and project.status != ProjectStatus.CANCELLED
+        and executable_statuses
+    ):
         return
 
     all_terminal = all(
@@ -309,3 +320,100 @@ async def test_queued_leaf_awaiting_warm_handoff_not_swept_into_parent_aggregati
         f"This regresses production fix for task 582a0210."
     )
     assert queued_leaf.latest_status_message is None
+
+
+@pytest.mark.asyncio
+async def test_live_autonomous_project_not_flipped_to_cancelled(db_session):
+    """A live autonomous project whose current wave drained to all-{COMPLETED,
+    CANCELLED} (no genuine failure) must NOT be flipped to a terminal CANCELLED
+    status. Tasks are routinely set to CANCELLED for benign reasons (dedup,
+    scope-empty, supersession, graceful reassignment) and keep their VM id, so
+    the wave-drain window commonly produces an all-{COMPLETED, CANCELLED} mix.
+    Because the autonomous engine selects work purely by ``autonomous_enabled``
+    and never consults project status, a flip here would display CANCELLED to
+    the operator forever while the project keeps running.
+    """
+    project = await _make_project(db_session, autonomous_enabled=True)
+    completed = await _make_task(
+        db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-1"
+    )
+    cancelled = await _make_task(
+        db_session, project.id, TaskStatus.CANCELLED, vm_instance_id="vm-2"
+    )
+    parent = await _make_task(
+        db_session, project.id, TaskStatus.EVALUATING, vm_instance_id=None
+    )
+
+    _run_aggregation([completed, cancelled, parent], project)
+
+    assert project.status != ProjectStatus.CANCELLED, (
+        f"Live autonomous project flipped to CANCELLED during wave-drain window; "
+        f"got {project.status}. The autonomous engine ignores project status, so "
+        f"this would display CANCELLED to the operator while work continues."
+    )
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_live_autonomous_project_not_flipped_to_completed(db_session):
+    """All-COMPLETED in the drain window must not flip a live autonomous
+    project to COMPLETED — it will keep generating its own work."""
+    project = await _make_project(db_session, autonomous_enabled=True)
+    completed_a = await _make_task(
+        db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-1"
+    )
+    completed_b = await _make_task(
+        db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-2"
+    )
+    parent = await _make_task(
+        db_session, project.id, TaskStatus.EVALUATING, vm_instance_id=None
+    )
+
+    _run_aggregation([completed_a, completed_b, parent], project)
+
+    assert project.status != ProjectStatus.COMPLETED
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_live_autonomous_project_not_flipped_to_failed(db_session):
+    """A FAILED task in the drain window must not flip a live autonomous
+    project to FAILED — autonomous projects continuously retry/respawn work."""
+    project = await _make_project(db_session, autonomous_enabled=True)
+    failed = await _make_task(
+        db_session, project.id, TaskStatus.FAILED, vm_instance_id="vm-1"
+    )
+    completed = await _make_task(
+        db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-2"
+    )
+    parent = await _make_task(
+        db_session, project.id, TaskStatus.EVALUATING, vm_instance_id=None
+    )
+
+    _run_aggregation([failed, completed, parent], project)
+
+    assert project.status != ProjectStatus.FAILED
+    assert parent.status == TaskStatus.EVALUATING
+
+
+@pytest.mark.asyncio
+async def test_finite_project_still_aggregates(db_session):
+    """A finite (non-autonomous) project must still aggregate to a terminal
+    status — the fix only narrows WHEN the flip fires, it does not change
+    finite-project semantics."""
+    project = await _make_project(db_session, autonomous_enabled=False)
+    completed = await _make_task(
+        db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-1"
+    )
+    cancelled = await _make_task(
+        db_session, project.id, TaskStatus.CANCELLED, vm_instance_id="vm-2"
+    )
+    parent = await _make_task(
+        db_session, project.id, TaskStatus.EVALUATING, vm_instance_id=None
+    )
+
+    _run_aggregation([completed, cancelled, parent], project)
+
+    assert project.status == ProjectStatus.CANCELLED
+    assert parent.status == TaskStatus.CANCELLED
+    assert parent.latest_status_message == "Project cancelled"

@@ -229,13 +229,80 @@ async def test_warm_vm_state_backlog_reuse_attribution(client: AsyncClient, db_s
         metrics = body["warm_pin_metrics"]
         assert metrics["active_backlog_reuse_claims"] >= 1
         # This warm-start task is backlog reuse, so it must NOT inflate the
-        # chain-continuity count, and the two partitions must never exceed the
-        # total warm-chain population.
+        # chain-continuity or pool-origin counts, and the three partitions must
+        # always sum to exactly the total warm-chain population.
         assert (
             metrics["active_backlog_reuse_claims"]
+            + metrics["active_pool_origin_claims"]
             + metrics["active_chain_continuity_claims"]
             == metrics["active_warm_chains"]
         )
+    finally:
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(saved_hb)
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_pool_origin_attribution(client: AsyncClient, db_session):
+    """A warm-pool-origin warm-start claim is attributed to its OWN bucket
+    (active_pool_origin_claims), not folded into chain continuity, and the
+    per-VM current_task exposes warm_claim_origin == 'warm_pool'."""
+    saved_hb = dict(_shared_state.vm_last_heartbeat)
+    _shared_state.vm_last_heartbeat.clear()
+
+    project = Project(name="Pool-Origin Test", user_id="test-user-789")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-pool-origin"
+    _shared_state.record_vm_heartbeat(vm_id)
+
+    current = Task(
+        project_id=project.id,
+        title="feat: a pool-served task",
+        payloads=[{"type": "create"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.utcnow(),
+        last_heartbeat=datetime.utcnow(),
+        context={
+            "_timing": {
+                "warm_start": True,
+                "warm_claim_origin": "warm_pool",
+                "prior_role_vm_id": vm_id,
+                "setup_secs": 1.4,
+            }
+        },
+    )
+    db_session.add(current)
+    await db_session.commit()
+    try:
+        resp = await client.get("/api/admin/warm-vm-state")
+        assert resp.status_code == 200
+        body = resp.json()
+        ours = next(
+            (v for v in body["active_vms"] if v["vm_instance_id"] == vm_id), None
+        )
+        assert ours is not None, f"vm {vm_id} missing from {body['active_vms']}"
+        cur = ours["current_task"]
+        assert cur is not None
+        assert cur["warm_start"] is True
+        assert cur["warm_claim_origin"] == "warm_pool"
+
+        metrics = body["warm_pin_metrics"]
+        assert metrics["active_pool_origin_claims"] >= 1
+        # Pool-origin claims must NOT be counted as chain continuity, and the
+        # three origin buckets must always sum to the total warm-chain count.
+        assert (
+            metrics["active_backlog_reuse_claims"]
+            + metrics["active_pool_origin_claims"]
+            + metrics["active_chain_continuity_claims"]
+            == metrics["active_warm_chains"]
+        )
+        # pool_origin_share is the pool fraction of all active warm chains.
+        assert metrics["pool_origin_share"] is not None
+        assert 0.0 <= metrics["pool_origin_share"] <= 1.0
     finally:
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(saved_hb)
@@ -325,3 +392,59 @@ async def test_warm_vm_state_clears_by_reason_histogram(client: AsyncClient):
     finally:
         _shared_state.warm_pin_clear_events.clear()
         _shared_state.warm_pin_clear_events.extend(saved_clears)
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_includes_pool_metrics(client: AsyncClient, db_session):
+    """The warm-vm-state payload exposes a pool_metrics block: enabled flag,
+    target/current size, idle count, projected idle cost, and the dispatch
+    funnel — sourced from the PoolVm registry + runtime config."""
+    from app.models import PoolVm, PoolVmState, Project, _utcnow
+    from datetime import timedelta
+
+    project = Project(name="Pool Metrics", user_id="test-user-pm")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    member = PoolVm(
+        vm_instance_id="vm-pm-idle-1",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        idle_since=_utcnow() - timedelta(seconds=120),
+    )
+    db_session.add(member)
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/warm-vm-state")
+    assert resp.status_code == 200
+    pool = resp.json()["pool_metrics"]
+    assert isinstance(pool, dict)
+    for key in (
+        "enabled",
+        "target_size",
+        "idle_ttl_secs",
+        "current_size",
+        "idle_count",
+        "projected_idle_cost_usd",
+        "funnel",
+        "idle_cost_by_account",
+        "cost_amortization_by_account",
+    ):
+        assert key in pool, f"missing pool_metrics.{key}"
+    assert isinstance(pool["enabled"], bool)
+    # The idle member we just inserted is counted and accruing live cost.
+    assert pool["current_size"] >= 1
+    assert pool["idle_count"] >= 1
+    assert pool["projected_idle_cost_usd"] > 0
+    assert "pool_hit_rate" in pool["funnel"]
+    assert "by_account" in pool["funnel"]
+    # Per-account idle cost attributes the unpinned idle member to the
+    # 'unattributed' bucket, and the amortization view emits a matching key so an
+    # operator can read per-account idle cost + hit rate together.
+    assert isinstance(pool["idle_cost_by_account"], dict)
+    assert "unattributed" in pool["idle_cost_by_account"]
+    assert "unattributed" in pool["cost_amortization_by_account"]
+    amort = pool["cost_amortization_by_account"]["unattributed"]
+    assert amort["pool_idle_cost_usd"] > 0
+    assert "pool_hit_rate" in amort

@@ -11,7 +11,8 @@ import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObjectDetailed, JsonExtractionError } from '../json-extract.js';
 import {
-  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
+  getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE,
+  buildCodeChangeHelperGuidance, codeChangeGuidanceVariant,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
   PARALLEL_AUDIT_GUIDANCE,
   getTaskTypeFocusBlock,
@@ -131,6 +132,13 @@ export async function handleMigrate(
 
 `
     : '';
+  // The schema-revision step occupies number 4 when present; the remaining steps
+  // (review/apply/downgrade/finish) renumber so a repo with no schema-revision
+  // gate sees a contiguous 4,5,6,7 instead of a gap at 4.
+  const reviewStepNum = hasSchemaRevisionGate ? 5 : 4;
+  const applyStepNum = reviewStepNum + 1;
+  const downgradeStepNum = reviewStepNum + 2;
+  const finishStepNum = reviewStepNum + 3;
 
   const migratePrompt = `You are a database migration agent specializing in Alembic and SQLAlchemy/SQLModel workflows.
 
@@ -146,7 +154,7 @@ Follow these steps precisely:
 
    IMPORTANT: Do NOT hand-edit the generated migration file unless autogenerate produced clearly incorrect output (e.g., dropped the wrong table, missed an index, used wrong column type). If you must edit, add a comment explaining why.
 
-${schemaRevisionStep}5. **Review the generated migration**: Open and carefully read the generated file. Check for:
+${schemaRevisionStep}${reviewStepNum}. **Review the generated migration**: Open and carefully read the generated file. Check for:
    - Data loss risks (e.g., \`DROP COLUMN\`, \`DROP TABLE\`, type changes that truncate data)
    - Missing indexes on foreign keys or frequently-queried columns
    - Incorrect \`nullable\` settings
@@ -154,15 +162,15 @@ ${schemaRevisionStep}5. **Review the generated migration**: Open and carefully r
    - \`op.execute()\` statements needed for data migrations
    If you find issues, fix them and document your changes with inline comments.
 
-6. **Test the migration applies cleanly**: Run \`alembic upgrade head\` to verify the migration applies without errors. If it fails:
+${applyStepNum}. **Test the migration applies cleanly**: Run \`alembic upgrade head\` to verify the migration applies without errors. If it fails:
    - Read the error carefully
    - Fix the migration file (add a comment explaining the manual fix)
    - Run \`alembic upgrade head\` again
    - Repeat until it succeeds
 
-7. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
+${downgradeStepNum}. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
 
-8. Once migration applies cleanly, run \`./check test\` (NOT just \`./check\` — migrations always touch backend, so the Docker pytest suite must pass before shipping). Then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
+${finishStepNum}. Once migration applies cleanly, run \`./check test\` (NOT just \`./check\` — migrations always touch backend, so the Docker pytest suite must pass before shipping). Then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
 
 ALREADY-DONE CASE: If you discover the requested migration/model change ALREADY EXISTS on the base branch (e.g. a sibling PR already added the same revision file and model${hasSchemaRevisionGate ? ` and the matching ${migrateLayout.schemaRevisionConst} bump` : ''}), do NOT create a duplicate migration — a second revision with the same logical change would branch the revision chain and break chain-linearity tests. Instead, VERIFY the deliverable is present (name the revision file and model${hasSchemaRevisionGate ? ' and schema-revision value' : ''}) and call \`./done --already-done "<reason naming the existing revision file and model${hasSchemaRevisionGate ? ' and schema-revision value' : ''}, and the sibling PR if known>"\`. This lands the task COMPLETED with no PR and records why. Do NOT just exit — a bare no-diff exit is treated as incomplete and fails.
 
@@ -180,15 +188,20 @@ CRITICAL RULES:
   const migratePromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   statusRef.value = 'Running migration workflow...';
   const migrateBaseCommit = git(['rev-parse', 'HEAD']);
-  const migrateFocusBlock = getTaskTypeFocusBlock('migrate');
+  const migrateFocusBlock = getTaskTypeFocusBlock('migrate', {
+    schemaRevisionFile: migrateLayout.schemaRevisionFile,
+    schemaRevisionConst: migrateLayout.schemaRevisionConst,
+  });
   const finalMigratePrompt = migrateClaudeMdSection + migratePlaybookSection + migrateRetryContext
     + migratePrompt + migrateFirstTaskSection
-    + CODE_CHANGE_HELPER_GUIDANCE + migrateFocusBlock + PLAYBOOK_GUIDANCE
+    + buildCodeChangeHelperGuidance({ buildConfig: migrateBuildConfig, owner, repo }) + migrateFocusBlock + PLAYBOOK_GUIDANCE
     + READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + PRIOR_ATTEMPT_DIVERGENCE + BEYOND_SCOPE_REPORTING
     + migratePromptSuffix + `
 
 ${DEFAULT_TOOL_GUIDANCE}`;
-  const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig);
+  const migrateFingerprint = computePromptFingerprint('migrate', migrateBuildConfig, {
+    codeChangeGuidanceVariant: codeChangeGuidanceVariant({ buildConfig: migrateBuildConfig, owner, repo }),
+  });
   setCurrentPromptFingerprint(migrateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: migrateFingerprint });
   // 2026-05-04: post-Claude commit/rebase/push/PR pipeline replaced with

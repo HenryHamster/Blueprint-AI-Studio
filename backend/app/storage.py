@@ -1,3 +1,12 @@
+"""Google Cloud Storage helpers for agent task payloads and artifacts.
+
+Wraps the blocking ``google.cloud.storage`` client in async helpers (run in a
+thread) for uploading large task payloads to the artifact bucket as
+``gs://`` URIs and for minting V4 signed upload URLs the agent VM can use to
+push artifacts back. The bucket and GCP project are read from the
+``ARTIFACT_BUCKET_NAME`` / ``GCP_PROJECT_ID`` environment variables.
+"""
+
 import os
 import datetime
 import logging

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from app.models import TaskStatus
+from app.landed_signal import is_merged_completion
 
 _MAX_ACTIONABILITY_CYCLES = 50
 
@@ -66,7 +66,7 @@ def _aggregate_actionability_bucket(
             continue
         entry = dir_outcome.setdefault(key, {"tasked": False, "merged": False})
         entry["tasked"] = True
-        if t.status == TaskStatus.COMPLETED and ctx.get("pr_merged") is True:
+        if is_merged_completion(t):
             entry["merged"] = True
 
     grade_tasked: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}

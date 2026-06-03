@@ -13,6 +13,10 @@ vi.mock('../index.js', () => ({
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
+  strVal: (v: unknown, fallback = '') => {
+    if (typeof v === 'string') return v;
+    return fallback;
+  },
 }));
 
 import fs from 'fs';
@@ -20,6 +24,7 @@ import { runClaudeCode, persistAndPostStatus } from '../index.js';
 import { buildThinkerPrompt, runThinkerWithGate, type ThinkerPromptParams } from './thinker.js';
 import { buildThinkerPrompt as buildThinkerPromptFromResearchPlan } from '../handlers/research-plan.js';
 import { buildMemoCitationsSection } from '../handlers/research-plan.js';
+import { renderStrategicPromptSuffix } from '../handlers/strategic.js';
 
 // Regression guard: research-plan.ts must re-export the same function object
 // from thinker.ts — not a local copy. If someone accidentally defines a second
@@ -99,6 +104,22 @@ describe('buildThinkerPrompt', () => {
     expect(idx('## 1. State assessment')).toBeLessThan(idx('## 6. Problem model'));
   });
 
+  it('renders verificationFailuresSection before # Your job when provided', () => {
+    const prompt = buildThinkerPrompt({
+      ...base,
+      verificationFailuresSection: '\n## Capability Verification (advisory)\nflagged capability\n',
+    });
+    const verificationIdx = prompt.indexOf('## Capability Verification (advisory)');
+    const jobIdx = prompt.indexOf('# Your job');
+    expect(verificationIdx).toBeGreaterThan(-1);
+    expect(verificationIdx).toBeLessThan(jobIdx);
+  });
+
+  it('omits verificationFailuresSection when empty', () => {
+    const prompt = buildThinkerPrompt({ ...base, verificationFailuresSection: '' });
+    expect(prompt).not.toContain('## Capability Verification (advisory)');
+  });
+
   it('problem_model section uses bootstrap text when problemModelSection signals empty', () => {
     const prompt = buildThinkerPrompt({
       ...base,
@@ -172,6 +193,12 @@ describe('buildThinkerPrompt', () => {
     // Agents must cite sources on gaps/directions so dedup logic can trace provenance
     expect(prompt).toMatch(/source.*user_message/);
     expect(prompt).toContain('Cite sources');
+  });
+
+  it('requires capabilities to round-trip backing_paths', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('backing_paths');
+    expect(prompt).toContain('Emit `backing_paths: []` instead of dropping the field');
   });
 
   it('includes retire-direction instruction language', () => {
@@ -430,5 +457,108 @@ describe('buildThinkerPrompt on_automain annotation', () => {
     const prompt = buildThinkerPrompt({ ...base, recentWorkSection: section });
     expect(prompt).not.toContain('[staged, NOT on automain]');
     expect(prompt).toContain('Normal landed fix');
+  });
+});
+
+// ── renderStrategicPromptSuffix composition ────────────────────────────────────
+
+describe('buildThinkerPrompt + renderStrategicPromptSuffix (strategic handler composition)', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: 'Clock: 2026-05-04',
+    isSelfRepo: false,
+    userStateLine: 'User last active: today',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n_(empty — bootstrap)_',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    threadSection: '',
+    taskId: 'test-task-123',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('appends Additional instructions block when prompt_suffix is non-empty', () => {
+    const payload = {
+      prompt_suffix: 'deployment-model: v2-multi-tenant\nstabilize audit-findings: gap-id-42 missing test coverage',
+    };
+    const composed = buildThinkerPrompt(base) + renderStrategicPromptSuffix(payload);
+
+    expect(composed).toContain('Additional instructions:');
+    expect(composed).toContain('deployment-model: v2-multi-tenant');
+    expect(composed).toContain('stabilize audit-findings: gap-id-42 missing test coverage');
+    // The prompt should have two line breaks before Additional instructions (forming a section break)
+    expect(composed).toContain('\n\nAdditional instructions:');
+  });
+
+  it('does NOT append Additional instructions block when prompt_suffix is absent', () => {
+    const payload = {};
+    const composed = buildThinkerPrompt(base) + renderStrategicPromptSuffix(payload);
+
+    expect(composed).not.toContain('Additional instructions:');
+    // Verify the base prompt is unchanged
+    expect(composed).toContain('You own this project\'s direction.');
+    expect(composed).toContain('## Your current understanding (problem_model)');
+  });
+
+  it('does NOT append Additional instructions block when prompt_suffix is empty string', () => {
+    const payload = { prompt_suffix: '' };
+    const composed = buildThinkerPrompt(base) + renderStrategicPromptSuffix(payload);
+
+    expect(composed).not.toContain('Additional instructions:');
+  });
+
+  it('renders prompt_suffix verbatim without modification', () => {
+    const suffix = 'Mode: build\nMax active directions: 8\nStabilize audit gaps: g-retry-logic, g-error-boundary';
+    const payload = { prompt_suffix: suffix };
+    const composed = buildThinkerPrompt(base) + renderStrategicPromptSuffix(payload);
+
+    // Exact substring match — no escaping, no truncation
+    expect(composed).toContain(suffix);
+  });
+
+  it('regression: strategic agent receives full prompt_suffix content in analysis pass', () => {
+    // This is the scenario from the task: the backend packs deployment framing,
+    // stabilize audit-findings hints, and mode hints into prompt_suffix.
+    // The strategic handler must append it as Additional instructions so the
+    // thinker receives it.
+    const deploymentFraming = 'Deployment model: v2-stable (SLA upgrade required for feature gate A)';
+    const auditHint = 'Stabilize audit gaps: gap-id-123 (test coverage <60%), gap-id-124 (API error handling)';
+    const modeHint = 'System health: audit mode — prioritize stability fixes over features';
+    const payload = {
+      prompt_suffix: `${deploymentFraming}\n${auditHint}\n${modeHint}`,
+    };
+
+    const thinkerPrompt = buildThinkerPrompt(base);
+    const thinkerPromptWithSuffix = thinkerPrompt + renderStrategicPromptSuffix(payload);
+
+    // Verify the thinker received all backend-supplied content
+    expect(thinkerPromptWithSuffix).toContain('Additional instructions:');
+    expect(thinkerPromptWithSuffix).toContain(deploymentFraming);
+    expect(thinkerPromptWithSuffix).toContain(auditHint);
+    expect(thinkerPromptWithSuffix).toContain(modeHint);
+    // Verify the additional instructions block is at the end (appended, not prepended)
+    const additionalIdx = thinkerPromptWithSuffix.indexOf('Additional instructions:');
+    const jobIdx = thinkerPrompt.indexOf('# Your job');
+    expect(additionalIdx).toBeGreaterThan(jobIdx);
   });
 });

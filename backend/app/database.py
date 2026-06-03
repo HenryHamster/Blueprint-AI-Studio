@@ -1,3 +1,12 @@
+"""Async database engine, session management, and connection-pool hardening.
+
+Builds the lazily-initialized SQLAlchemy asyncpg engine from ``DATABASE_URL``
+(normalizing SSL hints and listen DSNs), installs TCP keepalive and
+disconnect-driven pool invalidation, and exposes the session entry points used
+throughout the app: the ``get_session`` FastAPI dependency and the
+``closing_session`` async context manager for background workers.
+"""
+
 import contextlib
 import logging
 import os

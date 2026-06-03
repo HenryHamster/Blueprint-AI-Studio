@@ -15,6 +15,7 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
       '3. Identify dependencies between subtasks — which must complete before others can start.',
       '4. Write clear, self-contained prompts for each subtask.',
       'Output EXACTLY one JSON block as the VERY LAST thing in your response:',
+      'GREENFIELD MODE — this repository is empty or near-empty (only config/scaffolding, no real source).',
     );
   } else {
     blocks.push(
@@ -44,6 +45,7 @@ export interface ThinkerPromptParams {
   packerMetaSection: string;
   strategicContext: string;
   problemModelSection: string;
+  verificationFailuresSection?: string;
   reflectionSection: string;
   selfImprovementBlock: string;
   runningUpdateSection: string;
@@ -81,6 +83,7 @@ ${p.userStateLine}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
 ${p.problemModelSection}
+${p.verificationFailuresSection ? `\n${p.verificationFailuresSection}\n` : ''}
 
 ${p.reflectionSection}
 
@@ -224,12 +227,16 @@ Write the full updated problem_model as JSON to \`/tmp/problem_model_${p.taskId}
 
 # Problem model shape (quick reference)
 
+**Operator intent ownership:** The operator seeds \`intent.purpose\` and \`context\`/\`constraints\` at onboarding and may update them later. These are operator-owned — **do NOT blank them** even if you think they should change. If the model is replaced and these fields are omitted or emptied, the platform preserves the prior operator values. \`intent.current_focus\` is agent-owned and SHOULD advance as the project completes phases. If you genuinely believe the operator's purpose or steering should change, do NOT silently overwrite them — instead queue a \`pending_user_confirmation\` entry with \`type: "intent_change"\` proposing the change and asking for operator confirmation.
+
 - intent: {purpose, current_focus, source?}
 - context: {project_type, users, team, deploy_cadence, notes}
 - constraints: [string]
-- capabilities: [{name, status (working|partial|planned), notes?, source?}]
+- capabilities: [{name, status (working|partial|planned), notes?, source?, backing_paths}]
 - gaps: [{id, name, description, evidence, size, priority, status, tag?, source?, active_moves, past_moves, history}]
 - friction: [{id, name, description, seen_in, status, source?, promoted_to_gap_id?}]
+
+For every capability, preserve existing \`backing_paths\` and add repo-relative file paths when the code implementing that capability is known. Emit \`backing_paths: []\` instead of dropping the field when the implementation is still unknown.
 
 Source = {type (user_message|friction_promotion|agent_observation|self_reflection|shipped_change|direction_outcome), message_id?, excerpt?, pr_number?, direction_id?, friction_id?}
 

@@ -2,12 +2,23 @@ import { useState } from 'react';
 import { apiFetch } from '../api';
 import { usePoller } from './usePoller';
 
+export interface WarmStartOriginBreakdown {
+  warm_pool: number;
+  backlog_reuse: number;
+  chain_continuity: number;
+  warm_total: number;
+  pool_origin_share: number;
+}
+
 export interface PipelineEfficiencyWindow {
   setup_p50_secs: number | null;
   setup_p95_secs: number | null;
   setup_sample_n: number;
   warm_reuse_rate: number | null;
   warm_reuse_sample_n: number;
+  // Per-origin warm-start split + pool-origin share over the window. Optional:
+  // older backends omit it, in which case the breakdown row does not render.
+  warm_start_origin_breakdown?: WarmStartOriginBreakdown | null;
   review_iter_median: number | null;
   review_iter_p95: number | null;
   review_iter_sample_n: number;

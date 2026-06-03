@@ -12,6 +12,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session
+from app.landed_signal import is_merged_completion
 from app.models import Task, TaskStatus, Project, _utcnow
 from app.auth import get_current_user, require_admin
 from app.routers.admin_analytics import _derive_completed_at
@@ -62,7 +63,7 @@ def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
         week_monday = task_date - timedelta(days=task_date.weekday())
         week_key = week_monday.isoformat()
         bucket[(week_key, scope)]["created"] += 1
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+        if is_merged_completion(t):
             bucket[(week_key, scope)]["merged"] += 1
 
     # Build time-series sorted by week then scope
@@ -149,7 +150,7 @@ def _weekly_merge_rate_deltas(tasks: list) -> List[Dict[str, Any]]:
         week_monday = task_date - timedelta(days=task_date.weekday())
         week_key = week_monday.isoformat()
         week_bucket[week_key]["created"] += 1
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+        if is_merged_completion(t):
             week_bucket[week_key]["merged"] += 1
 
     sorted_weeks = sorted(week_bucket.keys())
@@ -195,9 +196,7 @@ def _compute_medium_scope_measurement(
     # --- Headline ---
     total_created = len(medium_tasks)
     total_merged = sum(
-        1
-        for t in medium_tasks
-        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+        1 for t in medium_tasks if is_merged_completion(t)
     )
     medium_scope_conversion_rate = (
         round(total_merged / total_created, 3) if total_created > 0 else None
@@ -255,9 +254,7 @@ def _compute_medium_scope_measurement(
         finished = [t for t in tasks_subset if t.status in _TERMINAL_STATUSES]
         created = len(finished)
         merged = sum(
-            1
-            for t in finished
-            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
+            1 for t in finished if is_merged_completion(t)
         )
         return {
             "merge_rate": round(merged / created, 3) if created > 0 else None,
@@ -293,7 +290,7 @@ def _compute_medium_scope_measurement(
             if not resolved_at or resolved_at < since:
                 continue
             finished += 1
-            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            if is_merged_completion(t):
                 merged += 1
         return {
             "merge_rate": round(merged / finished, 3) if finished > 0 else None,
@@ -360,9 +357,7 @@ def _compute_medium_scope_measurement(
         week_monday = task_date - timedelta(days=task_date.weekday())
         week_key = week_monday.isoformat()
         week_bucket[week_key]["created"] += 1
-        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get(
-            "pr_merged"
-        )
+        is_merged = is_merged_completion(t)
         if is_merged:
             week_bucket[week_key]["merged"] += 1
         if (
@@ -426,9 +421,7 @@ def _compute_medium_scope_measurement(
         day_bucket[day_key]["created"] += (
             1  # legacy key = denominator (finished-in-day)
         )
-        is_merged = t.status == TaskStatus.COMPLETED and (t.context or {}).get(
-            "pr_merged"
-        )
+        is_merged = is_merged_completion(t)
         if is_merged:
             day_bucket[day_key]["merged"] += 1
         if (
@@ -471,9 +464,7 @@ def _compute_medium_scope_measurement(
         for t in medium_tasks:
             if (t.context or {}).get("direction_id") != resolved_direction_id:
                 continue
-            if not (
-                t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged")
-            ):
+            if not is_merged_completion(t):
                 continue
             if not t.created_at:
                 continue

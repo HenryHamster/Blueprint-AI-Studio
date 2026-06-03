@@ -9644,6 +9644,560 @@ async def test_direction_reasoning_memos_absent_when_no_memos(db_session, mocker
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Design-doc system verification (claimed-but-absent / partial / verified)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _patch_classify(mocker, present_paths: set):
+    """Patch the design-doc verifier so existence is driven by *present_paths*."""
+
+    async def _classify(paths, **_kwargs):
+        present = [p for p in paths if isinstance(p, str) and p in present_paths]
+        missing = [p for p in paths if not (isinstance(p, str) and p in present_paths)]
+        return present, missing
+
+    mocker.patch(
+        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+    )
+
+
+async def _spawn_and_get_research_payload(project, db_session):
+    await _spawn_research_task(project, db_session)
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    research_task = result.scalars().first()
+    assert research_task is not None, "Research task should have been spawned"
+    return research_task.first_payload
+
+
+@pytest.mark.asyncio
+async def test_system_verification_all_missing_flagged_claimed_absent(
+    db_session, mocker
+):
+    """A system whose every declared module is absent is flagged claimed_absent."""
+    direction = _active_direction("d-sysverif-absent", "Improve ghost system")
+    project = Project(
+        name="SysVerif Absent",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/ghost": {
+                "status": "mature",
+                "modules": ["backend/app/ghost_a.py", "backend/app/ghost_b.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None, "system_verification annotation should be present"
+    assert sv["ghost"]["status"] == "claimed_absent"
+    assert sv["ghost"]["claimed_status"] == "mature"
+    assert sv["ghost"]["present"] == []
+    assert set(sv["ghost"]["missing"]) == {
+        "backend/app/ghost_a.py",
+        "backend/app/ghost_b.py",
+    }
+
+
+@pytest.mark.asyncio
+async def test_system_verification_mixed_flagged_partial(db_session, mocker):
+    """A system with some modules present and some missing is flagged partial."""
+    direction = _active_direction("d-sysverif-partial", "Improve partial system")
+    project = Project(
+        name="SysVerif Partial",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/half": {
+                "status": "functional",
+                "modules": ["backend/app/real.py", "backend/app/fake.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/real.py"})
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None
+    assert sv["half"]["status"] == "partial"
+    assert sv["half"]["present"] == ["backend/app/real.py"]
+    assert sv["half"]["missing"] == ["backend/app/fake.py"]
+
+
+@pytest.mark.asyncio
+async def test_system_verification_all_present_flagged_verified(db_session, mocker):
+    """A system whose declared modules all exist records status verified."""
+    direction = _active_direction("d-sysverif-ok", "Improve real system")
+    project = Project(
+        name="SysVerif Verified",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/real": {
+                "status": "mature",
+                "modules": ["backend/app/a.py", "backend/app/b.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(
+        mocker, present_paths={"backend/app/a.py", "backend/app/b.py"}
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None
+    assert sv["real"]["status"] == "verified"
+    assert sv["real"]["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_system_verification_does_not_mutate_design_doc(db_session, mocker):
+    """Verification is advisory only — the stored design_doc is left unchanged."""
+    direction = _active_direction("d-sysverif-immut", "Improve system")
+    original_doc = {
+        "systems/x": {
+            "status": "mature",
+            "modules": ["backend/app/missing.py"],
+        }
+    }
+    project = Project(
+        name="SysVerif Immutable",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={k: dict(v) for k, v in original_doc.items()},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    await _spawn_and_get_research_payload(project, db_session)
+    await db_session.refresh(project)
+    assert project.design_doc == original_doc, (
+        "design_doc must not be mutated by verification (no status field added)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_system_verification_folds_into_direction_context(db_session, mocker):
+    """The current direction's system verdict is folded into direction_design_context."""
+    system_id = "sys-folded"
+    direction = {**_active_direction("d-sysverif-fold", "Improve folded"), "system_id": system_id}
+    project = Project(
+        name="SysVerif Fold",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            f"systems/{system_id}": {
+                "status": "mature",
+                "modules": ["backend/app/gone.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    ctx = payload.get("direction_design_context")
+    assert ctx is not None
+    assert ctx.get("verification", {}).get("status") == "claimed_absent"
+
+
+@pytest.mark.asyncio
+async def test_system_verification_uses_project_repo_and_integration_branch(
+    db_session, mocker
+):
+    direction = _active_direction("d-sysverif-ctx", "Improve branch-aware system")
+    project = Project(
+        name="SysVerif Context",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/ctx": {
+                "status": "mature",
+                "modules": ["backend/app/ctx.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    seen_kwargs = {}
+
+    async def _classify(paths, **kwargs):
+        seen_kwargs.update(kwargs)
+        return paths, []
+
+    mocker.patch(
+        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+    )
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("ghs_test", "acme", "widget")),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert payload["system_verification"]["ctx"]["status"] == "verified"
+    assert seen_kwargs == {
+        "branch": "automain",
+        "project_id": str(project.id),
+        "token": "ghs_test",
+        "owner": "acme",
+        "repo": "widget",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bucket,key,marker",
+    [
+        ("systems", "system_verification", "systems/ctx"),
+        ("capabilities", "capability_verification", "capabilities/ctxcap"),
+    ],
+)
+async def test_symbol_verification_passes_branch_context_to_symbol_checks(
+    db_session, mocker, bucket, key, marker
+):
+    direction = _active_direction(f"d-{bucket}-symbol-ctx", "Improve symbol-aware")
+    design_doc = {
+        marker: {
+            "status": "mature" if bucket == "systems" else "working",
+            "modules": ["backend/app/ctx.py:missing_symbol"],
+            (
+                "description" if bucket == "systems" else "notes"
+            ): "Depends on backend/app/ctx.py:missing_symbol.",
+        }
+    }
+    project = Project(
+        name=f"{bucket.title()} Symbol Context",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc=design_doc,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    seen_kwargs = {}
+
+    async def _classify(paths, **kwargs):
+        return paths, []
+
+    async def _detect(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return ["backend/app/ctx.py:missing_symbol"]
+
+    mocker.patch(
+        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+    )
+    mocker.patch("app.autonomous_research.detect_absent_symbols", side_effect=_detect)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("ghs_test", "acme", "widget")),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert (
+        payload[key]["ctx" if bucket == "systems" else "ctxcap"]["status"]
+        == "claimed_absent"
+    )
+    assert seen_kwargs == {
+        "branch": "automain",
+        "project_id": str(project.id),
+        "token": "ghs_test",
+        "owner": "acme",
+        "repo": "widget",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Design-doc capability verification (claimed-but-absent / partial / untouched)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_all_missing_flagged_claimed_absent(
+    db_session, mocker
+):
+    """A working capability whose every backing path is absent is flagged claimed_absent."""
+    direction = _active_direction("d-capverif-absent", "Improve ghost capability")
+    project = Project(
+        name="CapVerif Absent",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/ghostcap": {
+                "status": "working",
+                "modules": ["backend/app/cap_a.py", "backend/app/cap_b.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None, "capability_verification annotation should be present"
+    assert cv["ghostcap"]["status"] == "claimed_absent"
+    assert cv["ghostcap"]["claimed_status"] == "working"
+    assert cv["ghostcap"]["present"] == []
+    assert set(cv["ghostcap"]["missing"]) == {
+        "backend/app/cap_a.py",
+        "backend/app/cap_b.py",
+    }
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_path_in_notes_flagged(db_session, mocker):
+    """A capability carrying its only path pointer in `notes` free text is verified."""
+    direction = _active_direction("d-capverif-notes", "Improve notes capability")
+    project = Project(
+        name="CapVerif Notes",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/notescap": {
+                "status": "working",
+                "notes": "Implemented in backend/app/notes_only.py and wired up.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None
+    assert cv["notescap"]["status"] == "claimed_absent"
+    assert cv["notescap"]["missing"] == ["backend/app/notes_only.py"]
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_passes_branch_context_to_symbol_checks(
+    db_session, mocker
+):
+    direction = _active_direction("d-capverif-symbol-ctx", "Improve symbol-aware capability")
+    project = Project(
+        name="CapVerif Symbol Context",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/ctxcap": {
+                "status": "working",
+                "modules": ["backend/app/ctx.py:missing_symbol"],
+                "notes": "Uses backend/app/ctx.py:missing_symbol.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    seen_kwargs = {}
+
+    async def _classify(paths, **kwargs):
+        return paths, []
+
+    async def _detect(*args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return ["backend/app/ctx.py:missing_symbol"]
+
+    mocker.patch(
+        "app.autonomous_research.classify_existing_paths", side_effect=_classify
+    )
+    mocker.patch("app.autonomous_research.detect_absent_symbols", side_effect=_detect)
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=("ghs_test", "acme", "widget")),
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert payload["capability_verification"]["ctxcap"]["status"] == "claimed_absent"
+    assert seen_kwargs == {
+        "branch": "automain",
+        "project_id": str(project.id),
+        "token": "ghs_test",
+        "owner": "acme",
+        "repo": "widget",
+    }
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_present_path_not_flagged(db_session, mocker):
+    """A capability with a present backing path is left alone (not claimed_absent)."""
+    direction = _active_direction("d-capverif-present", "Improve real capability")
+    project = Project(
+        name="CapVerif Present",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/realcap": {
+                "status": "working",
+                "modules": ["backend/app/real_cap.py", "backend/app/gone_cap.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths={"backend/app/real_cap.py"})
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None
+    assert cv["realcap"]["status"] == "partial"
+    assert cv["realcap"]["present"] == ["backend/app/real_cap.py"]
+    assert cv["realcap"]["missing"] == ["backend/app/gone_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_no_path_untouched(db_session, mocker):
+    """A capability with no path pointer is never classified (absence ≠ absent code)."""
+    direction = _active_direction("d-capverif-nopath", "Improve pathless capability")
+    project = Project(
+        name="CapVerif NoPath",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/pathless": {
+                "status": "working",
+                "notes": "Lets operators do a thing. No file pointer here.",
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    # No path pointer → the capability must not appear in the verification map.
+    assert "pathless" not in (payload.get("capability_verification") or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_planned_status_skipped(db_session, mocker):
+    """A non-present-status capability (planned) is skipped — agent already builds it."""
+    direction = _active_direction("d-capverif-planned", "Build planned capability")
+    project = Project(
+        name="CapVerif Planned",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/plannedcap": {
+                "status": "planned",
+                "modules": ["backend/app/not_yet.py"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    assert "plannedcap" not in (payload.get("capability_verification") or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_does_not_mutate_design_doc(db_session, mocker):
+    """Capability verification is advisory only — stored design_doc is unchanged."""
+    direction = _active_direction("d-capverif-immut", "Improve capability")
+    original_doc = {
+        "capabilities/x": {
+            "status": "working",
+            "modules": ["backend/app/cap_missing.py"],
+        }
+    }
+    project = Project(
+        name="CapVerif Immutable",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={k: dict(v) for k, v in original_doc.items()},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_classify(mocker, present_paths=set())
+
+    await _spawn_and_get_research_payload(project, db_session)
+    await db_session.refresh(project)
+    assert project.design_doc == original_doc, (
+        "design_doc must not be mutated by capability verification"
+    )
+
+
 # ── Undirected (cross-cutting) research spawn guard ──────────────────────────
 
 
@@ -9748,3 +10302,119 @@ async def test_undirected_guard_scoped_per_project(db_session):
     )
     assert await _undirected_research_recently_active(p1.id, db_session) is False
     assert await _undirected_research_recently_active(p2.id, db_session) is True
+
+
+@pytest.mark.asyncio
+async def test_idle_research_skips_paused_project(db_session, mocker):
+    """`_check_idle_research` must not spawn work for a paused project even when
+    autonomous_enabled is True and it has an active direction; a non-paused
+    sibling still spawns."""
+    from app.autonomous_research import _check_idle_research
+
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_periodic_task", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_residual_fingerprint_remediation",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.anomaly_detection._expire_stale_proposals", new_callable=AsyncMock
+    )
+    # _check_idle_research opens its own ``async with AsyncSessionLocal()``
+    # session; bind it to the test's own db_session (via a no-op context
+    # manager) so it sees the rows committed below and never builds the
+    # production lazy engine in the test environment.
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _session_cm():
+        yield db_session
+
+    mocker.patch(
+        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
+    )
+
+    paused = Project(
+        name="Idle Paused",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=True,
+        directions=[_active_direction("d-paused01")],
+    )
+    active = Project(
+        name="Idle Active",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=False,
+        directions=[_active_direction("d-active01")],
+    )
+    db_session.add_all([paused, active])
+    await db_session.commit()
+    await db_session.refresh(paused)
+    await db_session.refresh(active)
+
+    # Clear the time-gate so the periodic check actually runs this call.
+    _shared_state.last_idle_check = None
+    try:
+        await _check_idle_research()
+    finally:
+        _shared_state.last_idle_check = None
+
+    spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
+    assert active.id in spawned_ids, "Non-paused project should spawn research"
+    assert paused.id not in spawned_ids, "Paused project must be skipped"
+
+
+@pytest.mark.asyncio
+async def test_post_merge_research_skips_paused_project(db_session, mocker):
+    """`_check_autonomous_research` (post-merge hook) must skip a paused project
+    while still spawning for a non-paused project on the same repo."""
+    from app.autonomous_research import _check_autonomous_research
+
+    spawn_spy = mocker.patch(
+        "app.autonomous_research._spawn_research_task", new_callable=AsyncMock
+    )
+    # _check_autonomous_research opens its own ``async with
+    # AsyncSessionLocal()`` session; bind it to the test's own db_session so it
+    # sees the committed rows below.
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _session_cm():
+        yield db_session
+
+    mocker.patch(
+        "app.autonomous_research.AsyncSessionLocal", lambda: _session_cm()
+    )
+
+    owner, repo = "acme", "widgets"
+    paused = Project(
+        name="Merge Paused",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=True,
+        github_owner=owner,
+        github_repo=repo,
+    )
+    active = Project(
+        name="Merge Active",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        paused=False,
+        github_owner=owner,
+        github_repo=repo,
+    )
+    db_session.add_all([paused, active])
+    await db_session.commit()
+    await db_session.refresh(paused)
+    await db_session.refresh(active)
+
+    await _check_autonomous_research(owner, repo)
+
+    spawned_ids = {call.args[0].id for call in spawn_spy.call_args_list}
+    assert active.id in spawned_ids, "Non-paused project should spawn research"
+    assert paused.id not in spawned_ids, "Paused project must be skipped"

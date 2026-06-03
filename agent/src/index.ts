@@ -1,6 +1,7 @@
 import { spawn, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import path from 'path';
 import WebSocket from 'ws';
 import { handlers, type Handler } from './handlers/index.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
@@ -8,7 +9,7 @@ import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
-import { resetForNextRole } from './reset.js';
+import { resetForNextRole, clearProviderCredentials } from './reset.js';
 import { isHeartbeatTransient } from './heartbeat-classify.js';
 import {
   type FixLoopEvent,
@@ -50,6 +51,7 @@ import {
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  refreshRuntimeState,
   getProviderRunner,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
@@ -60,6 +62,7 @@ import {
 export {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, NoProgressTimeoutError,
+  refreshRuntimeState,
   getProviderRunner,
   __setRunClaudeCodeOverrideForSmoke, codexStreamHasTurnCompleted,
   runClaudeCode, runProviderAgent,
@@ -134,7 +137,11 @@ export { recordInitialOAuthAuthHash, ClaudeTimeoutError };
 
 /** Rotate OAuth credentials if changed, bound to the local apiPost. */
 export function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
-  return _rotateOAuthCredentialsIfChanged(taskId, apiPost);
+  return _rotateOAuthCredentialsIfChanged(taskId, apiPost).then(() => {
+    if (activeCredentialStateSource === 'boot' && bootCredentialSnapshot !== null) {
+      bootCredentialSnapshot = snapshotManagedCredentialState();
+    }
+  });
 }
 
 // ── Build configuration (from project settings, passed via claim response) ───
@@ -214,6 +221,12 @@ export function getAgentHeaders(): Record<string, string> {
   return { 'Content-Type': 'application/json', 'X-Agent-Token': AGENT_TOKEN };
 }
 
+/** Test-only: override the live agent token used by main()/api calls. */
+export function _setAgentTokenForTesting(value: string): void {
+  AGENT_TOKEN = value;
+  apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+}
+
 const apiHeaders: Record<string, string> = {
   'Content-Type': 'application/json',
   'X-Agent-Token': AGENT_TOKEN,
@@ -256,9 +269,223 @@ export function resolveBaseBranch(
 }
 
 
-function writePrivateFileSync(path: string, contents: string): void {
-  fs.writeFileSync(path, contents, { encoding: 'utf-8', mode: 0o600 });
-  try { fs.chmodSync(path, 0o600); } catch { /* best effort on non-POSIX filesystems */ }
+function writePrivateFileSync(path: string, contents: string, mode = 0o600): void {
+  fs.writeFileSync(path, contents, { encoding: 'utf-8', mode });
+  try { fs.chmodSync(path, mode); } catch { /* best effort on non-POSIX filesystems */ }
+}
+
+interface SecretManifestFile {
+  path: string;
+  content: string;
+  mode: number;
+}
+
+interface MaterializedCredentialState {
+  env: Record<string, string>;
+  files: SecretManifestFile[];
+}
+
+const MANAGED_LLM_ENV_KEYS = [
+  'PROVIDER',
+  'AUTH_MODE',
+  'LLM_MODEL',
+  'LLM_EXECUTION_MODE',
+  'LLM_SETTINGS',
+  'LLM_CLI_TRANSLATION',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'CODEX_API_KEY',
+  'CODEX_HOME',
+  'GEMINI_API_KEY',
+  'GOOGLE_APPLICATION_CREDENTIALS',
+  'GOOGLE_CLOUD_PROJECT',
+  'GOOGLE_CLOUD_LOCATION',
+  'GOOGLE_GENAI_USE_VERTEXAI',
+  'GEMINI_CLI_TRUST_WORKSPACE',
+];
+const IDENTITY_ENV_KEYS = new Set([
+  'AGENT_SECRET_TOKEN',
+  'TASK_ID',
+  'VM_INSTANCE_ID',
+  'ORCHESTRATOR_URL',
+  'PROJECT_ID',
+  'BLUEPRINT_POOL_MODE',
+]);
+const KNOWN_MANAGED_CREDENTIAL_FILE_PATHS = [
+  '/home/agent/.claude.json',
+  '/home/agent/.gemini/settings.json',
+  '/opt/agent/openai/auth.json',
+  '/opt/agent/gemini/sa.json',
+];
+
+let bootCredentialSnapshot: MaterializedCredentialState | null = null;
+let lastMaterializedCredentialPaths = new Set<string>();
+let activeCredentialStateSource: 'boot' | 'retarget' = 'boot';
+
+function parseSecretFileMode(raw: unknown): number {
+  if (typeof raw === 'number' && Number.isInteger(raw) && raw > 0) return raw;
+  if (typeof raw === 'string' && /^[0-7]{3,4}$/.test(raw)) return parseInt(raw, 8);
+  return 0o600;
+}
+
+function ensureParentDirectorySync(filePath: string): void {
+  const parent = path.dirname(filePath);
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(parent, 0o700); } catch { /* best effort on non-POSIX filesystems */ }
+}
+
+function clearManagedCredentialState(): void {
+  for (const key of MANAGED_LLM_ENV_KEYS) {
+    Reflect.deleteProperty(process.env, key);
+  }
+  const paths = new Set<string>([
+    ...KNOWN_MANAGED_CREDENTIAL_FILE_PATHS,
+    ...lastMaterializedCredentialPaths,
+  ]);
+  for (const filePath of paths) {
+    try { fs.unlinkSync(filePath); } catch { /* missing files are fine */ }
+  }
+  lastMaterializedCredentialPaths = new Set();
+}
+
+function snapshotManagedCredentialState(): MaterializedCredentialState {
+  const env: Record<string, string> = {};
+  for (const key of MANAGED_LLM_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  const files: SecretManifestFile[] = [];
+  for (const filePath of KNOWN_MANAGED_CREDENTIAL_FILE_PATHS) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      files.push({ path: filePath, content, mode: 0o600 });
+    } catch { /* absent files are normal for other providers */ }
+  }
+  return { env, files };
+}
+
+function materializeCredentialState(
+  state: MaterializedCredentialState,
+  source: 'boot' | 'retarget',
+): void {
+  clearManagedCredentialState();
+  for (const file of state.files) {
+    ensureParentDirectorySync(file.path);
+    writePrivateFileSync(file.path, file.content, file.mode);
+  }
+  for (const [key, value] of Object.entries(state.env)) {
+    process.env[key] = value;
+  }
+  lastMaterializedCredentialPaths = new Set(state.files.map(file => file.path));
+  activeCredentialStateSource = source;
+  refreshRuntimeState();
+  recordInitialOAuthAuthHash();
+}
+
+function toFailure(message: string): Error & { failureCategory: FailureCategory } {
+  const err = new Error(message) as Error & { failureCategory: FailureCategory };
+  err.failureCategory = 'reset_failed';
+  return err;
+}
+
+function normalizeSecretManifest(manifest: unknown, context: string): MaterializedCredentialState {
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    throw toFailure(`${context}: secret_manifest must be an object`);
+  }
+  const record = manifest as Record<string, unknown>;
+  const metadata = record.metadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw toFailure(`${context}: secret_manifest.metadata must be an object`);
+  }
+  if ((metadata as Record<string, unknown>).retarget !== true) {
+    throw toFailure(`${context}: secret_manifest.metadata.retarget must be true`);
+  }
+  for (const forbiddenKey of ['task_id', 'vm_instance_id', 'project_id', 'pool_mode']) {
+    if (Object.prototype.hasOwnProperty.call(metadata, forbiddenKey)) {
+      throw toFailure(`${context}: secret_manifest.metadata.${forbiddenKey} is not allowed`);
+    }
+  }
+  const envRaw = record.env;
+  if (!envRaw || typeof envRaw !== 'object' || Array.isArray(envRaw)) {
+    throw toFailure(`${context}: secret_manifest.env must be an object`);
+  }
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envRaw as Record<string, unknown>)) {
+    if (IDENTITY_ENV_KEYS.has(key)) {
+      throw toFailure(`${context}: secret_manifest.env.${key} is not allowed`);
+    }
+    if (typeof value !== 'string') {
+      throw toFailure(`${context}: secret_manifest.env.${key} must be a string`);
+    }
+    env[key] = value;
+  }
+  if (!env.PROVIDER || !env.AUTH_MODE) {
+    throw toFailure(`${context}: secret_manifest must include PROVIDER and AUTH_MODE`);
+  }
+  const filesRaw = record.files;
+  if (filesRaw !== undefined && !Array.isArray(filesRaw)) {
+    throw toFailure(`${context}: secret_manifest.files must be an array when present`);
+  }
+  const files: SecretManifestFile[] = [];
+  for (const [idx, item] of (filesRaw ?? []).entries()) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw toFailure(`${context}: secret_manifest.files[${idx}] must be an object`);
+    }
+    const file = item as Record<string, unknown>;
+    if (typeof file.path !== 'string' || !path.isAbsolute(file.path)) {
+      throw toFailure(`${context}: secret_manifest.files[${idx}].path must be an absolute path`);
+    }
+    if (typeof file.content !== 'string') {
+      throw toFailure(`${context}: secret_manifest.files[${idx}].content must be a string`);
+    }
+    files.push({
+      path: file.path,
+      content: file.content,
+      mode: parseSecretFileMode(file.mode),
+    });
+  }
+  return { env, files };
+}
+
+function captureBootCredentialSnapshot(): void {
+  if (bootCredentialSnapshot !== null) return;
+  bootCredentialSnapshot = snapshotManagedCredentialState();
+  lastMaterializedCredentialPaths = new Set(bootCredentialSnapshot.files.map(file => file.path));
+  activeCredentialStateSource = 'boot';
+}
+
+function materializeClaimCredentialState(
+  secretManifest: unknown,
+  context: string,
+): void {
+  if (secretManifest !== undefined) {
+    materializeCredentialState(normalizeSecretManifest(secretManifest, context), 'retarget');
+    return;
+  }
+  if (bootCredentialSnapshot === null) {
+    throw toFailure(`${context}: boot credential snapshot is unavailable`);
+  }
+  materializeCredentialState(bootCredentialSnapshot, 'boot');
+}
+
+export function _resetCredentialStateForTesting(): void {
+  bootCredentialSnapshot = null;
+  lastMaterializedCredentialPaths = new Set();
+  activeCredentialStateSource = 'boot';
+  refreshRuntimeState();
+}
+
+export function _captureBootCredentialSnapshotForTesting(): void {
+  captureBootCredentialSnapshot();
+}
+
+export function _materializeClaimCredentialStateForTesting(secretManifest?: unknown, context = 'test'): void {
+  materializeClaimCredentialState(secretManifest, context);
+}
+
+export function _getActiveCredentialStateSourceForTesting(): 'boot' | 'retarget' {
+  return activeCredentialStateSource;
 }
 
 /**
@@ -373,7 +600,124 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
 export type { StaleResultEnvelope };
 export { createStaleResultEnvelope, parseStaleResultFile, staleResultBackoffMs, shouldAbandonStaleResult, markStaleResultFailure };
 
-function writeStaleResultFile(path: string, envelope: StaleResultEnvelope): void {
+type PersistedStaleResultEnvelope = StaleResultEnvelope & {
+  agentToken?: string;
+};
+
+function decodeJwtSub(token: string): string | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    const payload = JSON.parse(json) as { sub?: unknown };
+    return typeof payload.sub === 'string' ? payload.sub : null;
+  } catch {
+    return null;
+  }
+}
+
+function createPersistedStaleResultEnvelope(
+  payload: Record<string, unknown>,
+  agentToken = AGENT_TOKEN,
+): PersistedStaleResultEnvelope {
+  const envelope = createStaleResultEnvelope(payload);
+  return agentToken ? { ...envelope, agentToken } : envelope;
+}
+
+function parsePersistedStaleResultFile(raw: string, now = Date.now()): PersistedStaleResultEnvelope {
+  const envelope = parseStaleResultFile(raw, now);
+  const parsed = JSON.parse(raw) as Record<string, unknown>;
+  const agentToken = strVal(parsed.agentToken) || strVal(parsed.agent_token);
+  return agentToken ? { ...envelope, agentToken } : envelope;
+}
+
+function markPersistedStaleResultFailure(
+  envelope: PersistedStaleResultEnvelope,
+  error: unknown,
+  now = Date.now(),
+): PersistedStaleResultEnvelope {
+  const updated = markStaleResultFailure(envelope, error, now);
+  return envelope.agentToken ? { ...updated, agentToken: envelope.agentToken } : updated;
+}
+
+function resolveReplayAgentToken(
+  envelope: PersistedStaleResultEnvelope,
+  staleTaskId: string,
+): { agentToken: string | null; reason?: string } {
+  if (envelope.agentToken) {
+    return { agentToken: envelope.agentToken };
+  }
+  const currentTokenTaskId = decodeJwtSub(AGENT_TOKEN);
+  if (currentTokenTaskId && currentTokenTaskId === staleTaskId) {
+    return { agentToken: AGENT_TOKEN };
+  }
+  if (currentTokenTaskId) {
+    return {
+      agentToken: null,
+      reason: `legacy envelope has no persisted agent token and current token belongs to ${currentTokenTaskId}`,
+    };
+  }
+  return {
+    agentToken: null,
+    reason: 'legacy envelope has no persisted agent token and current token is not task-scoped',
+  };
+}
+
+async function apiPostWithFixedToken(
+  path: string,
+  body: Record<string, unknown> = {},
+  agentToken: string,
+  retries = API_MAX_RETRIES,
+  timeoutMs = API_TIMEOUT,
+): Promise<unknown> {
+  if (body.logs && typeof body.logs === 'string' && body.logs.length > LOGS_MAX_LENGTH) {
+    body = { ...body, logs: body.logs.slice(0, LOGS_MAX_LENGTH) + '\n...(truncated)' };
+  }
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Agent-Token': agentToken,
+  };
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => { controller.abort(); }, timeoutMs);
+      const res = await fetch(`${ORCHESTRATOR_URL}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      if (res.ok) return await res.json() as unknown;
+      const text = await res.text();
+      if (res.status === 401 && text.includes('no longer active') && path === '/api/agent/status') {
+        log(`POST ${path} got 401 (task terminated) — previous POST likely succeeded`);
+        return { status: 'already_terminal', task_id: body.task_id };
+      }
+      if (res.status === 429) {
+        if (attempt === retries - 1) throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+        const retryAfterSec = parseInt(res.headers.get('Retry-After') || '5', 10);
+        const delayMs = Math.max(1000, Math.min(retryAfterSec * 1000, API_RETRY_BACKOFF_MAX_MS));
+        log(`POST ${path} got 429 (rate-limited/locked), retrying in ${delayMs}ms`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
+      if (res.status < 500) {
+        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+      }
+      if (attempt === retries - 1) {
+        throw new Error(`POST ${path} failed (${res.status}): ${text}`);
+      }
+    } catch (e) {
+      if (attempt === retries - 1 || (e instanceof Error && /failed \(4\d{2}\)/.test(e.message))) throw e;
+    }
+    await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, API_RETRY_BACKOFF_MAX_MS)));
+  }
+  throw new Error(`POST ${path} failed after ${retries} retries`);
+}
+
+function writeStaleResultFile(path: string, envelope: PersistedStaleResultEnvelope): void {
   writePrivateFileSync(path, JSON.stringify(envelope));
 }
 
@@ -443,7 +787,7 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
   const resultPath = `/tmp/task_${taskId}_result.json`;
   const statusPayload = await applyFinalStatusPrerequisites(taskId, payload);
   const enrichedPayload = enrichStatusPayload(taskId, statusPayload);
-  writeStaleResultFile(resultPath, createStaleResultEnvelope(enrichedPayload));
+  writeStaleResultFile(resultPath, createPersistedStaleResultEnvelope(enrichedPayload));
   const result = await apiPost('/api/agent/status', enrichedPayload);
   try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
   clearPendingStatusFlags(taskId);
@@ -581,6 +925,18 @@ export function log(msg: string) {
 // honours whatever response shape comes back. The only knob agents see is
 // the poll timeout default (180s), which matches the backend default.
 
+// Provider secret manifest shape, identical to what build_agent_secret_manifest
+// (backend/app/compute_manifest.py) produces and what the boot-time
+// materialize_manifest.py consumes: an env dict (provider/auth/model + secret
+// env), provider credential files, and metadata. The backend includes this
+// under the next-role response's `secret_manifest` ONLY when the warm-claimed
+// task re-targets to an LLM account different from the VM's frozen boot account.
+export interface SecretManifest {
+  env?: Record<string, unknown>;
+  files?: { path: string; content?: string; mode?: string }[];
+  metadata?: Record<string, unknown>;
+}
+
 export interface PollResult {
   action: 'claim' | 'exit';
   taskId?: string;
@@ -591,6 +947,11 @@ export interface PollResult {
   // idempotent-replay), since the prior task's JWT is terminal and only
   // authenticates the idempotent next-role/vm-heartbeat paths.
   agentToken?: string;
+  // Present only on an account-divergent warm claim: the resolved account's
+  // provider secret manifest. When set, the role loop must re-materialize
+  // credentials and re-exec so the frozen provider constants are re-read on
+  // the correct account. Absent (same-account claim) → JWT-only rotation.
+  secretManifest?: SecretManifest;
 }
 
 export interface PollForNextRoleOptions {
@@ -602,6 +963,17 @@ export interface PollForNextRoleOptions {
   pollIntervalMs?: number;
   timeoutMs?: number;
   heartbeatIntervalMs?: number;
+}
+
+export interface PoolBootPollOptions {
+  vmInstanceId: string;
+  apiBase: string;
+  agentJwt: string;
+  maxIdleLifetimeMs?: number;
+  pollWindowMs?: number;
+  pollIntervalMs?: number;
+  heartbeatIntervalMs?: number;
+  pollOnce?: (opts: PollForNextRoleOptions) => Promise<PollResult>;
 }
 
 export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<PollResult> {
@@ -702,19 +1074,28 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         }
         // 200 OK with a JSON body that selects claim or exit.
         if (res.status === 200) {
-          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string } = {};
+          let body: { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown } = {};
           try {
-            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string };
+            body = await res.json() as { action?: string; task_id?: string; reason?: string; agent_token?: string; secret_manifest?: unknown };
           } catch (e) {
             log(`pollForNextRole: 200 with unparseable body: ${String(e)}`);
             await new Promise(r => setTimeout(r, pollIntervalMs));
             continue;
           }
           if (body.action === 'claim' && typeof body.task_id === 'string') {
+            // secret_manifest is present ONLY for account-divergent re-targets;
+            // an object with an env/files shape signals the role loop to
+            // re-materialize + re-exec. Anything else (absent/null) → same-account
+            // JWT-only rotation, byte-for-byte unchanged from before.
+            const sm = body.secret_manifest;
+            const secretManifest = (sm && typeof sm === 'object' && !Array.isArray(sm))
+              ? (sm as SecretManifest)
+              : undefined;
             return {
               action: 'claim',
               taskId: body.task_id,
               agentToken: typeof body.agent_token === 'string' ? body.agent_token : undefined,
+              ...(secretManifest ? { secretManifest } : {}),
             };
           }
           if (body.action === 'exit') {
@@ -740,6 +1121,214 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
   } finally {
     clearInterval(heartbeatTimer);
   }
+}
+
+// ── Warm-VM provider re-targeting (account-divergent warm claim) ──────────────
+//
+// A warm VM runs many sequential roles in ONE process. The provider/auth/
+// execution-mode constants (PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE,
+// LLM_CLI_TRANSLATION in providers/runners.ts) are FROZEN at import from the
+// boot /etc/agent.env, and the provider secret material (CLAUDE_CODE_OAUTH_TOKEN,
+// ANTHROPIC_API_KEY, GEMINI_API_KEY, CODEX_HOME, …) lives in the process env +
+// on-disk credential files written at boot. So when the backend warm-claims a
+// task that resolves to a DIFFERENT LLM account, a JWT-only rotation cannot
+// adopt the new material — the role would run on the wrong provider.
+//
+// performWarmRetarget re-materializes the new account's credentials and then
+// performs a controlled re-exec (systemd unit restart) so the constants are
+// re-read from the freshly written /etc/agent.env. This reuses the boot path
+// rather than refactoring the ~50 frozen-const call sites into per-role getters.
+
+// Absolute path to the materialize helper baked into the agent VM image
+// alongside the agent source (infra/packer copies agent/src → /opt/agent/src).
+// It is a byte-identical mirror of backend/app/_agent_scripts/materialize_manifest.py
+// (CI enforces parity); the boot path embeds the same canonical file. Reusing
+// the real helper avoids a parallel materializer + the cross-language escaping
+// hazards of inlining the script (see CLAUDE.md).
+export const MATERIALIZE_SCRIPT_PATH = fileURLToPath(
+  new URL('./_agent_scripts/materialize_manifest.py', import.meta.url),
+);
+
+// Injectable side effects of the re-target path, so unit tests can assert the
+// clear → materialize → re-exec sequence without touching sudo / systemd /
+// the real filesystem. Mirrors the __setRunClaudeCodeOverrideForSmoke pattern.
+export interface WarmRetargetDeps {
+  /** Wipe the prior account's credential material (env file + cred dirs). */
+  clearCreds: () => Promise<void>;
+  /** Run the real materialize helper as root to (re)write envPath + cred files. */
+  materialize: (manifest: SecretManifest, envPath: string) => void;
+  /** Re-exec the agent process so frozen provider constants are re-read. */
+  reexec: () => Promise<never> | Promise<void>;
+}
+
+function defaultMaterialize(manifest: SecretManifest, envPath: string): void {
+  // The helper writes /etc/agent.env (root-owned 0600) and chowns provider
+  // credential files to the agent user, so it must run as root — exactly as the
+  // boot path invokes it. The manifest JSON itself carries no extra escaping
+  // burden (it is plain JSON.stringify), and the embedded script is a real
+  // file, so the cross-language code-generation hazards do not apply here.
+  const manifestPath = `/tmp/agent_retarget_manifest_${process.pid}.json`;
+  writePrivateFileSync(manifestPath, JSON.stringify(manifest));
+  try {
+    execFileSync('sudo', ['python3', MATERIALIZE_SCRIPT_PATH, manifestPath, envPath], {
+      timeout: 60_000,
+      stdio: 'pipe',
+    });
+  } finally {
+    try { fs.unlinkSync(manifestPath); } catch { /* ignore — best effort */ }
+  }
+}
+
+async function defaultReexec(): Promise<never> {
+  // Suppress this (about-to-be-killed) process's SIGTERM crash report: the
+  // restart SIGTERMs us and the FRESH process owns the just-claimed task. With
+  // TASK_ID blanked, _crashReport's `if (taskId)` gate skips, so the benign
+  // restart never overwrites the new task's status with a FATAL message.
+  requestCancel();
+  process.env.TASK_ID = '';
+  // --no-block returns immediately instead of blocking until the unit (us!)
+  // stops; systemd then asynchronously SIGTERMs this process and starts a fresh
+  // one that re-reads /etc/agent.env. A blocking restart would deadlock: the
+  // synchronous execFileSync would hold the event loop so our SIGTERM handler
+  // could never run, hanging until TimeoutStopSec → SIGKILL.
+  execFileSync('sudo', ['systemctl', 'restart', '--no-block', 'blueprint-agent'], {
+    timeout: 30_000,
+    stdio: 'pipe',
+  });
+  log('Warm re-target: systemd restart requested — awaiting SIGTERM to re-exec on new provider');
+  // Block forever; the incoming SIGTERM tears us down. Never resolves so the
+  // role loop cannot re-enter and run on stale credentials.
+  return new Promise<never>(() => { /* resolved only by process teardown */ });
+}
+
+let warmRetargetDeps: WarmRetargetDeps = {
+  clearCreds: () => clearProviderCredentials(),
+  materialize: defaultMaterialize,
+  reexec: defaultReexec,
+};
+
+/** Test-only: override the warm-retarget side effects. */
+export function __setWarmRetargetDepsForTesting(deps: Partial<WarmRetargetDeps> | null): void {
+  warmRetargetDeps = deps
+    ? { clearCreds: () => clearProviderCredentials(), materialize: defaultMaterialize, reexec: defaultReexec, ...deps }
+    : { clearCreds: () => clearProviderCredentials(), materialize: defaultMaterialize, reexec: defaultReexec };
+}
+
+/**
+ * Re-target a warm VM onto the account-divergent claim's provider credentials.
+ *
+ * 1. Clear the prior account's credential material (no leakage).
+ * 2. Re-inject the rotated JWT + task id + warm-handoff/re-exec markers the
+ *    backend dropped/omitted from the manifest, then materialize the new
+ *    account's manifest (rewrites /etc/agent.env + provider cred files).
+ * 3. Controlled re-exec so the frozen provider constants are re-read and the
+ *    role resumes on the correct provider.
+ *
+ * In production step 3 never returns (the restart SIGTERMs us). The injectable
+ * deps make the sequence assertable in tests.
+ */
+export async function performWarmRetarget(
+  secretManifest: SecretManifest,
+  opts: { rotatedJwt: string; taskId: string },
+  deps: WarmRetargetDeps = warmRetargetDeps,
+): Promise<void> {
+  // 1. Clear-then-write ordering: wipe prior creds before materializing new ones.
+  await deps.clearCreds();
+
+  // 2. The backend strips AGENT_SECRET_TOKEN from the manifest (the authoritative
+  //    rotated JWT rides the response's agent_token), so re-inject it here. TASK_ID
+  //    pins the just-claimed role so the re-exec'd process resumes THAT claim
+  //    (idempotent /api/agent/claim replay) rather than re-polling. The warm
+  //    markers tell main() to keep the workspace warm and count this as a warm role.
+  const env: Record<string, unknown> = { ...(secretManifest.env ?? {}) };
+  env.AGENT_SECRET_TOKEN = opts.rotatedJwt;
+  if (opts.taskId) env.TASK_ID = opts.taskId;
+  env.BLUEPRINT_WARM_HANDOFF = '1';
+  env.BLUEPRINT_REEXEC = '1';
+  const manifest: SecretManifest = { ...secretManifest, env };
+
+  // 3. Materialize via the real helper, then re-exec.
+  deps.materialize(manifest, '/etc/agent.env');
+  await deps.reexec();
+}
+
+const DEFAULT_POOL_MAX_IDLE_LIFETIME_MS = 60 * 60 * 1000;
+const INITIAL_POOL_PRIOR_TASK_ID = '00000000-0000-0000-0000-000000000000';
+
+function parseDurationEnvMs(name: string, fallbackMs: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallbackMs;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    log(`Ignoring invalid ${name}=${raw}; using ${fallbackMs}ms`);
+    return fallbackMs;
+  }
+  return Math.floor(parsed);
+}
+
+function getPoolMaxIdleLifetimeMs(): number {
+  return parseDurationEnvMs('BLUEPRINT_POOL_MAX_IDLE_LIFETIME_MS', DEFAULT_POOL_MAX_IDLE_LIFETIME_MS);
+}
+
+function activateClaimedRole(
+  claim: Pick<PollResult, 'taskId' | 'agentToken'>,
+  missingTokenErrorPrefix: string,
+): void {
+  if (claim.agentToken) {
+    AGENT_TOKEN = claim.agentToken;
+    apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+    stopProactiveTokenRefresh();
+    scheduleProactiveTokenRefresh(AGENT_TOKEN);
+  } else {
+    const err = new Error(`${missingTokenErrorPrefix}: missing agent_token in next-role response`) as Error & {
+      failureCategory?: FailureCategory;
+    };
+    err.failureCategory = 'reset_failed';
+    throw err;
+  }
+  if (claim.taskId) {
+    process.env.TASK_ID = claim.taskId;
+    setCrashReportTaskId(claim.taskId);
+  }
+  _inWarmPollWindow = false;
+}
+
+export async function bootstrapPoolMode(opts: PoolBootPollOptions): Promise<PollResult> {
+  const {
+    vmInstanceId,
+    apiBase,
+    agentJwt,
+    maxIdleLifetimeMs = getPoolMaxIdleLifetimeMs(),
+    pollWindowMs = 180_000,
+    pollIntervalMs,
+    heartbeatIntervalMs,
+    pollOnce = pollForNextRole,
+  } = opts;
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < maxIdleLifetimeMs) {
+    const remainingMs = maxIdleLifetimeMs - (Date.now() - startedAt);
+    const result = await pollOnce({
+      vmInstanceId,
+      priorTaskId: INITIAL_POOL_PRIOR_TASK_ID,
+      priorPrNumber: null,
+      apiBase,
+      agentJwt,
+      timeoutMs: Math.min(pollWindowMs, remainingMs),
+      ...(pollIntervalMs !== undefined ? { pollIntervalMs } : {}),
+      ...(heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs } : {}),
+    });
+    if (result.action === 'claim') {
+      if (bootCredentialSnapshot === null) {
+        captureBootCredentialSnapshot();
+      }
+      activateClaimedRole(result, 'reset_failed: pool-mode first claim');
+      materializeClaimCredentialState(result.secretManifest, 'reset_failed: pool-mode first claim');
+      return result;
+    }
+    if (result.reason !== 'poll_timeout') return result;
+  }
+  return { action: 'exit', reason: 'max_idle_lifetime_exceeded' };
 }
 
 // ── Tool-use ring buffer ────────────────────────────────────────────────────
@@ -1182,7 +1771,7 @@ export function postTerminalStatusSync(
   // Persist a stale-result file FIRST so a retry path survives even if the
   // curl below times out under a partition.
   try {
-    writeStaleResultFile(`/tmp/task_${taskId}_result.json`, createStaleResultEnvelope(enriched));
+    writeStaleResultFile(`/tmp/task_${taskId}_result.json`, createPersistedStaleResultEnvelope(enriched));
   } catch { /* best effort — directory may be unwritable */ }
   try {
     execFileSync('curl', [
@@ -1794,97 +2383,23 @@ ${result.stdout}`;
   }
 }
 
-// ── Main ────────────────────────────────────────────────────────────────────
-async function main() {
-  // Start forensic instrumentation as early as possible. The lag monitor + exit
-  // markers don't depend on auth or task claim, so we want them recording from
-  // the moment node starts so a pre-claim death still leaves /tmp logs.
-  startEventLoopLagMonitor();
-  installExitMarkers();
+async function loadVmImageIdentity(): Promise<void> {
+  const id = await fetchVmImageIdentity();
+  vmImageName = id.image_name;
+  vmImageTs = id.image_ts;
+  log(`VM image: ${vmImageName ?? '<unknown>'}${vmImageTs ? ` (ts=${vmImageTs})` : ''}`);
+}
 
-  const runner = getProviderRunner();
-  log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
-  log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
-  log(`Agent source: ${import.meta.url}`);
-  if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
-
-  // Cold start — ensure prepareWorkspaceForRole takes the fresh-clone path on
-  // role 1. The flag is set later by the role-loop AFTER resetForNextRole
-  // succeeds; on first boot the workspace is empty and we always cold-clone.
-  delete process.env.BLUEPRINT_WARM_HANDOFF;
-
-  // Per-role state reset on cold-start. Mirrors the role-loop's warm handoff
-  // (same single source of truth) so a stale value from a previous process
-  // incarnation (shouldn't happen, but defensive) cannot leak into the first
-  // role's status payload. warmStart:false — role 1 is a cold start.
-  resetPerRoleModuleState({ warmStart: false });
-
-  // TASK_ID is baked into /etc/agent.env by the orchestrator's startup script
-  // so we can post pre-claim failure heartbeats. The JWT also binds sub=task_id,
-  // so the backend heartbeat endpoint accepts this task_id before claim runs.
-  const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
-
-  // Report a pre-claim failure via the existing heartbeat endpoint. The backend's
-  // /api/agent/heartbeat accepts PROVISIONING-status tasks, so this turns silent
-  // startup deaths into explained ones. Uses sendHeartbeatSync so the request
-  // flushes before the process exits.
-  const reportPreClaimFailure = (reason: string) => {
-    if (!PRE_CLAIM_TASK_ID) {
-      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${reason}`);
-      return;
-    }
-    const truncated = reason.slice(0, 500);
-    log(`Reporting pre-claim failure for task ${PRE_CLAIM_TASK_ID}: ${truncated}`);
-    sendHeartbeatSync(PRE_CLAIM_TASK_ID, `PRE_CLAIM_FAILED: ${truncated}`);
-  };
-
-  // Early "node reached main" beacon. Lands before any async work, so if the
-  // agent silently hangs during validation or claim we can at least tell
-  // that node started and the TASK_ID env was readable — see the silent
-  // pre-claim death forensics in the reaper. Best-effort, non-blocking.
-  if (PRE_CLAIM_TASK_ID) {
-    sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_BOOTED: node reached main(), validating auth');
-  }
-
-  log(`Provider runtime: provider=${PROVIDER} auth_mode=${AUTH_MODE} execution_mode=${LLM_EXECUTION_MODE}`);
-  if (LLM_CLI_TRANSLATION) {
-    log(`Settings bag: ${LLM_CLI_TRANSLATION.args.length} CLI args, ${LLM_CLI_TRANSLATION.prompt_fragments.length} prompt fragments`);
-    if (LLM_CLI_TRANSLATION.unsupported.length > 0) {
-      log(`Settings bag unsupported (not honored by CLI): ${LLM_CLI_TRANSLATION.unsupported.join('; ')}`);
-    }
-  }
-  log(runner.credentialSummary());
-  // Snapshot the OAuth auth file *before* provider validation runs. Validation
-  // invokes the CLI with the provisioned token, which for Codex may trigger a
-  // refresh immediately; without a baseline hash we'd miss rotations that
-  // happen during validation itself.
-  recordInitialOAuthAuthHash();
-  await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
-  if (PRE_CLAIM_TASK_ID) {
-    sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_AUTH_OK: provider validation complete');
-  }
-
-  // Read GCP boot-disk image identity once at startup so vm-heartbeats can
-  // report which Packer image this VM is running. Defensive: unreachable
-  // in local dev — vmImageName stays null and heartbeats omit it rather
-  // than blocking startup.
-  { const id = await fetchVmImageIdentity();
-    vmImageName = id.image_name;
-    vmImageTs = id.image_ts;
-    log(`VM image: ${vmImageName ?? '<unknown>'}${vmImageTs ? ` (ts=${vmImageTs})` : ''}`);
-  }
-  agentRuntimeFingerprint = readAgentRuntimeFingerprint();
-  log(`Agent runtime fingerprint: ${agentRuntimeFingerprint ?? '<not available>'}`);
-
+async function replayStaleResults(): Promise<void> {
   // Retry any stale result files from previous runs (network failure / VM kill mid-POST)
   try {
     const staleFiles = fs.readdirSync('/tmp').filter(f => /^task_.+_result\.json$/.test(f));
     for (const file of staleFiles) {
       const filePath = `/tmp/${file}`;
-      let staleEnvelope: StaleResultEnvelope | null = null;
+      let staleEnvelope: PersistedStaleResultEnvelope | null = null;
       try {
         const raw = fs.readFileSync(filePath, 'utf-8');
-        staleEnvelope = parseStaleResultFile(raw);
+        staleEnvelope = parsePersistedStaleResultFile(raw);
         const stalePayload = staleEnvelope.payload;
         const staleTaskId = strVal(stalePayload.task_id) || file.replace(/^task_/, '').replace(/_result\.json$/, '');
         const now = Date.now();
@@ -1898,13 +2413,19 @@ async function main() {
           log(`Skipping stale result for task ${staleTaskId}; retry backoff has ${waitSec}s remaining`);
           continue;
         }
+        const replayAuth = resolveReplayAgentToken(staleEnvelope, staleTaskId);
+        if (!replayAuth.agentToken) {
+          log(`Abandoning stale result for task ${staleTaskId}: ${replayAuth.reason}`);
+          try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+          continue;
+        }
         log(`Found stale result file for task ${staleTaskId} — retrying POST`);
-        await apiPost('/api/agent/status', stalePayload);
+        await apiPostWithFixedToken('/api/agent/status', stalePayload, replayAuth.agentToken);
         try { fs.unlinkSync(filePath); } catch { /* ignore */ }
         log(`Stale result for task ${staleTaskId} posted successfully`);
       } catch (e) {
         if (staleEnvelope) {
-          const updated = markStaleResultFailure(staleEnvelope, e);
+          const updated = markPersistedStaleResultFailure(staleEnvelope, e);
           const staleTaskId = strVal(updated.payload.task_id) || file.replace(/^task_/, '').replace(/_result\.json$/, '');
           if (shouldAbandonStaleResult(updated)) {
             log(`WARNING: Stale result for task ${staleTaskId} exhausted retries after ${updated.retry.attempts} attempts; deleting file so /tmp cannot grow unbounded`);
@@ -1923,6 +2444,134 @@ async function main() {
   } catch (e) {
     log(`WARNING: Stale result scan failed: ${String(e)}`);
   }
+}
+
+async function completeStartup(
+  runner: ProviderRunner,
+  reportPreClaimFailure: (reason: string) => void,
+  bootTaskId: string,
+  startupStatusRef?: { value: string },
+  authAlreadyValidated = false,
+): Promise<void> {
+  log(`Provider runtime: provider=${PROVIDER} auth_mode=${AUTH_MODE} execution_mode=${LLM_EXECUTION_MODE}`);
+  if (LLM_CLI_TRANSLATION) {
+    log(`Settings bag: ${LLM_CLI_TRANSLATION.args.length} CLI args, ${LLM_CLI_TRANSLATION.prompt_fragments.length} prompt fragments`);
+    if (LLM_CLI_TRANSLATION.unsupported.length > 0) {
+      log(`Settings bag unsupported (not honored by CLI): ${LLM_CLI_TRANSLATION.unsupported.join('; ')}`);
+    }
+  }
+  log(runner.credentialSummary());
+  // Provider auth may already have been validated before the first claim (pool
+  // mode validates pre-claim so a bad-cred VM fails before flipping a task
+  // IN_PROGRESS — matching cold-boot semantics). Re-validating would also reset
+  // the OAuth baseline hash AFTER a validation-triggered rotation, masking it.
+  if (!authAlreadyValidated) {
+    // Snapshot the OAuth auth file *before* provider validation runs. Validation
+    // invokes the CLI with the provisioned token, which for Codex may trigger a
+    // refresh immediately; without a baseline hash we'd miss rotations that
+    // happen during validation itself.
+    recordInitialOAuthAuthHash();
+    if (startupStatusRef) startupStatusRef.value = 'Completing startup: validating provider auth';
+    await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
+    if (bootTaskId) {
+      sendHeartbeatSync(bootTaskId, 'AGENT_AUTH_OK: provider validation complete');
+    }
+  }
+  if (startupStatusRef) startupStatusRef.value = 'Completing startup: reading runtime fingerprint';
+  agentRuntimeFingerprint = readAgentRuntimeFingerprint();
+  log(`Agent runtime fingerprint: ${agentRuntimeFingerprint ?? '<not available>'}`);
+  if (startupStatusRef) startupStatusRef.value = 'Completing startup: loading VM image identity';
+  await loadVmImageIdentity();
+  if (startupStatusRef) startupStatusRef.value = 'Completing startup: replaying stale results';
+  await replayStaleResults();
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+export async function main() {
+  // Start forensic instrumentation as early as possible. The lag monitor + exit
+  // markers don't depend on auth or task claim, so we want them recording from
+  // the moment node starts so a pre-claim death still leaves /tmp logs.
+  startEventLoopLagMonitor();
+  installExitMarkers();
+
+  log(`Blueprint Agent starting (VM: ${VM_INSTANCE_ID})`);
+  log(`Registered handlers (${Object.keys(handlers).length}): ${Object.keys(handlers).join(', ')}`);
+  log(`Agent source: ${import.meta.url}`);
+  if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
+
+  // Distinguish a genuine cold boot from a warm re-target re-exec. The
+  // re-target path (performWarmRetarget) restarts the systemd unit after
+  // resetForNextRole already cleaned + preserved the workspace, stamping
+  // BLUEPRINT_REEXEC=1 (+ BLUEPRINT_WARM_HANDOFF=1) into /etc/agent.env. On
+  // such a resume we KEEP the warm-handoff flag so prepareWorkspaceForRole
+  // reuses the workspace instead of cold-cloning, and we count the role as a
+  // warm start so the telemetry the backend stamped (context._timing.warm_start)
+  // is not overwritten with a spurious cold sample.
+  const isReexecResume = process.env.BLUEPRINT_REEXEC === '1';
+  if (isReexecResume) {
+    // One-shot marker — consume it so a later genuine cold path is unaffected.
+    delete process.env.BLUEPRINT_REEXEC;
+  } else {
+    // Cold start — ensure prepareWorkspaceForRole takes the fresh-clone path on
+    // role 1. The flag is set later by the role-loop AFTER resetForNextRole
+    // succeeds; on first boot the workspace is empty and we always cold-clone.
+    delete process.env.BLUEPRINT_WARM_HANDOFF;
+  }
+
+  // Per-role state reset on cold-start. Mirrors the role-loop's warm handoff
+  // (same single source of truth) so a stale value from a previous process
+  // incarnation (shouldn't happen, but defensive) cannot leak into the first
+  // role's status payload. warmStart is true only on a warm re-target re-exec.
+  resetPerRoleModuleState({ warmStart: isReexecResume });
+
+  // TASK_ID is baked into /etc/agent.env by the orchestrator's startup script
+  // so we can post pre-claim failure heartbeats. The JWT also binds sub=task_id,
+  // so the backend heartbeat endpoint accepts this task_id before claim runs.
+  const PRE_CLAIM_TASK_ID = process.env.TASK_ID || '';
+  const poolMode = process.env.BLUEPRINT_POOL_MODE === '1';
+
+  // Report a pre-claim failure via the existing heartbeat endpoint. The backend's
+  // /api/agent/heartbeat accepts PROVISIONING-status tasks, so this turns silent
+  // startup deaths into explained ones. Uses sendHeartbeatSync so the request
+  // flushes before the process exits.
+  const reportPreClaimFailure = (reason: string) => {
+    const reportTaskId = PRE_CLAIM_TASK_ID || process.env.TASK_ID || '';
+    const truncated = reason.slice(0, 500);
+    if (!reportTaskId) {
+      // Taskless pool boot: there is no task to attribute the failure to, but a
+      // VM-scoped token can carry the reason via /vm-heartbeat so the orchestrator
+      // logs an EXPLAINED death instead of reaping an unexplained zombie. Sync
+      // curl so the request flushes before the imminent process.exit(1).
+      const vmInstanceId = process.env.VM_INSTANCE_ID || '';
+      if (poolMode && vmInstanceId) {
+        log(`Reporting pre-claim failure via vm-heartbeat for VM ${vmInstanceId}: ${truncated}`);
+        try {
+          execFileSync('curl', [
+            '-sf', '-X', 'POST',
+            `${ORCHESTRATOR_URL}/api/agent/vm-heartbeat`,
+            '-H', 'Content-Type: application/json',
+            '-H', `X-Agent-Token: ${AGENT_TOKEN}`,
+            '-d', JSON.stringify({ vm_instance_id: vmInstanceId, pre_claim_failure: truncated }),
+          ], { timeout: 10_000, stdio: 'ignore' });
+        } catch (e) {
+          log(`vm-heartbeat pre-claim failure report failed: ${e instanceof Error ? e.message : String(e)} (non-fatal)`);
+        }
+        return;
+      }
+      log(`Cannot report pre-claim failure — TASK_ID env not set. Reason: ${reason}`);
+      return;
+    }
+    log(`Reporting pre-claim failure for task ${reportTaskId}: ${truncated}`);
+    sendHeartbeatSync(reportTaskId, `PRE_CLAIM_FAILED: ${truncated}`);
+  };
+
+  // Early "node reached main" beacon. Lands before any async work, so if the
+  // agent silently hangs during validation or claim we can at least tell
+  // that node started and the TASK_ID env was readable — see the silent
+  // pre-claim death forensics in the reaper. Best-effort, non-blocking.
+  if (PRE_CLAIM_TASK_ID) {
+    sendHeartbeatSync(PRE_CLAIM_TASK_ID, 'AGENT_BOOTED: node reached main(), validating auth');
+  }
 
   // ── Role loop ────────────────────────────────────────────────────────────
   // The first iteration is a cold start — claim via /api/agent/claim and
@@ -1940,6 +2589,47 @@ async function main() {
   // outer catch reports via the existing global crash handlers which fire
   // on the rejected promise from main().
   try {
+    if (poolMode) {
+      const vmInstanceId = process.env.VM_INSTANCE_ID;
+      if (!vmInstanceId) throw new Error('VM_INSTANCE_ID is required in pool mode');
+      // Validate provider auth BEFORE claiming the first task, matching cold-boot
+      // semantics (the cold path validates in completeStartup before any claim).
+      // bootstrapPoolMode flips a task IN_PROGRESS and rotates to a task-scoped
+      // token, so a pool VM with bad creds must fail HERE — before claiming —
+      // rather than failing a task it already owns. Snapshot the OAuth baseline
+      // first so a refresh triggered by validation is detected; completeStartup
+      // below is told the auth step is already done (authAlreadyValidated).
+      const bootRunner = getProviderRunner();
+      recordInitialOAuthAuthHash();
+      await validateProviderAuth(bootRunner, reportPreClaimFailure, process.env.LLM_MODEL);
+      captureBootCredentialSnapshot();
+      log(`Pool mode enabled — polling for first task (max idle ${getPoolMaxIdleLifetimeMs()}ms)`);
+      const poolResult = await bootstrapPoolMode({
+        vmInstanceId,
+        apiBase: ORCHESTRATOR_URL,
+        agentJwt: AGENT_TOKEN,
+      });
+      if (poolResult.action === 'exit') {
+        log(`Pool mode exiting before first claim (reason=${poolResult.reason ?? 'unspecified'})`);
+        return;
+      }
+      log(`Pool mode claimed first task: ${poolResult.taskId ?? ''}`);
+      const claimedRunner = getProviderRunner();
+      const startupTaskId = process.env.TASK_ID || poolResult.taskId || '';
+      const startupStatusRef = { value: 'Completing startup before claim replay' };
+      if (startupTaskId) {
+        startHeartbeat(startupTaskId, () => startupStatusRef.value);
+      }
+      try {
+        await completeStartup(claimedRunner, reportPreClaimFailure, startupTaskId, startupStatusRef, true);
+      } catch (startupErr) {
+        stopHeartbeat();
+        throw startupErr;
+      }
+    } else {
+      await completeStartup(getProviderRunner(), reportPreClaimFailure, PRE_CLAIM_TASK_ID);
+      captureBootCredentialSnapshot();
+    }
     for (;;) {
       let claimResult: RunRoleOnceResult;
       try {
@@ -2024,32 +2714,7 @@ async function main() {
       // every subsequent task-scoped call) authenticates against the new
       // task. Without rotation the prior task's terminal JWT is rejected
       // by verify_agent_token outside the idempotent-path allowlist.
-      if (pollResult.agentToken) {
-        AGENT_TOKEN = pollResult.agentToken;
-        apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
-        // Re-schedule proactive refresh based on the new task token's real expiry.
-        stopProactiveTokenRefresh();
-        scheduleProactiveTokenRefresh(AGENT_TOKEN);
-      } else {
-        // Backend always mints one for warm claims; missing it indicates
-        // a deploy mismatch (old backend, new agent). Treat as fatal so
-        // we don't silently keep using the stale prior-task JWT.
-        const err = new Error('reset_failed: warm-claim missing agent_token in next-role response') as Error & { failureCategory?: FailureCategory };
-        err.failureCategory = 'reset_failed';
-        throw err;
-      }
-      // Pre-set TASK_ID BEFORE resetForNextRole so any crash inside reset
-      // (or this block) crash-reports against the new task, not the prior
-      // terminal one. Without this, the global crash handler reads
-      // process.env.TASK_ID == lastTaskId and the orchestrator attributes
-      // the failure to the wrong (already-completed) task.
-      if (pollResult.taskId) {
-        process.env.TASK_ID = pollResult.taskId;
-        setCrashReportTaskId(pollResult.taskId);
-      }
-      // We've claimed a follow-on; the poll gap is over. A crash from here on
-      // attributes to the new task (the normal active-execution path).
-      _inWarmPollWindow = false;
+      activateClaimedRole(pollResult, 'reset_failed: warm-claim');
       try {
         await resetForNextRole({
           workspace: WORKSPACE,
@@ -2066,6 +2731,7 @@ async function main() {
         err.failureCategory = 'reset_failed';
         throw err;
       }
+      materializeClaimCredentialState(pollResult.secretManifest, 'reset_failed: warm-claim');
       // Reset succeeded — flip the warm-handoff flag so handlers'
       // prepareWorkspaceForRole reuses the workspace (preserving caches)
       // instead of wiping + re-cloning.
@@ -2077,6 +2743,36 @@ async function main() {
       // as a warm role; the next runRoleOnce sets roleClaimTimestamp after a
       // successful re-claim. See resetPerRoleModuleState for the field list.
       resetPerRoleModuleState({ warmStart: true });
+
+      // Account-divergent warm claim: the backend resolved this task to an LLM
+      // account different from the VM's frozen boot account and shipped its
+      // secret manifest. A JWT-only rotation cannot adopt the new provider
+      // material (the constants are frozen at import), so re-materialize the new
+      // credentials and re-exec. In production performWarmRetarget never returns
+      // (systemd restarts us); same-account claims (no secretManifest) fall
+      // straight through to the loop and re-enter on JWT-only rotation, exactly
+      // as before.
+      if (pollResult.secretManifest) {
+        log('Warm claim is account-divergent — re-materializing provider creds + re-exec');
+        try {
+          await performWarmRetarget(pollResult.secretManifest, {
+            rotatedJwt: AGENT_TOKEN,
+            taskId: pollResult.taskId ?? '',
+          });
+        } catch (rtErr) {
+          const rtMsg = rtErr instanceof Error ? rtErr.message : String(rtErr);
+          log(`warm re-target failed: ${rtMsg}`);
+          // Surface as reset_failed so the orchestrator cold-provisions a fresh
+          // VM rather than letting the role run on the prior account's creds.
+          const err = new Error(`reset_failed: warm re-target failed: ${rtMsg}`) as Error & { failureCategory?: FailureCategory };
+          err.failureCategory = 'reset_failed';
+          throw err;
+        }
+        // Unreachable in production (the restart SIGTERMs us). If reexec was a
+        // no-op (e.g. test injection), break rather than risk running the role
+        // on stale credentials.
+        break;
+      }
     }
   } finally {
     // Workspace teardown happens once at process exit, not per-role —
@@ -2164,6 +2860,10 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };
+  // Pool mode may keep a startup heartbeat alive through completeStartup() and
+  // the idempotent claim replay. Replace that timer with the normal per-role
+  // heartbeat before the handler begins so only one task heartbeat remains.
+  stopHeartbeat();
   startHeartbeat(taskId, () => statusRef.value);
   scheduleProactiveTokenRefresh(AGENT_TOKEN);
   const ws = await connectLogStream(taskId);
@@ -2282,7 +2982,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Per-role /tmp scratch cleanup. Workspace teardown happens at process
     // exit (in main()'s outer finally) so warm continuity preserves it.
     try { fs.unlinkSync(`/tmp/agent_prompt_${taskId}.txt`); } catch { /* ignore */ }
-    for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
+    for (const name of ['review_verdict', 'plan_output', 'research_findings', 'security_findings', 'smoketest_result', 'verify_tests_result', 'debug_output', 'perf_output', 'investigation_report', 'strategic_output', 'design_doc_output']) {
       try { fs.unlinkSync(`/tmp/${name}_${taskId}.json`); } catch { /* ignore */ }
     }
   }

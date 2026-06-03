@@ -114,7 +114,12 @@ from app.playbook_lifecycle import (  # noqa: F401
 from app.playbook_storage import (  # noqa: F401
     _PLAYBOOK_CAPACITY_BYTES,
     _playbook_size_bytes,
+    branch_grounding_due,
+    check_and_flag_stale_refs_branch_aware,
     finalize_pending_playbook_entries,
+    ground_design_doc_systems,
+    ground_design_doc_systems_branch_aware,
+    mark_branch_grounding_done,
     maybe_archive_for_capacity,
     retire_idle_auto_entries,
 )

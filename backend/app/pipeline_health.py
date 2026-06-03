@@ -21,6 +21,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.landed_signal import is_merged_completion
 from app.models import (
     Task,
     TaskStatus,
@@ -494,7 +495,8 @@ async def compute_pipeline_health_summary(
     def _first_review_approval_rate(tasks):
         """Fraction of review-eligible merged tasks that had no first-review rejection.
 
-        A task is 'review-eligible' if it is a create/refactor type with pr_merged=True.
+        A task is 'review-eligible' if it is a create/refactor task that
+        landed on the integration branch.
         A task 'approved on first review' if it does NOT have _first_attempt_rejection_categories
         in its context (meaning the first review returned APPROVE, not REQUEST_CHANGES).
         """
@@ -502,7 +504,7 @@ async def compute_pipeline_health_summary(
             t
             for t in tasks
             if (t.first_payload or {}).get("type", "create") in _review_eligible_types
-            and (t.context or {}).get("pr_merged") is True
+            and is_merged_completion(t)
         ]
         if not eligible:
             return None
@@ -772,7 +774,7 @@ async def compute_pipeline_health_summary(
         t
         for t in terminal_tasks_24h
         if (t.first_payload or {}).get("type", "create") in _review_eligible_types
-        and (t.context or {}).get("pr_merged") is True
+        and is_merged_completion(t)
     ]
     first_review_approval_rate = {
         "overall": _first_review_approval_rate(terminal_tasks_24h),

@@ -158,6 +158,12 @@ async def test_sync_applies_runtime_config_json():
             "task_type_provider_overrides": {
                 "research": {"anthropic": {"effort": "max"}}
             },
+            "warm_pin_clear_rate_threshold": 11,
+            "warm_continuity_cooldown_seconds": 2400,
+            "warm_backlog_reuse_failure_rate_threshold": 7,
+            "warm_backlog_reuse_cooldown_seconds": 2400,
+            "warm_backlog_scan_limit": 18,
+            "warm_backlog_teardown_defer_secs": 25,
         },
     )
     _shared_state.runtime_config["strategic_research_frequency"] = 6
@@ -167,6 +173,12 @@ async def test_sync_applies_runtime_config_json():
         "anthropic": {"effort": "medium"}
     }
     _shared_state.runtime_config["task_type_provider_overrides"] = {}
+    _shared_state.runtime_config["warm_pin_clear_rate_threshold"] = 10
+    _shared_state.runtime_config["warm_continuity_cooldown_seconds"] = 1800
+    _shared_state.runtime_config["warm_backlog_reuse_failure_rate_threshold"] = 5
+    _shared_state.runtime_config["warm_backlog_reuse_cooldown_seconds"] = 1800
+    _shared_state.runtime_config["warm_backlog_scan_limit"] = 10
+    _shared_state.runtime_config["warm_backlog_teardown_defer_secs"] = 20
 
     changed = await sync_runtime_config_from_state(state)
 
@@ -179,14 +191,117 @@ async def test_sync_applies_runtime_config_json():
     assert _shared_state.runtime_config["task_type_provider_overrides"] == {
         "research": {"anthropic": {"effort": "max"}}
     }
+    assert _shared_state.runtime_config["warm_pin_clear_rate_threshold"] == 11
+    assert _shared_state.runtime_config["warm_continuity_cooldown_seconds"] == 2400
+    assert _shared_state.runtime_config[
+        "warm_backlog_reuse_failure_rate_threshold"
+    ] == 7
+    assert _shared_state.runtime_config["warm_backlog_reuse_cooldown_seconds"] == 2400
+    assert _shared_state.runtime_config["warm_backlog_scan_limit"] == 18
+    assert _shared_state.runtime_config["warm_backlog_teardown_defer_secs"] == 25
     for key in (
         "strategic_research_frequency",
         "require_approval_gates",
         "max_provision_retries",
         "provider_settings_defaults",
         "task_type_provider_overrides",
+        "warm_pin_clear_rate_threshold",
+        "warm_continuity_cooldown_seconds",
+        "warm_backlog_reuse_failure_rate_threshold",
+        "warm_backlog_reuse_cooldown_seconds",
+        "warm_backlog_scan_limit",
+        "warm_backlog_teardown_defer_secs",
     ):
         assert key in changed
+
+
+@pytest.mark.asyncio
+async def test_sync_applies_warm_pool_project_allowlist():
+    """The per-project warm-pool enablement scope (allowlist) must propagate
+    from the persisted runtime_config_json to every instance, normalized to a
+    sorted list of trimmed, non-empty string ids (dedup + CSV-tolerant), so the
+    maintainer and provisioning entrypoints across the fleet agree on which
+    projects the pool is scoped to."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={
+            # Mixed shapes: ints, blanks, dupes, whitespace — all normalized.
+            "warm_pool_project_allowlist": ["proj-b", " proj-a ", "proj-a", 7, ""],
+        },
+    )
+    _shared_state.runtime_config["warm_pool_project_allowlist"] = []
+
+    changed = await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["warm_pool_project_allowlist"] == [
+        "7",
+        "proj-a",
+        "proj-b",
+    ]
+    assert "warm_pool_project_allowlist" in changed
+
+
+@pytest.mark.asyncio
+async def test_sync_accepts_csv_warm_pool_project_allowlist():
+    """A comma-separated string is tolerated (mirrors the admin PATCH surface)
+    and an empty allowlist restores fleet-wide behavior."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={"warm_pool_project_allowlist": "proj-c, proj-d ,"},
+    )
+    _shared_state.runtime_config["warm_pool_project_allowlist"] = ["stale"]
+
+    await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["warm_pool_project_allowlist"] == [
+        "proj-c",
+        "proj-d",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_applies_warm_pool_target_size_by_project():
+    """The per-project warm-pool target map must propagate from persisted
+    runtime_config_json to every instance, normalized to string keys and integer
+    values clamped to 0..50, with malformed entries dropped — so the maintainer
+    fleet-wide agrees on each project's reconcile target."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={
+            "warm_pool_target_size_by_project": {
+                " proj-a ": "3",  # trimmed key, int-coerced value
+                "proj-b": 99,  # clamped to 50
+                "proj-c": -2,  # clamped to 0
+                "": 4,  # dropped (blank key)
+                "proj-d": "bad",  # dropped (non-int)
+            },
+        },
+    )
+    _shared_state.runtime_config["warm_pool_target_size_by_project"] = {}
+
+    changed = await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["warm_pool_target_size_by_project"] == {
+        "proj-a": 3,
+        "proj-b": 50,
+        "proj-c": 0,
+    }
+    assert "warm_pool_target_size_by_project" in changed
 
 
 # --- Dispatcher Cycle Log ---

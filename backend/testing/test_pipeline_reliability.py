@@ -2026,18 +2026,22 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Test 6 — Deadlock detection clears failed dependencies
+# Test 6 — Deadlock detection cascade-cancels tasks blocked on a genuine failure
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
-async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
-    """Deadlock detection must clear depends_on for tasks whose dependencies are
-    in terminal states (FAILED/CANCELLED), allowing them to be dispatched.
+async def test_deadlock_detection_cascade_cancels_failed_deps(orch_db, mocker):
+    """The deadlock-breaker shares the main dispatch path's dependency-death
+    policy: a stuck task whose real prerequisite *genuinely* FAILED is
+    cascade-cancelled (impossible work, never dispatched) rather than
+    cleared-and-dispatched.
 
-    Scenario: A depends on B, B depends on C.  C is FAILED.
-    Expected: deadlock detection clears B's depends_on (unblocking B),
-    and on the next scan also clears A's depends_on.
+    Scenario: A depends on B, B depends on C.  C is FAILED (a genuine failure,
+    no SCOPE_EMPTY exit, no replacement clone).
+    Expected: deadlock detection cancels B (its prerequisite cannot be
+    satisfied), leaving B's depends_on intact. A keeps waiting on the
+    still-pending B this cycle and is cascade-cancelled on a later scan.
     """
     session, _Session = orch_db
 
@@ -2099,14 +2103,20 @@ async def test_deadlock_detection_clears_failed_deps(orch_db, mocker):
         updated_b = b_result.scalars().first()
 
     assert updated_b is not None
-    assert updated_b.depends_on == [] or updated_b.depends_on is None, (
-        f"Expected B's depends_on to be cleared after C failed, "
+    assert updated_b.status == TaskStatus.CANCELLED, (
+        f"Expected B to be cascade-cancelled after its genuine prerequisite C "
+        f"failed (never cleared-and-dispatched), got status {updated_b.status!r}"
+    )
+    # depends_on is NOT cleared for a cascade-cancelled dependent — clearing is
+    # reserved for cycles / satisfied-dead deps that get dispatched.
+    assert updated_b.depends_on == [str(task_c.id)], (
+        f"Expected B's depends_on to be left intact on cancellation, "
         f"got {updated_b.depends_on!r}"
     )
-    assert (
-        "deadlock" in (updated_b.latest_status_message or "").lower()
-        or "dependencies cleared" in (updated_b.latest_status_message or "").lower()
-    ), f"Expected deadlock message on task B, got: {updated_b.latest_status_message!r}"
+    assert "dependency" in (updated_b.latest_status_message or "").lower(), (
+        f"Expected a dependency-failure cancellation message on task B, "
+        f"got: {updated_b.latest_status_message!r}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

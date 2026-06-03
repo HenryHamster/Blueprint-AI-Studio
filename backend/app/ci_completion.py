@@ -19,255 +19,34 @@ accepted as a fallback so in-flight tasks from before the gate split still merge
 import asyncio
 import contextlib
 import logging
-import os
-import re
 import uuid
 
-from sqlalchemy import func
-from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.database import resolve_dialect_name
+# Merge-helper layer (scope-aware retry-cap policy, merge-error normalization,
+# the one-time merge summary, and the lock-window snapshot/relock idiom) lives
+# in the ci_merge_helpers sibling. Re-export every public name so existing
+# ``from app.ci_completion import ...`` call sites and tests resolve unchanged;
+# the names below are referenced by the two routines that remain in this module.
+from app.ci_merge_helpers import (  # noqa: F401
+    MERGE_ESCALATE_BEFORE_CAP,
+    MERGE_FAILURE_HARD_CAP,
+    _capture_merge_snapshot,
+    _is_deterministic_merge_error,
+    _merge_hard_cap_for_task,
+    _normalize_merge_error,
+    _post_merge_summary,
+    _pr_number_match,
+    _relock_merge_task,
+    _review_approved,
+)
 from app.models import Task, TaskStatus, _utcnow
-from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
 
-
-def _pr_number_match(session, pr_number: int):
-    """Dialect-conditional WHERE clause for payloads[0].pr_number filter.
-
-    Postgres: matches the ``ix_task_payloads_pr_number`` expression index
-    (alembic 0057) via ``.as_string()`` which compiles to ``-> 0 ->> 'pr_number'``.
-    SQLite: uses ``func.json_extract`` because the .as_string() form
-    JSON_QUOTE-double-quotes ints on SQLite and never matches.
-    See review_pipeline.py:_spawn_pipeline_task for the canonical pattern.
-    """
-    dialect_name = resolve_dialect_name(session)
-    if dialect_name == "sqlite":
-        return func.json_extract(Task.payloads, "$[0].pr_number") == pr_number
-    return Task.payloads[0]["pr_number"].as_string() == str(pr_number)
-
-
-# Hard cap on merge retries — scope-aware. Small-scope PRs (single-file tweaks)
-# have fewer legitimate reasons for transient merge failures, so cap sooner.
-MERGE_FAILURE_HARD_CAP = 15
-_SCOPE_MERGE_HARD_CAP = {"small": 8, "medium": 12, "large": 15}
-
-# Single escalation rung for the per-PR stuck-merge ladder: how many failures
-# before the hard cap the one (deduped) "still stuck, retrying" operator alert
-# fires. Past this point the next milestone is the terminal hard-cap FAIL — no
-# intermediate "final-warn" rung (that second warning was redundant: the same
-# stuck PR already alerted once here and the operator gains nothing from a
-# countdown). Tunable via env to move the warning closer to / further from the
-# cap without touching the cap itself.
-MERGE_ESCALATE_BEFORE_CAP = int(os.getenv("MERGE_ESCALATE_BEFORE_CAP", "5"))
-
-
-def _merge_hard_cap_for_task(task: Task) -> int:
-    """Return scope-adjusted merge hard cap, falling back to the default."""
-    ctx = task.context or {}
-    scope = ctx.get("scope")
-    if not scope:
-        payload = task.first_payload or {}
-        scope = payload.get("scope")
-    if isinstance(scope, str):
-        return _SCOPE_MERGE_HARD_CAP.get(scope.lower(), MERGE_FAILURE_HARD_CAP)
-    return MERGE_FAILURE_HARD_CAP
-
-
-_MERGE_ERR_NORMALIZE_PATTERNS = (
-    (
-        re.compile(
-            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
-        ),
-        "<UUID>",
-    ),
-    (re.compile(r"\b[0-9a-fA-F]{12,}\b"), "<HEX>"),
-    (
-        re.compile(
-            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
-        ),
-        "<TS>",
-    ),
-    (re.compile(r"\b\d{10,}\b"), "<N>"),
-    (re.compile(r"\b\d+\b"), "<n>"),
-    (re.compile(r"\s+"), " "),
-)
-
-
-def _normalize_merge_error(msg: str) -> str:
-    """Strip variable data (IDs, timestamps, counts) so streak detection sees
-    structurally-identical errors as equal across retries."""
-    if not msg:
-        return ""
-    out = msg
-    for pattern, repl in _MERGE_ERR_NORMALIZE_PATTERNS:
-        out = pattern.sub(repl, out)
-    return out.strip().lower()
-
-
-# Deterministically non-retryable merge errors. Retrying these cannot succeed
-# without external state change (corrupt refs, GitHub-level blocks), so we skip
-# the usual 2-streak requirement and exit on first occurrence.
-_DETERMINISTIC_MERGE_ERROR_PATTERNS = (
-    "head sha can't be blank",
-    "pull request is not mergeable",
-    "base branch was modified",
-)
-
-
-def _is_deterministic_merge_error(normalized_msg: str) -> bool:
-    if not normalized_msg:
-        return False
-    return any(pat in normalized_msg for pat in _DETERMINISTIC_MERGE_ERROR_PATTERNS)
-
-
-def _review_approved(review_loop: dict) -> bool:
-    """True if a review task signed off on this PR.
-
-    Accepts the new ``review_approved`` flag and the legacy ``verdict == "APPROVE"``
-    form so EVALUATING tasks written before the gate split still merge.
-    """
-    if review_loop.get("review_approved"):
-        return True
-    return review_loop.get("verdict") == "APPROVE"
-
-
-async def _post_merge_summary(
-    gh_token: str,
-    owner: str,
-    repo: str,
-    pr_number: int,
-    task: Task,
-    review_loop: dict,
-) -> None:
-    """Post a one-time structured merge summary on a Blueprint-generated PR. Best-effort."""
-    from app.github import create_pr_comment
-
-    ctx = task.context or {}
-    payload = task.first_payload or {}
-
-    task_type = payload.get("type") or "create"
-    scope = ctx.get("scope") or payload.get("scope")
-    iteration = review_loop.get("iteration", 0)
-    direction_title = ctx.get("direction_title")
-    direction_id = ctx.get("direction_id")
-    provider = ctx.get("llm_provider")
-    model = ctx.get("llm_model")
-
-    cost_usd = None
-    _prov_at = getattr(task, "vm_provisioned_at", None)
-    _stop_at = getattr(task, "vm_stopped_at", None)
-    if _prov_at and _stop_at:
-        _rate = get_vm_rate_per_second(spot=getattr(task, "vm_spot", False))
-        cost_usd = (_stop_at - _prov_at).total_seconds() * _rate
-
-    type_scope = f"{task_type} / {scope}" if scope else task_type
-    lines = [f"**Blueprint merge summary** — {type_scope}", ""]
-    lines.append(f"- **Review-fix iterations**: {iteration}")
-    agent_parts = [p for p in [provider, model] if p]
-    if agent_parts:
-        lines.append(f"- **Agent**: {' / '.join(agent_parts)}")
-    if cost_usd is not None:
-        lines.append(f"- **Estimated cost**: ~${cost_usd:.2f}")
-    if direction_title or direction_id:
-        lines.append(f"- **Direction**: {(direction_title or str(direction_id))[:80]}")
-
-    try:
-        await create_pr_comment(gh_token, owner, repo, pr_number, "\n".join(lines))
-    except Exception as exc:
-        logger.warning(f"[CI] Failed to post merge summary on PR #{pr_number}: {exc}")
-
-
-# Round 4 W1 (audit C3): content snapshot used by the merge handler's
-# lock-window-break. Heartbeat-driven ``updated_at`` advances every 30s,
-# so the prior ``updated_at`` validation would false-defer under load.
-# Validate against the merge-gate fields instead.
-def _capture_merge_snapshot(task: Task) -> dict:
-    """Snapshot the merge-gate fields lock-window-break protects.
-
-    Fields covered:
-      - status: must remain the same (typically EVALUATING) for the merge
-        path to apply without overwriting a peer's terminal transition
-      - review_loop.iteration: review-fix iteration counter
-      - review_loop.review_approved / verdict: the review gate flag
-      - review_loop.ci_passed: the CI gate flag
-      - review_loop.pending_reopen: C4 — set True by the orchestrator's CI
-        poll when it self-closes the PR for a mergeability reset. Including
-        it here means a poll-cycle commit of pending_reopen=True (i.e. an
-        in-flight reset) DURING the merge's unlocked GitHub window
-        invalidates the snapshot, so _relock_merge_task defers rather than
-        reaching the closed-state branch on a PR we deliberately closed.
-    Heartbeat-only updates (last_heartbeat, last_metrics_json,
-    heartbeat_count) do NOT touch any of these, so they don't trip the
-    validator under heartbeat overlap.
-    """
-    ctx = task.context or {}
-    review_loop = ctx.get("review_loop") or {}
-    return {
-        "status": task.status,
-        "review_loop_iteration": review_loop.get("iteration"),
-        "review_loop_review_approved": review_loop.get("review_approved"),
-        "review_loop_verdict": review_loop.get("verdict"),
-        "review_loop_ci_passed": review_loop.get("ci_passed"),
-        "review_loop_pending_reopen": bool(review_loop.get("pending_reopen")),
-    }
-
-
-async def _relock_merge_task(
-    session: AsyncSession,
-    task_id,
-    expected_snapshot: dict,
-    cached_task: Task | None,
-    *,
-    source: str,
-) -> Task | None:
-    """Re-acquire FOR UPDATE on the merge task and validate the pre-release snapshot.
-
-    Mirrors ``rollup_management._relock_parent`` (the canonical reference). Returns
-    the freshly-loaded Task if the row is still ours and the merge-gate snapshot
-    still matches, or None if the row is held by a peer or has been mutated during
-    the unlocked window — in which case the caller should defer to the next sweep
-    rather than overwrite a peer's terminal transition.
-
-    Why ``session.expire`` first: ``populate_existing=True`` alone has been observed
-    unreliable under async + ``with_for_update(skip_locked=True)`` (see
-    rollup_management.py:155 and task_completion.py:1671). Expiring the cached
-    instance guarantees the re-SELECT cannot return stale identity-map attributes.
-    """
-    if cached_task is not None:
-        try:
-            session.expire(cached_task)
-        except InvalidRequestError:
-            # Object detached from this session — fall back to expire_all so the
-            # populate_existing SELECT below can repopulate from a clean slate.
-            session.expire_all()
-    relock_stmt = (
-        select(Task)
-        .where(Task.id == task_id)
-        .with_for_update(skip_locked=True)
-        .execution_options(populate_existing=True)
-    )
-    fresh = (await session.execute(relock_stmt)).scalars().first()
-    if fresh is None:
-        logger.info(
-            f"[CI] Task {task_id} held by peer after merge call — "
-            f"deferring to next sweep ({source})"
-        )
-        return None
-    fresh_snapshot = _capture_merge_snapshot(fresh)
-    if fresh_snapshot != expected_snapshot:
-        logger.info(
-            f"[CI] Task {task_id} mutated during merge window "
-            f"(expected snapshot={expected_snapshot}, found {fresh_snapshot}) — "
-            f"deferring to next sweep ({source})"
-        )
-        return None
-    return fresh
 
 
 async def _attempt_merge_with_retry_and_escalation(
@@ -309,8 +88,16 @@ async def _attempt_merge_with_retry_and_escalation(
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.alert_dispatch import _maybe_create_failure_alert
+    from app.branch_resolution import (
+        is_custom_staged_rollup_root,
+        merged_pr_counts_as_integration_landing,
+    )
+    from app.landed_signal import apply_merged_landed_signal
     from app.models import Project
-    from app.shared_state import get_project_integration_branch
+    from app.shared_state import (
+        get_project_integration_branch,
+        get_project_promotion_target,
+    )
     from app.shared_state import runtime_config as _rt_cfg
 
     # C5 invariant: the approval/safeguard gate is enforced AT the merge call,
@@ -553,19 +340,128 @@ async def _attempt_merge_with_retry_and_escalation(
             # maybe_finalize_qualification / reaper Step 9): it commits the flag
             # independently and an error here is fully contained.
             try:
+                from app.branch_resolution import (
+                    _signal_blocking_project_branch_configuration,
+                )
                 from app.database import AsyncSessionLocal
+                from app.models import Project
 
                 async with AsyncSessionLocal() as _orig_session:
                     orig = await _orig_session.get(Task, uuid.UUID(ci_orig_id))
                     if orig:
-                        orig.context = {**(orig.context or {}), "pr_merged": True}
+                        orig_project = (
+                            await _orig_session.get(Project, orig.project_id)
+                            if orig.project_id
+                            else None
+                        )
+                        _integration_branch = get_project_integration_branch(
+                            orig_project
+                        )
+                        _promotion_target = get_project_promotion_target(orig_project)
+                        _hotfix_lane = bool(
+                            (task.first_payload or {}).get("hotfix")
+                            or (task.context or {}).get("hotfix")
+                            or ci_loop.get("hotfix")
+                        )
+                        # automain branch-safety signal: a rollup landing on the
+                        # promotion target while that branch is distinct from the
+                        # integration branch (outside the hotfix lane) is a
+                        # misconfiguration — stage the deferred operator alert.
+                        if (
+                            _promotion_target
+                            and ci_base == _promotion_target
+                            and ci_base != _integration_branch
+                            and not _hotfix_lane
+                            and orig_project is not None
+                        ):
+                            _signal_blocking_project_branch_configuration(
+                                orig_project,
+                                "rollup_target_matches_promotion_target",
+                                (
+                                    f"Rollup blocked: target branch '{ci_base}' is this "
+                                    "project's promotion target. Configure a distinct "
+                                    "integration branch before landing fleet work."
+                                ),
+                            )
+                        # PR feature: custom staged rollup roots stay non-terminal
+                        # until they land downstream; promotion-target landings raise
+                        # the dedicated landing alert and leave pr_merged unset.
+                        _orig_is_custom_staged_rollup = is_custom_staged_rollup_root(
+                            orig, orig_project, ci_base
+                        )
+                        _terminal_rollup_merge = True
+                        if _orig_is_custom_staged_rollup and orig_project is not None:
+                            _landed_on_integration = ci_base == _integration_branch
+                            _landed_on_promotion = ci_base == _promotion_target
+                            if not _landed_on_integration and _landed_on_promotion:
+                                await merged_pr_counts_as_integration_landing(
+                                    orig,
+                                    orig_project,
+                                    _orig_session,
+                                    pr_number=ci_pr_number,
+                                    merged_base_branch=ci_base,
+                                    source="ci_completion.original_merge_success",
+                                )
+                            record_pr_merged = _landed_on_integration
+                            _terminal_rollup_merge = (
+                                _landed_on_integration or _landed_on_promotion
+                            )
+                        else:
+                            record_pr_merged = (
+                                await merged_pr_counts_as_integration_landing(
+                                    orig,
+                                    orig_project,
+                                    _orig_session,
+                                    pr_number=ci_pr_number,
+                                    merged_base_branch=ci_base,
+                                    source="ci_completion.original_merge_success",
+                                )
+                            )
+                        if record_pr_merged:
+                            apply_merged_landed_signal(
+                                orig,
+                                orig_project,
+                                base_branch=ci_base,
+                                hotfix_lane=bool(
+                                    (orig.first_payload or {}).get("hotfix")
+                                    or (orig.context or {}).get("hotfix")
+                                ),
+                                non_merge_reason="merged_pr_non_integration_branch",
+                            )
                         if orig.status == TaskStatus.EVALUATING and not (
                             orig.context or {}
                         ).get("review_loop", {}).get("ci_waiting"):
-                            orig.status = TaskStatus.COMPLETED
-                            orig.latest_status_message = "Rollup PR merged"
+                            if (
+                                not _orig_is_custom_staged_rollup
+                                or _terminal_rollup_merge
+                            ):
+                                orig.status = TaskStatus.COMPLETED
+                                orig.latest_status_message = "Rollup PR merged"
+                            else:
+                                orig.latest_status_message = (
+                                    f"Rollup PR merged into {ci_base}; awaiting "
+                                    "downstream landing"
+                                )
                         _orig_session.add(orig)
                         await _orig_session.commit()
+                        # Once a bootstrapped repo gains a project structure on
+                        # its integration branch, refresh an empty build_config
+                        # so verification commands exist without a manual step.
+                        # Best-effort + idempotent (cheap in-memory guard).
+                        if (
+                            record_pr_merged
+                            and orig_project is not None
+                            and ci_base == _integration_branch
+                        ):
+                            from app.build_config_detection import (
+                                maybe_refresh_empty_build_config,
+                            )
+
+                            await maybe_refresh_empty_build_config(
+                                orig_project,
+                                _orig_session,
+                                ref=_integration_branch,
+                            )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True

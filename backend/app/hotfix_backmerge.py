@@ -209,6 +209,23 @@ async def open_backmerge_pr(
 
     integration_branch, promotion_target = _lts_branch_names(project)
 
+    # 0. Single-branch repo guard.  When integration_branch == promotion_target
+    #    there is no separate trunk to back-merge into: opening a
+    #    promotion_target -> integration_branch PR would target the very branch
+    #    work already merges to (head == base — an erroneous self-merge / no-op).
+    #    Skip cleanly as inactive, mirroring reconcile_main_into_automain's guard
+    #    and release_promotion.promote()'s single-branch skip.  This makes the
+    #    one-shot hotfix back-merge path (task_lifecycle.py) safe for external
+    #    single-branch projects, not just the periodic reconciler.
+    if integration_branch == promotion_target:
+        logger.info(
+            "[BACKMERGE] project %s: integration_branch == promotion_target "
+            "(%s) — single-branch repo, nothing to back-merge",
+            project_id,
+            integration_branch,
+        )
+        return {"status": "skipped", "reason": "lts_inactive"}
+
     # 1. Resolve GitHub credentials (App token → installation → PAT).
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:

@@ -31,6 +31,7 @@ import {
   type BuildConfig, type TestRunner,
   detectTestRunners, isDockerRunner,
   parseFailingTests, buildTargetedPytestRunners,
+  classifyTestExecution,
 } from './test-runners.js';
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
@@ -319,7 +320,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -407,6 +408,12 @@ export async function testFixLoop(
     // so the caller doesn't push unverified code.
     const setupErrors: Array<{ label: string; message: string }> = [];
     let ranAnyRunner = false;
+    // Track whether ANY runner's output indicates a real test actually
+    // executed (vs. a placeholder command or a zero-test collection). Used to
+    // distinguish "a suite ran and produced a verdict" from "no real tests
+    // executed" so the no-CI merge gate can route the latter to the documented
+    // proceed-without-checks fallback instead of a hard fail / vacuous pass.
+    let anyRealTestExecuted = false;
     const taskId = process.env.TASK_ID || '';
     for (const runner of runners) {
       // Setup step: ensure node_modules exist for npm runners. A failure
@@ -445,8 +452,12 @@ export async function testFixLoop(
       try {
         sendHeartbeatSync(taskId, `Running tests [${runner.label}]...`);
         const runnerTimeout = isDockerRunner(runner) ? TEST_RUNNER_DOCKER_TIMEOUT : TEST_RUNNER_TIMEOUT;
-        await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout });
+        const passOutput = await execFileAsync(runner.cmd, runArgs, { cwd: runner.cwd, timeoutMs: runnerTimeout });
         ranAnyRunner = true;
+        // A clean exit only counts as a real verdict if real tests ran. An
+        // empty/zero-test suite that exits 0 must not be recorded as a
+        // verified pass.
+        if (classifyTestExecution(passOutput) === 'ran') anyRealTestExecuted = true;
         sendLog(ws, `Tests passed [${runner.label}].\n`);
       } catch (testErr: unknown) {
         // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
@@ -468,6 +479,11 @@ export async function testFixLoop(
         // and at least one test failed. Record the failure.
         ranAnyRunner = true;
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
+        // A non-zero exit from a placeholder command (e.g. the default `npm`
+        // "no test specified" script) is NOT a real test failure. Only count
+        // this as a real test executing when the output isn't a no-tests
+        // signature.
+        if (classifyTestExecution(msg) === 'ran') anyRealTestExecuted = true;
         let structuredIds: Set<string> | undefined;
         if (jsonOutputPath && fs.existsSync(jsonOutputPath)) {
           try {
@@ -506,7 +522,9 @@ export async function testFixLoop(
         exitReason: 'passed', startedAt: iterStartedAt,
       });
       sendLog(ws, 'All tests passed.\n');
-      return { passed: true, testFailuresDetected: false };
+      // noTestsExecuted: we ran at least one runner but none of them showed a
+      // real test executing — the "pass" is vacuous (empty/zero-test suite).
+      return { passed: true, testFailuresDetected: false, noTestsExecuted: ranAnyRunner && !anyRealTestExecuted };
     }
 
     // Serialize each failure for operator-facing output. This same format
@@ -645,7 +663,11 @@ export async function testFixLoop(
         : `WARNING: ${phasePrefix}Tests still failing after ${maxFixAttempts} fix attempts. Proceeding with commit.\n`;
       sendLog(ws, exhaustedMessage);
       const failureSummary = combinedFailures.slice(-8000);
-      return { passed: false, testFailuresDetected: true, failureSummary };
+      // noTestsExecuted: the only "failures" came from placeholder commands
+      // (e.g. `npm` "no test specified") — no real test executed, so the
+      // focused-verification fail should route to the proceed-without-checks
+      // fallback rather than blocking the merge.
+      return { passed: false, testFailuresDetected: true, failureSummary, noTestsExecuted: ranAnyRunner && !anyRealTestExecuted };
     }
   }
   return { passed: false, testFailuresDetected: true };

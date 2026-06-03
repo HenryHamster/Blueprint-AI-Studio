@@ -600,6 +600,14 @@ async def lifespan(app):
 
     digest_precompute_task = asyncio.create_task(digest_precompute_service())
 
+    # Start the Warm-Pool Maintainer (efficiency direction d-5fd69fe1). Leader-only
+    # tick that reconciles the pre-provisioned idle VM pool toward its configured
+    # target (provision below / drain above / recycle stale image). Inert while
+    # warm_pool_enabled is False.
+    from app.warm_pool_maintainer import pool_maintainer_service
+
+    pool_maintainer_task = asyncio.create_task(pool_maintainer_service())
+
     # Start the Efficiency Snapshot service (daily per-project axis snapshots).
     async def _efficiency_snapshot_service():
         """Hourly leader-only tick that writes a daily efficiency snapshot per project.
@@ -611,6 +619,7 @@ async def lifespan(app):
         """
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
+            maybe_alert_pool_payoff_transition,
             maybe_write_daily_snapshot,
         )
 
@@ -638,6 +647,31 @@ async def lifespan(app):
                                 "[EFFICIENCY_SNAPSHOT] project=%s error=%s",
                                 project_id,
                                 proj_exc,
+                            )
+                        # Warm-pool payoff transition alert: runs every hourly
+                        # tick (independent of the daily snapshot-write cadence)
+                        # so a scoped bounded-enable's verdict crossing a decision
+                        # boundary pages the operator promptly. Best-effort —
+                        # isolated try/except + commit so one project never blocks
+                        # the scan.
+                        try:
+                            fired = await maybe_alert_pool_payoff_transition(
+                                scan_session, project_id
+                            )
+                            await scan_session.commit()
+                            if fired is not None:
+                                logger.info(
+                                    "[EFFICIENCY_SNAPSHOT] project=%s pool-payoff "
+                                    "alert fired verdict=%s",
+                                    project_id,
+                                    fired,
+                                )
+                        except Exception as alert_exc:
+                            await scan_session.rollback()
+                            logger.warning(
+                                "[EFFICIENCY_SNAPSHOT] project=%s payoff-alert error=%s",
+                                project_id,
+                                alert_exc,
                             )
             except asyncio.CancelledError:
                 raise
@@ -826,6 +860,7 @@ async def lifespan(app):
     _bg_tasks["auto_archive"] = auto_archive_task
     _bg_tasks["pipeline_alert_scan"] = pipeline_alert_scan_task
     _bg_tasks["digest_precompute"] = digest_precompute_task
+    _bg_tasks["pool_maintainer"] = pool_maintainer_task
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["evaluating_timeout"] = evaluating_timeout_task
@@ -858,6 +893,7 @@ async def lifespan(app):
             "auto_archive": auto_archive_service,
             "pipeline_alert_scan": pipeline_alert_scan_service,
             "digest_precompute": digest_precompute_service,
+            "pool_maintainer": pool_maintainer_service,
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
             "evaluating_timeout": _evaluating_timeout_service,
@@ -1133,6 +1169,7 @@ async def lifespan(app):
         auto_archive_task,
         pipeline_alert_scan_task,
         digest_precompute_task,
+        pool_maintainer_task,
         branch_reconciliation_task,
         orchestrator_task,
         config_sync_task,

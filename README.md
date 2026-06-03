@@ -4,10 +4,16 @@ Blueprint is a platform for launching, monitoring, and scaling autonomous Claude
 
 Blueprint also supports autonomous research mode: the orchestrator can generate and dispatch tasks from configurable strategic directions without manual intervention.
 
+The runtime is split across three main surfaces:
+
+- `backend/` - FastAPI orchestrator and background workers
+- `admin-ui/` - React admin dashboard on port `3001`
+- root `src/` - launcher UI on port `3000`
+
 ## Architecture
 
 ```
-Launcher UI (React)   Admin UI (React)
+Launcher UI (React, root Vite app)   Admin UI (React workspace)
         \                  /
          \                /
     Orchestrator (FastAPI / Cloud Run)
@@ -23,15 +29,17 @@ Agent VMs          Background workers
 
 ### Components
 
-- **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. It registers the API routers under `backend/app/routers/` and runs background workers:
-  - `orchestrator_worker` — polls for QUEUED tasks every 10 s and provisions VMs
+- **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. It registers the API routers under `backend/app/routers/` and runs background workers for orchestration, reaping, cleanup, digest precompute, secret reconciliation, and pipeline alerts:
+  - `orchestrator_worker` — polls for QUEUED tasks every 10 s and provisions VMs; it
+    also drives autonomous-research spawning each cycle via `_check_idle_research()`
+    (there is no separate autonomous-research worker loop)
   - `reaper_service` — kills VMs that miss heartbeats (5-minute timeout, 30 s cadence)
   - `gcp_cleanup_service` — sweeps orphaned VMs every 15 min
-  - `autonomous_research_worker` — spawns research tasks based on strategic directions
+  - `secret_reconciliation_service` / `pipeline_alert_scan_service` / `digest_precompute_service` — keep runtime secrets, operator alerts, and digest cache state in sync
 
 - **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the WebSocket log stream.
 
-- **Launcher UI** (root `src/`) — Lightweight React frontend for creating new tasks and viewing progress. Runs on port 3000 in local dev.
+- **Launcher UI** (root `src/`) — Root Vite app for creating new tasks and viewing progress. Runs on port 3000 in local dev.
 
 - **Agent** (`agent/`) — TypeScript process that runs inside each VM. Claims its task, clones the repo, runs Claude Code with streaming output, handles the review-fix cycle, and creates a PR.
 
@@ -46,18 +54,24 @@ Local mode runs agents as subprocesses instead of GCP VMs. You still need the ba
 cp .env.example .env
 # Set at minimum: ANTHROPIC_API_KEY, ADMIN_API_KEY, LOCAL_MODE=true, DATABASE_URL
 
-# 2. Start backend + database
-docker-compose up -d
+# 2. Start PostgreSQL
+docker compose up -d db
 
-# 3. Run the backend API
+# 3. Apply backend migrations
+cd backend && bash run_migrations.sh
+
+# If you prefer containerized backend instead of uvicorn, `docker compose up -d` starts both `db` and `app`.
+
+# 4. Install backend dependencies and run the API (separate terminal)
 cd backend
+pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8080
 
-# 4. Start UIs (launcher on :3000, admin on :3001)
+# 5. In another terminal, start the UIs (launcher on :3000, admin on :3001)
 npm install
 npm run dev
 
-# 5. Open http://localhost:3001 and launch a task
+# 6. Open http://localhost:3000 to launch tasks, or http://localhost:3001 for the admin dashboard
 ```
 
 ## Production Setup (GCP)
@@ -71,22 +85,47 @@ See [Deploy.md](Deploy.md) for full Cloud Run + GCP deployment instructions.
 
 ## Configuration
 
-| Variable | Description |
-|---|---|
-| `ANTHROPIC_API_KEY` | API key passed to agent VMs for Claude Code |
-| `ADMIN_API_KEY` | Shared key for admin UI authentication |
-| `LOCAL_MODE` | `true` to run agents as local subprocesses |
-| `DATABASE_URL` | PostgreSQL connection string used by the backend |
-| `GCP_PROJECT_ID` | GCP project for VM provisioning |
-| `ORCHESTRATOR_URL` | URL agents use to reach the orchestrator |
-| `MAX_CONCURRENT_VMS` | Maximum simultaneously running agent VMs (default 8) |
-| `MAX_PROVISION_SLOTS` | Maximum concurrent VM provision operations (default 10) |
+### Required Environment Variables
 
-See `.env.example` for the full list.
+| Variable | Description | Example |
+|---|---|---|
+| `ADMIN_API_KEY` | Shared API key for admin UI and server-to-server requests (must also set `VITE_ADMIN_API_KEY` to same value) | `my-secret-admin-key` |
+| `ANTHROPIC_API_KEY` | Claude API key passed to agent VMs for Claude Code (or leave empty if using local Claude login) | `sk-ant-...` |
+| `AGENT_JWT_SECRET` | Secret used to sign short-lived agent JWTs (min 32 chars, used internally) | `my-secret-jwt-key` |
+| `WS_TICKET_SECRET` | Secret used to mint WebSocket authentication tickets (min 32 chars) | `my-secret-ws-key` |
+| `DATABASE_URL` | PostgreSQL connection string: `postgresql+asyncpg://user:pass@host:port/dbname` | See Quick Start section |
+| `GITHUB_APP_ID` | GitHub App ID (see Deploy.md section 5 for setup) | `123456` |
+| `GITHUB_PRIVATE_KEY` | GitHub App private key in PEM format (multiline, URL-escaped) | `-----BEGIN RSA PRIVATE KEY-----...` |
+| `GITHUB_WEBHOOK_SECRET` | Secret used to verify GitHub webhook signatures | `my-webhook-secret` |
+
+### GCP Configuration (Required for Production)
+
+| Variable | Description | Default | Example |
+|---|---|---|---|
+| `GCP_PROJECT_ID` | GCP project ID for VM provisioning | — | `my-blueprint-project` |
+| `GCP_ZONE` | GCP zone for agent VMs | `us-central1-a` | `us-central1-c` |
+| `MACHINE_TYPE` | GCP machine type for agent VMs | `e2-standard-2` | `e2-standard-4`, `n2-standard-2` |
+| `VPC_NETWORK` | GCP VPC network name for agents | `agent-sandbox-vpc` | custom network name |
+| `VPC_SUBNET` | GCP subnet name within VPC | `agent-sandbox-subnet` | custom subnet name |
+| `AGENT_IMAGE_FAMILY` | GCP image family path for prebuilt agent image | — | `projects/my-project/global/images/family/blueprint-agent` |
+| `AGENT_SERVICE_ACCOUNT_EMAIL` | Service account email for agent VMs (zero default permissions) | — | `vpm-worker@my-project.iam.gserviceaccount.com` |
+
+### Optional Configuration
+
+| Variable | Description | Default |
+|---|---|---|
+| `LOCAL_MODE` | Run agents as local subprocesses (for development) instead of GCP VMs | `false` |
+| `ORCHESTRATOR_URL` | URL agents use to reach the orchestrator backend (for production/multi-region setup) | `http://localhost:8080` |
+| `ALLOWED_ORIGINS` | Comma-separated CORS allowed origins (for frontend) | `http://localhost:3000,http://localhost:3001` |
+| `MAX_CONCURRENT_VMS` | Maximum simultaneously running agent VMs | `8` |
+| `MAX_PROVISION_SLOTS` | Maximum concurrent VM provision operations | `10` |
+| `VITE_ADMIN_API_KEY` | Frontend environment variable (must match `ADMIN_API_KEY`) | — |
+
+See `.env.example` for the complete template with all variables.
 
 ## How It Works
 
-1. Open the admin UI and click Launch Task
+1. Open the launcher UI and click Launch Task
 2. Enter a GitHub repo (`owner/repo`), base branch, and a prompt
 3. The orchestrator creates a project and task, then assigns a VM name
 4. The orchestrator worker picks up the queued task and provisions a GCP VM, or a local subprocess in `LOCAL_MODE=true`
@@ -136,15 +175,42 @@ When enabled, Blueprint continuously generates and dispatches tasks without manu
 
 Configure autonomous mode in the admin UI under Settings > Autonomous.
 
+## Backend Entry Points
+
+- `backend/app/main.py` wires the FastAPI app, middleware, router registration, startup/shutdown hooks, and schema revision checks.
+- `backend/app/routers/projects.py` owns the public task/project launch surface under `/api/*`.
+- `backend/app/routers/agent.py` and `backend/app/routers/agent_warm_continuity.py` own the agent lifecycle and warm handoff endpoints under `/api/agent/*`.
+- `backend/app/routers/admin_*.py` provide the admin dashboard, analytics, settings, diagnostics, and project configuration endpoints under `/api/admin/*` plus a few related internal paths.
+- `backend/app/orchestrator.py`, `backend/app/reaper.py`, and `backend/app/services.py` host the long-running background loops.
+
 ## Documentation
 
 Comprehensive documentation is available in the `docs/` directory:
 
+### Core Architecture & Design
+- **[ARCHITECTURE_OVERVIEW.md](docs/codebase-analysis.md)** — High-level system design and component interactions
+- **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions
+
+### Task Execution & Lifecycle
+- **[TASK_LIFECYCLE.md](docs/TASK_LIFECYCLE.md)** — Task state machine, transitions, and lifecycle callbacks
+- **[PAYLOADS_AND_SCHEMAS.md](docs/PAYLOADS_AND_SCHEMAS.md)** — Task payload structure and validation for all task types
+
+### API & Integration
 - **[API_REFERENCE.md](docs/API_REFERENCE.md)** — Complete HTTP endpoint reference with request/response schemas
 - **[DATA_MODELS.md](docs/DATA_MODELS.md)** — Database schema, Pydantic DTOs, and data structure guide
-- **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions
 - **[AGENT_HANDLERS.md](docs/AGENT_HANDLERS.md)** — TypeScript task handler implementations and workflows
+
+### Frontend & UI
 - **[FRONTEND_COMPONENTS.md](docs/FRONTEND_COMPONENTS.md)** — React component guide with props and usage patterns
+
+### Operations & Debugging
+- **[CONFIGURATION.md](docs/CONFIGURATION.md)** — Complete environment variable reference and configuration guide
+- **[TESTING_GUIDE.md](docs/TESTING_GUIDE.md)** — Testing strategies and best practices for backend, frontend, and agent
+- **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** — Troubleshooting failed tasks and interpreting logs
+- **[DEVELOPMENT_GUIDE.md](docs/DEVELOPMENT_GUIDE.md)** — Local development setup and workflow
+- **[ONBOARDING.md](docs/ONBOARDING.md)** — Bringing a new repository under Blueprint management
+
+### Standards & Guidelines
 - **[CLAUDE.md](CLAUDE.md)** — Project-specific coding standards and file restrictions
 
 ---
@@ -172,10 +238,11 @@ Key test invariants:
 - Module size guardrails (`backend/testing/module_size_limits.json`) — request permission to bump limits via test assertion message
 - Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
+- Use `./check` for the fast repo gate; use `./check test` for the lightweight backend smoke pass
 
 ### Adding Features
 
-1. **Create a branch** from `main`
+1. **Create a branch** from the integration branch (typically `automain`)
 2. **Implement changes** following [CLAUDE.md](CLAUDE.md) patterns
 3. **Run tests** (`./check` or `bash scripts/test-backend.sh` — see CLAUDE.md for details)
 4. **Self-review** — check for correctness, security, test coverage
@@ -219,35 +286,47 @@ Local mode runs agents as subprocess instead of GCP VMs. Full CI suite runs on P
 
 ## Troubleshooting
 
-### Task fails with "clone_failed"
+For detailed debugging guidance, see **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)**, which covers:
+- Common failure categories and how to diagnose them
+- Viewing task logs and interpreting error messages
+- Understanding failure classification
+- GCP VM inspection
+- Circuit breaker recovery
+- Performance profiling
 
-- Repo is private and agent token lacks access — grant OAuth token in admin settings
-- Repo doesn't exist or URL is wrong — check `github_owner`/`github_repo` in task payload
-- Network issue (rare in production) — reaper will auto-retry up to 3 times
+### Quick Fixes for Common Issues
 
-### Task hangs (no logs after 5 minutes)
+**Task fails with "clone_failed"**
+- Repo is private and agent token lacks access — grant OAuth token in Settings > GitHub
+- Repo doesn't exist or URL is wrong — verify `github_owner`/`github_repo` in task
+- Invalid GitHub token — reconnect OAuth in Settings
 
-- Agent VM hung or network partitioned — reaper kills VMs after 5-minute heartbeat timeout
-- Check agent logs in admin UI for the task — look for errors, timeouts, or blocked operations
-- In production, VMs auto-destruct after 1 hour as safety net
+**Task hangs (no logs after 5 minutes)**
+- Agent VM unresponsive — reaper kills VMs after 5-minute heartbeat timeout
+- Check **Logs** tab in task details for errors or timeouts
+- VMs auto-destruct after 1 hour as safety net
 
-### PR creation fails
+**PR creation fails**
+- Insufficient permissions — verify GitHub token has `pull_requests: read/write` scope
+- Branch doesn't exist — specify correct `base_branch` in task payload
+- Network timeout — retry task
 
-- Agent doesn't have permission to create PRs in this repo — check OAuth token scopes (need `pull_requests: read/write`)
-- PR title/body too long or contains unprintable characters — agent sanitizes before submission
-- Target branch doesn't exist — specify correct `base_branch` in task
+**Orchestrator won't start new tasks**
+- Circuit breaker tripped (too many failures) — click **Reset** in Project settings
+- Concurrency limit reached — increase `MAX_CONCURRENT_VMS` or wait for tasks to complete
+- Database unreachable — check `DATABASE_URL` connection string and database health
 
-### Orchestrator won't start new tasks
+**Fix loop stuck (task not progressing)**
+- Max iterations reached (default 5) — issue may be too complex; try simpler scope
+- Agent misunderstood the problem — check review findings in parent task
+- Missing tool or dependency — check VM logs, may need to rebuild agent image
 
-- Circuit breaker tripped due to repeated failures — check project status in admin UI
-- `MAX_CONCURRENT_VMS` limit reached — reduce concurrency or increase limit
-- Database unreachable — check `DATABASE_URL` connection string
+**Token expired or invalid**
+- GitHub token invalid — Settings > GitHub > **Reconnect**
+- Max plan account credentials invalid — Settings > re-authenticate
+- Agent JWT expired — rarely happens; restart the task
 
-### Memory/CPU limits
-
-- Default GCP VM is `e2-standard-2` (2 vCPU, 8 GB RAM) — sufficient for most tasks
-- Very large repos or heavy analysis may require larger machine — set `MACHINE_TYPE` in `.env`
-- In local mode, agent runs as subprocess — limited by host machine resources
+See **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)** for comprehensive troubleshooting steps and additional scenarios.
 
 ---
 
@@ -255,10 +334,11 @@ Local mode runs agents as subprocess instead of GCP VMs. Full CI suite runs on P
 
 Contributions are welcome. Please:
 
-1. **Read [CLAUDE.md](CLAUDE.md)** for coding standards and restrictions
-2. **Open an issue** for bugs or feature requests
-3. **Follow the test guidelines** — all code paths must have tests
-4. **Update documentation** when adding new features or APIs
+1. **Read [CONTRIBUTING.md](CONTRIBUTING.md)** for environment setup and the contribution workflow
+2. **Read [CLAUDE.md](CLAUDE.md)** for coding standards and restrictions
+3. **Open an issue** for bugs or feature requests
+4. **Follow the test guidelines** — all code paths must have tests
+5. **Update documentation** when adding new features or APIs
 
 For significant architectural changes, open an issue to discuss approach first.
 
@@ -283,5 +363,6 @@ For issues, questions, or feedback:
 
 - **Deployment** — See [Deploy.md](Deploy.md) for GCP Cloud Run + Terraform setup
 - **Database** — See [docs/db-operations.md](docs/db-operations.md) for manual DB queries and operations
+- **Deferred DB work** — See [docs/db-deferrals.md](docs/db-deferrals.md) for items the database audit deliberately deferred, with re-evaluation triggers
 - **Concurrency** — See [docs/concurrency.md](docs/concurrency.md) for row-locking and async patterns
 - **Analysis** — See [docs/codebase-analysis.md](docs/codebase-analysis.md) for cross-cutting architecture overview
