@@ -64,4 +64,10 @@ describe('ProjectApprovalGateSection — viewport regression', () => {
       await mount({ data: customizedData, canSave: true, onSave: vi.fn(async () => {}) });
     }, { selector: 'button, a[href]' });
   });
+
+  test('empty/onboarding collapses and its add-files button meets 44px at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      await mount({ data: emptyData, canSave: true, onSave: vi.fn(async () => {}) });
+    }, { selector: 'button, a[href]' });
+  });
 });
