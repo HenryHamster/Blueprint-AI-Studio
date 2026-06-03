@@ -769,6 +769,55 @@ async def create_direction_research_task(
     )
     from app.shared_state import runtime_config as _runtime_config
 
+    # In-flight guard: never spawn a second research on a direction that already
+    # has one in progress. Two concurrent research cycles produce two rollup PRs
+    # over the same files, guaranteed to conflict once one merges (mirrors the
+    # autonomous dedup in autonomous_research.py; incident 2026-06-03 on
+    # d-5d841cea). Unconditional — bypass_cooldown overrides only the recency
+    # cooldown, not concurrency. Match by current_direction_id, falling back to
+    # the legacy single-direction payload shape for any in-flight task spawned
+    # before this endpoint started stamping current_direction_id.
+    active_research = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.status.in_(
+                        [
+                            TaskStatus.QUEUED,
+                            TaskStatus.PROVISIONING,
+                            TaskStatus.IN_PROGRESS,
+                            TaskStatus.EVALUATING,
+                        ]
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for rt in active_research:
+        rp = rt.first_payload
+        if rp.get("type") != "research":
+            continue
+        rt_direction_id = rp.get("current_direction_id") or next(
+            (
+                d.get("id")
+                for d in (rp.get("directions") or [])
+                if isinstance(d, dict) and d.get("id")
+            ),
+            None,
+        )
+        if rt_direction_id == direction_id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Research is already in progress on this direction "
+                    f"(task {str(rt.id)[:8]}, status {rt.status}). "
+                    f"Cancel it before starting another."
+                ),
+            )
+
     if not bypass_cooldown:
         cooldown_minutes = _runtime_config.get(
             "autonomous_direction_cooldown_minutes", 240
@@ -795,6 +844,13 @@ async def create_direction_research_task(
         {
             "type": "research",
             "directions": [direction],
+            # Canonical direction key used by the autonomous dedup
+            # (autonomous_research.py) and completion attribution
+            # (research_completion.py). Without it, a manually-spawned research
+            # was invisible to the autonomous busy-direction check, so the
+            # autonomous loop could spawn a concurrent duplicate on the same
+            # direction.
+            "current_direction_id": direction_id,
             "base_branch": _get_project_integration_branch(project),
             "is_self_repo": bool(project.is_self_repo),
             "enable_self_improvement": project.enable_self_improvement,

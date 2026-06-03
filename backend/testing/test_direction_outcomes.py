@@ -23,6 +23,7 @@ from app.direction_outcomes import (
     _refresh_pipeline_scope_merge_rates,
     _update_cochange_index,
     _update_direction_research_outcomes,
+    refresh_direction_outcomes_after_merge,
 )
 from app.models import Project, Task, TaskStatus
 from app.shared_state import runtime_config
@@ -3587,3 +3588,83 @@ def test_autonomy_state_combines_history_and_aggregate():
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 10
     assert result["retirement_eligible"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh_direction_outcomes_after_merge — heal stale prs_merged after a late merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_refresh_after_merge_heals_stale_prs_merged(db_session: AsyncSession):
+    """Reproduces the churn-guard false positive and its fix.
+
+    prs_merged is snapshotted when each child reaches COMPLETED — at which point
+    its PR has only just opened, so the count is 0. The PR lands asynchronously
+    later; refreshing after the landed signal is stamped recomputes the real
+    count instead of leaving a stale 0 that trips the churn guardrail.
+    """
+    direction_id = "d-merge-refresh"
+    project = await _create_project(db_session)
+    research_task = await _make_research_task(db_session, project.id)
+    rtid = str(research_task.id)
+    project.directions = [_make_direction(direction_id, rtid, tasks_created=2)]
+    db_session.add(project)
+    await db_session.flush()
+
+    child_ctx = {"direction_id": direction_id, "research_task_id": rtid}
+    children = [
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            context=dict(child_ctx),
+            title=f"create {i}",
+        )
+        for i in range(2)
+    ]
+    await db_session.flush()
+
+    # Phase 1 — children COMPLETED but PRs only just opened (no landed signal).
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=rtid,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["tasks_completed"] == 2
+    assert entry["prs_merged"] == 0  # the stale snapshot that trips churn
+
+    # Phase 2 — both PRs land on the integration branch (landed signal stamped),
+    # then a single child's merge fires the refresh, healing the whole cycle.
+    for c in children:
+        c.context = {**c.context, "pr_merged": True, "landed_on_integration": True}
+        db_session.add(c)
+    await db_session.flush()
+
+    await refresh_direction_outcomes_after_merge(children[0], db_session)
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 2  # both siblings counted, not just the trigger
+
+
+@pytest.mark.asyncio
+async def test_refresh_after_merge_noop_without_direction_context(
+    db_session: AsyncSession,
+):
+    """A merged task that isn't a research-cycle child is a no-op (no crash)."""
+    project = await _create_project(db_session)
+    research_task = await _make_research_task(db_session, project.id)
+    task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},  # no direction_id
+    )
+    await db_session.flush()
+    # Must not raise and must not touch any direction state.
+    await refresh_direction_outcomes_after_merge(task, db_session)

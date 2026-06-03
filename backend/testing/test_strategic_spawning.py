@@ -6431,25 +6431,41 @@ async def test_empty_goal_leaves_strategic_payload_blank(db_session):
 
 
 class TestParallelismHint:
-    """_build_parallelism_hint surfaces the direction-count -> parallelism cost."""
+    """_build_parallelism_hint nudges toward enough INDEPENDENT direction lanes.
 
-    def test_healthy_lane_count_returns_empty(self):
+    Target = min(max_active_directions, max_concurrent_vms) — derived from config,
+    never hardcoded. The hint fires below that target and goes quiet at/above it.
+    """
+
+    def test_at_or_above_target_returns_empty(self):
         from app.strategic_spawning import _build_parallelism_hint
 
-        # 3 active directions with capacity for more — no nag.
-        assert _build_parallelism_hint(3, max_concurrent_vms=8, max_active_directions=10) == ""
-        assert _build_parallelism_hint(5, max_concurrent_vms=8, max_active_directions=10) == ""
+        # At the target (min(max_active, vms)): no nag.
+        assert _build_parallelism_hint(8, max_concurrent_vms=8, max_active_directions=10) == ""
+        # max_active_directions is the target even when the fleet could run more VMs.
+        assert _build_parallelism_hint(10, max_concurrent_vms=15, max_active_directions=10) == ""
+        # Above the VM-clamped target also no nag.
+        assert _build_parallelism_hint(10, max_concurrent_vms=8, max_active_directions=10) == ""
 
-    def test_below_floor_emits_cost_framed_hint(self):
+    def test_below_target_nags_above_the_old_floor(self):
+        from app.strategic_spawning import _build_parallelism_hint
+
+        # Core behavior change: the old gate went silent at 3 directions. Now 4 on
+        # a 15-VM fleet (target 10) still nags, and 5 of 8 (target 8) still nags.
+        assert _build_parallelism_hint(4, max_concurrent_vms=15, max_active_directions=10)
+        assert _build_parallelism_hint(5, max_concurrent_vms=8, max_active_directions=10)
+
+    def test_below_target_emits_independence_framed_hint(self):
         from app.strategic_spawning import _build_parallelism_hint
 
         hint = _build_parallelism_hint(1, max_concurrent_vms=8, max_active_directions=10)
         assert hint  # non-empty
         assert "PARALLELISM" in hint
         assert "1 active direction" in hint
-        # Surfaces the idle fleet capacity and stays quality-framed (not a quota).
         assert "8 VMs" in hint
-        assert "worthwhile parallel work" in hint
+        # Frames it as decomposing into INDEPENDENT, non-conflicting lanes (not a quota).
+        assert "INDEPENDENT" in hint
+        assert "conflicts_with" in hint
         assert "load-bearing" in hint
 
     def test_capacity_is_the_limit_does_not_nag(self):
@@ -6460,12 +6476,15 @@ class TestParallelismHint:
         # But 1 active on a 2-VM fleet still leaves a lane idle.
         assert _build_parallelism_hint(1, max_concurrent_vms=2, max_active_directions=10)
 
-    def test_unknown_capacity_omits_vm_clause(self):
+    def test_unknown_capacity_targets_max_active_and_omits_vm_clause(self):
         from app.strategic_spawning import _build_parallelism_hint
 
+        # No capacity signal → target falls back to max_active_directions; no VM clause.
         hint = _build_parallelism_hint(1, max_concurrent_vms=0, max_active_directions=10)
         assert hint
         assert "VMs at once" not in hint  # no concrete VM count when capacity unknown
+        # At the max_active_directions target with unknown capacity: no nag.
+        assert _build_parallelism_hint(10, max_concurrent_vms=0, max_active_directions=10) == ""
 
 
 # ── Deploy-model framing (integration-branch landing ≠ deployment) ────────────
