@@ -283,6 +283,74 @@ class TestSchemaRevisionSync:
             "the integration branch's `alembic upgrade head`."
         )
 
+    def test_backmerge_block_path_pushes_nothing(self):
+        """The hotfix back-merge module must never inline-push migration files to a branch.
+
+        Static belt-and-suspenders guard for the core invariant of direction
+        d-18cc6131 (the "block-path-pushes-nothing" property). On an Alembic
+        dual-head ``block`` verdict, the back-merge resolver ALWAYS routes to a
+        spawned resolution task (``_spawn_migration_resolution_task``) that does
+        the renumber + merge on a fresh branch through the normal PR gate, and
+        embeds a precomputed renumber plan in that task's prompt. It must NEVER
+        reconcile the dual head by pushing the renumber directly to the live
+        integration branch (e.g. ``automain``).
+
+        Why this is forbidden: pushing the renumber to the live integration
+        branch before the back-merge lands leaves a dangling second Alembic head,
+        wedging ``alembic upgrade head`` for every concurrent task for as long as
+        the merge is held off by branch protection, a CI gate, or an unrelated
+        conflict — the exact failure this design prevents.
+
+        The property is also enforced (a) structurally — the module imports only
+        read/merge GitHub helpers (``create_pull_request``, ``merge_pull_request``,
+        ``get_pull_request``, ``get_check_runs_cached``) and never a branch-write
+        helper — and (b) by per-scenario runtime assertions in
+        test_hotfix_backmerge.py (``commit_mock.assert_not_called()`` and the
+        call-args scan for ``automain``). This static scan locks it as a single
+        invariant so a future change (e.g. "restoring" an inline auto-reconcile,
+        which the stale design doc describes) cannot reintroduce the wedge through
+        a new code path the scenario tests do not cover. A future author who
+        genuinely needs to change this must update this invariant deliberately.
+        """
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "hotfix_backmerge.py"
+        )
+        with open(path) as f:
+            content = f.read()
+
+        # The GitHub commit/push helper the rollup staging-branch auto-reconcile
+        # path uses (rollup_management._attempt_rollup_migration_reconcile ->
+        # github.commit_file_changes). The back-merge block path must never use
+        # any branch-write helper to inline the renumber.
+        forbidden_write_helpers = [
+            "commit_file_changes",
+            "create_ref",
+            "update_ref",
+            "create_or_update_file",
+        ]
+        offenders = [h for h in forbidden_write_helpers if h in content]
+        assert not offenders, (
+            "hotfix_backmerge.py must NOT reference any inline branch-write helper "
+            f"({', '.join(offenders)}). On an Alembic dual-head `block` verdict the "
+            "back-merge must route to a spawned resolution task (the renumber + merge "
+            "happens on a fresh branch through the normal PR gate), NEVER push the "
+            "renumber to the live integration branch. An inline push leaves a dangling "
+            "second Alembic head that wedges `alembic upgrade head` for every concurrent "
+            "task until the held-off merge lands (the block-path-pushes-nothing invariant "
+            "of direction d-18cc6131). If you genuinely need to change this, update this "
+            "invariant deliberately and preserve the runtime guards in test_hotfix_backmerge.py."
+        )
+
+        # The block path must still route to the spawned resolver — if this
+        # disappears the renumber has to be happening somewhere, and the only
+        # safe somewhere is a fresh-branch resolution task.
+        assert "_spawn_migration_resolution_task" in content, (
+            "hotfix_backmerge.py must route a dual-head `block` verdict to "
+            "_spawn_migration_resolution_task. If the spawn route is removed, the "
+            "renumber+merge can only be happening via a forbidden inline branch push "
+            "(see the block-path-pushes-nothing invariant of direction d-18cc6131)."
+        )
+
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
         no gaps, no branches, no dangling down_revision references, and no
