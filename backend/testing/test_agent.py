@@ -6995,6 +6995,124 @@ async def test_post_commit_lock_on_retry_returns_pending_not_500(
 
 
 @pytest.mark.asyncio
+async def test_post_commit_disconnect_on_retry_returns_pending_not_500(
+    client: AsyncClient, db_session, mocker
+):
+    """A disconnection-class DB error during the post-commit RETRY path is deploy-
+    cutover collateral (a Cloud Run rollout drains the instance and severs the
+    in-flight connection), not a code fault. It must NOT surface as a 500 — Cloud
+    Run flags any 5xx as a ContainerError and quarantines the instance, which during
+    a cutover would cascade. The endpoint must return a clean 200
+    ``post_commit_retry_pending`` and leave ``post_commit_pending`` set so the sweep
+    keeps ownership of the deferred work.
+
+    Regression guard for the ``InterfaceError -> 500 -> ContainerError`` burst in the
+    2026-06-03 07:38 cutover window.
+    """
+    from sqlalchemy.exc import InterfaceError
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    pc = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        side_effect=InterfaceError(
+            "SELECT 1", {}, Exception("connection is closed")
+        ),
+    )
+
+    project = Project(name="PostCommit Disc Test", user_id="test-user-pc-disc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-pc-disc",
+        status=TaskStatus.COMPLETED,
+        post_commit_pending=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pc-disc")
+    headers = {"x-agent-token": token}
+    payload = {"task_id": str(task.id), "status": "COMPLETED"}
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+
+    assert resp.status_code == 200, (
+        f"cutover-collateral disconnect must not 500 (Cloud Run flags 5xx as "
+        f"ContainerError); got {resp.status_code}: {resp.text}"
+    )
+    assert resp.json().get("status") == "post_commit_retry_pending"
+    pc.assert_awaited()
+
+    await db_session.refresh(task)
+    assert task.post_commit_pending is True, (
+        "post_commit_pending must stay set on disconnect — the sweep owns the retry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_commit_disconnect_inline_returns_pending_not_500(
+    client: AsyncClient, db_session, mocker
+):
+    """The INLINE post-commit path (fresh terminal transition, no pre-existing
+    marker) wraps _process_post_commit in asyncio.wait_for. A disconnection-class
+    DB error there (the reported ``agent_status.py:3117 -> InterfaceError`` →
+    ContainerError) must be treated like a deferred-retry, not re-raised as a 500:
+    the early commit already persisted the terminal status and the write-ahead
+    marker is set, so the sweep owns the side effects.
+    """
+    from sqlalchemy.exc import InterfaceError
+
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    pc = mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        side_effect=InterfaceError(
+            "SELECT 1", {}, Exception("connection is closed")
+        ),
+    )
+
+    project = Project(name="PostCommit Disc Inline", user_id="test-user-pc-disc2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Fresh, NON-terminal task: the status POST drives the inline post-commit path.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build x"}],
+        vm_instance_id="agent-vm-pc-disc2",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pc-disc2")
+    headers = {"x-agent-token": token}
+    payload = {"task_id": str(task.id), "status": "COMPLETED"}
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+
+    assert resp.status_code == 200, (
+        f"inline post-commit disconnect must not 500; got {resp.status_code}: {resp.text}"
+    )
+    assert resp.json().get("status") == "post_commit_retry_pending"
+    pc.assert_awaited()
+
+    # The write-ahead marker must be set so the sweep retries the deferred effects.
+    await db_session.refresh(task)
+    assert task.post_commit_pending is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "requested_model", ["gemini-3.1-pro-preview", "gemini-3-pro-preview"]
 )

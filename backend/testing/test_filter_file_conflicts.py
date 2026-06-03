@@ -8,9 +8,13 @@ import uuid
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from app.models import TaskStatus
+from sqlalchemy.orm import load_only
+from sqlmodel import select
+
+from app.models import Task, TaskStatus
+from app.orchestrator import ACTIVE_TASKS_LIGHT_COLUMNS
 from app.orchestrator_filters import filter_file_conflicts
-from testing.factories import make_task
+from testing.factories import make_project, make_task
 
 
 def _queued(project_id, files, scope="small", ttype="fix", parent=None):
@@ -325,3 +329,85 @@ class TestFilterFileConflicts:
 
         result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_active_tasks_loaded_with_orchestrator_load_only_no_lazy_load(
+        self, db_session
+    ):
+        """Regression: the cross-parent check must not sync-lazy-load parent_task_id.
+
+        The dispatch loop fetches active (IN_PROGRESS) tasks with the
+        ACTIVE_TASKS_LIGHT_COLUMNS load_only set. filter_file_conflicts' cross-
+        parent looseness branch reads ``t.parent_task_id`` on the in-progress
+        blockers, so parent_task_id MUST be in that set — otherwise the access
+        is a sync IO load from async context (MissingGreenlet) that crashes the
+        ENTIRE dispatch cycle (prod 2026-06-03, 10x; introduced by PR #7431).
+        Importing the constant means if someone drops Task.parent_task_id from
+        it, this test re-breaks. The unit tests above can't catch it: their
+        make_task objects aren't load_only-deferred ORM instances.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        # Real parent rows: parent_task_id carries a FK (fk_task_parent_task_id),
+        # so the blockers must reference existing tasks (different parents = two
+        # different rollups).
+        parent_a = make_task(project_id=project.id, status=TaskStatus.EVALUATING)
+        parent_b = make_task(project_id=project.id, status=TaskStatus.EVALUATING)
+        db_session.add_all([parent_a, parent_b])
+        await db_session.commit()
+
+        # Significant overlap (2/4 files, ≥50%) so the deferral path is reached,
+        # but cross-parent so the looseness branch (which reads parent_task_id)
+        # decides NOT to defer.
+        ip = make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"related_files": ["a.py", "b.py"]},
+            payloads=[{"type": "fix"}],
+            parent_task_id=parent_b.id,
+        )
+        cand = make_task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            context={"related_files": ["a.py", "b.py", "c.py", "d.py"], "scope": "small"},
+            payloads=[{"type": "fix"}],
+            parent_task_id=parent_a.id,
+        )
+        db_session.add_all([ip, cand])
+        await db_session.commit()
+        db_session.expunge_all()
+
+        # Active tasks: load EXACTLY as the dispatch loop does.
+        active = (
+            (
+                await db_session.execute(
+                    select(Task)
+                    .where(
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        )
+                    )
+                    .options(load_only(*ACTIVE_TASKS_LIGHT_COLUMNS))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        candidates = (
+            (
+                await db_session.execute(
+                    select(Task).where(Task.status == TaskStatus.QUEUED)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        # Reading active[*].parent_task_id inside the cross-parent branch must not
+        # raise MissingGreenlet; cross-parent overlap is not deferred.
+        result = await filter_file_conflicts(
+            [c.id for c in candidates], candidates, active, db_session, AsyncMock()
+        )
+        assert result == [cand.id]

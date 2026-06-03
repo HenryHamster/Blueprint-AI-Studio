@@ -1799,6 +1799,20 @@ async def _process_post_commit(
                                     else {}
                                 )
                                 if _orig and _orig_loop.get("ci_waiting"):
+                                    # Snapshot identity + status while _orig is
+                                    # freshly locked. The merge gate below
+                                    # (_attempt_merge_with_retry_and_escalation) can
+                                    # roll back internally, which expires _orig even
+                                    # with expire_on_commit=False; re-reading
+                                    # _orig.project_id / .id / .status at broadcast
+                                    # time would then sync lazy-load in async context
+                                    # → MissingGreenlet / connection-acquire failure
+                                    # (prod 2026-06-03 task_lifecycle:1838). The
+                                    # parent stays EVALUATING on this CI-gate handoff,
+                                    # so the snapshotted status is correct.
+                                    _orig_pid_str = str(_orig.project_id)
+                                    _orig_id_str = str(_orig.id)
+                                    _orig_status_snap = _orig.status
                                     _orig_loop["review_approved"] = True
                                     _orig.context = {
                                         **(_orig.context or {}),
@@ -1835,11 +1849,11 @@ async def _process_post_commit(
 
                                     await session.commit()
                                     await broadcast_to_project(
-                                        str(_orig.project_id),
+                                        _orig_pid_str,
                                         "task_updated",
                                         {
-                                            "task_id": str(_orig.id),
-                                            "status": _orig.status,
+                                            "task_id": _orig_id_str,
+                                            "status": _orig_status_snap,
                                         },
                                     )
                                     logger.info(
@@ -2723,7 +2737,14 @@ async def _process_post_commit(
                                                     "_post_merge_effects_deferred"
                                                 ] = {
                                                     "pr_number": pr_number,
-                                                    "review_task_id": str(task.id),
+                                                    # task_id is the function's UUID
+                                                    # param — use it, not task.id: the
+                                                    # outer session is poisoned by the
+                                                    # lock_timeout abort, so reading
+                                                    # task.id would lazy-load on a dead
+                                                    # session (prod 2026-06-03
+                                                    # task_lifecycle:2726).
+                                                    "review_task_id": str(task_id),
                                                     "deferred_at": _utcnow().isoformat(),
                                                     "reason": "lock_timeout acquiring "
                                                     "parent FOR UPDATE during "
