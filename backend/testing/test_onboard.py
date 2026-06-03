@@ -17,6 +17,32 @@ from app.routers.admin_onboard import (
 TEST_USER_ID = "test-user-123"
 
 
+def _listing_resp(items, status_code=200):
+    """A MagicMock GitHub contents *directory listing* response."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = items
+    return resp
+
+
+def _file_content_resp(text, status_code=200):
+    """A MagicMock GitHub contents *single-file* response (base64-encoded body).
+
+    Mirrors the real Contents API single-file payload the detector decodes when
+    it must inspect a Makefile/composer.json body before emitting a command.
+    """
+    import base64
+
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json.return_value = {
+        "type": "file",
+        "content": base64.b64encode(text.encode()).decode(),
+        "encoding": "base64",
+    }
+    return resp
+
+
 @pytest.fixture(autouse=True)
 def override_auth():
     async def _user():
@@ -1650,6 +1676,297 @@ class TestBuildConfigDetection:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         assert config["has_ci"] is None
+
+
+class TestFallbackTestEntrypointDetection:
+    """Non-manifest / additional-language test entrypoint detection.
+
+    These broaden the no-CI merge gate so repos whose tests run via
+    make/tox/nox/a root script — or a language outside the core four
+    (Ruby, JVM, Elixir, .NET, PHP) — produce a runnable ``test_cmd`` instead of
+    silently merging UNVERIFIED. The emitted commands mirror the agent-side
+    fallback detector in agent/src/utils/test-runners.ts.
+    """
+
+    @pytest.mark.asyncio
+    async def test_makefile_with_test_target_emits_make_test(self):
+        """A Makefile that declares a real ``test:`` target → ``make test``.
+
+        The detector must fetch the Makefile CONTENT (a second request) and
+        confirm the target before emitting the command.
+        """
+        root = _listing_resp([{"name": "Makefile", "type": "file"}])
+        makefile = _file_content_resp(
+            "build:\n\tgo build ./...\n\ntest:\n\tgo test ./...\n"
+        )
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, makefile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["type"] == "other"
+        assert dirs[0]["test_cmd"] == "make test"
+        assert dirs[0]["path"] == "./"
+
+    @pytest.mark.asyncio
+    async def test_makefile_without_test_target_emits_no_test_cmd(self):
+        """A Makefile with NO ``test:`` target must not emit ``make test``."""
+        root = _listing_resp([{"name": "Makefile", "type": "file"}])
+        makefile = _file_content_resp("build:\n\tgo build ./...\n\nlint:\n\truff check\n")
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, makefile],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+
+    @pytest.mark.asyncio
+    async def test_tox_ini_emits_tox(self):
+        root = _listing_resp([{"name": "tox.ini", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["type"] == "other"
+        assert dirs[0]["test_cmd"] == "tox"
+
+    @pytest.mark.asyncio
+    async def test_noxfile_emits_nox(self):
+        root = _listing_resp([{"name": "noxfile.py", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["test_cmd"] == "nox"
+
+    @pytest.mark.asyncio
+    async def test_root_test_script_emits_bash_invocation(self):
+        root = _listing_resp(
+            [
+                {"name": "run-tests.sh", "type": "file"},
+                {"name": "main.c", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["test_cmd"] == "bash run-tests.sh"
+
+    @pytest.mark.asyncio
+    async def test_ruby_gemfile_and_rakefile_emit_rake_test(self):
+        root = _listing_resp(
+            [
+                {"name": "Gemfile", "type": "file"},
+                {"name": "Rakefile", "type": "file"},
+                {"name": "app.rb", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["test_cmd"] == "bundle exec rake test"
+
+    @pytest.mark.asyncio
+    async def test_jvm_gradle_emits_gradlew_test(self):
+        root = _listing_resp([{"name": "build.gradle", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"][0]["test_cmd"] == "./gradlew test"
+
+    @pytest.mark.asyncio
+    async def test_jvm_maven_emits_mvn_test(self):
+        root = _listing_resp([{"name": "pom.xml", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"][0]["test_cmd"] == "mvn test"
+
+    @pytest.mark.asyncio
+    async def test_elixir_mix_emits_mix_test(self):
+        root = _listing_resp([{"name": "mix.exs", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"][0]["test_cmd"] == "mix test"
+
+    @pytest.mark.asyncio
+    async def test_dotnet_csproj_emits_dotnet_test(self):
+        root = _listing_resp(
+            [
+                {"name": "App.csproj", "type": "file"},
+                {"name": "Program.cs", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"][0]["test_cmd"] == "dotnet test"
+
+    @pytest.mark.asyncio
+    async def test_php_phpunit_xml_emits_phpunit(self):
+        root = _listing_resp([{"name": "phpunit.xml.dist", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"][0]["test_cmd"] == "vendor/bin/phpunit"
+
+    @pytest.mark.asyncio
+    async def test_php_composer_with_test_script_emits_composer_test(self):
+        """composer.json must declare ``scripts.test`` (verified by content)."""
+        root = _listing_resp([{"name": "composer.json", "type": "file"}])
+        composer = _file_content_resp(
+            '{"scripts": {"test": "phpunit", "lint": "phpcs"}}'
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, composer],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"][0]["test_cmd"] == "composer test"
+
+    @pytest.mark.asyncio
+    async def test_php_composer_without_test_script_emits_no_test_cmd(self):
+        """A composer.json with no ``scripts.test`` must not emit a command."""
+        root = _listing_resp([{"name": "composer.json", "type": "file"}])
+        composer = _file_content_resp('{"scripts": {"lint": "phpcs"}}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, composer],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+
+    @pytest.mark.asyncio
+    async def test_core_python_manifest_takes_precedence_over_makefile(self):
+        """A pyproject.toml + Makefile dir keeps pytest and never adds make test.
+
+        Precedence: a recognized language manifest's test_cmd wins per-directory,
+        so the fallback is not emitted and the Makefile body is never fetched.
+        """
+        root = _listing_resp(
+            [
+                {"name": "pyproject.toml", "type": "file"},
+                {"name": "Makefile", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],  # one call only — no Makefile content fetch
+        ) as mock_req:
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert mock_req.call_count == 1
+        dirs = config["directories"]
+        assert len(dirs) == 1
+        assert dirs[0]["type"] == "python"
+        assert dirs[0]["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_bare_repo_with_no_entrypoints_yields_no_test_cmd(self):
+        """A repo with none of the recognized signals stays test-less."""
+        root = _listing_resp(
+            [
+                {"name": "README.md", "type": "file"},
+                {"name": "LICENSE", "type": "file"},
+                {"name": "notes.txt", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["directories"] == []
+        assert not any(
+            str(d.get("test_cmd") or "").strip() for d in config["directories"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_fallback_entry_makes_no_ci_gate_runnable(self):
+        """A detected fallback test_cmd makes should_run_no_ci_test_gate True.
+
+        Proves the detector output flows through to the gate decision:
+        has_detectable_tests reads the emitted ``test_cmd`` and gates the merge.
+        """
+        from app.ci_resolution import should_run_no_ci_test_gate
+
+        root = _listing_resp([{"name": "tox.ini", "type": "file"}])
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        project = Project(
+            name="ext",
+            user_id=TEST_USER_ID,
+            github_owner="owner",
+            github_repo="repo",
+            integration_branch="main",
+            build_config={"requires_ci_checks": False, **config},
+        )
+        assert (
+            should_run_no_ci_test_gate(project, "main", gate_enabled=True) is True
+        )
 
 
 class TestMaybeRefreshEmptyBuildConfig:

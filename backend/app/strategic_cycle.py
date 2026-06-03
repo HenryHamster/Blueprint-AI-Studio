@@ -74,15 +74,16 @@ async def create(
     phase1_task_id=None,
     baseline_vision: Optional[Mapping[str, Any]] = None,
     baseline_problem_model: Optional[Mapping[str, Any]] = None,
+    baseline_running_update: Optional[str] = None,
 ) -> StrategicCycle:
     """Insert a new StrategicCycle row at phase-1 spawn.
 
-    ``baseline_vision`` and ``baseline_problem_model`` are snapshot at cycle
-    start so the 3-way merges in ``strategic_completion`` / the live API path
-    can compare operator edits against the same baseline the agent was given.
-    Both are stored under ``cycle_metadata`` to avoid a per-project schema
-    change, and both are skipped by :func:`_to_legacy_dict` so the snapshots
-    never leak into the agent's cycle-history context.
+    ``baseline_vision``, ``baseline_problem_model`` and ``baseline_running_update``
+    are snapshot at cycle start so the 3-way merges in ``strategic_completion`` /
+    the live API path can compare operator edits against the same baseline the
+    agent was given. All are stored under ``cycle_metadata`` to avoid a
+    per-project schema change, and all are skipped by :func:`_to_legacy_dict` so
+    the snapshots never leak into the agent's cycle-history context.
     """
     cycle = StrategicCycle(
         id=cycle_id or new_cycle_id(),
@@ -93,6 +94,7 @@ async def create(
         cycle_metadata={
             "baseline_vision": dict(baseline_vision or {}),
             "baseline_problem_model": dict(baseline_problem_model or {}),
+            "baseline_running_update": baseline_running_update,
         },
     )
     session.add(cycle)
@@ -390,6 +392,21 @@ def baseline_problem_model(cycle: StrategicCycle) -> dict[str, Any]:
     return dict(snap) if isinstance(snap, dict) else {}
 
 
+def baseline_running_update(cycle: StrategicCycle) -> Optional[str]:
+    """Read the snapshot of ``running_update`` taken at cycle start.
+
+    Mirrors :func:`baseline_vision` / :func:`baseline_problem_model` but for the
+    freeform-markdown ``running_update`` document. Used by
+    ``strategic_completion`` to run a coarse whole-document operator-wins merge
+    so a concurrent operator edit to ``running_update`` is not clobbered by the
+    agent's refreshed write. Returns ``None`` when no baseline was captured
+    (legacy cycles), which the completion path treats as "degrade to blind
+    assignment"."""
+    meta = cycle.cycle_metadata or {}
+    snap = meta.get("baseline_running_update")
+    return snap if isinstance(snap, str) else None
+
+
 def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     """Render a StrategicCycle row in the legacy cycle_history JSONB shape.
 
@@ -427,7 +444,11 @@ def _to_legacy_dict(cycle: StrategicCycle) -> dict[str, Any]:
     # history shape, and must never leak into agent cycle-history context).
     meta = cycle.cycle_metadata or {}
     for k, v in meta.items():
-        if k in ("baseline_vision", "baseline_problem_model"):
+        if k in (
+            "baseline_vision",
+            "baseline_problem_model",
+            "baseline_running_update",
+        ):
             continue
         out[k] = v
     return out

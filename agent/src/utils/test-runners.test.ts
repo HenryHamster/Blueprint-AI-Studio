@@ -201,6 +201,155 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
   });
 });
 
+describe('detectTestRunners — generic external-repo fallbacks (make/tox/nox/scripts)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('Makefile with a real `test:` target → make test (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Makefile'));
+    fs.readFileSync.mockReturnValue('build:\n\tgo build\n\ntest:\n\tgo test ./...\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('make');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+  });
+
+  it('Makefile present but NO test target → no make runner emitted', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Makefile'));
+    fs.readFileSync.mockReturnValue('build:\n\tgo build\n\nlint:\n\tgolangci-lint run\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('lowercase `makefile` casing variant is recognized', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/makefile'));
+    fs.readFileSync.mockReturnValue('test:\n\tpytest\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('make');
+    expect(runners[0].args).toEqual(['test']);
+  });
+
+  it('GNUmakefile casing variant is recognized', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/GNUmakefile'));
+    fs.readFileSync.mockReturnValue('test :\n\tpytest\n');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('make');
+  });
+
+  it('tox.ini → tox (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/tox.ini'));
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('tox');
+    expect(runners[0].args).toEqual([]);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+  });
+
+  it('noxfile.py → nox (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/noxfile.py'));
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('nox');
+    expect(runners[0].args).toEqual([]);
+  });
+
+  it('root-level ./test.sh → bash test.sh (root)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/test.sh') && !p.includes('scripts/'));
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('bash');
+    expect(runners[0].args).toEqual(['test.sh']);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
+  });
+
+  it('run-tests.sh / run_tests.sh / scripts/test.sh are each recognized', () => {
+    const fs = mockFs;
+    for (const script of ['run-tests.sh', 'run_tests.sh', 'scripts/test.sh']) {
+      vi.clearAllMocks();
+      fs.existsSync.mockImplementation((p: string) => p.endsWith(`/${script}`));
+      const runners = detectTestRunners(undefined);
+      expect(runners, `script ${script}`).toHaveLength(1);
+      expect(runners[0].cmd).toBe('bash');
+      expect(runners[0].args).toEqual([script]);
+    }
+  });
+
+  it('a repo with none of these (and no Blueprint markers) yields NO runner', () => {
+    const fs = mockFs;
+    fs.existsSync.mockReturnValue(false);
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(0);
+  });
+
+  it('stored build_config test_cmd takes precedence — generic fallbacks do not fire', () => {
+    const fs = mockFs;
+    // Makefile + tox.ini + test.sh all present on disk...
+    fs.existsSync.mockReturnValue(true);
+    fs.readFileSync.mockReturnValue('test:\n\tpytest\n');
+
+    const buildConfig: BuildConfig = {
+      directories: [{ path: './', type: 'python', test_cmd: 'python3 -m pytest' }],
+    };
+    const runners = detectTestRunners(buildConfig);
+
+    // ...but a stored test_cmd suppresses every auto-detection fallback.
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('python3');
+    expect(runners[0].args).toEqual(['-m', 'pytest']);
+  });
+
+  it('Blueprint backend pytest precedence — Makefile fallback does not override scripts/test-backend.sh', () => {
+    const fs = mockFs;
+    // Both a Blueprint backend layout AND a generic Makefile are present.
+    fs.existsSync.mockImplementation((p: string) =>
+      p.endsWith('/backend/pytest.ini') ||
+      p.endsWith('/scripts/test-backend.sh') ||
+      p.endsWith('/Makefile')
+    );
+    fs.readFileSync.mockReturnValue('test:\n\tpytest\n');
+
+    const runners = detectTestRunners(undefined);
+
+    // The Blueprint-specific backend runner wins; the make fallback never fires.
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('bash');
+    expect(runners[0].args[0]).toBe('scripts/test-backend.sh');
+  });
+});
+
 describe('classifyTestExecution — placeholder/empty suite detection', () => {
   it('npm "no test specified" placeholder → no_tests', () => {
     expect(classifyTestExecution(
@@ -221,6 +370,36 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
   it('vitest "No test files found" → no_tests', () => {
     expect(classifyTestExecution(
       'No test files found, exiting with code 1',
+    )).toBe('no_tests');
+  });
+
+  it('npm missing script ("Missing script") → no_tests', () => {
+    expect(classifyTestExecution(
+      'Error: Missing script: "test"\nnpm ERR! Test failed.',
+    )).toBe('no_tests');
+  });
+
+  it('yarn missing script ("Command not found") → no_tests', () => {
+    expect(classifyTestExecution(
+      'error Command "test" not found.',
+    )).toBe('no_tests');
+  });
+
+  it('pnpm missing script command → no_tests', () => {
+    expect(classifyTestExecution(
+      'ERR!  No matching version found for test\nerror: command not found: test',
+    )).toBe('no_tests');
+  });
+
+  it('make missing target ("No rule to make target") → no_tests', () => {
+    expect(classifyTestExecution(
+      'make: *** No rule to make target `test\'. Stop.',
+    )).toBe('no_tests');
+  });
+
+  it('make missing target with single quotes → no_tests', () => {
+    expect(classifyTestExecution(
+      "make: *** No rule to make target 'test'. Stop.",
     )).toBe('no_tests');
   });
 

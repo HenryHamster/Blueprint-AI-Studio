@@ -1132,8 +1132,18 @@ async def test_requeue_parent_failed_when_blocked_and_genuine_cancelled_child_mi
 
 
 @pytest.mark.asyncio
-async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, mocker):
-    """A retry-superseded CANCELLED child does not block parent auto-parking."""
+async def test_requeue_parent_mixed_blocked_and_superseded_cancelled_not_parked(
+    tl_db, mocker
+):
+    """A mix of genuinely-BLOCKED + non-genuine-cancelled children (no genuine
+    failure) must NOT be coerced to fully-BLOCKED. Some children were superseded
+    by a replacement clone, so "all subtasks blocked" is factually wrong — the
+    parent is routed to EVALUATING for rollup re-evaluation instead, with no
+    precondition-blocker alert and no requeue-budget burn."""
+    alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_precondition_blocker_alert",
+        new_callable=AsyncMock,
+    )
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     session, _ = tl_db
     project = await _make_project(session)
@@ -1157,8 +1167,42 @@ async def test_requeue_parent_blocked_ignores_superseded_cancelled_child(tl_db, 
     await _requeue_parent_task(parent, session)
 
     await session.refresh(parent)
+    # Not coerced to fully-BLOCKED — re-evaluated by rollup instead.
+    assert parent.status == TaskStatus.EVALUATING
+    assert parent.status != TaskStatus.BLOCKED
+    assert "awaiting rollup re-evaluation" in (parent.latest_status_message or "")
+    # Message must NOT claim all subtasks are blocked.
+    assert "All 1 subtask" not in (parent.latest_status_message or "")
+    # No precondition-blocker alert for a mixed set, and budget untouched.
+    alert.assert_not_called()
+    assert (parent.context or {}).get("_requeue_count", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_blocked_only_when_purely_blocked(tl_db, mocker):
+    """When EVERY unsucceeded child is genuinely BLOCKED (no cancellations), the
+    parent still parks BLOCKED with an accurate count message."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+    for _ in range(2):
+        await _make_task(
+            session,
+            project.id,
+            status=TaskStatus.BLOCKED,
+            parent_task_id=parent.id,
+            latest_status_message="BLOCKER: dep not landed",
+        )
+
+    await _requeue_parent_task(parent, session)
+
+    await session.refresh(parent)
     assert parent.status == TaskStatus.BLOCKED
     assert (parent.context or {}).get("blocker", {}).get("source") == "parent"
+    # Count message is factually accurate: 2 blocked subtasks.
+    assert "All 2 subtask(s) blocked" in (parent.latest_status_message or "")
+    assert (parent.context or {}).get("_requeue_count", 0) == 0
 
 
 @pytest.mark.asyncio

@@ -1708,6 +1708,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         phase1_task_id=new_task.id,
         baseline_vision=project.vision or {},
         baseline_problem_model=project.problem_model or {},
+        baseline_running_update=project.running_update,
     )
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.

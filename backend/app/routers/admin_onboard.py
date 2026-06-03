@@ -6,6 +6,8 @@ task-branch namespace, and then validates the merged configuration against the
 BuildConfig schema before saving it.
 """
 
+import base64
+import json
 import logging
 import re
 from collections import deque
@@ -93,6 +95,39 @@ _NON_SOURCE_FILE_PREFIXES = (
 )
 _BUILD_CONFIG_SCAN_MAX_DEPTH = 2
 _BUILD_CONFIG_SCAN_MAX_DIRECTORIES = 40
+
+# A real ``test:`` target at the start of a line (after optional surrounding
+# whitespace). The Contents API only gives file names, so a bare Makefile is not
+# enough to justify ``make test`` — we fetch the body and confirm this target
+# exists, otherwise ``make test`` fails with "No rule to make target 'test'".
+# Mirrors the agent-side check in agent/src/utils/test-runners.ts.
+_MAKEFILE_TEST_TARGET_RE = re.compile(r"^test\s*:", re.MULTILINE)
+
+# Conventional root/dir-local test scripts, in deterministic precedence order,
+# emitted as ``bash <script>`` (run from the directory the entry points at).
+_CONVENTIONAL_TEST_SCRIPTS = ("test.sh", "run-tests.sh", "run_tests.sh")
+
+
+def _composer_defines_test_script(text: str | None) -> bool:
+    """True iff a ``composer.json`` body declares a non-empty ``scripts.test``.
+
+    A bare ``composer.json`` is not enough to justify ``composer test`` — the
+    script must actually be defined, otherwise the command errors with
+    "Script test is not defined". The detector fetches the file CONTENT and
+    confirms the script exists before emitting the command.
+    """
+    if not text:
+        return False
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return False
+    return bool(str(scripts.get("test") or "").strip())
 
 
 def _is_ci_workflow_file(name: str) -> bool:
@@ -284,6 +319,133 @@ async def _detect_build_config(
         if "Cargo.toml" in names:
             _add_detected_directory(directories, languages, path, "rust")
 
+    def _directory_has_test_cmd(path: str) -> bool:
+        normalized_path = _normalized_directory_path(path)
+        return any(
+            d["path"] == normalized_path and str(d.get("test_cmd") or "").strip()
+            for d in directories
+        )
+
+    def _add_fallback_directory(path: str, test_cmd: str) -> None:
+        """Append a generic ``type='other'`` directory carrying ``test_cmd``.
+
+        Deduped on (path, test_cmd). Intentionally does NOT record a language —
+        the top-level ``BuildConfig.language`` only models
+        python/typescript/go/rust/mixed, so a non-core entrypoint leaves the
+        summary language unchanged rather than emitting an out-of-pattern value
+        the schema would reject.
+        """
+        normalized_path = _normalized_directory_path(path)
+        if any(
+            d["path"] == normalized_path and d.get("test_cmd") == test_cmd
+            for d in directories
+        ):
+            return
+        directories.append(
+            {"path": normalized_path, "type": "other", "test_cmd": test_cmd}
+        )
+
+    async def _fetch_file_text(file_path: str) -> str | None:
+        """Fetch + decode a single repo file's text via the GitHub contents API.
+
+        Returns the decoded text, or None on any non-200 status, non-file
+        payload, missing/undecodable content, or transient error — callers must
+        treat None as 'could not confirm' and emit no command. Uses the same
+        headers/params (``ref``) as the listing requests so branch-targeted
+        detection stays consistent.
+        """
+        resp = await _github_request(
+            "GET",
+            _contents_url(file_path),
+            headers,
+            max_retries=1,
+            params=params,
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        if not isinstance(payload, dict) or payload.get("type") != "file":
+            return None
+        content_b64 = payload.get("content")
+        if not isinstance(content_b64, str):
+            return None
+        try:
+            return base64.b64decode(content_b64).decode(errors="replace")
+        except Exception:  # noqa: BLE001 — undecodable content → cannot confirm
+            return None
+
+    async def _detect_fallback_in_listing(
+        path: str, listing: list[Dict[str, Any]]
+    ) -> None:
+        """Detect non-manifest / additional-language test entrypoints in a dir.
+
+        Runs AFTER the core four-manifest detection for the same directory and
+        only when that directory has no recognized-manifest ``test_cmd`` yet, so
+        the existing python/node/go/rust behavior always takes precedence. Emits
+        at most one ``type='other'`` directory carrying a runnable ``test_cmd``
+        so the no-CI merge gate's ``has_detectable_tests`` becomes true for repos
+        whose tests run via make/tox/nox/a root script or a language outside the
+        core four (Ruby, JVM, Elixir, .NET, PHP).
+
+        Mirrors the agent-side fallback detector in
+        ``agent/src/utils/test-runners.ts`` so both layers agree on the emitted
+        command. SAFETY: a Makefile must expose a real ``test:`` target and a
+        ``composer.json`` must declare ``scripts.test``; those are confirmed by
+        fetching the file CONTENT before a command is emitted.
+        """
+        if _directory_has_test_cmd(path):
+            return
+
+        names = {
+            item.get("name")
+            for item in listing
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+
+        # --- Additional language manifests (name-based). First match wins. ---
+        if "Gemfile" in names and "Rakefile" in names:
+            _add_fallback_directory(path, "bundle exec rake test")
+            return
+        if "build.gradle" in names or "build.gradle.kts" in names:
+            _add_fallback_directory(path, "./gradlew test")
+            return
+        if "pom.xml" in names:
+            _add_fallback_directory(path, "mvn test")
+            return
+        if "mix.exs" in names:
+            _add_fallback_directory(path, "mix test")
+            return
+        if any(n.endswith(".sln") or n.endswith(".csproj") for n in names):
+            _add_fallback_directory(path, "dotnet test")
+            return
+        if "phpunit.xml" in names or "phpunit.xml.dist" in names:
+            _add_fallback_directory(path, "vendor/bin/phpunit")
+            return
+        if "composer.json" in names:
+            composer_path = f"{path}/composer.json" if path else "composer.json"
+            if _composer_defines_test_script(await _fetch_file_text(composer_path)):
+                _add_fallback_directory(path, "composer test")
+                return
+
+        # --- Generic non-manifest fallbacks: Makefile → tox → nox → script. ---
+        for makefile_name in ("Makefile", "makefile", "GNUmakefile"):
+            if makefile_name in names:
+                makefile_path = f"{path}/{makefile_name}" if path else makefile_name
+                text = await _fetch_file_text(makefile_path)
+                if text and _MAKEFILE_TEST_TARGET_RE.search(text):
+                    _add_fallback_directory(path, "make test")
+                    return
+        if "tox.ini" in names:
+            _add_fallback_directory(path, "tox")
+            return
+        if "noxfile.py" in names:
+            _add_fallback_directory(path, "nox")
+            return
+        for script in _CONVENTIONAL_TEST_SCRIPTS:
+            if script in names:
+                _add_fallback_directory(path, f"bash {script}")
+                return
+
     # Fetch root directory listing
     resp = await _github_request(
         "GET",
@@ -313,6 +475,7 @@ async def _detect_build_config(
     # normal walk reads it for free alongside build-config detection.
     ci_workflow_found = False
     _detect_projects_in_listing("", root_listing, directories, languages)
+    await _detect_fallback_in_listing("", root_listing)
 
     pending_dirs = deque(
         sorted(
@@ -364,6 +527,7 @@ async def _detect_build_config(
         ):
             ci_workflow_found = True
         _detect_projects_in_listing(subdir, sub_listing, directories, languages)
+        await _detect_fallback_in_listing(subdir, sub_listing)
 
         child_dirs = sorted(
             item["name"]

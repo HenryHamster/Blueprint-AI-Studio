@@ -651,6 +651,75 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 persist_failure_category,
             )
 
+            # Re-apply PR #7487 on top of automain's shared-helper refactor.
+            # Classify the terminal child set BEFORE the pure-blocked verdict so a
+            # mix of genuinely-BLOCKED + non-genuine-cancelled children (with no
+            # genuine failure) is routed to rollup re-evaluation rather than being
+            # coerced to fully-BLOCKED — "all subtasks blocked" is factually wrong
+            # for a mixed set. ``_maybe_block_on_preconditions`` (below) recomputes
+            # the same tallies for the pure-blocked / genuine-failure verdict and
+            # is the single source of truth shared with the requeue-limit path.
+            from app.direction_outcomes import _is_non_genuine_cancelled
+
+            failed_children = [c for c in children if c.status == TaskStatus.FAILED]
+            blocked_children = [c for c in children if c.status == TaskStatus.BLOCKED]
+            genuine_cancelled_children = [
+                c
+                for c in children
+                if c.status == TaskStatus.CANCELLED
+                and not _is_non_genuine_cancelled(c)
+            ]
+            non_genuine_cancelled = [
+                c
+                for c in children
+                if c.status == TaskStatus.CANCELLED
+                and _is_non_genuine_cancelled(c)
+            ]
+            genuine_failures = (
+                len(failed_children) - blocked_count + len(genuine_cancelled_children)
+            )
+            total_blocked = blocked_count + len(blocked_children)
+
+            if (
+                total_blocked > 0
+                and genuine_failures <= 0
+                and len(non_genuine_cancelled) > 0
+            ):
+                # Mixed set: some children are genuinely blocked, but others were
+                # superseded / handed-off / approved-then-capped (non-genuine
+                # cancellations) — there is no genuine failure. Parking the whole
+                # parent BLOCKED on a precondition would be factually wrong ("all
+                # subtasks blocked" is false) and could mask that a replacement
+                # clone or landed work is advancing the parent's real outcome.
+                # Route to rollup re-evaluation so that outcome — not a coerced
+                # precondition block — drives the parent. Don't burn the requeue
+                # budget; nothing was actually retried. Checked before the shared
+                # helper because that helper would otherwise BLOCK this set.
+                parent.status = TaskStatus.EVALUATING
+                parent.latest_status_message = (
+                    f"{total_blocked} subtask(s) blocked alongside "
+                    f"{len(non_genuine_cancelled)} superseded/handed-off "
+                    f"subtask(s) — awaiting rollup re-evaluation"
+                )
+                session.add(parent)
+                await session.commit()
+                await broadcast_to_project(
+                    str(parent.project_id),
+                    "task_updated",
+                    {"task_id": str(parent.id), "status": TaskStatus.EVALUATING},
+                )
+                logger.info(
+                    f"[REQUEUE] Parent {parent.id} — mixed blocked "
+                    f"({total_blocked}) + non-genuine-cancelled "
+                    f"({len(non_genuine_cancelled)}) children, no genuine "
+                    f"failure; kept at EVALUATING for rollup re-evaluation"
+                )
+                return 0
+
+            # Not a mixed set — defer the pure-blocked-vs-genuine-failure verdict
+            # to the shared helper (also used by the requeue-limit path) so the two
+            # terminal paths cannot drift apart. Its "all blocked" message is
+            # accurate here because the mixed case was already handled above.
             if await _maybe_block_on_preconditions(
                 parent, children, blocked_count, session, broadcast_to_project
             ):

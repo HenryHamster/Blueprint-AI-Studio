@@ -184,6 +184,46 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
         } catch { /* malformed package.json — skip */ }
       }
     }
+
+    // --- Generic external-repo fallbacks (only if no Blueprint-specific or
+    //     manifest-based runner was found above). These let an external no-CI
+    //     repo whose stored build_config is empty still run its real suite.
+    //     Ordering is deterministic: Makefile → tox.ini → noxfile.py → test
+    //     scripts; the first match wins.
+    if (noRunners()) {
+      // Makefile with a real `test:` target → `make test` from repo root.
+      // SAFETY: only emit when the file actually declares a `test` target,
+      // otherwise `make test` fails with "No rule to make target 'test'".
+      for (const makefileName of ['Makefile', 'makefile', 'GNUmakefile']) {
+        if (!noRunners()) break;
+        const makefilePath = `${WORKSPACE}/${makefileName}`;
+        if (existsSync(makefilePath)) {
+          try {
+            if (/^test\s*:/m.test(readFileSync(makefilePath, 'utf-8'))) {
+              runners.push({ cmd: 'make', args: ['test'], cwd: WORKSPACE, label: `make test (${makefileName})` });
+            }
+          } catch { /* unreadable — skip */ }
+        }
+      }
+    }
+
+    if (noRunners() && existsSync(`${WORKSPACE}/tox.ini`)) {
+      runners.push({ cmd: 'tox', args: [], cwd: WORKSPACE, label: 'tox (root)' });
+    }
+
+    if (noRunners() && existsSync(`${WORKSPACE}/noxfile.py`)) {
+      runners.push({ cmd: 'nox', args: [], cwd: WORKSPACE, label: 'nox (root)' });
+    }
+
+    // Conventional root-level test scripts → `bash <script>`. First match wins.
+    if (noRunners()) {
+      for (const script of ['test.sh', 'run-tests.sh', 'run_tests.sh', 'scripts/test.sh']) {
+        if (!noRunners()) break;
+        if (existsSync(`${WORKSPACE}/${script}`)) {
+          runners.push({ cmd: 'bash', args: [script], cwd: WORKSPACE, label: `bash ${script}` });
+        }
+      }
+    }
   }
 
   return runners;
@@ -200,6 +240,10 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
  * as a hard failure (placeholder exits non-zero) or a vacuous pass (empty suite
  * exits zero).
  *
+ * Recognizes missing-script signatures (package.json has no test script, or a
+ * target does not exist) as a no-tests case so the gate falls back to
+ * proceed-without-checks rather than blocking the merge on an invocation error.
+ *
  * CONSERVATIVE BY DESIGN: returns 'no_tests' ONLY on a positive signature match.
  * Anything else — including a genuine failure like "1 failed" or "2 passed",
  * empty output, or an unrecognized format — defaults to 'ran' so that a real
@@ -210,6 +254,14 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // npm placeholder: the default `package.json` test script prints
   // "Error: no test specified" and exits 1 without running anything.
   if (lower.includes('no test specified')) return 'no_tests';
+  // npm/yarn/pnpm: missing test script in package.json.
+  // npm: "Error: Missing script: "test"" or "npm ERR! Missing script: "test""
+  // yarn: "error Command "test" not found."
+  // pnpm: "ERR!  No matching version found for test"
+  if (lower.includes('missing script')) return 'no_tests';
+  if (lower.includes('command') && lower.includes('not found')) return 'no_tests';
+  // make: "No rule to make target 'test'" or "No rule to make target `test'"
+  if (lower.includes('no rule to make target')) return 'no_tests';
   // pytest: "no tests ran in 0.01s" / "collected 0 items".
   if (lower.includes('no tests ran')) return 'no_tests';
   if (lower.includes('collected 0 items')) return 'no_tests';

@@ -34,8 +34,10 @@ artifact reader so a regression that classifies a still-running verify task —
 or merges before its verdict lands — fails this flow.
 """
 
+import base64
 import json
 import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -719,6 +721,117 @@ async def test_unverified_merge_alert_not_duplicated_on_second_sweep(
 
     alerts = await _unverified_merge_alerts(db_session, project.id)
     assert len(alerts) == 1, "second merge sweep must not duplicate the alert"
+
+
+# ---------------------------------------------------------------------------
+# 5. A repo detected via a NON-MANIFEST entrypoint runs its suite and blocks
+#    the merge on failure (detection layer → gate layer, composed).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_ci_makefile_detected_repo_blocks_merge_on_failure(
+    db_session, mocker
+):
+    """An external no-CI repo whose tests run via a Makefile ``test:`` target
+    (no python/node/go/rust manifest) is auto-detected at onboarding and the
+    gate runs that suite as the merge verdict — a failing run blocks the merge.
+
+    This composes the onboarding detector (which fetches the Makefile body and
+    emits ``make test``) with the no-CI gate so a non-manifest repo is no longer
+    silently merged UNVERIFIED.
+    """
+    from app.routers.admin_onboard import _detect_build_config
+
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    # --- Detection: a Makefile-only repo with a real test target. ---
+    root_resp = MagicMock()
+    root_resp.status_code = 200
+    root_resp.json.return_value = [{"name": "Makefile", "type": "file"}]
+    makefile_resp = MagicMock()
+    makefile_resp.status_code = 200
+    makefile_resp.json.return_value = {
+        "type": "file",
+        "content": base64.b64encode(
+            b"build:\n\tcc -o app main.c\n\ntest:\n\t./run-suite\n"
+        ).decode(),
+        "encoding": "base64",
+    }
+    with patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[root_resp, makefile_resp],
+    ):
+        detected = await _detect_build_config("ghs_test", "acme", "widget")
+
+    assert any(
+        d.get("test_cmd") == "make test" for d in detected["directories"]
+    ), "Makefile-with-test-target repo must detect a `make test` command"
+
+    # --- Build a no-CI project from the DETECTED config. ---
+    project = Project(
+        name="Makefile no-CI repo",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch=BASE,
+        build_config={"requires_ci_checks": False, **detected},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # The gate runs because the non-manifest entrypoint produced a test_cmd.
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    # The agent ran `make test` and it failed.
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": False,
+            "tests": [{"name": "make test", "passed": False}],
+            "output": "make: *** [test] Error 1\nFAILED suite::case_a",
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+    assert "case_a" in detail
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+
+    assert acted is True
+    merge_mock.assert_not_called()  # the failing make-test suite blocked the merge
+    assert await _unverified_merge_alerts(db_session, project.id) == []
 
 
 @pytest.mark.asyncio
