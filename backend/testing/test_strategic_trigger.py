@@ -7,6 +7,7 @@ floor, and consume/clear — plus the durable set via with_vision_locked.
 from __future__ import annotations
 
 from datetime import timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -211,6 +212,20 @@ async def test_request_defaults_origin_to_qualification(db_session):
     marker = project.vision["_strategic_refresh"]
     assert marker["origin"] == st.ORIGIN_QUALIFICATION
     assert st.refresh_breaker_applies(project.vision) is True
+
+
+@pytest.mark.asyncio
+async def test_request_qualification_uses_skip_locked_policy(db_session):
+    """The qualification path must keep the best-effort skip-locked lock policy."""
+    project = await _make_project(db_session)
+
+    with patch.object(st, "with_vision_locked", AsyncMock(return_value=True)) as spy:
+        await st.request_strategic_refresh(
+            db_session, project.id, "post_qualification:promoted"
+        )
+
+    assert spy.await_count == 1
+    assert spy.await_args.kwargs["skip_locked"] is True
 
 
 @pytest.mark.asyncio

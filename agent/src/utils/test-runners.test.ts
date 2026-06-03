@@ -44,7 +44,21 @@ type LayoutFixture = {
     content?: string;
   }>;
   detectable: boolean;
-  family: 'pytest' | 'npm' | 'cargo' | 'make' | 'tox' | 'nox' | null;
+  family:
+    | 'pytest'
+    | 'npm'
+    | 'cargo'
+    | 'make'
+    | 'tox'
+    | 'nox'
+    | 'go'
+    | 'ruby'
+    | 'gradle'
+    | 'maven'
+    | 'elixir'
+    | 'dotnet'
+    | 'php'
+    | null;
 };
 
 const sharedLayouts = JSON.parse(
@@ -77,6 +91,27 @@ function familyFromRunner(runner: TestRunner): LayoutFixture['family'] {
   }
   if (runner.cmd === 'nox') {
     return 'nox';
+  }
+  if (runner.cmd === 'go' && runner.args[0] === 'test') {
+    return 'go';
+  }
+  if (runner.cmd === 'bundle' && runner.args.join(' ') === 'exec rake test') {
+    return 'ruby';
+  }
+  if (runner.cmd === './gradlew' && runner.args[0] === 'test') {
+    return 'gradle';
+  }
+  if (runner.cmd === 'mvn' && runner.args[0] === 'test') {
+    return 'maven';
+  }
+  if (runner.cmd === 'mix' && runner.args[0] === 'test') {
+    return 'elixir';
+  }
+  if (runner.cmd === 'dotnet' && runner.args[0] === 'test') {
+    return 'dotnet';
+  }
+  if (runner.cmd === 'vendor/bin/phpunit') {
+    return 'php';
   }
   return null;
 }
@@ -427,6 +462,18 @@ describe('detectTestRunners — shared layout parity fixtures', () => {
         }
         return file.content ?? '';
       });
+      // The .NET detector globs the directory listing for a *.sln/*.csproj, so
+      // the parity loop must expose the fixture's root-level files to readdirSync
+      // (existsSync alone cannot match an arbitrary project-file name).
+      fsMock.readdirSync.mockImplementation((p: string) => {
+        const rel = toWorkspaceRelativePath(p);
+        if (rel === WORKSPACE || rel === '') {
+          return layout.files
+            .map((item) => item.path)
+            .filter((path) => !path.includes('/'));
+        }
+        return [];
+      });
 
       const runners = detectTestRunners(undefined);
 
@@ -531,6 +578,71 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     expect(byCwd['/tmp/workspace/packages/core'].args).toEqual(['test']);
     expect(byCwd['/tmp/workspace/packages/svc'].cmd).toBe('go');
     expect(byCwd['/tmp/workspace/packages/svc'].args).toEqual(['test', './...']);
+  });
+
+  it('services/api/pom.xml → mvn test at services/api (maven nested)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/services' || p.endsWith('/services/api/pom.xml'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['api'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('mvn');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/services/api');
+  });
+
+  it('packages/web/Gemfile + Rakefile → bundle exec rake test (ruby nested)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/packages' ||
+      p.endsWith('/packages/web/Gemfile') ||
+      p.endsWith('/packages/web/Rakefile'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/packages') ? ['web'] : [],
+    );
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('bundle');
+    expect(runners[0].args).toEqual(['exec', 'rake', 'test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/packages/web');
+  });
+
+  it('apps/svc/*.csproj → dotnet test at apps/svc (.NET nested via readdir glob)', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p === '/tmp/workspace/apps');
+    fs.readdirSync.mockImplementation((p: string) => {
+      if (p.endsWith('/apps')) return ['svc'];
+      if (p.endsWith('/apps/svc')) return ['Service.csproj'];
+      return [];
+    });
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('dotnet');
+    expect(runners[0].args).toEqual(['test']);
+    expect(runners[0].cwd).toBe('/tmp/workspace/apps/svc');
+  });
+
+  it('Go at repo ROOT (go.mod) → go test ./... at root', () => {
+    const fs = mockFs;
+    fs.existsSync.mockImplementation((p: string) => p === '/tmp/workspace/go.mod');
+
+    const runners = detectTestRunners(undefined);
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('go');
+    expect(runners[0].args).toEqual(['test', './...']);
+    expect(runners[0].cwd).toBe('/tmp/workspace');
   });
 
   it('src/ as a single package directory (pytest.ini at src/) → python3 -m pytest at src', () => {

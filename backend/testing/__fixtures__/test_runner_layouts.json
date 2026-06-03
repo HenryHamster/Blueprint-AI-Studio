@@ -84,6 +84,79 @@
     "family": "nox"
   },
   {
+    "name": "go_mod_root",
+    "files": [
+      {
+        "path": "go.mod"
+      }
+    ],
+    "detectable": true,
+    "family": "go"
+  },
+  {
+    "name": "gemfile_rakefile_root",
+    "files": [
+      {
+        "path": "Gemfile"
+      },
+      {
+        "path": "Rakefile"
+      }
+    ],
+    "detectable": true,
+    "family": "ruby"
+  },
+  {
+    "name": "build_gradle_root",
+    "files": [
+      {
+        "path": "build.gradle"
+      }
+    ],
+    "detectable": true,
+    "family": "gradle"
+  },
+  {
+    "name": "pom_xml_root",
+    "files": [
+      {
+        "path": "pom.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "maven"
+  },
+  {
+    "name": "mix_exs_root",
+    "files": [
+      {
+        "path": "mix.exs"
+      }
+    ],
+    "detectable": true,
+    "family": "elixir"
+  },
+  {
+    "name": "csproj_root",
+    "files": [
+      {
+        "path": "App.csproj"
+      }
+    ],
+    "detectable": true,
+    "family": "dotnet"
+  },
+  {
+    "name": "phpunit_xml_root",
+    "files": [
+      {
+        "path": "phpunit.xml"
+      }
+    ],
+    "detectable": true,
+    "family": "php"
+  },
+  {
     "name": "empty_repo",
     "files": [],
     "detectable": false,

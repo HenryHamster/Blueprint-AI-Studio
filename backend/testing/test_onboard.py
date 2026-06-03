@@ -69,6 +69,8 @@ def _backend_family_for_directory(directory):
         return "npm"
     if directory_type == "rust":
         return "cargo"
+    if directory_type == "go":
+        return "go"
 
     test_cmd = str(directory.get("test_cmd") or "").strip()
     if test_cmd == "make test":
@@ -77,6 +79,18 @@ def _backend_family_for_directory(directory):
         return "tox"
     if test_cmd == "nox":
         return "nox"
+    if test_cmd == "bundle exec rake test":
+        return "ruby"
+    if test_cmd == "./gradlew test":
+        return "gradle"
+    if test_cmd == "mvn test":
+        return "maven"
+    if test_cmd == "mix test":
+        return "elixir"
+    if test_cmd == "dotnet test":
+        return "dotnet"
+    if test_cmd == "vendor/bin/phpunit":
+        return "php"
     return None
 
 

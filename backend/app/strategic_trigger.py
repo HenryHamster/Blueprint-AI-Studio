@@ -36,12 +36,15 @@ most one per qualification attempt), so even the *setter* is naturally bounded.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from datetime import datetime
 
 from app.models import MessageType
 from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
+from sqlalchemy.exc import OperationalError
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +66,12 @@ ORIGIN_OPERATOR = "operator"
 
 
 async def request_strategic_refresh(
-    session, project_id, reason: str, *, origin: str = ORIGIN_QUALIFICATION
+    session,
+    project_id,
+    reason: str,
+    *,
+    origin: str = ORIGIN_QUALIFICATION,
+    skip_locked: bool = True,
 ) -> None:
     """Coalesced: record that the strategic loop owes a refresh.
 
@@ -85,12 +93,12 @@ async def request_strategic_refresh(
     normal cadence/wall-clock backstop. Does NOT commit — the caller owns the
     transaction (matches the ``with_vision_locked`` contract).
 
-    Uses ``skip_locked=True``: this runs in the post-qualification trigger path
-    (after the finalize session commits) and must NEVER block on the project
-    row lock — a contended project would otherwise stall the trigger for the
-    full lock timeout. If the project is momentarily locked the mark is skipped
-    (a rare race the loop's cadence/empty-frontier backstop still recovers),
-    not waited on.
+    ``skip_locked=True`` preserves the existing post-qualification behavior:
+    the caller never blocks on the project row lock, so a contended project
+    simply skips the mark and the loop's cadence/backstop recovers later.
+    ``skip_locked=False`` is for operator steering: it waits briefly for the
+    row, so a live admin message does not silently drop just because another
+    writer held the lock for a moment.
     """
 
     def _mark(vision: dict) -> None:
@@ -116,10 +124,43 @@ async def request_strategic_refresh(
                 "origin": origin,
             }
 
+    async def _store_locked_refresh() -> bool:
+        for attempt in range(3):
+            try:
+                # Route the vision write through the canonical helper so the
+                # read-modify-write stays serialized under the project row lock
+                # (with_vision_locked owns the FOR UPDATE acquire + write-back).
+                # ``timeout=1.0`` keeps the operator-steering acquire bounded:
+                # a momentarily-contended row raises OperationalError and we
+                # retry rather than stalling on the lock.
+                return await with_vision_locked(
+                    session, project_id, _mark, skip_locked=False, timeout=1.0
+                )
+            except OperationalError:
+                # A bounded blocking acquire can still time out if another
+                # writer holds the row unusually long. Roll back the aborted
+                # statement before retrying so the caller's transaction stays
+                # usable on the next attempt.
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (attempt + 1))
+                else:
+                    logger.exception(
+                        "[STRATEGIC] blocking refresh request for project %s failed",
+                        project_id,
+                    )
+                if attempt == 2:
+                    return False
+        return False
+
     try:
-        marked = await with_vision_locked(
-            session, project_id, _mark, skip_locked=True
-        )
+        if skip_locked:
+            marked = await with_vision_locked(
+                session, project_id, _mark, skip_locked=True
+            )
+        else:
+            marked = await _store_locked_refresh()
         if marked:
             logger.info(
                 "[STRATEGIC] strategic refresh requested for project %s (%s)",
@@ -169,7 +210,11 @@ async def maybe_arm_operator_refresh(
         if event_type in ROUTINE_EVENT_TYPES:
             return False
     await request_strategic_refresh(
-        session, project_id, "operator_message", origin=ORIGIN_OPERATOR
+        session,
+        project_id,
+        "operator_message",
+        origin=ORIGIN_OPERATOR,
+        skip_locked=False,
     )
     return True
 

@@ -9,6 +9,7 @@ Tests for admin routers:
 
 import json
 import uuid
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -2709,20 +2710,40 @@ class TestMessages:
 
         Regression guard for the bug where the canonical MessagesPanel endpoint
         (POST /api/admin/messages) created the message but never armed the
-        operator-origin refresh marker, so live-chat steering didn't wake the
-        strategist (only the CLI-only project-scoped endpoint did).
+        operator-origin refresh marker when the project row was contended, so
+        live-chat steering could silently wait for the next cadence instead of
+        waking the strategist immediately.
         """
         from app.strategic_trigger import strategic_refresh_pending
+        import app.task_locking as task_locking
 
         project = await _make_project(db_session)
-        resp = await client.post(
-            "/api/admin/messages",
-            json={
-                "project_id": str(project.id),
-                "message_type": "FEEDBACK",
-                "content": "Please refocus on the auth bug",
-            },
-        )
+
+        lock_calls: list[tuple[bool, float]] = []
+
+        @asynccontextmanager
+        async def _fake_project_lock(
+            session, project_id, *, skip_locked=True, timeout=30.0
+        ):
+            lock_calls.append((skip_locked, timeout))
+            if skip_locked:
+                yield None
+                return
+            locked_project = await session.get(Project, project_id)
+            assert locked_project is not None
+            yield locked_project
+
+        # The operator path routes its vision write through with_vision_locked(),
+        # which acquires the row via task_locking.project_lock — patch it there.
+        with patch.object(task_locking, "project_lock", _fake_project_lock):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "FEEDBACK",
+                    "content": "Please refocus on the auth bug",
+                },
+            )
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "created"
 
@@ -2734,6 +2755,7 @@ class TestMessages:
         # Operator origin is what activates the breaker-bypass and deferral
         # consumer paths — the whole point of live steering.
         assert marker["origin"] == "operator"
+        assert lock_calls == [(False, 1.0)]
 
     @pytest.mark.asyncio
     async def test_canonical_passive_note_does_not_arm_refresh(

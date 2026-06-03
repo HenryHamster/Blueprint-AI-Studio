@@ -112,6 +112,56 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   // TS doesn't track .push() mutations, so use a Boolean accessor that always reads the
   // current length to avoid spurious "always-true" narrowing on the literal-empty array.
   const noRunners = (): boolean => runners.length === 0;
+
+  // Shared manifest→runner mapping for the test-runner families that diverge
+  // from the core python/node/go/rust set: Ruby, Gradle, Maven, Elixir, .NET,
+  // and PHP. Mirrors the backend onboarding detector
+  // (admin_onboard.py::_detect_fallback_in_listing) byte-for-byte so the no-CI
+  // merge gate runs the SAME command the backend recorded for the repo.
+  // Invoked from BOTH the repo-root detection and the nested
+  // services/apps/packages/src scan so the two sides stay at family parity.
+  // First match wins; CONSERVATIVE — a runner is emitted only when the real
+  // manifest is actually present. Returns null when no recognized extra-family
+  // manifest is found. Defensive against fs errors (treated as "absent").
+  const { existsSync: _exists, readdirSync: _readdir } = fs;
+  const detectExtraFamilyRunner = (absDir: string, label: string): TestRunner | null => {
+    const has = (name: string): boolean => {
+      try { return _exists(`${absDir}/${name}`); } catch { return false; }
+    };
+    // Ruby: Gemfile + Rakefile → `bundle exec rake test`.
+    if (has('Gemfile') && has('Rakefile')) {
+      return { cmd: 'bundle', args: ['exec', 'rake', 'test'], cwd: absDir, label: `bundle exec rake test (${label})` };
+    }
+    // Gradle: build.gradle / build.gradle.kts → `./gradlew test`.
+    if (has('build.gradle') || has('build.gradle.kts')) {
+      return { cmd: './gradlew', args: ['test'], cwd: absDir, label: `./gradlew test (${label})` };
+    }
+    // Maven: pom.xml → `mvn test`.
+    if (has('pom.xml')) {
+      return { cmd: 'mvn', args: ['test'], cwd: absDir, label: `mvn test (${label})` };
+    }
+    // Elixir: mix.exs → `mix test`.
+    if (has('mix.exs')) {
+      return { cmd: 'mix', args: ['test'], cwd: absDir, label: `mix test (${label})` };
+    }
+    // .NET: any *.sln / *.csproj at this dir → `dotnet test`. The project file
+    // name is arbitrary, so glob the directory listing (name-based, like the
+    // backend's `n.endswith('.sln') or n.endswith('.csproj')`).
+    let dotnetEntries: string[] = [];
+    try {
+      const entries = _readdir(absDir) as unknown as string[];
+      if (Array.isArray(entries)) dotnetEntries = entries;
+    } catch { /* unreadable — skip */ }
+    if (dotnetEntries.some(n => typeof n === 'string' && (n.endsWith('.sln') || n.endsWith('.csproj')))) {
+      return { cmd: 'dotnet', args: ['test'], cwd: absDir, label: `dotnet test (${label})` };
+    }
+    // PHP: phpunit.xml / phpunit.xml.dist → `vendor/bin/phpunit`.
+    if (has('phpunit.xml') || has('phpunit.xml.dist')) {
+      return { cmd: 'vendor/bin/phpunit', args: [], cwd: absDir, label: `vendor/bin/phpunit (${label})` };
+    }
+    return null;
+  };
+
   if (noRunners()) {
     const pkgPath = `${WORKSPACE}/package.json`;
     const pytestIniPath = `${WORKSPACE}/pytest.ini`;
@@ -141,6 +191,22 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
 
     if (noRunners() && existsSync(cargoPath)) {
       runners.push({ cmd: 'cargo', args: ['test'], cwd: WORKSPACE, label: 'cargo test (root)' });
+    }
+
+    // Go at repo root: go.mod → `go test ./...`. Mirrors the backend core
+    // detector, which recognizes go.mod at the repository root (the agent's
+    // nested scan already covered go.mod, but root-level Go was missing).
+    if (noRunners() && existsSync(`${WORKSPACE}/go.mod`)) {
+      runners.push({ cmd: 'go', args: ['test', './...'], cwd: WORKSPACE, label: 'go test (root)' });
+    }
+
+    // Additional divergent families at repo root (Ruby/Gradle/Maven/Elixir/
+    // .NET/PHP). Brings the agent runtime detector to family parity with the
+    // backend onboarding detector so a standard repo in one of these ecosystems
+    // runs its REAL suite instead of falling through to an UNVERIFIED merge.
+    if (noRunners()) {
+      const rootExtra = detectExtraFamilyRunner(WORKSPACE, 'root');
+      if (rootExtra) runners.push(rootExtra);
     }
 
     // --- Subdirectory detection (only if no root-level runner found) ---
@@ -247,6 +313,13 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
           // Rust: Cargo.toml → `cargo test`.
           if (existsSync(`${abs}/Cargo.toml`)) {
             runners.push({ cmd: 'cargo', args: ['test'], cwd: abs, label: `cargo test (${relPath})` });
+            return;
+          }
+          // Divergent families (Ruby/Gradle/Maven/Elixir/.NET/PHP) — shared
+          // mapping with the root detection above and the backend detector.
+          const extra = detectExtraFamilyRunner(abs, relPath);
+          if (extra) {
+            runners.push(extra);
             return;
           }
         } catch { /* defensive: any fs error — skip this package */ }
