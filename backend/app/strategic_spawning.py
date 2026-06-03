@@ -233,6 +233,36 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
     }
 
 
+def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
+    """Render a fleet-utilization snapshot as a compact axis ``current`` string.
+
+    Returns None when capacity is unknown (no enabled, capped accounts) so the
+    axis is omitted rather than shipping a meaningless row. The cooled-account
+    breakdown is appended only when accounts are actually cooled, keeping the
+    common (healthy) case terse — the cause of low utilization (idle headroom
+    vs rate-limit cooldown) is what would otherwise mislead the strategist into
+    manufacturing work.
+    """
+    if not fleet:
+        return None
+    cap = fleet.get("nominal_capacity")
+    if not cap:
+        return None
+    active = fleet.get("active_now", 0)
+    util_now = fleet.get("util_now")
+    util_avg = fleet.get("util_avg")
+    window = fleet.get("window_hours", 24)
+    now_pct = f"{round(util_now * 100)}%" if util_now is not None else "n/a"
+    line = f"now {active}/{cap} ({now_pct})"
+    if util_avg is not None:
+        line += f", {window}h-avg {round(util_avg * 100)}%"
+    cooled = fleet.get("cooled_accounts") or 0
+    usable = fleet.get("usable_capacity")
+    if cooled and usable is not None and usable != cap:
+        line += f" — {cooled} acct cooled, {usable} usable"
+    return line
+
+
 _VERSION_PHASE_RECENT_VERSIONS_CAP = 3
 
 
@@ -2166,6 +2196,30 @@ async def _spawn_strategic_review(
             _efficiency_snapshot = _summarize_efficiency_snapshot(_raw_snapshot)
     except Exception:
         logger.exception("[STRATEGIC] efficiency snapshot fetch failed; continuing")
+
+    # Fleet slot utilization — a GLOBAL, real-time signal injected as an extra
+    # axis into the efficiency table the strategist already renders. Unlike the
+    # per-project daily axes above, it is computed fresh each cycle from the
+    # shared max-plan account pool, so it ships even before any per-project
+    # efficiency baseline exists. The active count is DB-derived (not the in-
+    # memory active_tasks counter, which can leak and read high), so genuine
+    # idle headroom is never masked.
+    try:
+        from app.fleet_utilization import get_fleet_utilization_snapshot
+
+        _fleet_line = _format_fleet_utilization_axis(
+            await get_fleet_utilization_snapshot(session)
+        )
+        if _fleet_line is not None:
+            if _efficiency_snapshot is None:
+                _efficiency_snapshot = {"axes": {}}
+            _efficiency_snapshot.setdefault("axes", {})["fleet_utilization"] = {
+                "current": _fleet_line,
+                "baseline": None,
+                "drift_pct": None,
+            }
+    except Exception:
+        logger.exception("[STRATEGIC] fleet utilization snapshot failed; continuing")
     # Held-directions block — directions that hit the consecutive-failure hold
     # threshold (3 consecutive CODE_ERROR failures; see
     # shared_state.record_direction_result). Surfaces the held flag, the

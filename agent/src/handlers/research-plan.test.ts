@@ -1367,6 +1367,32 @@ describe('buildEfficiencySnapshotSection', () => {
     const result = buildEfficiencySnapshotSection(snapshot);
     expect(result).toContain('+20.0%');
   });
+
+  it('renders the injected fleet_utilization axis (string current) with its interpretation note', () => {
+    const snapshot = {
+      axes: {
+        fleet_utilization: {
+          current: 'now 6/15 (40%), 24h-avg 38%',
+          baseline: null,
+          drift_pct: null,
+        },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Fleet slot utilization');
+    expect(result).toContain('now 6/15 (40%), 24h-avg 38%');
+    // Interpretation note is appended only when the fleet axis is present.
+    expect(result).toContain('throughput is being left on the table');
+    expect(result).toContain('distinguish idle headroom from cooled accounts');
+  });
+
+  it('omits the fleet interpretation note when no fleet_utilization axis is present', () => {
+    const snapshot = {
+      axes: { cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 } },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).not.toContain('throughput is being left on the table');
+  });
 });
 
 describe('Strategic executor set-retirement-critiques verification', () => {
