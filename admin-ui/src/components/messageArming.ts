@@ -4,17 +4,21 @@
  * Single source of truth shared by the MessagesPanel (post-send toast) and the
  * MessagesComposer (steering hint), mirroring the backend strategic_trigger
  * ARMING_* constants. `steering` armed the strategist; `passive_note` and
- * `routine_event` were recorded but do not wake it. Kept in its own module (not
+ * `routine_event` were recorded but do not wake it. `not_armed` is a genuine
+ * steering message the server tried to arm but could NOT persist (the project
+ * row was momentarily contended), so the strategist was NOT woken — surfaced
+ * truthfully instead of a false `steering` promise. Kept in its own module (not
  * the component file) so these helpers can be exported without tripping
  * react-refresh's only-export-components rule.
  */
-export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event';
+export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed';
 
 // Outcome → composer hint copy.
 const ARMING_HINT: Record<ArmingOutcome, string> = {
   steering: 'Steering message — reaches the strategist soon.',
   passive_note: 'Recorded as a note — won’t wake the strategist.',
   routine_event: 'Routine event — won’t wake the strategist.',
+  not_armed: 'Couldn’t wake the strategist — try resending in a moment.',
 };
 
 // Outcome → post-send toast copy.
@@ -22,6 +26,7 @@ const ARMING_TOAST: Record<ArmingOutcome, string> = {
   steering: 'Message sent — steering the strategist',
   passive_note: 'Note recorded — won’t wake the strategist',
   routine_event: 'Recorded — routine event, won’t wake the strategist',
+  not_armed: 'Message saved, but the strategist wasn’t woken — try resending',
 };
 
 /** Composer hint copy for a given (real or predicted) arming outcome. */
@@ -45,7 +50,10 @@ export function predictArming(newType: string): ArmingOutcome {
 
 /** Narrow an unknown response field to a valid ArmingOutcome, else null. */
 export function parseArmingOutcome(value: unknown): ArmingOutcome | null {
-  return value === 'steering' || value === 'passive_note' || value === 'routine_event'
+  return value === 'steering' ||
+    value === 'passive_note' ||
+    value === 'routine_event' ||
+    value === 'not_armed'
     ? value
     : null;
 }

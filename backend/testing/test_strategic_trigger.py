@@ -333,3 +333,232 @@ async def test_operator_origin_upgrades_existing_qualification(db_session):
     await db_session.refresh(project)
     assert st.strategic_refresh_origin(project.vision) == st.ORIGIN_OPERATOR
     assert st.refresh_breaker_applies(project.vision) is False
+
+
+# ===========================================================================
+# Steering excerpt persistence (operator message text on the marker)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_request_persists_operator_steering_excerpt(db_session):
+    """An operator request stores the message text on the marker so the steering
+    directive survives the volatile recent-messages snapshot aging out."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session,
+        project.id,
+        "operator_message",
+        origin=st.ORIGIN_OPERATOR,
+        steering_excerpt="Pivot toward billing reliability.",
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert (
+        st.strategic_refresh_excerpt(project.vision)
+        == "Pivot toward billing reliability."
+    )
+
+
+@pytest.mark.asyncio
+async def test_excerpt_truncated_to_max_chars(db_session):
+    """A long excerpt is truncated to the per-message budget on the marker."""
+    project = await _make_project(db_session)
+    long_text = "z" * 2000
+    await st.request_strategic_refresh(
+        db_session,
+        project.id,
+        "operator_message",
+        origin=st.ORIGIN_OPERATOR,
+        steering_excerpt=long_text,
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    stored = st.strategic_refresh_excerpt(project.vision)
+    assert stored is not None
+    assert len(stored) == st._STEERING_EXCERPT_MAX_CHARS
+
+
+@pytest.mark.asyncio
+async def test_coalesce_replaces_excerpt_with_newer(db_session):
+    """The most recent operator message wins: a newer excerpt replaces the older
+    one when two operator messages arm in quick succession."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session,
+        project.id,
+        "operator_message",
+        origin=st.ORIGIN_OPERATOR,
+        steering_excerpt="First steering message.",
+    )
+    await db_session.commit()
+    await st.request_strategic_refresh(
+        db_session,
+        project.id,
+        "operator_message",
+        origin=st.ORIGIN_OPERATOR,
+        steering_excerpt="Second, newer steering message.",
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert (
+        st.strategic_refresh_excerpt(project.vision)
+        == "Second, newer steering message."
+    )
+
+
+@pytest.mark.asyncio
+async def test_qualification_origin_stores_no_excerpt(db_session):
+    """A non-operator (qualification) refresh never stores a steering excerpt,
+    even if one is somehow supplied."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session,
+        project.id,
+        "post_qualification:promoted",
+        steering_excerpt="should be ignored",
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert st.strategic_refresh_excerpt(project.vision) is None
+    assert "excerpt" not in project.vision["_strategic_refresh"]
+
+
+@pytest.mark.asyncio
+async def test_automated_coalesce_preserves_operator_excerpt(db_session):
+    """A coalescing automated refresh (no excerpt) leaves an operator excerpt
+    already present on the sticky-operator marker untouched."""
+    project = await _make_project(db_session)
+    await st.request_strategic_refresh(
+        db_session,
+        project.id,
+        "operator_message",
+        origin=st.ORIGIN_OPERATOR,
+        steering_excerpt="Operator steering intent.",
+    )
+    await db_session.commit()
+    # A later automated refresh coalesces in with no excerpt.
+    await st.request_strategic_refresh(
+        db_session, project.id, "post_qualification:promoted"
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert (
+        st.strategic_refresh_excerpt(project.vision) == "Operator steering intent."
+    )
+
+
+@pytest.mark.asyncio
+async def test_maybe_arm_operator_refresh_passes_message_content(db_session):
+    """maybe_arm_operator_refresh forwards the message text as the steering
+    excerpt for genuine steering messages."""
+    from app.models import MessageType
+
+    project = await _make_project(db_session)
+    armed = await st.maybe_arm_operator_refresh(
+        db_session,
+        project.id,
+        MessageType.FEEDBACK,
+        message_content="Operator: prioritize the billing fix.",
+    )
+    assert armed == st.ARMING_STEERING
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert (
+        st.strategic_refresh_excerpt(project.vision)
+        == "Operator: prioritize the billing fix."
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_returns_true_on_persist(db_session):
+    """request_strategic_refresh reports True when the marker was actually
+    written — the signal callers surface as a truthful operator receipt."""
+    project = await _make_project(db_session)
+    persisted = await st.request_strategic_refresh(
+        db_session, project.id, "post_qualification:promoted"
+    )
+    assert persisted is True
+    await db_session.commit()
+    await db_session.refresh(project)
+    assert st.strategic_refresh_pending(project.vision) is True
+
+
+@pytest.mark.asyncio
+async def test_request_returns_false_when_lock_exhausted(db_session):
+    """When the operator-steering (skip_locked=False) acquire never persists the
+    marker — every with_vision_locked attempt returns False (row contended) —
+    request_strategic_refresh reports False and writes no marker."""
+    project = await _make_project(db_session)
+    with patch(
+        "app.strategic_trigger.with_vision_locked",
+        new=AsyncMock(return_value=False),
+    ):
+        persisted = await st.request_strategic_refresh(
+            db_session,
+            project.id,
+            "operator_message",
+            origin=st.ORIGIN_OPERATOR,
+            skip_locked=False,
+        )
+    assert persisted is False
+    await db_session.refresh(project)
+    assert st.strategic_refresh_pending(project.vision) is False
+
+
+@pytest.mark.asyncio
+async def test_maybe_arm_returns_not_armed_when_request_fails(db_session):
+    """A genuine steering message whose marker cannot be persisted yields the
+    truthful ARMING_NOT_ARMED outcome — never a false ARMING_STEERING promise."""
+    from app.models import MessageType
+
+    project = await _make_project(db_session)
+    with patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=False),
+    ):
+        outcome = await st.maybe_arm_operator_refresh(
+            db_session,
+            project.id,
+            MessageType.FEEDBACK,
+            message_content="Operator: wake up.",
+        )
+    assert outcome == st.ARMING_NOT_ARMED
+
+
+@pytest.mark.asyncio
+async def test_maybe_arm_returns_steering_when_request_succeeds(db_session):
+    """A genuine steering message whose marker IS persisted yields
+    ARMING_STEERING (the request_strategic_refresh return is threaded through)."""
+    from app.models import MessageType
+
+    project = await _make_project(db_session)
+    with patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    ):
+        outcome = await st.maybe_arm_operator_refresh(
+            db_session,
+            project.id,
+            MessageType.FEEDBACK,
+            message_content="Operator: wake up.",
+        )
+    assert outcome == st.ARMING_STEERING
+
+
+@pytest.mark.asyncio
+async def test_maybe_arm_returns_passive_note_without_requesting(db_session):
+    """A passive NOTE returns its classification verbatim and never calls
+    request_strategic_refresh (no wake attempt for a non-steering message)."""
+    from app.models import MessageType
+
+    project = await _make_project(db_session)
+    with patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=True),
+    ) as req:
+        outcome = await st.maybe_arm_operator_refresh(
+            db_session, project.id, MessageType.NOTE, message_content="fyi"
+        )
+    assert outcome == st.ARMING_PASSIVE_NOTE
+    req.assert_not_awaited()

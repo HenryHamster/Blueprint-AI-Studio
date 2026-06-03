@@ -529,20 +529,23 @@ async def create_message(
     # so the two paths cannot diverge again. Best-effort: the helper does not
     # commit (we own the txn) and swallows its own errors, so message creation
     # never fails on it; the second commit persists the marker independently.
-    from app.strategic_trigger import (
-        classify_operator_arming,
-        maybe_arm_operator_refresh,
-    )
+    from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
 
-    # Classify first so the response can report the *actual* wake decision the
-    # operator's message triggered (steering / passive note / routine event).
-    # maybe_arm_operator_refresh derives its arm/no-arm choice from the same
-    # classifier, so the surfaced ``arming`` value always matches what arming
-    # actually did. Additive field — existing ``id``/``status`` are unchanged.
-    arming = classify_operator_arming(MessageType(msg_type), event_type=event_type)
-    if await maybe_arm_operator_refresh(
-        session, project_id, MessageType(msg_type), event_type=event_type
-    ):
+    # The shared gate returns the *truthful* arming outcome — the actual wake
+    # decision for this message (steering / passive note / routine event), or
+    # ``not_armed`` when a genuine steering message could NOT persist its marker
+    # because the project row was momentarily contended. We surface that string
+    # verbatim and commit only when the marker was really armed, so the operator
+    # is never told their message reached the strategist when it did not.
+    # Additive ``arming`` field — existing ``id``/``status`` are unchanged.
+    arming = await maybe_arm_operator_refresh(
+        session,
+        project_id,
+        MessageType(msg_type),
+        event_type=event_type,
+        message_content=content,
+    )
+    if arming == ARMING_STEERING:
         await session.commit()
     return {"id": str(msg.id), "status": "created", "arming": arming}
 

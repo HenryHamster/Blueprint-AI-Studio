@@ -7661,6 +7661,9 @@ async def test_operator_message_arms_strategic_refresh(
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "created"
+    # The CLI endpoint reports the truthful arming outcome identically to the
+    # canonical live-chat endpoint, so the two paths cannot diverge.
+    assert resp.json()["arming"] == "steering"
 
     vision = await _reload_vision(db_session, project_id)
     assert strategic_refresh_pending(vision) is True
@@ -7687,6 +7690,34 @@ async def test_passive_note_does_not_arm_strategic_refresh(
         json={"content": "FYI, just a note", "message_type": "NOTE"},
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["arming"] == "passive_note"
+
+    vision = await _reload_vision(db_session, project_id)
+    assert strategic_refresh_pending(vision) is False
+
+
+@pytest.mark.asyncio
+async def test_operator_message_arm_failure_reports_not_armed(
+    client: AsyncClient, db_session, mocker
+):
+    """Parity with the canonical endpoint: when a genuine steering message
+    cannot persist its wake marker (contended row exhausts the bounded acquire),
+    the CLI endpoint surfaces the truthful ``not_armed`` outcome and arms no
+    marker — never a false ``steering`` promise."""
+    from app.strategic_trigger import strategic_refresh_pending
+
+    project_id = await _deploy_project(client, mocker)
+    mocker.patch(
+        "app.strategic_trigger.request_strategic_refresh",
+        new=AsyncMock(return_value=False),
+    )
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={"content": "Please refocus on the auth bug", "message_type": "FEEDBACK"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "created"
+    assert resp.json()["arming"] == "not_armed"
 
     vision = await _reload_vision(db_session, project_id)
     assert strategic_refresh_pending(vision) is False

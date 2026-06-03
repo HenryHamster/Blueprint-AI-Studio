@@ -55,6 +55,11 @@ _LAST_FIRED_KEY = "_strategic_refresh_last_fired_at"
 
 DEFAULT_MIN_INTERVAL_SECONDS = 120
 
+# Per-message operator steering excerpt budget persisted on the refresh marker.
+# Mirrors strategic_spawning._OPERATOR_STEERING_QUOTE_MAX_CHARS so the directive
+# built from the marker fallback matches the directive built from the live thread.
+_STEERING_EXCERPT_MAX_CHARS = 600
+
 # Marker origins. ``qualification`` is the original automated trigger (a
 # resolved qualification verdict); ``operator`` is an explicit human steering
 # request routed through the live-chat foundation. Operator intent outranks the
@@ -72,10 +77,17 @@ ORIGIN_OPERATOR = "operator"
 #                          the strategist);
 #   * ``passive_note``   — a passive ``NOTE``, recorded but never wakes;
 #   * ``routine_event``  — a system/routine digest event, never wakes even
-#                          though its type is non-passive.
+#                          though its type is non-passive;
+#   * ``not_armed``      — a genuine steering message that the wake-gate tried
+#                          to arm but COULD NOT persist (the bounded project-row
+#                          lock acquire was exhausted under contention), so no
+#                          marker was written and the strategist will NOT be
+#                          woken by this message. Surfaced truthfully instead of
+#                          a false ``steering`` promise.
 ARMING_STEERING = "steering"
 ARMING_PASSIVE_NOTE = "passive_note"
 ARMING_ROUTINE_EVENT = "routine_event"
+ARMING_NOT_ARMED = "not_armed"
 
 
 def classify_operator_arming(
@@ -83,11 +95,13 @@ def classify_operator_arming(
 ) -> str:
     """Pure classifier: what will/did an operator message do to the strategist?
 
-    Single source of truth for the wake decision, shared by
-    ``maybe_arm_operator_refresh`` (which arms only on ``ARMING_STEERING``) and
-    the message-create endpoint (which echoes the outcome back to the operator).
-    Keeping both on this one function guarantees the surfaced outcome always
-    matches what arming actually did.
+    Single source of truth for the *wake intent*, shared by
+    ``maybe_arm_operator_refresh`` (which arms only on ``ARMING_STEERING``) and,
+    through it, the message-create endpoints. This decides whether a message
+    *should* wake the strategist; whether the wake was actually persisted is
+    determined downstream — ``maybe_arm_operator_refresh`` downgrades a steering
+    verdict to ``ARMING_NOT_ARMED`` when the marker could not be written — so the
+    operator-facing outcome reflects what arming *actually did*, not just intent.
 
     Returns one of ``ARMING_PASSIVE_NOTE`` (a ``NOTE``), ``ARMING_ROUTINE_EVENT``
     (a non-passive type carrying a system/routine digest ``event_type``), or
@@ -111,8 +125,9 @@ async def request_strategic_refresh(
     reason: str,
     *,
     origin: str = ORIGIN_QUALIFICATION,
+    steering_excerpt: str | None = None,
     skip_locked: bool = True,
-) -> None:
+) -> bool:
     """Coalesced: record that the strategic loop owes a refresh.
 
     Single-slot — repeated calls collapse into ONE pending marker (it cannot
@@ -133,13 +148,32 @@ async def request_strategic_refresh(
     normal cadence/wall-clock backstop. Does NOT commit — the caller owns the
     transaction (matches the ``with_vision_locked`` contract).
 
+    Returns ``True`` when the marker was actually persisted (the project-row
+    lock was acquired and ``_mark`` ran), ``False`` when it was not — the
+    ``skip_locked`` acquire found the row contended, the bounded blocking
+    acquire was exhausted after its retries, or an unexpected error was
+    swallowed. Callers that surface an operator-facing receipt MUST honor this
+    so a momentarily-contended project is not falsely reported as armed.
+
     ``skip_locked=True`` preserves the existing post-qualification behavior:
     the caller never blocks on the project row lock, so a contended project
     simply skips the mark and the loop's cadence/backstop recovers later.
     ``skip_locked=False`` is for operator steering: it waits briefly for the
     row, so a live admin message does not silently drop just because another
     writer held the lock for a moment.
+
+    ``steering_excerpt`` is the operator's message text, persisted on the marker
+    (truncated to ``_STEERING_EXCERPT_MAX_CHARS``) ONLY for operator-origin
+    requests. Storing it durably here lets the strategist rebuild the steering
+    directive at spawn time even after the operator message has aged out of the
+    volatile recent-messages snapshot. On coalesce, a newer excerpt replaces the
+    older one — the most recent operator message is the active steering intent.
     """
+    _excerpt = (
+        steering_excerpt[:_STEERING_EXCERPT_MAX_CHARS]
+        if origin == ORIGIN_OPERATOR and steering_excerpt
+        else None
+    )
 
     def _mark(vision: dict) -> None:
         existing = vision.get(_REFRESH_KEY)
@@ -155,14 +189,22 @@ async def request_strategic_refresh(
                 existing["origin"] = ORIGIN_OPERATOR
             else:
                 existing["origin"] = origin
+            # Most-recent operator message wins: replace the stored excerpt when
+            # a newer one is supplied. A coalescing automated refresh (no
+            # excerpt) leaves any operator excerpt already present untouched.
+            if _excerpt is not None:
+                existing["excerpt"] = _excerpt
             existing.pop("notified", None)
         else:
-            vision[_REFRESH_KEY] = {
+            marker = {
                 "requested_at": _utcnow().isoformat(),
                 "reason": reason,
                 "count": 1,
                 "origin": origin,
             }
+            if _excerpt is not None:
+                marker["excerpt"] = _excerpt
+            vision[_REFRESH_KEY] = marker
 
     async def _store_locked_refresh() -> bool:
         for attempt in range(3):
@@ -213,15 +255,22 @@ async def request_strategic_refresh(
                 "project momentarily locked (best-effort; loop backstop recovers)",
                 project_id,
             )
+        return bool(marked)
     except Exception:
         logger.exception(
             "[STRATEGIC] request_strategic_refresh failed for project %s", project_id
         )
+        return False
 
 
 async def maybe_arm_operator_refresh(
-    session, project_id, message_type: MessageType, *, event_type: str | None = None
-) -> bool:
+    session,
+    project_id,
+    message_type: MessageType,
+    *,
+    event_type: str | None = None,
+    message_content: str | None = None,
+) -> str:
     """Shared 'should this operator message wake the strategist, and arm it' gate.
 
     Both operator message-creation endpoints route their wake decision through
@@ -237,23 +286,41 @@ async def maybe_arm_operator_refresh(
 
     Best-effort and coalescing: delegates to ``request_strategic_refresh``, which
     swallows its own errors and does NOT commit (the caller owns the txn), so
-    arming can never make message creation fail. Returns True when arming was
-    requested.
+    arming can never make message creation fail.
+
+    Returns the *truthful* arming outcome string — the SINGLE value both
+    endpoints surface to the operator, so a momentarily-contended project that
+    fails to persist the marker is never reported as a successful steer:
+
+      * the ``classify_operator_arming`` verdict (``passive_note`` /
+        ``routine_event``) for a message that was never meant to wake;
+      * ``ARMING_STEERING`` for a genuine steering message whose marker WAS
+        persisted (``request_strategic_refresh`` returned ``True``);
+      * ``ARMING_NOT_ARMED`` for a genuine steering message whose marker could
+        NOT be persisted (the bounded lock acquire was exhausted) — the wake
+        did not happen, so the operator is told so rather than promised a steer.
 
     The wake decision itself is derived from ``classify_operator_arming`` so this
     helper and the operator-facing outcome surfaced by the message-create
     endpoint can never diverge.
+
+    ``message_content`` is the operator's message text. It is persisted on the
+    refresh marker (as the steering excerpt) so the steering directive survives
+    the operator message aging out of the volatile recent-messages snapshot
+    before the deferred strategic cycle reaches its review phase.
     """
-    if classify_operator_arming(message_type, event_type=event_type) != ARMING_STEERING:
-        return False
-    await request_strategic_refresh(
+    outcome = classify_operator_arming(message_type, event_type=event_type)
+    if outcome != ARMING_STEERING:
+        return outcome
+    persisted = await request_strategic_refresh(
         session,
         project_id,
         "operator_message",
         origin=ORIGIN_OPERATOR,
+        steering_excerpt=message_content,
         skip_locked=False,
     )
-    return True
+    return ARMING_STEERING if persisted else ARMING_NOT_ARMED
 
 
 def strategic_refresh_pending(vision: dict | None) -> bool:
@@ -272,6 +339,22 @@ def strategic_refresh_origin(vision: dict | None) -> str | None:
     if not isinstance(marker, dict):
         return None
     return marker.get("origin") or ORIGIN_QUALIFICATION
+
+
+def strategic_refresh_excerpt(vision: dict | None) -> str | None:
+    """Operator steering excerpt persisted on the pending refresh marker, if any.
+
+    Captured at arm time (``maybe_arm_operator_refresh``) so the steering
+    directive can be rebuilt at spawn time even after the operator message has
+    aged out of the volatile recent-messages snapshot. Only operator-origin
+    markers carry an excerpt; returns ``None`` when no marker is set, the marker
+    is automated, or no message text was preserved.
+    """
+    marker = (vision or {}).get(_REFRESH_KEY)
+    if not isinstance(marker, dict):
+        return None
+    excerpt = marker.get("excerpt")
+    return excerpt if isinstance(excerpt, str) and excerpt else None
 
 
 def refresh_breaker_applies(vision: dict | None) -> bool:

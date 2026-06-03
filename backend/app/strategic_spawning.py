@@ -39,6 +39,7 @@ from app.strategic_trigger import (
     ARMING_STEERING,
     ORIGIN_OPERATOR,
     classify_operator_arming,
+    strategic_refresh_excerpt,
     strategic_refresh_origin,
 )
 import app.shared_state as _shared_state
@@ -658,7 +659,9 @@ _OPERATOR_STEERING_QUOTE_MAX_CHARS = 600
 _OPERATOR_STEERING_QUOTE_COUNT = 2
 
 
-def _build_operator_steering_directive(conversation_thread: list) -> str | None:
+def _build_operator_steering_directive(
+    conversation_thread: list, *, fallback_excerpt: str | None = None
+) -> str | None:
     """High-priority steering directive for an operator-woken strategic cycle.
 
     When a strategic cycle is spawned *because* an operator-origin
@@ -671,9 +674,14 @@ def _build_operator_steering_directive(conversation_thread: list) -> str | None:
     meant — and frames them as the reason this cycle exists, so the strategist
     treats them as a priority directive rather than one of N messages.
 
-    Returns ``None`` when the thread snapshot carries no qualifying operator
-    steering message (e.g. it was trimmed out under budget pressure), in which
-    case the caller appends no steering framing.
+    ``fallback_excerpt`` is the operator message text persisted on the refresh
+    marker at arm time. When the live thread snapshot carries no qualifying
+    operator steering message (e.g. it aged out of the recent-messages window
+    before the deferred cycle reached its review phase), the directive is
+    synthesized from this durable excerpt instead — so an operator wake never
+    silently loses its steering. Returns ``None`` only when neither the thread
+    nor the fallback yields any steering text, in which case the caller appends
+    no steering framing.
     """
     steering_msgs = []
     for m in conversation_thread:
@@ -694,8 +702,6 @@ def _build_operator_steering_directive(conversation_thread: list) -> str | None:
             # dropping a potential directive.
             pass
         steering_msgs.append(m)
-    if not steering_msgs:
-        return None
     # conversation_thread is chronological (oldest→newest); the steering
     # message(s) that woke this cycle are the most recent, so quote the tail.
     quoted = []
@@ -706,6 +712,15 @@ def _build_operator_steering_directive(conversation_thread: list) -> str | None:
         if len(content) > _OPERATOR_STEERING_QUOTE_MAX_CHARS:
             content = content[:_OPERATOR_STEERING_QUOTE_MAX_CHARS] + "…"
         quoted.append(f"  > {content}")
+    # Thread-aging fallback: the live snapshot yielded no operator message, but
+    # the excerpt was durably persisted on the refresh marker at arm time. Build
+    # the directive from it using the same truncation/framing as a found message.
+    if not quoted and fallback_excerpt:
+        content = fallback_excerpt.strip()
+        if content:
+            if len(content) > _OPERATOR_STEERING_QUOTE_MAX_CHARS:
+                content = content[:_OPERATOR_STEERING_QUOTE_MAX_CHARS] + "…"
+            quoted.append(f"  > {content}")
     if not quoted:
         return None
     return (
@@ -1869,6 +1884,12 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     task_context: dict = {"strategic_cycle_id": cycle_id}
     if operator_steered:
         task_context["operator_steered"] = True
+        # Persist the operator steering excerpt alongside the flag: the marker is
+        # consumed when this Phase 1 spawn is recorded, so Phase 2 must carry the
+        # text forward (the live thread snapshot may age it out before then).
+        steering_excerpt = strategic_refresh_excerpt(project.vision)
+        if steering_excerpt:
+            task_context["steering_excerpt"] = steering_excerpt
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -1913,6 +1934,7 @@ async def _spawn_strategic_review(
     session: AsyncSession,
     cycle_id: str | None = None,
     operator_steered: bool = False,
+    steering_excerpt: str | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -1928,6 +1950,14 @@ async def _spawn_strategic_review(
     steering directive would otherwise be dropped (~1/3 of operator wakes land
     on an architecture cycle). The caller threads the flag through the
     design_doc task context so the directive still reaches the strategist.
+
+    ``steering_excerpt`` is the operator's message text, threaded forward on the
+    architecture-cycle Phase 2 path (where the marker — and its persisted
+    excerpt — was already consumed at Phase 1 spawn). On the strategy-only path
+    it is ``None`` and the excerpt is read directly from the still-armed marker.
+    Either way it feeds ``_build_operator_steering_directive`` as the durable
+    fallback so the directive survives the operator message aging out of the
+    volatile conversation-thread snapshot.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -2974,7 +3004,16 @@ async def _spawn_strategic_review(
     #     to keep the directive alive across the Phase 1 → Phase 2 chain.
     # Read-only on the marker; scheduled/qualification cycles never reach this.
     if operator_steered or strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR:
-        _steering_directive = _build_operator_steering_directive(conversation_thread)
+        # Durable fallback excerpt: the threaded Phase 2 value (architecture
+        # cycle, marker already consumed) takes precedence; otherwise read it
+        # from the still-armed marker (strategy-only cycle). This keeps the
+        # directive alive when the operator message has aged out of the thread.
+        _fallback_excerpt = steering_excerpt or strategic_refresh_excerpt(
+            project.vision
+        )
+        _steering_directive = _build_operator_steering_directive(
+            conversation_thread, fallback_excerpt=_fallback_excerpt
+        )
         if _steering_directive:
             prompt_suffix = (
                 f"{_steering_directive}\n{prompt_suffix}"

@@ -1056,12 +1056,21 @@ async def create_message(
     # and coalescing: the helper does not commit (we own the txn), swallows its
     # own errors so message creation never fails on it, and the min-interval
     # floor + failure breaker keep a burst of messages from storming spawns.
-    from app.strategic_trigger import maybe_arm_operator_refresh
+    #
+    # The gate returns the truthful arming outcome (steering / passive note /
+    # routine event, or ``not_armed`` when a genuine steering message could not
+    # persist its marker under row contention). Surfaced verbatim and committed
+    # only on a real arm, identically to admin_notifications.create_message, so
+    # the two endpoints cannot diverge.
+    from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
 
-    if await maybe_arm_operator_refresh(session, project.id, msg_type):
+    arming = await maybe_arm_operator_refresh(
+        session, project.id, msg_type, message_content=payload.content.strip()
+    )
+    if arming == ARMING_STEERING:
         await session.commit()
 
-    return {"id": str(msg.id), "status": "created"}
+    return {"id": str(msg.id), "status": "created", "arming": arming}
 
 
 @router.get("/projects/{project_id}/messages")

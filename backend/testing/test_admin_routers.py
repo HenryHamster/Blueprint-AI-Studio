@@ -2758,6 +2758,10 @@ class TestMessages:
         # Operator origin is what activates the breaker-bypass and deferral
         # consumer paths — the whole point of live steering.
         assert marker["origin"] == "operator"
+        # The message text is persisted on the marker so the steering directive
+        # survives the recent-messages snapshot aging out before the deferred
+        # cycle reaches its review phase.
+        assert marker["excerpt"] == "Please refocus on the auth bug"
         assert lock_calls == [(False, 1.0)]
 
     @pytest.mark.asyncio
@@ -2803,6 +2807,42 @@ class TestMessages:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["arming"] == "routine_event"
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is False
+
+    @pytest.mark.asyncio
+    async def test_canonical_message_arm_failure_reports_not_armed(
+        self, client: AsyncClient, db_session
+    ):
+        """When a genuine steering message cannot persist its wake marker (the
+        bounded project-row acquire is exhausted under contention), the endpoint
+        must surface the truthful ``not_armed`` outcome — never a false
+        ``steering`` promise — and write no marker. Regression guard for the
+        false operator receipt this task fixes.
+        """
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+
+        # Simulate the contended-row path: request_strategic_refresh exhausts its
+        # bounded lock acquire and persists nothing (returns False).
+        with patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(return_value=False),
+        ):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": "FEEDBACK",
+                    "content": "Please refocus on the auth bug",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        # Message still saved, but the receipt is truthful about the failed wake.
+        assert resp.json()["status"] == "created"
+        assert resp.json()["arming"] == "not_armed"
 
         vision = await self._reload_vision(db_session, project.id)
         assert strategic_refresh_pending(vision) is False

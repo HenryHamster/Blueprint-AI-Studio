@@ -2064,6 +2064,11 @@ async def _handle_design_doc_completion(
     # context at spawn time — thread it into Phase 2 so the operator steering
     # directive still reaches the strategist.
     operator_steered = bool((task.context or {}).get("operator_steered"))
+    # The operator steering text was persisted on the Phase 1 task context (the
+    # refresh marker — and its excerpt — was consumed at Phase 1 spawn). Thread
+    # it into Phase 2 so the steering directive survives even when the operator
+    # message has aged out of the live conversation-thread snapshot.
+    steering_excerpt = (task.context or {}).get("steering_excerpt")
     spawned = None
     try:
         # Wave F4 H9: removed `await session.refresh(project)`. The caller
@@ -2073,7 +2078,11 @@ async def _handle_design_doc_completion(
         # round-trip that defeats the lock-share optimization between
         # strategic-completion handlers.
         spawned = await _spawn_strategic_review(
-            project, session, cycle_id=cycle_id, operator_steered=operator_steered
+            project,
+            session,
+            cycle_id=cycle_id,
+            operator_steered=operator_steered,
+            steering_excerpt=steering_excerpt,
         )
         if spawned:
             phase2_spawned = True
@@ -2094,6 +2103,7 @@ async def _handle_design_doc_completion(
                     "error": "skipped: active strategic task exists",
                     "cycle_id": cycle_id,
                     "operator_steered": operator_steered,
+                    "steering_excerpt": steering_excerpt,
                 },
             }
             flag_modified(project, "vision")
@@ -2120,6 +2130,7 @@ async def _handle_design_doc_completion(
                 "error": str(chain_exc)[:200],
                 "cycle_id": cycle_id,
                 "operator_steered": operator_steered,
+                "steering_excerpt": steering_excerpt,
             },
         }
         if cycle_id:

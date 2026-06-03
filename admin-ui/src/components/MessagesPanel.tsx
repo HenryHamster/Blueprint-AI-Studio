@@ -732,7 +732,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       setReplyTo(null);
       setLastArming(arming);
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
-      addToast(armingToastCopy(arming), 'success');
+      // A genuine steering message the server could not arm (`not_armed`) is a
+      // partial outcome — the message saved, but the strategist was not woken.
+      // Surface it as info, not a green success, so the receipt is truthful.
+      addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
       await fetchMessages();
     } catch {
       addToast('Failed to send message', 'error');

@@ -766,6 +766,9 @@ async def test_operator_steering_consumed_posts_acted_confirmation(db_session, m
                 "reason": "operator_steering",
                 "count": 1,
                 "origin": "operator",
+                # Genuine operator steering carries the message text; the
+                # confirmation fires only when an excerpt was preserved.
+                "excerpt": "Please refocus on the auth bug.",
             },
         },
     )
@@ -803,6 +806,69 @@ async def test_operator_steering_consumed_posts_acted_confirmation(db_session, m
     ]
     assert len(acted) == 1, "operator must get exactly one steering confirmation"
     assert acted[0].message_type == MessageType.NOTE
+
+
+@pytest.mark.asyncio
+async def test_operator_marker_without_excerpt_posts_no_acted_confirmation(
+    db_session, mocker
+):
+    """An operator-origin marker carrying NO excerpt must NOT post the steering
+    confirmation: with no preserved message text the woken cycle has no
+    directive to act on, so promising the operator that steering reached the
+    strategist would be untruthful."""
+    strategic_review_mock = mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    project = Project(
+        name="Operator steering no excerpt",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={
+            "purpose": "test",
+            "_strategic_refresh": {
+                "requested_at": datetime.utcnow().isoformat(),
+                "reason": "operator_steering",
+                "count": 1,
+                "origin": "operator",
+                # no excerpt — no message text was preserved
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(_recent_strategic_task(project.id, minutes_ago=5))
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert strategic_review_mock.called, "operator-origin refresh must still fire the spawn"
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_refresh") is None
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    acted = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type") == "strategic_steering_acted"
+    ]
+    assert acted == [], "no excerpt → no steering confirmation"
 
 
 @pytest.mark.asyncio

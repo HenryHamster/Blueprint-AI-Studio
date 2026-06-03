@@ -893,6 +893,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 session,
                 cycle_id=pending_sr.get("cycle_id"),
                 operator_steered=bool(pending_sr.get("operator_steered")),
+                steering_excerpt=pending_sr.get("steering_excerpt"),
             ):
                 def _clear_pending_sr(vision: dict) -> None:
                     vision.pop("_pending_strategic_review", None)
@@ -1187,12 +1188,18 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 from app.strategic_trigger import (
                     ORIGIN_OPERATOR,
                     clear_strategic_refresh,
+                    strategic_refresh_excerpt,
                     strategic_refresh_origin,
                 )
 
                 _consumed["operator"] = (
                     strategic_refresh_origin(vision) == ORIGIN_OPERATOR
                 )
+                # Capture the persisted steering excerpt BEFORE the marker is
+                # wiped: the success confirmation must fire only when the
+                # operator's message text was actually preserved (otherwise the
+                # woken cycle has no directive to act on).
+                _consumed["excerpt"] = strategic_refresh_excerpt(vision)
                 clear_strategic_refresh(vision, now)
 
             await with_vision_locked(session, project.id, _record_strategic_spawn)
@@ -1207,10 +1214,13 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             await session.commit()
 
             # Symmetric success counterpart to the deferral notice: when the
-            # consumed marker was operator-origin, confirm the strategist woke
-            # and is acting on the steering. Best-effort — never fatal to the
+            # consumed marker was operator-origin AND carried preserved steering
+            # text, confirm the strategist woke and is acting on the steering.
+            # Without an excerpt the woken cycle has no directive to act on, so
+            # suppress the confirmation rather than promise steering that the
+            # strategist cannot actually see. Best-effort — never fatal to the
             # spawn that already succeeded and committed above.
-            if _consumed.get("operator"):
+            if _consumed.get("operator") and _consumed.get("excerpt"):
                 await _maybe_notify_operator_steering_acted(project, session)
 
     # Guard: limit parallel research tasks per project.

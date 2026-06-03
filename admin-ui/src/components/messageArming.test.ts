@@ -16,6 +16,13 @@ describe('armingToastCopy — post-send toast grounded in the real outcome', () 
   test('routine_event outcome states it won’t wake the strategist', () => {
     expect(armingToastCopy('routine_event')).toContain('won’t wake the strategist');
   });
+  test('not_armed outcome is truthful: saved but the strategist wasn’t woken', () => {
+    const copy = armingToastCopy('not_armed');
+    expect(copy).toContain('wasn’t woken');
+    expect(copy).toContain('resending');
+    // Must NOT make the false steering promise.
+    expect(copy).not.toContain('steering the strategist');
+  });
   test('missing outcome falls back to the generic confirmation', () => {
     expect(armingToastCopy(null)).toBe('Message sent');
     expect(armingToastCopy(undefined)).toBe('Message sent');
@@ -32,6 +39,11 @@ describe('armingHintCopy — composer hint per outcome', () => {
   test('routine_event hint won’t wake', () => {
     expect(armingHintCopy('routine_event')).toContain('won’t wake the strategist');
   });
+  test('not_armed hint admits the wake failed and suggests resending', () => {
+    const copy = armingHintCopy('not_armed');
+    expect(copy).toContain('Couldn’t wake the strategist');
+    expect(copy).toContain('resending');
+  });
 });
 
 describe('predictArming — type-only prediction before any send', () => {
@@ -45,10 +57,11 @@ describe('predictArming — type-only prediction before any send', () => {
 });
 
 describe('parseArmingOutcome — narrows an untrusted response field', () => {
-  test('accepts the three valid outcomes', () => {
+  test('accepts the four valid outcomes', () => {
     expect(parseArmingOutcome('steering')).toBe('steering');
     expect(parseArmingOutcome('passive_note')).toBe('passive_note');
     expect(parseArmingOutcome('routine_event')).toBe('routine_event');
+    expect(parseArmingOutcome('not_armed')).toBe('not_armed');
   });
   test('rejects unknown / missing values', () => {
     expect(parseArmingOutcome(undefined)).toBeNull();
