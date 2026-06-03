@@ -517,6 +517,20 @@ async def create_message(
         append_routine_digest(locked_project, event_type, content)
     await session.commit()
     await session.refresh(msg)
+
+    # Wake the strategist on genuine operator steering. This is the live-chat
+    # surface the admin MessagesPanel composer hits, and it must steer exactly
+    # like the project-scoped CLI endpoint (routers/directions.py). The shared
+    # gate decides whether to arm (non-passive type, not a routine digest event)
+    # so the two paths cannot diverge again. Best-effort: the helper does not
+    # commit (we own the txn) and swallows its own errors, so message creation
+    # never fails on it; the second commit persists the marker independently.
+    from app.strategic_trigger import maybe_arm_operator_refresh
+
+    if await maybe_arm_operator_refresh(
+        session, project_id, MessageType(msg_type), event_type=event_type
+    ):
+        await session.commit()
     return {"id": str(msg.id), "status": "created"}
 
 

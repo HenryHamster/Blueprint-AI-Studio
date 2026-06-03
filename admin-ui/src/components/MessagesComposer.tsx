@@ -41,6 +41,9 @@ export function MessagesComposer({
     el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
   }
 
+  // NOTE is recorded passively; every other type wakes the active strategist.
+  const isPassive = newType === 'NOTE';
+
   return (
     <div className="px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50">
       {/* Reply quote bar */}
@@ -78,6 +81,12 @@ export function MessagesComposer({
           <Send className="w-4 h-4" />
         </button>
       </div>
+      {/* Steering hint: tells the operator whether the chosen type wakes the strategist. */}
+      <p className="text-[11px] leading-snug text-neutral-500 mt-1.5 px-0.5">
+        {isPassive
+          ? 'Recorded as a note — won’t wake the strategist.'
+          : 'Steering message — reaches the strategist soon.'}
+      </p>
     </div>
   );
 }

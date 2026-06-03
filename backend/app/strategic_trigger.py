@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from app.models import MessageType
 from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
 
@@ -135,6 +136,42 @@ async def request_strategic_refresh(
         logger.exception(
             "[STRATEGIC] request_strategic_refresh failed for project %s", project_id
         )
+
+
+async def maybe_arm_operator_refresh(
+    session, project_id, message_type: MessageType, *, event_type: str | None = None
+) -> bool:
+    """Shared 'should this operator message wake the strategist, and arm it' gate.
+
+    Both operator message-creation endpoints route their wake decision through
+    this single helper so the two paths cannot silently diverge again (this bug
+    existed precisely because the wake logic was added to the project-scoped CLI
+    endpoint ``POST /api/admin/projects/{id}/messages`` but not the canonical
+    live-chat endpoint ``POST /api/admin/messages`` the admin MessagesPanel hits).
+
+    A message arms the operator-origin strategic-refresh marker only when it is a
+    genuine operator steering message: a non-passive operator type (anything but
+    a passive ``NOTE``) that is NOT a system/routine digest-event message (those
+    are automated digests appended to ``running_update``, never human steering).
+
+    Best-effort and coalescing: delegates to ``request_strategic_refresh``, which
+    swallows its own errors and does NOT commit (the caller owns the txn), so
+    arming can never make message creation fail. Returns True when arming was
+    requested.
+    """
+    if message_type is MessageType.NOTE:
+        return False
+    if event_type:
+        # Inline import — ROUTINE_EVENT_TYPES lives in the router module, which
+        # imports a great deal; importing it at module load would risk a cycle.
+        from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
+
+        if event_type in ROUTINE_EVENT_TYPES:
+            return False
+    await request_strategic_refresh(
+        session, project_id, "operator_message", origin=ORIGIN_OPERATOR
+    )
+    return True
 
 
 def strategic_refresh_pending(vision: dict | None) -> bool:

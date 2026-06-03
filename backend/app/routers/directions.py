@@ -1044,16 +1044,15 @@ async def create_message(
     # feedback / question / blocker — anything but a passive NOTE) arms the
     # coalescing strategic-refresh marker so the autonomous loop wakes the
     # strategist promptly (bypassing strategic_spawn_cooldown) instead of
-    # waiting for the next scheduled cycle. Best-effort and coalescing: the
-    # helper does not commit (we own the txn), swallows its own errors so
-    # message creation never fails on it, and the min-interval floor + failure
-    # breaker keep a burst of messages from storming strategic spawns.
-    if msg_type is not MessageType.NOTE:
-        from app.strategic_trigger import ORIGIN_OPERATOR, request_strategic_refresh
+    # waiting for the next scheduled cycle. Routed through the shared gate so
+    # this CLI path and the canonical live-chat endpoint
+    # (admin_notifications.create_message) can never diverge again. Best-effort
+    # and coalescing: the helper does not commit (we own the txn), swallows its
+    # own errors so message creation never fails on it, and the min-interval
+    # floor + failure breaker keep a burst of messages from storming spawns.
+    from app.strategic_trigger import maybe_arm_operator_refresh
 
-        await request_strategic_refresh(
-            session, project.id, "operator_message", origin=ORIGIN_OPERATOR
-        )
+    if await maybe_arm_operator_refresh(session, project.id, msg_type):
         await session.commit()
 
     return {"id": str(msg.id), "status": "created"}

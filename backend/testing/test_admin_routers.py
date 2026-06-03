@@ -2685,6 +2685,133 @@ class TestMessages:
         assert "pr_merged" in project.running_update
         assert "PR #123 merged into main" in project.running_update
 
+    async def _reload_vision(self, db_session, project_id) -> dict:
+        """Re-read the project's vision JSON after an endpoint commit.
+
+        The endpoint arms the marker on its own request-session/connection. We
+        must close the test session first so the subsequent read happens in a
+        fresh transaction — expiring the identity map alone keeps the stale
+        pre-commit snapshot and would miss the just-committed marker.
+        """
+        await db_session.close()
+        project = (
+            await db_session.execute(
+                select(Project).where(Project.id == project_id)
+            )
+        ).scalar_one()
+        return project.vision or {}
+
+    @pytest.mark.asyncio
+    async def test_canonical_message_arms_strategic_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        """The live-chat endpoint wakes the strategist on a steering message.
+
+        Regression guard for the bug where the canonical MessagesPanel endpoint
+        (POST /api/admin/messages) created the message but never armed the
+        operator-origin refresh marker, so live-chat steering didn't wake the
+        strategist (only the CLI-only project-scoped endpoint did).
+        """
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "FEEDBACK",
+                "content": "Please refocus on the auth bug",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "created"
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is True
+        marker = vision["_strategic_refresh"]
+        assert marker["reason"] == "operator_message"
+        assert marker["count"] == 1
+        # Operator origin is what activates the breaker-bypass and deferral
+        # consumer paths — the whole point of live steering.
+        assert marker["origin"] == "operator"
+
+    @pytest.mark.asyncio
+    async def test_canonical_passive_note_does_not_arm_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        """A passive NOTE on the canonical endpoint must NOT wake the strategist."""
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "FYI, just a note",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is False
+
+    @pytest.mark.asyncio
+    async def test_canonical_routine_event_does_not_arm_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        """A system/routine digest-event message must NOT wake the strategist,
+        even though it is not a NOTE-typed message, because routine digests are
+        automated, not human steering."""
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "FEEDBACK",
+                "content": "review feedback digest",
+                "context": {"event_type": "review_feedback"},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is False
+
+    @pytest.mark.asyncio
+    async def test_canonical_message_burst_coalesces(
+        self, client: AsyncClient, db_session
+    ):
+        """A burst of operator messages collapses into a single coalesced slot."""
+        from app.strategic_trigger import (
+            refresh_breaker_applies,
+            strategic_refresh_pending,
+        )
+
+        project = await _make_project(db_session)
+        for message_type in ("QUESTION", "BLOCKER"):
+            resp = await client.post(
+                "/api/admin/messages",
+                json={
+                    "project_id": str(project.id),
+                    "message_type": message_type,
+                    "content": f"steer {message_type}",
+                },
+            )
+            assert resp.status_code == 200, resp.text
+
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is True
+        marker = vision["_strategic_refresh"]
+        assert marker["count"] == 2
+        assert marker["reason"] == "operator_message"
+        assert marker["origin"] == "operator"
+        # Operator origin bypasses the failure breaker — exactly when an
+        # operator needs to steer.
+        assert refresh_breaker_applies(vision) is False
+
     @pytest.mark.asyncio
     async def test_create_routine_message_acquires_project_lock(
         self, client: AsyncClient, db_session

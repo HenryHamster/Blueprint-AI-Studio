@@ -1,0 +1,69 @@
+import { afterEach, describe, test, expect } from 'vitest';
+import { createRoot, type Root } from 'react-dom/client';
+import { act, createRef } from 'react';
+import { MessagesComposer } from './MessagesComposer';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+
+async function renderComposer(root: Root, newType: string) {
+  const ref = createRef<HTMLTextAreaElement>();
+  await act(async () => {
+    root.render(
+      <MessagesComposer
+        textareaRef={ref}
+        newType={newType}
+        newContent=""
+        submitting={false}
+        replyTo={null}
+        onChangeType={() => {}}
+        onChangeContent={() => {}}
+        onCancelReply={() => {}}
+        onSubmit={() => {}}
+      />,
+    );
+  });
+}
+
+describe('MessagesComposer — steering hint viewport regression', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) {
+      host.remove();
+      host = null;
+    }
+  });
+
+  test('NOTE (passive) hint fits 375px without overflow, truncation, or small targets', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'NOTE');
+    });
+    expect(host!.textContent).toContain('won’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('FEEDBACK (steering) hint fits 375px without overflow, truncation, or small targets', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK');
+    });
+    expect(host!.textContent).toContain('reaches the strategist soon');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+});
