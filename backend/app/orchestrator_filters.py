@@ -297,17 +297,46 @@ async def filter_file_conflicts(
             len(overlap) >= 2 and len(overlap) >= len(candidate_files) * 0.5
         )
         if should_defer:
+            overlapping_blockers = [
+                t
+                for t in active_tasks
+                if t.status == TaskStatus.IN_PROGRESS
+                and t.project_id == candidate.project_id
+                and _prod_files((t.context or {}).get("related_files", [])) & overlap
+            ]
+            # Cross-parent looseness: two WRITE tasks under DIFFERENT parents are
+            # different features whose PRs target different rollup branches — they
+            # share no immediate merge target, so overlapping a hot file
+            # (orchestrator.py / models.py / task_lifecycle.py) is rarely a real
+            # conflict; the eventual rollup/automain merge + the back-merge
+            # resolver catch the rare one. Only HOLD when an overlapping in-flight
+            # task is a SAME-PARENT sibling (the plan's coordinated decomposition
+            # merges to the same rollup branch). ALWAYS hold large-scope tasks
+            # (wide rewrites genuinely conflict across the board), and stay
+            # conservative on missing data — a null parent on either side keeps
+            # the hold.
+            cand_parent = candidate.parent_task_id
+            if (
+                not is_large
+                and cand_parent is not None
+                and overlapping_blockers
+                and all(
+                    t.parent_task_id is not None and t.parent_task_id != cand_parent
+                    for t in overlapping_blockers
+                )
+            ):
+                non_conflicting.append(eid)
+                logger.info(
+                    "[DISPATCH] Not deferring task %s — file overlap is cross-parent "
+                    "(different rollups, %d file(s): %s); real conflicts, if any, "
+                    "resolve at merge",
+                    eid,
+                    len(overlap),
+                    ", ".join(sorted(overlap))[:80],
+                )
+                continue
             overlapping_files = ", ".join(sorted(overlap))[:120]
-            blocking_task = next(
-                (
-                    t
-                    for t in active_tasks
-                    if t.status == TaskStatus.IN_PROGRESS
-                    and t.project_id == candidate.project_id
-                    and set((t.context or {}).get("related_files", [])) & overlap
-                ),
-                None,
-            )
+            blocking_task = overlapping_blockers[0] if overlapping_blockers else None
             blocking_title = (
                 f" (blocked by: {blocking_task.title[:60]})" if blocking_task else ""
             )

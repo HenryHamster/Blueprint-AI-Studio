@@ -13,22 +13,24 @@ from app.orchestrator_filters import filter_file_conflicts
 from testing.factories import make_task
 
 
-def _queued(project_id, files, scope="small", ttype="fix"):
+def _queued(project_id, files, scope="small", ttype="fix", parent=None):
     task = make_task(
         project_id=project_id,
         status=TaskStatus.QUEUED,
         context={"related_files": files, "scope": scope},
         payloads=[{"type": ttype}],
+        parent_task_id=parent,
     )
     return task
 
 
-def _in_progress(project_id, files):
+def _in_progress(project_id, files, parent=None):
     return make_task(
         project_id=project_id,
         status=TaskStatus.IN_PROGRESS,
         context={"related_files": files},
         payloads=[{"type": "fix"}],
+        parent_task_id=parent,
     )
 
 
@@ -122,6 +124,65 @@ class TestFilterFileConflicts:
         result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
         assert result == []
         assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_cross_parent_overlap_not_deferred(self):
+        """Two WRITE tasks under DIFFERENT parents (different rollups) overlapping
+        a hot file are NOT held — they target different branches, so it's rarely a
+        real conflict; the merge/back-merge resolver catches the rare one."""
+        pid = uuid.uuid4()
+        parent_a, parent_b = uuid.uuid4(), uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="small", parent=parent_a)
+        ip = _in_progress(pid, ["a.py", "b.py"], parent=parent_b)
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == [c.id]
+        assert "file conflict" not in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_same_parent_overlap_still_deferred(self):
+        """Same-parent siblings (one plan's coordinated decomposition) merge to the
+        same rollup branch — keep gating their file overlap."""
+        pid = uuid.uuid4()
+        parent = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="small", parent=parent)
+        ip = _in_progress(pid, ["a.py", "b.py"], parent=parent)
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_large_scope_cross_parent_still_deferred(self):
+        """Large-scope tasks (wide rewrites) conflict broadly even across rollups —
+        the cross-parent looseness must NOT exempt them."""
+        pid = uuid.uuid4()
+        c = _queued(pid, ["a.py", "b.py"], scope="large", parent=uuid.uuid4())
+        ip = _in_progress(pid, ["a.py"], parent=uuid.uuid4())
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
+        assert "file conflict" in (c.latest_status_message or "")
+
+    @pytest.mark.asyncio
+    async def test_null_parent_overlap_stays_conservative_and_defers(self):
+        """Missing parent on either side → can't confirm independence → keep the
+        hold (conservative)."""
+        pid = uuid.uuid4()
+        # candidate has a parent, blocker does not → not confidently cross-parent.
+        c = _queued(pid, ["a.py", "b.py", "c.py", "d.py"], scope="small", parent=uuid.uuid4())
+        ip = _in_progress(pid, ["a.py", "b.py"], parent=None)
+        session = MagicMock()
+        broadcast_fn = AsyncMock()
+
+        result = await filter_file_conflicts([c.id], [c], [ip], session, broadcast_fn)
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_standard_not_deferred_on_single_file_overlap(self):
