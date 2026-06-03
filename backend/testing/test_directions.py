@@ -6107,6 +6107,39 @@ def _mock_escalation_externals(mocker, direction_id):
 
 
 @pytest.mark.asyncio
+async def test_cochange_decomposition_gated_by_runtime_flag(db_session, mocker):
+    """Co-change auto-decomposition runs only when cochange_decomposition_enabled
+    is on. Default off, _handle_research_completion must not call
+    auto_decompose_findings_by_cochange at all (live data: 0/14 sub-findings
+    merged while ~3x-ing fan-out). Spying on the splitter isolates the call-site
+    gate from finding-shape prerequisites."""
+    import app.shared_state as _ss
+
+    direction_id = "d-decompgate"
+    _mock_escalation_externals(mocker, direction_id)
+    mocker.patch("app.research_completion.predict_spawn_success", return_value=0.9)
+    spy = mocker.patch(
+        "app.research_completion.auto_decompose_findings_by_cochange",
+        side_effect=lambda dedup, *a, **k: dedup,
+    )
+    # patch.dict snapshots/restores the whole runtime_config around the test.
+    mocker.patch.dict(
+        _ss.runtime_config, {"cochange_decomposition_enabled": False}
+    )
+
+    # OFF (default): the splitter is never invoked.
+    _, task_off, _ = await _setup_escalation_project(db_session, direction_id, None)
+    await _handle_research_completion(task_off, "", db_session)
+    assert spy.call_count == 0, "decomposition must be skipped when flag is off"
+
+    # ON: the splitter runs.
+    _ss.runtime_config["cochange_decomposition_enabled"] = True
+    _, task_on, _ = await _setup_escalation_project(db_session, direction_id, None)
+    await _handle_research_completion(task_on, "", db_session)
+    assert spy.call_count >= 1, "decomposition must run when flag is on"
+
+
+@pytest.mark.asyncio
 async def test_low_confidence_medium_auto_escalates_to_large(db_session, mocker):
     """Medium-scope low-confidence finding is escalated to large+plan; the
     low_confidence_spawn flag is preserved in context for tracking."""

@@ -219,6 +219,36 @@ async def test_sync_applies_runtime_config_json():
         assert key in changed
 
 
+def test_cochange_decomposition_defaults_off():
+    """Co-change auto-decomposition ships disabled by default (live data showed
+    0/14 split sub-findings merging while ~3x-ing fan-out). Re-enable per-deploy
+    via COCHANGE_DECOMPOSITION_ENABLED or live via PATCH /api/admin/settings."""
+    from app.runtime_config_state import runtime_config as _rc
+
+    assert _rc.get("cochange_decomposition_enabled") is False
+
+
+@pytest.mark.asyncio
+async def test_sync_applies_cochange_decomposition_enabled():
+    """The decomposition kill-switch propagates from persisted runtime_config_json
+    so an admin PATCH flips it across every Cloud Run instance without a deploy."""
+    state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,
+        current_revision="rev-1",
+        current_sha="sha-1",
+        last_known_good_revision="rev-1",
+        last_known_good_sha="sha-1",
+        runtime_config_json={"cochange_decomposition_enabled": True},
+    )
+    _shared_state.runtime_config["cochange_decomposition_enabled"] = False
+
+    changed = await sync_runtime_config_from_state(state)
+
+    assert _shared_state.runtime_config["cochange_decomposition_enabled"] is True
+    assert "cochange_decomposition_enabled" in changed
+
+
 @pytest.mark.asyncio
 async def test_sync_applies_warm_pool_project_allowlist():
     """The per-project warm-pool enablement scope (allowlist) must propagate

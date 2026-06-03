@@ -1417,6 +1417,11 @@ async def handle_ci_completion(
     # id/project_id are immutable — capture them now while ``task`` is fresh.
     _bcast_task_id = str(task.id)
     _bcast_project_id = str(task.project_id) if task.project_id else ""
+    # Broadcast status for the shared tail broadcast below. The fix-spawned path
+    # pre-sets this (it may have expired ``task`` via _spawn_pipeline_task's
+    # rollback, so it must not re-read task.status); every other path leaves it
+    # None and the tail falls back to a fresh task.status read.
+    _bcast_status = None
 
     # Re-check: task may have been completed by the concurrent handler that held the lock
     if task.status != TaskStatus.EVALUATING:
@@ -1649,8 +1654,18 @@ async def handle_ci_completion(
             task.context = {**(task.context or {}), "review_loop": ci_loop_ctx}
             # Rollup parents stay in EVALUATING — ci_completion will promote them
             # via pr_merged=True once the fix lands and the PR merges.
+            # Capture the broadcast status HERE, at the point of decision, rather
+            # than re-reading task.status before the broadcast below: a rollback
+            # inside _spawn_pipeline_task above can expire `task` (rollback defers
+            # every attr even with expire_on_commit=False), and on the
+            # rollup-awaiting path task.status is not re-assigned, so a late read
+            # would lazy-load in async context → MissingGreenlet (#6754 family;
+            # prod 2026-06-03 ci_completion crash).
             if not _is_rollup_parent_awaiting_merge(task.context):
                 task.status = TaskStatus.COMPLETED
+                _bcast_status = TaskStatus.COMPLETED
+            else:
+                _bcast_status = TaskStatus.EVALUATING
             task.latest_status_message = (
                 f"CI failed on PR #{ci_pr_number}, spawned fix → {fix_task.id}"
             )
@@ -1727,11 +1742,13 @@ async def handle_ci_completion(
     # nested _spawn_pipeline_task / prior session work may have rolled back,
     # and rollback expires instances even with expire_on_commit=False.
     session.add(task)
-    # Snapshot status before commit. A rollback earlier on this path (e.g. inside
-    # _spawn_pipeline_task) expires `task` even with expire_on_commit=False, so a
-    # post-commit task.status read here does a sync lazy-load in async context →
-    # MissingGreenlet (same family as the #6754 claim_task fix).
-    _bcast_status = task.status
+    # The fix-spawned branch pre-set _bcast_status at its status-decision point so
+    # we don't re-read a possibly-expired ``task`` (a rollback inside
+    # _spawn_pipeline_task expires it → sync lazy-load in async context →
+    # MissingGreenlet, #6754 family). Other paths reach here with a fresh ``task``
+    # (no nested rollback), so fall back to reading task.status directly.
+    if _bcast_status is None:
+        _bcast_status = task.status
     await session.commit()
     await broadcast_to_project(
         _bcast_project_id,

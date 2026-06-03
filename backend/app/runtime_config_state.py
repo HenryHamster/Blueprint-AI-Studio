@@ -59,6 +59,18 @@ runtime_config: Dict = {
     "max_autonomous_tasks_per_hour": 12,
     "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
     "autonomous_research_interval_minutes": 30,
+    # Co-change auto-decomposition: split a medium research finding's files into
+    # independent co-change/dir clusters and spawn one small sub-finding per
+    # cluster (research_completion -> cochange_decomposition.py). Default OFF:
+    # live data (2026-06-03) showed 0/14 sub-findings merged while ~3x-ing task
+    # fan-out, and the per-direction self-suppressor only learns reactively.
+    # Flip on (settable via PATCH /api/admin/settings, no deploy) to re-enable
+    # globally. NOTE: this gates only the splitting; the cochange_index signal
+    # that also feeds scope_complexity scoring + agent-prompt hints is untouched.
+    "cochange_decomposition_enabled": os.getenv(
+        "COCHANGE_DECOMPOSITION_ENABLED", "false"
+    ).lower()
+    in ("1", "true", "yes"),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
@@ -881,6 +893,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "warm_backlog_reuse_enabled",
                         bool(config_json["warm_backlog_reuse_enabled"]),
+                    )
+                if "cochange_decomposition_enabled" in config_json:
+                    _set(
+                        "cochange_decomposition_enabled",
+                        bool(config_json["cochange_decomposition_enabled"]),
                     )
                 if "warm_retarget_enabled" in config_json:
                     _set(

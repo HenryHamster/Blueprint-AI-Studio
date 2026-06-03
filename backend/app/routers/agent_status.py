@@ -16,7 +16,7 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
-from sqlalchemy.exc import IntegrityError, InvalidRequestError
+from sqlalchemy.exc import IntegrityError, InterfaceError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -999,6 +999,28 @@ async def update_agent_status(
                     "task_id": str(task.id),
                 }
             except Exception as e:
+                # A disconnection-class DB error on the retry path is deploy-cutover
+                # collateral, not a code fault: the terminal status is already
+                # committed and post_commit_pending is still set (we only clear it on
+                # the clean-return branch above), so the sweep retains ownership of
+                # the deferred side effects. Returning a clean 200 avoids a 500 →
+                # Cloud Run ContainerError → instance quarantine during a cutover
+                # (prod 2026-06-03). Genuine errors still surface as 500.
+                if bool(getattr(e, "connection_invalidated", False)) or isinstance(
+                    e, InterfaceError
+                ):
+                    logger.warning(
+                        "[PIPELINE] Post-commit retry for %s hit a disconnection-class "
+                        "DB error (instance-shutdown collateral); leaving "
+                        "post_commit_pending set for the sweep",
+                        _task_id_str,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                    return {
+                        "status": "post_commit_retry_pending",
+                        "task_id": _task_id_str,
+                    }
                 logger.error(
                     f"[PIPELINE] Post-commit retry also failed for {task.id}: {e}",
                     exc_info=True,
@@ -3200,12 +3222,28 @@ async def update_agent_status(
             # swallowing the failure → clean return → marker cleared → sweep
             # never retries (incident eefbed05).
             is_final_commit = isinstance(e, PostCommitFinalCommitFailed)
+            # A disconnection-class DB error (connection severed mid-request by a
+            # Cloud Run deploy cutover / instance drain) is infra collateral, not
+            # a code fault. ``connection_invalidated`` is SQLAlchemy's canonical
+            # disconnect flag (set when the pool's handle_error listener invalidated
+            # the connection — see database._install_disconnect_invalidation);
+            # InterfaceError ("connection is closed") is the asyncpg shape that
+            # surfaces directly. The terminal status is already committed and the
+            # write-ahead marker (below) hands the deferred side effects to
+            # _sweep_post_commit_pending, so re-raising would only turn benign
+            # cutover collateral into a 500 → Cloud Run ContainerError → instance
+            # quarantine (prod 2026-06-03 07:38 cutover burst).
+            is_disconnect = bool(getattr(e, "connection_invalidated", False)) or isinstance(
+                e, InterfaceError
+            )
             if is_timeout:
                 reason = "post_commit_timeout"
             elif is_locked:
                 reason = "post_commit_locked"
             elif is_final_commit:
                 reason = "post_commit_final_commit_failed"
+            elif is_disconnect:
+                reason = "post_commit_disconnect"
             else:
                 reason = "post_commit_error"
             logger.error(  # noqa: TRY400 — conditional exc_info: suppress for expected timeout/lock, show for real errors
@@ -3243,10 +3281,21 @@ async def update_agent_status(
             # 5xx → Cloud Run ContainerError for what is benign contention with a
             # peer post-commit driver, exactly the case the row-lock guard above
             # converts to a 429. So treat it like the final-commit case.
-            if (is_final_commit or is_locked) and _persist_err is None:
+            if (
+                is_final_commit or is_locked or is_disconnect
+            ) and _persist_err is None:
+                if is_disconnect:
+                    logger.warning(
+                        "[PIPELINE] Post-commit hit a disconnection-class DB error "
+                        "for task %s (instance-shutdown collateral) — terminal status "
+                        "already committed, retry marker persisted; returning 200 so "
+                        "the sweep owns the deferred side effects instead of 500ing the "
+                        "agent.",
+                        _task_id_str,
+                    )
                 return {
                     "status": "post_commit_retry_pending",
-                    "task_id": str(task.id),
+                    "task_id": _task_id_str,
                 }
             # Audit 2026-04-25 A9: explicitly chain the persist failure so
             # operators see both the original post-commit error AND the
