@@ -1325,11 +1325,14 @@ class TestBuildConfigDetection:
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = root_files
+        # A pyproject-only dir's test command is gated on the body configuring
+        # pytest (matching the runtime), so the detector fetches its content.
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\nminversion = '7'\n")
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp],
+            side_effect=[root_resp, pyproject_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1387,11 +1390,12 @@ class TestBuildConfigDetection:
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = root_files
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp],
+            side_effect=[root_resp, pyproject_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1532,16 +1536,19 @@ class TestBuildConfigDetection:
         subdir_resp.status_code = 200
         subdir_resp.json.return_value = subdir_files
 
+        # The pyproject body fetch (to confirm pytest) must carry the same ref.
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
+
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp, subdir_resp],
+            side_effect=[root_resp, subdir_resp, pyproject_resp],
         ) as mock_req:
             await _detect_build_config(
                 "fake-token", "owner", "repo", ref="feature-x"
             )
 
-        assert mock_req.call_count == 2
+        assert mock_req.call_count == 3
         for call in mock_req.call_args_list:
             assert call.kwargs.get("params") == {"ref": "feature-x"}
 
@@ -1555,16 +1562,19 @@ class TestBuildConfigDetection:
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = root_files
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp],
+            side_effect=[root_resp, pyproject_resp],
         ) as mock_req:
             await _detect_build_config("fake-token", "owner", "repo")
 
-        assert mock_req.call_count == 1
-        assert mock_req.call_args.kwargs.get("params") is None
+        assert mock_req.call_count == 2
+        # Both the listing and the pyproject body fetch must omit params (ref=None).
+        for call in mock_req.call_args_list:
+            assert call.kwargs.get("params") is None
 
     @pytest.mark.asyncio
     async def test_detect_build_config_scans_second_level_python_and_node_dirs(self):
@@ -1589,15 +1599,17 @@ class TestBuildConfigDetection:
         web_resp.json.return_value = [{"name": "package.json", "type": "file"}] + [
             {"name": f"file{i}.ts", "type": "file"} for i in range(5)
         ]
-        # package.json content fetched right after the apps/web listing so the
-        # node detector can confirm a real ``scripts.test`` before emitting it.
-        web_package = _file_content_resp('{"scripts": {"test": "vitest"}}')
 
         api_resp = MagicMock()
         api_resp.status_code = 200
         api_resp.json.return_value = [{"name": "pyproject.toml", "type": "file"}] + [
             {"name": f"file{i}.py", "type": "file"} for i in range(4)
         ]
+
+        # Content fetches confirming each dir's runtime-honored test command:
+        # the web package.json declares scripts.test, the api pyproject pytest.
+        web_pkg_resp = _file_content_resp('{"scripts": {"test": "vitest run"}}')
+        api_pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
 
         with patch(
             "app.github._github_request",
@@ -1607,8 +1619,9 @@ class TestBuildConfigDetection:
                 apps_resp,
                 services_resp,
                 web_resp,
-                web_package,
+                web_pkg_resp,
                 api_resp,
+                api_pyproject_resp,
             ],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
@@ -1636,12 +1649,15 @@ class TestBuildConfigDetection:
             {"name": "app.py", "type": "file"},
             {"name": "index.ts", "type": "file"},
         ]
-        root_package = _file_content_resp('{"scripts": {"test": "jest"}}')
+        # Python is detected before Node, so the pyproject body is fetched first,
+        # then the package.json body — both confirming their test commands.
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
+        package_resp = _file_content_resp('{"scripts": {"test": "jest"}}')
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp, root_package],
+            side_effect=[root_resp, pyproject_resp, package_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1711,13 +1727,14 @@ class TestBuildConfigDetection:
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = root_files
-        # Node detection now fetches package.json content; no scripts.test here.
-        root_package = _file_content_resp('{"name": "x"}')
+        # Node detection now fetches package.json to gate the test command;
+        # a script-less package.json still records the dir but emits no test_cmd.
+        package_resp = _file_content_resp('{"name": "thing"}')
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp, root_package],
+            side_effect=[root_resp, package_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1907,11 +1924,12 @@ class TestBuildConfigDetection:
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = [{"name": "pyproject.toml", "type": "file"}]
+        pyproject_resp = _file_content_resp("[tool.pytest.ini_options]\n")
 
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root_resp],
+            side_effect=[root_resp, pyproject_resp],
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
@@ -1962,6 +1980,170 @@ class TestBuildConfigDetection:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         assert config["has_ci"] is None
+
+
+class TestDetectorRuntimeParity:
+    """The stored detector must emit only test commands the runtime can honor.
+
+    The no-CI preflight (``ci_resolution.has_detectable_tests``) reads the
+    stored ``build_config.directories[].test_cmd``; the live merge verifier
+    (``agent/src/utils/test-runners.ts``) re-resolves entrypoints with its own
+    rules. These pin the alignment: Node ``npm test`` is persisted only when
+    ``scripts.test`` exists, Python ``python3 -m pytest`` is unconditional for
+    pytest.ini/setup.py/setup.cfg but content-gated for a pyproject-only dir.
+    """
+
+    @pytest.mark.asyncio
+    async def test_bare_package_json_without_test_script_emits_no_test_cmd(self):
+        """package.json with no ``scripts.test`` records node but no test_cmd.
+
+        The runtime would resolve such a repo to no-tests, so persisting
+        ``npm test`` is the exact drift that promises a false "tests gated".
+        """
+        root = _listing_resp(
+            [
+                {"name": "package.json", "type": "file"},
+                {"name": "index.ts", "type": "file"},
+            ]
+        )
+        package = _file_content_resp('{"name": "app", "scripts": {"build": "tsc"}}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node_dirs = [d for d in config["directories"] if d["type"] == "node"]
+        assert len(node_dirs) == 1
+        assert "test_cmd" not in node_dirs[0]
+        # Install/build commands still seeded — only the unrunnable test is dropped.
+        assert node_dirs[0]["install_cmd"] == "npm ci"
+        assert node_dirs[0]["build_cmd"] == "npm run build"
+
+    @pytest.mark.asyncio
+    async def test_package_json_with_test_script_emits_npm_test(self):
+        """package.json declaring ``scripts.test`` emits ``npm test``."""
+        root = _listing_resp(
+            [
+                {"name": "package.json", "type": "file"},
+                {"name": "index.ts", "type": "file"},
+            ]
+        )
+        package = _file_content_resp('{"scripts": {"test": "vitest run"}}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        node_dirs = [d for d in config["directories"] if d["type"] == "node"]
+        assert len(node_dirs) == 1
+        assert node_dirs[0]["test_cmd"] == "npm test"
+
+    @pytest.mark.asyncio
+    async def test_pytest_ini_only_dir_emits_python3_pytest(self):
+        """A pytest.ini-only repo (no pyproject/setup) is now detected.
+
+        The runtime honors pytest.ini directly; the stored detector previously
+        missed it (it was absent from the python trigger set), causing a
+        needless UNVERIFIED fallback. No content fetch is needed — pytest.ini is
+        an unconditional pytest signal.
+        """
+        root = _listing_resp(
+            [
+                {"name": "pytest.ini", "type": "file"},
+                {"name": "app.py", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],  # one call — pytest.ini needs no body fetch
+        ) as mock_req:
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert mock_req.call_count == 1
+        py_dirs = [d for d in config["directories"] if d["type"] == "python"]
+        assert len(py_dirs) == 1
+        assert py_dirs[0]["test_cmd"] == "python3 -m pytest"
+        assert py_dirs[0]["lint_cmd"] == "ruff check"
+
+    @pytest.mark.asyncio
+    async def test_bare_pyproject_without_pytest_emits_no_test_cmd(self):
+        """A packaging-only pyproject.toml (no pytest) records python, no test_cmd."""
+        root = _listing_resp(
+            [
+                {"name": "pyproject.toml", "type": "file"},
+                {"name": "app.py", "type": "file"},
+            ]
+        )
+        pyproject = _file_content_resp(
+            "[build-system]\nrequires = ['setuptools']\n\n[project]\nname = 'thing'\n"
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, pyproject],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        py_dirs = [d for d in config["directories"] if d["type"] == "python"]
+        assert len(py_dirs) == 1
+        assert "test_cmd" not in py_dirs[0]
+        assert py_dirs[0]["lint_cmd"] == "ruff check"
+
+    @pytest.mark.asyncio
+    async def test_setup_py_dir_emits_pytest_without_content_fetch(self):
+        """setup.py is an unconditional pytest signal — no body fetch needed."""
+        root = _listing_resp(
+            [
+                {"name": "setup.py", "type": "file"},
+                {"name": "app.py", "type": "file"},
+            ]
+        )
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root],
+        ) as mock_req:
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert mock_req.call_count == 1
+        py_dirs = [d for d in config["directories"] if d["type"] == "python"]
+        assert py_dirs[0]["test_cmd"] == "python3 -m pytest"
+
+    @pytest.mark.asyncio
+    async def test_bare_pyproject_keeps_no_ci_gate_unverified(self):
+        """A script-less node dir leaves the no-CI gate at proceed-without-checks.
+
+        Proves the conservative emission flows through to the gate decision:
+        with no runnable ``test_cmd`` stored, ``should_run_no_ci_test_gate`` is
+        False, so the operator sees no false "tests gated" promise.
+        """
+        from app.ci_resolution import should_run_no_ci_test_gate
+
+        root = _listing_resp([{"name": "package.json", "type": "file"}])
+        package = _file_content_resp('{"name": "thing"}')
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root, package],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        project = Project(
+            name="ext",
+            user_id=TEST_USER_ID,
+            github_owner="owner",
+            github_repo="repo",
+            integration_branch="main",
+            build_config={"requires_ci_checks": False, **config},
+        )
+        assert (
+            should_run_no_ci_test_gate(project, "main", gate_enabled=True) is False
+        )
 
 
 class TestFallbackTestEntrypointDetection:
@@ -2283,6 +2465,8 @@ class TestFallbackTestEntrypointDetection:
 
         Precedence: a recognized language manifest's test_cmd wins per-directory,
         so the fallback is not emitted and the Makefile body is never fetched.
+        The pyproject body IS fetched (to confirm it configures pytest), but the
+        Makefile is not — proving the python manifest short-circuits the fallback.
         """
         root = _listing_resp(
             [
@@ -2290,14 +2474,17 @@ class TestFallbackTestEntrypointDetection:
                 {"name": "Makefile", "type": "file"},
             ]
         )
+        pyproject = _file_content_resp("[tool.pytest.ini_options]\n")
         with patch(
             "app.github._github_request",
             new_callable=AsyncMock,
-            side_effect=[root],  # one call only — no Makefile content fetch
+            # Two calls: the root listing + the pyproject body. The Makefile body
+            # is never fetched because the python test_cmd already won.
+            side_effect=[root, pyproject],
         ) as mock_req:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
-        assert mock_req.call_count == 1
+        assert mock_req.call_count == 2
         dirs = config["directories"]
         assert len(dirs) == 1
         assert dirs[0]["type"] == "python"
@@ -2370,12 +2557,12 @@ class TestSharedTestRunnerLayouts:
 
         # The detector fetches the CONTENT of certain manifests before emitting
         # a command: package.json (node ``scripts.test`` guard), composer.json
-        # (composer ``scripts.test`` guard) and Makefile (real ``test:`` target).
+        # (composer ``scripts.test`` guard), Makefile (real ``test:`` target),
+        # and pyproject.toml when pytest must be confirmed from its body.
         # Mirror those content fetches so the mock side-effect list stays in sync.
-        _CONTENT_FETCHED = {"package.json", "composer.json", "Makefile"}
         responses = [root_resp]
         for item in layout["files"]:
-            if item["path"] in _CONTENT_FETCHED:
+            if "content" in item:
                 responses.append(_file_content_resp(item.get("content", "")))
 
         with patch(

@@ -329,6 +329,10 @@ _UNVERIFIED_REASON_LABELS = {
         "the PR targets an internal staging branch (CI is path-filtered there)"
     ),
     "undetected_runtime": "the detected test suite produced no usable verdict",
+    "verify_setup_failed": (
+        "the detected test suite exists but could not be run "
+        "(setup/runner infrastructure failed after retries)"
+    ),
 }
 
 

@@ -135,6 +135,47 @@ def _json_defines_test_script(text: str | None) -> bool:
     return bool(str(scripts.get("test") or "").strip())
 
 
+def _node_defines_test_script(text: str | None) -> bool:
+    """True iff a ``package.json`` body declares a non-empty ``scripts.test``.
+
+    A bare ``package.json`` is not enough to justify ``npm test`` — the runtime
+    test-runner detector (``agent/src/utils/test-runners.ts``) only emits
+    ``npm test`` when ``scripts.test`` is actually present, otherwise ``npm
+    test`` exits with "Missing script: test" and the no-CI gate treats it as
+    no-tests. Persisting ``npm test`` for a script-less ``package.json`` is the
+    exact detector drift that surfaces a false "tests gated" promise, so the
+    detector fetches the file CONTENT and confirms the script before emitting.
+    """
+    if not text:
+        return False
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    scripts = data.get("scripts")
+    if not isinstance(scripts, dict):
+        return False
+    return bool(str(scripts.get("test") or "").strip())
+
+
+def _pyproject_configures_pytest(text: str | None) -> bool:
+    """True iff a ``pyproject.toml`` body mentions ``pytest``.
+
+    Mirrors the runtime test-runner detector exactly: a ``pyproject.toml``-only
+    directory yields ``python3 -m pytest`` only when the file content references
+    ``pytest`` (a ``[tool.pytest.ini_options]`` table, a test dependency, etc.).
+    A packaging-only ``pyproject.toml`` (build-system / project metadata, no
+    pytest) must NOT emit a test command, otherwise the stored config promises a
+    suite the runtime would resolve to no-tests. ``pytest.ini``/``setup.py``/
+    ``setup.cfg`` remain unconditional pytest signals and never reach here.
+    """
+    if not text:
+        return False
+    return "pytest" in text
+
+
 def _is_ci_workflow_file(name: str) -> bool:
     """True when a filename under ``.github/workflows`` is a GitHub Actions workflow.
 
@@ -247,7 +288,8 @@ async def _detect_build_config(
         languages: list[str],
         path: str,
         project_type: str,
-        node_has_test_script: bool = False,
+        *,
+        emit_test_cmd: bool = True,
     ) -> None:
         normalized_path = _normalized_directory_path(path)
         if any(
@@ -257,19 +299,23 @@ async def _detect_build_config(
             return
 
         if project_type == "python":
-            directories.append(
-                {
-                    "path": normalized_path,
-                    "type": "python",
-                    "lint_cmd": "ruff check",
-                    "test_cmd": "python3 -m pytest",
-                }
-            )
+            entry: Dict[str, Any] = {
+                "path": normalized_path,
+                "type": "python",
+                "lint_cmd": "ruff check",
+            }
+            # Only persist a test command the runtime can really honor. For a
+            # pyproject-only directory whose body does not configure pytest the
+            # caller passes emit_test_cmd=False, so the dir still records the
+            # python language + lint_cmd without a false "tests gated" promise.
+            if emit_test_cmd:
+                entry["test_cmd"] = "python3 -m pytest"
+            directories.append(entry)
             _record_language(languages, "python")
             return
 
         if project_type == "node":
-            entry: Dict[str, Any] = {
+            entry = {
                 "path": normalized_path,
                 "type": "node",
                 "install_cmd": "npm ci",
@@ -280,7 +326,7 @@ async def _detect_build_config(
             # npm's "no test specified" placeholder, which executes no tests.
             # Mirrors the composer.json / Makefile content-guards and the
             # agent-side detector in agent/src/utils/test-runners.ts.
-            if node_has_test_script:
+            if emit_test_cmd:
                 entry["test_cmd"] = "npm test"
             if path:
                 entry["lint_cmd"] = "npx eslint ."
@@ -322,22 +368,40 @@ async def _detect_build_config(
             if isinstance(item, dict) and isinstance(item.get("name"), str)
         }
 
+        # Python: pytest.ini / setup.py / setup.cfg are unconditional pytest
+        # signals (matching the runtime). A pyproject.toml-only directory emits
+        # a test command only when its body actually configures pytest, fetched
+        # and confirmed before emission so the stored config never promises a
+        # suite the runtime would resolve to no-tests.
         if {"pyproject.toml", "setup.py", "setup.cfg", "pytest.ini"} & names:
-            _add_detected_directory(directories, languages, path, "python")
+            emit_python_test = bool(
+                {"pytest.ini", "setup.py", "setup.cfg"} & names
+            )
+            if not emit_python_test and "pyproject.toml" in names:
+                pyproject_path = (
+                    f"{path}/pyproject.toml" if path else "pyproject.toml"
+                )
+                emit_python_test = _pyproject_configures_pytest(
+                    await _fetch_file_text(pyproject_path)
+                )
+            _add_detected_directory(
+                directories, languages, path, "python",
+                emit_test_cmd=emit_python_test,
+            )
+        # Node: ``npm test`` only when package.json declares scripts.test, which
+        # is what the runtime honors; an absent test script must fall back, not
+        # block, so the dir is still recorded but carries no test command.
         if "package.json" in names:
             # Fetch + inspect package.json so ``npm test`` is only emitted when a
             # real ``scripts.test`` exists (otherwise has_detectable_tests would
             # claim "tests gated" for a package with no runnable suite).
             package_path = f"{path}/package.json" if path else "package.json"
-            node_has_test_script = _json_defines_test_script(
+            emit_node_test = _json_defines_test_script(
                 await _fetch_file_text(package_path)
             )
             _add_detected_directory(
-                directories,
-                languages,
-                path,
-                "node",
-                node_has_test_script=node_has_test_script,
+                directories, languages, path, "node",
+                emit_test_cmd=emit_node_test,
             )
         if "go.mod" in names:
             _add_detected_directory(directories, languages, path, "go")

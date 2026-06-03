@@ -43,6 +43,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy import select
 
+from app.build_config_detection import persist_recovered_test_command
 from app.ci_completion import handle_ci_completion
 from app.ci_resolution import (
     build_no_ci_gate_ci_result,
@@ -928,6 +929,111 @@ async def test_no_ci_makefile_detected_repo_blocks_merge_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_no_ci_package_json_with_test_script_detected_repo_passes_and_merges(
+    db_session, mocker
+):
+    """A Node repo whose package.json declares ``scripts.test`` is detected at
+    onboarding (the body confirms the script), the gate runs that ``npm test``
+    suite, and a passing run proceeds to merge.
+
+    Composes the runtime-aligned detector (only persists ``npm test`` when
+    ``scripts.test`` exists) with the no-CI gate so a real Node suite gates the
+    merge instead of either a false "tests gated" promise or a needless
+    UNVERIFIED fallback.
+    """
+    from app.routers.admin_onboard import _detect_build_config
+
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    # --- Detection: a package.json declaring a real scripts.test. ---
+    root_resp = MagicMock()
+    root_resp.status_code = 200
+    root_resp.json.return_value = [
+        {"name": "package.json", "type": "file"},
+        {"name": "index.ts", "type": "file"},
+    ]
+    package_resp = MagicMock()
+    package_resp.status_code = 200
+    package_resp.json.return_value = {
+        "type": "file",
+        "content": base64.b64encode(
+            b'{"scripts": {"test": "vitest run", "build": "tsc"}}'
+        ).decode(),
+        "encoding": "base64",
+    }
+    with patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[root_resp, package_resp],
+    ):
+        detected = await _detect_build_config("ghs_test", "acme", "widget")
+
+    assert any(
+        d.get("test_cmd") == "npm test" for d in detected["directories"]
+    ), "package.json with scripts.test must detect an `npm test` command"
+
+    project = Project(
+        name="Node no-CI repo",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch=BASE,
+        build_config={"requires_ci_checks": False, **detected},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "src/app.test.ts > adds", "passed": True}],
+            "output": "Test Files  1 passed (1)\nTests  1 passed (1)",
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "pass"
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    merge_mock.assert_called_once()
+    assert await _unverified_merge_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_no_ci_pytest_ini_detected_repo_blocks_merge_on_failure(
     db_session, mocker
 ):
@@ -1095,7 +1201,6 @@ async def test_no_ci_pytest_ini_detected_repo_merges_on_pass(db_session, mocker)
     )
     outcome, detail = classify_merge_test_verdict(verdict)
     assert outcome == "pass"
-
     ci_result = build_no_ci_gate_ci_result(outcome, detail)
     assert ci_result["conclusion"] == "success"
 
@@ -1103,7 +1208,6 @@ async def test_no_ci_pytest_ini_detected_repo_merges_on_pass(db_session, mocker)
     acted = await handle_ci_completion(
         parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
     )
-
     assert acted is True
     merge_mock.assert_called_once()
     assert (
@@ -1203,3 +1307,278 @@ async def test_record_no_ci_gate_runtime_is_best_effort_on_none_project(db_sessi
         unverified_reason=None,
         when=_RUNTIME_WHEN,
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. Auto-recovery: a stale stored test command self-heals when verify_tests
+# runs a real replacement suite and reports it via
+# recovered/recovered_directories.
+#
+# These mirror the orchestrator's inline persistence call (orchestrator.py
+# ~5365): after the verdict is read+classified, when recovered is true with
+# concrete recovered_directories, persist_recovered_test_command converges the
+# project's build_config so FUTURE merges use the corrected command —
+# regardless of the replacement suite's pass/fail outcome.
+# ---------------------------------------------------------------------------
+
+
+async def _make_stale_no_ci_project(db_session):
+    """A no-CI project whose stored test_cmd is STALE, with operator-owned fields.
+
+    The operator-set fields (git identity, branch prefix, requires_ci_checks,
+    env_vars) must survive recovery persistence untouched.
+    """
+    project = Project(
+        name="External no-CI repo with stale cmd",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch=BASE,
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [{"path": ".", "type": "python", "test_cmd": "make test"}],
+            "git_user_name": "Operator Bot",
+            "git_user_email": "ops@example.com",
+            "task_branch_prefix": "ops/",
+            "env_vars": {"FOO": "bar"},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_no_ci_recovered_passing_suite_merges_and_persists_command(
+    db_session, mocker
+):
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_stale_no_ci_project(db_session)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    # The agent self-healed: the stored `make test` was stale, so it ran the
+    # repo's REAL pytest suite and reports the recovery. detected/passed reflect
+    # the REPLACEMENT suite's real run.
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "tests/test_math.py::test_add", "passed": True}],
+            "output": "1 passed in 0.10s",
+            "recovered": True,
+            "recovered_directories": [
+                {"path": ".", "type": "python", "test_cmd": "python3 -m pytest"}
+            ],
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert (
+        outcome == "pass"
+    ), "recovered passing suite must classify as pass, not undetected"
+
+    # Mirror the orchestrator: persist the recovered command before merging.
+    persisted = await persist_recovered_test_command(
+        project, db_session, verdict.get("recovered_directories") or []
+    )
+    assert persisted is True
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    # (a) Merge decision honors the REAL replacement-suite verdict — not an
+    #     UNVERIFIED fall-open.
+    merge_mock.assert_called_once()
+    assert (
+        await _unverified_merge_alerts(db_session, project.id) == []
+    ), "a recovered+passing merge is verified, not UNVERIFIED"
+
+    # (b) build_config converged to the recovered command; operator-owned fields
+    #     are preserved.
+    await db_session.refresh(project)
+    dirs = project.build_config["directories"]
+    assert len(dirs) == 1
+    assert dirs[0]["path"] == "."
+    assert dirs[0]["test_cmd"] == "python3 -m pytest"
+    assert project.build_config["git_user_name"] == "Operator Bot"
+    assert project.build_config["git_user_email"] == "ops@example.com"
+    assert project.build_config["task_branch_prefix"] == "ops/"
+    assert project.build_config["env_vars"] == {"FOO": "bar"}
+    assert project.build_config["requires_ci_checks"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_ci_recovered_failing_suite_blocks_merge_and_persists_command(
+    db_session, mocker
+):
+    _patch_github(mocker)
+    merge_mock = mocker.patch("app.github.merge_pull_request", return_value=None)
+
+    project = await _make_stale_no_ci_project(db_session)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+    )
+    assert was_created is True and verify_task is not None
+
+    # The replacement suite ran but FAILED — recovery still corrects the stored
+    # command (a recovered-but-failing suite means the stored command was stale).
+    failing_output = "FAILED tests/test_math.py::test_add - assert 3 == 4\n1 failed"
+    await _plant_verdict(
+        db_session,
+        verify_task,
+        {
+            "detected": True,
+            "passed": False,
+            "tests": [{"name": "tests/test_math.py::test_add", "passed": False}],
+            "output": failing_output,
+            "recovered": True,
+            "recovered_directories": [
+                {"path": ".", "type": "python", "test_cmd": "python3 -m pytest"}
+            ],
+        },
+    )
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "fail"
+
+    # Recovery persistence runs regardless of pass/fail.
+    persisted = await persist_recovered_test_command(
+        project, db_session, verdict.get("recovered_directories") or []
+    )
+    assert persisted is True
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "failure"
+
+    parent = await db_session.get(Task, parent.id)
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+    assert acted is True
+    # (a) Merge decision honors the REAL replacement-suite verdict: blocked, with
+    #     a fix spawned — NOT an UNVERIFIED fall-open.
+    merge_mock.assert_not_called()
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    fix_tasks = [t for t in all_tasks if t.first_payload.get("type") == "fix"]
+    assert (
+        len(fix_tasks) == 1
+    ), "a recovered+failing suite must block and spawn a fix"
+
+    # (b) build_config still converged to the recovered command.
+    await db_session.refresh(project)
+    assert project.build_config["directories"][0]["test_cmd"] == "python3 -m pytest"
+
+
+@pytest.mark.asyncio
+async def test_persist_recovered_appends_new_directory_and_guards_blanks(db_session):
+    """Unit-level contract for the persistence helper itself."""
+    project = await _make_stale_no_ci_project(db_session)
+
+    # Append a newly discovered directory + update the existing one; a blank
+    # test_cmd entry is skipped (conservative guard).
+    persisted = await persist_recovered_test_command(
+        project,
+        db_session,
+        [
+            {"path": "./", "type": "python", "test_cmd": "python3 -m pytest"},
+            {"path": "services/api", "type": "node", "test_cmd": "npm test"},
+            {"path": "blank", "type": "python", "test_cmd": ""},
+        ],
+    )
+    assert persisted is True
+
+    await db_session.refresh(project)
+    dirs = {d["path"]: d for d in project.build_config["directories"]}
+    assert dirs["."]["test_cmd"] == "python3 -m pytest"
+    assert dirs["services/api"]["test_cmd"] == "npm test"
+    assert "blank" not in dirs, "blank test_cmd must never be persisted"
+
+    # Empty recovered list is a no-op.
+    assert await persist_recovered_test_command(project, db_session, []) is False
+
+
+@pytest.mark.asyncio
+async def test_persist_recovered_appends_other_type_stays_in_schema(db_session):
+    """A make/shell suite recovery (agent maps both to the schema-valid ``other``
+    type) must round-trip through BuildConfigSchema validation and persist as a
+    clean config — NOT fall to the raw-store fallback.
+
+    Regression guard for the agent-side enum mismatch: ``runnerKindFromCmd``
+    previously emitted ``make``/``shell``/``unknown``, which are outside the
+    BuildConfigDirectoryEntry.type enum (^(python|node|go|rust|other)$) and would
+    silently persist a schema-invalid config that a later operator PATCH
+    /build_config rejects with HTTP 400.
+    """
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    project = await _make_stale_no_ci_project(db_session)
+
+    persisted = await persist_recovered_test_command(
+        project,
+        db_session,
+        [
+            # Makefile test target -> agent emits type 'other'.
+            {"path": "services/worker", "type": "other", "test_cmd": "make test"},
+            # bash script suite -> agent emits type 'other'.
+            {"path": "scripts", "type": "other", "test_cmd": "bash scripts/test.sh"},
+        ],
+    )
+    assert persisted is True
+
+    await db_session.refresh(project)
+    dirs = {d["path"]: d for d in project.build_config["directories"]}
+    assert dirs["services/worker"]["test_cmd"] == "make test"
+    assert dirs["services/worker"]["type"] == "other"
+    assert dirs["scripts"]["test_cmd"] == "bash scripts/test.sh"
+    assert dirs["scripts"]["type"] == "other"
+
+    # The persisted config must be schema-valid (validated round-trip, NOT the
+    # raw-store fallback) so a subsequent operator PATCH /build_config succeeds.
+    BuildConfigSchema(**project.build_config)

@@ -10,7 +10,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import { readFile } from 'node:fs/promises';
-import { detectTestRunners, classifyTestExecution } from './test-runners.js';
+import {
+  detectTestRunners, detectAutoTestRunners, describeRunnerDirectory, classifyTestExecution,
+} from './test-runners.js';
 import type { BuildConfig, TestRunner } from './test-runners.js';
 
 // We test detectTestRunners in isolation.  fs.existsSync and fs.readFileSync
@@ -177,6 +179,29 @@ describe('detectTestRunners — bare pytest guard (C19)', () => {
     expect(runners).toHaveLength(1);
     expect(runners[0].cmd).toBe('python3');
     expect(runners[0].args).toEqual(['-m', 'pytest', '-x', '-q']);
+  });
+
+  it('classifyTestExecution treats Go empty-package output as no_tests', () => {
+    expect(classifyTestExecution('?    example.com/foo [no test files]')).toBe('no_tests');
+  });
+
+  it('classifyTestExecution treats filtered-out Go output as no_tests', () => {
+    expect(classifyTestExecution('testing: warning: no tests to run\nok  example.com/foo 0.004s [no tests to run]')).toBe('no_tests');
+  });
+
+  it('classifyTestExecution treats Rust zero-test summary as no_tests', () => {
+    expect(classifyTestExecution([
+      'running 0 tests',
+      '',
+      'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s',
+    ].join('\n'))).toBe('no_tests');
+  });
+
+  it('classifyTestExecution keeps mixed Go output with real tests as ran', () => {
+    expect(classifyTestExecution([
+      '?    example.com/foo [no test files]',
+      'ok   example.com/bar  0.021s',
+    ].join('\n'))).toBe('ran');
   });
 
   // --------------------------------------------------------------------------
@@ -758,6 +783,90 @@ describe('detectTestRunners — nested monorepo / external layouts', () => {
     expect(runners).toHaveLength(1);
     expect(runners[0].cmd).toBe('bash');
     expect(runners[0].args[0]).toBe('scripts/test-backend.sh');
+  });
+});
+
+describe('detectAutoTestRunners — buildConfig-suppressed auto-detection (stale-command self-heal)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockFs.existsSync.mockReturnValue(false);
+    mockFs.readFileSync.mockReturnValue('');
+    mockFs.readdirSync.mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns the same runners as detectTestRunners(undefined) — auto-detection only', () => {
+    const fs = mockFs;
+    // A real replacement suite lives at services/api even though a (stale)
+    // stored command might exist elsewhere.
+    fs.existsSync.mockImplementation((p: string) =>
+      p === '/tmp/workspace/services' || p.endsWith('/services/api/pytest.ini'),
+    );
+    fs.readdirSync.mockImplementation((p: string) =>
+      p.endsWith('/services') ? ['api'] : [],
+    );
+
+    const auto = detectAutoTestRunners();
+    const baseline = detectTestRunners(undefined);
+
+    expect(auto).toEqual(baseline);
+    expect(auto).toHaveLength(1);
+    expect(auto[0].cmd).toBe('python3');
+    expect(auto[0].cwd).toBe('/tmp/workspace/services/api');
+  });
+
+  it('ignores any stored build_config entirely (no buildConfig argument)', () => {
+    const fs = mockFs;
+    // Makefile with a real test target is on disk — detectAutoTestRunners finds
+    // it regardless of what a stored config would have said.
+    fs.existsSync.mockImplementation((p: string) => p.endsWith('/Makefile'));
+    fs.readFileSync.mockReturnValue('test:\n\tgo test ./...\n');
+
+    const runners = detectAutoTestRunners();
+
+    expect(runners).toHaveLength(1);
+    expect(runners[0].cmd).toBe('make');
+    expect(runners[0].args).toEqual(['test']);
+  });
+
+  it('finds nothing when the workspace carries no runnable suite', () => {
+    mockFs.existsSync.mockReturnValue(false);
+    expect(detectAutoTestRunners()).toHaveLength(0);
+  });
+});
+
+describe('describeRunnerDirectory — runner → build_config directory descriptor', () => {
+  const mk = (cmd: string, args: string[], cwd: string): TestRunner => ({ cmd, args, cwd, label: 'x' });
+
+  it('maps a nested pytest runner to {path, type:python, test_cmd}', () => {
+    expect(describeRunnerDirectory(mk('python3', ['-m', 'pytest', '-x', '-q'], '/tmp/workspace/services/api')))
+      .toEqual({ path: 'services/api', type: 'python', test_cmd: 'python3 -m pytest -x -q' });
+  });
+
+  it('maps a root runner to an empty path', () => {
+    expect(describeRunnerDirectory(mk('npm', ['test'], '/tmp/workspace')))
+      .toEqual({ path: '', type: 'node', test_cmd: 'npm test' });
+  });
+
+  it('derives type from the runner command kind', () => {
+    expect(describeRunnerDirectory(mk('go', ['test', './...'], '/tmp/workspace/svc')).type).toBe('go');
+    expect(describeRunnerDirectory(mk('cargo', ['test'], '/tmp/workspace/core')).type).toBe('rust');
+    expect(describeRunnerDirectory(mk('tox', [], '/tmp/workspace')).type).toBe('python');
+  });
+
+  // make targets, bash/sh script suites, and unrecognized commands have no
+  // dedicated language bucket; they MUST map to the schema-valid catch-all
+  // 'other' so the recovered directory entry stays inside the
+  // BuildConfigDirectoryEntry.type enum (^(python|node|go|rust|other)$) and does
+  // not force the backend's schema-invalid raw-store fallback.
+  it('maps make/shell/unknown commands to the schema-valid "other" type', () => {
+    expect(describeRunnerDirectory(mk('make', ['test'], '/tmp/workspace')).type).toBe('other');
+    expect(describeRunnerDirectory(mk('bash', ['test.sh'], '/tmp/workspace')).type).toBe('other');
+    expect(describeRunnerDirectory(mk('sh', ['run-tests.sh'], '/tmp/workspace')).type).toBe('other');
+    expect(describeRunnerDirectory(mk('gradle', ['test'], '/tmp/workspace')).type).toBe('other');
   });
 });
 

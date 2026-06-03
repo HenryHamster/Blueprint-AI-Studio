@@ -87,6 +87,38 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.noTestsExecuted).toBe(true);
   });
 
+  it('Go empty-package output → passed but noTestsExecuted=true', async () => {
+    execFileAsync.mockResolvedValue('?    example.com/foo [no test files]');
+
+    const goRunner: TestRunner = { cmd: 'go', args: ['test', './...'], cwd: '/tmp/workspace', label: 'go test (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [goRunner] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.noTestsExecuted).toBe(true);
+  });
+
+  it('Rust zero-test summary → passed but noTestsExecuted=true', async () => {
+    execFileAsync.mockResolvedValue([
+      'running 0 tests',
+      '',
+      'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s',
+    ].join('\n'));
+
+    const cargoRunner: TestRunner = { cmd: 'cargo', args: ['test'], cwd: '/tmp/workspace', label: 'cargo test (root)' };
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [cargoRunner] },
+    );
+
+    expect(result.passed).toBe(true);
+    expect(result.noTestsExecuted).toBe(true);
+  });
+
   it('a genuine test failure → noTestsExecuted is NOT set (real verification preserved)', async () => {
     execFileAsync.mockRejectedValue(
       new Error('Command failed: npm test\nTests  1 failed | 2 passed (3)\nAssertionError: expected 1 to equal 2'),

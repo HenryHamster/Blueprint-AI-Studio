@@ -5263,12 +5263,34 @@ async def orchestrator_worker():
                                     )
                                     continue
                                 # Terminal — read the latest verdict artifact.
+                                # Only a COMPLETED verify task carries a usable
+                                # verdict; a FAILED/CANCELLED one is treated as a
+                                # crash (``_verdict`` stays None → crash-retry).
                                 _verdict = None
                                 if _verify_task.status == TaskStatus.COMPLETED:
                                     _verdict = await _latest_artifact_logs(
                                         session,
                                         _verify_task.id,
                                         ArtifactType.MERGE_TEST_RESULT,
+                                    )
+                                # Peek (does NOT feed the verdict): a FAILED
+                                # verify task that posted setupFailed=true could
+                                # not run an EXISTING suite due to infra (dep
+                                # install / runner spawn), distinct from a cold
+                                # clone crash. Used only to label an
+                                # exhausted-retry UNVERIFIED merge for operators.
+                                _verify_setup_failed = False
+                                if _verify_task.status == TaskStatus.FAILED:
+                                    _failed_artifact = (
+                                        await _latest_artifact_logs(
+                                            session,
+                                            _verify_task.id,
+                                            ArtifactType.MERGE_TEST_RESULT,
+                                        )
+                                    )
+                                    _verify_setup_failed = bool(
+                                        isinstance(_failed_artifact, dict)
+                                        and _failed_artifact.get("setupFailed")
                                     )
                                 _outcome, _detail = (
                                     ci_resolution.classify_merge_test_verdict(
@@ -5340,6 +5362,52 @@ async def orchestrator_worker():
                                     )
                                     continue
                                 ci_loop["verify_tests_verdict"] = _outcome
+                                # Auto-heal a stale stored test command: when the
+                                # verify run discovered the stored command was
+                                # stale and ran a real replacement suite, persist
+                                # the corrected per-directory command back into the
+                                # project's build_config so FUTURE merges use it
+                                # instead of re-discovering it every poll. This is
+                                # additive and best-effort — it never alters the
+                                # pass/fail/undetected merge decision and runs
+                                # regardless of the replacement suite's outcome (a
+                                # recovered-but-failing suite still means the stored
+                                # command should be corrected).
+                                if isinstance(_verdict, dict) and _verdict.get(
+                                    "recovered"
+                                ):
+                                    _recovered_dirs = (
+                                        _verdict.get("recovered_directories") or []
+                                    )
+                                    if _recovered_dirs:
+                                        from app.build_config_detection import (
+                                            persist_recovered_test_command,
+                                        )
+
+                                        _recover_proj = await session.get(
+                                            Project, ci_task.project_id
+                                        )
+                                        if _recover_proj is not None:
+                                            _persisted = (
+                                                await persist_recovered_test_command(
+                                                    _recover_proj,
+                                                    session,
+                                                    _recovered_dirs,
+                                                )
+                                            )
+                                            if _persisted:
+                                                ci_loop["recovered_test_command"] = (
+                                                    _recovered_dirs
+                                                )
+                                                logger.info(
+                                                    f"[CI] PR #{ci_pr_number} no-CI "
+                                                    f"merge gate: stored test command "
+                                                    f"was stale — persisted recovered "
+                                                    f"command(s) for "
+                                                    f"{len(_recovered_dirs)} "
+                                                    f"directory(ies) to converge "
+                                                    f"build_config"
+                                                )
                                 if _outcome == "pass":
                                     logger.info(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "
@@ -5367,20 +5435,42 @@ async def orchestrator_worker():
                                         and _verify_retries
                                         >= _VERIFY_TESTS_MAX_RETRIES
                                     )
-                                    logger.warning(
-                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
-                                        + (
+                                    # A setup-failure crash (suite exists but
+                                    # could not run) gets a distinct operator
+                                    # reason from a cold-clone crash or a genuine
+                                    # no-suite repo, so the resulting UNVERIFIED
+                                    # merge is diagnosable.
+                                    if _crash_exhausted and _verify_setup_failed:
+                                        _reason_phrase = (
+                                            f"verify_tests setup failed and retries "
+                                            f"exhausted ({_verify_retries}/"
+                                            f"{_VERIFY_TESTS_MAX_RETRIES}) — could "
+                                            f"not run an existing suite"
+                                        )
+                                        _unverified_merge_reason = (
+                                            "verify_setup_failed"
+                                        )
+                                    elif _crash_exhausted:
+                                        _reason_phrase = (
                                             f"verify_tests crashed and retries "
                                             f"exhausted ({_verify_retries}/"
                                             f"{_VERIFY_TESTS_MAX_RETRIES})"
-                                            if _crash_exhausted
-                                            else "no test command detectable"
                                         )
+                                        _unverified_merge_reason = (
+                                            "undetected_runtime"
+                                        )
+                                    else:
+                                        _reason_phrase = "no test command detectable"
+                                        _unverified_merge_reason = (
+                                            "undetected_runtime"
+                                        )
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        + _reason_phrase
                                         + f" (verify_tests {_v_task_id[:8]} status="
                                         f"{_verify_task.status}) — merge proceeding "
                                         f"UNVERIFIED"
                                     )
-                                    _unverified_merge_reason = "undetected_runtime"
                                 ci_result = ci_resolution.build_no_ci_gate_ci_result(
                                     _outcome, _detail
                                 )

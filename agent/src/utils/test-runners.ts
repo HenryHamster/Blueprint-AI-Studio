@@ -395,6 +395,74 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
 }
 
 /**
+ * Auto-detect test runners against the cloned workspace ONLY, ignoring any
+ * stored project build_config.
+ *
+ * This is exactly the auto-detection fallback path that `detectTestRunners`
+ * runs when a stored build_config produces zero runners — surfaced as a named
+ * entry point so the no-CI merge gate can ask "what would we detect if there
+ * were no stored test command?" in order to self-heal a STALE stored command
+ * (renamed/removed suite, dropped Makefile target, deleted npm `test` script).
+ *
+ * Inspects only the local filesystem (the already-cloned workspace), so there
+ * is zero GitHub-API cost. `detectTestRunners` behaviour for every existing
+ * caller is byte-for-byte unchanged — this is purely additive.
+ */
+export function detectAutoTestRunners(): TestRunner[] {
+  return detectTestRunners(undefined);
+}
+
+/**
+ * Map a detected `TestRunner` back to a project build_config directory entry
+ * (repo-root-relative path, language type, reconstructed test command) so the
+ * backend can converge a stale stored config onto the suite that actually ran.
+ * Used to populate `recovered_directories` on the MERGE_TEST_RESULT verdict.
+ */
+export function describeRunnerDirectory(runner: TestRunner): { path: string; type: string; test_cmd: string } {
+  // Relative path from repo root: strip the WORKSPACE prefix; root → ''.
+  let path = runner.cwd;
+  if (path === WORKSPACE) {
+    path = '';
+  } else if (path.startsWith(`${WORKSPACE}/`)) {
+    path = path.slice(WORKSPACE.length + 1);
+  }
+  return { path, type: runnerKindFromCmd(runner.cmd), test_cmd: [runner.cmd, ...runner.args].join(' ') };
+}
+
+/** Derive a coarse language/runner kind from a runner's command.
+ *
+ *  The returned value MUST stay within the BuildConfigDirectoryEntry.type enum
+ *  (`^(python|node|go|rust|other)$` in backend/app/schemas.py) — a recovered
+ *  directory entry is appended verbatim to build_config and re-validated by the
+ *  backend (and by a later operator PATCH /build_config), so an out-of-enum
+ *  value (make/shell/unknown) would fail BuildConfigSchema validation and force
+ *  the raw-store fallback, persisting a schema-invalid config. Anything without
+ *  a dedicated language bucket (make targets, `bash`/`sh` script suites, or an
+ *  unrecognized command) collapses to the catch-all `other`. */
+function runnerKindFromCmd(cmd: string): string {
+  switch (cmd) {
+    case 'python3':
+    case 'python':
+    case 'pytest':
+    case 'tox':
+    case 'nox':
+      return 'python';
+    case 'npm':
+    case 'yarn':
+    case 'pnpm':
+      return 'node';
+    case 'go':
+      return 'go';
+    case 'cargo':
+      return 'rust';
+    default:
+      // make targets, bash/sh script suites, and any unrecognized command have
+      // no dedicated language bucket — map to the schema-valid catch-all.
+      return 'other';
+  }
+}
+
+/**
  * Classify whether a test runner's output indicates that real tests actually
  * executed, or that the command was a placeholder / collected zero tests.
  *
@@ -416,6 +484,7 @@ export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
  */
 export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   const lower = output.toLowerCase();
+  const lines = output.split(/\r?\n/);
   // npm placeholder: the default `package.json` test script prints
   // "Error: no test specified" and exits 1 without running anything.
   if (lower.includes('no test specified')) return 'no_tests';
@@ -432,6 +501,31 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   if (lower.includes('collected 0 items')) return 'no_tests';
   // vitest: "No test files found, exiting with code 1".
   if (lower.includes('no test files found')) return 'no_tests';
+  // Go: `go test` on an empty package reports `? pkg [no test files]`.
+  // The default reporter also emits `ok pkg ...` lines when real tests ran,
+  // so only classify as no_tests when every observed package line is empty or
+  // explicitly filtered out with `[no tests to run]`.
+  {
+    const goResults = lines.filter(line => /^\s*(?:\?\s+\S+\s+\[no test files\]|ok\s+\S+)/i.test(line));
+    if (goResults.length > 0) {
+      const sawRealGoPass = goResults.some(line => /^ok\s+\S+/.test(line) && !/\[no tests to run\]/i.test(line));
+      if (sawRealGoPass) return 'ran';
+      return 'no_tests';
+    }
+  }
+  // Go / Rust filtered-out suites can emit "no tests to run" without a real
+  // test body executing.
+  if (lower.includes('no tests to run')) return 'no_tests';
+  // Rust: zero-test runs emit a zero-count summary. Require the summary and
+  // the `running 0 tests` header, while excluding any non-zero run counts so
+  // mixed suites still count as real verification.
+  if (
+    lower.includes('running 0 tests') &&
+    lower.includes('test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out') &&
+    !/\brunning [1-9]\d* test(s)?\b/.test(lower)
+  ) {
+    return 'no_tests';
+  }
   return 'ran';
 }
 
