@@ -1292,6 +1292,7 @@ def _render_renumber_plan_section(
     new_revision = plan.get("new_revision")
     new_down_revision = plan.get("new_down_revision")
     expected_schema_revision = plan.get("expected_schema_revision")
+    upserts = plan.get("upserts") or {}
     return (
         f"## Known-good renumber plan (verify, then apply)\n"
         f"The system already computed and chain-validated the exact mechanical "
@@ -1310,8 +1311,13 @@ def _render_renumber_plan_section(
         f"- Rechain the immediate descendant (if any) onto `{new_revision}`.\n"
         f"- Bump `EXPECTED_SCHEMA_REVISION` in `backend/app/main.py` to "
         f"`{expected_schema_revision}` (the resulting single head).\n"
-        f"- The full structured plan (including the rewritten file sources) is in "
-        f"this task's `context['backmerge_renumber_plan']`.\n\n"
+        f"## Rewritten migration sources\n"
+        f"Use these exact file bodies if the live branch still matches the "
+        f"precomputed plan:\n"
+        + "".join(
+            f"### `{path}`\n```python\n{source}\n```\n\n"
+            for path, source in upserts.items()
+        )
     )
 
 

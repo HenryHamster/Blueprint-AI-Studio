@@ -1636,6 +1636,8 @@ async def test_backmerge_single_collision_embeds_renumber_plan(db_session, mocke
     assert "0003" in prompt  # the new revision id
     assert "0002_feature.py" in prompt  # the file being renamed
     assert "EXPECTED_SCHEMA_REVISION" in prompt
+    for rewritten_source in expected_plan["upserts"].values():
+        assert rewritten_source in prompt
     # Presented as a verify-then-apply candidate, not a blind apply.
     assert "verify" in prompt.lower()
 
