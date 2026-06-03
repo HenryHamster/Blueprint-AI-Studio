@@ -7272,6 +7272,11 @@ async def test_agent_status_post_commit_resolves_engine_from_none_bind_session(
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
     async def _process_post_commit(task_id, _payload, _session_factory):
+        async with _session_factory() as session:
+            assert await session.get(Task, task_id), (
+                "resolved post-commit session factory must load the task even "
+                "when the request session exposes bind=None"
+            )
         return {"status": "accepted", "task_id": str(task_id)}
 
     mocker.patch(
