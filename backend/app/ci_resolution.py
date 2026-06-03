@@ -127,6 +127,62 @@ def has_detectable_tests(project) -> bool:
     return False
 
 
+def compute_merge_verification_verdict(project) -> dict[str, Any]:
+    """Read-only advisory describing what the no-CI merge gate will do for a
+    project's normal (non-staging-base) PRs — display data for the operator,
+    NOT a live decision input.
+
+    The verdict is computed purely from the project's persisted
+    ``build_config`` by REUSING this module's existing gate predicates
+    (:func:`requires_ci_checks` and :func:`has_detectable_tests`); it never
+    re-implements test detection.  The three mutually-exclusive states follow
+    the same precedence the gate itself uses:
+
+      - ``"ci_checks"`` — :func:`requires_ci_checks` is True (the default):
+        merges wait for the repository's GitHub required CI checks.
+      - ``"tests_gated"`` — ``requires_ci_checks`` is False AND
+        :func:`has_detectable_tests` is True: the repo's own detected test
+        command(s) run on the PR head as the merge verdict.  ``test_commands``
+        lists each non-empty ``build_config.directories[].test_cmd`` paired
+        with its directory ``path`` (in stored order).
+      - ``"unverified"`` — ``requires_ci_checks`` is False AND no detectable
+        tests: PRs merge with no test verification at all.
+
+    Returns
+    -------
+    A stable, JSON-serializable dict::
+
+        {"state": "ci_checks" | "tests_gated" | "unverified",
+         "test_commands": [{"path": str, "test_cmd": str}, ...]}
+
+    ``test_commands`` is ``[]`` for every state except ``"tests_gated"``.
+
+    Handles ``project is None`` / missing ``build_config`` defensively
+    (mirroring :func:`has_detectable_tests`): a ``None`` project yields the
+    CI-gated default shape, matching ``requires_ci_checks``'s default-True
+    semantics, and never raises.
+    """
+    if requires_ci_checks(project):
+        return {"state": "ci_checks", "test_commands": []}
+
+    if has_detectable_tests(project):
+        build_config = getattr(project, "build_config", None) or {}
+        directories = build_config.get("directories") or []
+        test_commands: list[dict[str, str]] = []
+        for d in directories:
+            if not isinstance(d, dict):
+                continue
+            test_cmd = str(d.get("test_cmd") or "").strip()
+            if not test_cmd:
+                continue
+            test_commands.append(
+                {"path": str(d.get("path") or ""), "test_cmd": test_cmd}
+            )
+        return {"state": "tests_gated", "test_commands": test_commands}
+
+    return {"state": "unverified", "test_commands": []}
+
+
 def should_run_no_ci_test_gate(project, branch: str | None, *, gate_enabled: bool) -> bool:
     """Whether a definitive ``no_checks`` PR should be gated on a ``verify_tests``
     verdict (run the repo's detected suite on the PR head) instead of taking the

@@ -1538,6 +1538,119 @@ class TestBuildConfigDetection:
 
         assert config["repo_is_empty"] is True
 
+    @pytest.mark.asyncio
+    async def test_detect_build_config_has_ci_true_when_workflows_present(self):
+        """A workflow file under .github/workflows => has_ci True."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [{"name": ".github", "type": "dir"}]
+
+        github_resp = MagicMock()
+        github_resp.status_code = 200
+        github_resp.json.return_value = [{"name": "workflows", "type": "dir"}]
+
+        workflows_resp = MagicMock()
+        workflows_resp.status_code = 200
+        workflows_resp.json.return_value = [
+            {"name": "ci.yml", "type": "file"},
+            {"name": "README.md", "type": "file"},
+        ]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, github_resp, workflows_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["has_ci"] is True
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_has_ci_true_for_yaml_extension(self):
+        """A .yaml (not .yml) workflow still flips has_ci True."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [{"name": ".github", "type": "dir"}]
+
+        github_resp = MagicMock()
+        github_resp.status_code = 200
+        github_resp.json.return_value = [{"name": "workflows", "type": "dir"}]
+
+        workflows_resp = MagicMock()
+        workflows_resp.status_code = 200
+        workflows_resp.json.return_value = [{"name": "deploy.yaml", "type": "file"}]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, github_resp, workflows_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["has_ci"] is True
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_has_ci_false_when_no_workflows_dir(self):
+        """A fully-read repo with no .github/workflows => has_ci False."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [{"name": "pyproject.toml", "type": "file"}]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["has_ci"] is False
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_has_ci_false_when_workflows_dir_empty(self):
+        """A read .github/workflows with no yml/yaml files => has_ci False."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [{"name": ".github", "type": "dir"}]
+
+        github_resp = MagicMock()
+        github_resp.status_code = 200
+        github_resp.json.return_value = [{"name": "workflows", "type": "dir"}]
+
+        workflows_resp = MagicMock()
+        workflows_resp.status_code = 200
+        workflows_resp.json.return_value = [{"name": "README.md", "type": "file"}]
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, github_resp, workflows_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["has_ci"] is False
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_has_ci_none_when_read_incomplete(self):
+        """An incomplete walk never asserts no-CI => has_ci None."""
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = [{"name": "backend", "type": "dir"}]
+
+        # The backend/ subdir listing fails to fetch, so the walk is incomplete
+        # and we cannot rule out a workflow living under an unread path.
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 502
+        subdir_resp.json.return_value = {}
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["has_ci"] is None
+
 
 class TestMaybeRefreshEmptyBuildConfig:
     """Auto-refresh of an empty stored build_config once a repo gains structure."""

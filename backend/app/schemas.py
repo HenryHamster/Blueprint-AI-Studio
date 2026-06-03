@@ -333,6 +333,17 @@ class BuildConfig(BaseModel):
     # agree. Default False so pre-existing projects (and any repo with detected
     # source) degrade gracefully.
     repo_is_empty: bool = False
+    # Tri-state CI-presence signal computed at onboarding/re-detect from the
+    # already-fetched ``.github/workflows`` listing during build-config detection
+    # (see ``admin_onboard._detect_build_config``). True = a GitHub Actions
+    # workflow file was observed; False = the bounded repo walk completed and
+    # found none; None = the read was incomplete/undetected (legacy stored
+    # configs also have None). Surfaced read-only in the UI to warn operators
+    # that a no-CI repo left with ``requires_ci_checks`` ON will stall PRs.
+    # ``model_dump(exclude_none=True)`` drops the key when None so legacy configs
+    # round-trip unchanged. This is detection/guidance only — it never auto-flips
+    # ``requires_ci_checks``.
+    has_ci: bool | None = None
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.

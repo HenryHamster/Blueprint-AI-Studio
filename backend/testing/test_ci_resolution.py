@@ -92,6 +92,85 @@ def test_has_detectable_tests_none_project():
     assert ci_resolution.has_detectable_tests(None) is False
 
 
+# compute_merge_verification_verdict — read-only operator advisory. Must REUSE
+# requires_ci_checks / has_detectable_tests and agree with them.
+
+
+def test_verdict_ci_checks_when_requires_ci_default():
+    # Default project (requires_ci_checks True) → merges wait for GitHub CI.
+    p = _proj()
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict == {"state": "ci_checks", "test_commands": []}
+    # Agrees with the gate predicate.
+    assert ci_resolution.requires_ci_checks(p) is True
+
+
+def test_verdict_ci_checks_even_with_detectable_tests():
+    # requires_ci_checks True takes precedence over present test commands.
+    p = _proj(
+        {"directories": [{"path": "backend/", "test_cmd": "python3 -m pytest"}]}
+    )
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict["state"] == "ci_checks"
+    assert verdict["test_commands"] == []
+
+
+def test_verdict_tests_gated_collects_commands():
+    # requires_ci_checks False + detectable tests → tests_gated, only non-empty
+    # test_cmd values returned with their path, stored order preserved.
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "directories": [
+                {"path": "backend/", "test_cmd": "python3 -m pytest"},
+                {"path": "ui/", "test_cmd": "   "},
+                {"path": "agent/", "test_cmd": "npm test"},
+            ],
+        }
+    )
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict["state"] == "tests_gated"
+    assert verdict["test_commands"] == [
+        {"path": "backend/", "test_cmd": "python3 -m pytest"},
+        {"path": "agent/", "test_cmd": "npm test"},
+    ]
+    # The verdict agrees with the gate predicates.
+    assert ci_resolution.requires_ci_checks(p) is False
+    assert ci_resolution.has_detectable_tests(p) is True
+
+
+def test_verdict_tests_gated_handles_missing_path():
+    p = _proj(
+        {
+            "requires_ci_checks": False,
+            "directories": [{"test_cmd": "go test ./..."}],
+        }
+    )
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict["state"] == "tests_gated"
+    assert verdict["test_commands"] == [{"path": "", "test_cmd": "go test ./..."}]
+
+
+def test_verdict_unverified_when_no_tests():
+    # requires_ci_checks False + no runnable suite → PRs merge UNVERIFIED.
+    p = _proj({"requires_ci_checks": False, "directories": [{"path": "x/"}]})
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict == {"state": "unverified", "test_commands": []}
+    assert ci_resolution.has_detectable_tests(p) is False
+
+
+def test_verdict_none_project_is_stable_default_shape():
+    # None project → CI-gated default, no raise (mirrors requires_ci_checks).
+    verdict = ci_resolution.compute_merge_verification_verdict(None)
+    assert verdict == {"state": "ci_checks", "test_commands": []}
+
+
+def test_verdict_missing_build_config_is_safe():
+    p = _proj(None)
+    verdict = ci_resolution.compute_merge_verification_verdict(p)
+    assert verdict == {"state": "ci_checks", "test_commands": []}
+
+
 # should_run_no_ci_test_gate — the orchestrator's gating decision
 
 

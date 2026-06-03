@@ -1322,6 +1322,44 @@ class TestApplyOperatorBuildConfigOverrides:
         assert merged["stale_branch_prefixes"] == []
         assert merged["protected_branches"] == []
 
+    def test_has_ci_is_repo_derived_not_overridden(self):
+        """has_ci is computed fresh from the repo each detect, so the override
+        merge must keep the freshly detected value and never resurrect a stale
+        stored one (stored has_ci=True must not survive a re-detect that now
+        sees no CI)."""
+        from app.build_config_detection import (
+            apply_operator_build_config_overrides,
+        )
+
+        # Fresh detection says no CI; the stored config still claims True.
+        merged = apply_operator_build_config_overrides(
+            {"language": "python", "has_ci": False},
+            {"has_ci": True, "requires_ci_checks": False},
+        )
+        assert merged["has_ci"] is False
+        # Operator-owned requires_ci_checks is still carried forward.
+        assert merged["requires_ci_checks"] is False
+
+    def test_has_ci_round_trips_through_schema(self):
+        """has_ci survives BuildConfig validation; None is dropped by
+        exclude_none=True so legacy/undetected configs round-trip unchanged."""
+        from app.schemas import BuildConfig as BuildConfigSchema
+
+        assert (
+            BuildConfigSchema(has_ci=True).model_dump(exclude_none=True)["has_ci"]
+            is True
+        )
+        assert (
+            BuildConfigSchema(has_ci=False).model_dump(exclude_none=True)["has_ci"]
+            is False
+        )
+        # None => undetected => key dropped on serialization.
+        assert "has_ci" not in BuildConfigSchema(has_ci=None).model_dump(
+            exclude_none=True
+        )
+        # Default is None (legacy stored configs validate unchanged).
+        assert BuildConfigSchema().has_ci is None
+
     def test_falsey_git_identity_not_preserved(self):
         """git_user_* use a truthy check, so empty values do not override."""
         from app.build_config_detection import (

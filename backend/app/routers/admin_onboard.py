@@ -21,6 +21,7 @@ from app.database import get_session
 from app.shared_state import limiter
 from app.models import Project, ProjectMember, ProjectStatus, ProjectMessage, MessageType
 from app.auth import get_current_user, require_admin
+from app.ci_resolution import compute_merge_verification_verdict
 from app.schemas import OnboardPayload
 from app.task_locking import with_design_doc_locked
 
@@ -92,6 +93,17 @@ _NON_SOURCE_FILE_PREFIXES = (
 )
 _BUILD_CONFIG_SCAN_MAX_DEPTH = 2
 _BUILD_CONFIG_SCAN_MAX_DIRECTORIES = 40
+
+
+def _is_ci_workflow_file(name: str) -> bool:
+    """True when a filename under ``.github/workflows`` is a GitHub Actions workflow.
+
+    GitHub only executes ``*.yml`` / ``*.yaml`` files placed directly in
+    ``.github/workflows`` as Actions workflows, so the presence of any such file
+    is the deterministic signal that the repository has CI configured.
+    """
+    base = name.rsplit("/", 1)[-1].strip().lower()
+    return base.endswith(".yml") or base.endswith(".yaml")
 
 
 def _is_real_source_file(name: str) -> bool:
@@ -295,6 +307,11 @@ async def _detect_build_config(
     # or scan-cap truncation flips this to False so the repo is not falsely
     # classified as greenfield from a partial walk.
     listing_complete = True
+    # Whether the bounded walk positively observed a GitHub Actions workflow
+    # file under ``.github/workflows``. ``.github`` is a root dir (depth 1) and
+    # ``.github/workflows`` is reached at depth 2, within the scan bounds, so a
+    # normal walk reads it for free alongside build-config detection.
+    ci_workflow_found = False
     _detect_projects_in_listing("", root_listing, directories, languages)
 
     pending_dirs = deque(
@@ -339,6 +356,13 @@ async def _detect_build_config(
         sub_listing = [item for item in sub_resp.json() if isinstance(item, dict)]
         scanned_directories += 1
         source_items.extend(sub_listing)
+        if subdir == ".github/workflows" and any(
+            item.get("type") == "file"
+            and isinstance(item.get("name"), str)
+            and _is_ci_workflow_file(item["name"])
+            for item in sub_listing
+        ):
+            ci_workflow_found = True
         _detect_projects_in_listing(subdir, sub_listing, directories, languages)
 
         child_dirs = sorted(
@@ -375,6 +399,17 @@ async def _detect_build_config(
             source_items, listing_complete=listing_complete
         ),
     }
+
+    # Tri-state CI-presence signal derived from the same bounded walk (zero
+    # extra GitHub cost): True when a workflow file was observed; False when the
+    # walk completed without finding one; None (undetermined) when the read was
+    # incomplete, so the absence of CI is never asserted from a partial walk.
+    if ci_workflow_found:
+        config["has_ci"] = True
+    elif listing_complete:
+        config["has_ci"] = False
+    else:
+        config["has_ci"] = None
 
     return config
 
@@ -635,4 +670,5 @@ async def onboard_project(
         "project_id": str(project.id),
         "build_config": project.build_config or {},
         "default_branch": default_branch,
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
     }

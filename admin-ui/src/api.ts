@@ -2,6 +2,7 @@ import { getIdToken } from './firebase';
 import type { SrMissedTask } from './components/SrRetrospectiveShared';
 import type { WarmPoolTargets, WarmPoolTargetSetResponse } from './types/warmVm';
 import type { ProblemModelPatch } from './types';
+import type { MergeVerificationVerdict } from './types/project';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -728,7 +729,13 @@ export async function onboardProject(
   promotionTarget?: string,
   goal?: string,
   initialSteering?: Pick<ProblemModelPatch, 'context' | 'constraints'>,
-): Promise<{ project_id: string; build_config: Record<string, unknown> }> {
+): Promise<{
+  project_id: string;
+  build_config: Record<string, unknown>;
+  default_branch?: string;
+  /** Backend-computed merge-gate verdict for the freshly-onboarded repo (sibling of build_config). */
+  merge_verification_verdict?: MergeVerificationVerdict;
+}> {
   const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
   if (name) body.name = name;
   if (buildConfigOverride) body.build_config_override = buildConfigOverride;

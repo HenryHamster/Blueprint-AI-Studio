@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
-import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag } from 'lucide-react';
+import { X, GitBranch, Loader2, CheckCircle, Plus, Search, ArrowRight, Wrench, Zap, Tag, AlertTriangle } from 'lucide-react';
 import { onboardProject, authGet, apiFetch, API_BASE_URL } from '../api';
-import type { BuildConfig, AutoRemediationConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, MergeVerificationVerdict } from '../types/project';
 import type { ProblemModelPatch } from '../types';
+import { MergeVerificationBanner } from './MergeVerificationBanner';
 
 interface IssueImplementationConfig {
   enabled: boolean;
@@ -90,6 +91,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
   const [submitError, setSubmitError] = useState('');
   const [createdProjectId, setCreatedProjectId] = useState(setupProject?.id ?? '');
   const [detectedConfig, setDetectedConfig] = useState<BuildConfig | null>(null);
+  const [detectedVerdict, setDetectedVerdict] = useState<MergeVerificationVerdict | null>(null);
 
   // Repo picker state
   const [detectedDefaultBranch, setDetectedDefaultBranch] = useState('');
@@ -200,6 +202,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
       const projectId = data.project_id;
       setCreatedProjectId(projectId);
       setDetectedConfig((data.build_config as BuildConfig) || null);
+      setDetectedVerdict(data.merge_verification_verdict ?? null);
       setDetectedDefaultBranch((data as Record<string, unknown>).default_branch as string || '');
       setStep('success');
       onSuccess(projectId);
@@ -732,6 +735,50 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                       No build configuration detected. Configure it in project settings.
                     </p>
                   ) : null}
+
+                  {/* CI-presence pre-flight (detection + guidance only). */}
+                  {detectedConfig.has_ci === true && (
+                    <div
+                      data-testid="ci-status-banner"
+                      className="mt-2 flex items-start gap-2 text-[11px] text-emerald-400 bg-emerald-950/30 border border-emerald-900/50 rounded-lg px-3 py-2"
+                    >
+                      <CheckCircle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                      <span>
+                        CI detected (GitHub Actions workflows present) — merges will be gated on the
+                        repository's CI checks.
+                      </span>
+                    </div>
+                  )}
+                  {detectedConfig.has_ci === false && (
+                    <div
+                      data-testid="ci-status-banner"
+                      className="mt-2 flex items-start gap-2 text-[11px] text-amber-400 bg-amber-950/30 border border-amber-900/50 rounded-lg px-3 py-2"
+                    >
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+                      <span>
+                        No CI detected. With "required CI checks" left on, PRs will stall waiting for
+                        checks that never arrive. Turn it off in project settings so merges are gated on
+                        this repo's detected tests instead.
+                        {detectedConfig.directories?.some(d => d.test_cmd?.trim()) ? (
+                          <span className="block mt-1 text-emerald-400">
+                            A test command is configured — the no-CI gate will run tests as the merge verdict.
+                          </span>
+                        ) : (
+                          <span className="block mt-1 text-amber-300">
+                            No test command detected — PRs would merge UNVERIFIED. Add one in settings before
+                            relying on the gate.
+                          </span>
+                        )}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Merge-gate verdict — tells the operator whether merges run tests or fall open to UNVERIFIED. */}
+              {detectedVerdict && (
+                <div className="mb-4">
+                  <MergeVerificationBanner verdict={detectedVerdict} />
                 </div>
               )}
 

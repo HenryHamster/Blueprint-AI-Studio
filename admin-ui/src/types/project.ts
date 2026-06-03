@@ -46,11 +46,42 @@ export interface BuildConfig {
    *  (the merge gate waits for required checks). False means the repo has no required
    *  CI checks and a definitive absence of checks is treated as "CI not applicable". */
   requires_ci_checks?: boolean;
+  /** Tri-state CI-presence signal derived from `.github/workflows` during build-config
+   *  detection. `true` = a GitHub Actions workflow file was found (merges will be CI-gated);
+   *  `false` = the repo walk completed and found none (no CI — PRs will stall unless
+   *  `requires_ci_checks` is turned off); `null`/undefined = undetected/legacy. Read-only:
+   *  detection + guidance only, never auto-flips `requires_ci_checks`. */
+  has_ci?: boolean | null;
 }
 
 export interface StagingBranchPrefixesConfig {
   staging_branch_prefixes: string[];
   is_default: boolean;
+}
+
+/** A directory path paired with the test command the no-CI merge gate would run there. */
+export interface MergeVerificationTestCommand {
+  path: string;
+  test_cmd: string;
+}
+
+/**
+ * Read-only, backend-computed verdict describing what Blueprint's merge gate will
+ * do for a project's normal PRs — the single source of truth the UI renders so it
+ * can never drift from the actual gate. Attached as a sibling of `build_config` on
+ * the onboard, project-detail, list, update, and re-detect responses.
+ *
+ *  - `ci_checks`    — merges wait for the repository's required GitHub CI checks.
+ *  - `tests_gated`  — `requires_ci_checks` is off AND a test command was detected;
+ *                     each `test_commands` entry runs on the PR head as the verdict.
+ *  - `unverified`   — `requires_ci_checks` is off and no test command was detected;
+ *                     PRs merge with no test verification at all.
+ *
+ * `test_commands` is non-empty only for the `tests_gated` state.
+ */
+export interface MergeVerificationVerdict {
+  state: 'ci_checks' | 'tests_gated' | 'unverified';
+  test_commands: MergeVerificationTestCommand[];
 }
 
 export interface Project {
@@ -74,6 +105,9 @@ export interface Project {
   created_at: string;
   my_role?: 'owner' | 'member' | 'viewer';
   build_config?: BuildConfig | null;
+  /** Backend-computed merge-gate verdict (sibling of `build_config`). Present on
+   *  the list and detail endpoints; optional/additive so older responses omit it. */
+  merge_verification_verdict?: MergeVerificationVerdict;
   is_self_repo?: boolean;
   sr_catch_rate_targets?: Record<string, number>;
 }

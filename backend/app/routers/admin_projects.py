@@ -34,6 +34,7 @@ from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app.build_config_lint import build_config_lint_warnings
+from app.ci_resolution import compute_merge_verification_verdict
 
 router = APIRouter(
     prefix="/api/admin",
@@ -126,6 +127,7 @@ async def get_all_projects(
                     row.build_config or {}, row.my_role
                 ),
                 "build_config_warnings": build_config_lint_warnings(row.build_config),
+                "merge_verification_verdict": compute_merge_verification_verdict(row),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
                 "running_update_acknowledged_at": (
                     row.running_update_acknowledged_at.isoformat()
@@ -183,6 +185,7 @@ async def get_project(
         "self_reflection_log": project.self_reflection_log or [],
         "build_config": _redact_build_config(project.build_config or {}, role),
         "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
         "autonomous_enabled": project.autonomous_enabled,
         "paused": project.paused,
         "is_self_repo": project.is_self_repo,
@@ -489,6 +492,7 @@ async def update_project(
     # build_config so the value reflects what was actually persisted.
     response = project.model_dump()
     response["build_config_warnings"] = build_config_lint_warnings(project.build_config)
+    response["merge_verification_verdict"] = compute_merge_verification_verdict(project)
     return response
 
 
@@ -554,6 +558,7 @@ async def detect_project_build_config(
     return {
         "build_config": project.build_config or {},
         "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
     }
 
 
