@@ -166,13 +166,13 @@ async def _attempt_alembic_autoreconcile(
         )
         return False
 
-    upserts = {
-        plan["new_path"]: plan["new_source"],
-        "backend/app/main.py": new_main_text,
-    }
-    # Renumber always changes the NNNN prefix, so old_path != new_path; delete the
-    # original file so the rename is clean (one head, no duplicate revision).
-    deletes = [plan["old_path"]] if plan["old_path"] != plan["new_path"] else []
+    # The plan renumbers the colliding migration AND its entire linear
+    # descendant tail (one entry per renamed file in ``upserts``/``deletes``);
+    # merge the rewritten main.py into the upserts. Renumber always changes the
+    # NNNN prefix, so every old path is deleted so the rename is clean (one head,
+    # no duplicate revision).
+    upserts = {**plan["upserts"], "backend/app/main.py": new_main_text}
+    deletes = list(plan["deletes"])
     try:
         await commit_file_changes(
             gh_token,

@@ -559,21 +559,31 @@ def test_plan_reconciliation_collision_renumbers_and_rechains():
         validate_combined_migration_chain(existing, {plan["new_path"]: plan["new_source"]})
         is None
     )
+    # The single-migration plan also exposes the unified upserts/deletes shape:
+    # one renamed file in each.
+    assert plan["deletes"] == ["backend/alembic/versions/0137_new.py"]
+    assert set(plan["upserts"]) == {"backend/alembic/versions/0138_new.py"}
+    assert plan["upserts"][plan["new_path"]] == plan["new_source"]
 
 
 def test_plan_reconciliation_stale_anchor_rechains():
     """A single migration anchored to a no-longer-head revision is rechained
-    onto the current head (and renumbered to the next free revision)."""
+    onto the current head and renumbered into the contiguous block strictly
+    above every existing revision (the unified ``max(all)+1`` rule shared with
+    the back-merge planner), so the renumber can never collide with the added
+    migration's own slot."""
     existing = ["0136_prev.py", "0137_other.py"]
     added = {
         "backend/alembic/versions/0138_new.py": _migration_src("0138", "0136"),
     }
     plan = plan_migration_reconciliation(existing, added)
     assert plan is not None
-    assert plan["new_revision"] == "0138"
+    # max(existing | added) == 0138, so the root renumbers to 0139, rechained
+    # onto the current head 0137.
+    assert plan["new_revision"] == "0139"
     assert plan["new_down_revision"] == "0137"
     rev, down = parse_revision_identifiers(plan["new_source"])
-    assert (rev, down) == ("0138", "0137")
+    assert (rev, down) == ("0139", "0137")
 
 
 def test_plan_reconciliation_already_valid_returns_none():
@@ -585,12 +595,128 @@ def test_plan_reconciliation_already_valid_returns_none():
     assert plan_migration_reconciliation(existing, added) is None
 
 
-def test_plan_reconciliation_multiple_added_returns_none():
-    """Multiple added migrations are never auto-reconciled (ambiguous)."""
+def test_plan_reconciliation_multiple_added_already_clean_returns_none():
+    """Several chained added migrations that already extend the head cleanly (no
+    collision, root anchored to the head) need no plan."""
     existing = ["0136_prev.py", "0137_head.py"]
     added = {
         "backend/alembic/versions/0138_a.py": _migration_src("0138", "0137"),
         "backend/alembic/versions/0139_b.py": _migration_src("0139", "0138"),
+    }
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_multi_migration_collision_renumbers_full_tail_monotonic():
+    """A rollup bundling several chained migrations whose oldest collides with the
+    target head: the colliding root AND its full linear descendant tail are
+    renumbered monotonically into a contiguous block above every existing
+    revision, each rechained onto its renumbered predecessor (root onto the
+    head)."""
+    # Branch-time head was 0123; subtasks cut 0124 (down 0123) and 0125 (down
+    # 0124). Meanwhile the target advanced to head 0124, so the rollup's oldest
+    # migration 0124 now collides and its anchor 0123 is stale.
+    existing = ["0123_base.py", "0124_taken.py"]
+    added = {
+        "backend/alembic/versions/0124_a.py": _migration_src("0124", "0123"),  # root
+        "backend/alembic/versions/0125_b.py": _migration_src("0125", "0124"),  # tail
+    }
+    plan = plan_migration_reconciliation(existing, added)
+    assert plan is not None
+    # Root 0124 renumbered to max(all)+1 == 0126, rechained onto the head 0124.
+    assert plan["old_revision"] == "0124"
+    assert plan["new_revision"] == "0126"
+    assert plan["new_down_revision"] == "0124"
+    assert plan["old_path"] == "backend/alembic/versions/0124_a.py"
+    assert plan["new_path"] == "backend/alembic/versions/0126_a.py"
+    # deletes: BOTH old paths being renamed away (in chain order).
+    assert plan["deletes"] == [
+        "backend/alembic/versions/0124_a.py",
+        "backend/alembic/versions/0125_b.py",
+    ]
+    # upserts: BOTH renamed/renumbered files — the full tail moved up.
+    assert set(plan["upserts"]) == {
+        "backend/alembic/versions/0126_a.py",
+        "backend/alembic/versions/0127_b.py",
+    }
+    root_rev, root_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0126_a.py"]
+    )
+    assert (root_rev, root_down) == ("0126", "0124")
+    tail_rev, tail_down = parse_revision_identifiers(
+        plan["upserts"]["backend/alembic/versions/0127_b.py"]
+    )
+    assert (tail_rev, tail_down) == ("0127", "0126")
+    assert plan["expected_schema_revision"] == "0127"
+    # The full reconciled added set revalidates clean against the target.
+    reconciled = {
+        p: s for p, s in added.items() if p not in plan["deletes"]
+    }
+    reconciled.update(plan["upserts"])
+    assert validate_combined_migration_chain(existing, reconciled) is None
+    # Monotonicity property: the numeric-max revision IS the structural head.
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    assert max(reconciled_chain, key=int) == find_heads(reconciled_chain)[0]
+    assert max(int(r) for r in reconciled_chain) == int(
+        plan["expected_schema_revision"]
+    )
+
+
+def test_plan_reconciliation_multi_migration_chain_is_monotonic():
+    """Explicit regression: for the multi-migration tail case every reconciled
+    node points strictly downward (int(revision) > int(down_revision)) and the
+    numeric-max revision equals the single structural head."""
+    existing = ["0123_base.py", "0124_taken.py"]
+    added = {
+        "backend/alembic/versions/0124_a.py": _migration_src("0124", "0123"),
+        "backend/alembic/versions/0125_b.py": _migration_src("0125", "0124"),
+        "backend/alembic/versions/0126_c.py": _migration_src("0126", "0125"),
+    }
+    plan = plan_migration_reconciliation(existing, added)
+    assert plan is not None
+    reconciled = {p: s for p, s in added.items() if p not in plan["deletes"]}
+    reconciled.update(plan["upserts"])
+    reconciled_chain, _dups, _unp = build_migration_chain(reconciled)
+    for rev, down in reconciled_chain.items():
+        if down is not None and down in reconciled_chain:
+            assert int(rev) > int(down), f"{rev} <- {down} is not monotonic"
+    heads = find_heads(reconciled_chain)
+    assert len(heads) == 1
+    assert max(reconciled_chain, key=int) == heads[0]
+
+
+def test_plan_reconciliation_multiple_independent_collisions_returns_none():
+    """Two added migrations that each independently collide but do NOT form one
+    linear chain (two roots, two heads) are ambiguous — no plan."""
+    existing = ["0136_x.py", "0137_y.py"]
+    added = {
+        # Both anchor externally to 0135 (not in the added set) → two roots,
+        # two heads; each collides with an existing revision.
+        "backend/alembic/versions/0136_a.py": _migration_src("0136", "0135"),
+        "backend/alembic/versions/0137_b.py": _migration_src("0137", "0135"),
+    }
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_fanout_returns_none():
+    """A colliding root with more than one child is a fan-out, not a single
+    linear chain. In Alembic's single-parent model a fan-out surfaces as two
+    Alembic heads, so it is rejected (no plan) — the same ambiguity the
+    back-merge fan-out guard rejects."""
+    existing = ["0136_prev.py", "0137_head.py"]
+    added = {
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),  # root, collides
+        "backend/alembic/versions/0138_d.py": _migration_src("0138", "0137"),  # child A → head
+        "backend/alembic/versions/0139_e.py": _migration_src("0139", "0137"),  # child B → head
+    }
+    assert plan_migration_reconciliation(existing, added) is None
+
+
+def test_plan_reconciliation_parse_failure_in_chain_returns_none():
+    """An unparseable file within an otherwise-chained added set yields no plan."""
+    existing = ["0136_prev.py", "0137_head.py"]
+    added = {
+        "backend/alembic/versions/0137_c.py": _migration_src("0137", "0136"),
+        "backend/alembic/versions/0138_d.py": "def upgrade():\n    pass\n",
     }
     assert plan_migration_reconciliation(existing, added) is None
 

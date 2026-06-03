@@ -1392,6 +1392,104 @@ async def test_backmerge_block_dedup_prevents_spurious_resolver_on_periodic(
     assert len(await _alerts_for(db_session, project.id)) == baseline_alerts
 
 
+async def test_backmerge_deduped_periodic_reentry_skips_planner(db_session, mocker):
+    """Deduped periodic re-entry computes NO plan. The migration-block handler
+    must consult the renumber planner ONLY on the path where it actually spawns a
+    resolver. When a resolver is already open and the periodic reconciler
+    re-enters, the project-wide dedup short-circuits BEFORE the planner runs: the
+    planner ``_plan_backmerge_migration_reconciliation`` must NOT be invoked and
+    its file-read GitHub leg must NOT fire.
+
+    Regression guard against re-introducing a per-cycle GitHub fetch on the hot
+    deduped path (every reconciler tick would otherwise re-fetch the diff +
+    branch listings + every post-divergence migration source for no reason)."""
+    project = await _make_project(db_session)
+    _create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 308, "html_url": "http://pr/308"},
+        merge_return={"merged": True},  # must never be reached
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_hotfix.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+
+    async def _file_text(path, *, token, owner, repo, ref, project_id=None):
+        if path == "backend/app/main.py":
+            return 'EXPECTED_SCHEMA_REVISION = "0002"\n'
+        if path.endswith("0002_feature.py"):
+            return _migration_source("0002", "0001")
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+    commit_mock = mocker.patch(
+        "app.github.commit_file_changes", new=AsyncMock(return_value={"commit": "sha"})
+    )
+
+    # Prime an open resolver via a first NON-periodic block. The real planner runs
+    # here (spawn path) and embeds the renumber plan into the resolver.
+    first = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+    assert first["status"] == "migration_conflict"
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers_after_first = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers_after_first) == 1
+    baseline_alerts = len(await _alerts_for(db_session, project.id))
+
+    # Install the planner spy AND reset the file-read leg AFTER the prime so we
+    # measure only the second (deduped) call. The planner is patched in the
+    # hotfix_backmerge module namespace, where it is imported and called.
+    planner_spy = mocker.patch.object(
+        hb,
+        "_plan_backmerge_migration_reconciliation",
+        new=AsyncMock(return_value=None),
+    )
+    file_read_spy = mocker.patch(
+        "app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_file_text)
+    )
+
+    # Periodic re-entry with the resolver still open: the dedup short-circuits
+    # before the planner runs.
+    second = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    assert second["status"] == "migration_conflict"
+    # The planner (and therefore its file-read leg) was never invoked.
+    planner_spy.assert_not_called()
+    file_read_spy.assert_not_called()
+    # No merge, no inline push.
+    merge_mock.assert_not_called()
+    commit_mock.assert_not_called()
+    # No duplicate resolver task and no new Alert.
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [
+        t for t in tasks if (t.context or {}).get("backmerge_migration_conflict") is True
+    ]
+    assert len(resolvers) == 1
+    assert len(await _alerts_for(db_session, project.id)) == baseline_alerts
+
+
 async def test_backmerge_ambiguous_dual_head_falls_back_to_resolver(db_session, mocker):
     """When the block is NOT a single unambiguous collision (the integration
     branch's post-divergence set is empty), the guided dual-head resolver is
@@ -2011,6 +2109,112 @@ async def test_plan_backmerge_reconciliation_fetch_error_returns_none(mocker):
         "tok", "acme", "widget", 402, "automain", "main"
     )
     assert plan is None
+
+
+async def test_plan_backmerge_reconciliation_file_read_error_returns_none(mocker):
+    """Per-file read FAILURE fails safe to no-plan. When reading an individual
+    post-divergence integration migration source raises, the helper must return
+    ``None`` — never a partial/unsafe plan computed from a missing source."""
+    from app import rollup_migration_validation as rmv
+
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # main carries the hotfix at 0002; automain has its own post-divergence
+    # 0002_feature that would be the colliding migration to renumber.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+    # Reading the post-divergence integration migration source blows up.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=RuntimeError("GitHub 502 reading file")),
+    )
+
+    plan = await rmv._plan_backmerge_migration_reconciliation(
+        "tok", "acme", "widget", 403, "automain", "main"
+    )
+    assert plan is None
+
+
+async def test_plan_backmerge_reconciliation_empty_file_read_returns_none(mocker):
+    """Per-file EMPTY/None read fails safe to no-plan. When the post-divergence
+    integration migration source comes back empty/``None`` (the file could not be
+    materialized), the helper must return ``None`` — it must never proceed with a
+    missing source."""
+    from app import rollup_migration_validation as rmv
+
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_hotfix.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+    # Empty source read for the post-divergence integration migration.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=""),
+    )
+
+    plan = await rmv._plan_backmerge_migration_reconciliation(
+        "tok", "acme", "widget", 404, "automain", "main"
+    )
+    assert plan is None
+
+
+async def test_plan_backmerge_reconciliation_no_post_divergence_returns_none(mocker):
+    """Nothing post-divergence yields no plan. When EVERY integration-branch
+    migration basename is shared with the promotion target (so the post-divergence
+    set is empty — there is no colliding integration migration to renumber), the
+    helper returns ``None`` even though the back-merge diff DID add a migration.
+    No integration source is ever read in this case."""
+    from app import rollup_migration_validation as rmv
+
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new=AsyncMock(
+            return_value=_migration_diff(
+                "backend/alembic/versions/0002_hotfix.py", "0002", "0001"
+            )
+        ),
+    )
+    # Identical filename lists for both branches → post-divergence set is empty.
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_branch_aware_versions(
+            ["0001_init.py", "0002_feature.py"],
+            ["0001_init.py", "0002_feature.py"],
+        ),
+    )
+    file_read_mock = mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_migration_source("0002", "0001")),
+    )
+
+    plan = await rmv._plan_backmerge_migration_reconciliation(
+        "tok", "acme", "widget", 405, "automain", "main"
+    )
+    assert plan is None
+    # With an empty post-divergence set there is nothing to read.
+    file_read_mock.assert_not_called()
 
 
 # ===========================================================================
