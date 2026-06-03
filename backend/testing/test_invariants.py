@@ -815,6 +815,179 @@ class TestSchemaRevisionSync:
         )
 
 
+# ── Pre-merge dual-head guard coverage (whole-package) ─────────────────────
+
+
+class TestPreMergeDualHeadGuardCoverage:
+    """Whole-package invariant: EVERY PR-merge site under backend/app/ that can
+    target an integration/promotion branch must be covered by the pre-merge
+    combined-chain dual-head guard.
+
+    WHY: merging a PR that creates two Alembic heads / a duplicate revision id
+    wedges ``alembic upgrade head`` on the integration branch. The backend merges
+    PRs from many sites — the CI-completion handler, the autonomous rollup
+    auto-merge, the hotfix back-merge, the qualify->promote release merge,
+    operator-approval merges, and the normal task-PR completion handler. Each
+    must first run one of the two shared guard entrypoints, both defined in
+    ``app/rollup_migration_validation.py``:
+      - ``enforce_premerge_migration_guard(...)``
+      - ``_validate_rollup_migration_chain(...)``
+
+    The two narrow tests ``test_rollup_guard_uses_combined_chain_check`` and
+    ``test_backmerge_guard_uses_combined_chain_check`` assert that two *specific*
+    files call the guard with the right target/integration-branch argument. This
+    test is complementary: it enumerates the FULL set of merge SITES so a new (or
+    existing) merge path cannot silently skip the guard without a test noticing.
+
+    Modeled on the os.walk whole-package invariants in this module
+    (``TestNoRawBindDialectIdiom`` / ``TestBaseBranchFallback``): walk
+    backend/app/ (recursing routers/), flag each offending file:function, and
+    carry an allowlist of legitimate exceptions, each documenting WHY.
+
+    The scan is source-level only (AST) and NEVER executes a merge path.
+    """
+
+    # The two shared combined-chain guard entrypoints (app/rollup_migration_validation.py).
+    _GUARD_NAMES = frozenset(
+        {"_validate_rollup_migration_chain", "enforce_premerge_migration_guard"}
+    )
+
+    # Merge symbols the scan treats as a merge SITE: the direct primitive
+    # (``merge_pull_request`` / ``github.merge_pull_request``) and the
+    # exponential-backoff wrapper (``_merge_with_retry``, which is always handed
+    # ``merge_pull_request`` as its first argument).
+    _MERGE_NAMES = frozenset({"merge_pull_request", "_merge_with_retry"})
+
+    # Whole files that define/re-export the merge primitive or the generic retry
+    # wrapper. These make NO integration/promotion-branch merge *decision* (the
+    # target branch is chosen by their callers, which carry the guard), so they
+    # are exempt. Mirrors how the dialect/base-branch guards allowlist the files
+    # that *define* the thing they otherwise forbid.
+    _EXEMPT_FILES = {
+        "github_pulls.py": (
+            "defines the low-level merge_pull_request primitive (raw GitHub merge "
+            "API); chooses no integration/promotion branch"
+        ),
+        "github.py": (
+            "re-exports merge_pull_request for callers; makes no merge decision"
+        ),
+        "task_lifecycle_github_helpers.py": (
+            "defines the generic _merge_with_retry wrapper; the merging caller "
+            "picks the target branch and carries the guard"
+        ),
+    }
+
+    # Specific (file, function) merge sites that can never carry a migration onto
+    # an integration/promotion branch. Each entry MUST document WHY. Empty today:
+    # every real merge site already calls one of the two guard entrypoints in its
+    # merging function (verified while authoring this test). If a future site is
+    # genuinely exempt (e.g. a staging-only branch that never reaches the
+    # integration trunk), add it here with a reason — do NOT silently widen
+    # _EXEMPT_FILES.
+    _EXEMPT_SITES: dict = {}
+
+    def test_all_pr_merge_sites_guarded(self):
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        guard_names = self._GUARD_NAMES
+        merge_names = self._MERGE_NAMES
+
+        def _called_name(call: "ast.Call") -> str | None:
+            """Return the bare callee name for ``foo(...)`` or ``mod.foo(...)``."""
+            func = call.func
+            if isinstance(func, ast.Name):
+                return func.id
+            if isinstance(func, ast.Attribute):
+                return func.attr
+            return None
+
+        def _references_guard(node) -> bool:
+            """True if any guard entrypoint is referenced anywhere in the subtree
+            (a call ``guard(...)`` shows up as a Name/Attribute load)."""
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and n.id in guard_names:
+                    return True
+                if isinstance(n, ast.Attribute) and n.attr in guard_names:
+                    return True
+            return False
+
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".py"):
+                    continue
+                if fname in self._EXEMPT_FILES:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    source = f.read()
+                tree = ast.parse(source, filename=fpath)
+
+                funcs = [
+                    n
+                    for n in ast.walk(tree)
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+                rel = os.path.relpath(fpath, app_dir)
+
+                for node in ast.walk(tree):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    if _called_name(node) not in merge_names:
+                        continue
+
+                    # Resolve the innermost enclosing function for an actionable
+                    # offender message and a function-scoped guard check.
+                    enclosing = None
+                    for fn in funcs:
+                        if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
+                            if enclosing is None or fn.lineno > enclosing.lineno:
+                                enclosing = fn
+                    func_name = enclosing.name if enclosing is not None else "<module>"
+
+                    if (fname, func_name) in self._EXEMPT_SITES:
+                        continue
+
+                    # Covered iff the guard is referenced inside the merging
+                    # function itself. The check is deliberately function-scoped
+                    # (not file-scoped): a file-wide fallback would let a new
+                    # unguarded merge call site slip in unflagged as long as the
+                    # file already contained some guard reference — which is true
+                    # of every current merge file — directly defeating the purpose
+                    # of this invariant.
+                    #
+                    # Known coarseness: the granularity is the function, not the
+                    # individual call. A function that contains several merge calls
+                    # plus one guard reference is treated as covered for ALL of
+                    # those calls, so a regression that drops the guard for only one
+                    # of multiple merges in the same function would not be caught
+                    # here. Splitting each merge into its own guarded function (the
+                    # current shape of every real call site) keeps the check tight.
+                    covered = enclosing is not None and _references_guard(enclosing)
+                    if not covered:
+                        offenders.append(
+                            f"  {rel}:{node.lineno} in {func_name}() — PR-merge "
+                            "site not covered by the pre-merge dual-head guard"
+                        )
+
+        assert not offenders, (
+            "Found PR-merge site(s) under backend/app/ that can target an "
+            "integration/promotion branch but are NOT covered by the pre-merge "
+            "combined-chain dual-head guard "
+            "(enforce_premerge_migration_guard / _validate_rollup_migration_chain, "
+            "both in app/rollup_migration_validation.py).\n"
+            "Merging a PR that creates two Alembic heads / a duplicate revision id "
+            "wedges `alembic upgrade head` on the integration branch.\n"
+            "Fix each site by calling one of the guard entrypoints in the merging "
+            "function, OR — if the site can never carry a migration onto the "
+            "integration/promotion branch — add its (file, function) to "
+            "TestPreMergeDualHeadGuardCoverage._EXEMPT_SITES with a documented "
+            "reason.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Security Scanner Integrity ──────────────────────────────────────────────
 
 

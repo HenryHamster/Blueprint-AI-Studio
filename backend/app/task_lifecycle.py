@@ -953,6 +953,51 @@ async def _process_post_commit(
                                 await session.commit()
                                 return {"status": "accepted"}
 
+                        # Pre-merge Alembic dual-head guard for the non-staging
+                        # auto-approve path (`auto_approve_small` → main/promotion
+                        # target). The staging/intermediate case (`is_intermediate`)
+                        # merges onto a staging branch that never carries a
+                        # migration onto the integration branch, so it is out of
+                        # scope and skips the guard. On a block-or-defer verdict do
+                        # NOT merge — park EVALUATING with ci_waiting so the guarded
+                        # CI-completion sweep retries once the collision resolves.
+                        if not is_intermediate:
+                            from app.rollup_migration_validation import (
+                                enforce_premerge_migration_guard,
+                            )
+
+                            (
+                                _dh_ok,
+                                _dh_reason,
+                            ) = await enforce_premerge_migration_guard(
+                                gh_token, owner, repo, pr_number, base_branch
+                            )
+                            if not _dh_ok:
+                                logger.warning(
+                                    f"[PIPELINE] Auto-approve merge held for PR "
+                                    f"#{pr_number} — Alembic combined-chain guard: "
+                                    f"{_dh_reason}"
+                                )
+                                task.status = TaskStatus.EVALUATING
+                                task.latest_status_message = (
+                                    f"Merge held — Alembic dual-head guard: {_dh_reason}"
+                                )[:500]
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": {
+                                        **((task.context or {}).get("review_loop") or {}),
+                                        "ci_waiting": True,
+                                        "review_approved": True,
+                                        "ci_passed": True,
+                                        "pr_number": pr_number,
+                                        "branch": branch,
+                                        "base_branch": base_branch,
+                                    },
+                                }
+                                session.add(task)
+                                await session.commit()
+                                return {"status": "accepted"}
+
                         merge_result = await _merge_with_retry(
                             merge_pull_request,
                             gh_token,
@@ -2119,6 +2164,58 @@ async def _process_post_commit(
                                     f"[PIPELINE] Error checking requires_approval for merge gate: {e}",
                                     exc_info=True,
                                 )
+
+                        # Pre-merge Alembic dual-head guard (parity with the
+                        # CI-completion, rollup, hotfix back-merge and promotion
+                        # paths). When CI has ALREADY finished green by the time
+                        # the review APPROVE arrives, the merge fires inline here
+                        # rather than from the guarded CI-completion handler — so
+                        # without this check two task PRs that each add 'the next'
+                        # migration with the same revision id would both merge and
+                        # leave the integration branch with a dual Alembic head.
+                        # Only integration/promotion-targeted merges need it; on a
+                        # block-or-defer verdict do NOT merge — park EVALUATING with
+                        # the same ci_waiting/review_approved/ci_passed flags the
+                        # CI-completion path sets so the guarded sweep retries once
+                        # the collision resolves.
+                        if is_ci_gated_merge:
+                            from app.rollup_migration_validation import (
+                                enforce_premerge_migration_guard,
+                            )
+
+                            (
+                                _dh_ok,
+                                _dh_reason,
+                            ) = await enforce_premerge_migration_guard(
+                                gh_token, owner, repo, pr_number, base_branch
+                            )
+                            if not _dh_ok:
+                                logger.warning(
+                                    f"[CI] Inline merge held for PR #{pr_number} — "
+                                    f"Alembic combined-chain guard: {_dh_reason}"
+                                )
+                                task.status = TaskStatus.EVALUATING
+                                task.latest_status_message = (
+                                    f"Merge held — Alembic dual-head guard: {_dh_reason}"
+                                )[:500]
+                                task.context = {
+                                    **(task.context or {}),
+                                    "review_loop": {
+                                        **review_loop,
+                                        "ci_waiting": True,
+                                        "review_approved": True,
+                                        "ci_passed": True,
+                                        "head_sha": head_sha,
+                                        "pr_number": pr_number,
+                                        "branch": branch,
+                                        "base_branch": base_branch,
+                                        "original_task_id": original_task_id,
+                                    },
+                                }
+                                session.add(task)
+                                await session.commit()
+                                action_taken = True
+                                return {"status": "accepted"}
 
                         merge_result = await _merge_with_retry(
                             merge_pull_request,

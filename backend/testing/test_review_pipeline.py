@@ -6998,6 +6998,102 @@ async def test_release_safeguard_gate_sets_ci_waiting_when_evaluating(db_session
     assert (orig.context or {}).get("review_loop", {}).get("pr_number") == 7
 
 
+_SG_DUAL_HEAD_DIFF = (
+    "diff --git a/backend/alembic/versions/0002_dup.py "
+    "b/backend/alembic/versions/0002_dup.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/backend/alembic/versions/0002_dup.py\n"
+    '+"""dup migration"""\n'
+    '+revision = "0002"\n'
+    '+down_revision = "0001"\n'
+)
+
+
+@pytest.mark.asyncio
+async def test_release_safeguard_gate_post_gate_merge_held_on_dual_head(
+    db_session, mocker
+):
+    """A gated post-gate merge (orig already COMPLETED) HOLDS on a dual head.
+
+    Exercises the _sg_gated=True branch of _maybe_release_safeguard_gate: the
+    held PR targets the project integration branch and adds a migration whose
+    revision id collides with one already on that branch, so the pre-merge
+    Alembic dual-head guard must block — merge_pull_request is never called and
+    the PR is left open for the guarded retry/resolver flow.
+    """
+    from app.task_completion import _maybe_release_safeguard_gate
+
+    project = make_project(integration_branch="automain")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # orig already terminalized (COMPLETED) with an open held PR — the path that
+    # fires the merge directly from the gate-release rather than via CI polling.
+    orig = make_task(
+        project_id=project.id,
+        requires_approval=True,
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    safeguard = make_task(
+        project_id=project.id,
+        context={"safeguard_for_task_id": str(orig.id), "safeguard_pr_number": 42},
+    )
+
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # PR is open, unmerged, and targets the integration branch -> _sg_gated=True.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "merged": False,
+            "base": {"ref": "automain"},
+        },
+    )
+    # Make the real dual-head guard see a same-revision collision on the target.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}],
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        new_callable=AsyncMock,
+        return_value=_SG_DUAL_HEAD_DIFF,
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new_callable=AsyncMock,
+        return_value=["0001_init.py", "0002_existing.py"],
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    await _maybe_release_safeguard_gate(safeguard, [], db_session)
+
+    # Gate still released, but the held merge was NOT fired — left open for the
+    # guarded retry/resolver flow.
+    merge_mock.assert_not_called()
+    await db_session.refresh(orig)
+    assert orig.requires_approval is False
+    # Idempotency flag was set with the gate-clear commit so the merge is never
+    # re-attempted from here even though it was held.
+    assert (orig.context or {}).get("_safeguard_merge_fired") is True
+
+
 # ── Cross-cutting gate: integration (spawn + merge-gate) ──────────────────────
 
 

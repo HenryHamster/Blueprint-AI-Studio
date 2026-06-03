@@ -96,6 +96,26 @@ async def tl_db(mocker):
     await _engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def _default_no_migration_pr(mocker):
+    """Default the inline pre-merge Alembic dual-head guard to a no-op.
+
+    Both inline merge paths in ``_process_post_commit`` (review-APPROVE and the
+    non-staging small-scope auto-approve) now run
+    ``enforce_premerge_migration_guard`` before merging, which calls
+    ``github.get_pr_files``. Existing merge-reaching tests only mock
+    ``_merge_with_retry`` / ``merge_pull_request``; without this default an
+    unmocked ``get_pr_files`` would make the guard DEFER and falsely hold the
+    merge. A PR that touches only a non-migration file passes the guard cleanly.
+    Tests that exercise the guard re-patch ``app.github.get_pr_files`` to
+    override this default.
+    """
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(return_value=[{"filename": "README.md"}]),
+    )
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -3445,6 +3465,303 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     await session.refresh(case)
     assert case.status == ResidualCaseStatus.MERGED
     assert case.updated_at >= now
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Inline pre-merge Alembic dual-head guard (parity with the CI-completion path)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# A diff that adds a migration whose revision id ("0002") collides with a
+# revision already on the target branch — the dual-head vector.
+_TL_DUAL_HEAD_DIFF = (
+    "diff --git a/backend/alembic/versions/0002_dup.py "
+    "b/backend/alembic/versions/0002_dup.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/backend/alembic/versions/0002_dup.py\n"
+    '+"""dup migration"""\n'
+    '+revision = "0002"\n'
+    '+down_revision = "0001"\n'
+)
+
+
+def _patch_dual_head_collision(mocker):
+    """Make the inline guard see a same-revision dual-head collision."""
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=_TL_DUAL_HEAD_DIFF),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+
+
+async def _setup_approve_merge(session, project, *, base_branch="main"):
+    """Create original + review tasks wired for the APPROVE inline-merge path."""
+    original = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "X", "base_branch": base_branch}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={},
+    )
+    session.add(original)
+    await session.commit()
+    await session.refresh(original)
+
+    review_task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 5151,
+                "branch": "feat/x",
+                "base_branch": base_branch,
+                "original_task_id": str(original.id),
+            }
+        ],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        context={
+            "review_loop": {
+                "pr_number": 5151,
+                "branch": "feat/x",
+                "base_branch": base_branch,
+                "original_task_id": str(original.id),
+                "iteration": 1,
+            },
+        },
+    )
+    session.add(review_task)
+    await session.commit()
+    await session.refresh(review_task)
+    return original, review_task
+
+
+def payload_for(review_task):
+    """Build the APPROVE completion payload for a review task."""
+    return AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/5151",
+        artifact_type=ArtifactType.PULL_REQUEST,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+
+
+def _patch_approve_merge_env(mocker):
+    """Mocks shared by the APPROVE inline-merge tests (CI green, PR open)."""
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "head": {"sha": "abc123", "ref": "feat/x"},
+            "state": "open",
+            "merged": False,
+        },
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new_callable=AsyncMock,
+        return_value={"status": "completed", "conclusion": "success"},
+    )
+    mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
+    mocker.patch("app.github.submit_pr_review", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._comment_with_retry", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.asyncio.sleep", new_callable=AsyncMock)
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_review_approve_merge_held_on_dual_head(
+    tl_db, mocker
+):
+    """APPROVE + CI green: a same-revision dual head HOLDS the inline merge."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    _, review_task = await _setup_approve_merge(session, project)
+
+    _patch_approve_merge_env(mocker)
+    _patch_dual_head_collision(mocker)
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    result = await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    await session.refresh(review_task)
+    assert review_task.status == TaskStatus.EVALUATING
+    rl = (review_task.context or {}).get("review_loop", {})
+    assert rl.get("ci_waiting") is True
+    assert rl.get("review_approved") is True
+    assert "dual-head" in (review_task.latest_status_message or "").lower()
+    assert "0002" in (review_task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_process_post_commit_review_approve_merge_proceeds_when_guard_ok(
+    tl_db, mocker
+):
+    """APPROVE + CI green + clean (non-migration) PR: the inline merge fires."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    _, review_task = await _setup_approve_merge(session, project)
+
+    _patch_approve_merge_env(mocker)
+    # autouse _default_no_migration_pr fixture already returns a non-migration
+    # file from get_pr_files, so the guard returns ok.
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    await _process_post_commit(
+        review_task.id, payload_for(review_task), _session_factory=factory
+    )
+
+    merge_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
+    """Non-staging auto_approve_small path HOLDS the merge on a dual head."""
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    direction_id = "dir-auto-approve"
+    project.directions = [{"id": direction_id, "title": "d"}]
+    session.add(project)
+    await session.commit()
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small", "direction_id": direction_id},
+    )
+    task.payloads = [{"type": "create", "prompt": "x", "base_branch": "main"}]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # Force the auto_approve_small gate open.
+    mocker.patch(
+        "app.direction_metrics._compute_acceptance_rate", return_value=0.9
+    )
+    mocker.patch(
+        "app.task_lifecycle.should_auto_approve_diff",
+        return_value=(True, "small clean diff"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    _patch_dual_head_collision(mocker)
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/77",
+        branch="blueprint/task-aa",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    result = await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert result == {"status": "accepted"}
+    merge_mock.assert_not_called()
+    await session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    assert "dual-head" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_small_scope_intermediate_merge_skips_guard(tl_db, mocker):
+    """A staging-branch (intermediate) small-scope merge does NOT invoke the guard."""
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [
+        {"type": "create", "prompt": "x", "base_branch": "research/cycle-1"}
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "clean", "report": ""},
+    )
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    # If the guard ran it would call get_pr_files first; assert it never does.
+    guard_files = mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=[{"filename": "README.md"}],
+    )
+    merge_mock = mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        branch="blueprint/task-bb",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    merge_mock.assert_awaited_once()
+    guard_files.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1180,18 +1180,56 @@ async def _maybe_release_safeguard_gate(
                     f"— skipping post-gate merge (orig {safeguard_for_id[:8]})"
                 )
             else:
-                _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
-                if _res.get("merged"):
-                    logger.info(
-                        f"[SAFEGUARD] Fired held merge for COMPLETED orig "
-                        f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"
+                # Pre-merge Alembic dual-head guard (parity with the CI-completion
+                # and inline task-completion merge paths). The held merge can target
+                # the integration or promotion branch; without this check a PR that
+                # added 'the next' migration while the safeguard ran could land a
+                # duplicate revision / dual head. Only guard integration/promotion
+                # targets; on a block-or-defer verdict skip the merge and leave the
+                # PR open so the guarded retry/resolver flow can handle it.
+                from app.shared_state import (  # noqa: PLC0415
+                    get_project_promotion_target,
+                )
+
+                _sg_project = (
+                    await session.get(Project, orig.project_id)
+                    if orig.project_id
+                    else None
+                )
+                _sg_base = (_pr.get("base") or {}).get("ref", "")
+                _sg_gated = _sg_base in (
+                    get_project_integration_branch(_sg_project),
+                    get_project_promotion_target(_sg_project),
+                )
+                _sg_ok = True
+                if _sg_gated:
+                    from app.rollup_migration_validation import (  # noqa: PLC0415
+                        enforce_premerge_migration_guard,
+                    )
+
+                    _sg_ok, _sg_reason = await enforce_premerge_migration_guard(
+                        gh_token, owner, repo, int(pr_num), _sg_base
+                    )
+                if not _sg_ok:
+                    logger.warning(
+                        f"[SAFEGUARD] Post-gate merge of PR #{pr_num} held — "
+                        f"Alembic dual-head guard: {_sg_reason} (orig "
+                        f"{safeguard_for_id[:8]}) — leaving PR open for the "
+                        f"guarded retry/resolver flow"
                     )
                 else:
-                    logger.warning(
-                        f"[SAFEGUARD] Post-gate merge of PR #{pr_num} (orig "
-                        f"{safeguard_for_id[:8]}) did not merge: "
-                        f"{_res.get('message', 'unknown')}"
-                    )
+                    _res = await merge_pull_request(gh_token, owner, repo, int(pr_num))
+                    if _res.get("merged"):
+                        logger.info(
+                            f"[SAFEGUARD] Fired held merge for COMPLETED orig "
+                            f"{safeguard_for_id[:8]} PR #{pr_num} after gate release"
+                        )
+                    else:
+                        logger.warning(
+                            f"[SAFEGUARD] Post-gate merge of PR #{pr_num} (orig "
+                            f"{safeguard_for_id[:8]}) did not merge: "
+                            f"{_res.get('message', 'unknown')}"
+                        )
         except Exception as _merge_exc:  # noqa: BLE001
             logger.warning(
                 f"[SAFEGUARD] Post-gate merge attempt for PR #{pr_num} (orig "

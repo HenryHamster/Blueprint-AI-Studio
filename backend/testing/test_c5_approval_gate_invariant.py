@@ -373,6 +373,121 @@ async def test_release_gate_fires_merge_when_orig_already_completed(
     assert (orig.context or {}).get("_safeguard_merge_fired") is True
 
 
+# Same-revision dual-head collision diff: the PR adds a 0002 migration while
+# the integration branch already has a 0002 — a duplicate revision id / dual
+# head that the pre-merge guard must block.
+_C5_DUAL_HEAD_DIFF = (
+    "diff --git a/backend/alembic/versions/0002_dup.py "
+    "b/backend/alembic/versions/0002_dup.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/backend/alembic/versions/0002_dup.py\n"
+    '+"""dup migration"""\n'
+    '+revision = "0002"\n'
+    '+down_revision = "0001"\n'
+)
+
+
+def _patch_c5_dual_head_collision(mocker):
+    """Make enforce_premerge_migration_guard see a same-revision dual head."""
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            return_value=[{"filename": "backend/alembic/versions/0002_dup.py"}]
+        ),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff",
+        AsyncMock(return_value=_C5_DUAL_HEAD_DIFF),
+    )
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        AsyncMock(return_value=["0001_init.py", "0002_existing.py"]),
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_gate_completed_orig_held_on_dual_head(db_session, mocker):
+    """The post-gate merge of an already-COMPLETED orig HOLDS on a dual head.
+
+    When the held PR targets the integration/promotion branch (_sg_gated=True)
+    and the combined migration chain has a duplicate revision id, the pre-merge
+    Alembic guard must block: merge_pull_request is NOT called and the PR is
+    left open for the guarded retry/resolver flow. The idempotency flag is still
+    committed (the gate-clear branch ran), so the merge is never re-attempted
+    from here. Pre-fix the guard was absent on this branch and the dual head
+    would have merged through.
+    """
+    from app.task_completion import _maybe_release_safeguard_gate
+
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    # PR is open and targets the project's integration branch, so _sg_gated=True
+    # and the dual-head guard runs.
+    get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "state": "open",
+            "merged": False,
+            "base": {"ref": "automain"},
+        },
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True},
+    )
+    _patch_c5_dual_head_collision(mocker)
+
+    project = Project(
+        name="C5 dual-head hold", user_id="u1", integration_branch="automain"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig = Task(
+        project_id=project.id,
+        title="orig already completed",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        requires_approval=True,
+        context={},
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    safeguard = Task(
+        project_id=project.id,
+        title="safeguard",
+        payloads=[{"type": "security_audit", "base_branch": "automain"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "safeguard_for_task_id": str(orig.id),
+            "safeguard_pr_number": 909,
+        },
+    )
+    db_session.add(safeguard)
+    await db_session.commit()
+    await db_session.refresh(safeguard)
+
+    await _maybe_release_safeguard_gate(safeguard, [], db_session)
+
+    await db_session.refresh(orig)
+    # Gate is still released (the clear-and-fire branch ran)...
+    assert orig.requires_approval is False, "Gate must be released"
+    # ...but the dual head HOLDS the held merge: PR left open, no merge call.
+    get_pr.assert_awaited_once()
+    merge_mock.assert_not_called()
+    # Idempotency flag committed so the merge is never re-attempted from here.
+    assert (orig.context or {}).get("_safeguard_merge_fired") is True
+
+
 @pytest.mark.asyncio
 async def test_release_gate_completed_orig_is_idempotent(db_session, mocker):
     """A second release call must NOT re-fire the merge (idempotency flag)."""
