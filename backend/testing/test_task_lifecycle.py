@@ -5971,8 +5971,8 @@ class TestRequeueExtractionTripwire:
 # clears the poison and the chain finishes cleanly.
 # ══════════════════════════════════════════════════════════════════════════════
 
-from sqlalchemy import text as _sa_text
-from sqlalchemy.exc import (
+from sqlalchemy import text as _sa_text  # noqa: E402 — deliberate mid-file import for the post-commit poison-recovery test section below
+from sqlalchemy.exc import (  # noqa: E402 — see above
     IntegrityError as _IntegrityError,
     PendingRollbackError as _PendingRollbackError,
 )
