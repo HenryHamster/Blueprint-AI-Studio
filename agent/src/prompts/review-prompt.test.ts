@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   buildTypeCheckInstructions,
   buildReviewIterationPreamble,
+  buildReviewVerdictInstructions,
   REVIEW_DELTA_FOCUS_NOTE,
 } from './review-prompt.js';
 
@@ -65,7 +66,7 @@ describe('buildTypeCheckInstructions — lint scoping', () => {
 
     const out = buildTypeCheckInstructions(cfg);
     expect(out).not.toContain(maliciousPath);
-    expect(out).toContain('Build & Type Safety (MUST run these');
+    expect(out).toContain('Build, Tests & Lint — who verifies what');
   });
 
   it('ruff: keeps hardcoded --select E,F,W --ignore E501 override and strips trailing dot', () => {
@@ -134,17 +135,94 @@ describe('buildTypeCheckInstructions — lint scoping', () => {
     expect(out).not.toContain('xargs -r make');
   });
 
-  it('no buildConfig: emits the generic fallback wording', () => {
+  it('no buildConfig: emits the CI-owns-build / scoped-lint fallback wording', () => {
     const out = buildTypeCheckInstructions(undefined);
-    expect(out).toContain('Build & Type Safety (MUST run these');
-    expect(out).toContain('For TypeScript/JavaScript changes');
-    expect(out).toContain('For Python changes');
+    expect(out).toContain('Build, Tests & Lint — who verifies what');
+    // CI is named as the authoritative gate and the reviewer is told not to re-run it.
+    expect(out).toContain('CI is the authoritative gate');
+    expect(out).toMatch(/do NOT re-run the build, type-check, or tests/);
+    // The retained reviewer check is scoped lint on changed files.
+    expect(out).toContain('python -m ruff check <changed .py files>');
   });
 
-  it('buildConfig with no build_cmd or lint_cmd: emits "No build commands configured" notice', () => {
+  it('buildConfig with no lint_cmd: states CI owns build/tests and no scoped lint is runnable', () => {
     const out = buildTypeCheckInstructions({
       directories: [{ path: 'backend', type: 'python' }],
     });
-    expect(out).toContain('No build commands configured');
+    expect(out).toContain('CI is the authoritative gate');
+    expect(out).toContain('No reviewer-runnable lint is configured');
+  });
+
+  it('buildConfig with only a build_cmd: does NOT emit a build invocation as a gate', () => {
+    // CI runs the build authoritatively; the reviewer must not re-run it. A
+    // directory with only a build_cmd (no lint_cmd) contributes no reviewer check.
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'admin-ui', type: 'node', build_cmd: 'npm run build' }],
+    });
+    expect(out).not.toContain('npm run build');
+    expect(out).toContain('No reviewer-runnable lint is configured');
+  });
+});
+
+describe('buildTypeCheckInstructions — CI owns build/tests, reviewer owns scoped lint', () => {
+  it('reframes verification: CI is authoritative, reviewer does not re-run build/test and does not block on env failures', () => {
+    const out = buildTypeCheckInstructions(undefined);
+    expect(out).toContain('CI is the authoritative gate');
+    expect(out).not.toContain('automatic REQUEST_CHANGES');
+    expect(out).not.toContain('MUST run these');
+    // An environment condition (uninstallable / unrunnable) must never be a blocker.
+    expect(out).toMatch(/environment condition, never a code defect/);
+    expect(out).toMatch(/NOT grounds for REQUEST_CHANGES/);
+  });
+
+  it('with a configured lint dir: frames scoped lint as an optional NET-NEW quality check, not a build gate', () => {
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'backend', type: 'python', lint_cmd: 'ruff check .' }],
+    });
+    // Scoped lint one-liner is still emitted, restricted to changed files.
+    expect(out).toContain('xargs -r python3 -m ruff check --select E,F,W --ignore E501');
+    expect(out).toContain('NET-NEW');
+    expect(out).toContain('OPTIONAL');
+    // Not framed as an aggregate build gate, and no automatic-block language.
+    expect(out).not.toContain('automatic REQUEST_CHANGES');
+    expect(out).not.toContain('MUST run these');
+  });
+
+  it('does not instruct the reviewer to run ./check or aggregate build commands', () => {
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'backend', type: 'python', lint_cmd: 'ruff check .' }],
+    });
+    expect(out).not.toContain('./check');
+  });
+});
+
+describe('buildReviewVerdictInstructions — block on substantiated code defects, not unverifiable uncertainty', () => {
+  const out = buildReviewVerdictInstructions('task-xyz');
+
+  it('keeps the two-verdict structure and no-third-verdict guidance', () => {
+    expect(out).toContain('"verdict": "APPROVE"');
+    expect(out).toContain('"verdict": "REQUEST_CHANGES"');
+    expect(out).toContain('Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY"');
+    expect(out).toContain('There is no informational-only path');
+  });
+
+  it('keeps the exhaustiveness guidance', () => {
+    expect(out).toContain('Exhaustiveness');
+    expect(out).toContain('enumerate every blocker');
+  });
+
+  it('removes the "when uncertain, pick REQUEST_CHANGES" tie-breaker', () => {
+    expect(out).not.toContain('If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES');
+    expect(out).not.toContain('another round is cheap');
+  });
+
+  it('reframes uncertainty: an unverifiable concern is not grounds to block; trust CI for build/test pass', () => {
+    expect(out).toMatch(/Uncertainty rooted in something you could NOT verify .* is NOT grounds to block/);
+    expect(out).toContain('trust CI for build/test pass');
+    expect(out).toContain('substantiated CODE defect');
+  });
+
+  it('still writes the verdict JSON to the per-task /tmp file', () => {
+    expect(out).toContain('/tmp/review_verdict_task-xyz.json');
   });
 });
