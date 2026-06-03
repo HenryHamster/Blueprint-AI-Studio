@@ -4,6 +4,7 @@ node_modules/
 *.pem
 __pycache__/
 *.pyc
+.mypy_cache/
 .terraform/
 terraform.tfstate*
 .setup-config

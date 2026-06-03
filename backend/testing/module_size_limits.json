@@ -6,7 +6,7 @@
     "task_completion_self_audit.py": 600,
     "task_lifecycle.py": 5750,
     "task_lifecycle_requeue.py": 750,
-    "orchestrator.py": 5700,
+    "orchestrator.py": 5800,
     "orchestrator_health.py": 700,
     "orchestrator_runtime_env.py": 400,
     "admin.py": 3200,

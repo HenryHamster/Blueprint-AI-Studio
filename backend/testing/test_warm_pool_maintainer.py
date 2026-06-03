@@ -633,6 +633,10 @@ async def test_evaluate_cost_guard_engages_on_low_hit_rate(db_session, warm_pool
     engaged = await evaluate_pool_cost_guard(db_session, runtime_config=_runtime_config)
     assert engaged["engaged"] is True
     assert "below" in engaged["reason"]
+    # The diagnostic carries the floors the panel renders the current values
+    # against (default config: 10% hit-rate floor, $1 idle-spend floor).
+    assert engaged["min_hit_rate"] == pytest.approx(0.10)
+    assert engaged["min_idle_cost_usd"] == pytest.approx(1.0)
 
     # Healthy hit rate (40%) → disengage, provisioning resumes next tick.
     snap.return_value = {"pool_hit_rate": 0.40, "total_dispatches": 50}

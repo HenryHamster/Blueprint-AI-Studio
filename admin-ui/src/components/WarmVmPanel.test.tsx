@@ -737,9 +737,12 @@ describe('WarmVmPanel — warm-pool retarget toggles + per-account misses', () =
   });
 });
 
-describe('WarmVmPanel — warm-breaker suppression callouts', () => {
+describe('WarmVmPanel — cost-guard + warm-breaker callouts', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(baseState), { status: 200 }),
+    );
     (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
       new Response('{}', { status: 200 }),
     );
@@ -750,6 +753,85 @@ describe('WarmVmPanel — warm-breaker suppression callouts', () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  test('renders the cost-guard banner with reason and floors when engaged', async () => {
+    const stateGuardEngaged: WarmVmStateResponse = {
+      ...baseState,
+      pool_metrics: {
+        enabled: true,
+        target_size: 2,
+        current_size: 2,
+        idle_count: 2,
+        funnel: {
+          window_hours: 24,
+          pool_lease_hits: 1,
+          cold_dispatches: 49,
+          total_dispatches: 50,
+          pool_hit_rate: 0.02,
+          lease_miss_by_reason: {},
+          lease_miss_total: 0,
+        },
+        cost_guard: {
+          engaged: true,
+          reason: 'Pool hit rate 2.0% is below the 10% floor over 24h (50 dispatches) while idle spend is $5.00 — draining idle members.',
+          hit_rate: 0.02,
+          total_dispatches: 50,
+          idle_cost_usd: 5.0,
+          min_hit_rate: 0.1,
+          min_idle_cost_usd: 1.0,
+        },
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateGuardEngaged), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    const banner = await screen.findByTestId('pool-cost-guard-banner');
+    expect(banner.textContent).toContain('cost guard engaged');
+    expect(banner.textContent).toContain('below the 10% floor');
+    // hit rate 2% vs floor 10%.
+    expect(screen.getByTestId('pool-cost-guard-hit-rate').textContent).toContain('2%');
+    expect(screen.getByTestId('pool-cost-guard-hit-rate').textContent).toContain('floor 10%');
+    // idle spend $5.00 vs floor $1.00.
+    expect(screen.getByTestId('pool-cost-guard-idle-cost').textContent).toContain('$5.00');
+    expect(screen.getByTestId('pool-cost-guard-idle-cost').textContent).toContain('$1.00');
+  });
+
+  test('does not render the cost-guard banner when disengaged or omitted', async () => {
+    const stateGuardOff: WarmVmStateResponse = {
+      ...baseState,
+      pool_metrics: {
+        enabled: true,
+        target_size: 2,
+        current_size: 2,
+        idle_count: 2,
+        cost_guard: {
+          engaged: false,
+          reason: null,
+          hit_rate: 0.5,
+          total_dispatches: 50,
+          idle_cost_usd: 5.0,
+          min_hit_rate: 0.1,
+          min_idle_cost_usd: 1.0,
+        },
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateGuardOff), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByTestId('pool-metrics-row');
+    expect(screen.queryByTestId('pool-cost-guard-banner')).toBeNull();
+  });
+
+  test('does not render the cost-guard banner when the field is absent (older backend)', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByTestId('pool-cost-guard-banner')).toBeNull();
   });
 
   test('renders the pool breaker callout with reset time and failures/threshold', async () => {

@@ -156,6 +156,22 @@ export interface PoolMetrics {
   // with the per-account dispatch funnel for per-account hit rate + $/warm.
   idle_cost_by_account?: Record<string, PoolIdleCostAccountBreakdown>;
   cost_amortization_by_account?: Record<string, PoolAccountAmortization>;
+  // Cost-aware auto-drain guard diagnostic, as built by
+  // warm_pool_maintainer.evaluate_pool_cost_guard and surfaced through
+  // admin_health._get_pool_metrics. When `engaged`, the maintainer is draining
+  // idle members and pausing provisioning because the pool's hit rate sits below
+  // `min_hit_rate` while idle spend exceeds `min_idle_cost_usd`. `reason` is the
+  // human-readable explanation. Optional/nullable: omitted by older backends and
+  // null when the diagnostic could not be computed — the panel renders no banner.
+  cost_guard?: {
+    engaged: boolean;
+    reason: string | null;
+    hit_rate: number | null;
+    total_dispatches: number;
+    idle_cost_usd: number;
+    min_hit_rate: number;
+    min_idle_cost_usd: number;
+  } | null;
 }
 
 // Per-account slice of the offline pool hit-rate estimate, as built by

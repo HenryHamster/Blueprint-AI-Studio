@@ -7376,6 +7376,11 @@ async def test_operator_message_arms_strategic_refresh(
     marker = vision["_strategic_refresh"]
     assert marker["reason"] == "operator_message"
     assert marker["count"] == 1
+    # The producer must stamp operator origin so the breaker-bypass and
+    # deferral-notice consumer paths actually activate (the whole point of the
+    # live-steering feature). Without this wiring the marker defaulted to
+    # qualification origin and the feature was dead in production.
+    assert marker["origin"] == "operator"
 
 
 @pytest.mark.asyncio
@@ -7417,6 +7422,96 @@ async def test_operator_message_burst_coalesces_into_one_slot(
     # Single slot — two messages bumped the observability count, not stacked.
     assert marker["count"] == 2
     assert marker["reason"] == "operator_message"
+    # Coalesced burst stays operator-origin (sticky), so the bypass holds.
+    assert marker["origin"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_operator_message_marker_is_operator_origin_and_bypasses_breaker(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end producer wiring: an operator message arms an operator-origin
+    marker whose breaker gate is bypassed even when the strategist failure
+    breaker is tripped (>= 3 failures). The unit tests construct operator-origin
+    markers by hand; this drives the real producer endpoint so a missing
+    origin wire-up (the bug this fix closes) can't slip through green."""
+    from app.strategic_trigger import (
+        ORIGIN_OPERATOR,
+        refresh_breaker_applies,
+        strategic_refresh_origin,
+    )
+
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={"content": "The loop is stuck — pivot to the deploy bug", "message_type": "BLOCKER"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    vision = await _reload_vision(db_session, project_id)
+    # The producer stamped operator origin (not the default qualification).
+    assert strategic_refresh_origin(vision) == ORIGIN_OPERATOR
+    # Operator intent bypasses the _strategic_failures breaker — the gate is
+    # open even with the breaker tripped, which is exactly when an operator
+    # needs to steer.
+    assert refresh_breaker_applies(vision) is False
+    strategic_failures = 5  # breaker tripped (>= 3)
+    breaker_gate_ok = not refresh_breaker_applies(vision) or strategic_failures < 3
+    assert breaker_gate_ok is True
+
+
+@pytest.mark.asyncio
+async def test_operator_message_deferral_notice_when_cycle_active(
+    client: AsyncClient, db_session, mocker
+):
+    """When a strategic cycle is already active, the operator-origin marker drives
+    a one-time deferral notice through the real consumer path — proving the
+    notice fires (it was silently swallowed under the buggy qualification
+    origin) and stamps ``notified`` so it does not repeat."""
+    from app.autonomous_research import _maybe_notify_operator_refresh_deferred
+    from app.strategic_trigger import strategic_refresh_notified
+
+    project_id = await _deploy_project(client, mocker)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/messages",
+        json={"content": "Reprioritize the auth regression", "message_type": "FEEDBACK"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # The dispatch helper is imported inside the consumer from
+    # app.notification_dispatch — patch it there.
+    dispatch = mocker.patch(
+        "app.notification_dispatch.post_strategic_steering_deferred_message",
+        new=AsyncMock(),
+    )
+
+    db_session.expire_all()
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+
+    await _maybe_notify_operator_refresh_deferred(
+        project, db_session, "queued behind an active strategic cycle"
+    )
+
+    dispatch.assert_awaited_once()
+    vision = await _reload_vision(db_session, project_id)
+    assert strategic_refresh_notified(vision) is True
+
+    # Idempotent: a second tick with the marker already notified stays quiet.
+    dispatch.reset_mock()
+    db_session.expire_all()
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    await _maybe_notify_operator_refresh_deferred(
+        project, db_session, "queued behind an active strategic cycle"
+    )
+    dispatch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

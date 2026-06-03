@@ -3800,6 +3800,10 @@ class TestWarmVMSkipProvision:
         # Cold fall-through → funnel records a cold dispatch, never a lease hit.
         assert cold_spy.called
         assert not lease_hit_spy.called
+        # The cold dispatch is attributed to the resolved account (acct-pool-1),
+        # so the per-account funnel denominator reconciles with fleet totals
+        # instead of dumping every cold dispatch into the unattributed bucket.
+        assert cold_spy.call_args.args == ("acct-pool-1",)
 
         async with orch_warm_db() as verify:
             row = (

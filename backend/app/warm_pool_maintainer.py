@@ -223,6 +223,11 @@ async def evaluate_pool_cost_guard(session, *, runtime_config) -> dict:
         "hit_rate": hit_rate,
         "total_dispatches": total,
         "idle_cost_usd": idle_cost,
+        # Floors the panel renders the current values against (hit-rate-vs-floor,
+        # idle-spend-vs-floor) so an operator can see how far the pool is from
+        # disengaging the guard. Additive — existing consumers ignore them.
+        "min_hit_rate": cfg["min_hit_rate"],
+        "min_idle_cost_usd": cfg["min_idle_cost_usd"],
     }
 
 

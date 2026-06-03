@@ -47,6 +47,7 @@ from app.ci_resolution import (
     should_run_no_ci_test_gate,
 )
 from app.models import Alert, Artifact, ArtifactType, Project, Task, TaskStatus
+from app.orchestrator import _VERIFY_TESTS_MAX_RETRIES
 from app.release_qualifier_audit import _latest_artifact_logs
 from app.review_pipeline import _spawn_pipeline_task
 
@@ -131,6 +132,26 @@ async def _plant_verdict(db_session, verify_task: Task, verdict: dict) -> None:
     verify_task.status = TaskStatus.COMPLETED
     db_session.add(verify_task)
     await db_session.commit()
+
+
+async def _terminalize_without_verdict(db_session, verify_task: Task) -> None:
+    """Mark the verify task terminal without creating a verdict artifact."""
+    verify_task.status = TaskStatus.FAILED
+    db_session.add(verify_task)
+    await db_session.commit()
+
+
+def _is_verify_crash(outcome: str, verdict: dict | None) -> bool:
+    """Mirror the orchestrator's crash-vs-undetected split (orchestrator.py
+    ~5283).
+
+    A verify task that terminalized without a usable verdict artifact
+    (``verdict is None``) crashed — most often a transient cold-clone flake —
+    and is re-spawned. A detected=false verdict (a ``dict`` from a suite that
+    actually ran and found no runnable command) is a genuine undetected result,
+    not a crash, and falls open immediately without consuming the retry budget.
+    """
+    return outcome == "undetected" and verdict is None
 
 
 def _patch_github(mocker):
@@ -421,6 +442,133 @@ async def test_no_ci_awaiting_verdict_while_verify_running_then_passes(
     merge_mock.assert_called_once()
     await db_session.refresh(parent)
     assert parent.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_no_ci_failed_verify_task_without_artifact_merges_unverified_and_alerts_once(
+    db_session, mocker
+):
+    """A crashed (FAILED, no-artifact) verify task is RETRIED once before the
+    gate falls open — and only the exhausted retry raises the UNVERIFIED alert.
+
+    A verify task that terminalizes with no verdict artifact did not run the
+    suite (most often a transient cold-clone flake), so the orchestrator's
+    crash-vs-undetected split re-spawns it up to ``_VERIFY_TESTS_MAX_RETRIES``
+    times before merging UNVERIFIED. This pins that retry-then-fail-open
+    contract: the first crash must NOT merge or alert; only the crash after the
+    retry budget is spent does.
+    """
+    _patch_github(mocker)
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request", return_value={"merged": True}
+    )
+
+    project = await _make_no_ci_project(db_session, with_test_cmd=True)
+    parent = _make_parent_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    assert should_run_no_ci_test_gate(project, BASE, gate_enabled=True) is True
+
+    # ── First attempt: spawn, then crash without posting a verdict artifact ──
+    verify_task, was_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+        attempt=0,
+    )
+    assert was_created is True and verify_task is not None
+    assert verify_task.status == TaskStatus.QUEUED
+
+    await _terminalize_without_verdict(db_session, verify_task)
+    await db_session.refresh(verify_task)
+    assert verify_task.status == TaskStatus.FAILED
+
+    verdict = await _latest_artifact_logs(
+        db_session, verify_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    assert verdict is None, "FAILED verify_tests with no artifact must read no verdict"
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "undetected" and detail == ""
+
+    # A terminal task with no verdict artifact is a CRASH, not a real
+    # detected-undetected suite — with retries remaining the gate re-spawns
+    # rather than failing open.
+    retries = 0
+    assert _is_verify_crash(outcome, verdict) is True
+    assert retries < _VERIFY_TESTS_MAX_RETRIES, "first crash still has retry budget"
+
+    # ── Retry: a NEW verify task is spawned (attempt bumps the idem key) ──────
+    retries += 1
+    retry_task, retry_created = await _spawn_pipeline_task(
+        parent,
+        "verify_tests",
+        db_session,
+        PR_NUMBER,
+        BRANCH,
+        BASE,
+        original_task_id=str(parent.id),
+        suppress_warm_handoff=True,
+        attempt=retries,
+    )
+    assert retry_created is True and retry_task is not None
+    assert retry_task.id != verify_task.id, (
+        "a crashed verify task must be re-spawned as a distinct task, not reuse "
+        "the crashed corpse"
+    )
+    # The retry is still pending: nothing merged, no alert raised yet.
+    merge_mock.assert_not_called()
+    assert await _unverified_merge_alerts(db_session, project.id) == []
+
+    # ── Retry also crashes: budget spent → fall open to the UNVERIFIED merge ──
+    await _terminalize_without_verdict(db_session, retry_task)
+    verdict = await _latest_artifact_logs(
+        db_session, retry_task.id, ArtifactType.MERGE_TEST_RESULT
+    )
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert _is_verify_crash(outcome, verdict) is True
+    assert retries >= _VERIFY_TESTS_MAX_RETRIES, "retry budget is now exhausted"
+
+    ci_result = build_no_ci_gate_ci_result(outcome, detail)
+    assert ci_result["conclusion"] == "success"
+
+    parent = await _set_unverified_reason(db_session, parent, "undetected_runtime")
+    acted = await handle_ci_completion(
+        parent, ci_result, "ghs_test", "acme", "widget", db_session, source="poll"
+    )
+
+    assert acted is True
+    merge_mock.assert_called_once()
+    await db_session.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+    alerts = await _unverified_merge_alerts(db_session, project.id)
+    assert len(alerts) == 1, "exhausted-retry crash must raise exactly one alert"
+    assert f"PR #{PR_NUMBER}" in alerts[0].title
+    assert "UNVERIFIED" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_no_ci_detected_undetected_verdict_does_not_retry(db_session, mocker):
+    """A real ``detected=false`` verdict does NOT consume the verify retry budget.
+
+    When the suite actually ran and reported no runnable command, ``_verdict``
+    is a dict — not a crash — so the gate falls open immediately. This guards
+    the split from over-firing: a genuine no-suite repo must not be retried as
+    if it were a transient infra flake.
+    """
+    verdict = {"detected": False}
+    outcome, detail = classify_merge_test_verdict(verdict)
+    assert outcome == "undetected" and detail == ""
+    assert _is_verify_crash(outcome, verdict) is False, (
+        "a detected=false verdict (a dict from a suite that ran) is not a crash "
+        "and must not be retried"
+    )
 
 
 # ---------------------------------------------------------------------------

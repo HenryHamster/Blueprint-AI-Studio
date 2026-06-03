@@ -993,9 +993,11 @@ async def create_message(
     # message creation never fails on it, and the min-interval floor + failure
     # breaker keep a burst of messages from storming strategic spawns.
     if msg_type is not MessageType.NOTE:
-        from app.strategic_trigger import request_strategic_refresh
+        from app.strategic_trigger import ORIGIN_OPERATOR, request_strategic_refresh
 
-        await request_strategic_refresh(session, project.id, "operator_message")
+        await request_strategic_refresh(
+            session, project.id, "operator_message", origin=ORIGIN_OPERATOR
+        )
         await session.commit()
 
     return {"id": str(msg.id), "status": "created"}

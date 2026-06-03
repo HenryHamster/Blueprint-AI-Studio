@@ -369,6 +369,10 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
                 </div>
               )}
 
+              {pool?.cost_guard?.engaged && (
+                <PoolCostGuardBanner guard={pool.cost_guard} />
+              )}
+
               <WarmBreakerCallouts metrics={data.warm_pin_metrics} />
 
               <AccountRetargetCallout
@@ -467,6 +471,39 @@ function fmtUsd(v: number | undefined): string {
   if (v === 0) return '$0';
   if (v < 0.01) return `$${v.toFixed(4)}`;
   return `$${v.toFixed(2)}`;
+}
+
+// Amber banner shown when the cost-aware auto-drain guard has paused leasing and
+// is draining idle members (pool.cost_guard.engaged). Surfaces the reason and
+// the two floors the operator can read the current values against — hit rate vs
+// min_hit_rate, idle spend vs min_idle_cost_usd — so an enabled-but-dark pool
+// points straight at the cost lever. Gated by the caller on engaged === true.
+function PoolCostGuardBanner({ guard }: { guard: NonNullable<PoolMetrics['cost_guard']> }) {
+  const hitRate = guard.hit_rate;
+  return (
+    <div
+      className="mb-3 px-2 py-1.5 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-[11px] flex items-start gap-2"
+      data-testid="pool-cost-guard-banner"
+    >
+      <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+      <div className="min-w-0">
+        <div className="font-bold uppercase tracking-wide text-[10px] mb-0.5">
+          Warm-pool cost guard engaged — draining idle members, provisioning paused
+        </div>
+        {guard.reason && <div className="text-amber-200/90 mb-0.5">{guard.reason}</div>}
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] text-amber-200/80">
+          <span data-testid="pool-cost-guard-hit-rate">
+            hit rate {hitRate === null || hitRate === undefined ? '—' : `${Math.round(hitRate * 100)}%`}
+            {' '}/ floor {Math.round(guard.min_hit_rate * 100)}%
+          </span>
+          <span data-testid="pool-cost-guard-idle-cost">
+            idle spend {fmtUsd(guard.idle_cost_usd)} / floor {fmtUsd(guard.min_idle_cost_usd)}
+          </span>
+          <span>dispatches {guard.total_dispatches}</span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function PoolMetricsRow({ pool }: { pool: PoolMetrics }) {

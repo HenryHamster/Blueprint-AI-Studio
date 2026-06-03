@@ -1044,6 +1044,20 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
         cost = await compute_pool_idle_cost(session)
         funnel = get_pool_funnel_snapshot()
         idle_by_account = cost.get("by_account") or {}
+        # Cost-aware auto-drain guard diagnostic (engaged flag, reason, hit-rate
+        # vs floor, idle-spend vs floor). Surfaced so the panel can show WHY an
+        # enabled pool is dark when the guard has paused leasing/draining. Best-
+        # effort within this already-guarded block — a failure leaves cost_guard
+        # absent and the panel renders no banner (older-backend-tolerant).
+        cost_guard = None
+        try:
+            from app.warm_pool_maintainer import evaluate_pool_cost_guard
+
+            cost_guard = await evaluate_pool_cost_guard(
+                session, runtime_config=_shared_state.runtime_config
+            )
+        except Exception:  # noqa: BLE001 — best-effort diagnostic, never blank panel
+            cost_guard = None
         return {
             "enabled": bool(
                 _shared_state.runtime_config.get("warm_pool_enabled", False)
@@ -1069,6 +1083,7 @@ async def _get_pool_metrics(session: AsyncSession) -> dict:
             "cost_amortization_by_account": compute_pool_cost_amortization_by_account(
                 idle_by_account, funnel
             ),
+            "cost_guard": cost_guard,
         }
     except Exception:  # noqa: BLE001 — best-effort metric, never blank the panel
         return {}

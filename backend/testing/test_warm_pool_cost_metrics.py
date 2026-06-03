@@ -129,6 +129,33 @@ def test_pool_funnel_per_account_breakdown():
     assert u["pool_hit_rate"] == 1.0
 
 
+def test_pool_funnel_cold_dispatch_attributed_with_hit():
+    """A lease hit AND a cold dispatch on the SAME account reconcile in the
+    per-account funnel: the cold dispatch lands in the account's own denominator
+    (not the unattributed bucket), so an account that mostly cold-dispatches no
+    longer looks artificially healthy. Regression guard for the orchestrator
+    cold-dispatch site that previously dropped the account argument."""
+    _pool_lease_hit_events.clear()
+    _pool_cold_dispatch_events.clear()
+    _pool_lease_miss_events.clear()
+
+    record_pool_lease_hit("acct-x")
+    record_pool_cold_dispatch("acct-x")
+
+    snap = get_pool_funnel_snapshot()
+    # The cold dispatch is attributed to acct-x, NOT the unattributed bucket.
+    assert set(snap["by_account"]) == {"acct-x"}
+    x = snap["by_account"]["acct-x"]
+    assert x["pool_lease_hits"] == 1
+    assert x["cold_dispatches"] == 1
+    assert x["total_dispatches"] == 2
+    # Hit rate reflects BOTH the hit and the cold dispatch (1 / 2).
+    assert x["pool_hit_rate"] == 0.5
+    # Per-account denominator reconciles with the fleet totals.
+    assert snap["total_dispatches"] == 2
+    assert snap["pool_hit_rate"] == 0.5
+
+
 # ---------------------------------------------------------------------------
 # Idle-cost accounting
 # ---------------------------------------------------------------------------

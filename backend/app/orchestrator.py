@@ -339,6 +339,15 @@ _last_type_throttle_broadcast: dict[str, float] = {}
 _last_type_unthrottle_broadcast: dict[str, float] = {}
 _previously_failing_types: set[str] = set()
 
+# No-CI merge gate: how many times a CRASHED verify_tests task (FAILED/CANCELLED,
+# or COMPLETED with no usable verdict artifact) may be re-spawned before the gate
+# falls open to an UNVERIFIED merge. A crashed verify task is most often transient
+# infra noise (a failed cold clone of the PR head), so one retry recovers the
+# common flake; the hard cap precludes any re-spawn loop. A genuine
+# detected=false verdict (a suite that ran and found nothing) is NOT a crash and
+# never retries — it falls open immediately, as before.
+_VERIFY_TESTS_MAX_RETRIES = 1
+
 # Debounce: fire the all-accounts-blocked alert once per stall episode.
 # Reset when any task dispatches successfully (stall resolved), then re-arm
 # if every eligible task is again blocked by account rate limits.
@@ -3147,7 +3156,14 @@ async def orchestrator_worker():
                         # Recorded only when the pool feature is on so the funnel
                         # denominator reflects the period the pool was actually live.
                         if is_warm_pool_enabled():
-                            record_pool_cold_dispatch()
+                            # Attribute the cold dispatch to the same resolved
+                            # account as the lease hit/miss recorded earlier in
+                            # this iteration so the per-account funnel
+                            # denominator reconciles with fleet totals. When
+                            # selection fell back to env credentials account_id
+                            # is None and the cold dispatch buckets under the
+                            # unattributed account, exactly as before.
+                            record_pool_cold_dispatch(account_id)
                     except Exception as e:
                         import traceback
 
@@ -5133,6 +5149,9 @@ async def orchestrator_worker():
                                 _v_orig = ci_loop.get(
                                     "original_task_id", ""
                                 ) or ci_task.first_payload.get("original_task_id", "")
+                                _v_attempt = int(
+                                    ci_loop.get("verify_tests_retries", 0) or 0
+                                )
                                 _verify_task, _ = await _spawn_pipeline_task(
                                     ci_task,
                                     "verify_tests",
@@ -5142,6 +5161,7 @@ async def orchestrator_worker():
                                     _no_ci_verify_base,
                                     original_task_id=_v_orig,
                                     suppress_warm_handoff=True,
+                                    attempt=_v_attempt,
                                 )
                                 # _spawn_pipeline_task commits internally — re-lock
                                 # the parent before mutating it.
@@ -5255,6 +5275,70 @@ async def orchestrator_worker():
                                         _verdict
                                     )
                                 )
+                                # Crash vs. genuinely-undetected split. A FAILED/
+                                # CANCELLED verify task — or a COMPLETED one that
+                                # posted no usable verdict artifact (``_verdict``
+                                # is None) — did not actually run the suite: this
+                                # is transient infra noise (most often a failed
+                                # cold clone of the PR head). Re-spawn once before
+                                # failing open. A detected=false verdict (a suite
+                                # that ran and found nothing — ``_verdict`` is a
+                                # dict) is NOT a crash and falls open immediately.
+                                _is_verify_crash = (
+                                    _outcome == "undetected" and _verdict is None
+                                )
+                                _verify_retries = int(
+                                    ci_loop.get("verify_tests_retries", 0) or 0
+                                )
+                                if (
+                                    _is_verify_crash
+                                    and _verify_retries < _VERIFY_TESTS_MAX_RETRIES
+                                ):
+                                    # Clear the crashed task id + verdict so the
+                                    # ``not _v_task_id`` branch re-spawns next
+                                    # poll (with attempt=verify_tests_retries for a
+                                    # distinct idempotency key).
+                                    ci_loop["verify_tests_retries"] = (
+                                        _verify_retries + 1
+                                    )
+                                    ci_loop.pop("verify_tests_task_id", None)
+                                    ci_loop.pop("verify_tests_verdict", None)
+                                    logger.warning(
+                                        f"[CI] PR #{ci_pr_number} no-CI merge gate: "
+                                        f"verify_tests {_v_task_id[:8]} crashed "
+                                        f"(status={_verify_task.status}, no verdict "
+                                        f"artifact) — re-spawning "
+                                        f"(retry {_verify_retries + 1}/"
+                                        f"{_VERIFY_TESTS_MAX_RETRIES}) before "
+                                        f"failing open"
+                                    )
+                                    ci_loop["ci_poll_interval"] = _v_poll_interval
+                                    ci_loop["ci_last_polled"] = (
+                                        _utcnow().isoformat()
+                                    )
+                                    ci_loop["head_sha"] = ci_head_sha
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} — verify_tests crashed, "
+                                        f"retrying detected-test gate "
+                                        f"({_verify_retries + 1}/"
+                                        f"{_VERIFY_TESTS_MAX_RETRIES})"
+                                    )
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    await broadcast_to_project(
+                                        str(ci_task.project_id),
+                                        "task_updated",
+                                        {
+                                            "task_id": str(ci_task.id),
+                                            "status": ci_task.status,
+                                        },
+                                    )
+                                    continue
                                 ci_loop["verify_tests_verdict"] = _outcome
                                 if _outcome == "pass":
                                     logger.info(
@@ -5270,14 +5354,29 @@ async def orchestrator_worker():
                                     )
                                     ci_loop["verify_tests_output"] = _detail[:4000]
                                 else:
-                                    # detected=false or no usable verdict (verify
-                                    # task crashed / produced no artifact): fall
-                                    # back to proceed-without-checks. Absent-tests
-                                    # repos must still progress — merge UNVERIFIED.
+                                    # Fall open to proceed-without-checks (merge
+                                    # UNVERIFIED). Two paths reach here:
+                                    #   - detected=false: a suite ran and found no
+                                    #     runnable command — an absent-tests repo
+                                    #     must still progress.
+                                    #   - crash with retries exhausted: the verify
+                                    #     task never produced a verdict even after
+                                    #     ``_VERIFY_TESTS_MAX_RETRIES`` re-spawns.
+                                    _crash_exhausted = (
+                                        _is_verify_crash
+                                        and _verify_retries
+                                        >= _VERIFY_TESTS_MAX_RETRIES
+                                    )
                                     logger.warning(
                                         f"[CI] PR #{ci_pr_number} no-CI merge gate: "
-                                        f"no test command detectable (verify_tests "
-                                        f"{_v_task_id[:8]} status="
+                                        + (
+                                            f"verify_tests crashed and retries "
+                                            f"exhausted ({_verify_retries}/"
+                                            f"{_VERIFY_TESTS_MAX_RETRIES})"
+                                            if _crash_exhausted
+                                            else "no test command detectable"
+                                        )
+                                        + f" (verify_tests {_v_task_id[:8]} status="
                                         f"{_verify_task.status}) — merge proceeding "
                                         f"UNVERIFIED"
                                     )
