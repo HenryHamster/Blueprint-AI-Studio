@@ -53,8 +53,14 @@ async def _resolve_terminal_parent_verdict(
     parent: Task,
     children: list,
     blocked_count: int,
-) -> TaskStatus:
+) -> tuple[TaskStatus, str]:
     """Shared terminal-state verdict for both parent terminal paths.
+
+    Returns ``(status, reason)`` where ``reason`` explains *why* the status was
+    chosen so the call sites can emit an accurate operator message and decide
+    whether to penalize direction health. ``reason`` is one of:
+    ``"genuine_failure"``, ``"rollup_pending"``, ``"blocked"``,
+    ``"all_non_genuine_cancelled"``, ``"no_subtasks"``.
 
     Distinguishes blocked-on-precondition (recoverable, not a failure), genuine
     terminal failures, and rollup-re-evaluation cases that should stay EVALUATING.
@@ -67,9 +73,17 @@ async def _resolve_terminal_parent_verdict(
 
     When every unsucceeded subtask is waiting on an upstream precondition and no
     cancellation or completed work is present, the parent should park BLOCKED.
-    When the unsucceeded set is mixed with non-genuine cancellations, or when any
-    completed child exists to roll up, the parent should stay EVALUATING so the
-    genuine outcome can be recomputed without burning retry budget.
+    When any completed child exists to roll up, a still-active child may yet roll
+    up, or a non-genuine cancel sits alongside a still-blocked child (a live
+    replacement may still land), the parent should stay EVALUATING so the genuine
+    outcome can be recomputed without burning retry budget.
+
+    The remaining terminal case — every unsucceeded child is a NON-genuine cancel
+    (superseded / replaced-by-retry / reassigned / scope-empty) with no completed,
+    active, blocked, or genuinely-failed sibling — has nothing left to roll up or
+    wait for. It resolves to FAILED with reason ``all_non_genuine_cancelled`` so
+    the parent finalizes immediately instead of parking EVALUATING forever and
+    being re-poked by the reaper every cycle until the 48h backstop force-fails it.
 
     Centralizing the verdict here keeps the requeue-limit path and the
     all-children-terminal sweep from silently drifting apart.
@@ -92,17 +106,83 @@ async def _resolve_terminal_parent_verdict(
     )
     total_blocked = blocked_count + len(blocked_children)
     has_completed_children = any(c.status == TaskStatus.COMPLETED for c in children)
+    has_active_children = any(
+        c.status
+        in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        )
+        for c in children
+    )
 
     if genuine_failures > 0:
-        return TaskStatus.FAILED
+        return TaskStatus.FAILED, "genuine_failure"
 
-    if has_completed_children or non_genuine_cancelled_children:
-        return TaskStatus.EVALUATING
+    # A completed child to roll up, or a still-active child (e.g. a running
+    # requeue clone / live replacement) that may yet roll up — keep waiting.
+    if has_completed_children or has_active_children:
+        return TaskStatus.EVALUATING, "rollup_pending"
+
+    # A non-genuine cancel alongside a still-blocked child: the blocked child's
+    # precondition may resolve and a live replacement may still roll up. This
+    # mixed case is locked by existing tests and must stay EVALUATING.
+    if non_genuine_cancelled_children and total_blocked > 0:
+        return TaskStatus.EVALUATING, "rollup_pending"
 
     if total_blocked > 0:
-        return TaskStatus.BLOCKED
+        return TaskStatus.BLOCKED, "blocked"
 
-    return TaskStatus.FAILED
+    # Only non-genuine cancels remain — nothing to roll up or wait for. Terminate
+    # now rather than looping EVALUATING (see docstring).
+    if non_genuine_cancelled_children:
+        return TaskStatus.FAILED, "all_non_genuine_cancelled"
+
+    return TaskStatus.FAILED, "no_subtasks"
+
+
+async def _terminate_all_non_genuine_cancelled(
+    parent: Task,
+    children: list,
+    session: AsyncSession,
+    broadcast_to_project,
+) -> int:
+    """Finalize a parent whose unsucceeded children are ALL non-genuine cancels.
+
+    Shared by both terminal paths so the message + direction-health treatment
+    stay in lockstep. Decision (documented here on purpose): because every child
+    was a non-genuine cancellation (superseded / replaced-by-retry / reassigned /
+    scope-empty), their work may have landed elsewhere — so this terminal FAILED
+    does NOT record a direction-health failure (no ``_record_parent_failure``) and
+    raises NO failure alert. We still persist an accurate, non-confabulated
+    failure category: SCOPE_EMPTY (an INFRA_CLASS that does not penalize health),
+    meaning "no genuine work remained to roll up".
+    """
+    from app.failure_classification import SCOPE_EMPTY, persist_failure_category
+
+    cancelled_count = len(
+        [c for c in children if c.status == TaskStatus.CANCELLED]
+    )
+    parent.status = TaskStatus.FAILED
+    parent.latest_status_message = (
+        f"All {cancelled_count} subtask(s) superseded/cancelled — "
+        f"nothing to roll up"
+    )
+    persist_failure_category(parent, SCOPE_EMPTY)
+    session.add(parent)
+    await session.commit()
+    await broadcast_to_project(
+        str(parent.project_id),
+        "task_updated",
+        {"task_id": str(parent.id), "status": TaskStatus.FAILED},
+    )
+    logger.info(
+        f"[REQUEUE] Parent {parent.id} FAILED — all {cancelled_count} "
+        f"subtask(s) non-genuine cancelled (superseded/replaced); nothing to "
+        f"roll up. No direction-health penalty, no failure alert."
+    )
+    return 0
 
 
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
@@ -172,7 +252,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
         # precondition, the parent is recoverable-BLOCKED (no retry-budget burn,
         # no direction-health ding) — not force-failed. Mirrors the
         # all-children-terminal sweep below.
-        limit_verdict = await _resolve_terminal_parent_verdict(
+        limit_verdict, limit_reason = await _resolve_terminal_parent_verdict(
             parent, children, limit_blocked_count
         )
         if limit_verdict == TaskStatus.BLOCKED:
@@ -225,6 +305,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 f"[REQUEUE] Parent {parent.id} kept at EVALUATING — rollup re-evaluation needed"
             )
             return 0
+        if limit_reason == "all_non_genuine_cancelled":
+            return await _terminate_all_non_genuine_cancelled(
+                parent, children, session, broadcast_to_project
+            )
 
         # Genuine failure(s) and/or cancellation(s) present — fail permanently.
         parent.status = TaskStatus.FAILED
@@ -684,7 +768,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                 [c for c in children if c.status == TaskStatus.BLOCKED]
             )
 
-            verdict = await _resolve_terminal_parent_verdict(
+            verdict, verdict_reason = await _resolve_terminal_parent_verdict(
                 parent, children, blocked_count
             )
             if verdict == TaskStatus.BLOCKED:
@@ -737,6 +821,10 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
                     f"[REQUEUE] Parent {parent.id} kept at EVALUATING — rollup re-evaluation needed"
                 )
                 return 0
+            if verdict_reason == "all_non_genuine_cancelled":
+                return await _terminate_all_non_genuine_cancelled(
+                    parent, children, session, broadcast_to_project
+                )
 
             parent.status = TaskStatus.FAILED
             parent_class = AGENT_TIMEOUT

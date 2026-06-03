@@ -1319,6 +1319,175 @@ async def test_requeue_limit_respects_mixed_terminal_child_sets(
 
 
 @pytest.mark.asyncio
+async def test_requeue_terminal_all_non_genuine_cancelled_single(tl_db, mocker):
+    """All-children-terminal path: a parent whose ONLY unsucceeded child is a
+    non-genuine cancel (cascade/replaced-by-retry) finalizes FAILED immediately —
+    not parked EVALUATING forever — with an accurate message and NO direction
+    health penalty / failure alert."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    failure_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0, "direction_id": "d-non-genuine"},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "superseded/cancelled" in (parent.latest_status_message or "")
+    assert "nothing to roll up" in (parent.latest_status_message or "")
+    # Accurate, non-confabulated category — SCOPE_EMPTY, not AGENT_TIMEOUT.
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    # Budget untouched — nothing was retried.
+    assert parent.context.get("_requeue_count") == 0
+    # Non-genuine cancels → no direction-health ding and no failure alert.
+    record_failure.assert_not_called()
+    failure_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_requeue_terminal_all_non_genuine_cancelled_multiple_kinds(
+    tl_db, mocker
+):
+    """All non-genuine-cancel taxonomy classes together (cascade, superseded,
+    pr_closed_non_rejection, cap_exhausted_after_approve, REASSIGNED, SCOPE_EMPTY)
+    with nothing else → parent FAILED, no direction-health ding."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    non_genuine_specs = [
+        ({"_replaced_by_task_id": str(uuid.uuid4())}, "Parent requeued — replaced by retry"),
+        ({}, "Superseded by task abc123"),
+        ({"failure_detail": "pr_closed_non_rejection"}, "PR closed without rejection"),
+        ({"failure_detail": "cap_exhausted_after_approve"}, "Capped after approval"),
+        ({"failure_category": "REASSIGNED"}, "Reassigned to another agent"),
+        ({"failure_category": "SCOPE_EMPTY"}, "SCOPE_EMPTY: nothing to do"),
+    ]
+    for ctx, msg in non_genuine_specs:
+        await _make_task(
+            session,
+            project.id,
+            status=TaskStatus.CANCELLED,
+            parent_task_id=parent.id,
+            context=ctx,
+            latest_status_message=msg,
+        )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "All 6 subtask(s) superseded/cancelled" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    record_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_requeue_limit_all_non_genuine_cancelled_terminates_failed(tl_db, mocker):
+    """Requeue-LIMIT path: parent at the cap whose only unsucceeded child is a
+    non-genuine cancel terminates FAILED (kept in lockstep with the
+    all-children-terminal path) without a direction-health ding."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    record_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 3},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.FAILED
+    assert "superseded/cancelled" in (parent.latest_status_message or "")
+    assert parent.context.get("failure_category") == "SCOPE_EMPTY"
+    record_failure.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_requeue_non_genuine_cancel_with_active_replacement_stays_evaluating(
+    tl_db, mocker
+):
+    """A non-genuine cancel alongside a still-active replacement child must STAY
+    EVALUATING — the live replacement may yet roll up; do NOT terminate."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+    )
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        parent_task_id=parent.id,
+        context={"_replaced_by_task_id": str(uuid.uuid4())},
+        latest_status_message="Parent requeued — replaced by retry",
+    )
+    # Still-active replacement clone.
+    await _make_task(
+        session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=parent.id,
+    )
+
+    result = await _requeue_parent_task(parent, session)
+
+    assert result == 0
+    await session.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+    assert "awaiting rollup re-evaluation" in (parent.latest_status_message or "")
+    assert parent.context.get("_requeue_count") == 0
+
+
+@pytest.mark.asyncio
 async def test_requeue_cancels_failed_children_and_creates_clones(tl_db, mocker):
     """Failed children are cancelled and replaced with QUEUED clones."""
     mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)

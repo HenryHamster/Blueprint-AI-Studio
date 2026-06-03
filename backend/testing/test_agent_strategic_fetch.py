@@ -475,3 +475,60 @@ async def test_agent_fetch_problem_model_hyphen_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_problem_model_both_spellings_return_same_body(
+    client: AsyncClient, db_session
+):
+    """Both /problem_model (underscore) and /problem-model (hyphen) spellings
+    return 200 and identical bodies. This regression test locks the dual-alias
+    guarantee: deleting either decorator would break the test."""
+    project = Project(
+        name="Spelling Test",
+        user_id="test-user-spelling",
+        problem_model={
+            "revision": 5,
+            "intent": {"purpose": "Image rollover compatibility"},
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "Test gap",
+                    "history": [{"ts": "t1", "event": "created"}],
+                }
+            ],
+            "archived_gaps": [{"id": "g-old", "name": "Archived", "status": "closed"}],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-spelling"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-spelling")
+    headers = {"x-agent-token": token}
+
+    # Fetch via underscore route
+    res_underscore = await client.get(
+        f"/api/agent/projects/{project.id}/problem_model", headers=headers
+    )
+    assert res_underscore.status_code == 200, res_underscore.text
+    body_underscore = res_underscore.json()
+
+    # Fetch via hyphen route
+    res_hyphen = await client.get(
+        f"/api/agent/projects/{project.id}/problem-model", headers=headers
+    )
+    assert res_hyphen.status_code == 200, res_hyphen.text
+    body_hyphen = res_hyphen.json()
+
+    # Both must return identical bodies
+    assert body_underscore == body_hyphen
+    assert body_underscore["data"]["revision"] == 5
+    assert body_underscore["data"]["intent"]["purpose"] == "Image rollover compatibility"
