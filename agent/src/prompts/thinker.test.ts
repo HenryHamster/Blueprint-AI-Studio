@@ -372,7 +372,16 @@ describe('runThinkerWithGate', () => {
 
     expect(result.ok).toBe(true);
     expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
-    expect(mockRunClaudeCode.mock.calls[1][0]).toContain('handoff files were not written');
+    // The focused retry is a fresh session — it must embed the thinker's PRIOR
+    // OUTPUT verbatim so it has real content to extract, instead of asking it to
+    // recall "your prior analysis" it cannot see (regression for the 2026-06-03
+    // "I can't manufacture that completeness from an empty context" refusal that
+    // failed every strategic_review with strategic_thinker_artifacts_missing).
+    const retryPrompt = mockRunClaudeCode.mock.calls[1][0];
+    expect(retryPrompt).toContain('were not written to disk');
+    expect(retryPrompt).toContain('FRESH session');
+    expect(retryPrompt).toContain('YOUR PREVIOUS ANALYSIS OUTPUT');
+    expect(retryPrompt).toContain('analysis output'); // okThinkerResult.allOutput, embedded verbatim
     expect(mockPersistAndPostStatus).not.toHaveBeenCalled();
   });
 

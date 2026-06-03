@@ -296,17 +296,47 @@ export async function runThinkerWithGate(
     if (!fs.existsSync(runningUpdatePath)) missing.push(runningUpdatePath);
     sendLog(ws, `\n[WARNING] Thinker exited 0 but handoff files missing (${missing.join(', ')}). Running focused retry...\n`);
 
+    // The focused retry is a FRESH runClaudeCode session — it does NOT carry the
+    // thinker's prior conversation. The old prompt told it to write the files
+    // "verbatim from your prior analysis Section 1/4", which the fresh session
+    // cannot see, so a conscientious agent refused ("I can't manufacture that
+    // completeness from an empty context") and the retry failed every time
+    // (incident 2026-06-03: strategic_review repeatedly FAILED
+    // strategic_thinker_artifacts_missing). Reproduce the thinker's actual output
+    // verbatim in the prompt so the retry has real content to extract from. Use
+    // allOutput's tail (not lastResultText) because the Section-1 problem_model
+    // JSON is usually emitted before the final summary text.
+    const priorOutput = thinkerResult.allOutput.slice(-80_000);
     const retryPrompt = [
-      'Your previous analysis completed but the required handoff files were not written.',
-      'Write them NOW using cat heredoc — nothing else.',
+      'Your previous strategic analysis completed but the required handoff files',
+      'were not written to disk. IMPORTANT: this is a FRESH session — you do NOT',
+      'have the previous conversation. Your previous analysis output is reproduced',
+      'verbatim below; extract the relevant section(s) from IT and write the',
+      'file(s) NOW using cat heredoc. Do nothing else.',
       '',
       `Missing: ${missing.join(', ')}`,
       '',
+      '===== YOUR PREVIOUS ANALYSIS OUTPUT (verbatim) =====',
+      priorOutput,
+      '===== END PREVIOUS ANALYSIS OUTPUT =====',
+      '',
       ...(missing.includes(problemModelPath)
-        ? [`cat > ${problemModelPath} << 'HEREDOC'\n<problem_model JSON verbatim from your prior analysis Section 1>\nHEREDOC`]
+        ? [
+            'Extract the problem_model JSON (the Section 1 / "problem_model" object)',
+            `from the analysis above and write it to ${problemModelPath}:`,
+            `cat > ${problemModelPath} << 'HEREDOC'`,
+            '<the problem_model JSON object, copied from the analysis above>',
+            'HEREDOC',
+          ]
         : []),
       ...(missing.includes(runningUpdatePath)
-        ? [`cat > ${runningUpdatePath} << 'HEREDOC'\n<running_update markdown verbatim from your prior analysis Section 4>\nHEREDOC`]
+        ? [
+            'Extract the running_update markdown (the Section 4 / "running update")',
+            `from the analysis above and write it to ${runningUpdatePath}:`,
+            `cat > ${runningUpdatePath} << 'HEREDOC'`,
+            '<the running_update markdown, copied from the analysis above>',
+            'HEREDOC',
+          ]
         : []),
     ].join('\n');
     const retryResult = await runClaudeCode(retryPrompt, ws, statusRef, model, effort, disallowedTools);
