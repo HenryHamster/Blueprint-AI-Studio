@@ -954,6 +954,54 @@ async def promote(
             lock_released=True,
         )
 
+    # --- Pre-merge Alembic dual-head guard (parity with the rollup, hotfix
+    #     back-merge, and CI task-PR merge paths) -----------------------------
+    # The promotion merge lands the release branch's added migrations onto the
+    # promotion target. The qualification-time structural sync gate is
+    # commit-ancestry based (not migration-aware) and deliberately bounded — it
+    # falls through and promotes after a delay when the back-merge looks stuck,
+    # leaving a window where a hotfix migration can land on the promotion target
+    # AFTER qualification but BEFORE this merge. Because the merge API does not
+    # enforce CI, there is no backstop at merge time. Validate the combined
+    # migration chain against the promotion target's CURRENT chain immediately
+    # before merging, reusing the SAME shared validator the other gates use.
+    #
+    # On a non-clean verdict — a real dual-head / duplicate-revision / stale-
+    # anchor collision OR an inability to fetch/parse the migration metadata —
+    # DO NOT call the merge API. Hold the promotion in a RETRYABLE state:
+    # _record_promotion_failure keeps the version open and bounces it to
+    # stabilize (main is untouched), so the next strategic cycle re-qualifies
+    # once the main → automain back-merge reconciles the integration branch.
+    # This is the missing hard backstop at merge time, NOT a replacement for the
+    # structural sync gate (which stays as-is).
+    from app.rollup_migration_validation import enforce_premerge_migration_guard
+
+    ok_to_merge, hold_reason = await enforce_premerge_migration_guard(
+        token, owner, repo, pr_number, promotion_target
+    )
+    if not ok_to_merge:
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: held merge of promotion PR #%s for "
+            "v%d — Alembic combined-chain guard: %s",
+            pr_number,
+            version.version_number,
+            hold_reason,
+        )
+        # The merge never ran; clean up the release branch best-effort so it
+        # does not dangle while the version waits to re-qualify.
+        await _delete_release_branch_best_effort(
+            token, owner, repo, release_branch, version
+        )
+        return await _record_promotion_failure(
+            session,
+            version,
+            base_record,
+            "migration_guard_blocked",
+            detail=hold_reason,
+            pr_url=pr_url,
+            lock_released=True,
+        )
+
     # 2. Merge the PR — merge_method="merge" preserves integration history.
     #    merge_pull_request does NOT raise on 405/409; it returns merged=False.
     try:
