@@ -582,14 +582,25 @@ function runnerKindFromCmd(cmd: string): string {
 export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   const lower = output.toLowerCase();
   const lines = output.split(/\r?\n/);
+  const trimmedLines = lines.map(line => line.trim());
   // npm placeholder: the default `package.json` test script prints
   // "Error: no test specified" and exits 1 without running anything.
-  if (lower.includes('no test specified')) return 'no_tests';
+  const hasRealFailureEvidence = trimmedLines.some(line => (
+    /^FAILED\s+\S+/.test(line) ||
+    /^FAIL\s{2,}\S+/.test(line) ||
+    /^[✕✗×⨯]\s+\S+/.test(line) ||
+    /^AssertionError:/i.test(line) ||
+    /^Traceback \(most recent call last\):/i.test(line) ||
+    /\b[1-9]\d*\s+failed\b/i.test(line) ||
+    /\btest result:\s+ok\.\s+[1-9]\d*\s+passed;\s+[1-9]\d*\s+failed\b/i.test(line)
+  ));
+  const lineMatches = (pattern: RegExp): boolean => trimmedLines.some(line => pattern.test(line));
+  if (!hasRealFailureEvidence && lineMatches(/^Error:\s+no test specified\b/i)) return 'no_tests';
   // npm/yarn/pnpm: missing test script in package.json.
   // npm: "Error: Missing script: "test"" or "npm ERR! Missing script: "test""
   // yarn: "error Command "test" not found."
   // pnpm: "ERR!  No matching version found for test"
-  if (lower.includes('missing script')) return 'no_tests';
+  if (!hasRealFailureEvidence && lineMatches(/missing script/i)) return 'no_tests';
   // Shell / package-manager missing-runner messages put the literal phrase
   // "command not found" together on a single line:
   //   bash:  "bash: pytest: command not found"
@@ -607,14 +618,14 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // match. Genuine failures whose signal words are far apart or on different
   // lines fall through to 'ran'.
   const missingCommand = /\bcommand\b(?:\s+(?:"[^"]*"|'[^']*'|\S+))?\s+not\s+found\b/i;
-  if (lines.some(line => missingCommand.test(line))) return 'no_tests';
+  if (!hasRealFailureEvidence && lines.some(line => missingCommand.test(line))) return 'no_tests';
   // make: "No rule to make target 'test'" or "No rule to make target `test'"
-  if (lower.includes('no rule to make target')) return 'no_tests';
+  if (!hasRealFailureEvidence && lineMatches(/no rule to make target/i)) return 'no_tests';
   // pytest: "no tests ran in 0.01s" / "collected 0 items".
-  if (lower.includes('no tests ran')) return 'no_tests';
-  if (lower.includes('collected 0 items')) return 'no_tests';
+  if (!hasRealFailureEvidence && lineMatches(/^no tests ran\b/i)) return 'no_tests';
+  if (!hasRealFailureEvidence && lineMatches(/^collected 0 items\b/i)) return 'no_tests';
   // vitest: "No test files found, exiting with code 1".
-  if (lower.includes('no test files found')) return 'no_tests';
+  if (!hasRealFailureEvidence && lineMatches(/^no test files found\b/i)) return 'no_tests';
   // Go: `go test` on an empty package reports `? pkg [no test files]`.
   // The default reporter also emits `ok pkg ...` lines when real tests ran,
   // so only classify as no_tests when every observed package line is empty or
@@ -622,6 +633,7 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   {
     const goResults = lines.filter(line => /^\s*(?:\?\s+\S+\s+\[no test files\]|ok\s+\S+)/i.test(line));
     if (goResults.length > 0) {
+      if (hasRealFailureEvidence) return 'ran';
       const sawRealGoPass = goResults.some(line => /^ok\s+\S+/.test(line) && !/\[no tests to run\]/i.test(line));
       if (sawRealGoPass) return 'ran';
       return 'no_tests';
@@ -629,11 +641,12 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   }
   // Go / Rust filtered-out suites can emit "no tests to run" without a real
   // test body executing.
-  if (lower.includes('no tests to run')) return 'no_tests';
+  if (!hasRealFailureEvidence && lineMatches(/^.*no tests to run.*$/i)) return 'no_tests';
   // Rust: zero-test runs emit a zero-count summary. Require the summary and
   // the `running 0 tests` header, while excluding any non-zero run counts so
   // mixed suites still count as real verification.
   if (
+    !hasRealFailureEvidence &&
     lower.includes('running 0 tests') &&
     lower.includes('test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out') &&
     !/\brunning [1-9]\d* test(s)?\b/.test(lower)

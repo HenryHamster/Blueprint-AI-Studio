@@ -119,9 +119,9 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.noTestsExecuted).toBe(true);
   });
 
-  it('a genuine test failure → noTestsExecuted is NOT set (real verification preserved)', async () => {
+  it('a genuine test failure that mentions an empty-suite phrase → noTestsExecuted is NOT set', async () => {
     execFileAsync.mockRejectedValue(
-      new Error('Command failed: npm test\nTests  1 failed | 2 passed (3)\nAssertionError: expected 1 to equal 2'),
+      new Error('Command failed: npm test\nFAILED src/foo.test.ts > test_command_parser\nAssertionError: collected 0 items but 1 test failed'),
     );
 
     const result = await testFixLoop(
@@ -164,9 +164,9 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
     expect(result.noTestsExecuted).toBe(false);
   });
 
-  it('mixed real-fail + placeholder runner → real failure still blocks and placeholder is ignored', async () => {
+  it('mixed real-fail + placeholder runner where the real failure mentions no-tests text → real failure still blocks', async () => {
     execFileAsync
-      .mockRejectedValueOnce(new Error('Command failed: python3 -m pytest -x -q\nAssertionError: expected 1 to equal 2'))
+      .mockRejectedValueOnce(new Error('Command failed: python3 -m pytest -x -q\nFAILED src/foo.test.ts > test_command_parser\nAssertionError: no tests ran but 1 assertion failed'))
       .mockRejectedValueOnce(Object.assign(new Error('Command failed: npm test\nError: no test specified\nnpm ERR! Test failed.'), {}));
 
     const result = await testFixLoop(

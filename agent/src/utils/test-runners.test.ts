@@ -1307,6 +1307,12 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     )).toBe('no_tests');
   });
 
+  it('pytest empty-suite text mixed with a real failure marker → ran', () => {
+    expect(classifyTestExecution(
+      'FAILED src/foo.test.ts > test_command_parser\nAssertionError: collected 0 items but 1 test failed',
+    )).toBe('ran');
+  });
+
   it('pytest "no tests ran" → no_tests', () => {
     expect(classifyTestExecution('no tests ran in 0.02s')).toBe('no_tests');
   });

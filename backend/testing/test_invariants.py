@@ -7796,6 +7796,40 @@ class TestAgentTestRunnerSourceParity:
             "match 'not found' with optional whitespace between the words."
         )
 
+    def test_classifier_empty_suite_signals_require_failure_guard(self):
+        """Empty-suite phrases may only classify as no_tests when no real
+        failure evidence is present. This prevents a genuine failing suite from
+        being downgraded just because its output mentions 'no tests ran',
+        'collected 0 items', or a similar placeholder phrase as data."""
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        assert "hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "defines a real-failure guard. Empty-suite phrases must be gated "
+            "by a failure-evidence check so genuine failures are not reclassified "
+            "as no_tests."
+        )
+        assert "!hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "requires `!hasRealFailureEvidence` before returning no_tests. "
+            "Restore the guard so real failures win over empty-suite phrases."
+        )
+        for phrase in [
+            "no test specified",
+            "missing script",
+            "No rule to make target",
+            "no tests ran",
+            "collected 0 items",
+            "No test files found",
+            "no tests to run",
+        ]:
+            assert phrase in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+                f"contains the empty-suite signature {phrase!r}; update this "
+                "invariant to match the classifier if the signal moved."
+            )
+
 
 class TestAgentTestRunnerParseHelpers:
     """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic
