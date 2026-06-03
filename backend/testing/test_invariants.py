@@ -2797,29 +2797,83 @@ class TestOperatorMessageArmingGateCoverage:
         ),
     }
 
-    def test_all_operator_message_sites_route_through_shared_gate(self):
-        import ast
-
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        gate_name = self._GATE_NAME
-        message_class = self._MESSAGE_CLASS
-
+    @staticmethod
+    def _collect_offenders(
+        source: str,
+        *,
+        filename: str,
+        rel: str,
+        gate_name: str,
+        message_class: str,
+    ) -> list[str]:
         def _called_name(call: "ast.Call") -> str | None:
             """Return the bare callee name for ``foo(...)`` or ``mod.foo(...)``."""
-            func = call.func
-            if isinstance(func, ast.Name):
-                return func.id
-            if isinstance(func, ast.Attribute):
-                return func.attr
-            return None
+            return _ast_called_name(call)
 
-        def _references_gate(node) -> bool:
-            """True if the shared arming gate is referenced anywhere below node."""
+        def _calls_gate(node) -> bool:
+            """True if the shared arming gate is CALLED anywhere in the subtree."""
+            return any(
+                isinstance(n, ast.Call) and _called_name(n) == gate_name
+                for n in ast.walk(node)
+            )
+
+        def _gate_verdict_used(node) -> bool:
+            """True if the gate's verdict is used (not just called and ignored).
+
+            The gate must be called AND its verdict must appear in:
+            - A return statement/value, or
+            - A conditional test
+
+            Assigning the verdict to a variable but never using it does not count.
+            """
+            # Find all gate calls and their assigned targets
+            verdict_vars = set()
             for n in ast.walk(node):
-                if isinstance(n, ast.Name) and n.id == gate_name:
-                    return True
-                if isinstance(n, ast.Attribute) and n.attr == gate_name:
-                    return True
+                if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                    # Check if the RHS contains a gate call
+                    rhs = n.value if hasattr(n, "value") else None
+                    if rhs and any(
+                        isinstance(c, ast.Call) and _called_name(c) == gate_name
+                        for c in ast.walk(rhs)
+                    ):
+                        # Extract variable names assigned on LHS
+                        if isinstance(n, ast.Assign):
+                            for target in n.targets:
+                                if isinstance(target, ast.Name):
+                                    verdict_vars.add(target.id)
+                        elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                            if isinstance(n.target, ast.Name):
+                                verdict_vars.add(n.target.id)
+
+            # Now check if the verdict is actually used
+            # 1. Used directly in a return value
+            for n in ast.walk(node):
+                if isinstance(n, ast.Return) and n.value:
+                    # Check for direct gate call in return
+                    if any(
+                        isinstance(c, ast.Call) and _called_name(c) == gate_name
+                        for c in ast.walk(n.value)
+                    ):
+                        return True
+                    # Check for verdict variable in return
+                    for name_node in ast.walk(n.value):
+                        if isinstance(name_node, ast.Name) and name_node.id in verdict_vars:
+                            return True
+
+            # 2. Used in a conditional
+            for n in ast.walk(node):
+                if isinstance(n, ast.If):
+                    # Check for gate call in the conditional test
+                    if any(
+                        isinstance(c, ast.Call) and _called_name(c) == gate_name
+                        for c in ast.walk(n.test)
+                    ):
+                        return True
+                    # Check for verdict variable in the conditional test
+                    for name_node in ast.walk(n.test):
+                        if isinstance(name_node, ast.Name) and name_node.id in verdict_vars:
+                            return True
+
             return False
 
         def _is_operator_message_call(node: "ast.Call") -> bool:
@@ -2836,6 +2890,153 @@ class TestOperatorMessageArmingGateCoverage:
             return False
 
         offenders: list[str] = []
+        tree = ast.parse(source, filename=filename)
+
+        funcs = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not _is_operator_message_call(node):
+                continue
+
+            # Resolve the innermost enclosing function for an actionable
+            # offender message and a function-scoped guard check.
+            enclosing = None
+            for fn in funcs:
+                if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
+                    if enclosing is None or fn.lineno > enclosing.lineno:
+                        enclosing = fn
+            func_name = enclosing.name if enclosing is not None else "<module>"
+
+            if (rel, func_name) in TestOperatorMessageArmingGateCoverage._EXEMPT_SITES:
+                continue
+
+            # Fail-closed hardening: the gate must be CALLED and its verdict USED.
+            # A bare reference to the gate symbol (e.g. in an import) is not enough;
+            # only an actual call produces a verdict to use.
+            gate_called = enclosing is not None and _calls_gate(enclosing)
+            verdict_used = gate_called and _gate_verdict_used(enclosing)
+            if not verdict_used:
+                offenders.append(
+                    f"  {rel}:{node.lineno} in {func_name}() — operator "
+                    "ProjectMessage site not covered by the shared arming gate"
+                )
+
+        return offenders
+
+    def test_scan_flags_unguarded_operator_message(self):
+        """Fail-closed basic: an operator ProjectMessage(from_type='user') with
+        no gate call in the enclosing function must be flagged."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def create_message(session, project_id, content):
+                msg = ProjectMessage(
+                    project_id=project_id,
+                    from_type="user",
+                    content=content
+                )
+                await session.add(msg)
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_operator_msg_fixture.py",
+            rel="synthetic_operator_msg_fixture.py",
+            gate_name=self._GATE_NAME,
+            message_class=self._MESSAGE_CLASS,
+        )
+
+        assert offenders == [
+            "  synthetic_operator_msg_fixture.py:3 in create_message() — operator "
+            "ProjectMessage site not covered by the shared arming gate"
+        ]
+
+    def test_scan_accepts_guarded_operator_message(self):
+        """A guarded operator message with the gate called and verdict assigned
+        and used in a response is accepted."""
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def create_message(session, project_id, content):
+                msg = ProjectMessage(
+                    project_id=project_id,
+                    from_type="user",
+                    content=content
+                )
+                arming = await maybe_arm_operator_refresh(
+                    session, project_id, msg_type, message_content=content
+                )
+                return {"id": msg.id, "arming": arming}
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_operator_msg_fixture.py",
+            rel="synthetic_operator_msg_fixture.py",
+            gate_name=self._GATE_NAME,
+            message_class=self._MESSAGE_CLASS,
+        )
+
+        assert offenders == []
+
+    def test_operator_gate_reference_without_verdict_usage_is_flagged(self):
+        """Fail-closed ratchet: referencing the gate symbol is NOT enough — the
+        verdict must actually be USED to drive the response or a conditional.
+
+        This is the documented false-negative the hardened scan prevents:
+        the gate is called and its result assigned, but the value is never
+        tested and the response is formed unconditionally. 'Gate symbol
+        referenced ⇒ covered' would mark this safe; the hardened scan flags it
+        because the verdict is not used to gate the response or a commit.
+        """
+        from textwrap import dedent
+
+        source = dedent(
+            """
+            async def create_message(session, project_id, content):
+                msg = ProjectMessage(
+                    project_id=project_id,
+                    from_type="user",
+                    content=content
+                )
+                # verdict captured but NEVER used in response or conditional
+                arming = await maybe_arm_operator_refresh(
+                    session, project_id, msg_type, message_content=content
+                )
+                return {"id": msg.id, "status": "created"}
+            """
+        )
+
+        offenders = self._collect_offenders(
+            source,
+            filename="synthetic_operator_msg_fixture.py",
+            rel="synthetic_operator_msg_fixture.py",
+            gate_name=self._GATE_NAME,
+            message_class=self._MESSAGE_CLASS,
+        )
+
+        assert offenders == [
+            "  synthetic_operator_msg_fixture.py:3 in create_message() — operator "
+            "ProjectMessage site not covered by the shared arming gate"
+        ], (
+            "A gate verdict that is captured but never used in the response "
+            "(the return dict lacks the arming field) must be flagged — "
+            "referencing the gate symbol is not the same as using its verdict."
+        )
+
+    def test_all_operator_message_sites_route_through_shared_gate(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list[str] = []
         for root, _dirs, files in os.walk(app_dir):
             for fname in sorted(files):
                 if not fname.endswith(".py"):
@@ -2844,46 +3045,24 @@ class TestOperatorMessageArmingGateCoverage:
                 rel = os.path.relpath(fpath, app_dir)
                 with open(fpath, encoding="utf-8") as f:
                     source = f.read()
-                tree = ast.parse(source, filename=fpath)
 
-                funcs = [
-                    n
-                    for n in ast.walk(tree)
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ]
-
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    if not _is_operator_message_call(node):
-                        continue
-
-                    # Resolve the innermost enclosing function for an actionable
-                    # offender message and a function-scoped guard check.
-                    enclosing = None
-                    for fn in funcs:
-                        if fn.lineno <= node.lineno <= (fn.end_lineno or fn.lineno):
-                            if enclosing is None or fn.lineno > enclosing.lineno:
-                                enclosing = fn
-                    func_name = enclosing.name if enclosing is not None else "<module>"
-
-                    if (rel, func_name) in self._EXEMPT_SITES:
-                        continue
-
-                    covered = enclosing is not None and _references_gate(enclosing)
-                    if not covered:
-                        offenders.append(
-                            f"  {rel}:{node.lineno} in {func_name}() — operator "
-                            "ProjectMessage site not covered by the shared arming gate"
-                        )
+                offenders.extend(
+                    self._collect_offenders(
+                        source,
+                        filename=fpath,
+                        rel=rel,
+                        gate_name=self._GATE_NAME,
+                        message_class=self._MESSAGE_CLASS,
+                    )
+                )
 
         assert not offenders, (
             "Found operator-authored ProjectMessage site(s) under backend/app/ "
             "that do NOT route their wake decision through the shared operator "
-            f"arming gate ({gate_name}, in app/strategic_trigger.py).\n"
+            f"arming gate ({self._GATE_NAME}, in app/strategic_trigger.py).\n"
             "Fix each site by calling maybe_arm_operator_refresh(...) in the "
-            "enclosing function, OR — if the site is intentionally exempt — add "
-            "its (file, function) to "
+            "enclosing function and using its verdict in the response, OR — if "
+            "the site is intentionally exempt — add its (file, function) to "
             "TestOperatorMessageArmingGateCoverage._EXEMPT_SITES with a documented "
             "reason.\n"
             "Offenders:\n" + "\n".join(offenders)
