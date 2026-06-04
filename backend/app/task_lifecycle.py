@@ -39,7 +39,12 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     derive_task_branch as _derive_task_branch,
 )
-from app.task_capabilities import WRITE_TASK_TYPES, get_task_capability
+from app.task_capabilities import (
+    STRATEGIC_TASK_TYPES,
+    WRITE_TASK_TYPES,
+    get_task_capability,
+    strategic_phase_for,
+)
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project  # noqa: F401 — re-exported for test patching
 from app.payload_schemas import validate_internal_payload
@@ -279,7 +284,7 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
         .all()
     )
     return any(
-        (t.first_payload).get("type") in ("design_doc_update", "strategic_review")
+        (t.first_payload).get("type") in STRATEGIC_TASK_TYPES
         for t in active
     )
 
@@ -517,7 +522,7 @@ async def _process_post_commit(
         _peek_first = _peek_payload_list[0] if _peek_payload_list else {}
         _peek_type = _peek_first.get("type") if isinstance(_peek_first, dict) else None
         _peek_project_id = _peek_row[1]
-        _is_strategic_type = _peek_type in ("design_doc_update", "strategic_review")
+        _is_strategic_type = _peek_type in STRATEGIC_TASK_TYPES
 
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
@@ -4446,9 +4451,7 @@ async def _process_post_commit(
                     and cycle_row.outcome in strategic_cycle.ACTIVE_OUTCOMES
                 ):
                     task_type = task.first_payload.get("type", "")
-                    failed_phase = (
-                        "phase1" if task_type == "design_doc_update" else "phase2"
-                    )
+                    failed_phase = strategic_phase_for(task_type) or "phase2"
                     logger.warning(
                         f"[STRATEGIC] Task {task.id} ({task_type}) reached {payload.status} "
                         f"but cycle {cycle_id} still in {cycle_row.outcome} — backstop marking failed_{failed_phase}"

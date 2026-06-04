@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { expectNoOverflowAt } from '../test/viewport';
 import { TaskTypeCatalogPanel } from './TaskTypeCatalogPanel';
-import type { TaskTypeCatalogEntry } from '../api';
+import type { TaskTypeCatalogEntry, TaskTypeCostAdherenceEntry } from '../api';
 
 const ENTRIES: TaskTypeCatalogEntry[] = [
   {
@@ -65,14 +65,17 @@ describe('TaskTypeCatalogPanel — viewport regression', () => {
     if (host) { host.remove(); host = null; }
   });
 
-  async function render(entries: TaskTypeCatalogEntry[]) {
+  async function render(
+    entries: TaskTypeCatalogEntry[],
+    adherence?: TaskTypeCostAdherenceEntry[],
+  ) {
     host = document.createElement('div');
     host.style.padding = '12px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
     await act(async () => {
-      r.render(<TaskTypeCatalogPanel entries={entries} />);
+      r.render(<TaskTypeCatalogPanel entries={entries} adherence={adherence} />);
     });
   }
 
@@ -103,5 +106,45 @@ describe('TaskTypeCatalogPanel — viewport regression', () => {
     const createCard = host!.querySelector('[data-task-type="create"]');
     expect(createCard?.textContent).toContain('$8.00');
     expect(createCard?.textContent).toContain('CI + review');
+  });
+
+  test('renders actual avg/p95 cost and an over-ceiling badge when a type chronically overruns', async () => {
+    localStorage.setItem('blueprint-admin:taskTypeCatalogCollapsed', 'false');
+    const adherence: TaskTypeCostAdherenceEntry[] = [
+      {
+        id: 'create',
+        declared_ceiling_usd: 8.0,
+        avg_cost_usd: 12.5,
+        p95_cost_usd: 18.0,
+        sample_count: 7,
+        over_ceiling: true,
+      },
+      // research has no in-window samples -> actual cost degrades to "—".
+      {
+        id: 'research',
+        declared_ceiling_usd: 4.0,
+        avg_cost_usd: null,
+        p95_cost_usd: null,
+        sample_count: 0,
+        over_ceiling: false,
+      },
+    ];
+    await render(ENTRIES, adherence);
+
+    const createCard = host!.querySelector('[data-task-type="create"]');
+    expect(createCard?.textContent).toContain('$12.50');
+    expect(createCard?.textContent).toContain('$18.00');
+    // Over-ceiling types get a visual warning badge.
+    expect(createCard?.querySelector('[data-testid="over-ceiling-badge"]')).not.toBeNull();
+
+    // A type with zero samples shows no badge and a blank actual cost.
+    const researchCard = host!.querySelector('[data-task-type="research"]');
+    expect(researchCard?.querySelector('[data-testid="over-ceiling-badge"]')).toBeNull();
+    const researchActual = researchCard?.querySelector('[data-testid="actual-cost"]');
+    expect(researchActual?.textContent?.trim()).toBe('—');
+
+    // memo has no adherence entry at all -> sample column also blank.
+    const memoCard = host!.querySelector('[data-task-type="memo"]');
+    expect(memoCard?.querySelector('[data-testid="actual-cost"]')?.textContent?.trim()).toBe('—');
   });
 });

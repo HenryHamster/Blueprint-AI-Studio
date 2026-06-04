@@ -29,6 +29,7 @@ from app.models import (
     TaskStatus,
 )
 from app.shared_state import runtime_config as _runtime_config
+from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ async def _record_strategic_task_failure(
     cycle_id = task.strategic_cycle_id or (task.context or {}).get("strategic_cycle_id")
     if cycle_id:
         task_type = task.first_payload.get("type", "")
-        failed_phase = "phase1" if task_type == "design_doc_update" else "phase2"
+        failed_phase = strategic_phase_for(task_type) or "phase2"
         failure_category = task.first_payload.get("failure_category", "")
         outcome_override = (
             strategic_cycle.OUTCOME_THINKER_ARTIFACTS_MISSING

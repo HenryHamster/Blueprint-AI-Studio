@@ -10,7 +10,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -43,6 +42,7 @@ from app.strategic_trigger import (
     strategic_refresh_excerpt,
     strategic_refresh_origin,
 )
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
@@ -2283,10 +2283,7 @@ async def _find_last_strategic_cycle_time(
         .where(
             Task.project_id == project.id,
             Task.status == TaskStatus.COMPLETED,
-            or_(
-                Task.payloads[0]["type"].as_string() == "strategic_review",
-                Task.payloads[0]["type"].as_string() == "design_doc_update",
-            ),
+            Task.payloads[0]["type"].as_string().in_(sorted(STRATEGIC_TASK_TYPES)),
         )
         .order_by(Task.updated_at.desc())
         .limit(1)

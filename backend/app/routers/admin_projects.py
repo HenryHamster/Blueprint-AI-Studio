@@ -1137,6 +1137,72 @@ async def get_task_types(
     return {"task_types": task_type_catalog()}
 
 
+@router.get("/task-types/cost-adherence")
+@limiter.limit("30/minute")
+async def get_task_type_cost_adherence(
+    request: Request,
+    days: int = Query(14, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Per-task-type actual VM cost vs the declared registry ceiling.
+
+    DB-backed sibling of ``/task-types`` (which is intentionally DB-free): the
+    catalog endpoint stays fast and static while the actual-cost comparison —
+    which requires scanning recent terminal tasks — lives here. Returns, per
+    registered task type, the average and p95 actual VM cost (including banked
+    retry spend) over the last ``days`` days, a sample count, and an
+    ``over_ceiling`` flag that fires only once a type has enough samples and its
+    average exceeds its declared ceiling. Read-only and additive.
+
+    The query explicitly loads every column the VM-cost accessor reads so the
+    synchronous compute path never lazy-loads off the async session
+    (MissingGreenlet). Scoped to the caller's projects.
+    """
+    from app.digest_metrics import compute_task_type_cost_adherence
+    from app.models import get_task_total_vm_cost_usd_or_none  # noqa: F401  (accessor used in compute fn)
+    from app.task_capabilities import TASK_CAPABILITY_BY_VALUE
+
+    window_start = _utcnow() - timedelta(days=days)
+    user_pids = _user_project_ids(current_user["user_id"])
+
+    result = await session.execute(
+        select(Task)
+        .where(
+            Task.project_id.in_(user_pids),
+            Task.created_at >= window_start,
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.created_at,
+                Task.payloads,
+                Task.context,
+                Task.vm_provisioned_at,
+                Task.vm_stopped_at,
+                Task.vm_spot,
+                Task.vm_machine_type,
+                Task.vm_runtime_cost_banked_db,
+            )
+        )
+        .limit(10000)
+    )
+    tasks = result.scalars().all()
+
+    ceilings = {
+        value: cap.cost_ceiling_usd
+        for value, cap in TASK_CAPABILITY_BY_VALUE.items()
+    }
+    rows = compute_task_type_cost_adherence(
+        tasks, window_start=window_start, ceilings=ceilings
+    )
+    return {"window_days": days, "task_types": rows}
+
+
 @router.get("/autonomous-status")
 @limiter.limit("30/minute")
 async def get_autonomous_status(

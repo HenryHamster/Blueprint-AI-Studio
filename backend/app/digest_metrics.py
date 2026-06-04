@@ -2106,3 +2106,98 @@ async def compute_release_qualifier_infra_metrics(
         "smoketest_report_missing_count": smoketest_report_missing_count,
         "release_infra_failure_streak_max": release_infra_failure_streak_max,
     }
+
+
+# Minimum number of in-window samples before a task type's average actual cost is
+# allowed to flag as over its declared ceiling. A type that has only run once or
+# twice in the window is too noisy to call "chronically over budget".
+TASK_TYPE_COST_ADHERENCE_MIN_SAMPLES = 3
+
+
+def _cost_pct_float(values: List[float], p: int) -> Optional[float]:
+    """Nearest-rank percentile over a list of floats (None when empty)."""
+    if not values:
+        return None
+    s = sorted(values)
+    return s[min(int(len(s) * p / 100), len(s) - 1)]
+
+
+def compute_task_type_cost_adherence(
+    tasks: List["Task"],
+    *,
+    window_start: datetime,
+    ceilings: Dict[str, Optional[float]],
+    min_samples: int = TASK_TYPE_COST_ADHERENCE_MIN_SAMPLES,
+) -> List[Dict[str, Any]]:
+    """Per-task-type actual VM cost (avg/p95/sample count) vs the declared ceiling.
+
+    Pure transform over already-loaded ``Task`` rows — no DB access. Buckets
+    terminal, in-window tasks by their declared type (``first_payload['type']``),
+    derives each task's total VM cost via ``get_task_total_vm_cost_usd_or_none``
+    (which includes banked retry spend), and compares the per-type average against
+    the declared ``cost_ceiling_usd`` for that type.
+
+    ``ceilings`` maps task-type id -> declared ceiling (or None for types with no
+    declared ceiling). The returned rows cover every type present in ``ceilings``
+    so the operator catalog can render a row per registered type even when a type
+    has no in-window runs (``sample_count == 0``). ``over_ceiling`` is True only
+    once a type has at least ``min_samples`` observed runs AND its average exceeds
+    a positive declared ceiling — a None or non-positive ceiling never flags, and
+    a thin sample never flags.
+
+    Tasks whose cost is None (never provisioned a VM, no banked spend) contribute
+    no sample. The caller MUST load the columns the cost accessor reads
+    (``vm_provisioned_at``, ``vm_stopped_at``, ``vm_spot``, ``vm_machine_type``,
+    ``vm_runtime_cost_banked`` and ``context``) or SQLAlchemy will lazy-load them
+    off an async session and raise MissingGreenlet.
+    """
+    from app.models import (
+        TaskStatus,
+        get_task_total_vm_cost_usd_or_none,
+    )
+
+    _terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+    costs_by_type: Dict[str, List[float]] = defaultdict(list)
+    for t in tasks:
+        if t.status not in _terminal:
+            continue
+        if t.created_at is None or t.created_at < window_start:
+            continue
+        cost = get_task_total_vm_cost_usd_or_none(t)
+        if cost is None:
+            continue
+        task_type = (t.first_payload or {}).get("type", "create")
+        costs_by_type[task_type].append(cost)
+
+    rows: List[Dict[str, Any]] = []
+    # Render a row for every registered type, plus any observed type not in the
+    # registry (so unexpected types are still visible rather than silently dropped).
+    type_ids = list(ceilings.keys())
+    for extra in costs_by_type:
+        if extra not in ceilings:
+            type_ids.append(extra)
+
+    for type_id in type_ids:
+        samples = costs_by_type.get(type_id, [])
+        ceiling = ceilings.get(type_id)
+        sample_count = len(samples)
+        avg_cost = round(sum(samples) / sample_count, 4) if sample_count else None
+        p95_cost = _cost_pct_float(samples, 95)
+        over_ceiling = bool(
+            sample_count >= min_samples
+            and ceiling is not None
+            and ceiling > 0
+            and avg_cost is not None
+            and avg_cost > ceiling
+        )
+        rows.append(
+            {
+                "id": type_id,
+                "declared_ceiling_usd": ceiling,
+                "avg_cost_usd": avg_cost,
+                "p95_cost_usd": round(p95_cost, 4) if p95_cost is not None else None,
+                "sample_count": sample_count,
+                "over_ceiling": over_ceiling,
+            }
+        )
+    return rows

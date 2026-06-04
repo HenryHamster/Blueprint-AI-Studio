@@ -168,6 +168,35 @@ export async function fetchTaskTypeCatalog(
   return Array.isArray(data?.task_types) ? data.task_types : [];
 }
 
+export interface TaskTypeCostAdherenceEntry {
+  id: string;
+  declared_ceiling_usd: number | null;
+  avg_cost_usd: number | null;
+  p95_cost_usd: number | null;
+  sample_count: number;
+  over_ceiling: boolean;
+}
+
+/**
+ * Fetch per-task-type actual VM cost (avg/p95 over a recent window) versus the
+ * declared ceiling. DB-backed sibling of {@link fetchTaskTypeCatalog}; the
+ * catalog endpoint stays DB-free, so actual-cost adherence lives here.
+ */
+export async function fetchTaskTypeCostAdherence(
+  signal?: AbortSignal,
+): Promise<TaskTypeCostAdherenceEntry[]> {
+  const res = await apiFetch(
+    '/api/admin/task-types/cost-adherence',
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch task-type cost adherence: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
 export async function fetchTask(taskId: string): Promise<import('./components/TaskCard').Task> {
   const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}`);
   if (!res.ok) throw new Error(`Failed to fetch task: ${res.status}`);

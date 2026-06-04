@@ -12,11 +12,14 @@ from app.task_capabilities import (
     PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
     READ_ONLY_TASK_TYPES,
+    STRATEGIC_PHASE_BY_TASK_TYPE,
+    STRATEGIC_TASK_TYPES,
     TASK_CAPABILITIES,
     TASK_CAPABILITY_BY_TYPE,
     USER_LAUNCHABLE_TASK_TYPES,
     WRITE_TASK_TYPES,
     get_task_capability,
+    strategic_phase_for,
     task_type_catalog,
 )
 
@@ -108,6 +111,43 @@ def test_completion_handler_declarations_match_legacy_dispatch():
     for cap in TASK_CAPABILITIES:
         if cap.completion_needs_locked_project:
             assert cap.completion_handler is not None
+
+
+def test_strategic_task_types_match_legacy_tuple():
+    """The registry-derived strategic membership set must reproduce exactly the
+    literal ("design_doc_update", "strategic_review") tuple that was previously
+    hardcoded across the lock-ordering peek, the spawn guards, the
+    strategic-failure circuit breaker, the lifecycle backstop, and the
+    active-strategic-task DB queries. This is the SINGLE source of truth those
+    sites now consume, so a drift here is a behavior change everywhere."""
+    assert STRATEGIC_TASK_TYPES == frozenset(
+        {"design_doc_update", "strategic_review"}
+    )
+    # Membership is derived from the same flag that drives the completion lock.
+    assert STRATEGIC_TASK_TYPES == {
+        cap.id.value
+        for cap in TASK_CAPABILITIES
+        if cap.completion_needs_locked_project
+    }
+
+
+def test_strategic_phase_ordering_is_registry_declared():
+    """Phase is an ORDERING within the strategic cycle, declared per-type.
+    design_doc_update is Phase 1, strategic_review is Phase 2. The failure /
+    backstop sites resolve it via strategic_phase_for with a "phase2" default,
+    preserving the old `"phase1" if type == "design_doc_update" else "phase2"`
+    semantics (including the default for any non-strategic type)."""
+    assert STRATEGIC_PHASE_BY_TASK_TYPE == {
+        "design_doc_update": "phase1",
+        "strategic_review": "phase2",
+    }
+    # Every type that declares a phase is a strategic type and vice versa.
+    assert set(STRATEGIC_PHASE_BY_TASK_TYPE) == STRATEGIC_TASK_TYPES
+    assert strategic_phase_for("design_doc_update") == "phase1"
+    assert strategic_phase_for("strategic_review") == "phase2"
+    # Legacy "else phase2" fallback for non-strategic / unknown types.
+    assert (strategic_phase_for("research") or "phase2") == "phase2"
+    assert (strategic_phase_for("totally_unknown_type") or "phase2") == "phase2"
 
 
 def test_task_lifecycle_binds_every_declared_completion_handler():

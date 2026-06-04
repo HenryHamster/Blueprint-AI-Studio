@@ -2408,6 +2408,63 @@ class TestAutonomousMode:
         assert body["counts_by_type"][direction_id]["research"] == 1
 
 
+class TestTaskTypeCostAdherence:
+    @pytest.mark.asyncio
+    async def test_requires_auth(self, override_get_session):
+        """Unauthenticated callers are rejected (router-level get_current_user)."""
+        from fastapi import HTTPException
+
+        async def reject():
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        app.dependency_overrides[get_current_user] = reject
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as anon:
+                resp = await anon.get("/api/admin/task-types/cost-adherence")
+            assert resp.status_code in (401, 403)
+        finally:
+            app.dependency_overrides.pop(get_current_user, None)
+
+    @pytest.mark.asyncio
+    async def test_returns_actual_cost_vs_declared_ceiling(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-type rows carry declared ceilings and actual costs from recent runs."""
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+        from app.task_capabilities import TASK_CAPABILITY_BY_VALUE
+
+        project = await _make_project(db_session, name="Cost Project")
+        now = _utcnow()
+        for cost in (2.0, 4.0, 6.0):
+            db_session.add(
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.COMPLETED,
+                    created_at=now - timedelta(hours=1),
+                    vm_runtime_cost_banked_db=cost,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-types/cost-adherence")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["window_days"] == 14
+        by_id = {r["id"]: r for r in body["task_types"]}
+        # Every registered type is represented.
+        assert set(by_id) >= set(TASK_CAPABILITY_BY_VALUE)
+        create = by_id["create"]
+        assert create["sample_count"] == 3
+        assert create["avg_cost_usd"] == pytest.approx(4.0)
+        assert create["declared_ceiling_usd"] == (
+            TASK_CAPABILITY_BY_VALUE["create"].cost_ceiling_usd
+        )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_notifications.py — Alerts, Messages, Playbook
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -64,6 +64,7 @@ from app.strategic_constants import (
     STRATEGIC_RESOLUTION_MAX,
     STRATEGIC_SYSTEM_ID_MAX,
 )
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
@@ -132,9 +133,9 @@ async def update_design_doc(
         raise HTTPException(status_code=404, detail="Task not found")
 
     # Write operations restricted to strategic agents; reads open to all
-    if payload.op not in ("list", "get") and token.get("task_type") not in (
-        "design_doc_update",
-        "strategic_review",
+    if (
+        payload.op not in ("list", "get")
+        and token.get("task_type") not in STRATEGIC_TASK_TYPES
     ):
         raise HTTPException(
             status_code=403,

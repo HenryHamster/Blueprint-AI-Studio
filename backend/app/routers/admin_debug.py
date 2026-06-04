@@ -34,6 +34,7 @@ from app.auth import get_current_user, require_admin
 from app.broadcast import broadcast_to_project
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.reaper import _heartbeat_stale_cutoff
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -752,9 +753,7 @@ async def get_strategic_debug(
             Task.status.in_(
                 [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
             ),
-            Task.payloads[0]["type"].astext.in_(
-                ["design_doc_update", "strategic_review"]
-            ),
+            Task.payloads[0]["type"].astext.in_(sorted(STRATEGIC_TASK_TYPES)),
         )
         .limit(1)
     )

@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Boxes, ChevronDown, ChevronUp, Rocket } from 'lucide-react';
-import { fetchTaskTypeCatalog, type TaskTypeCatalogEntry } from '../api';
+import { AlertTriangle, Boxes, ChevronDown, ChevronUp, Rocket } from 'lucide-react';
+import {
+  fetchTaskTypeCatalog,
+  fetchTaskTypeCostAdherence,
+  type TaskTypeCatalogEntry,
+  type TaskTypeCostAdherenceEntry,
+} from '../api';
 
 interface TaskTypeCatalogPanelProps {
   /**
@@ -8,6 +13,12 @@ interface TaskTypeCatalogPanelProps {
    * network fetch. Used by tests and by callers that already hold the catalog.
    */
   entries?: TaskTypeCatalogEntry[];
+  /**
+   * Optional per-type actual-cost adherence rows, keyed by task-type id. When
+   * provided alongside ``entries`` the panel renders them directly and skips the
+   * adherence fetch (used by tests).
+   */
+  adherence?: TaskTypeCostAdherenceEntry[];
 }
 
 const OUTPUT_KIND_LABELS: Record<TaskTypeCatalogEntry['output_kind'], string> = {
@@ -38,7 +49,23 @@ function Requirement({ label, active }: { label: string; active: boolean }) {
   );
 }
 
-function CatalogCard({ entry }: { entry: TaskTypeCatalogEntry }) {
+function fmtUsd(value: number | null | undefined): string {
+  return value != null ? `$${value.toFixed(2)}` : '—';
+}
+
+function CatalogCard({
+  entry,
+  adherence,
+}: {
+  entry: TaskTypeCatalogEntry;
+  adherence?: TaskTypeCostAdherenceEntry;
+}) {
+  const hasSamples = adherence != null && adherence.sample_count > 0;
+  const over = adherence?.over_ceiling ?? false;
+  const actualLabel =
+    adherence != null && adherence.sample_count > 0
+      ? `${fmtUsd(adherence.avg_cost_usd)} / ${fmtUsd(adherence.p95_cost_usd)}`
+      : '—';
   return (
     <div
       data-testid="task-type-card"
@@ -79,7 +106,25 @@ function CatalogCard({ entry }: { entry: TaskTypeCatalogEntry }) {
         <dd className="text-neutral-300 truncate text-right">{EVALUATION_LABELS[entry.evaluation_strategy]}</dd>
         <dt className="text-neutral-500">Cost ceiling</dt>
         <dd className="text-neutral-300 truncate text-right tabular-nums">
-          {entry.cost_ceiling_usd != null ? `$${entry.cost_ceiling_usd.toFixed(2)}` : '—'}
+          {fmtUsd(entry.cost_ceiling_usd)}
+        </dd>
+        <dt className="text-neutral-500">Actual avg / p95</dt>
+        <dd
+          data-testid="actual-cost"
+          className={`truncate text-right tabular-nums ${over ? 'text-red-400 font-medium' : 'text-neutral-300'}`}
+        >
+          {hasSamples ? (
+            <span className="inline-flex items-center gap-1 justify-end">
+              {over && <AlertTriangle data-testid="over-ceiling-badge" className="w-3 h-3 shrink-0" />}
+              {actualLabel}
+            </span>
+          ) : (
+            '—'
+          )}
+        </dd>
+        <dt className="text-neutral-500">Samples ({adherence ? 'recent' : '—'})</dt>
+        <dd className="text-neutral-300 truncate text-right tabular-nums">
+          {adherence ? adherence.sample_count : '—'}
         </dd>
       </dl>
 
@@ -93,12 +138,15 @@ function CatalogCard({ entry }: { entry: TaskTypeCatalogEntry }) {
   );
 }
 
-export function TaskTypeCatalogPanel({ entries }: TaskTypeCatalogPanelProps) {
+export function TaskTypeCatalogPanel({ entries, adherence }: TaskTypeCatalogPanelProps) {
   const injected = entries !== undefined;
   const [collapsed, setCollapsed] = useState(() =>
     localStorage.getItem('blueprint-admin:taskTypeCatalogCollapsed') !== 'false'
   );
   const [catalog, setCatalog] = useState<TaskTypeCatalogEntry[]>(entries ?? []);
+  const [adherenceMap, setAdherenceMap] = useState<Record<string, TaskTypeCostAdherenceEntry>>(
+    () => Object.fromEntries((adherence ?? []).map(a => [a.id, a]))
+  );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -107,8 +155,14 @@ export function TaskTypeCatalogPanel({ entries }: TaskTypeCatalogPanelProps) {
     setLoading(true);
     setError(null);
     try {
-      const list = await fetchTaskTypeCatalog();
+      // Fetch the static catalog and the DB-backed adherence rows in parallel.
+      // Adherence failure must not blank the catalog — degrade to "—" instead.
+      const [list, adherenceRows] = await Promise.all([
+        fetchTaskTypeCatalog(),
+        fetchTaskTypeCostAdherence().catch(() => [] as TaskTypeCostAdherenceEntry[]),
+      ]);
       setCatalog(list);
+      setAdherenceMap(Object.fromEntries(adherenceRows.map(a => [a.id, a])));
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load task-type catalog');
     } finally {
@@ -119,10 +173,11 @@ export function TaskTypeCatalogPanel({ entries }: TaskTypeCatalogPanelProps) {
   useEffect(() => {
     if (injected) {
       setCatalog(entries ?? []);
+      setAdherenceMap(Object.fromEntries((adherence ?? []).map(a => [a.id, a])));
       return;
     }
     if (!collapsed && catalog.length === 0) load();
-  }, [collapsed, injected, entries, catalog.length, load]);
+  }, [collapsed, injected, entries, adherence, catalog.length, load]);
 
   const toggle = () => {
     const next = !collapsed;
@@ -163,7 +218,7 @@ export function TaskTypeCatalogPanel({ entries }: TaskTypeCatalogPanelProps) {
           {catalog.length > 0 && (
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {catalog.map(entry => (
-                <CatalogCard key={entry.id} entry={entry} />
+                <CatalogCard key={entry.id} entry={entry} adherence={adherenceMap[entry.id]} />
               ))}
             </div>
           )}

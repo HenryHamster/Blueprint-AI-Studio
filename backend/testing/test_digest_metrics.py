@@ -22,6 +22,7 @@ from app.digest_metrics import (
     compute_release_qualifier_infra_metrics,
     compute_retry_analytics,
     compute_scope_mismatch_summary,
+    compute_task_type_cost_adherence,
 )
 from app.failure_classification import ALL_FAILURE_CLASSES
 from app.sr_review_quality_metrics import (
@@ -331,6 +332,112 @@ def test_compute_narrative_summary_consumes_explicit_churn_direction():
 def _make_failed_task(**kwargs):
     """Minimal failed Task object for compute_failure_grouping unit tests."""
     return make_task(status=TaskStatus.FAILED, **kwargs)
+
+
+def _make_cost_task(task_type, cost, *, status=TaskStatus.COMPLETED, created_at=None):
+    """Terminal task whose total VM cost equals ``cost`` (via banked spend).
+
+    Banking the cost on ``vm_runtime_cost_banked_db`` and leaving
+    ``vm_provisioned_at`` None gives a deterministic total cost equal to ``cost``
+    (current-attempt term is 0), which is all the adherence math needs.
+    """
+    now = _utcnow()
+    return make_task(
+        status=status,
+        payloads=[{"type": task_type}],
+        created_at=created_at if created_at is not None else now - timedelta(hours=1),
+        vm_runtime_cost_banked_db=cost,
+    )
+
+
+def test_cost_adherence_avg_p95_and_sample_count():
+    """Per-type avg/p95/sample_count reflect the banked total VM cost."""
+    now = _utcnow()
+    tasks = [
+        _make_cost_task("create", 2.0),
+        _make_cost_task("create", 4.0),
+        _make_cost_task("create", 6.0),
+    ]
+    rows = compute_task_type_cost_adherence(
+        tasks,
+        window_start=now - timedelta(days=14),
+        ceilings={"create": 8.0},
+    )
+    row = next(r for r in rows if r["id"] == "create")
+    assert row["sample_count"] == 3
+    assert row["avg_cost_usd"] == pytest.approx(4.0)
+    assert row["p95_cost_usd"] == pytest.approx(6.0)
+    assert row["declared_ceiling_usd"] == 8.0
+    assert row["over_ceiling"] is False
+
+
+def test_cost_adherence_over_ceiling_requires_min_samples():
+    """A type only flags over_ceiling once it has >= MIN_SAMPLES costly runs."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    # Two runs, both well over the $1 ceiling, but below the 3-sample minimum.
+    thin = compute_task_type_cost_adherence(
+        [_make_cost_task("fix", 5.0), _make_cost_task("fix", 5.0)],
+        window_start=window_start,
+        ceilings={"fix": 1.0},
+    )
+    assert next(r for r in thin if r["id"] == "fix")["over_ceiling"] is False
+
+    # Three over-ceiling runs now trip the flag.
+    enough = compute_task_type_cost_adherence(
+        [_make_cost_task("fix", 5.0) for _ in range(3)],
+        window_start=window_start,
+        ceilings={"fix": 1.0},
+    )
+    assert next(r for r in enough if r["id"] == "fix")["over_ceiling"] is True
+
+
+def test_cost_adherence_none_ceiling_never_flags():
+    """A type with no declared ceiling never flags over_ceiling."""
+    now = _utcnow()
+    rows = compute_task_type_cost_adherence(
+        [_make_cost_task("research", 99.0) for _ in range(5)],
+        window_start=now - timedelta(days=14),
+        ceilings={"research": None},
+    )
+    row = next(r for r in rows if r["id"] == "research")
+    assert row["sample_count"] == 5
+    assert row["over_ceiling"] is False
+
+
+def test_cost_adherence_excludes_out_of_window_and_zero_cost():
+    """Out-of-window tasks and tasks with no VM cost contribute no sample."""
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    tasks = [
+        _make_cost_task("create", 3.0),  # in-window, counts
+        _make_cost_task("create", 3.0, created_at=now - timedelta(days=30)),  # too old
+        make_task(  # terminal but never ran a VM -> cost None
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            created_at=now - timedelta(hours=1),
+        ),
+    ]
+    rows = compute_task_type_cost_adherence(
+        tasks, window_start=window_start, ceilings={"create": 8.0}
+    )
+    assert next(r for r in rows if r["id"] == "create")["sample_count"] == 1
+
+
+def test_cost_adherence_renders_row_per_registered_type():
+    """Every registered type gets a row even with zero in-window samples."""
+    now = _utcnow()
+    rows = compute_task_type_cost_adherence(
+        [],
+        window_start=now - timedelta(days=14),
+        ceilings={"create": 8.0, "fix": 3.0},
+    )
+    by_id = {r["id"]: r for r in rows}
+    assert set(by_id) == {"create", "fix"}
+    assert by_id["create"]["sample_count"] == 0
+    assert by_id["create"]["avg_cost_usd"] is None
+    assert by_id["create"]["p95_cost_usd"] is None
+    assert by_id["create"]["over_ceiling"] is False
 
 
 def test_compute_failure_grouping_empty():

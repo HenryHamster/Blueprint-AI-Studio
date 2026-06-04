@@ -30,6 +30,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import with_vision_locked
 from app.time_utils import _utcnow
 from app.direction_mode import (
@@ -673,7 +674,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         Task.project_id == project.id,
                         Task.payloads[0]["type"]
                         .as_string()
-                        .in_(["strategic_review", "design_doc_update"]),
+                        .in_(sorted(STRATEGIC_TASK_TYPES)),
                     )
                 )
             ).scalar()
@@ -979,7 +980,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     Task.project_id == project.id,
                     Task.payloads[0]["type"]
                     .as_string()
-                    .in_(["strategic_review", "design_doc_update"]),
+                    .in_(sorted(STRATEGIC_TASK_TYPES)),
                     Task.status.in_(
                         [
                             TaskStatus.QUEUED,
@@ -1020,7 +1021,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         Task.project_id == project.id,
                         Task.payloads[0]["type"]
                         .as_string()
-                        .in_(["strategic_review", "design_doc_update"]),
+                        .in_(sorted(STRATEGIC_TASK_TYPES)),
                         Task.created_at >= cooldown_cutoff,
                     )
                 )

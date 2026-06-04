@@ -82,6 +82,15 @@ EvaluationStrategy = Literal[
     "ci_and_review", "review_only", "forward_quality", "metric", "none"
 ]
 
+# Ordering of a strategic-style task type within the two-phase strategic cycle.
+# This is an ORDERING, not mere membership: ``phase1`` is the architecture /
+# design-doc analysis pass and ``phase2`` is the vision / direction-update pass.
+# Declared per-type so the strategic-failure circuit breaker and the lifecycle
+# backstop can resolve a task's phase from the registry instead of a hardcoded
+# ``"phase1" if type == "design_doc_update" else "phase2"`` conditional. ``None``
+# for every non-strategic type. See STRATEGIC_TASK_TYPES below for membership.
+StrategicPhase = Literal["phase1", "phase2"]
+
 
 @dataclass(frozen=True)
 class TaskCapability:
@@ -124,6 +133,15 @@ class TaskCapability:
     # docs/concurrency.md). Only the strategic completion handlers
     # (design_doc_update, strategic_review) consume it.
     completion_needs_locked_project: bool = False
+    # Position of this task type within the two-phase strategic cycle, or
+    # ``None`` if it is not a strategic-style type. Only the two strategic types
+    # set it: design_doc_update -> "phase1", strategic_review -> "phase2". This
+    # is the registry-declared ORDERING that the strategic-failure circuit
+    # breaker and the lifecycle backstop resolve via ``strategic_phase_for``
+    # (replacing the hardcoded design_doc_update/strategic_review conditional).
+    # Kept aligned with ``completion_needs_locked_project`` (the same two types):
+    # one declares the cycle ordering, the other the completion lock requirement.
+    strategic_phase: StrategicPhase | None = None
     # Whether this task type directly ships user-facing product value (as opposed
     # to structural / overhead work). This is a NEW, independent analytics
     # dimension — intentionally distinct from agent_mode and WRITE_TASK_TYPES.
@@ -208,6 +226,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         cost_ceiling_usd=4.0,
         completion_handler="strategic",
         completion_needs_locked_project=True,
+        strategic_phase="phase2",
         evaluation="forward-quality",
     ),
     TaskCapability(
@@ -221,6 +240,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         cost_ceiling_usd=3.0,
         completion_handler="design_doc",
         completion_needs_locked_project=True,
+        strategic_phase="phase1",
         evaluation="forward-quality",
     ),
     TaskCapability(
@@ -480,6 +500,41 @@ COMPLETION_HANDLER_BY_TASK_TYPE: dict[str, str] = {
 EVALUATION_STRATEGY_BY_TASK_TYPE: dict[str, str] = {
     capability.id.value: capability.evaluation for capability in TASK_CAPABILITIES
 }
+# Canonical registry-derived set of "strategic-style" task types — those whose
+# completion runs the strategic-cycle chain under the canonical Project→Task
+# lock (``completion_needs_locked_project=True``, currently design_doc_update
+# and strategic_review). This is the SINGLE source of truth for the question
+# "is this a strategic task type?" that was previously hardcoded as the literal
+# tuple ``("design_doc_update", "strategic_review")`` across the post-commit
+# lock-ordering peek, the concurrent-strategic spawn guards, the
+# strategic-failure circuit breaker, the lifecycle backstop, and the
+# active-strategic-task DB queries. Adding a new strategic-style task type is
+# now a single registry edit (declare ``completion_needs_locked_project=True``
+# plus a ``strategic_phase``) rather than a hunt-and-edit across modules.
+STRATEGIC_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.completion_needs_locked_project
+)
+# Map of strategic task-type value -> its declared two-phase-cycle ordering
+# ("phase1"/"phase2"), derived from the registry. Non-strategic types are
+# absent. Resolved via ``strategic_phase_for`` at the failure/backstop sites.
+STRATEGIC_PHASE_BY_TASK_TYPE: dict[str, str] = {
+    capability.id.value: capability.strategic_phase
+    for capability in TASK_CAPABILITIES
+    if capability.strategic_phase is not None
+}
+
+
+def strategic_phase_for(task_type: str | TaskType) -> str | None:
+    """Return the declared strategic-cycle phase ("phase1"/"phase2") for a task
+    type, or ``None`` if it is not a strategic-style type.
+
+    Callers that historically defaulted a non-design_doc strategic task to
+    "phase2" preserve that behavior with ``strategic_phase_for(t) or "phase2"``.
+    """
+    capability = get_task_capability(task_type)
+    return capability.strategic_phase if capability is not None else None
 
 
 def get_task_capability(task_type: str | TaskType) -> TaskCapability | None:
