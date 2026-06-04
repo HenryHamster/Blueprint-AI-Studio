@@ -6594,6 +6594,85 @@ async def test_unblock_sweep_requeues_conflict_blocker(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_broadcasts_after_commit(reaper_db, mocker):
+    """The unblock-to-QUEUED task_updated broadcast must fire only after the
+    batch commit succeeds, so the UI never refetches a still-BLOCKED row."""
+    project = await _make_project(reaper_db)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "blocker": {"source": "agent", "waiting_on": "file conflict"},
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+        },
+    )
+
+    # Track commit/broadcast ordering. Install AFTER setup so the setup's own
+    # commits aren't recorded.
+    events: list = []
+    real_commit = reaper_db.commit
+
+    async def _tracking_commit(*a, **k):
+        events.append("commit")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
+
+    async def _tracking_broadcast(project_id, event, payload):
+        events.append(("broadcast", event, payload.get("status")))
+
+    mocker.patch(
+        "app.broadcast.broadcast_to_project", side_effect=_tracking_broadcast
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    # The QUEUED broadcast fired exactly once and strictly after the commit.
+    assert "commit" in events
+    assert ("broadcast", "task_updated", "QUEUED") in events
+    assert events.index("commit") < events.index(
+        ("broadcast", "task_updated", "QUEUED")
+    )
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_does_not_broadcast_on_commit_failure(
+    reaper_db, mocker
+):
+    """If the batch commit raises, no task_updated event may be published —
+    otherwise the UI would act on a transition that never persisted."""
+    project = await _make_project(reaper_db)
+    await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        context={
+            "blocker": {"source": "agent", "waiting_on": "file conflict"},
+            "failure_class": "BLOCKED_PRECONDITION",
+            "failure_category": "BLOCKED_PRECONDITION",
+        },
+    )
+
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch.object(
+        reaper_db, "commit", side_effect=RuntimeError("commit boom")
+    )
+
+    with pytest.raises(RuntimeError, match="commit boom"):
+        await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    # The status transition was never committed, so no broadcast may fire.
+    broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_keeps_agent_precondition_without_dep_edge_blocked(
     reaper_db, mocker
 ):
@@ -6701,6 +6780,9 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_past_deadline(
         "app.broadcast.broadcast_to_project", new_callable=AsyncMock
     )
     project = await _make_project(reaper_db)
+    # Record commit/broadcast ordering to prove the EVALUATING event fires
+    # only after the batch commit. Installed below, after setup commits.
+    events: list = []
     now = _utcnow()
     parent = await _blocked_task(
         reaper_db,
@@ -6735,6 +6817,15 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_past_deadline(
     reaper_db.add(child)
     await reaper_db.commit()
 
+    real_commit = reaper_db.commit
+
+    async def _tracking_commit(*a, **k):
+        events.append("commit")
+        return await real_commit(*a, **k)
+
+    mocker.patch.object(reaper_db, "commit", side_effect=_tracking_commit)
+    broadcast.side_effect = lambda *a, **k: events.append("broadcast")
+
     requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
 
     assert requeued == 0
@@ -6766,6 +6857,10 @@ async def test_unblock_sweep_moves_parent_blocker_to_evaluating_past_deadline(
             "message": "Unblocked — awaiting rollup re-evaluation",
         },
     )
+    # The EVALUATING broadcast must follow the batch commit, not precede it.
+    assert "commit" in events
+    assert "broadcast" in events
+    assert events.index("commit") < events.index("broadcast")
 
 
 @pytest.mark.asyncio

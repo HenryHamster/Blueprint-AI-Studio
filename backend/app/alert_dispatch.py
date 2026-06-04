@@ -615,7 +615,7 @@ async def _maybe_create_precondition_blocker_alert(
     blocker_kind: str,
     detail: str,
     severity: AlertSeverity = AlertSeverity.WARNING,
-) -> None:
+) -> bool:
     """Create a deduplicated operator Alert for a persistent precondition blocker.
 
     Fires when a *recognized* precondition blocker won't clear on its own: a
@@ -644,7 +644,7 @@ async def _maybe_create_precondition_blocker_alert(
         )
     )
     if existing.scalars().first() is not None:
-        return
+        return False
     alert = Alert(
         project_id=task.project_id,
         severity=severity,
@@ -663,6 +663,7 @@ async def _maybe_create_precondition_blocker_alert(
             "title": alert.title,
         },
     )
+    return True
 
 
 async def _maybe_create_blocked_escalation_alert(

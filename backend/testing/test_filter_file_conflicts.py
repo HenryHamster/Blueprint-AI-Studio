@@ -14,7 +14,7 @@ from sqlmodel import select
 from app.models import Task, TaskStatus
 from app.orchestrator import ACTIVE_TASKS_LIGHT_COLUMNS
 from app.orchestrator_filters import filter_file_conflicts
-from testing.factories import make_project, make_task
+from testing.factories import make_alert, make_project, make_task
 
 
 def _queued(project_id, files, scope="small", ttype="fix", parent=None):
@@ -409,6 +409,57 @@ class TestFilterFileConflicts:
         # blocked_at reflects the preserved onset (~7h ago), not a fresh now,
         # so now - blocked_at exceeds the escalation deadline.
         assert c.blocked_at == onset
+
+    @pytest.mark.asyncio
+    async def test_reblock_with_existing_alert_broadcasts_after_commit(
+        self, db_session, mocker
+    ):
+        """When the same blocker reoccurs after its alert already exists, the
+        helper must commit the parked task and then broadcast BLOCKED."""
+        mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+        pid = uuid.uuid4()
+        project = make_project(id=pid)
+        db_session.add(project)
+        await db_session.commit()
+
+        c = _queued(pid, ["a.py", "b.py"], scope="large")
+        ip = _in_progress(pid, ["a.py"])
+        db_session.add(c)
+        db_session.add(ip)
+        await db_session.commit()
+        await db_session.refresh(c)
+        await db_session.refresh(ip)
+
+        existing = make_alert(
+            project_id=pid,
+            task_id=c.id,
+            severity="WARNING",
+            title="Precondition blocker: file conflict on a.py",
+            message="Waiting: file conflict on a.py",
+        )
+        db_session.add(existing)
+        await db_session.commit()
+
+        broadcast_fn = AsyncMock()
+
+        await filter_file_conflicts([c.id], [c], [ip], db_session, broadcast_fn)
+        assert broadcast_fn.call_count == 1
+        args, _ = broadcast_fn.call_args
+        assert args[2]["status"] == "QUEUED"
+        broadcast_fn.reset_mock()
+
+        await filter_file_conflicts([c.id], [c], [ip], db_session, broadcast_fn)
+        await filter_file_conflicts([c.id], [c], [ip], db_session, broadcast_fn)
+
+        await db_session.refresh(c)
+        assert c.status == TaskStatus.BLOCKED
+        broadcast_fn.assert_called_once()
+        args, _ = broadcast_fn.call_args
+        assert args[0] == str(pid)
+        assert args[1] == "task_updated"
+        assert args[2]["task_id"] == str(c.id)
+        assert args[2]["status"] == "BLOCKED"
+        assert "Blocked:" in args[2]["message"]
 
     @pytest.mark.asyncio
     async def test_shared_test_files_not_deferred(self):

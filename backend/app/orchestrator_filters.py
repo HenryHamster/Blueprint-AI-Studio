@@ -149,13 +149,18 @@ async def _record_defer_and_maybe_escalate(
             f"[DISPATCH] Parking task {candidate.id} in BLOCKED after {count} "
             f"deferrals on persistent precondition blocker: {blocker_kind}"
         )
-        await _maybe_create_precondition_blocker_alert(
+        alert_created = await _maybe_create_precondition_blocker_alert(
             candidate,
             session,
             blocker_kind=blocker_kind,
             detail=detail,
         )
-        # Broadcast the BLOCKED status transition so the UI reflects the committed state
+        # The UI must only see BLOCKED after the state is durable. A newly
+        # inserted alert commits the task mutation inside the helper; when the
+        # alert already exists, commit the parked task here because filtered-out
+        # candidates have no later post-commit task_updated broadcast path.
+        if not alert_created:
+            await session.commit()
         if broadcast_fn:
             try:
                 await broadcast_fn(

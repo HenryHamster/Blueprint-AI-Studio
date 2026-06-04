@@ -654,6 +654,10 @@ async def sweep_unblock_blocked_tasks(
 
     requeued = 0
     changed = False
+    # task_updated broadcasts are deferred until after the batch commit so the
+    # admin UI (which refetches task/digest data on these events) never observes
+    # a stale BLOCKED row — or, on rollback, a transition that never persisted.
+    pending_broadcasts: list[tuple[str, dict]] = []
 
     async def _escalate_blocked_task(
         task,
@@ -747,18 +751,13 @@ async def sweep_unblock_blocked_tasks(
             session.add(task)
             requeued += 1
             changed = True
-            try:
-                await _bcast(
+            pending_broadcasts.append(
+                (
                     str(task.project_id),
-                    "task_updated",
                     {"task_id": str(task.id), "status": "QUEUED",
                      "message": task.latest_status_message},
                 )
-            except Exception:
-                logger.debug(
-                    f"[REAPER] Failed to broadcast unblock for {task.id}",
-                    exc_info=True,
-                )
+            )
         elif state == "re_evaluate":
             _clear_blocked_fields(task, preserve_first_blocked=False)
             task.status = TaskStatus.EVALUATING
@@ -768,21 +767,16 @@ async def sweep_unblock_blocked_tasks(
             flag_modified(task, "context")
             session.add(task)
             changed = True
-            try:
-                await _bcast(
+            pending_broadcasts.append(
+                (
                     str(task.project_id),
-                    "task_updated",
                     {
                         "task_id": str(task.id),
                         "status": "EVALUATING",
                         "message": task.latest_status_message,
                     },
                 )
-            except Exception:
-                logger.debug(
-                    f"[REAPER] Failed to broadcast blocked-parent re-eval for {task.id}",
-                    exc_info=True,
-                )
+            )
         elif state == "dead":
             await _escalate_blocked_task(
                 task,
@@ -823,6 +817,18 @@ async def sweep_unblock_blocked_tasks(
 
     if changed:
         await session.commit()
+    # Emit task_updated only after the batch commit succeeds, so a rollback
+    # never publishes a transition the DB didn't keep. Per-broadcast failures
+    # are swallowed so one bad emit can't break the sweep or skip the rest.
+    for project_id, payload in pending_broadcasts:
+        try:
+            await _bcast(project_id, "task_updated", payload)
+        except Exception:
+            logger.debug(
+                f"[REAPER] Failed to broadcast {payload.get('status')} "
+                f"for {payload.get('task_id')}",
+                exc_info=True,
+            )
     if requeued:
         logger.info(f"[REAPER] Step 12: unblocked {requeued} task(s) → QUEUED")
     return requeued

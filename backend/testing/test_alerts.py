@@ -565,12 +565,13 @@ class TestPreconditionBlockerAlert:
         mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task,
             db_session,
             blocker_kind="file conflict on a.py, b.py",
             detail="Waiting: file conflict on a.py, b.py",
         )
+        assert created is True
 
         alerts = await _all_alerts(db_session, task_id=task.id)
         assert len(alerts) == 1
@@ -587,13 +588,15 @@ class TestPreconditionBlockerAlert:
         mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         _project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="upstream dependency", detail="first"
         )
+        assert created is True
         # Re-fire on the same blocker identity must NOT create a second alert.
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="upstream dependency", detail="second"
         )
+        assert created is False
 
         alerts = await _all_alerts(db_session, task_id=task.id)
         assert len(alerts) == 1
@@ -605,12 +608,14 @@ class TestPreconditionBlockerAlert:
         mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
         _project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="file conflict on a.py", detail="d1"
         )
-        await _maybe_create_precondition_blocker_alert(
+        assert created is True
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="pending rollup 'Refactor X'", detail="d2"
         )
+        assert created is True
 
         alerts = await _all_alerts(db_session, task_id=task.id)
         assert len(alerts) == 2
@@ -625,9 +630,10 @@ class TestPreconditionBlockerAlert:
         )
         project, task = await self._make_task(db_session)
 
-        await _maybe_create_precondition_blocker_alert(
+        created = await _maybe_create_precondition_blocker_alert(
             task, db_session, blocker_kind="upstream dependency", detail="d"
         )
+        assert created is True
 
         mock_bc.assert_called_once()
         call_args = mock_bc.call_args
