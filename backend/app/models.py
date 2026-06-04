@@ -2232,7 +2232,7 @@ class VmContact(SQLModel, table=True):
     preempted / OOM — sends no requests) leaves this row stale or absent and is
     reaped on the existing schedule. One row per VM, upserted on every contact.
 
-    ``last_tool_use_at`` (added by alembic 0143) carries the most recent
+    ``last_tool_use_at`` (added by alembic 0144) carries the most recent
     tool-use timestamp the orchestrator heard from this VM, recorded OFF the
     contended Task row for the SAME reason as ``last_contact_at``: a heartbeat
     whose contended ``Task`` write is lock-starved also drops
@@ -2245,7 +2245,7 @@ class VmContact(SQLModel, table=True):
     and is still reaped. Nullable: heartbeats without tool telemetry (or pre-
     backfill rows) leave it None, which falls back to the on-row behaviour.
 
-    Created on Postgres by alembic 0142 (base table) + 0143 (last_tool_use_at)
+    Created on Postgres by alembic 0142 (base table) + 0144 (last_tool_use_at)
     and on the SQLite test fixture by ``SQLModel.metadata.create_all``.
     """
 

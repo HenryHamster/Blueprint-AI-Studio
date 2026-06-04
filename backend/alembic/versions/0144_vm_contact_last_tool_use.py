@@ -23,11 +23,14 @@ the on-row ``Task.last_tool_use_at`` behaviour (no regression). On SQLite (local
 test fixture) the column is created from ``SQLModel.metadata.create_all``; this
 migration is the Postgres path. See ``app.models.VmContact``.
 
-Per CLAUDE.md this migration is chained from the latest head (0142) and
-``EXPECTED_SCHEMA_REVISION`` is bumped to match.
+Per CLAUDE.md this migration is chained from the latest head (0143
+``add_compute_job_persistence``) and ``EXPECTED_SCHEMA_REVISION`` is bumped to
+match. (Renumbered from 0143 to 0144 during the main->automain back-merge: both
+branches independently added a 0143 off 0142, so this one re-chains after the
+compute-job-persistence revision to keep the Alembic chain linear.)
 
-Revision ID: 0143
-Revises: 0142
+Revision ID: 0144
+Revises: 0143
 Create Date: 2026-06-04 12:00:00.000000
 
 """
@@ -36,8 +39,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0143"
-down_revision = "0142"
+revision = "0144"
+down_revision = "0143"
 branch_labels = None
 depends_on = None
 
