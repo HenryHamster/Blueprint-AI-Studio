@@ -1524,3 +1524,75 @@ describe('classifyTestExecution — placeholder/empty suite detection', () => {
     expect(classifyTestExecution('some unrelated output')).toBe('ran');
   });
 });
+
+// Regression: the real-failure guard must recognize a genuine failure in EVERY
+// ecosystem the no-CI gate's runner detection can launch (Go, Ruby/Rake,
+// Gradle, Maven, Elixir, .NET, PHPUnit) — not just pytest/vitest/Rust. A
+// failing suite in those ecosystems whose output ALSO quotes a placeholder
+// diagnostic line (a captured child process's "command not found", an
+// assertion diff printing "no test specified", a sub-invocation's "no tests
+// ran") must classify as a real run so its failure blocks the merge. The
+// pre-fix guard recognized none of these summaries, so every case below was
+// misread as "no tests ran" and the gate fell open, merging UNVERIFIED.
+describe('classifyTestExecution — extra-family real-failure guard', () => {
+  it('Go --- FAIL + tab-separated FAIL\\tpkg quoting "command not found" → ran', () => {
+    expect(classifyTestExecution(
+      '--- FAIL: TestHelperInvocation (0.01s)\n    runner_test.go:42: child process output did not match\nbash: testhelper: command not found\nFAIL\texample.com/runner\t0.03s\nFAIL',
+    )).toBe('ran');
+  });
+
+  it('Go tab-separated FAIL summary alone → ran', () => {
+    expect(classifyTestExecution('FAIL\texample.com/pkg\t0.02s')).toBe('ran');
+  });
+
+  it('.NET "Failed: N" (non-zero) quoting "no test specified" → ran', () => {
+    expect(classifyTestExecution(
+      '  Failed MyApp.Tests.RunnerTests.InvokesNpm [12 ms]\n  Error Message:\nError: no test specified\nFailed!  - Failed:     1, Passed:     4, Skipped:     0, Total:     5',
+    )).toBe('ran');
+  });
+
+  it('Elixir "N failure" (non-zero) quoting "No rule to make target" → ran', () => {
+    expect(classifyTestExecution(
+      "  1) test runs the make target (Mix.RunnerTest)\n     stderr was:\nmake: *** No rule to make target 'test'. Stop.\n\n1 test, 1 failure",
+    )).toBe('ran');
+  });
+
+  it('Ruby minitest "N failures" (non-zero) quoting "command not found" → ran', () => {
+    expect(classifyTestExecution(
+      '  1) Failure:\nRunnerTest#test_invokes_helper [test/runner_test.rb:9]:\nbash: helper: command not found\n\n1 runs, 1 assertions, 1 failures, 0 errors, 0 skips',
+    )).toBe('ran');
+  });
+
+  it('PHPUnit "Failures: N" (non-zero) quoting "no tests ran" → ran', () => {
+    expect(classifyTestExecution(
+      'There was 1 failure:\n\n1) RunnerTest::testPytestRuns\nno tests ran in 0.01s\n\nFAILURES!\nTests: 1, Assertions: 1, Failures: 1.',
+    )).toBe('ran');
+  });
+
+  it('Maven "Failures: N" (non-zero) quoting "Missing script" → ran', () => {
+    expect(classifyTestExecution(
+      '[ERROR] RunnerTest.invokesNpm:21 expected:<> but was child stderr:\nMissing script: "test"\n[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0',
+    )).toBe('ran');
+  });
+
+  // Negative direction: a zero-count summary must NOT be mistaken for a real
+  // failure — these stay placeholder/empty signals so the gate still routes to
+  // proceed-without-checks rather than hard-blocking an empty repo.
+  it('.NET zero-count "Failed: 0" with no-test-specified placeholder → no_tests', () => {
+    expect(classifyTestExecution(
+      'Error: no test specified\nPassed!  - Failed:     0, Passed:     0, Skipped:     0, Total:     0',
+    )).toBe('no_tests');
+  });
+
+  it('PHPUnit/Maven zero-count "Failures: 0" with make placeholder → no_tests', () => {
+    expect(classifyTestExecution(
+      "make: *** No rule to make target 'test'. Stop.\nTests run: 0, Failures: 0, Errors: 0, Skipped: 0",
+    )).toBe('no_tests');
+  });
+
+  it('Elixir zero-count "0 failures" with command-not-found placeholder → no_tests', () => {
+    expect(classifyTestExecution(
+      'bash: mix: command not found\n0 tests, 0 failures',
+    )).toBe('no_tests');
+  });
+});

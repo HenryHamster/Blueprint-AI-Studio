@@ -7777,23 +7777,35 @@ class TestAgentTestRunnerSourceParity:
             "Use a regex pattern like /\\bcommand\\b(?:\\s+(?:\"[^\"]*\"|'[^']*'|\\S+))?\\s+not\\s+found\\b/i"
         )
 
-        # Verify the correct line-scoped pattern is present
-        assert "missingCommand" in region, (
+        # Verify the correct line-scoped detection is present. The classifier
+        # detects missing runners with a set of line-anchored, runner-shaped
+        # patterns (missingCommandPatterns) tested PER LINE — never a whole-output
+        # substring scan. Each pattern requires the CONTIGUOUS phrase "command not
+        # found" (or the yarn-shaped 'command "x" not found') on a runner-emitted
+        # line, so a failing suite whose output merely contains the two signal
+        # words non-adjacently stays a real run.
+        assert "missingCommandPatterns" in region, (
             "agent/src/utils/test-runners.ts classifyTestExecution must define a "
-            "missingCommand regex variable to handle missing-command detection."
+            "missingCommandPatterns set of line-anchored regexes for missing-command "
+            "detection."
         )
-        assert ".some(line => missingCommand.test(line))" in region, (
+        assert "missingCommandPatterns.some(pattern => pattern.test(line))" in region, (
             "agent/src/utils/test-runners.ts classifyTestExecution must test "
-            "missingCommand on individual lines, not on the whole output."
+            "missingCommandPatterns on individual lines (some(line => "
+            "missingCommandPatterns.some(pattern => pattern.test(line)))), not on "
+            "the whole output."
         )
-        # Verify the regex has the word-boundary and adjacency constraints
-        assert r"\bcommand\b" in region, (
-            "agent/src/utils/test-runners.ts classifyTestExecution regex must "
-            "use \\bcommand\\b for word-boundary matching to avoid test_command_parser false-positives."
+        # The patterns must require the contiguous phrase on a runner-shaped line,
+        # never the two signal words matched independently across the output.
+        assert "command not found" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must require the "
+            "contiguous phrase 'command not found' in its runner-shaped patterns, "
+            "not 'command' and 'not found' matched independently."
         )
-        assert r"not\s+found" in region or "not found" in region, (
-            "agent/src/utils/test-runners.ts classifyTestExecution regex must "
-            "match 'not found' with optional whitespace between the words."
+        assert "^(?:bash|sh):" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution must line-anchor "
+            "its missing-command patterns to runner-emitted shapes (e.g. "
+            "'^(?:bash|sh):') so a quoted phrase mid-line stays a real run."
         )
 
     def test_classifier_empty_suite_signals_require_failure_guard(self):
@@ -7828,6 +7840,68 @@ class TestAgentTestRunnerSourceParity:
                 "agent/src/utils/test-runners.ts classifyTestExecution no longer "
                 f"contains the empty-suite signature {phrase!r}; update this "
                 "invariant to match the classifier if the signal moved."
+            )
+
+    def test_classifier_real_failure_guard_covers_every_runner_family(self):
+        """COUPLED INVARIANT: the no-CI gate's runner detection can launch many
+        ecosystems (Go, Ruby/Rake, Gradle, Maven, Elixir, .NET, PHPUnit) beyond
+        pytest/vitest/Rust, and the real-failure guard (hasRealFailureEvidence)
+        MUST recognize a genuine failure in each one. Otherwise a failing suite
+        whose output ALSO quotes a placeholder diagnostic line (a captured child
+        process's "command not found", an assertion diff printing "no test
+        specified", a sub-invocation's "no tests ran") is misread as "no tests
+        ran" and the gate falls open, merging UNVERIFIED.
+
+        The agent vitest suite (which directly exercises the behavior) is run
+        NOWHERE automatically — not by ./check, not by CI — so this CI-enforced
+        source-scan pins "a family the gate can launch" and "its failure
+        signature is recognized" as ONE invariant. Each per-ecosystem failure
+        signature below must be present in the classifier region; a future edit
+        that silently drops one re-opens the fall-open and fails here.
+        """
+        source = self._read_agent_source()
+        region = _extract_classifier_region(source)  # raises (loud) on parse miss
+
+        assert "hasRealFailureEvidence" in region, (
+            "agent/src/utils/test-runners.ts classifyTestExecution no longer "
+            "defines the real-failure guard hasRealFailureEvidence."
+        )
+
+        # Each entry: (human label, list of acceptable source substrings — at
+        # least one must be present). The substrings are the line-anchored,
+        # non-zero-guarded signatures the guard uses for that family.
+        required_signatures = [
+            ("Go verbose per-test failure (--- FAIL:)", [r"^--- FAIL:"]),
+            ("Go tab-separated package FAIL summary", [r"^FAIL\t"]),
+            (".NET `Failed: N` (non-zero)", [r"Failed:\s+[1-9]"]),
+            (
+                "Elixir/Ruby/RSpec `N failure(s)` (non-zero)",
+                [r"[1-9]\d*\s+failures?"],
+            ),
+            ("PHPUnit/Maven `Failures: N` (non-zero)", [r"Failures:\s+[1-9]"]),
+        ]
+        missing = [
+            label
+            for label, candidates in required_signatures
+            if not any(candidate in region for candidate in candidates)
+        ]
+        assert not missing, (
+            "agent/src/utils/test-runners.ts classifyTestExecution's real-failure "
+            "guard no longer recognizes a genuine failure for runner family/"
+            f"families: {missing}. The no-CI gate's runner detection can still "
+            "launch these ecosystems, so dropping their failure signature re-opens "
+            "the merge-unverified fall-open. Restore the line-anchored, non-zero "
+            "signature(s) in hasRealFailureEvidence."
+        )
+
+        # The count-summary signatures MUST keep a non-zero guard so a zero-count
+        # summary (`Failed: 0`, `Failures: 0`, `0 failures`) is never mistaken for
+        # a real failure (which would hard-block a genuinely empty repo).
+        for nonzero_guard in [r"Failed:\s+[1-9]", r"Failures:\s+[1-9]", r"[1-9]\d*\s+failures?"]:
+            assert nonzero_guard in region, (
+                "agent/src/utils/test-runners.ts classifyTestExecution dropped the "
+                f"non-zero count guard {nonzero_guard!r}; a zero-count summary would "
+                "be misread as a real failure and hard-block an empty repo."
             )
 
 

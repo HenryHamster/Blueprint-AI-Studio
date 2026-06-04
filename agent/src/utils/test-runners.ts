@@ -653,6 +653,19 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
   // the runner-emitted line shape so a real suite that merely asserts on the
   // literal "Error: no test specified" as data (e.g. `AssertionError: expected
   // 'Error: no test specified' in output`) stays a real run.
+  // The runner detection (detectExtraFamilyRunner + the root/nested scans) can
+  // launch MANY ecosystems beyond pytest/vitest/Rust — Go, Ruby/Rake, Gradle,
+  // Maven, Elixir, .NET, PHPUnit. Each reports a real failure with its own
+  // summary shape, and the guard MUST recognize every one of them: a genuine
+  // failure that ALSO quotes a placeholder-looking line (a captured child
+  // process's "command not found", an assertion diff printing "no test
+  // specified", a sub-invocation's "no tests ran in 0.01s") would otherwise be
+  // misread as "no tests ran" and merged UNVERIFIED. Treat "a family the gate
+  // can launch" and "its failure signature is recognized" as ONE invariant
+  // (mirrored by the CI-enforced source-scan in test_invariants.py). Keep every
+  // signal LINE-ANCHORED and, for count summaries, REQUIRE a non-zero count so a
+  // zero-count summary ("0 failures", "Failed: 0", "Failures: 0") is never
+  // mistaken for a failure.
   const hasRealFailureEvidence = trimmedLines.some(line => (
     /^FAILED\s+\S+/.test(line) ||
     /^FAIL\s{2,}\S+/.test(line) ||
@@ -660,7 +673,20 @@ export function classifyTestExecution(output: string): 'ran' | 'no_tests' {
     /^AssertionError:/i.test(line) ||
     /^Traceback \(most recent call last\):/i.test(line) ||
     /\b[1-9]\d*\s+failed\b/i.test(line) ||
-    /\btest result:\s+ok\.\s+[1-9]\d*\s+passed;\s+[1-9]\d*\s+failed\b/i.test(line)
+    /\btest result:\s+ok\.\s+[1-9]\d*\s+passed;\s+[1-9]\d*\s+failed\b/i.test(line) ||
+    // Go: verbose per-test failure marker and the tab-separated package-fail
+    // summary line ("FAIL\texample.com/pkg\t0.03s"). The bare-2-space FAIL rule
+    // above does not match the tab form.
+    /^--- FAIL:/.test(line) ||
+    /^FAIL\t\S/.test(line) ||
+    // .NET (`dotnet test`): "Failed!  - Failed:     N, Passed: ..." — non-zero.
+    /\bFailed:\s+[1-9]\d*\b/i.test(line) ||
+    // Elixir/Ruby/RSpec count summaries: "1 test, 1 failure",
+    // "3 examples, 1 failure", "1 runs, .., 1 failures, .." — non-zero.
+    /\b[1-9]\d*\s+failures?\b/i.test(line) ||
+    // PHPUnit/Maven: "Tests: .., Assertions: .., Failures: N" /
+    // "Tests run: .., Failures: N, .." — non-zero.
+    /\bFailures:\s+[1-9]\d*\b/i.test(line)
   ));
   const noTestSpecified = /^(?:npm (?:ERR!|error)\s+)?error:\s*no test specified\s*$/i;
   if (!hasRealFailureEvidence && trimmedLines.some(line => noTestSpecified.test(line))) return 'no_tests';
