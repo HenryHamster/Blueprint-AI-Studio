@@ -4459,6 +4459,192 @@ async def test_strategic_api_set_running_update_operator_edit_between_writes_win
         _cleanup_strategic_overrides()
 
 
+async def _attach_cycle_with_vision_baseline(
+    db_session, project, task_id, *, baseline, current
+):
+    """Snapshot ``baseline`` as the cycle's vision baseline, link the fixture's
+    task to the cycle, and set ``current`` as the live DB vision (simulating a
+    mid-cycle operator edit). Returns the cycle id. Mirrors
+    :func:`_attach_cycle_with_running_update_baseline`."""
+    from app import strategic_cycle
+
+    cycle = await strategic_cycle.create(
+        db_session,
+        project_id=project.id,
+        baseline_vision=baseline,
+    )
+    await db_session.commit()
+
+    project.vision = current
+    db_session.add(project)
+
+    task = await db_session.get(Task, uuid.UUID(task_id))
+    task.strategic_cycle_id = cycle.id
+    task.context = {**(task.context or {}), "strategic_cycle_id": cycle.id}
+    db_session.add(task)
+    await db_session.commit()
+    return cycle.id
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_vision_operator_edit_preserved(db_session):
+    """Live op: a concurrent operator edit to a vision field (purpose) survives
+    (operator wins) and the agent's superseded value lands on the rejected-edits
+    ledger. Regression: pre-fix the live set_vision blind-assigned and silently
+    clobbered the operator's edit."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        baseline = {"revision": 1, "purpose": "Original purpose."}
+        current = {"revision": 1, "purpose": "OPERATOR EDITED PURPOSE."}
+        await _attach_cycle_with_vision_baseline(
+            db_session, project, task_id, baseline=baseline, current=current
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_vision",
+                    "task_id": task_id,
+                    "data": {"purpose": "AGENT REWRITTEN PURPOSE."},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        # Operator's mid-cycle edit wins on the persisted vision.
+        assert project.vision["purpose"] == "OPERATOR EDITED PURPOSE."
+        # Agent's superseded value is recorded for next cycle.
+        ledger = (project.vision or {}).get(REJECTED_EDITS_KEY) or []
+        assert any(
+            e.get("agent_value") == "AGENT REWRITTEN PURPOSE."
+            for e in ledger
+        ), f"Expected the agent's superseded purpose on the ledger; got {ledger}"
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_vision_agent_wins_when_untouched(db_session):
+    """Live op: when the operator did not touch vision since the cycle baseline,
+    the agent's rewritten field is taken (no false operator-conflict)."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        baseline = {"revision": 1, "purpose": "Original purpose."}
+        await _attach_cycle_with_vision_baseline(
+            db_session, project, task_id, baseline=baseline, current=dict(baseline)
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_vision",
+                    "task_id": task_id,
+                    "data": {"purpose": "AGENT REWRITTEN PURPOSE."},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(project)
+        assert project.vision["purpose"] == "AGENT REWRITTEN PURPOSE."
+        assert not (project.vision or {}).get(REJECTED_EDITS_KEY)
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_vision_legacy_no_cycle_blind_assign(db_session):
+    """Live op: with NO cycle attached (legacy task) the op degrades to today's
+    direct assignment — the agent's vision is taken verbatim, revision bumps, and
+    internal tracking fields are preserved."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        project.vision = {
+            "revision": 3,
+            "purpose": "Old purpose.",
+            "_strategic_failures": 2,
+            "_keep_me": "internal",
+        }
+        db_session.add(project)
+        await db_session.commit()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_vision",
+                    "task_id": task_id,
+                    "data": {"purpose": "AGENT NEW PURPOSE."},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["revision"] == 4
+        await db_session.refresh(project)
+        assert project.vision["purpose"] == "AGENT NEW PURPOSE."
+        # Internal tracking preserved; failure counter reset on success.
+        assert project.vision["_keep_me"] == "internal"
+        assert "_strategic_failures" not in project.vision
+    finally:
+        _cleanup_strategic_overrides()
+
+
+@pytest.mark.asyncio
+async def test_strategic_api_set_vision_second_write_advances_own_proposal(db_session):
+    """Live op: two set_vision writes in one cycle with NO operator edit between —
+    the SECOND write's value persists (advances the agent's own proposal) and is
+    NOT misread as a mid-cycle operator edit / recorded as superseded."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.vision_merge import REJECTED_EDITS_KEY
+
+    project, task_id = await _make_strategic_project_and_task(db_session)
+    try:
+        baseline = {"revision": 1, "purpose": "Original purpose."}
+        await _attach_cycle_with_vision_baseline(
+            db_session, project, task_id, baseline=baseline, current=dict(baseline)
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            r1 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_vision",
+                    "task_id": task_id,
+                    "data": {"purpose": "AGENT PURPOSE A."},
+                },
+            )
+            assert r1.status_code == 200, r1.text
+            r2 = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "set_vision",
+                    "task_id": task_id,
+                    "data": {"purpose": "AGENT PURPOSE B."},
+                },
+            )
+            assert r2.status_code == 200, r2.text
+        await db_session.refresh(project)
+        assert project.vision["purpose"] == "AGENT PURPOSE B."
+        assert not (project.vision or {}).get(REJECTED_EDITS_KEY)
+    finally:
+        _cleanup_strategic_overrides()
+
+
 @pytest.mark.asyncio
 async def test_strategic_api_create_message_rejects_over_limit(db_session):
     """create_message rejects content exceeding limit."""

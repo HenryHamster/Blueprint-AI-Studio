@@ -622,12 +622,52 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail="Vision must have a 'purpose' field"
             )
+        from app import strategic_cycle as _strategic_cycle
+        from app.vision_merge import append_rejected_edits, merge_vision
+
         current = dict(project.vision or {})
-        new_vision = {
-            **dict(data),
-            "revision": (current.get("revision", 0) or 0) + 1,
-            "last_updated": _utcnow().isoformat(),
-        }
+        # Operator-wins reconciliation, mirroring set_problem_model /
+        # set_running_update: resolve the cycle's vision merge ancestor and run
+        # the shared 3-way merge so a concurrent operator edit (purpose, systems,
+        # priorities, context) is preserved (operator wins) and the agent's
+        # superseded value is recorded to the rejected-edits ledger for next
+        # cycle. On the FIRST write the ancestor is the cycle-start
+        # baseline_vision snapshot; on a SECOND same-cycle write it is the
+        # agent's own prior proposal (stored below) so the agent advances its
+        # own field instead of being misread as an operator edit. Degrades to a
+        # blind assign onto ``current`` when no cycle/baseline resolves (legacy
+        # task), preserving today's behavior.
+        vision_cycle_row = None
+        vision_cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        merge_ancestor: dict | None = None
+        if vision_cycle_id:
+            vision_cycle_row = await _strategic_cycle.get(session, vision_cycle_id)
+            if vision_cycle_row is not None:
+                prior = _strategic_cycle.agent_vision_proposal(vision_cycle_row)
+                if prior is not None:
+                    merge_ancestor = prior
+                else:
+                    snap = _strategic_cycle.baseline_vision(vision_cycle_row)
+                    if snap:
+                        merge_ancestor = snap
+        if merge_ancestor is not None:
+            merged, rejected_edits = merge_vision(
+                baseline=merge_ancestor, agent=dict(data), current=current
+            )
+            if rejected_edits:
+                append_rejected_edits(merged, rejected_edits)
+                logger.info(
+                    f"[STRATEGIC API] Vision merge rejected {len(rejected_edits)} "
+                    f"agent edit(s) in favor of concurrent operator changes for "
+                    f"project {project.id}"
+                )
+            new_vision = merged
+        else:
+            new_vision = dict(data)
+        new_vision["revision"] = (current.get("revision", 0) or 0) + 1
+        new_vision["last_updated"] = _utcnow().isoformat()
         # Preserve internal tracking fields; reset failure counters on success
         new_vision.update(
             {
@@ -641,6 +681,11 @@ async def strategic_operation(
         project.vision = new_vision
         flag_modified(project, "vision")
         session.add(project)
+        # Remember the agent's pre-merge proposed vision so a subsequent
+        # same-cycle write reconciles against it (see ancestor resolution above).
+        if vision_cycle_row is not None:
+            _strategic_cycle.set_agent_vision_proposal(vision_cycle_row, dict(data))
+            session.add(vision_cycle_row)
         # Stamp task so the completion handler knows a real vision update occurred
         task.context = {**(task.context or {}), "_strategic_vision_set": True}
         flag_modified(task, "context")

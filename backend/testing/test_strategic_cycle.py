@@ -176,6 +176,43 @@ async def test_agent_problem_model_proposal_roundtrip(db_session):
     assert strategic_cycle.agent_problem_model_proposal(refetched) == subset
 
 
+@pytest.mark.asyncio
+async def test_agent_vision_proposal_roundtrip(db_session):
+    """The agent's per-cycle pre-merge vision proposal stores and reads back;
+    absent until the first write (so callers fall back to baseline_vision)."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    # No write yet → None (callers fall back to baseline_vision snapshot).
+    assert strategic_cycle.agent_vision_proposal(fetched) is None
+
+    vision = {"purpose": "P", "systems": [{"id": "s1", "name": "Core"}]}
+    strategic_cycle.set_agent_vision_proposal(fetched, vision)
+    db_session.add(fetched)
+    await db_session.commit()
+    refetched = await strategic_cycle.get(db_session, cycle.id)
+    assert strategic_cycle.agent_vision_proposal(refetched) == vision
+
+
+def test_to_legacy_dict_omits_agent_vision_proposal():
+    """The per-cycle agent vision proposal must never leak into the agent-facing
+    cycle-history shape, exactly as the baseline snapshots are hidden."""
+    cycle = StrategicCycle(
+        id="sc-test-vprop",
+        project_id="p-1",
+        outcome=strategic_cycle.OUTCOME_COMPLETED,
+        phase1_started_at=_utcnow(),
+        cycle_metadata={
+            strategic_cycle.AGENT_VISION_PROPOSAL_KEY: {"purpose": "secret"},
+            "memos_cited": 1,
+        },
+    )
+    out = strategic_cycle._to_legacy_dict(cycle)
+    assert strategic_cycle.AGENT_VISION_PROPOSAL_KEY not in out
+    assert out["memos_cited"] == 1
+
+
 def test_to_legacy_dict_omits_agent_problem_model_proposal():
     """The per-cycle agent proposal must never leak into the agent-facing
     cycle-history shape, exactly as the baseline snapshots are hidden."""
