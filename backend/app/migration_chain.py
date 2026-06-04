@@ -119,8 +119,10 @@ def main(versions_dir: str | None = None) -> int:
 
     chain, duplicates, _unparseable = build_migration_chain(sources)
 
-    for rev in sorted(set(duplicates)):
-        errors.append(f"  duplicate revision '{rev}' declared by more than one file")
+    errors.extend(
+        f"  duplicate revision '{rev}' declared by more than one file"
+        for rev in sorted(set(duplicates))
+    )
 
     heads = find_heads(chain)
     if len(heads) != 1:
@@ -181,6 +183,92 @@ def find_filename_revision_mismatches(sources: dict[str, str]) -> list[str]:
                 f"internal revision says {revision}"
             )
     return mismatches
+
+
+def _filename_description(identifier: str) -> str | None:
+    """The descriptive suffix after a migration filename's ``NNNN_`` prefix.
+
+    ``0138_digest_cache_table.py`` -> ``digest_cache_table``. Returns ``None``
+    for identifiers without a numeric revision prefix (non-migration files), so
+    callers can skip them. The description is a migration's stable identity:
+    immutable migrations keep it forever, so a description appearing under two
+    different revision ids means the migration was renumbered.
+    """
+    if _filename_revision_prefix(identifier) is None:
+        return None
+    basename = os.path.basename(identifier)
+    stem = basename[:-3] if basename.endswith(".py") else basename
+    parts = stem.split("_", 1)
+    return parts[1] if len(parts) > 1 else ""
+
+
+def find_content_divergent_revisions(
+    base_filenames: list[str], head_filenames: list[str]
+) -> list[str]:
+    """Revisions whose migration *identity* diverges between two refs.
+
+    The other guards each prove a single checkout's chain is internally valid;
+    none compares a revision id's content ACROSS refs. The main<->automain
+    back-merge renumber produced exactly that blind spot: a revision id the LIVE
+    DB had already applied ended up mapping to a DIFFERENT migration than what
+    shipped, so alembic considered it applied and skipped it, and the new
+    revision boot-crashed on the missing schema (prod incident 2026-06-04).
+
+    This catches it statically, before merge, by comparing the two refs'
+    migration FILENAMES — the ``NNNN`` prefix is the revision id and the suffix
+    is the migration's identity, kept in lockstep with the in-file revision by
+    the migration-chain invariant. It flags two complementary divergences:
+
+      (a) the SAME revision id describes a DIFFERENT migration on each side — an
+          id was reused for new content, so a DB that applied the old meaning
+          silently skips the new one; and
+      (b) the SAME migration appears under DIFFERENT revision ids — a migration
+          was renumbered/moved, so a DB that applied it under the old id will
+          re-run (or skip) it under the new one.
+
+    Returns human-readable strings naming each divergence; empty when the two
+    refs agree on every shared revision id and migration. Pure and repo-agnostic
+    (filename-only, no DB, no I/O) — protects any repo Blueprint edits, not just
+    the self-repo. Distinct from :func:`validate_combined_migration_chain`, which
+    only catches an *added* id colliding with an existing one; a renumber that
+    moves a migration to a brand-new id leaves the on-disk chain valid and slips
+    past every structural check while still breaking the live DB.
+    """
+    def _rev_to_desc(filenames: list[str]) -> dict[str, str | None]:
+        out: dict[str, str | None] = {}
+        for fn in filenames:
+            rev = _filename_revision_prefix(fn)
+            if rev is not None:
+                out[rev] = _filename_description(fn)
+        return out
+
+    def _desc_to_rev(filenames: list[str]) -> dict[str | None, str]:
+        out: dict[str | None, str] = {}
+        for fn in filenames:
+            rev = _filename_revision_prefix(fn)
+            if rev is not None:
+                out[_filename_description(fn)] = rev
+        return out
+
+    base_rev, head_rev = _rev_to_desc(base_filenames), _rev_to_desc(head_filenames)
+    base_desc, head_desc = _desc_to_rev(base_filenames), _desc_to_rev(head_filenames)
+
+    divergences: list[str] = [
+        f"revision '{rev}' maps to migration '{base_rev[rev]}' on one ref but "
+        f"'{head_rev[rev]}' on the other — the same revision id was reused for "
+        f"different content; a DB that applied the first will silently skip the "
+        f"second"
+        for rev in sorted(set(base_rev) & set(head_rev))
+        if base_rev[rev] != head_rev[rev]
+    ]
+    divergences += [
+        f"migration '{desc}' is revision '{base_desc[desc]}' on one ref but "
+        f"'{head_desc[desc]}' on the other — it was renumbered; a DB that "
+        f"applied it under the old id will mishandle the new id"
+        for desc in sorted(d for d in (set(base_desc) & set(head_desc)) if d)
+        if base_desc[desc] != head_desc[desc]
+    ]
+    return divergences
 
 
 def validate_added_migrations(sources: dict[str, str]) -> str | None:
