@@ -1096,7 +1096,20 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     )
 
     retired = 0
-    for member in candidates:
+    # Iterate by id and re-fetch each member fresh. retire_and_delete_pool_vm
+    # commits per member, and a failed teardown below issues session.rollback() —
+    # both expire the batch-loaded ``candidates`` instances. Reading a later
+    # candidate's attributes (or the failed member's vm_instance_id in the except)
+    # off an expired instance triggers a sync lazy-load under async ->
+    # MissingGreenlet, which masks the real error AND aborts the rest of the
+    # sweep (leaving idle/zombie members unswept). session.get re-loads a fresh
+    # instance (identity-map hit until a rollback expires it). Stale-ORM-after-
+    # rollback pattern; observed via the 2026-06-04 lock-contention incident.
+    candidate_ids = [member.id for member in candidates]
+    for member_id in candidate_ids:
+        member = await session.get(PoolVm, member_id)
+        if member is None:
+            continue  # retired/deleted by a peer since the lock-free scan
         reason: str | None = None
         if member.state == PoolVmState.RETIRING:
             # Stuck mid-teardown from a prior interrupted sweep — finish it.
@@ -1153,6 +1166,9 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
                 reason = "pool_zombie_no_heartbeat"
         if reason is None:
             continue
+        # Snapshot before the teardown so the failure log never reads an
+        # attribute off an instance the except's rollback just expired.
+        vm_id = member.vm_instance_id
         try:
             if await retire_and_delete_pool_vm(
                 session, member, reason=reason, claim_grace_seconds=claim_grace
@@ -1162,7 +1178,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             await session.rollback()
             logger.warning(
                 "[WARM-POOL] idle-reaper failed to retire %s",
-                member.vm_instance_id,
+                vm_id,
                 exc_info=True,
             )
     return retired
