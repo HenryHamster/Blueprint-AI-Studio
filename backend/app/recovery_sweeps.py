@@ -48,6 +48,7 @@ from app.models import (
     ArtifactType,
     Alert,
     AlertSeverity,
+    VmContact,
 )
 from app.time_utils import _utcnow
 
@@ -95,6 +96,11 @@ async def _chain_has_active_pipeline_work(
             .all()
         )
         cutoff = _utcnow() - timedelta(seconds=stale_seconds)
+        # Children matching this chain (review/fix + pr_number + original_id)
+        # whose on-row last_heartbeat looked dead — collected so we can give them
+        # a SECOND, off-row chance via vmcontact below before letting the kill
+        # cascade-cancel them (Fix 4).
+        heartbeat_dead_vm_ids: set[str] = set()
         for t in candidates:
             fp = t.first_payload
             if fp.get("type") not in ("review", "fix"):
@@ -112,6 +118,40 @@ async def _chain_has_active_pipeline_work(
             if t.status in (TaskStatus.QUEUED, TaskStatus.PROVISIONING):
                 queued_cutoff = _utcnow() - timedelta(seconds=queued_max_age_seconds)
                 if t.created_at and t.created_at > queued_cutoff:
+                    return True
+            # On-row last_heartbeat reads dead. Before giving up on this child,
+            # remember its VM so we can corroborate with the uncontended
+            # vmcontact signal — a child whose heartbeat write was lock-starved
+            # by the rollup's task-row lock (the same false-reap this whole
+            # vmcontact apparatus targets) still has a fresh off-row contact and
+            # must NOT be cascade-killed by the parent's hard timeout.
+            if t.status == TaskStatus.IN_PROGRESS and t.vm_instance_id:
+                heartbeat_dead_vm_ids.add(t.vm_instance_id)
+
+        # Fix 4: OR-in the uncontended vmcontact liveness signal for the chain's
+        # heartbeat-dead children. A child whose contended last_heartbeat write
+        # was skipped (rollup holds the task row FOR UPDATE) reads as dead on-row
+        # but still upserts vmcontact(last_contact_at) on its own row — so a
+        # contact within the SAME stale cutoff proves it is alive and the
+        # irreversible hard-FAIL must defer. A genuinely dead child (no requests)
+        # has a stale/absent contact row and the kill proceeds as before.
+        # Best-effort: a lookup error never blocks the kill path.
+        if heartbeat_dead_vm_ids:
+            contact_rows = (
+                await session.execute(
+                    select(
+                        VmContact.vm_instance_id, VmContact.last_contact_at
+                    ).where(VmContact.vm_instance_id.in_(heartbeat_dead_vm_ids))
+                )
+            ).all()
+            for _vm_id, last_contact in contact_rows:
+                if last_contact is not None and last_contact > cutoff:
+                    logger.info(
+                        f"[EVAL TIMEOUT] Task {str(parent.id)[:8]} chain child on "
+                        f"vm={_vm_id} had stale last_heartbeat but fresh vmcontact "
+                        f"(last_contact_at={last_contact}) — pipeline alive "
+                        f"(lock-starved heartbeat), deferring kill"
+                    )
                     return True
     except Exception:
         logger.debug(

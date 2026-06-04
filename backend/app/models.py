@@ -2232,14 +2232,31 @@ class VmContact(SQLModel, table=True):
     preempted / OOM — sends no requests) leaves this row stale or absent and is
     reaped on the existing schedule. One row per VM, upserted on every contact.
 
-    Created on Postgres by alembic 0142 and on the SQLite test fixture by
-    ``SQLModel.metadata.create_all``.
+    ``last_tool_use_at`` (added by alembic 0144) carries the most recent
+    tool-use timestamp the orchestrator heard from this VM, recorded OFF the
+    contended Task row for the SAME reason as ``last_contact_at``: a heartbeat
+    whose contended ``Task`` write is lock-starved also drops
+    ``Task.last_tool_use_at``, so the reaper's progress-stall branch can
+    false-reap a live PROGRESSING agent. The reaper consults this off-row
+    stamp before reaping a suspected stall: a tool-use more recent than the
+    progress-stale cutoff proves the agent is making tool calls (its on-row
+    stamp was merely lock-dropped), so the stall reap is suppressed. A
+    genuinely stalled agent (no tool calls anywhere) leaves this stale/None
+    and is still reaped. Nullable: heartbeats without tool telemetry (or pre-
+    backfill rows) leave it None, which falls back to the on-row behaviour.
+
+    Created on Postgres by alembic 0142 (base table) + 0144 (last_tool_use_at)
+    and on the SQLite test fixture by ``SQLModel.metadata.create_all``.
     """
 
     vm_instance_id: str = Field(sa_column=Column(String, primary_key=True))
     last_contact_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    last_tool_use_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
 

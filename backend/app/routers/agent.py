@@ -13,6 +13,7 @@ from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -3316,7 +3317,34 @@ _COLD_START_BEACON_MAP: dict[str, str] = {
 }
 
 
-async def _record_vm_contact(vm_instance_id: str | None) -> None:
+def _parse_latest_tool_use_at(tool_trace) -> datetime | None:
+    """Parse the most-recent tool-use timestamp from a heartbeat's tool_trace tail.
+
+    The agent stamps each tool_trace entry's ``t`` as ISO-8601. Returns the
+    parsed (naive-UTC) timestamp of the last entry, falling back to ``_utcnow``
+    if the tail is present but unparseable so we never crash a heartbeat on a
+    bad value. Returns ``None`` when there is no tool_trace at all (the caller
+    then leaves the off-row progress stamp untouched). Shared by the off-row
+    ``vmcontact`` upsert (Fix 3b) and the on-row ``Task.last_tool_use_at``
+    column write so both derive the same value from one parse.
+    """
+    if not tool_trace:
+        return None
+    try:
+        last_t = tool_trace[-1].t
+        parsed = datetime.fromisoformat(last_t.replace("Z", "+00:00"))
+        # Strip tz so the (naive DateTime) columns don't reject tz-aware values.
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
+    except (ValueError, AttributeError, IndexError):
+        return _utcnow()
+
+
+async def _record_vm_contact(
+    vm_instance_id: str | None,
+    last_tool_use_at: datetime | None = None,
+) -> None:
     """Record an uncontended liveness signal that the orchestrator heard from a VM.
 
     This is the heartbeat false-reap fix (option B). The heartbeat handler
@@ -3338,6 +3366,16 @@ async def _record_vm_contact(vm_instance_id: str | None) -> None:
     break the heartbeat response: it is best-effort liveness, the existing
     ``Task.last_heartbeat`` path is unchanged, and the worst case on failure is
     falling back to today's behaviour.
+
+    ``last_tool_use_at`` (Fix 3b) carries the same lock-starvation immunity to
+    the PROGRESS-stall branch: a lock-starved heartbeat also drops
+    ``Task.last_tool_use_at``, so the reaper's stall watchdog can false-reap a
+    live PROGRESSING agent. We upsert it OFF the contended task row here so the
+    reaper can corroborate genuine progress. We only ADVANCE it (never regress
+    it to NULL or to an older value), so a tool-less heartbeat between two
+    tool-bearing ones can't blank a fresh progress signal; a heartbeat that
+    carries no tool telemetry passes ``None`` and leaves the stored value
+    untouched.
     """
     if not vm_instance_id:
         return
@@ -3348,12 +3386,23 @@ async def _record_vm_contact(vm_instance_id: str | None) -> None:
             if dialect == "postgresql":
                 from sqlalchemy.dialects.postgresql import insert as _pg_insert
 
-                stmt = _pg_insert(VmContact).values(
-                    vm_instance_id=vm_instance_id, last_contact_at=now
-                )
+                insert_values = {
+                    "vm_instance_id": vm_instance_id,
+                    "last_contact_at": now,
+                }
+                set_ = {"last_contact_at": now}
+                if last_tool_use_at is not None:
+                    insert_values["last_tool_use_at"] = last_tool_use_at
+                    # Monotonic: never regress the stored progress stamp. GREATEST
+                    # over the existing value tolerates out-of-order heartbeats and
+                    # a tool_trace tail older than what we already recorded.
+                    set_["last_tool_use_at"] = func.greatest(
+                        VmContact.last_tool_use_at, last_tool_use_at
+                    )
+                stmt = _pg_insert(VmContact).values(**insert_values)
                 stmt = stmt.on_conflict_do_update(
                     index_elements=[VmContact.vm_instance_id],
-                    set_={"last_contact_at": now},
+                    set_=set_,
                 )
                 await contact_session.execute(stmt)
             else:
@@ -3363,11 +3412,19 @@ async def _record_vm_contact(vm_instance_id: str | None) -> None:
                 if existing is None:
                     contact_session.add(
                         VmContact(
-                            vm_instance_id=vm_instance_id, last_contact_at=now
+                            vm_instance_id=vm_instance_id,
+                            last_contact_at=now,
+                            last_tool_use_at=last_tool_use_at,
                         )
                     )
                 else:
                     existing.last_contact_at = now
+                    # Monotonic: only advance last_tool_use_at.
+                    if last_tool_use_at is not None and (
+                        existing.last_tool_use_at is None
+                        or last_tool_use_at > existing.last_tool_use_at
+                    ):
+                        existing.last_tool_use_at = last_tool_use_at
             await contact_session.commit()
     except Exception as exc:  # noqa: BLE001 — best-effort, never break heartbeat
         logger.warning(
@@ -3433,7 +3490,14 @@ async def agent_heartbeat(
     # succeeds, 409s, or rolls back. Best-effort: a failure here never breaks the
     # heartbeat response and the reaper degrades to the existing last_heartbeat
     # behaviour. The vm_instance_id is sourced from the trusted JWT.
-    await _record_vm_contact(token.get("vm_instance_id"))
+    #
+    # Fix 3b: also carry the heartbeat's latest tool-use timestamp off-row. A
+    # lock-starved heartbeat drops the contended ``Task.last_tool_use_at`` write
+    # too, so the reaper's PROGRESS-stall branch can false-reap a live,
+    # actively-PROGRESSING agent. Parsed ONCE here from the tool_trace tail and
+    # reused below for the on-row column write so both stay in sync.
+    _latest_tool_use_at = _parse_latest_tool_use_at(req.tool_trace)
+    await _record_vm_contact(token.get("vm_instance_id"), _latest_tool_use_at)
 
     # SKIP LOCKED: if the status endpoint holds FOR UPDATE on this row
     # (processing completion/pipeline), skip instead of blocking.  Blocking
@@ -3540,24 +3604,10 @@ async def agent_heartbeat(
         if req.metrics:
             metrics_dump = req.metrics.model_dump(exclude_none=True)
 
-        # Derive last_tool_use_at from the tail of the tool_trace ring buffer.
-        # The agent stamps each entry's ``t`` as ISO-8601. Fall back to current
-        # time if parsing fails so we never crash a heartbeat on a bad value.
-        latest_tool_use_at: datetime | None = None
-        if req.tool_trace:
-            try:
-                last_t = req.tool_trace[-1].t
-                latest_tool_use_at = datetime.fromisoformat(
-                    last_t.replace("Z", "+00:00")
-                )
-                # Strip tz so the column (naive DateTime, matching the rest of
-                # the timestamp columns on Task) doesn't reject tz-aware values.
-                if latest_tool_use_at.tzinfo is not None:
-                    latest_tool_use_at = latest_tool_use_at.astimezone(
-                        timezone.utc
-                    ).replace(tzinfo=None)
-            except (ValueError, AttributeError, IndexError):
-                latest_tool_use_at = _utcnow()
+        # last_tool_use_at is parsed once at the top of the handler (reused for
+        # the off-row ``vmcontact`` upsert in Fix 3b) so the on-row column write
+        # and the off-row progress signal can never diverge.
+        latest_tool_use_at: datetime | None = _latest_tool_use_at
 
         # Hot-path writes: dedicated columns. Cheap in-place column UPDATE.
         if metrics_dump is not None:

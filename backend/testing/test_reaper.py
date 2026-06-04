@@ -52,6 +52,7 @@ from app.reaper import (
     _orphan_priority_key,
     _select_orphans_for_cycle,
     _classify_orphan,
+    _relock_orphan_task,
     _REAPER_ORPHAN_LOOP_TIME_BUDGET_DEFAULT,
     _ORPHAN_PRIORITY_RATE_LIMITED,
     _ORPHAN_PRIORITY_SPOT,
@@ -606,6 +607,98 @@ async def test_in_progress_no_tool_use_past_progress_stale_reaped(
         context={"scope": "small", "llm_provider": "anthropic"},
     )
     reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_in_progress_stalled_but_fresh_offrow_tool_use_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Fix 3b end-to-end: a task that LOOKS stalled on-row (fresh heartbeat, stale
+    on-row last_tool_use_at) is NOT reaped when the off-row vmcontact carries a
+    fresh last_tool_use_at — the agent's on-row tool stamp was lock-starved by the
+    rollup's task-row lock together with the heartbeat, but it IS making tool
+    calls. A genuine stall (stale off-row too) is still reaped (covered by
+    test_in_progress_no_tool_use_past_progress_stale_reaped)."""
+    from app.models import VmContact
+
+    project = await _make_project(reaper_db)
+    now = datetime.utcnow()
+    vm_id = "vm-lockstarved-progress"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "scope": "small"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        # started 12min ago → past the cross-attempt guard; on-row tool use 10min
+        # stale → past the 8min small progress cutoff → would be agent_stalled.
+        started_at=now - timedelta(minutes=12),
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=now - timedelta(minutes=10),
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    # Off-row vmcontact with a FRESH tool-use stamp (1min ago, within the 8min
+    # cutoff): the lock-starved heartbeat dropped the on-row write but the agent
+    # IS calling tools.
+    reaper_db.add(
+        VmContact(
+            vm_instance_id=vm_id,
+            last_contact_at=now - timedelta(seconds=20),
+            last_tool_use_at=now - timedelta(minutes=1),
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "Reaper killed a lock-starved-but-progressing agent — off-row "
+        "vmcontact.last_tool_use_at progress override (Fix 3b) regressed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_progress_stalled_with_stale_offrow_tool_use_still_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Fix 3b safety: a genuinely stalled agent whose off-row vmcontact tool-use is
+    ALSO stale (no tool calls anywhere) is still reaped — the override must never
+    mask a real stall. Distinguishes from the lock-starved case above."""
+    from app.models import VmContact
+
+    project = await _make_project(reaper_db)
+    now = datetime.utcnow()
+    vm_id = "vm-genuine-stall"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "scope": "small"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        started_at=now - timedelta(minutes=12),
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=now - timedelta(minutes=10),
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    # Off-row contact is fresh (it IS heartbeating) but its tool-use is 11min
+    # stale — past the 8min cutoff → genuine stall, must still reap.
+    reaper_db.add(
+        VmContact(
+            vm_instance_id=vm_id,
+            last_contact_at=now - timedelta(seconds=20),
+            last_tool_use_at=now - timedelta(minutes=11),
+        )
+    )
     await reaper_db.commit()
 
     await _run_reaper_once()
@@ -6602,6 +6695,201 @@ def test_classify_orphan_fresh_contact_suppresses_provisioning_preclaim_death():
     assert (
         _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
     )
+
+
+# ── Fix 3b: off-row vmcontact.last_tool_use_at progress override ─────────────
+
+
+def test_classify_orphan_fresh_offrow_tool_use_suppresses_progress_stall():
+    """Fix 3b: a stalled-but-heartbeating task (fresh heartbeat, stale ON-ROW
+    last_tool_use_at) is NOT reaped when the OFF-ROW vmcontact.last_tool_use_at is
+    within the progress cutoff — the agent IS calling tools; its on-row tool stamp
+    was lock-starved together with the heartbeat by the rollup's task-row lock."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),  # FRESH heartbeat
+        # on-row tool use is 10min stale (past small 8min progress cutoff) and the
+        # attempt started 12min ago (so the cross-attempt guard doesn't spare it).
+        last_tool_use_at=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id="vm-progressing",
+    )
+    # Without the off-row tool-use lookup this is a genuine-looking stall → reap.
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    # A mere contact lookup must NOT suppress it (regression guard for the
+    # contact-vs-tool-use distinction — a hung agent still heartbeats).
+    contact_lookup = {"vm-progressing": now - timedelta(seconds=5)}
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_contact_lookup=contact_lookup
+        )
+        is True
+    )
+    # A FRESH off-row tool use (1min ago, within the 8min small progress cutoff)
+    # proves real progress → suppress the reap.
+    tool_lookup = {"vm-progressing": now - timedelta(minutes=1)}
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=tool_lookup
+        )
+        is False
+    )
+
+
+def test_classify_orphan_stale_offrow_tool_use_still_reaps_genuine_stall():
+    """A genuinely stalled agent (no recent tool use anywhere — on-row stale AND
+    off-row stale/absent) is still reaped. Gated on the SAME progress cutoff so an
+    old off-row tool stamp can never mask a real stall."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=now - timedelta(minutes=10),
+        started_at=now - timedelta(minutes=12),
+        vm_instance_id="vm-stalled",
+    )
+    # Off-row tool use is 9min old — past the 8min small progress cutoff → no
+    # suppression, the genuine stall is reaped exactly as today.
+    stale_tool = {"vm-stalled": now - timedelta(minutes=9)}
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=stale_tool
+        )
+        is True
+    )
+    # An off-row tool use for a DIFFERENT vm must also not suppress.
+    other_tool = {"vm-someone-else": now - timedelta(seconds=10)}
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=other_tool
+        )
+        is True
+    )
+    # No lookup / empty lookup → unchanged (reap).
+    assert _classify_orphan(t, now, has_open_pr=False, vm_tool_use_lookup={}) is True
+
+
+def test_classify_orphan_fresh_offrow_tool_use_suppresses_zero_toolcall_stall():
+    """Fix 3b also covers the zero-tool-calls-ever branch (anthropic gate): on-row
+    last_tool_use_at is None and started_at is past the progress cutoff, but a
+    fresh OFF-ROW tool use means the agent DID record a tool call the lock-starved
+    heartbeat failed to land on the task row — it is progressing, don't reap."""
+    now = datetime.utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=None,  # on-row: zero tool calls ever
+        started_at=now - timedelta(minutes=10),  # past 8min small progress cutoff
+        context={"llm_provider": "anthropic"},
+        vm_instance_id="vm-zero-tool",
+    )
+    # Without the off-row signal → reap (existing zero-tool anthropic stall).
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    # Fresh off-row tool use → suppress.
+    tool_lookup = {"vm-zero-tool": now - timedelta(minutes=1)}
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=tool_lookup
+        )
+        is False
+    )
+    # Stale off-row tool use → still reaped (genuine zero-progress stall).
+    stale_lookup = {"vm-zero-tool": now - timedelta(minutes=9)}
+    assert (
+        _classify_orphan(
+            t, now, has_open_pr=False, vm_tool_use_lookup=stale_lookup
+        )
+        is True
+    )
+
+
+# ── Fix 3a: _relock_orphan_task vm_liveness override is reason-gated ─────────
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_vm_liveness_cutoff_suppresses_heartbeat_stale_reap(
+    reaper_db,
+):
+    """A heartbeat-stale orphan with a fresh vmcontact landing during the unlocked
+    I/O window is spared: passing vm_liveness_cutoff causes _relock_orphan_task to
+    consult vmcontact.last_contact_at and abort the reap. (Heartbeat-stale path.)"""
+    from app.models import VmContact
+
+    project = await _make_project(reaper_db)
+    now = datetime.utcnow()
+    vm_id = "vm-relock-alive"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(minutes=12),
+        last_heartbeat=now - timedelta(minutes=10),
+    )
+    reaper_db.add(t)
+    reaper_db.add(
+        VmContact(vm_instance_id=vm_id, last_contact_at=now - timedelta(seconds=20))
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    # cutoff = 5min ago (small default). Fresh contact (20s) >= cutoff → suppress.
+    cutoff = now - timedelta(minutes=5)
+    relocked = await _relock_orphan_task(
+        reaper_db,
+        t.id,
+        t,
+        TaskStatus.IN_PROGRESS,
+        t.last_heartbeat,
+        vm_liveness_cutoff=cutoff,
+    )
+    assert relocked is None, "fresh vmcontact within cutoff must abort the reap"
+
+
+@pytest.mark.asyncio
+async def test_relock_orphan_no_cutoff_does_not_consult_vm_contact(reaper_db):
+    """Fix 3a: for a PROGRESS-stall reap (agent_stalled) the caller passes
+    vm_liveness_cutoff=None, so _relock_orphan_task must NOT consult vmcontact —
+    a hung-but-heartbeating agent always has a fresh contact, and consulting it
+    would defeat genuine stall detection. With None the relock proceeds (returns
+    the locked task) so the stall reap goes through."""
+    from app.models import VmContact
+
+    project = await _make_project(reaper_db)
+    now = datetime.utcnow()
+    vm_id = "vm-relock-stalled"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "scope": "small"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=now - timedelta(minutes=12),
+        # Fresh heartbeat (a stalled agent is still heartbeating).
+        last_heartbeat=now - timedelta(seconds=30),
+    )
+    reaper_db.add(t)
+    # A very fresh contact exists — but with cutoff=None it must be IGNORED.
+    reaper_db.add(
+        VmContact(vm_instance_id=vm_id, last_contact_at=now - timedelta(seconds=5))
+    )
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    relocked = await _relock_orphan_task(
+        reaper_db,
+        t.id,
+        t,
+        TaskStatus.IN_PROGRESS,
+        t.last_heartbeat,
+        vm_liveness_cutoff=None,
+    )
+    assert relocked is not None, (
+        "agent_stalled reap (vm_liveness_cutoff=None) must NOT be suppressed by a "
+        "fresh vmcontact — a hung agent still heartbeats; genuine stall detection "
+        "must be preserved (Fix 3a)"
+    )
+    assert relocked.id == t.id
 
 
 # ── Per-cycle orphan-loop wall-time budget (FIX c) ──────────────────────────

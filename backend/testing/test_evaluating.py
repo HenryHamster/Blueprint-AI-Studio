@@ -983,6 +983,164 @@ async def test_rollup_proceeds_when_parent_lock_available(eval_db, mocker):
     )
 
 
+# ── Fix 1: narrowed sibling lock — live siblings read-only, idempotency kept ──
+
+
+@pytest.mark.asyncio
+async def test_rollup_live_sibling_keeps_parent_evaluating_unmutated(eval_db, mocker):
+    """Fix 1: with a LIVE (IN_PROGRESS) sibling present, the rollup must still
+    WAIT (active_count > 0 → parent stays EVALUATING) and must NOT mutate the live
+    sibling — it is only READ for the tally. This pins the invariant that lets the
+    sibling lock be narrowed away from live children (so their heartbeats never
+    409): the rollup never writes a live child, so it never needs to lock one."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Live Sibling Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # One terminal (COMPLETED, merged) child + one LIVE (IN_PROGRESS) sibling.
+    done_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "done"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    live_child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "still working"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow(),
+        context={"sentinel": "untouched"},
+    )
+    eval_db.add(done_child)
+    eval_db.add(live_child)
+    await eval_db.commit()
+    await eval_db.refresh(live_child)
+
+    # Trigger on the terminal child's completion event.
+    await _check_and_trigger_rollup(done_child, eval_db)
+
+    # active_count > 0 (the live sibling) → rollup waits, parent stays EVALUATING.
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING
+
+    # The live sibling was only READ — never mutated (status + context intact).
+    await eval_db.refresh(live_child)
+    assert live_child.status == TaskStatus.IN_PROGRESS
+    assert (live_child.context or {}).get("sentinel") == "untouched"
+
+
+@pytest.mark.asyncio
+async def test_rollup_concurrent_terminal_events_respawn_at_most_once(
+    eval_db, mocker
+):
+    """Fix 1 idempotency: two back-to-back rollup invocations (simulating two
+    sibling-terminal events firing near-simultaneously) on a stale-unmerged child
+    must respawn the review AT MOST once. The parent lock — not the all-children
+    lock — provides this guarantee, so narrowing the children lock does not open a
+    double-respawn. The respawn-count bump persisted under the parent lock makes
+    the second invocation see a non-stale (already-respawned) child."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # _verify_pr_merged: child PR is NOT merged (so it stays in `unmerged`).
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+
+    # Track spawn calls; return a distinct new task id so respawned += 1 fires and
+    # the respawn-count bump persists (was_spawned=True).
+    spawn_calls = {"n": 0}
+
+    async def _mock_spawn(child, kind, session, pr_number, branch, base_branch, **kw):
+        spawn_calls["n"] += 1
+        new_task = Task(
+            project_id=child.project_id,
+            parent_task_id=child.parent_task_id,
+            payloads=[{"type": "review", "prompt": "review"}],
+            status=TaskStatus.QUEUED,
+        )
+        session.add(new_task)
+        await session.flush()
+        return new_task, True
+
+    mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(side_effect=_mock_spawn),
+    )
+
+    from app.models import Artifact, ArtifactType
+
+    project = Project(name="Concurrent Respawn Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    # A COMPLETED child whose PR is not merged and is STALE (>10min) so the
+    # respawn path fires. updated_at must be old — set it explicitly.
+    stale_when = datetime.utcnow() - timedelta(minutes=20)
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "unmerged stale"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+    await eval_db.refresh(child)
+    child.updated_at = stale_when
+    eval_db.add(child)
+    # PR artifact so the respawn path can parse a pr_number.
+    eval_db.add(
+        Artifact(
+            task_id=child.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/4242",
+        )
+    )
+    await eval_db.commit()
+
+    # Two near-simultaneous terminal events. Each invocation re-reads the child;
+    # the first respawns + bumps _review_respawn_count, the second sees the bumped
+    # child (no longer eligible for another respawn within the same staleness).
+    await _check_and_trigger_rollup(child, eval_db)
+    # Re-stale the child's updated_at so a NAIVE (lock-free) second pass would
+    # respawn again if idempotency were broken — the respawn-count guard must
+    # still prevent it.
+    await eval_db.refresh(child)
+    child.updated_at = datetime.utcnow() - timedelta(minutes=20)
+    eval_db.add(child)
+    await eval_db.commit()
+    await _check_and_trigger_rollup(child, eval_db)
+
+    assert spawn_calls["n"] <= 1, (
+        f"Expected at most one review respawn across two concurrent terminal "
+        f"events (parent-lock idempotency), got {spawn_calls['n']}"
+    )
+
+
 # ── Backstop diagnosis honesty + one-shot recovery ──────────────────────────
 #
 # Regression coverage for the PR #1705/#1688/#1676 incident: CI genuinely
@@ -2707,3 +2865,134 @@ async def test_eval_sweep_all_genuine_cancelled_finalizes_failed_with_alert(
     mock_signals.assert_not_called()
     mock_cleanup.assert_awaited()
     assert "_rollup_retries" not in (parent.context or {})
+
+
+# ── Fix 4: hard-FAIL kill-suppression corroborated by off-row vmcontact ──────
+
+
+async def _make_chain_parent_and_child(
+    eval_db, *, child_status, last_heartbeat, vm_instance_id, pr_number=7777
+):
+    """Build an EVALUATING parent (with a review_loop chain) + one matching
+    review child for _chain_has_active_pipeline_work tests."""
+    project = Project(name="Chain VMContact Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "parent"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+    parent.context = {
+        "review_loop": {
+            "pr_number": pr_number,
+            "original_task_id": str(parent.id),
+        }
+    }
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "original_task_id": str(parent.id),
+            }
+        ],
+        status=child_status,
+        last_heartbeat=last_heartbeat,
+        vm_instance_id=vm_instance_id,
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+    return parent, child
+
+
+@pytest.mark.asyncio
+async def test_chain_active_fresh_heartbeat_defers_kill(eval_db):
+    """Baseline: a chain child with a FRESH on-row last_heartbeat defers the kill
+    (the pre-existing path, unchanged by Fix 4)."""
+    parent, _child = await _make_chain_parent_and_child(
+        eval_db,
+        child_status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        vm_instance_id="vm-chain-alive",
+    )
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is True
+
+
+@pytest.mark.asyncio
+async def test_chain_active_vmcontact_overrides_stale_heartbeat(eval_db):
+    """Fix 4: a chain child whose on-row last_heartbeat is STALE (lock-starved)
+    but whose off-row vmcontact.last_contact_at is FRESH must DEFER the kill — the
+    child is alive; its contended heartbeat write was skipped by the rollup's
+    task-row lock. Without this, the irreversible hard-FAIL would cascade-cancel a
+    live review/fix child and delete its VM."""
+    from app.models import VmContact
+
+    parent, _child = await _make_chain_parent_and_child(
+        eval_db,
+        child_status=TaskStatus.IN_PROGRESS,
+        # 20min-stale on-row heartbeat (past the default 600s/10min cutoff).
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        vm_instance_id="vm-chain-lockstarved",
+    )
+    # Fresh off-row contact (30s) within the 10min stale cutoff.
+    eval_db.add(
+        VmContact(
+            vm_instance_id="vm-chain-lockstarved",
+            last_contact_at=datetime.utcnow() - timedelta(seconds=30),
+        )
+    )
+    await eval_db.commit()
+
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is True
+
+
+@pytest.mark.asyncio
+async def test_chain_active_stale_heartbeat_and_stale_vmcontact_allows_kill(eval_db):
+    """Fix 4 safety: a chain child whose on-row heartbeat AND off-row vmcontact are
+    BOTH stale (genuinely dead — no requests) must NOT defer the kill. The override
+    is gated on the SAME stale cutoff so a dead child never wedges the parent's
+    hard timeout forever."""
+    from app.models import VmContact
+
+    parent, _child = await _make_chain_parent_and_child(
+        eval_db,
+        child_status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        vm_instance_id="vm-chain-dead",
+    )
+    # Off-row contact is ALSO stale (15min, past the 10min cutoff).
+    eval_db.add(
+        VmContact(
+            vm_instance_id="vm-chain-dead",
+            last_contact_at=datetime.utcnow() - timedelta(minutes=15),
+        )
+    )
+    await eval_db.commit()
+
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is False
+
+
+@pytest.mark.asyncio
+async def test_chain_active_no_vmcontact_row_allows_kill(eval_db):
+    """Fix 4 back-compat: a stale-heartbeat child with NO vmcontact row at all
+    (genuinely dead VM that never recorded a contact) still allows the kill —
+    unchanged from pre-fix behaviour."""
+    parent, _child = await _make_chain_parent_and_child(
+        eval_db,
+        child_status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        vm_instance_id="vm-chain-no-contact-row",
+    )
+    assert await _chain_has_active_pipeline_work(parent, eval_db) is False

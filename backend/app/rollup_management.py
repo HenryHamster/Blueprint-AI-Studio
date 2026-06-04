@@ -600,31 +600,86 @@ async def _check_and_trigger_rollup(
     if parent.status != TaskStatus.EVALUATING:
         return
 
-    # Lock children with skip_locked to avoid deadlocks with concurrent
-    # agent status updates that hold FOR UPDATE on individual child rows.
+    # Heartbeat false-reap fix (Fix 1 — narrowed sibling lock):
+    #
+    # Previously this took ``FOR UPDATE skip_locked`` on ALL sibling children on
+    # every child-terminal event. A live (IN_PROGRESS/QUEUED/PROVISIONING/
+    # EVALUATING/BLOCKED) sibling's heartbeat then 409'd (its own
+    # ``with_for_update(skip_locked=True)`` task-row write was skipped while this
+    # lock was held), freezing its ``last_heartbeat`` → the reaper false-reaped
+    # the live VM. But live siblings are ONLY READ here (for the active_count /
+    # pipeline_active tally) — they are never mutated. Only TERMINAL
+    # (COMPLETED / FAILED / CANCELLED) children get written (pr_merged force-set,
+    # review respawn-count bump, requires_approval escalation). So we:
+    #   1. read ALL children NON-locking — a consistent snapshot under the
+    #      parent lock, sufficient for the read-only tally + list-building, and
+    #   2. lock ONLY the terminal children FOR UPDATE (skip_locked) — the rows we
+    #      actually mutate — re-populating the same identity-map objects so the
+    #      downstream mutations land on row-locked rows.
+    #
+    # IDEMPOTENCY is preserved by the PARENT lock (acquired above): it serializes
+    # concurrent rollup checks (lock-all-or-defer), so there is never a
+    # double-rollup or double-respawn — only one invocation holds the parent and
+    # proceeds; peers get None and defer. The all-children lock never provided
+    # the idempotency guarantee (review respawn is idempotent via
+    # _spawn_pipeline_task's own per-PR advisory lock + the parent-locked
+    # _review_respawn_count; the rollup PR POST is idempotent via the parent-
+    # locked rollup_pr_creating_at/rollup_pr_number markers). It only (a) avoided
+    # acting on contended terminal data and (b) avoided deadlocks — both of which
+    # the narrowed terminal-only lock still covers.
     all_children = (
         (
             await session.execute(
-                select(Task)
-                .where(Task.parent_task_id == parent.id)
-                .with_for_update(skip_locked=True)
+                select(Task).where(Task.parent_task_id == parent.id)
             )
         )
         .scalars()
         .all()
     )
 
-    # Verify we locked all children — if some were skipped (held by agent_status
-    # or another rollup), defer to avoid acting on incomplete data.
-    total_children = await session.scalar(
-        select(_func.count()).select_from(Task).where(Task.parent_task_id == parent.id)
+    # Lock ONLY the terminal children (the rows we may mutate below). Live
+    # siblings are deliberately left UNLOCKED so their heartbeats never 409.
+    _TERMINAL_CHILD_STATUSES = (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
     )
-    if len(all_children) < total_children:
-        logger.info(
-            f"[ROLLUP] Deferred rollup for parent {parent.id} — "
-            f"locked {len(all_children)}/{total_children} children (others held)"
+    terminal_child_ids = [
+        c.id for c in all_children if c.status in _TERMINAL_CHILD_STATUSES
+    ]
+    if terminal_child_ids:
+        locked_terminal = (
+            (
+                await session.execute(
+                    select(Task)
+                    .where(Task.id.in_(terminal_child_ids))
+                    .with_for_update(skip_locked=True)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
         )
-        return
+        # If a TERMINAL child we intend to mutate is held by a peer (another
+        # rollup invocation racing on a sibling event, or a late agent_status
+        # write), defer to avoid acting on / clobbering contended terminal data.
+        # Preserves the original "don't act on incomplete data" intent, narrowed
+        # to the rows that actually matter. Live siblings (never mutated) do NOT
+        # gate this defer. The reaper's EVALUATING stale-parent sweep retries.
+        if len(locked_terminal) < len(terminal_child_ids):
+            logger.info(
+                f"[ROLLUP] Deferred rollup for parent {parent.id} — "
+                f"locked {len(locked_terminal)}/{len(terminal_child_ids)} "
+                f"terminal children (others held)"
+            )
+            return
+        # NB: ``populate_existing`` refreshed the terminal rows IN the session
+        # identity map, so the terminal objects already inside ``all_children``
+        # (and the ``children`` / ``completed_children`` / ``unmerged`` /
+        # ``failed`` lists derived from it below) ARE the freshly-locked
+        # instances — SQLAlchemy guarantees object identity per session. No
+        # re-read of ``all_children`` is needed; downstream mutations on those
+        # objects land on row-locked rows.
 
     # Consider create, refactor, plan, research, and specialized agent tasks for rollup decisions.
     # Review/fix tasks are pipeline helpers that operate on the same PR — excluded.
