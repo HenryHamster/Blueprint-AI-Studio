@@ -115,15 +115,11 @@ def _run_aggregation(all_tasks, project):
     )
     new_project_status = None
     if all_terminal:
-        if all(s == TaskStatus.COMPLETED for s in executable_statuses):
-            new_project_status = ProjectStatus.COMPLETED
-        elif any(s == TaskStatus.FAILED for s in executable_statuses):
-            new_project_status = ProjectStatus.FAILED
-        elif all(
-            s in [TaskStatus.COMPLETED, TaskStatus.CANCELLED]
-            for s in executable_statuses
-        ):
-            new_project_status = ProjectStatus.CANCELLED
+        new_project_status = (
+            ProjectStatus.FAILED
+            if any(s == TaskStatus.FAILED for s in executable_statuses)
+            else ProjectStatus.COMPLETED
+        )
 
     if new_project_status:
         project.status = new_project_status
@@ -131,17 +127,13 @@ def _run_aggregation(all_tasks, project):
             TaskStatus.COMPLETED
             if new_project_status == ProjectStatus.COMPLETED
             else TaskStatus.FAILED
-            if new_project_status == ProjectStatus.FAILED
-            else TaskStatus.CANCELLED
         )
         for pt in parent_tasks:
             pt.status = terminal_task_status
             if terminal_task_status == TaskStatus.FAILED:
                 pt.latest_status_message = "Project aggregation: child task failed"
-            elif terminal_task_status == TaskStatus.COMPLETED:
-                pt.latest_status_message = "Project completed"
             else:
-                pt.latest_status_message = "Project cancelled"
+                pt.latest_status_message = "Project completed"
 
 
 @pytest.mark.asyncio
@@ -185,8 +177,11 @@ async def test_parent_task_gets_completed_message_on_all_children_complete(db_se
 
 
 @pytest.mark.asyncio
-async def test_parent_task_gets_cancelled_message_on_all_children_cancelled(db_session):
-    """Parent task should get 'Project cancelled' when all children are cancelled/completed."""
+async def test_cancelled_children_complete_project_never_cancel_it(db_session):
+    """The pipeline must NEVER auto-set a project to CANCELLED. A cancelled child
+    is benign (dedup / scope-empty / supersession), not a project cancellation —
+    so an all-terminal, no-failure mix completes the (finite) project instead.
+    CANCELLED stays an explicit operator decision (the /cancel endpoint)."""
     project = await _make_project(db_session)
     child = await _make_task(
         db_session, project.id, TaskStatus.CANCELLED, vm_instance_id="vm-1"
@@ -197,8 +192,10 @@ async def test_parent_task_gets_cancelled_message_on_all_children_cancelled(db_s
 
     _run_aggregation([child, parent], project)
 
-    assert parent.status == TaskStatus.CANCELLED
-    assert parent.latest_status_message == "Project cancelled"
+    assert project.status != ProjectStatus.CANCELLED
+    assert project.status == ProjectStatus.COMPLETED
+    assert parent.status == TaskStatus.COMPLETED
+    assert parent.latest_status_message == "Project completed"
 
 
 @pytest.mark.asyncio
@@ -399,8 +396,9 @@ async def test_live_autonomous_project_not_flipped_to_failed(db_session):
 @pytest.mark.asyncio
 async def test_finite_project_still_aggregates(db_session):
     """A finite (non-autonomous) project must still aggregate to a terminal
-    status — the fix only narrows WHEN the flip fires, it does not change
-    finite-project semantics."""
+    status. A COMPLETED+CANCELLED mix (no genuine failure) now COMPLETES —
+    cancelled children are benign and the pipeline never auto-sets CANCELLED
+    (that stays an explicit operator decision)."""
     project = await _make_project(db_session, autonomous_enabled=False)
     completed = await _make_task(
         db_session, project.id, TaskStatus.COMPLETED, vm_instance_id="vm-1"
@@ -414,6 +412,6 @@ async def test_finite_project_still_aggregates(db_session):
 
     _run_aggregation([completed, cancelled, parent], project)
 
-    assert project.status == ProjectStatus.CANCELLED
-    assert parent.status == TaskStatus.CANCELLED
-    assert parent.latest_status_message == "Project cancelled"
+    assert project.status == ProjectStatus.COMPLETED
+    assert parent.status == TaskStatus.COMPLETED
+    assert parent.latest_status_message == "Project completed"
