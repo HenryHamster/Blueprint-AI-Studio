@@ -5145,17 +5145,80 @@ async def test_pipeline_dedup_cancels_when_sibling_already_running(db_session, m
     result = await filter_pipeline_duplicates(
         [candidate.id], [candidate], db_session, broadcast_mock
     )
-    await db_session.commit()
+    # NOTE: no external commit here — the filter must durably commit the
+    # CANCELLED transition itself BEFORE broadcasting. Expiring the candidate
+    # forces the refresh below to re-read from the DB, proving the transition
+    # is persisted (not merely set in-memory and pending rollback).
     assert result == [], "Duplicate with running sibling must be filtered out"
+    db_session.expire(candidate)
     await db_session.refresh(candidate)
     assert candidate.status == TaskStatus.CANCELLED
     assert "Deduplicated" in (candidate.latest_status_message or "")
+    # The CANCELLED broadcast must have fired (after the commit above).
+    broadcast_mock.assert_awaited_once()
     # Cancelled candidate must carry an infra failure_category so rollup parents
     # don't get upgraded to CODE_ERROR by worst_child_failure_category.
     assert (candidate.context or {}).get("failure_category") == "AGENT_TIMEOUT"
     # Sibling must not be touched.
     await db_session.refresh(running)
     assert running.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_pipeline_dedup_commits_cancelled_before_broadcast(db_session, mocker):
+    """Regression: the dedup-cancel path must durably commit the loser's
+    terminal CANCELLED transition BEFORE emitting the task_updated broadcast.
+    Emitting first lets the UI refetch /api/admin/tasks and read a still-QUEUED
+    row (stale UI), and a later rollback would discard the CANCELLED change
+    after the event already announced it (lost transition)."""
+    from datetime import datetime, timezone
+    from app.orchestrator_filters import filter_pipeline_duplicates
+
+    project = await _make_db_project(db_session)
+
+    running = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "review", "pr_number": 777, "base_branch": "main"}],
+    )
+    candidate = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "review", "pr_number": 777, "base_branch": "main"}],
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    db_session.add(running)
+    db_session.add(candidate)
+    await db_session.commit()
+    await db_session.refresh(candidate)
+
+    # Record the relative order of session.commit() and the broadcast. The
+    # filter must commit the CANCELLED transition first so the event is never
+    # emitted for an uncommitted (rollback-able) change.
+    events: list[str] = []
+    real_commit = db_session.commit
+
+    async def _record_commit(*args, **kwargs):
+        result = await real_commit(*args, **kwargs)
+        events.append("commit")
+        return result
+
+    async def _on_broadcast(*_args, **_kwargs):
+        events.append("broadcast")
+
+    mocker.patch.object(db_session, "commit", side_effect=_record_commit)
+    broadcast_mock = mocker.AsyncMock(side_effect=_on_broadcast)
+
+    result = await filter_pipeline_duplicates(
+        [candidate.id], [candidate], db_session, broadcast_mock
+    )
+    assert result == []
+    broadcast_mock.assert_awaited_once()
+    # A commit must be recorded, and the last commit before the broadcast must
+    # precede it — proving commit-before-broadcast ordering.
+    assert "commit" in events
+    assert events.index("broadcast") > 0
+    assert events[events.index("broadcast") - 1] == "commit"
 
 
 @pytest.mark.asyncio

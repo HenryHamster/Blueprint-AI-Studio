@@ -39,6 +39,9 @@ def _mock_session(completed_siblings):
     scalars.all.return_value = completed_siblings
     result.scalars.return_value = scalars
     session.execute = AsyncMock(return_value=result)
+    # The CANCELLED transition must be durably committed BEFORE the broadcast
+    # fires, so the filter now awaits session.commit(). Provide an awaitable.
+    session.commit = AsyncMock()
     return session
 
 
@@ -63,6 +66,37 @@ class TestFilterScopeEmpty:
         assert "SCOPE_EMPTY" in (candidate.latest_status_message or "")
         assert (candidate.context or {}).get("failure_category") == "SCOPE_EMPTY"
         broadcast.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_commits_cancelled_before_broadcast(self):
+        """Regression: the terminal CANCELLED transition must be durably
+        committed BEFORE the task_updated broadcast fires. Otherwise the UI
+        refetches /api/admin/tasks on the event and reads a still-QUEUED row
+        (stale UI), and a later rollback discards the CANCELLED change while
+        the broadcast already announced it (lost transition)."""
+        pid = uuid.uuid4()
+        parent_id = uuid.uuid4()
+        files = ["backend/app/foo.py"]
+        sibling = _task(pid, parent_id, TaskStatus.COMPLETED, files=files)
+        candidate = _task(pid, parent_id, TaskStatus.QUEUED, files=files)
+
+        session = _mock_session([sibling])
+        # Record the global call order across commit + broadcast on a shared
+        # parent mock so we can assert commit precedes broadcast.
+        order = MagicMock()
+        session.commit = AsyncMock(side_effect=lambda *a, **k: order.commit())
+        broadcast = AsyncMock(side_effect=lambda *a, **k: order.broadcast())
+
+        result = await filter_scope_empty(
+            [candidate.id], [candidate], session, broadcast
+        )
+
+        assert result == []
+        assert candidate.status == TaskStatus.CANCELLED
+        session.commit.assert_awaited_once()
+        broadcast.assert_awaited_once()
+        # commit must be recorded strictly before broadcast.
+        assert [c[0] for c in order.mock_calls] == ["commit", "broadcast"]
 
     @pytest.mark.parametrize("ptype", ["review", "fix", "plan"])
     @pytest.mark.asyncio

@@ -862,15 +862,26 @@ async def filter_scope_empty(
         await close_orphan_pr_if_any(
             candidate, session, reason="dispatch_scope_empty_preempt"
         )
+        # Commit the terminal CANCELLED transition BEFORE broadcasting so the
+        # websocket event never announces a status the API has not yet
+        # persisted (stale-UI defect) and is never emitted for a change that a
+        # later rollback discards (lost-transition defect). Same commit-then-
+        # broadcast discipline as PR #7721 (unblock sweep). expire_on_commit is
+        # False (database.py), so committing here does NOT expire candidate or
+        # the other in-memory candidate_tasks the downstream dispatch steps
+        # still read. Snapshot the broadcast literals before committing.
+        _project_id = str(candidate.project_id)
+        _task_id = str(candidate.id)
+        await session.commit()
         try:
             await broadcast_fn(
-                str(candidate.project_id),
+                _project_id,
                 "task_updated",
-                {"task_id": str(candidate.id), "status": "CANCELLED", "message": msg},
+                {"task_id": _task_id, "status": "CANCELLED", "message": msg},
             )
         except Exception:
             logger.debug(
-                f"Failed to broadcast SCOPE_EMPTY for {candidate.id}", exc_info=True
+                f"Failed to broadcast SCOPE_EMPTY for {_task_id}", exc_info=True
             )
         logger.info(
             f"[DISPATCH] SCOPE_EMPTY: pre-empting task {candidate.id} — "
@@ -998,19 +1009,27 @@ async def filter_pipeline_duplicates(
             await close_orphan_pr_if_any(
                 candidate, session, reason="dispatch_dedup_running_sibling"
             )
+            # Commit the terminal CANCELLED transition BEFORE broadcasting so
+            # the event is durable and never rolled back out from under it
+            # (see filter_scope_empty for the full rationale). Snapshot the
+            # broadcast literals before the commit.
+            _project_id = str(candidate.project_id)
+            _task_id = str(eid)
+            _dedup_msg = candidate.latest_status_message
+            await session.commit()
             try:
                 await broadcast_fn(
-                    str(candidate.project_id),
+                    _project_id,
                     "task_updated",
                     {
-                        "task_id": str(eid),
+                        "task_id": _task_id,
                         "status": "CANCELLED",
-                        "message": candidate.latest_status_message,
+                        "message": _dedup_msg,
                     },
                 )
             except Exception:
                 logger.debug(
-                    f"Failed to broadcast dedup cancel for {eid}", exc_info=True
+                    f"Failed to broadcast dedup cancel for {_task_id}", exc_info=True
                 )
             logger.warning(
                 f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
@@ -1046,19 +1065,27 @@ async def filter_pipeline_duplicates(
                 await close_orphan_pr_if_any(
                     candidate, session, reason="dispatch_dedup_queued_sibling"
                 )
+                # Commit the terminal CANCELLED transition BEFORE broadcasting
+                # so the event is durable and never rolled back out from under
+                # it (see filter_scope_empty for the full rationale). Snapshot
+                # the broadcast literals before the commit.
+                _project_id = str(candidate.project_id)
+                _task_id = str(eid)
+                _dedup_msg = candidate.latest_status_message
+                await session.commit()
                 try:
                     await broadcast_fn(
-                        str(candidate.project_id),
+                        _project_id,
                         "task_updated",
                         {
-                            "task_id": str(eid),
+                            "task_id": _task_id,
                             "status": "CANCELLED",
-                            "message": candidate.latest_status_message,
+                            "message": _dedup_msg,
                         },
                     )
                 except Exception:
                     logger.debug(
-                        f"Failed to broadcast dedup cancel for {eid}", exc_info=True
+                        f"Failed to broadcast dedup cancel for {_task_id}", exc_info=True
                     )
                 logger.warning(
                     f"[DISPATCH] Cancelling duplicate {fp.get('type')} {eid} — "
