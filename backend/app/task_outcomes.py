@@ -298,3 +298,221 @@ def is_successful_outcome(task: Task) -> bool:
     ``(status, kind)`` bucketing should use :func:`evaluate_task_outcome`.
     """
     return evaluate_task_outcome(task).status == "success"
+
+
+# ---------------------------------------------------------------------------
+# Operator-facing evaluation summaries
+# ---------------------------------------------------------------------------
+#
+# Where :func:`evaluate_task_outcome` answers *was the output good* with a
+# single (status, kind) verdict for analytics, the SUMMARY_BUILDERS registry
+# answers *what did the output say* for operator surfaces (Task Detail,
+# Research Browser). Each builder turns a terminal task's type-specific artifact
+# into a normalized ``{status, verdict, evidence[], highlights[]}`` dict that the
+# admin endpoints wrap into the ``TaskEvaluationSummary`` wire schema.
+#
+# Registering a new evaluator-backed task type is one entry in SUMMARY_BUILDERS
+# (or relying on the shared findings builder fallback) rather than a new
+# ``if task_type == …`` branch in admin.py.
+
+
+@dataclass(frozen=True)
+class SummaryContext:
+    """Side-channel artifacts a summary builder may need beyond the Task row.
+
+    ``merge_test_result`` is the parsed MERGE_TEST_RESULT artifact for a
+    verify_tests task — it lives off-task (the admin endpoint loads it) so the
+    builder cannot read it from ``plan_output``.
+    """
+
+    merge_test_result: dict[str, Any] | None = None
+
+
+def _summary_status_label(task: Task) -> str:
+    status = getattr(task.status, "value", task.status)
+    return str(status)
+
+
+def _trim_summary_text(value: Any, limit: int = 200) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _summary_item(label: str, value: Any) -> dict[str, str]:
+    return {"label": label, "value": _trim_summary_text(value)}
+
+
+def _summary_dict(
+    task: Task,
+    verdict: str,
+    evidence: list[dict[str, str]],
+    highlights: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Assemble the normalized summary dict with the canonical truncation."""
+    return {
+        "status": _summary_status_label(task),
+        "verdict": verdict,
+        "evidence": evidence[:4],
+        "highlights": highlights[:3],
+    }
+
+
+def _build_verify_tests_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
+    verdict = "undetected"
+    evidence: list[dict[str, str]] = []
+    highlights: list[dict[str, str]] = []
+    result = ctx.merge_test_result or {}
+    tests = result.get("tests") if isinstance(result.get("tests"), list) else []
+    output = _trim_summary_text(result.get("output"), 240)
+    detected = result.get("detected")
+    passed = result.get("passed")
+    if detected is False:
+        verdict = "undetected"
+    elif passed:
+        verdict = "pass"
+    elif detected is True:
+        verdict = "fail"
+
+    if detected is not None:
+        evidence.append(_summary_item("Detected suite", "yes" if detected else "no"))
+    if isinstance(tests, list) and tests:
+        pass_count = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
+        fail_count = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "fail")
+        evidence.append(_summary_item("Tests", f"{len(tests)} total, {pass_count} passed, {fail_count} failed"))
+        for test in tests[:3]:
+            if not isinstance(test, dict):
+                continue
+            name = str(test.get("name") or test.get("suite") or "test").strip()
+            status_text = str(test.get("status") or "unknown").strip()
+            message = _trim_summary_text(test.get("message") or "", 80)
+            highlights.append(
+                _summary_item(name, f"{status_text}{f' - {message}' if message else ''}")
+            )
+    if output:
+        evidence.append(_summary_item("Output", output))
+    if not evidence and result:
+        evidence.append(_summary_item("Result", "MERGE_TEST_RESULT captured"))
+    if not highlights and output:
+        highlights.append(_summary_item("Output", output))
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
+def _build_memo_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
+    raw_plan_output = _task_local_attr(task, "plan_output")
+    plan_output = raw_plan_output if isinstance(raw_plan_output, dict) else None
+    memo = plan_output.get("memo") if isinstance(plan_output, dict) else None
+    if not isinstance(memo, dict):
+        return None
+    summary = _trim_summary_text(memo.get("summary"), 200)
+    reasoning = _trim_summary_text(memo.get("reasoning"), 240)
+    citations = memo.get("citations") if isinstance(memo.get("citations"), list) else []
+    tags = memo.get("tags") if isinstance(memo.get("tags"), list) else []
+    evidence: list[dict[str, str]] = []
+    if summary:
+        evidence.append(_summary_item("Summary", summary))
+    if reasoning:
+        evidence.append(_summary_item("Reasoning", reasoning))
+    highlights: list[dict[str, str]] = []
+    if citations:
+        highlights.append(_summary_item("Citations", ", ".join(str(c) for c in citations[:3])))
+    if tags:
+        highlights.append(_summary_item("Tags", ", ".join(str(t) for t in tags[:4])))
+    return _summary_dict(task, "memo", evidence, highlights)
+
+
+def _build_self_audit_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
+    raw_plan_output = _task_local_attr(task, "plan_output")
+    findings = raw_plan_output if isinstance(raw_plan_output, list) else []
+    normalized = [f for f in findings if isinstance(f, dict)]
+    if not normalized:
+        return None
+    severity_order = {"ship": 0, "fundamentals": 1, "audit": 2, "pause": 3}
+
+    def _rank(finding: dict[str, Any]) -> int:
+        mode = str(finding.get("recommended_mode") or "ship").strip().lower()
+        return severity_order.get(mode, 0)
+
+    worst = max(normalized, key=_rank)
+    verdict = str(worst.get("recommended_mode") or "ship").strip().lower() or "ship"
+    evidence = [
+        _summary_item("Systems", len(normalized)),
+        _summary_item("Worst score", worst.get("score", "n/a")),
+        _summary_item("Worst mode", verdict),
+    ]
+    highlights: list[dict[str, str]] = []
+    for finding in sorted(
+        normalized,
+        key=lambda f: (int(f.get("score", 0)) if str(f.get("score", "")).isdigit() else 0),
+    )[:3]:
+        system_id = str(finding.get("system_id") or "system").strip()
+        score = finding.get("score", "n/a")
+        mode = str(finding.get("recommended_mode") or "ship").strip().lower() or "ship"
+        highlights.append(_summary_item(system_id, f"{mode} · score {score}"))
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
+def _build_findings_summary(task: Task, ctx: SummaryContext) -> dict[str, Any] | None:
+    """Shared builder for the structured-findings task types (security_audit,
+    perf, release_audit, …) and the fallback for any unregistered type whose
+    ``plan_output`` carries a ``findings``/``issues`` list."""
+    raw_plan_output = _task_local_attr(task, "plan_output")
+    plan_output = raw_plan_output if isinstance(raw_plan_output, dict) else None
+    findings = None
+    if isinstance(plan_output, dict):
+        findings = plan_output.get("findings") or plan_output.get("issues")
+    if not isinstance(findings, list) or not findings:
+        return None
+    normalized_findings = [f for f in findings if isinstance(f, dict)]
+    if not normalized_findings:
+        return None
+    actionable = [
+        f for f in normalized_findings if str(f.get("severity") or "").lower() in {"critical", "high"}
+    ]
+    verdict = "clean" if not actionable else "actionable"
+    evidence = [
+        _summary_item("Findings", len(normalized_findings)),
+        _summary_item("Actionable", len(actionable)),
+    ]
+    highlights: list[dict[str, str]] = []
+    for finding in normalized_findings[:3]:
+        severity = str(finding.get("severity") or "info").strip().lower()
+        title = str(finding.get("title") or finding.get("description") or "finding").strip()
+        highlights.append(_summary_item(title, severity))
+    return _summary_dict(task, verdict, evidence, highlights)
+
+
+# Per-type summary builders, keyed by task-type value. Types absent from this
+# map fall back to the shared findings builder (which returns ``None`` when the
+# task carries no structured findings) — so security_audit / perf / release_audit
+# and any future findings-shaped type are handled without a new branch.
+SUMMARY_BUILDERS: dict[str, Callable[[Task, SummaryContext], dict[str, Any] | None]] = {
+    "verify_tests": _build_verify_tests_summary,
+    "memo": _build_memo_summary,
+    "self_audit": _build_self_audit_summary,
+    "security_audit": _build_findings_summary,
+    "perf": _build_findings_summary,
+    "release_audit": _build_findings_summary,
+}
+
+
+def build_task_evaluation_summary(
+    task: Task,
+    *,
+    merge_test_result: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the normalized operator-facing evaluation summary for *task*.
+
+    Resolves the builder for the task's type from :data:`SUMMARY_BUILDERS`,
+    falling back to the shared findings builder for any type without a dedicated
+    entry. Returns ``None`` when the type produces no renderable summary (e.g. a
+    task with no structured artifact), exactly as the previous admin-local
+    dispatcher did. The returned dict is ``{status, verdict, evidence,
+    highlights}`` with ``evidence``/``highlights`` already truncated; the caller
+    wraps it into the ``TaskEvaluationSummary`` wire schema.
+    """
+    task_type = _task_type(task) or ""
+    ctx = SummaryContext(merge_test_result=merge_test_result)
+    builder = SUMMARY_BUILDERS.get(task_type, _build_findings_summary)
+    return builder(task, ctx)

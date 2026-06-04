@@ -6,6 +6,7 @@ import type { Direction } from './DirectionsPanel';
 import type { DirectionCategory } from '../hooks/useDirectionForm';
 import { formatRelativeTime, formatTimeRemaining, getCooldownStatus, getStagedWaitingInfo, STAGED_STALE_DAYS, priorityColors, statusColors } from '../utils/directionHelpers';
 import { parseTimestamp } from '../utils/time';
+import { healthRateColorClass, summarizeOutcomeKinds } from '../utils/outcomeKinds';
 
 const TAXONOMY_ORDER = ['scope_related', 'review_quality', 'infra_related', 'code_defect'] as const;
 const TAXONOMY_LABELS: Record<string, string> = {
@@ -146,6 +147,15 @@ function DirectionCardImpl({
     () => formatAutoRecoveryLine(d.held_until),
     [d.held_until],
   );
+
+  // Generalized cross-task-type outcome lanes. Only surfaced when a non-code-
+  // merge lane has terminal outcomes — otherwise the count equals merged PRs
+  // and the existing PR badges already represent it (honest legacy degrade).
+  const outcomeRows = useMemo(
+    () => summarizeOutcomeKinds(d.outcome_kind_breakdown),
+    [d.outcome_kind_breakdown],
+  );
+  const showGeneralized = outcomeRows.some(row => row.kind !== 'code_merge');
 
   const remediationSummaryRows = useMemo<RemediationSummaryRow[]>(() => {
     const history = Array.isArray(d.remediation_history) ? d.remediation_history : [];
@@ -852,6 +862,16 @@ function DirectionCardImpl({
                 </span>
               );
             })()}
+            {/* Generalized cross-task-type success — distinct from the PR-merge
+                count; shown only when a non-code-merge lane has outcomes. */}
+            {showGeneralized && (
+              <span
+                title="Generalized success across task types (code merges + research/audit/memo/verification), distinct from the PR-merge count"
+                className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-neutral-800/60 border-neutral-700/60 ${healthRateColorClass(d.generalized_health_rate)}`}
+              >
+                {d.generalized_successes ?? 0} eval{typeof d.generalized_health_rate === 'number' ? ` · ${Math.round(d.generalized_health_rate * 100)}%` : ''}
+              </span>
+            )}
             {/* Reactivate button for auto-paused directions */}
             {d.auto_paused && key === 'paused' && (
               // reason: inline direction action chip; text-[10px] py-0.5 matches card density
@@ -1047,6 +1067,27 @@ function DirectionCardImpl({
               </span>
             )}
           </div>
+          {showGeneralized && (
+            <div className="flex flex-wrap gap-1 mt-1.5">
+              {outcomeRows.map(row => {
+                const rate = row.terminal > 0 ? row.success / row.terminal : 0;
+                const color = rate >= 0.7
+                  ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400'
+                  : rate >= 0.4
+                    ? 'bg-amber-950/40 border-amber-900/50 text-amber-400'
+                    : 'bg-neutral-800/60 border-neutral-700/60 text-neutral-400';
+                return (
+                  <span
+                    key={row.kind}
+                    title={`${row.label}: ${row.success} success / ${row.neutral} neutral / ${row.failure} failure (${Math.round(rate * 100)}%)`}
+                    className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${color}`}
+                  >
+                    {row.label} {row.success}/{row.terminal}
+                  </span>
+                );
+              })}
+            </div>
+          )}
           {d.paths && d.paths.length > 0 && (
             <div className="flex flex-wrap gap-1 mt-1.5">
               {d.paths.map(p => (

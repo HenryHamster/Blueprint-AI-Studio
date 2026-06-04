@@ -13,9 +13,11 @@ from app.task_capabilities import (
     COMPLETION_HANDLER_BY_TASK_TYPE,
     EVALUATION_STRATEGY_BY_TASK_TYPE,
     FILTER_VISIBLE_TASK_TYPES,
+    PERIODIC_TASK_TYPES,
     PRODUCT_TASK_TYPES,
     PROVIDER_CONFIGURABLE_TASK_TYPES,
     READ_ONLY_TASK_TYPES,
+    RESERVABLE_TASK_TYPES,
     RUN_SHAPE_BY_TASK_TYPE,
     STRATEGIC_PHASE_BY_TASK_TYPE,
     STRATEGIC_TASK_TYPES,
@@ -24,6 +26,7 @@ from app.task_capabilities import (
     USER_LAUNCHABLE_TASK_TYPES,
     WRITE_TASK_TYPES,
     get_task_capability,
+    task_capability_contract,
     run_shape_for,
     strategic_phase_for,
     task_type_catalog,
@@ -264,6 +267,77 @@ def test_product_task_types_derived_from_registry():
     # The stale hardcoded legacy set referenced task types that no longer exist.
     assert "feature" not in PRODUCT_TASK_TYPES
     assert "improvement" not in PRODUCT_TASK_TYPES
+
+
+def test_reservable_task_types_derived_from_registry():
+    """RESERVABLE_TASK_TYPES is the single source of truth for which task types
+    an operator may reserve pipeline slots for. It must be registry-derived,
+    contain only known types, and preserve the historical reservable set so
+    existing reserved_slots_for_types configs keep validating."""
+    expected = {cap.id.value for cap in TASK_CAPABILITIES if cap.reservable}
+    assert frozenset(expected) == RESERVABLE_TASK_TYPES
+    assert RESERVABLE_TASK_TYPES.issubset(ALL_TASK_TYPES)
+    # Backward-compat: the historically-allowed reserved types must remain.
+    assert RESERVABLE_TASK_TYPES == {"create", "research", "plan"}
+
+
+def test_periodic_task_types_derived_from_registry():
+    """PERIODIC_TASK_TYPES is the single source of truth for autonomous periodic
+    eligibility, registry-derived and preserving the historical set."""
+    expected = {cap.id.value for cap in TASK_CAPABILITIES if cap.periodic_eligible}
+    assert frozenset(expected) == PERIODIC_TASK_TYPES
+    assert PERIODIC_TASK_TYPES.issubset(ALL_TASK_TYPES)
+    assert PERIODIC_TASK_TYPES == {"security_audit", "qa", "deps"}
+
+
+def test_task_capability_contract_covers_every_registered_type():
+    """The published contract has exactly one entry per registered task type and
+    surfaces every flag the operator/agent surfaces consume — so a newly
+    registered task type appears in the contract with no per-surface edit."""
+    contract = task_capability_contract()
+    assert set(contract) == ALL_TASK_TYPES
+    required_fields = {
+        "type",
+        "label",
+        "badge",
+        "agent_mode",
+        "default_category",
+        "description",
+        "user_launchable",
+        "provider_configurable",
+        "filter_visible",
+        "delivers_product",
+        "reservable",
+        "periodic_eligible",
+        "run_shape",
+        "output_kind",
+        "requires_code",
+        "requires_web",
+        "requires_compute",
+    }
+    for task_type, entry in contract.items():
+        assert entry["type"] == task_type
+        assert required_fields.issubset(entry)
+        # badge defaults to label when unset.
+        assert entry["badge"]
+        assert entry["agent_mode"] in ("write", "read_only")
+        assert entry["run_shape"] in {"single_agent", "workflow", "experiment_loop"}
+
+
+def test_contract_flags_match_derived_registry_subsets():
+    """Each capability-flag column in the contract is consistent with the
+    registry-derived subset that the settings validators key off."""
+    contract = task_capability_contract()
+    assert {t for t, e in contract.items() if e["user_launchable"]} == set(
+        USER_LAUNCHABLE_TASK_TYPES
+    )
+    assert {t for t, e in contract.items() if e["provider_configurable"]} == set(
+        PROVIDER_CONFIGURABLE_TASK_TYPES
+    )
+    assert {t for t, e in contract.items() if e["reservable"]} == RESERVABLE_TASK_TYPES
+    assert {
+        t for t, e in contract.items() if e["periodic_eligible"]
+    } == PERIODIC_TASK_TYPES
 
 
 def test_task_capability_lookup_is_metadata_only():

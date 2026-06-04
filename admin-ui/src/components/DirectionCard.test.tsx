@@ -596,3 +596,40 @@ describe('DirectionCard autonomous/assisted merge split', () => {
     expect(screen.queryByText('✓ self-sufficient')).not.toBeInTheDocument();
   });
 });
+
+describe('DirectionCard generalized outcome metrics', () => {
+  it('shows generalized eval badge and per-kind breakdown chips when non-code lanes exist', () => {
+    const d = makeDirection({
+      generalized_successes: 6,
+      generalized_health_rate: 0.75,
+      outcome_kind_breakdown: {
+        code_merge: { success: 3, neutral: 0, failure: 1 },
+        research_quality: { success: 2, neutral: 0, failure: 0 },
+        audit_findings: { success: 1, neutral: 1, failure: 0 },
+      },
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+
+    expect(screen.getByText('6 eval · 75%')).toBeInTheDocument();
+    expect(screen.getByText('code 3/4')).toBeInTheDocument();
+    expect(screen.getByText('research 2/2')).toBeInTheDocument();
+    expect(screen.getByText('audit 1/2')).toBeInTheDocument();
+  });
+
+  it('omits generalized UI for legacy directions with only code_merge outcomes', () => {
+    const d = makeDirection({
+      generalized_successes: 3,
+      generalized_health_rate: 1,
+      outcome_kind_breakdown: { code_merge: { success: 3, neutral: 0, failure: 0 } },
+    });
+    render(<DirectionCard {...makeProps(d)} />);
+
+    expect(screen.queryByText(/\beval\b/)).not.toBeInTheDocument();
+    expect(screen.queryByText('code 3/3')).not.toBeInTheDocument();
+  });
+
+  it('omits generalized UI when no breakdown is present', () => {
+    render(<DirectionCard {...makeProps(makeDirection())} />);
+    expect(screen.queryByText(/eval/)).not.toBeInTheDocument();
+  });
+});

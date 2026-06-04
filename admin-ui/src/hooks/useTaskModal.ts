@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react';
 import type React from 'react';
 import { API_BASE_URL, authHeaders, authGet, fetchTaskTypeCatalog } from '../api';
 import type { LaunchableTaskTypeOption, UserLaunchableTaskType } from '../taskCapabilities';
-import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import { USER_LAUNCHABLE_TASK_TYPE_IDS, USER_LAUNCHABLE_TASK_TYPE_OPTIONS, resolveTaskCapabilities } from '../taskCapabilities';
+import type { TaskCapabilityContract } from '../types/settings';
 import type { Task } from '../types/task';
 
 interface RepoOption {
@@ -16,7 +17,15 @@ export function useTaskModal(
   fetchTasksRef: React.MutableRefObject<() => void>,
   defaultTaskBranchRef?: React.MutableRefObject<string | null>,
   selectedProjectRepoRef?: React.MutableRefObject<string | null>,
+  taskCapabilityContract?: TaskCapabilityContract | null,
 ) {
+  // Launchable set derives from the published contract (falling back to the
+  // built-in table when the backend hasn't published it) so the duplicate
+  // guard below honors a newly registered launchable type instead of
+  // collapsing it to 'create'.
+  const launchableTaskTypeIds: readonly string[] = taskCapabilityContract
+    ? resolveTaskCapabilities(taskCapabilityContract).userLaunchableOptions.map(o => o.value)
+    : USER_LAUNCHABLE_TASK_TYPE_IDS;
   const getDefaultTaskBranch = () => defaultTaskBranchRef?.current ?? null;
   const getSelectedProjectRepo = () => selectedProjectRepoRef?.current || null;
   const defaultTaskBranch = getDefaultTaskBranch();
@@ -312,7 +321,7 @@ export function useTaskModal(
     const model = (payload.model as string) || '';
     const effort = (payload.effort as string) || '';
     const taskType: UserLaunchableTaskType =
-      USER_LAUNCHABLE_TASK_TYPE_IDS.includes(task.task_type as UserLaunchableTaskType)
+      task.task_type && launchableTaskTypeIds.includes(task.task_type)
         ? (task.task_type as UserLaunchableTaskType)
         : 'create';
 

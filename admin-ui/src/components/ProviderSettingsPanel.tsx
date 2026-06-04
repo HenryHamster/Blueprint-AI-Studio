@@ -10,7 +10,7 @@ import type {
   TaskTypeProviderOverrides,
 } from '../types/settings';
 import { EFFORT_LEVELS } from '../types/settings';
-import { PROVIDER_ROUTABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import { useTaskCapabilities } from '../taskCapabilities';
 
 // Keep in sync with backend/app/providers/gemini.py::_GEMINI_PREVIEW_MODELS
 // and _PREVIEW_TO_GA_FALLBACK. When the backend adds a preview model (or
@@ -74,6 +74,7 @@ export function ProviderSettingsPanel({
   onUpdateOverrides,
   onUpdateProviderSettingsByEffort,
 }: Props) {
+  const { providerRoutableOptions } = useTaskCapabilities();
   const [scope, setScope] = useState<'matrix' | 'defaults' | 'overrides'>('matrix');
   const [selectedProvider, setSelectedProvider] = useState<ProviderName>('anthropic');
   const [selectedTaskType, setSelectedTaskType] = useState<string>('review');
@@ -186,7 +187,7 @@ export function ProviderSettingsPanel({
             onChange={e => setSelectedTaskType(e.target.value)}
             className="flex-1 bg-neutral-900 border border-neutral-700 rounded px-2 py-1.5 text-xs text-neutral-100"
           >
-            {PROVIDER_ROUTABLE_TASK_TYPE_OPTIONS.map(t => (
+            {providerRoutableOptions.map(t => (
               <option key={t.value} value={t.value}>{t.label}</option>
             ))}
           </select>

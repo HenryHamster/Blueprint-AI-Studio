@@ -846,6 +846,9 @@ def test_compute_digest_cost_economics_empty():
     assert result["pipeline_autonomous_prs_merged"] == 0
     assert result["pipeline_assisted_prs_merged"] == 0
     assert result["pipeline_operator_action_count"] == 0
+    assert result["pipeline_generalized_successes"] == 0
+    assert result["pipeline_generalized_health_rate"] is None
+    assert result["pipeline_outcome_kind_breakdown"] == {}
     assert result["overall_type_distribution"] == {}
     assert result["pipeline_filter_funnel"] == {}
 
@@ -1038,6 +1041,12 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "autonomous_prs_merged": 2,
             "assisted_prs_merged": 1,
             "operator_action_count": 4,
+            "generalized_successes": 5,
+            "generalized_terminal_outcomes": 6,
+            "outcome_kind_breakdown": {
+                "code_merge": {"success": 3, "neutral": 0, "failure": 1},
+                "research_quality": {"success": 2, "neutral": 0, "failure": 0},
+            },
             "type_distribution": {"create": 5},
             "filter_funnel": {"a": 2},
         },
@@ -1049,6 +1058,11 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
             "autonomous_prs_merged": 1,
             "assisted_prs_merged": 0,
             "operator_action_count": 1,
+            "generalized_successes": 1,
+            "generalized_terminal_outcomes": 2,
+            "outcome_kind_breakdown": {
+                "code_merge": {"success": 1, "neutral": 0, "failure": 1}
+            },
             "type_distribution": {"create": 2, "fix": 1},
             "filter_funnel": {"a": 1, "b": 3},
         },
@@ -1066,6 +1080,12 @@ def test_compute_digest_cost_economics_pipeline_aggregates():
     assert result["pipeline_autonomous_prs_merged"] == 3
     assert result["pipeline_assisted_prs_merged"] == 1
     assert result["pipeline_operator_action_count"] == 5
+    assert result["pipeline_generalized_successes"] == 6
+    assert result["pipeline_generalized_health_rate"] == 0.75
+    assert result["pipeline_outcome_kind_breakdown"] == {
+        "code_merge": {"success": 4, "neutral": 0, "failure": 2},
+        "research_quality": {"success": 2, "neutral": 0, "failure": 0},
+    }
     assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
     assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
 

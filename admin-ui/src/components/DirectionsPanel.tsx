@@ -10,6 +10,7 @@ import { DirectionsQuickLinks } from './DirectionsQuickLinks';
 import { DirectionsList, type DirectionCategoryFilter } from './DirectionsList';
 import { useDirectionsData } from '../hooks/useDirectionsData';
 import type { Project } from '../types/project';
+import type { OutcomeKindBreakdown } from '../utils/outcomeKinds';
 
 export interface ResearchHistoryEntry {
   timestamp: string;
@@ -117,6 +118,12 @@ export interface Direction {
   budget_utilization_pct?: number | null;
   budget_exceeded?: boolean;
   quality_score?: number | null;
+  // Generalized cross-task-type success metrics, emitted by GET /directions
+  // alongside the legacy PR-merge counters. `outcome_kind_breakdown` is keyed
+  // by outcome kind (code_merge, research_quality, audit_findings, …).
+  generalized_successes?: number | null;
+  generalized_health_rate?: number | null;
+  outcome_kind_breakdown?: OutcomeKindBreakdown | null;
   cost_per_merged_pr?: number | null;
   cost_per_merge_exceeds_threshold?: boolean;
   // Per-(provider, model) cost breakdown for the digest window. Keys are

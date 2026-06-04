@@ -48,7 +48,14 @@ async def compute_direction_progress(
 
     from sqlalchemy.orm.attributes import flag_modified
 
-    from app.direction_metrics import _compute_direction_quality_score
+    from app.direction_metrics import (
+        _compute_direction_quality_score,
+        _compute_lifetime_generalized_outcome_state,
+        _entry_generalized_successes,
+        _entry_generalized_terminal_outcomes,
+        _fallback_outcome_kind_breakdown,
+        _merge_outcome_kind_breakdown,
+    )
     from app.direction_outcomes import synthesize_prompt_quality_patterns
     from app.notification_dispatch import dispatch_external_notification
     from app.routers.admin_analytics import (
@@ -107,6 +114,8 @@ async def compute_direction_progress(
         assisted_prs_merged = 0
         operator_action_count = 0
         prs_rejected = 0
+        generalized_successes = 0
+        generalized_terminal_outcomes = 0
         findings_tasks_created = 0
         merge_time_values: List[float] = []
         dir_scope_agg: Dict[str, Dict[str, Any]] = {}
@@ -114,6 +123,7 @@ async def compute_direction_progress(
         window_product_ratios: List[float] = []
         agg_type_distribution: Dict[str, int] = {}
         agg_type_breakdown: Dict[str, Dict[str, int]] = {}
+        dir_outcome_kind_breakdown: Dict[str, Dict[str, int]] = {}
         dir_taxonomy_summary: Dict[str, int] = {}
         dir_stage_dropout: Dict[str, int] = {}
         recent_failed_titles: List[str] = []
@@ -144,6 +154,15 @@ async def compute_direction_progress(
                 assisted_prs_merged += entry.get("assisted_prs_merged", 0) or 0
                 operator_action_count += entry.get("operator_action_count", 0) or 0
                 prs_rejected += entry.get("prs_rejected") or 0
+                generalized_successes += _entry_generalized_successes(entry)
+                generalized_terminal_outcomes += _entry_generalized_terminal_outcomes(
+                    entry
+                )
+                _merge_outcome_kind_breakdown(
+                    dir_outcome_kind_breakdown,
+                    entry.get("outcome_kind_breakdown")
+                    or _fallback_outcome_kind_breakdown(entry),
+                )
                 dir_reviews_dismissed += entry.get("reviews_dismissed") or 0
                 dir_reviews_overridden += entry.get("reviews_overridden") or 0
                 dir_user_issues_caught += entry.get("user_issues_caught") or 0
@@ -378,6 +397,7 @@ async def compute_direction_progress(
         lifetime_operator_actions = sum(
             h.get("operator_action_count", 0) for h in _history_all
         ) + (_agg.get("total_operator_actions") or 0)
+        lifetime_generalized_state = _compute_lifetime_generalized_outcome_state(d)
         retirement_eligible = (
             lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
         )
@@ -394,6 +414,11 @@ async def compute_direction_progress(
         conversion_rate = (
             round(prs_merged / findings_tasks_created, 3)
             if findings_tasks_created > 0
+            else None
+        )
+        generalized_health_rate = (
+            round(generalized_successes / generalized_terminal_outcomes, 3)
+            if generalized_terminal_outcomes > 0
             else None
         )
         # Accumulate into project-level scope rate aggregates
@@ -559,6 +584,10 @@ async def compute_direction_progress(
                 "assisted_prs_merged": assisted_prs_merged,
                 "operator_action_count": operator_action_count,
                 "prs_rejected": prs_rejected,
+                "generalized_successes": generalized_successes,
+                "generalized_terminal_outcomes": generalized_terminal_outcomes,
+                "generalized_health_rate": generalized_health_rate,
+                "outcome_kind_breakdown": dir_outcome_kind_breakdown or None,
                 "acceptance_rate": acceptance_rate,
                 "conversion_rate": conversion_rate,
                 "avg_time_to_merge_hours": avg_time_to_merge_hours,
@@ -606,6 +635,12 @@ async def compute_direction_progress(
                 "lifetime_conversion_rate": lifetime_conversion_rate,
                 "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
                 "lifetime_operator_actions": lifetime_operator_actions,
+                "lifetime_generalized_successes": lifetime_generalized_state[
+                    "generalized_successes"
+                ],
+                "lifetime_generalized_health_rate": lifetime_generalized_state[
+                    "generalized_health_rate"
+                ],
                 "retirement_eligible": retirement_eligible,
                 "evicted_findings_count": evicted_findings_count,
                 "review_quality": {
@@ -640,4 +675,3 @@ async def compute_direction_progress(
         dir_id_to_text,
         budget_alert_fired,
     )
-

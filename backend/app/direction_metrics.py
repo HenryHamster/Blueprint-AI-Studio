@@ -39,6 +39,8 @@ _HISTORY_AGG_DEFAULTS = {
     "total_autonomous_prs_merged": 0,
     "total_assisted_prs_merged": 0,
     "total_operator_actions": 0,
+    "total_generalized_successes": 0,
+    "total_generalized_terminal_outcomes": 0,
 }
 
 _DECOMP_AGG_DEFAULTS = {
@@ -47,6 +49,248 @@ _DECOMP_AGG_DEFAULTS = {
     "subtask_count_sum": 0,
     "cross_module_count_sum": 0,
 }
+
+_OUTCOME_KIND_STATUSES = ("success", "neutral", "failure")
+_READ_ONLY_UNCLASSIFIED_KIND = "read_only_unclassified"
+
+
+def _entry_generalized_successes(entry: dict[str, Any]) -> int:
+    """Return generalized successes for one research_history entry.
+
+    Legacy entries predate generalized_successes; for those, merged PRs are the
+    only durable success signal available, so they serve as the additive
+    fallback.
+    """
+    return int(entry.get("generalized_successes", entry.get("prs_merged", 0)) or 0)
+
+
+def _entry_generalized_terminal_outcomes(entry: dict[str, Any]) -> int:
+    """Return the number of terminal outcomes represented by one entry.
+
+    Prefer the structured outcome breakdown when available. Otherwise fall back
+    to the terminal task counters, and finally to merged PRs for sparse legacy
+    rows that only recorded merge counts.
+    """
+    breakdown = entry.get("outcome_kind_breakdown") or {}
+    if isinstance(breakdown, dict) and breakdown:
+        return sum(
+            int((counts or {}).get(status, 0) or 0)
+            for counts in breakdown.values()
+            if isinstance(counts, dict)
+            for status in _OUTCOME_KIND_STATUSES
+        )
+
+    terminal = sum(
+        int(entry.get(field, 0) or 0)
+        for field in ("tasks_completed", "tasks_failed", "tasks_cancelled")
+    )
+    if terminal > 0:
+        return terminal
+
+    generalized_successes = _entry_generalized_successes(entry)
+    if generalized_successes > 0:
+        return generalized_successes
+    return int(entry.get("prs_merged", 0) or 0)
+
+
+def _fallback_outcome_kind_breakdown(entry: dict[str, Any]) -> dict[str, dict[str, int]]:
+    """Synthesize a minimal outcome-kind breakdown for sparse legacy entries."""
+    merged = int(entry.get("prs_merged", 0) or 0)
+    if merged <= 0:
+        return {}
+    return {"code_merge": {"success": merged, "neutral": 0, "failure": 0}}
+
+
+def _merge_outcome_kind_breakdown(
+    target: dict[str, dict[str, int]], source: dict[str, Any] | None
+) -> None:
+    """Add per-kind generalized outcome counts into ``target`` in place."""
+    if not isinstance(source, dict):
+        return
+    for kind, counts in source.items():
+        if not isinstance(counts, dict):
+            continue
+        bucket = target.setdefault(
+            kind, {"success": 0, "neutral": 0, "failure": 0}
+        )
+        for status in _OUTCOME_KIND_STATUSES:
+            bucket[status] += int(counts.get(status, 0) or 0)
+
+
+def _copy_outcome_kind_breakdown(
+    source: dict[str, Any] | None,
+) -> dict[str, dict[str, int]]:
+    """Return a normalized copy of an outcome-kind breakdown mapping."""
+    normalized: dict[str, dict[str, int]] = {}
+    if not isinstance(source, dict):
+        return normalized
+    for kind, counts in source.items():
+        if not isinstance(counts, dict):
+            continue
+        normalized[kind] = {
+            status: int(counts.get(status, 0) or 0)
+            for status in _OUTCOME_KIND_STATUSES
+        }
+    return normalized
+
+
+def _sum_outcome_kind_statuses(
+    breakdown: dict[str, dict[str, int]], statuses: tuple[str, ...]
+) -> int:
+    """Return the total counts across ``statuses`` for all outcome kinds."""
+    return sum(
+        int((counts or {}).get(status, 0) or 0)
+        for counts in breakdown.values()
+        if isinstance(counts, dict)
+        for status in statuses
+    )
+
+
+def _backfill_breakdown_to_generalized_totals(
+    breakdown: dict[str, dict[str, int]],
+    *,
+    generalized_successes: int,
+    generalized_terminal_outcomes: int,
+) -> dict[str, dict[str, int]]:
+    """Fill sparse aggregate breakdowns so their counts match generalized totals."""
+    normalized = _copy_outcome_kind_breakdown(breakdown)
+    breakdown_successes = _sum_outcome_kind_statuses(normalized, ("success",))
+    breakdown_terminal = _sum_outcome_kind_statuses(
+        normalized, _OUTCOME_KIND_STATUSES
+    )
+    missing_successes = max(0, generalized_successes - breakdown_successes)
+    missing_terminal = max(0, generalized_terminal_outcomes - breakdown_terminal)
+    if missing_successes <= 0 and missing_terminal <= 0:
+        return normalized
+
+    bucket = normalized.setdefault(
+        _READ_ONLY_UNCLASSIFIED_KIND,
+        {"success": 0, "neutral": 0, "failure": 0},
+    )
+    if missing_successes > 0:
+        bucket["success"] += missing_successes
+    residual_terminal = max(0, missing_terminal - missing_successes)
+    if residual_terminal > 0:
+        bucket["neutral"] += residual_terminal
+    return normalized
+
+
+def _normalize_aggregate_generalized_state(
+    agg: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Upgrade a history aggregate so generalized totals stay compatible with legacy data."""
+    normalized = dict(agg or {})
+    breakdown = _copy_outcome_kind_breakdown(
+        normalized.get("outcome_kind_breakdown")
+    )
+    legacy_merged = int(normalized.get("total_prs_merged", 0) or 0)
+    if legacy_merged > 0:
+        code_merge = breakdown.setdefault(
+            "code_merge", {"success": 0, "neutral": 0, "failure": 0}
+        )
+        code_merge["success"] = max(
+            int(code_merge.get("success", 0) or 0), legacy_merged
+        )
+
+    breakdown_successes = _sum_outcome_kind_statuses(breakdown, ("success",))
+    normalized["total_generalized_successes"] = max(
+        int(normalized.get("total_generalized_successes", 0) or 0),
+        legacy_merged,
+        breakdown_successes,
+    )
+
+    legacy_terminal = sum(
+        int(normalized.get(field, 0) or 0)
+        for field in (
+            "total_tasks_completed",
+            "total_tasks_failed",
+            "total_tasks_cancelled",
+        )
+    )
+    breakdown_terminal = _sum_outcome_kind_statuses(
+        breakdown, _OUTCOME_KIND_STATUSES
+    )
+    breakdown_non_success = breakdown_terminal - breakdown_successes
+    normalized["total_generalized_terminal_outcomes"] = max(
+        int(normalized.get("total_generalized_terminal_outcomes", 0) or 0),
+        legacy_terminal,
+        breakdown_terminal,
+        int(normalized["total_generalized_successes"] or 0),
+        int(normalized["total_generalized_successes"] or 0) + breakdown_non_success,
+    )
+    normalized["outcome_kind_breakdown"] = _backfill_breakdown_to_generalized_totals(
+        breakdown,
+        generalized_successes=int(normalized["total_generalized_successes"] or 0),
+        generalized_terminal_outcomes=int(
+            normalized["total_generalized_terminal_outcomes"] or 0
+        ),
+    )
+    return normalized
+
+
+def _aggregate_generalized_terminal_outcomes(agg: dict[str, Any]) -> int:
+    """Return lifetime terminal outcomes from a direction history aggregate."""
+    normalized = _normalize_aggregate_generalized_state(agg)
+    total = int(normalized.get("total_generalized_terminal_outcomes") or 0)
+    if total > 0:
+        return total
+
+    terminal = sum(
+        int(normalized.get(field, 0) or 0)
+        for field in (
+            "total_tasks_completed",
+            "total_tasks_failed",
+            "total_tasks_cancelled",
+        )
+    )
+    if terminal > 0:
+        return terminal
+
+    generalized_successes = int(normalized.get("total_generalized_successes") or 0)
+    return generalized_successes
+
+
+def _compute_lifetime_generalized_outcome_state(direction: dict[str, Any]) -> dict[str, Any]:
+    """Return lifetime generalized success metrics for a direction."""
+    history = direction.get("research_history") or []
+    agg = _normalize_aggregate_generalized_state(
+        direction.get("history_aggregate") or {}
+    )
+
+    generalized_successes = sum(
+        _entry_generalized_successes(entry) for entry in history
+    ) + int(agg.get("total_generalized_successes") or 0)
+    generalized_terminal_outcomes = sum(
+        _entry_generalized_terminal_outcomes(entry) for entry in history
+    ) + _aggregate_generalized_terminal_outcomes(agg)
+
+    outcome_kind_breakdown: dict[str, dict[str, int]] = {}
+    for entry in history:
+        _merge_outcome_kind_breakdown(
+            outcome_kind_breakdown,
+            entry.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(entry),
+        )
+    _merge_outcome_kind_breakdown(
+        outcome_kind_breakdown, agg.get("outcome_kind_breakdown")
+    )
+    if not outcome_kind_breakdown and generalized_successes > 0:
+        _merge_outcome_kind_breakdown(
+            outcome_kind_breakdown,
+            _fallback_outcome_kind_breakdown(
+                {"prs_merged": agg.get("total_prs_merged") or generalized_successes}
+            ),
+        )
+
+    return {
+        "generalized_successes": generalized_successes,
+        "generalized_terminal_outcomes": generalized_terminal_outcomes,
+        "generalized_health_rate": (
+            round(generalized_successes / generalized_terminal_outcomes, 3)
+            if generalized_terminal_outcomes > 0
+            else None
+        ),
+        "outcome_kind_breakdown": outcome_kind_breakdown or None,
+    }
 
 
 def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> dict:
@@ -59,8 +303,17 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
     agg = prev_agg or {}
     for k, v in _HISTORY_AGG_DEFAULTS.items():
         agg.setdefault(k, v)
+    normalized_generalized = _normalize_aggregate_generalized_state(agg)
+    agg["total_generalized_successes"] = normalized_generalized[
+        "total_generalized_successes"
+    ]
+    agg["total_generalized_terminal_outcomes"] = normalized_generalized[
+        "total_generalized_terminal_outcomes"
+    ]
+    agg["outcome_kind_breakdown"] = normalized_generalized["outcome_kind_breakdown"]
     sb = agg.setdefault("scope_breakdown", {})
     dq = agg.setdefault("decomposition_quality", dict(_DECOMP_AGG_DEFAULTS))
+    outcome_kind_breakdown = agg["outcome_kind_breakdown"]
     for ev in evicted:
         agg["total_cycles"] += 1
         agg["total_tasks_created"] += ev.get("tasks_created", 0)
@@ -78,6 +331,14 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         )
         agg["total_assisted_prs_merged"] += ev.get("assisted_prs_merged", 0)
         agg["total_operator_actions"] += ev.get("operator_action_count", 0)
+        agg["total_generalized_successes"] += _entry_generalized_successes(ev)
+        agg["total_generalized_terminal_outcomes"] += (
+            _entry_generalized_terminal_outcomes(ev)
+        )
+        _merge_outcome_kind_breakdown(
+            outcome_kind_breakdown,
+            ev.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(ev),
+        )
         if not agg["first_cycle_at"] and ev.get("timestamp"):
             agg["first_cycle_at"] = ev["timestamp"]
         for scope, stats in (ev.get("scope_breakdown") or {}).items():
@@ -106,6 +367,14 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
             rate = qd.get("subtask_merge_rate")
             if isinstance(rate, (int, float)) and count > 0:
                 dq["subtask_merge_rate_weighted_sum"] += float(rate) * count
+    normalized_generalized = _normalize_aggregate_generalized_state(agg)
+    agg["total_generalized_successes"] = normalized_generalized[
+        "total_generalized_successes"
+    ]
+    agg["total_generalized_terminal_outcomes"] = normalized_generalized[
+        "total_generalized_terminal_outcomes"
+    ]
+    agg["outcome_kind_breakdown"] = normalized_generalized["outcome_kind_breakdown"]
     return agg
 
 
@@ -228,7 +497,7 @@ def _compute_direction_quality_score(d: dict) -> float:
     actionable_w = structural_w = scope_w = total_taxon_w = 0.0
     active_w = wasted_w = 0.0
 
-    for entry, w in zip(recent, weights):
+    for entry, w in zip(recent, weights, strict=True):
         tx = entry.get("taxonomy_summary") or {}
         code_defect = tx.get(TAXONOMY_CODE_DEFECT, 0) or 0
         scope_related = tx.get(TAXONOMY_SCOPE_RELATED, 0) or 0
@@ -253,10 +522,7 @@ def _compute_direction_quality_score(d: dict) -> float:
     else:
         taxonomy_health = 0.5
 
-    if active_w > 0:
-        productivity_signal = 1.0 - (wasted_w / active_w)
-    else:
-        productivity_signal = 0.5
+    productivity_signal = 1.0 - (wasted_w / active_w) if active_w > 0 else 0.5
 
     if total_taxon_w > 0:
         scope_signal = 0.0 if (scope_w / total_taxon_w) > 0.5 else 1.0

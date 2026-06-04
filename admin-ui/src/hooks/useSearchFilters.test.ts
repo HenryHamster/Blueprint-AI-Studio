@@ -112,4 +112,34 @@ describe('useSearchFilters', () => {
     expect(FAILURE_CLASSES.length).toBe(Object.keys(FAILURE_CLASS_CONFIG).length);
     expect(FAILURE_CLASSES.length).toBeGreaterThan(0);
   });
+
+  it('uses the resolved contract-driven task types for defaults', () => {
+    const { result } = renderHook(() => useSearchFilters(['create', 'release_audit']));
+    expect(result.current.taskTypeFilter).toEqual(['create', 'release_audit']);
+  });
+
+  it('expands an all-types selection when the published filter-visible set grows', () => {
+    const { result, rerender } = renderHook(
+      ({ taskTypes }) => useSearchFilters(taskTypes),
+      { initialProps: { taskTypes: ['create', 'fix'] as string[] } },
+    );
+
+    expect(result.current.taskTypeFilter).toEqual(['create', 'fix']);
+
+    rerender({ taskTypes: ['create', 'fix', 'release_audit'] });
+
+    expect(result.current.taskTypeFilter).toEqual(['create', 'fix', 'release_audit']);
+  });
+
+  it('preserves an explicit subset when the published filter-visible set grows', () => {
+    const { result, rerender } = renderHook(
+      ({ taskTypes }) => useSearchFilters(taskTypes),
+      { initialProps: { taskTypes: ['create', 'fix'] as string[] } },
+    );
+
+    act(() => result.current.setTaskTypeFilter(['create']));
+    rerender({ taskTypes: ['create', 'fix', 'release_audit'] });
+
+    expect(result.current.taskTypeFilter).toEqual(['create']);
+  });
 });

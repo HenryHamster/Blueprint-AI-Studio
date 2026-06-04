@@ -675,9 +675,23 @@ async def test_admin_tasks_expose_evaluation_summary(
             ]
         },
     )
-    db_session.add_all([memo_task, self_audit_task, audit_task])
+    # perf shares the registry's findings builder with security_audit — it
+    # flows through without a dedicated admin.py branch, proving registry-driven
+    # dispatch handles new evaluator-backed types by registration alone.
+    perf_task = Task(
+        project_id=project.id,
+        title="Perf audit task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "perf"}],
+        plan_output={
+            "findings": [
+                {"severity": "low", "title": "Slow query", "description": "n+1"},
+            ]
+        },
+    )
+    db_session.add_all([memo_task, self_audit_task, audit_task, perf_task])
     await db_session.commit()
-    for t in (verify_task, memo_task, self_audit_task, audit_task):
+    for t in (verify_task, memo_task, self_audit_task, audit_task, perf_task):
         await db_session.refresh(t)
 
     list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
@@ -703,6 +717,10 @@ async def test_admin_tasks_expose_evaluation_summary(
     assert audit_summary["verdict"] == "actionable"
     assert audit_summary["evidence"][1]["value"] == "1"
     assert audit_summary["highlights"][0]["label"] == "Missing auth check"
+
+    perf_summary = by_id[str(perf_task.id)]["evaluation_summary"]
+    assert perf_summary["verdict"] == "clean"
+    assert perf_summary["highlights"][0]["label"] == "Slow query"
 
     detail_resp = await client.get(f"/api/admin/tasks/{verify_task.id}")
     assert detail_resp.status_code == 200

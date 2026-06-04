@@ -25,6 +25,7 @@ from app.task_outcomes import (
     KIND_VERIFICATION_VERDICT,
     OUTCOME_EVALUATORS,
     TaskOutcome,
+    build_task_evaluation_summary,
     evaluate_task_outcome,
     is_successful_outcome,
 )
@@ -278,6 +279,122 @@ def test_outcome_evaluators_override_is_consulted_first():
         assert evaluate_task_outcome(task) is sentinel
     finally:
         OUTCOME_EVALUATORS.pop("research", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Operator-facing evaluation summaries (build_task_evaluation_summary)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_summary_verify_tests_pass_verdict():
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task,
+        merge_test_result={
+            "detected": True,
+            "passed": True,
+            "tests": [{"name": "pytest", "status": "pass", "message": "ok"}],
+            "output": "PASS all tests",
+        },
+    )
+    assert summary is not None
+    assert summary["verdict"] == "pass"
+    assert summary["evidence"][0]["label"] == "Detected suite"
+    assert summary["highlights"][0]["label"] == "pytest"
+
+
+def test_summary_verify_tests_fail_verdict():
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(
+        task, merge_test_result={"detected": True, "passed": False}
+    )
+    assert summary["verdict"] == "fail"
+
+
+def test_summary_verify_tests_undetected_verdict():
+    # No merge_test_result context → undetected (neutral) verdict.
+    task = _make_task("verify_tests")
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "undetected"
+
+
+def test_summary_memo_artifact():
+    task = _make_task(
+        "memo",
+        plan_output={
+            "memo": {
+                "summary": "Cache strategy summary",
+                "reasoning": "Why we picked this cache.",
+                "citations": ["task:1", "direction:cache"],
+                "tags": ["memo"],
+            }
+        },
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "memo"
+    assert summary["evidence"][0]["value"] == "Cache strategy summary"
+    assert summary["highlights"][0]["label"] == "Citations"
+
+
+def test_summary_memo_without_artifact_is_none():
+    task = _make_task("memo", plan_output={})
+    assert build_task_evaluation_summary(task) is None
+
+
+def test_summary_self_audit_verdict_and_evidence():
+    task = _make_task(
+        "self_audit",
+        plan_output=[
+            {"system_id": "auth", "score": 45, "recommended_mode": "audit"},
+            {"system_id": "billing", "score": 80, "recommended_mode": "ship"},
+        ],
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "audit"
+    assert summary["evidence"][0]["label"] == "Systems"
+    assert summary["highlights"][0]["label"] == "auth"
+
+
+def test_summary_security_audit_actionable():
+    task = _make_task(
+        "security_audit",
+        plan_output={
+            "findings": [
+                {"severity": "high", "title": "Missing auth check"},
+                {"severity": "low", "title": "Verbose logging"},
+            ]
+        },
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "actionable"
+    assert summary["evidence"][1]["value"] == "1"
+    assert summary["highlights"][0]["label"] == "Missing auth check"
+
+
+def test_summary_findings_clean_when_no_actionable():
+    task = _make_task(
+        "perf",
+        plan_output={"findings": [{"severity": "low", "title": "minor"}]},
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary["verdict"] == "clean"
+
+
+def test_summary_unregistered_type_falls_through_to_findings():
+    # A type with no dedicated builder still gets a summary via the shared
+    # findings fallback when its plan_output carries findings — no new branch.
+    task = _make_task(
+        "release_audit",
+        plan_output={"findings": [{"severity": "critical", "title": "boom"}]},
+    )
+    summary = build_task_evaluation_summary(task)
+    assert summary is not None
+    assert summary["verdict"] == "actionable"
+
+
+def test_summary_type_without_findings_is_none():
+    task = _make_task("plan", plan_output={"notes": "nothing structured"})
+    assert build_task_evaluation_summary(task) is None
 
 
 if __name__ == "__main__":

@@ -69,7 +69,14 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, main, type SecretManifest, type FailureCategory } from './index.js';
+import {
+  __resetTaskCapabilityContractForTesting,
+  isReadOnlyTaskType,
+  loadTaskCapabilityContract,
+  type TaskCapabilityContract,
+} from './taskCapabilities.js';
+import { buildFixtureCapabilityContract } from './testSetup.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -5132,5 +5139,74 @@ describe('codexStreamHasTurnCompleted', () => {
     const stream =
       '{"type":"item.completed","item":{"type":"agent_message","text":"the turn.completed event was missing"}}\n';
     expect(codexStreamHasTurnCompleted(stream)).toBe(false);
+  });
+});
+
+// ── Task-capability contract load (runs before handler dispatch) ──────────────
+// runRoleOnce fetches + loads the published contract after the github-token
+// fetch and before dispatching to a handler, so isReadOnlyTaskType (used by
+// configureAgentPermissions) resolves against backend metadata. These cases
+// exercise the load helper directly (the fetcher is injectable for tests).
+describe('ensureTaskCapabilityContractLoaded', () => {
+  beforeEach(() => {
+    __resetTaskCapabilityContractLoadedForTesting();
+    __resetTaskCapabilityContractForTesting();
+  });
+
+  afterEach(() => {
+    // Restore the canonical fixture so other suites in this file keep a loaded
+    // contract (testSetup seeded it at top-level / beforeAll).
+    __resetTaskCapabilityContractForTesting();
+    loadTaskCapabilityContract(buildFixtureCapabilityContract());
+  });
+
+  it('fetches and loads the contract, enabling permission classification', async () => {
+    let fetched = 0;
+    const fetcher = (): Promise<TaskCapabilityContract> => {
+      fetched += 1;
+      return Promise.resolve(buildFixtureCapabilityContract());
+    };
+
+    await ensureTaskCapabilityContractLoaded(fetcher);
+
+    expect(fetched).toBe(1);
+    // After load, the partition resolves instead of throwing.
+    expect(isReadOnlyTaskType('review')).toBe(true);
+    expect(isReadOnlyTaskType('create')).toBe(false);
+  });
+
+  it('is idempotent — a second call does not re-fetch', async () => {
+    let fetched = 0;
+    const fetcher = (): Promise<TaskCapabilityContract> => {
+      fetched += 1;
+      return Promise.resolve(buildFixtureCapabilityContract());
+    };
+
+    await ensureTaskCapabilityContractLoaded(fetcher);
+    await ensureTaskCapabilityContractLoaded(fetcher);
+
+    expect(fetched).toBe(1);
+  });
+
+  it('throws (fails the role) when the contract is incomplete', async () => {
+    const fetcher = (): Promise<TaskCapabilityContract> => {
+      const incomplete = buildFixtureCapabilityContract();
+      delete incomplete.migrate;
+      return Promise.resolve(incomplete);
+    };
+
+    await expect(ensureTaskCapabilityContractLoaded(fetcher)).rejects.toThrow(/migrate/);
+    // The guard did not flip — classification still throws, so a follow-up
+    // attempt would retry the fetch rather than run with no contract.
+    expect(() => isReadOnlyTaskType('create')).toThrow(/not loaded/);
+  });
+
+  it('rejects an empty contract map (no task types covered)', async () => {
+    // The fetch wrapper guards a missing key; loadTaskCapabilityContract guards
+    // an empty/partial map. An empty object reaches the completeness check and
+    // surfaces an explicit error rather than silently classifying nothing.
+    const fetcher = (): Promise<TaskCapabilityContract> =>
+      Promise.resolve({} as TaskCapabilityContract);
+    await expect(ensureTaskCapabilityContractLoaded(fetcher)).rejects.toThrow(/does not cover/);
   });
 });

@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useRef } from 'react';
 import { usePersistedState } from './usePersistedState';
 import { FILTER_TASK_TYPE_IDS } from '../taskCapabilities';
 import { STATUS_OPTIONS } from '../constants';
@@ -16,10 +17,8 @@ export const FAILURE_CLASSES: FailureClass[] = Object.keys(FAILURE_CLASS_CONFIG)
 
 const DATE_RANGES: DateRange[] = ['all', '1h', '6h', '24h', '7d'];
 const STATUS_VALUES = STATUS_OPTIONS.map(o => o.value);
-const TASK_TYPE_VALUES = FILTER_TASK_TYPE_IDS as readonly string[];
 
 const DEFAULT_STATUS_FILTER: string[] = [...STATUS_VALUES];
-const DEFAULT_TASK_TYPE_FILTER: string[] = [...FILTER_TASK_TYPE_IDS];
 
 // Keep only values present in `valid`, preserving a legitimately-empty selection.
 // Falls back to `fallback` when the stored value is not an array at all.
@@ -29,13 +28,24 @@ function sanitizeStringArray(parsed: unknown, valid: readonly string[], fallback
   return parsed.filter((v): v is string => typeof v === 'string' && allowed.has(v));
 }
 
-export function useSearchFilters() {
+function sameSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const setB = new Set(b);
+  return a.every(v => setB.has(v));
+}
+
+export function useSearchFilters(taskTypeValues: readonly string[] = FILTER_TASK_TYPE_IDS) {
+  const validTaskTypes = useMemo(
+    () => (taskTypeValues.length > 0 ? taskTypeValues : FILTER_TASK_TYPE_IDS),
+    [taskTypeValues],
+  );
+  const defaultTaskTypeFilter = useMemo(() => [...validTaskTypes], [validTaskTypes]);
   const [searchQuery, setSearchQuery] = usePersistedState<string>(
     'filter:searchQuery', '', parsed => (typeof parsed === 'string' ? parsed : ''),
   );
   const [taskTypeFilter, setTaskTypeFilter] = usePersistedState<string[]>(
-    'filter:taskType', DEFAULT_TASK_TYPE_FILTER,
-    parsed => sanitizeStringArray(parsed, TASK_TYPE_VALUES, DEFAULT_TASK_TYPE_FILTER),
+    'filter:taskType', defaultTaskTypeFilter,
+    parsed => sanitizeStringArray(parsed, validTaskTypes, defaultTaskTypeFilter),
   );
   const [statusFilter, setStatusFilter] = usePersistedState<string[]>(
     'filter:status', DEFAULT_STATUS_FILTER,
@@ -65,6 +75,19 @@ export function useSearchFilters() {
     'filter:failureClass', [],
     parsed => sanitizeStringArray(parsed, FAILURE_CLASSES, []),
   );
+  const previousValidTaskTypesRef = useRef<string[]>(defaultTaskTypeFilter);
+
+  useEffect(() => {
+    setTaskTypeFilter(prev => {
+      const priorValidTaskTypes = previousValidTaskTypesRef.current;
+      previousValidTaskTypesRef.current = defaultTaskTypeFilter;
+
+      const sanitized = prev.filter(type => validTaskTypes.includes(type));
+      if (sameSet(prev, priorValidTaskTypes)) return defaultTaskTypeFilter;
+      if (sameSet(sanitized, prev)) return prev;
+      return sanitized;
+    });
+  }, [defaultTaskTypeFilter, setTaskTypeFilter, validTaskTypes]);
 
   return { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter };
 }

@@ -5,6 +5,7 @@ import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
+import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvider } from './taskCapabilities';
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 import { DirectionsPanel } from './components/DirectionsPanel';
 import TaskStreamPanel from './components/TaskStreamPanel';
@@ -52,7 +53,6 @@ import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPa
 import { PlaybookPanel } from './components/PlaybookPanel';
 import { TaskTypeCatalogPanel } from './components/TaskTypeCatalogPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
-import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
 import { parseTimestamp } from './utils/time';
 
 const COLUMNS: KanbanColumn[] = [
@@ -100,6 +100,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
+  const resolvedTaskCapabilities = useMemo(
+    () => resolveTaskCapabilities(s.taskCapabilityContract),
+    [s.taskCapabilityContract],
+  );
+  const filterTaskTypeIds = resolvedTaskCapabilities.filterIds;
 
   // Snapshot of the full task-board filter combination + sort, fed to the saved-views
   // switcher so it can detect "modified" state and capture new views.
@@ -439,8 +444,7 @@ export default function App() {
     const cutoff = s.dateRange !== 'all' ? now - dateRangeCutoffs[s.dateRange] : null;
     return s.tasks.filter(t => {
       const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
-      const knownTypes: readonly string[] = FILTER_TASK_TYPE_IDS;
-      const typeMatch = s.taskTypeFilter.includes(taskType) || (!knownTypes.includes(taskType) && s.taskTypeFilter.length === knownTypes.length);
+      const typeMatch = matchesTaskTypeFilter(taskType, s.taskTypeFilter, filterTaskTypeIds);
       const statusMatch = s.statusFilter.includes(t.status);
       const query = s.searchQuery.toLowerCase();
       const searchMatch = !query || t.id.toLowerCase().includes(query) || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query)) || (t.latest_status_message?.toLowerCase().includes(query));
@@ -455,7 +459,7 @@ export default function App() {
       return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && failureClassMatch && stuckMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter, filterTaskTypeIds]);
 
   const orderedExportTasks = useMemo(() => {
     if (s.viewMode !== 'kanban') return filteredTasks;
@@ -526,6 +530,7 @@ export default function App() {
 
   return (
     <ErrorBoundary>
+    <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
     <div className="flex flex-col bg-neutral-950 text-neutral-200 font-sans p-3 md:p-6 min-h-screen md:h-screen md:overflow-hidden">
       {s.refreshing && (
         <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
@@ -1311,6 +1316,7 @@ export default function App() {
         />
       )}
     </div>
+    </TaskCapabilitiesProvider>
     </ErrorBoundary>
   );
 }

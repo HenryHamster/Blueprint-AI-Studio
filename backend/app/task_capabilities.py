@@ -163,6 +163,19 @@ class TaskCapability:
     # dimension — intentionally distinct from agent_mode and WRITE_TASK_TYPES.
     # See PRODUCT_TASK_TYPES below for the derived single source of truth.
     delivers_product: bool = False
+    # Whether an operator may reserve pipeline slots for this task type via the
+    # `reserved_slots_for_types` settings map. This is the SINGLE source of truth
+    # for reserved-slot eligibility — the PATCH validator derives its allowlist
+    # from RESERVABLE_TASK_TYPES rather than hardcoding a tuple, so a newly
+    # registered reservable type is accepted automatically.
+    reservable: bool = False
+    # Whether this task type can be scheduled as an autonomous periodic task via
+    # the `autonomous_periodic_tasks` settings map. SINGLE source of truth for
+    # periodic eligibility — see PERIODIC_TASK_TYPES.
+    periodic_eligible: bool = False
+    # Short presentation badge for compact operator surfaces (task cards, filter
+    # chips). Defaults to ``label`` when unset via the published contract.
+    badge: str | None = None
     # HOW this task type runs (its execution shape). Defaults to "single_agent"
     # so a newly-registered terminal type needs no edit; the PR-producing code
     # types declare "workflow" (the create→review→fix pipeline) explicitly.
@@ -179,6 +192,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         default_category="build",
         user_launchable=True,
         delivers_product=True,
+        reservable=True,
         description="Implement new functionality and open a PR.",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
@@ -218,6 +232,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         user_launchable=True,
+        reservable=True,
         description="Decompose work into subtasks.",
         output_kind="knowledge",
         evaluation_strategy="review_only",
@@ -231,6 +246,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "read_only",
         default_category="strategic",
         user_launchable=True,
+        reservable=True,
         description="Analyze the codebase and produce findings.",
         output_kind="knowledge",
         requires_web=True,
@@ -272,6 +288,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Security Audit",
         "read_only",
         default_category="review",
+        periodic_eligible=True,
         description="Audit for security risks without changing code.",
         output_kind="knowledge",
         evaluation_strategy="review_only",
@@ -284,6 +301,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "QA",
         "write",
         default_category="review",
+        periodic_eligible=True,
         description="Add or improve test coverage.",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
@@ -296,6 +314,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Deps",
         "write",
         default_category="ops",
+        periodic_eligible=True,
         description="Update dependencies and verify compatibility.",
         output_kind="pr",
         evaluation_strategy="ci_and_review",
@@ -560,6 +579,21 @@ PROVIDER_CONFIGURABLE_TASK_TYPES: tuple[str, ...] = tuple(
 FILTER_VISIBLE_TASK_TYPES: tuple[str, ...] = tuple(
     capability.id.value for capability in TASK_CAPABILITIES if capability.filter_visible
 )
+# Canonical registry of task types an operator may reserve pipeline slots for
+# (the `reserved_slots_for_types` settings map). SINGLE source of truth for that
+# settings surface's allowlist — the PATCH validator derives from this set so a
+# newly registered reservable type is honored without editing the validator.
+RESERVABLE_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value for capability in TASK_CAPABILITIES if capability.reservable
+)
+# Canonical registry of task types eligible for autonomous periodic scheduling
+# (the `autonomous_periodic_tasks` settings map). SINGLE source of truth for that
+# settings surface's allowlist.
+PERIODIC_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.periodic_eligible
+)
 # Map of task-type value -> declared completion-handler logical name, derived
 # from the registry. This REPLACES the hand-maintained if/elif completion
 # cascade in task_lifecycle._process_post_commit: that module binds each
@@ -640,6 +674,49 @@ def get_task_capability(task_type: str | TaskType) -> TaskCapability | None:
     """Return metadata for a known task type, or None for future/unknown types."""
     value = task_type.value if isinstance(task_type, TaskType) else task_type
     return TASK_CAPABILITY_BY_VALUE.get(value)
+
+
+def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
+    """Flatten one capability into a JSON-serializable contract entry."""
+    return {
+        "type": capability.id.value,
+        "label": capability.label,
+        # ``badge`` falls back to ``label`` so every entry has a renderable
+        # compact tag without each surface re-deriving the default.
+        "badge": capability.badge or capability.label,
+        "agent_mode": capability.agent_mode,
+        "default_category": capability.default_category,
+        "description": capability.description,
+        "user_launchable": capability.user_launchable,
+        "provider_configurable": capability.provider_configurable,
+        "filter_visible": capability.filter_visible,
+        "delivers_product": capability.delivers_product,
+        "reservable": capability.reservable,
+        "periodic_eligible": capability.periodic_eligible,
+        "run_shape": capability.run_shape,
+        "output_kind": capability.output_kind,
+        "requires_code": capability.requires_code,
+        "requires_web": capability.requires_web,
+        "requires_compute": capability.requires_compute,
+    }
+
+
+def task_capability_contract() -> dict[str, dict[str, object]]:
+    """Return the published task-capability contract.
+
+    This is the authoritative, backend-owned metadata map that operator and
+    agent surfaces consume instead of maintaining private task-type tables. One
+    entry per registered task type, keyed by the task-type value, declaring its
+    presentation (label/badge), run-shape (agent_mode), and the capability flags
+    that gate where it may be used (launchability, provider configurability,
+    filter visibility, reserved-slot eligibility, periodic eligibility). A newly
+    registered task type flows through here — and through the settings validators
+    that derive from the same registry — with no per-surface allowlist edits.
+    """
+    return {
+        capability.id.value: _capability_to_contract(capability)
+        for capability in TASK_CAPABILITIES
+    }
 
 
 def agent_capability_slice(task_type: str | TaskType) -> dict | None:

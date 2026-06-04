@@ -80,7 +80,7 @@ import {
   assembleFailureGuidanceBlocks,
   type FixAttempt,
 } from './prompt.js';
-import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
+import { getReadOnlyTaskTypes, getWriteTaskTypes } from './taskCapabilities.js';
 import { handlers } from './handlers/index.js';
 
 // ── formatPlaybook ────────────────────────────────────────────────────────────
@@ -2126,7 +2126,7 @@ describe('configureAgentPermissions', () => {
     vi.clearAllMocks();
   });
 
-  it.each(READ_ONLY_TASK_TYPES)(
+  it.each(getReadOnlyTaskTypes())(
     'returns [Write, Edit, NotebookEdit] for read-only type "%s"',
     (taskType) => {
       const result = configureAgentPermissions(taskType);
@@ -2134,7 +2134,7 @@ describe('configureAgentPermissions', () => {
     },
   );
 
-  it.each(WRITE_TASK_TYPES)(
+  it.each(getWriteTaskTypes())(
     'returns [] (no restrictions) for write type "%s"',
     (taskType) => {
       const result = configureAgentPermissions(taskType);

@@ -8,11 +8,10 @@ import type {
   TaskTypeRoutingEntry,
 } from '../types/settings';
 import { EFFORT_LEVELS } from '../types/settings';
-import { PROVIDER_ROUTABLE_TASK_TYPE_IDS } from '../taskCapabilities';
+import { useTaskCapabilities } from '../taskCapabilities';
 
 const DEFAULT_CATEGORY_KEY = '_default';
 type SelectionMode = 'balanced' | 'preferred' | 'exclusive';
-const ALL_TASK_TYPES = [...PROVIDER_ROUTABLE_TASK_TYPE_IDS];
 
 const MODE_DESCRIPTIONS: Record<SelectionMode, string> = {
   balanced: 'Pool accounts across listed providers; pick by health + current load. Adding an account immediately puts it into rotation.',
@@ -43,6 +42,8 @@ export function ProviderCategoriesPanel({
   taskTypeRouting,
   onUpdateTaskTypeRouting,
 }: Props) {
+  const { providerRoutableIds } = useTaskCapabilities();
+  const allTaskTypes = providerRoutableIds;
   const providerNames = Object.keys(providers) as ProviderName[];
   const [newCategoryName, setNewCategoryName] = useState('');
 
@@ -54,8 +55,8 @@ export function ProviderCategoriesPanel({
     Object.values(taskTypeCategories).forEach(members => {
       if (Array.isArray(members)) members.forEach(m => claimed.add(m));
     });
-    return ALL_TASK_TYPES.filter(t => !claimed.has(t));
-  }, [taskTypeCategories]);
+    return allTaskTypes.filter(t => !claimed.has(t));
+  }, [taskTypeCategories, allTaskTypes]);
 
   const defaultEntry: CategoryRoutingEntry = categoryRouting[DEFAULT_CATEGORY_KEY] ?? {
     providers: providerNames,
@@ -158,7 +159,7 @@ export function ProviderCategoriesPanel({
         name={DEFAULT_CATEGORY_KEY}
         isDefault
         members={[]}
-        allTaskTypes={[...PROVIDER_ROUTABLE_TASK_TYPE_IDS]}
+        allTaskTypes={allTaskTypes}
         taskTypeCategories={taskTypeCategories}
         providerNames={providerNames}
         entry={defaultEntry}
@@ -201,7 +202,7 @@ export function ProviderCategoriesPanel({
               key={category}
               name={category}
               members={members || []}
-              allTaskTypes={[...PROVIDER_ROUTABLE_TASK_TYPE_IDS]}
+              allTaskTypes={allTaskTypes}
               taskTypeCategories={taskTypeCategories}
               providerNames={providerNames}
               entry={categoryRouting[category] ?? { providers: defaultEntry.providers, effort: defaultEntry.effort }}
@@ -231,6 +232,7 @@ export function ProviderCategoriesPanel({
         </div>
         <TaskOverrideTable
           providerNames={providerNames}
+          allTaskTypes={allTaskTypes}
           overrides={taskTypeRouting}
           onSet={setTaskOverride}
         />
@@ -423,16 +425,18 @@ function CategoryCard({
 
 function TaskOverrideTable({
   providerNames,
+  allTaskTypes,
   overrides,
   onSet,
 }: {
   providerNames: ProviderName[];
+  allTaskTypes: string[];
   overrides: Record<string, TaskTypeRoutingEntry>;
   onSet: (taskType: string, entry: TaskTypeRoutingEntry | null) => void;
 }) {
   const [newType, setNewType] = useState<string>('');
   const entries = Object.entries(overrides);
-  const eligibleToAdd = ALL_TASK_TYPES.filter(t => !(t in overrides));
+  const eligibleToAdd = allTaskTypes.filter(t => !(t in overrides));
 
   return (
     <div className="border border-neutral-800 rounded bg-neutral-900/30 divide-y divide-neutral-800">

@@ -2317,6 +2317,184 @@ async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_generalized_metrics_in_list_use_lifetime_and_legacy_fallback(
+    client: AsyncClient, db_session, mocker
+):
+    """GET directions exposes additive generalized metrics across history + aggregate."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction with evals")
+    direction_id = direction["id"]
+
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [
+                {"prs_merged": 1},
+                {
+                    "generalized_successes": 3,
+                    "tasks_completed": 3,
+                    "outcome_kind_breakdown": {
+                        "research_quality": {
+                            "success": 3,
+                            "neutral": 0,
+                            "failure": 0,
+                        }
+                    },
+                },
+            ]
+            d["history_aggregate"] = {
+                "total_generalized_successes": 2,
+                "total_generalized_terminal_outcomes": 4,
+                "outcome_kind_breakdown": {
+                    "audit_findings": {"success": 1, "neutral": 0, "failure": 1}
+                },
+            }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+
+    assert target["generalized_successes"] == 6
+    assert target["generalized_health_rate"] == 0.75
+    assert target["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 1, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 3, "neutral": 0, "failure": 0},
+        "audit_findings": {"success": 1, "neutral": 0, "failure": 1},
+        "read_only_unclassified": {"success": 1, "neutral": 1, "failure": 0},
+    }
+
+
+@pytest.mark.asyncio
+async def test_generalized_metrics_in_list_merge_legacy_aggregate_breakdown(
+    client: AsyncClient, db_session, mocker
+):
+    """Legacy aggregate merge counts still appear in the breakdown beside live typed outcomes."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Direction with legacy agg")
+    direction_id = direction["id"]
+
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [
+                {
+                    "generalized_successes": 3,
+                    "tasks_completed": 3,
+                    "outcome_kind_breakdown": {
+                        "research_quality": {
+                            "success": 3,
+                            "neutral": 0,
+                            "failure": 0,
+                        }
+                    },
+                }
+            ]
+            d["history_aggregate"] = {
+                "total_prs_merged": 2,
+                "total_tasks_completed": 2,
+                "total_tasks_failed": 1,
+            }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+
+    assert target["generalized_successes"] == 5
+    assert target["generalized_health_rate"] == round(5 / 6, 3)
+    assert target["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 3, "neutral": 0, "failure": 0},
+        "read_only_unclassified": {"success": 0, "neutral": 1, "failure": 0},
+    }
+
+
+@pytest.mark.asyncio
+async def test_generalized_metrics_in_list_backfills_sparse_aggregate_breakdown(
+    client: AsyncClient, db_session, mocker
+):
+    """Aggregate generalized totals without typed buckets stay visible in the breakdown."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(
+        client, project_id, text="Direction with sparse aggregate evals"
+    )
+    direction_id = direction["id"]
+
+    from app.models import Project as ProjectModel
+    from sqlmodel import select as sa_select
+
+    result = await db_session.execute(
+        sa_select(ProjectModel).where(ProjectModel.id == uuid.UUID(project_id))
+    )
+    project = result.scalars().first()
+    updated_directions = list(project.directions or [])
+    for d in updated_directions:
+        if d["id"] == direction_id:
+            d["research_history"] = [
+                {
+                    "generalized_successes": 1,
+                    "tasks_completed": 1,
+                    "outcome_kind_breakdown": {
+                        "memo_artifact": {
+                            "success": 1,
+                            "neutral": 0,
+                            "failure": 0,
+                        }
+                    },
+                }
+            ]
+            d["history_aggregate"] = {
+                "total_generalized_successes": 4,
+                "total_generalized_terminal_outcomes": 6,
+            }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.directions = updated_directions
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    dirs = resp.json()["directions"]
+    target = next(d for d in dirs if d["id"] == direction_id)
+
+    assert target["generalized_successes"] == 5
+    assert target["generalized_health_rate"] == round(5 / 7, 3)
+    assert target["outcome_kind_breakdown"] == {
+        "memo_artifact": {"success": 1, "neutral": 0, "failure": 0},
+        "read_only_unclassified": {"success": 4, "neutral": 2, "failure": 0},
+    }
+
+
+@pytest.mark.asyncio
 async def test_completion_criteria_stored(client: AsyncClient, mocker):
     """POST direction with completion_criteria stores and returns it."""
     project_id = await _deploy_project(client, mocker)

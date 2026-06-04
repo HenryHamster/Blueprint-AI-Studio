@@ -60,6 +60,16 @@ const RICH_DIRECTION: DirectionProgress = {
   lifetime_tasks_failed: 3,
   lifetime_conversion_rate: 0.75,
   review_quality: { reviews_dismissed: 1, reviews_overridden: 0, user_issues_caught: 2 },
+  // Generalized cross-type success — exercises the dual-metric badge (collapsed)
+  // and the "outcomes:" breakdown row (expanded) in the dense layout.
+  generalized_successes: 11,
+  generalized_terminal_outcomes: 15,
+  generalized_health_rate: 0.733,
+  outcome_kind_breakdown: {
+    code_merge: { success: 8, neutral: 0, failure: 2 },
+    research_quality: { success: 2, neutral: 1, failure: 0 },
+    audit_findings: { success: 1, neutral: 0, failure: 0 },
+  },
 };
 
 describe('DirectionProgressSection — viewport regression', () => {

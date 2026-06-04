@@ -449,6 +449,26 @@ from app.github_token_resolver import (  # noqa: F401,E402
 # ---------------------------------------------------------------------------
 
 
+@router.get("/task-capabilities")
+@limiter.limit("120/minute")
+async def agent_task_capabilities(
+    request: Request,
+    token: dict = Depends(verify_agent_token),
+):
+    """Publish the authoritative task-capability contract to the agent VM.
+
+    Mirrors the operator-facing GET /api/admin/task-capabilities (which is
+    Bearer/Firebase-authed and therefore unreachable with the agent's
+    ``X-Agent-Token`` JWT). The agent consumes this contract to derive its
+    known task types and read_only/write permission partitioning from the
+    single backend-owned registry instead of a hand-maintained agent table,
+    so adding a backend task type does not require an agent-side edit.
+    """
+    from app.task_capabilities import task_capability_contract
+
+    return {"task_capabilities": task_capability_contract()}
+
+
 @router.post("/refresh-token")
 @limiter.limit("120/minute")
 async def agent_refresh_token(

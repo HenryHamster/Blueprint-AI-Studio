@@ -3506,6 +3506,73 @@ def test_fold_evicted_attribution_accumulates_on_prior_agg():
     assert agg["total_operator_actions"] == 2  # 1 + 1
 
 
+def test_fold_evicted_generalized_fields_survive_eviction():
+    """Generalized successes and outcome-kind counts persist in history_aggregate."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    evicted = [
+        {
+            "timestamp": "2025-01-01T00:00:00",
+            "prs_merged": 2,
+        },
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "generalized_successes": 3,
+            "tasks_completed": 3,
+            "tasks_failed": 1,
+            "outcome_kind_breakdown": {
+                "research_quality": {"success": 3, "neutral": 0, "failure": 1}
+            },
+        },
+    ]
+
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_generalized_successes"] == 5
+    assert agg["total_generalized_terminal_outcomes"] == 6
+    assert agg["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 3, "neutral": 0, "failure": 1},
+    }
+
+
+def test_fold_evicted_generalized_fields_backfill_legacy_aggregate():
+    """Legacy aggregates are upgraded before new evictions are added."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    prior = {
+        "total_cycles": 3,
+        "total_prs_merged": 4,
+        "total_tasks_completed": 5,
+        "total_tasks_failed": 1,
+    }
+    evicted = [
+        {
+            "timestamp": "2025-03-01T00:00:00",
+            "generalized_successes": 2,
+            "tasks_completed": 2,
+            "outcome_kind_breakdown": {
+                "research_quality": {"success": 2, "neutral": 0, "failure": 0}
+            },
+        }
+    ]
+
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    assert agg["total_generalized_successes"] == 6
+    assert agg["total_generalized_terminal_outcomes"] == 8
+    # The legacy prior records 6 terminal task outcomes (5 completed + 1 failed)
+    # but only 4 are attributable to a kind (code_merge, from prs_merged). The
+    # backfill reconciles the breakdown with the terminal total by parking the 2
+    # unattributable outcomes under read_only_unclassified, so the breakdown sums
+    # to the asserted total_generalized_terminal_outcomes (4 + 2 + 2 == 8).
+    assert agg["outcome_kind_breakdown"] == {
+        "code_merge": {"success": 4, "neutral": 0, "failure": 0},
+        "research_quality": {"success": 2, "neutral": 0, "failure": 0},
+        "read_only_unclassified": {"success": 0, "neutral": 2, "failure": 0},
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # compute_direction_autonomy_state
 # ─────────────────────────────────────────────────────────────────────────────

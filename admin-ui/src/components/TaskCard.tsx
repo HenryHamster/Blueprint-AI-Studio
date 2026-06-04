@@ -4,6 +4,7 @@ import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Termin
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
+import { useTaskCapabilities } from '../taskCapabilities';
 import type { FixLoopSummary } from '../types/task';
 
 /** Format seconds as compact "30s", "5m", "1h" for HB age / queue wait labels. */
@@ -314,17 +315,22 @@ export function getHeartbeatStatus(lastHeartbeat?: string) {
 }
 
 export function TaskTypeBadge({ taskType, expanded }: { taskType?: TaskType; expanded?: boolean }) {
+  // Label derives from the published capability contract (so a newly registered
+  // type renders its real label, not the raw id); icon + color stay UI-local
+  // since they are presentation the backend contract does not carry.
+  const { getLabel } = useTaskCapabilities();
   if (!taskType) return null;
   const style = TASK_TYPE_STYLES[taskType] ?? { bg: 'bg-neutral-500/10 border-neutral-500/20', text: 'text-neutral-400', icon: Hash, label: taskType };
   const Icon = style.icon;
+  const label = getLabel(taskType);
   return (
     <span
       className={`group/badge ${style.bg} ${style.text} border text-[10px] uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-0 hover:gap-1 p-1 hover:px-2 hover:py-0.5 transition-all duration-150 ${expanded ? 'gap-1 px-2 py-0.5' : ''}`}
-      title={style.label}
+      title={label}
     >
       <Icon className="w-3 h-3 shrink-0" />
       <span data-viewport-allow-truncation className={`max-w-0 overflow-hidden group-hover/badge:max-w-[80px] transition-all duration-150 ${expanded ? 'max-w-[80px]' : ''}`}>
-        {style.label}
+        {label}
       </span>
     </span>
   );

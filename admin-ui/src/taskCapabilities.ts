@@ -1,3 +1,7 @@
+import { createContext, createElement, useContext, useMemo } from 'react';
+import type { ReactNode } from 'react';
+import type { TaskCapabilityContract, TaskCapabilityContractEntry } from './types/settings';
+
 export const TASK_CAPABILITIES = [
   {
     id: 'create',
@@ -249,4 +253,152 @@ export function getTaskCapability(taskType: string): TaskCapability | undefined 
 
 export function getTaskTypeLabel(taskType: string): string {
   return getTaskCapability(taskType)?.label ?? taskType;
+}
+
+// ─── Backend-published-contract resolution ─────────────────────────────────
+//
+// The operator UI consumes the backend's published task-capability contract
+// (the `task_capabilities` map in GET /settings) so newly registered task
+// types surface automatically without editing this file. The static table
+// above is the *compatibility fallback*: it seeds the resolved capabilities
+// when talking to an older backend that does not yet publish the contract, and
+// it supplies the UI-only synthetic entries (e.g. `rollup`) the backend never
+// publishes. There is intentionally NO second backend registry here — the
+// fallback is the same table that already drives the legacy exports.
+
+// A capability normalized into the shape every operator surface consumes,
+// regardless of whether it came from the published contract or the fallback.
+export interface ResolvedCapability {
+  id: string;
+  label: string;
+  badge: string;
+  description: string;
+  userLaunchable: boolean;
+  providerConfigurable: boolean;
+  filterVisible: boolean;
+  reservable: boolean;
+  synthetic: boolean;
+}
+
+export interface ResolvedTaskCapabilities {
+  all: ResolvedCapability[];
+  byId: Record<string, ResolvedCapability>;
+  filterIds: string[];
+  userLaunchableOptions: { value: string; label: string; description: string }[];
+  providerRoutableIds: string[];
+  providerRoutableOptions: { value: string; label: string }[];
+  filterOptions: { value: string; label: string }[];
+  reservableIds: string[];
+  getCapability: (id: string) => ResolvedCapability | undefined;
+  getLabel: (id: string) => string;
+}
+
+// Reservable task types in the fallback (older-backend) path. Mirrors the
+// backend RESERVABLE_TASK_TYPES set; only consulted when the published
+// contract is absent, since the contract carries `reservable` per entry.
+const FALLBACK_RESERVABLE_IDS = new Set<string>(['create', 'plan', 'research']);
+
+const STATIC_RESOLVED: ResolvedCapability[] = TASK_CAPABILITIES.map(capability => ({
+  id: capability.id,
+  label: capability.label,
+  badge: capability.label,
+  description: capability.description,
+  userLaunchable: capability.userLaunchable,
+  providerConfigurable: capability.providerConfigurable,
+  filterVisible: capability.filterVisible,
+  reservable: FALLBACK_RESERVABLE_IDS.has(capability.id),
+  synthetic: capability.synthetic,
+}));
+
+function normalizePublished(entry: TaskCapabilityContractEntry): ResolvedCapability {
+  const label = entry.label ?? entry.type;
+  return {
+    id: entry.type,
+    label,
+    badge: entry.badge ?? label,
+    description: entry.description ?? '',
+    userLaunchable: entry.user_launchable ?? false,
+    providerConfigurable: entry.provider_configurable ?? false,
+    filterVisible: entry.filter_visible ?? false,
+    reservable: entry.reservable ?? false,
+    // The backend registry has no notion of synthetic UI-only types; anything
+    // it publishes is a real, backend-backed task type.
+    synthetic: false,
+  };
+}
+
+function buildResolved(caps: ResolvedCapability[]): ResolvedTaskCapabilities {
+  const byId: Record<string, ResolvedCapability> = {};
+  for (const cap of caps) byId[cap.id] = cap;
+  const getCapability = (id: string) => byId[id];
+  const filterCaps = caps.filter(c => c.filterVisible);
+  return {
+    all: caps,
+    byId,
+    filterIds: filterCaps.map(c => c.id),
+    userLaunchableOptions: caps
+      .filter(c => c.userLaunchable && !c.synthetic)
+      .map(c => ({ value: c.id, label: c.label, description: c.description })),
+    providerRoutableIds: caps
+      .filter(c => c.providerConfigurable && !c.synthetic)
+      .map(c => c.id),
+    providerRoutableOptions: caps
+      .filter(c => c.providerConfigurable && !c.synthetic)
+      .map(c => ({ value: c.id, label: c.label })),
+    filterOptions: filterCaps.map(c => ({ value: c.id, label: c.label })),
+    reservableIds: caps.filter(c => c.reservable && !c.synthetic).map(c => c.id),
+    getCapability,
+    getLabel: (id: string) => getCapability(id)?.label ?? id,
+  };
+}
+
+export function matchesTaskTypeFilter(
+  taskType: string,
+  selectedTaskTypes: readonly string[],
+  knownTaskTypes: readonly string[],
+): boolean {
+  if (selectedTaskTypes.includes(taskType)) return true;
+  if (selectedTaskTypes.length !== knownTaskTypes.length) return false;
+  return !knownTaskTypes.includes(taskType);
+}
+
+// Resolve the capability set the UI should render. When the backend publishes a
+// non-empty contract we use it as the source of truth and overlay only the
+// UI-only synthetic entries (rollup) it never publishes; otherwise we fall back
+// to the built-in static table (fail closed to known behavior).
+export function resolveTaskCapabilities(
+  published?: TaskCapabilityContract | null,
+): ResolvedTaskCapabilities {
+  if (published && Object.keys(published).length > 0) {
+    const publishedCaps = Object.values(published).map(normalizePublished);
+    const publishedIds = new Set(publishedCaps.map(c => c.id));
+    const syntheticUi = STATIC_RESOLVED.filter(c => c.synthetic && !publishedIds.has(c.id));
+    return buildResolved([...publishedCaps, ...syntheticUi]);
+  }
+  return buildResolved(STATIC_RESOLVED);
+}
+
+// Resolved fallback computed once; also the default context value so consumers
+// rendered without a provider (and unit tests) keep working unchanged.
+export const FALLBACK_RESOLVED_TASK_CAPABILITIES = resolveTaskCapabilities();
+
+const TaskCapabilitiesContext = createContext<ResolvedTaskCapabilities>(
+  FALLBACK_RESOLVED_TASK_CAPABILITIES,
+);
+
+export function TaskCapabilitiesProvider({
+  contract,
+  children,
+}: {
+  contract: TaskCapabilityContract | null | undefined;
+  children: ReactNode;
+}) {
+  const value = useMemo(() => resolveTaskCapabilities(contract), [contract]);
+  return createElement(TaskCapabilitiesContext.Provider, { value }, children);
+}
+
+// Hook every operator surface uses to read the resolved, contract-driven
+// capability set. Returns the fallback when no provider is mounted.
+export function useTaskCapabilities(): ResolvedTaskCapabilities {
+  return useContext(TaskCapabilitiesContext);
 }

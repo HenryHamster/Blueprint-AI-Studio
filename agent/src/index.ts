@@ -4,6 +4,10 @@ import fs from 'fs';
 import path from 'path';
 import WebSocket from 'ws';
 import { handlers, resolveHandler } from './handlers/index.js';
+import {
+  loadTaskCapabilityContract,
+  type TaskCapabilityContract,
+} from './taskCapabilities.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
 import {
   startEventLoopLagMonitor, traceHeartbeat, installExitMarkers, recordFinalState,
@@ -905,6 +909,43 @@ function enrichStatusPayload(taskId: string, payload: Record<string, unknown>): 
 
 export async function apiGet(path: string, retries = API_MAX_RETRIES) {
   return apiRequest('GET', path, () => ({ headers: apiHeaders }), retries, API_TIMEOUT);
+}
+
+// ── Task-capability contract (agent permission source of truth) ──────────────
+// The agent derives its read_only/write task partition from the published
+// backend contract (the same registry operator surfaces consume) rather than a
+// hand-maintained agent table. Fetch the contract from the agent-authed
+// endpoint and load it into taskCapabilities once per VM, BEFORE any handler
+// dispatch — so configureAgentPermissions/isReadOnlyTaskType resolve against
+// real backend metadata. A missing or incomplete contract throws, failing the
+// role loudly instead of silently misclassifying permissions.
+
+let _taskCapabilityContractLoaded = false;
+
+export async function fetchTaskCapabilityContract(): Promise<TaskCapabilityContract> {
+  const res = await apiGet('/api/agent/task-capabilities') as { task_capabilities?: TaskCapabilityContract };
+  const contract = res.task_capabilities;
+  if (!contract || typeof contract !== 'object') {
+    throw new Error('GET /api/agent/task-capabilities returned no task_capabilities map');
+  }
+  return contract;
+}
+
+// Idempotent: fetches + loads the contract on first call per VM, then no-ops.
+// The optional fetcher injection point exists for tests; production callers
+// omit it and use the real endpoint fetch.
+export async function ensureTaskCapabilityContractLoaded(
+  fetcher: () => Promise<TaskCapabilityContract> = fetchTaskCapabilityContract,
+): Promise<void> {
+  if (_taskCapabilityContractLoaded) return;
+  const contract = await fetcher();
+  loadTaskCapabilityContract(contract);
+  _taskCapabilityContractLoaded = true;
+}
+
+// Test-only: reset the once-per-VM guard so the load flow can be re-exercised.
+export function __resetTaskCapabilityContractLoadedForTesting(): void {
+  _taskCapabilityContractLoaded = false;
 }
 
 export function log(msg: string) {
@@ -2911,6 +2952,15 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     const ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string; owner: string; repo: string } };
     const { token: ghToken, owner, repo } = ghRes.data;
     log(`GitHub: ${owner}/${repo}`);
+
+    // Load the published task-capability contract before any handler runs. The
+    // agent token is valid here (the github/token fetch above just succeeded
+    // with it), and the guard makes this a once-per-VM cost. configureAgentPermissions
+    // / isReadOnlyTaskType throw until this completes, so a missing or incomplete
+    // contract fails the role loudly here rather than silently mis-granting write
+    // permissions to a read-only task.
+    statusRef.value = 'Loading task-capability contract...';
+    await ensureTaskCapabilityContractLoaded();
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //

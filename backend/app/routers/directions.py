@@ -114,7 +114,10 @@ async def get_directions(
 ):
     from app.shared_state import get_direction_hold_info as _get_direction_hold_info  # noqa: PLC0415
     from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
-    from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+    from app.direction_metrics import (  # noqa: PLC0415
+        _compute_direction_quality_score,
+        _compute_lifetime_generalized_outcome_state,
+    )
     from app.strategic_completion import (
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
@@ -142,6 +145,7 @@ async def get_directions(
         hold_info = _get_direction_hold_info(d.get("id", ""))
         held_at = hold_info["held_at"]
         held_until = hold_info["held_until"]
+        generalized_state = _compute_lifetime_generalized_outcome_state(d)
         raw_churn = _compute_churn_metrics(d)
         churn_metrics = (
             {
@@ -167,6 +171,13 @@ async def get_directions(
                 **d,
                 "merge_rate": _compute_direction_merge_rate(d),
                 "quality_score": round(_compute_direction_quality_score(d), 3),
+                "generalized_successes": generalized_state["generalized_successes"],
+                "generalized_health_rate": generalized_state[
+                    "generalized_health_rate"
+                ],
+                "outcome_kind_breakdown": generalized_state[
+                    "outcome_kind_breakdown"
+                ],
                 "held": bool(hold_info["held"]),
                 "held_reason": hold_info["reason"] if hold_info["held"] else None,
                 "held_at": held_at.isoformat()
