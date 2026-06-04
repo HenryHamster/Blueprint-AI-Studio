@@ -88,6 +88,12 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # broad-except pattern.
 "app/rollup_pr_verification.py" = ["BLE001"]
 "app/rollup_branch_cleanup.py" = ["BLE001"]
+# rollup_migration_validation.py was extracted from rollup_management.py; its
+# except blocks are the same fail-safe "could not fetch/parse the PR's migration
+# files → DEFER, never merge unvalidated" pattern (GitHub API blips while listing
+# PR files / diffs / target migrations). Narrowing risks merging on an unknown
+# migration state — strictly worse than logging and retrying next sweep.
+"app/rollup_migration_validation.py" = ["BLE001"]
 # orchestrator.py is the background provisioning + monitoring loop. Same
 # log-and-continue policy: crash here halts all task dispatch and health monitoring.
 # E402: re-exports symbols extracted to app.orchestrator_health via deferred mid-module

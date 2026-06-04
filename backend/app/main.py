@@ -176,6 +176,52 @@ async def _verify_schema_version():
             raise
 
 
+async def _verify_schema_drift():
+    """Verify the live DB has every table/column the models require.
+
+    Complements _verify_schema_version: the alembic version number can be exactly
+    correct while the actual schema is MISSING objects — a back-merge renumber
+    leaves ``alembic_version`` ahead of the real schema, so the version check
+    passes but a later query hits a column that does not exist (prod incident
+    2026-06-04, a silent multi-hour outage). Failing fast here turns that cryptic
+    ``UndefinedColumnError`` deep in startup into one clear, specific message.
+
+    Defensive: an uninitialized DB (no ``alembic_version``) is left to
+    _verify_schema_version's early return, and a reflection error is logged and
+    skipped rather than crashing boot on an infra hiccup — only a genuine missing
+    object raises. The ``test_no_schema_drift_against_migrated_head`` invariant
+    keeps this from ever false-positiving by asserting models match the migrated
+    schema in CI, so a fatal check here is safe.
+    """
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.deploy_smoketest import reflect_schema_drift
+
+    def _reflect(sync_conn):
+        # Reflect only once the schema is actually migrated; an uninitialized DB
+        # is handled by _verify_schema_version (parity), not flagged as drift.
+        if "alembic_version" not in sa_inspect(sync_conn).get_table_names():
+            return None
+        return reflect_schema_drift(sync_conn)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            connection = await session.connection()
+            drift = await connection.run_sync(_reflect)
+    except Exception as e:
+        logger.warning(f"[STARTUP] could not reflect schema for drift check: {e}")
+        return
+
+    if drift:
+        msg = (
+            "Schema drift — the database is missing objects the code requires "
+            "(the alembic version can be correct while the real schema is short):"
+            "\n  " + "\n  ".join(drift)
+        )
+        logger.error(f"[STARTUP] {msg}")
+        raise RuntimeError(msg)
+
+
 async def _init_deployment_state():
     """Check/initialize deployment state on startup. Detects new deploys and rollbacks."""
     async with AsyncSessionLocal() as session:

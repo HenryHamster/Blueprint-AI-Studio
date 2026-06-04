@@ -4,6 +4,7 @@ import app.github as github
 from app.migration_chain import (
     _filename_revision_prefix,
     build_migration_chain,
+    find_content_divergent_revisions,
     find_filename_revision_mismatches,
     find_heads,
     plan_integration_side_renumber,
@@ -142,7 +143,31 @@ async def _validate_rollup_migration_chain(
             f"validate the combined Alembic chain: {type(e).__name__}: {e}",
         )
     reason = validate_combined_migration_chain(existing_filenames, added_sources)
-    return ("ok", None) if reason is None else ("block", reason)
+    if reason is not None:
+        return ("block", reason)
+
+    # Cross-ref content-divergence guard. The combined-chain check proves the
+    # added migrations don't collide with or dangle off the target's chain by
+    # revision id, but it is blind to a RENUMBER that keeps both checkouts
+    # internally valid while remapping a revision the live DB already applied —
+    # the main<->automain back-merge class (prod incident 2026-06-04). Comparing
+    # the target's existing migrations against the ones this PR adds catches the
+    # tell: the same migration (by filename description) appearing under a
+    # different revision id, or a revision id reused for a different migration.
+    # Uses only data already fetched (no extra I/O), so it can't add a new
+    # fail-safe surface to the shared guard.
+    divergences = find_content_divergent_revisions(
+        existing_filenames, list(added_sources.keys())
+    )
+    if divergences:
+        return (
+            "block",
+            f"Alembic revision-identity divergence between the candidate and "
+            f"target '{target_branch}' (a renumber/reuse that would skip or "
+            f"mishandle a migration the live DB already applied): "
+            + "; ".join(divergences),
+        )
+    return ("ok", None)
 
 
 async def enforce_premerge_migration_guard(
